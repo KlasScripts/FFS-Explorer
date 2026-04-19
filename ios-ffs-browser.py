@@ -1974,6 +1974,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._build_jump_menu(menu, FORENSIC_SHORTCUTS)
         menu.exec(self.jump_btn.mapToGlobal(self.jump_btn.rect().bottomLeft()))
 
+    def _adapt_shortcut_path(self, path: str) -> str:
+        """Prefix shortcut paths for formats where ui_paths include the full
+        partition root.  GrayKey keeps private/var/ in every ui_path."""
+        if (self._adapter and
+                self._adapter.format == FfsAdapter.FORMAT_GRAYKEY and
+                not path.startswith('private/')):
+            return 'private/var/' + path
+        return path
+
     def _build_jump_menu(self, menu, items):
         for item in items:
             if item is None:
@@ -1984,7 +1993,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             else:
                 name, path = item
                 act = QAction(name, self)
-                act.triggered.connect(lambda _, p=path: self.navigate_tree_to_path(p))
+                act.triggered.connect(
+                    lambda _, p=path: self.navigate_tree_to_path(self._adapt_shortcut_path(p)))
                 menu.addAction(act)
 
     def _on_dropdown_activated(self, index):

@@ -1,0 +1,22 @@
+[
+  {
+    "path": "/Volumes/DataDrive/Test data/iOS16.5 CTF23 Cellebrite/CTF23_Abe_EXTRACTION_FFS.zip",
+    "case_dir": "/Users/klastveita/scripting/case_data/CTF23_Abe_EXTRACTION_FFS",
+    "label": "Apple iPhone X \u00b7 iOS 16.5"
+  },
+  {
+    "path": "/Volumes/DataDrive/Test data/IOS17 JoshHickman/EXTRACTION_FFS.zip",
+    "case_dir": "/Users/klastveita/scripting/case_data/EXTRACTION_FFS-Josh",
+    "label": "Apple iPhone 11 \u00b7 iOS 17.3"
+  },
+  {
+    "path": "/Volumes/DataDrive/Test data/iOS15.0.2 CTF22 Magnet/fb028ddefa8af7df5b12d3e729f075d150637a31_files_full.zip",
+    "case_dir": "/Users/klastveita/scripting/case_data/fb028ddefa8af7df5b12d3e729f075d150637a31_files_full",
+    "label": "Apple iPhone 8 Plus (China)"
+  },
+  {
+    "path": "/Volumes/DataDrive/Test data/IOS18.3.2 CTF25 Cellebrite/EXTRACTION_FFS.zip",
+    "case_dir": "/Users/klastveita/scripting/case_data/IOS18.3.2 CTF25 Cellebrite",
+    "label": "Apple iPhone 16 \u00b7 iOS 18.3.2"
+  }
+]

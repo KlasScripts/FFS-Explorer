@@ -136,7 +136,13 @@ class FfsAdapter:
         the physical layout inside the zip.
         """
         if self.format == self.FORMAT_GRAYKEY:
-            return "/private/var/" + ui_path
+            return "/" + ui_path
+
+        # Fast path: no '-' means no GUID segments (covers ~90% of paths)
+        if '-' not in ui_path:
+            if self.old_layout:
+                return f"{self.user_prefix}/private/var/{ui_path}"
+            return f"{self.user_prefix}/{ui_path}"
 
         parts = []
         for part in ui_path.split("/"):
@@ -210,11 +216,7 @@ class FfsAdapter:
         '/private/var/' prefix stripped."""
         if self.format == self.FORMAT_GRAYKEY:
             raw = _gk.extract_metadata(zip_path)
-            _GK_PREFIX = "/private/var/"
-            return {
-                (k[len(_GK_PREFIX):] if k.startswith(_GK_PREFIX) else k.lstrip("/")): v
-                for k, v in raw.items()
-            }
+            return {k.lstrip("/"): v for k, v in raw.items()}
         else:
             for candidate in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
                 try:

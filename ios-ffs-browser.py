@@ -2,37 +2,39 @@ import sys
 import os
 import re
 import time
-import sqlite3
-import struct
 import zipfile
 import json
-import subprocess
 import plistlib
 import pathlib
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+
+_APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app')
+sys.path.insert(0, _APP_DIR)
 
 from adapters import FfsAdapter
-from zip_entry import ZipEntry
+from db_utils import _open_case_db
+from hex_viewer import HexViewerMixin
+from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
+from keyword_search import KeywordSearchMixin
 from streaming_zip import StreamingZipIndex
 from datetime import datetime, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
                               QHBoxLayout, QWidget, QHeaderView, QPushButton,
                               QFileDialog, QProgressBar, QMenu, QDialog,
-                              QRadioButton, QButtonGroup, QComboBox, QSplitter, QStatusBar,
-                              QLineEdit, QLabel, QPlainTextEdit, QFrame, QTextEdit,
-                              QTabWidget, QScrollArea, QGridLayout, QSizePolicy,
-                              QStyledItemDelegate, QStyle)
+                              QComboBox, QSplitter, QStatusBar,
+                              QLineEdit, QLabel,
+                              QTabWidget, QSizePolicy,
+                              QStyle, QMessageBox)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
-                           QCursor, QColor, QTextCharFormat, QTextCursor, QFontMetricsF,
-                           QIcon, QPixmap, QImage, QFontDatabase, QTextDocument)
-from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent,
-                             QModelIndex, QAbstractTableModel, QBuffer, QIODevice)
+                           QCursor, QColor, QIcon)
+from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
+                             QModelIndex, QAbstractTableModel,
+                             qInstallMessageHandler, QtMsgType)
 
-SETTINGS_FILE        = "forensic_settings.json"
-FFS_ARCHIVES_FILE    = "ffs_archives.json"
-HARDWARE_MODELS_FILE = "hardware_models.json"
-NEW_ARCHIVE_SENTINEL = "<Open New FFS...>"   # kept for back-compat with saved data; no longer shown in dropdown
+_CONFIG_DIR          = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config')
+FFS_ARCHIVES_FILE    = os.path.join(_CONFIG_DIR, 'ffs_archives.json')
+HARDWARE_MODELS_FILE = os.path.join('config', 'hardware_models.json')
 
 # Hardware identifier → marketing name mapping for common iOS devices
 _HW_MODEL_NAMES = {
@@ -74,56 +76,17 @@ _HW_MODEL_NAMES = {
     # iPod
     'iPod9,1':'iPod touch (7th gen)',
 }
-EDIT_FILTER_MODE = 1
 
-# Files that exist only to carry container metadata; a folder containing
-# nothing but these is treated as "Metadata Only" rather than user content.
-# Hex viewer layout constants — must stay in sync with _render_hex()
-# Format: "XXXXXXXX  [GRP0]  [GRP1]  …  [GRP7]  ASCII…"
-# Each group: "XX XX XX XX" = 11 chars; groups separated by 2 spaces.
-_HEX_OFFSET_COLS  = 10   # width of "XXXXXXXX  "
-_HEX_GROUP_STRIDE = 13   # 11 chars/group + 2-char separator
-_HEX_GROUPS       = 8
-_HEX_BYTES_PER_ROW = 32
-_HEX_ASCII_START  = _HEX_OFFSET_COLS + _HEX_GROUPS * _HEX_GROUP_STRIDE - 2 + 2
-# = 10 + 8*13 - 2 + 2 = 114  (subtract trailing sep that doesn't exist, add "  " before ASCII)
-
-INITIAL_HEX_BYTES = 16384   # bytes shown immediately on open
-HEX_PAGE_BYTES    = 32768   # bytes loaded per scroll page
-MAX_HEX_HIGHLIGHT_BYTES = 512   # cap on simultaneous byte highlights
-HIT_WINDOW_BEFORE = 8192    # bytes before a search hit to load initially
-HIT_WINDOW_AFTER  = 8192    # bytes after a search hit to load initially
 FRAME_BUDGET_SECS = 0.016   # ~16 ms per batch (one frame budget)
-
-# Precomputed table: maps each byte value to its printable ASCII char or '.'
-_ASCII_XLAT = bytes(b if 32 <= b < 127 else ord('.') for b in range(256))
 
 def resource_path(relative):
     """Works both in development and when bundled by PyInstaller."""
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative)
   
-def _hex_col_to_byte(col: int) -> int | None:
-    """Map a column index within a hex line to its byte index (0-31), or None."""
-    if col < _HEX_OFFSET_COLS:
-        return None
-    rel   = col - _HEX_OFFSET_COLS
-    group = rel // _HEX_GROUP_STRIDE
-    within = rel % _HEX_GROUP_STRIDE
-    if group >= _HEX_GROUPS or within >= 11:
-        return None
-    b_in_grp = within // 3
-    return (group * 4 + b_in_grp) if b_in_grp < 4 else None
 
-
-def _ascii_col_to_byte(col: int) -> int | None:
-    """Map a column index in the ASCII section of a hex line to its byte index, or None."""
-    if col < _HEX_ASCII_START:
-        return None
-    b = col - _HEX_ASCII_START
-    return b if b < _HEX_BYTES_PER_ROW else None
-
-
+# Files that exist only to carry container metadata; a folder containing
+# nothing but these is treated as "Metadata Only" rather than user content.
 _SYSTEM_METADATA_NAMES: frozenset = frozenset({
     ".com.apple.mobile_container_manager.metadata.plist",
     ".com.apple.FairPlay.MachineIdentifier",
@@ -133,7 +96,6 @@ _TREE_PLACEHOLDER = "__placeholder__"
 _UUID_RE = re.compile(
     r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
 )
-CLEAN_MODE = 2
 
 FORENSIC_SHORTCUTS = [
     ("App Data", "mobile/Containers/Data/Application"),
@@ -467,9 +429,71 @@ class ExtractorWorker(QThread):
         return children
 
 
+def _precompute_content_cache(folder_map: dict, zip_names: frozenset, adapter,
+                              progress_cb=None,
+                              zip_ui_paths: frozenset | None = None) -> dict:
+    """Compute content-status for every folder in *folder_map* on the calling thread.
+
+    Identical logic to FastZipBrowser._folder_content_status but standalone so
+    it can run inside ZipMetadataWorker before the signal is emitted, keeping the
+    expensive recursive traversal off the main/GUI thread.
+
+    *progress_cb*, if given, is called as progress_cb(done, total) periodically.
+
+    *zip_ui_paths*, when supplied (zip-first Cellebrite mode), is the exact set of
+    ui_paths that were derived from the zip scan.  Using it directly avoids the
+    adapter.resolve() path which only handles the user partition prefix.
+
+    Returns a dict  folder_path -> 'content' | 'metadata_only' | 'empty'."""
+    cache: dict = {}
+    total   = len(folder_map)
+    counter = [0]
+    _REPORT_EVERY = 2000
+
+    def _in_zip_local(child: str) -> bool:
+        if zip_ui_paths is not None:
+            return child in zip_ui_paths
+        resolved = adapter.resolve(child)
+        return resolved in zip_names or resolved.lstrip('/') in zip_names
+
+    def _status(fp: str) -> str:
+        if fp in cache:
+            return cache[fp]
+        # Sentinel to cut cycles in malformed archives
+        cache[fp] = "empty"
+        has_metadata = False
+        for child in folder_map.get(fp, []):
+            if child in folder_map:
+                cs = _status(child)
+                if cs == "content":
+                    cache[fp] = "content"
+                    return "content"
+                if cs == "metadata_only":
+                    has_metadata = True
+            else:
+                if _in_zip_local(child):
+                    if child.split('/')[-1] in _SYSTEM_METADATA_NAMES:
+                        has_metadata = True
+                    else:
+                        cache[fp] = "content"
+                        return "content"
+        result = "metadata_only" if has_metadata else "empty"
+        cache[fp] = result
+        return result
+
+    for fp in list(folder_map.keys()):
+        _status(fp)
+        if progress_cb is not None:
+            counter[0] += 1
+            if counter[0] % _REPORT_EVERY == 0:
+                progress_cb(counter[0], total)
+
+    return cache
+
+
 class ZipMetadataWorker(QThread):
     status_update = Signal(str)
-    metadata_ready = Signal(dict, dict, dict, object, object, object)
+    metadata_ready = Signal(dict, dict, dict, object, object, object, dict, object)
 
     def __init__(self, zip_path):
         super().__init__()
@@ -521,18 +545,33 @@ class ZipMetadataWorker(QThread):
                     self.status_update.emit("Mapping Bundle IDs to GUIDs...")
                     guid_to_bundle = {}
                     meta_name = ".com.apple.mobile_container_manager.metadata.plist"
+                    meta_files = [f for f in zip_names if f.endswith(meta_name)]
 
-                    meta_files = (f for f in zip_names if f.endswith(meta_name))
-                    for mp in meta_files:
+                    def _read_plist_batch(batch):
+                        results = {}
                         try:
-                            guid = mp.split('/')[-2]
-                            with z.open(mp) as f:
-                                plist = plistlib.loads(f.read())
-                                bid = plist.get("MCMMetadataIdentifier")
-                                if bid:
-                                    guid_to_bundle[guid] = bid
-                        except (KeyError, OSError, plistlib.InvalidFileException):
-                            continue
+                            with zipfile.ZipFile(self.zip_path, 'r') as zf:
+                                for entry in batch:
+                                    try:
+                                        guid = entry.split('/')[-2]
+                                        plist = plistlib.loads(zf.read(entry))
+                                        bid = plist.get("MCMMetadataIdentifier")
+                                        if bid:
+                                            results[guid] = bid
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        return results
+
+                    if meta_files:
+                        n_workers = min(8, len(meta_files))
+                        batch_size = max(1, (len(meta_files) + n_workers - 1) // n_workers)
+                        batches = [meta_files[i:i + batch_size]
+                                   for i in range(0, len(meta_files), batch_size)]
+                        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                            for batch_result in pool.map(_read_plist_batch, batches):
+                                guid_to_bundle.update(batch_result)
 
                     adapter = FfsAdapter.detect(z)
                     if adapter.format == FfsAdapter.FORMAT_GRAYKEY:
@@ -544,13 +583,76 @@ class ZipMetadataWorker(QThread):
                 if z_ctx is not None:
                     z_ctx.__exit__(None, None, None)
 
-            self.status_update.emit(f"Building folder tree ({len(raw_data):,} entries)...")
-            ui_metadata = {}
+            # ── Build ui_metadata ─────────────────────────────────────────────
+            # For Cellebrite (non-streaming): use the zip entries under
+            # filesystemN/ as the authoritative file list, enriched with
+            # timestamps / xattrs from the msgpack where available.  This
+            # ensures every stored file appears in the tree even when the
+            # msgpack is incomplete.
+            # GrayKey and streaming Cellebrite fall back to the metadata dict.
+            if adapter.format == FfsAdapter.FORMAT_CELLEBRITE and not use_streaming:
+                self.status_update.emit("Building enrichment index from metadata…")
+                # resolve() maps a metadata key → its physical zip entry path
+                # (handling GUID-segment stripping).  This reverse dict lets us
+                # enrich any zip entry with its metadata in O(1).
+                meta_by_zip_path: dict = {}
+                for k, v in raw_data.items():
+                    meta_by_zip_path[adapter.resolve(k)] = v
+
+                user_prefix_slash = adapter.user_prefix + '/'
+                old_pv_slash = (user_prefix_slash + 'private/var/') if adapter.old_layout else None
+
+                # Discover every filesystemN/ partition present in the zip so
+                # that both the user partition (filesystem2) AND the system
+                # partition (filesystem1 — contains Containers/Bundle, System/…)
+                # are included.  Only strip old-layout private/var/ for the
+                # user partition prefix.
+                _fs_re = re.compile(r'^(filesystem\d+)/')
+                fs_prefixes: set = set()
+                for _e in zip_names:
+                    _m = _fs_re.match(_e)
+                    if _m:
+                        fs_prefixes.add(_m.group(1) + '/')
+
+                self.status_update.emit(
+                    f"Scanning {len(fs_prefixes)} filesystem partition(s)…")
+                # O(n) scan: check user prefix first (covers most entries), then
+                # fall through to any remaining filesystem partitions.
+                user_prefix_len = len(user_prefix_slash)
+                old_pv_len      = len(old_pv_slash) if old_pv_slash else 0
+                other_prefixes  = [(p, len(p)) for p in fs_prefixes
+                                   if p != user_prefix_slash]
+
+                ui_metadata = {}
+                for entry in zip_names:
+                    if entry.endswith('/'):
+                        continue
+                    if entry.startswith(user_prefix_slash):
+                        if old_pv_slash and entry.startswith(old_pv_slash):
+                            ui_path = entry[old_pv_len:]
+                        else:
+                            ui_path = entry[user_prefix_len:]
+                    else:
+                        for other_slash, other_len in other_prefixes:
+                            if entry.startswith(other_slash):
+                                ui_path = entry[other_len:]
+                                break
+                        else:
+                            continue
+                    if ui_path:
+                        ui_metadata[ui_path] = meta_by_zip_path.get(entry, {})
+
+
+                zip_ui_paths = frozenset(ui_metadata.keys())
+            else:
+                ui_metadata = dict(raw_data)
+                zip_ui_paths = None
+
+            self.status_update.emit(f"Building folder tree ({len(ui_metadata):,} entries)...")
             # Use sets for O(1) child-membership checks during orphan reconnection.
             folder_map_sets: dict[str, set] = {}
 
-            for ui_path, meta in raw_data.items():
-                ui_metadata[ui_path] = meta
+            for ui_path in ui_metadata:
                 parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ""
                 folder_map_sets.setdefault(parent_path, set()).add(ui_path)
 
@@ -573,13 +675,24 @@ class ZipMetadataWorker(QThread):
             # Convert sets → lists now that all mutations are done.
             folder_map = {k: list(v) for k, v in folder_map_sets.items()}
 
+            # Backfill folder metadata from msgpack.  The zip scan only processes
+            # file entries, so folder ui_paths are inferred but never get their
+            # timestamps/attributes from raw_data.  raw_data keys are already
+            # bare ui_paths (old-layout private/var/ prefix is stripped by
+            # adapter.load_metadata), so a direct lookup works.
+            if adapter.format == FfsAdapter.FORMAT_CELLEBRITE and not use_streaming:
+                for folder_path in folder_map:
+                    if folder_path and folder_path not in ui_metadata and folder_path in raw_data:
+                        ui_metadata[folder_path] = raw_data[folder_path]
+
             # Find UUID-shaped container folders (in the three known locations)
             # that have no bundle ID mapping — their metadata.plist is absent
             # or unreadable, which may indicate a corrupt/incomplete download.
+            _cp_prefix = "private/var/" if adapter.format == FfsAdapter.FORMAT_GRAYKEY else ""
             _CONTAINER_PARENTS = (
-                "mobile/Containers/Data/Application",
-                "mobile/Containers/Data/PluginKitPlugin",
-                "mobile/Containers/Shared/AppGroup",
+                _cp_prefix + "mobile/Containers/Data/Application",
+                _cp_prefix + "mobile/Containers/Data/PluginKitPlugin",
+                _cp_prefix + "mobile/Containers/Shared/AppGroup",
             )
             missing_plist_paths = [
                 p for p in folder_map
@@ -588,343 +701,21 @@ class ZipMetadataWorker(QThread):
                 and p.split('/')[-1] not in guid_to_bundle
             ]
 
-            self.metadata_ready.emit(ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths)
+            self.status_update.emit("Computing folder content status...")
+            content_cache = _precompute_content_cache(
+                folder_map, zip_names, adapter,
+                progress_cb=lambda done, total: self.status_update.emit(
+                    f"Computing folder content status… {done:,}/{total:,}"),
+                zip_ui_paths=zip_ui_paths)
+            self.metadata_ready.emit(ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths, content_cache, zip_ui_paths)
         except Exception as e:
             self.status_update.emit(f"Error: {str(e)}")
 
 
 
-MEDIA_EXTENSIONS = frozenset({
-    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif',
-    '.tiff', '.tif', '.mov', '.mp4', '.m4v', '.3gp', '.avi',
-})
-VIDEO_THUMB_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.avi'})
-THUMB_SIZE = 160   # thumbnail box size in pixels
 
 
-def _find_ffmpeg() -> str | None:
-    """Return the absolute path to ffmpeg, or None if not found.
-    Checks PATH first, then the fixed Homebrew locations for Apple Silicon
-    and Intel Macs, since subprocess does not inherit the shell PATH when
-    launched from a GUI app or PyInstaller bundle."""
-    if not hasattr(_find_ffmpeg, '_result'):
-        import shutil
-        candidate = shutil.which('ffmpeg')
-        if candidate is None:
-            # Homebrew on Apple Silicon is /opt/homebrew; Intel is /usr/local
-            for p in ('/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'):
-                if os.path.isfile(p):
-                    candidate = p
-                    break
-        if candidate:
-            try:
-                subprocess.run([candidate, '-version'],
-                               capture_output=True, timeout=3, check=True)
-            except Exception:
-                candidate = None
-        _find_ffmpeg._result = candidate
-    return _find_ffmpeg._result
 
-
-def _video_frame_bytes(video_data: bytes) -> bytes | None:
-    """Extract a frame from video bytes via ffmpeg, returning PNG bytes or None.
-
-    MOV/MP4 containers store the moov atom at the end by default, which means
-    ffmpeg cannot seek when reading from a plain stdin pipe.  Passing
-    -probesize and -analyzeduration large enough forces ffmpeg to buffer the
-    whole stream before decoding, so it can locate the moov atom without
-    needing a seekable file descriptor."""
-    ffmpeg = _find_ffmpeg()
-    print(f'[video_thumb] ffmpeg={ffmpeg!r}  data_len={len(video_data)}', flush=True)
-    if not ffmpeg:
-        return None
-    for seek in ('00:00:01', '00:00:00'):
-        try:
-            result = subprocess.run(
-                [ffmpeg, '-hide_banner', '-loglevel', 'error',
-                 '-probesize', '100M',
-                 '-analyzeduration', '100M',
-                 '-ss', seek,
-                 '-i', 'pipe:0',
-                 '-vframes', '1',
-                 '-f', 'image2',
-                 '-vcodec', 'png',
-                 'pipe:1'],
-                input=video_data,
-                capture_output=True,
-                timeout=30,
-            )
-            print(f'[video_thumb] seek={seek} rc={result.returncode} '
-                  f'stdout_len={len(result.stdout)} '
-                  f'stderr={result.stderr[:200]!r}', flush=True)
-            if result.returncode == 0 and result.stdout:
-                return result.stdout
-        except Exception as e:
-            print(f'[video_thumb] seek={seek} exception={e!r}', flush=True)
-    return None
-
-
-def _thumb_cache_path() -> str:
-    """Return the path to the persistent thumbnail cache database."""
-    if sys.platform == 'win32':
-        base = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
-    else:
-        base = os.environ.get('XDG_CACHE_HOME', os.path.join(os.path.expanduser('~'), '.cache'))
-    d = os.path.join(base, 'ios-ffs-browser')
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, 'thumbcache.db')
-
-
-def _open_case_db(cache_dir: str | None = None) -> sqlite3.Connection:
-    """Open (or create) the per-case database with WAL mode for safe access.
-
-    Tables:
-      thumbnails    — cached media thumbnails
-      search_results — saved keyword search hits
-    """
-    if cache_dir is not None:
-        os.makedirs(cache_dir, exist_ok=True)
-        db_path = os.path.join(cache_dir, 'casedata.db')
-    else:
-        # Fallback: shared location when no case dir is configured
-        base = os.environ.get('LOCALAPPDATA', os.path.expanduser('~')) \
-               if sys.platform == 'win32' \
-               else os.environ.get('XDG_CACHE_HOME',
-                                   os.path.join(os.path.expanduser('~'), '.cache'))
-        d = os.path.join(base, 'ios-ffs-browser')
-        os.makedirs(d, exist_ok=True)
-        db_path = os.path.join(d, 'casedata.db')
-    conn = sqlite3.connect(db_path, timeout=5)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS thumbnails (
-            zip_path   TEXT    NOT NULL,
-            ui_path    TEXT    NOT NULL,
-            file_size  INTEGER NOT NULL,
-            thumb_size INTEGER NOT NULL,
-            data       BLOB    NOT NULL,
-            PRIMARY KEY (zip_path, ui_path, file_size, thumb_size)
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS search_results (
-            zip_path  TEXT    NOT NULL,
-            keyword   TEXT    NOT NULL,
-            filename  TEXT    NOT NULL,
-            offset    INTEGER NOT NULL,
-            context   TEXT    NOT NULL
-        )
-    ''')
-    conn.execute('''
-        CREATE INDEX IF NOT EXISTS idx_search_results
-        ON search_results (zip_path, keyword)
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS device_info (
-            zip_path    TEXT PRIMARY KEY,
-            make        TEXT NOT NULL DEFAULT '',
-            model       TEXT NOT NULL DEFAULT '',
-            ios_version TEXT NOT NULL DEFAULT '',
-            hw_id       TEXT NOT NULL DEFAULT ''
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS recent_searches (
-            term       TEXT    NOT NULL,
-            used_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-            PRIMARY KEY (term)
-        )
-    ''')
-    conn.commit()
-    return conn
-
-
-_THUMB_BATCH_COMMIT = 20  # inserts to accumulate before a single db.commit()
-
-
-class ThumbnailWorker(QThread):
-    """Loads thumbnails from the cache DB or the ZIP, emits (ui_path, QImage).
-
-    Single-threaded by design: QImage.loadFromData() and img.scaled() are Qt
-    Python-binding calls that hold the GIL, so a ThreadPoolExecutor would only
-    serialise them anyway while adding GIL-contention overhead and forcing a
-    fresh ZipFile.open() (= full central-directory parse) per thread per file.
-    One thread with one open ZipFile handle is measurably faster.
-    """
-    thumbnail_ready = Signal(str, object)   # ui_path, QImage
-    finished_all    = Signal()
-
-    def __init__(self, zip_path, items, path_resolver, thumb_size, zip_info_map,
-                 streaming_index=None, cache_dir=None):
-        super().__init__()
-        self.zip_path        = zip_path
-        self.items           = items
-        self.path_resolver   = path_resolver
-        self.thumb_size      = thumb_size
-        self.zip_info_map    = zip_info_map
-        self.streaming_index = streaming_index
-        self.cache_dir       = cache_dir
-        self._stop           = False
-
-    def stop(self):
-        self._stop = True
-
-    @staticmethod
-    def _encode_jpeg(img):
-        buf = QBuffer()
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        img.save(buf, 'JPEG', 85)
-        data = bytes(buf.data())
-        buf.close()
-        return data
-
-    def run(self):
-        db = _open_case_db(self.cache_dir)
-        try:
-            # ── 1. Bulk-load only the thumbnails needed for the current item set ──
-            # Using IN (...) rather than loading the full archive avoids pulling
-            # thousands of BLOB rows into memory when only a folder subset is shown.
-            # SQLite IN() limit is 999, so chunk large sets.
-            cached = {}
-            _CHUNK = 900
-            items_list = list(self.items)
-            for i in range(0, len(items_list), _CHUNK):
-                chunk = items_list[i:i + _CHUNK]
-                placeholders = ','.join('?' * len(chunk))
-                for r in db.execute(
-                    f'SELECT ui_path, file_size, data FROM thumbnails '
-                    f'WHERE zip_path=? AND thumb_size=? AND ui_path IN ({placeholders})',
-                    (self.zip_path, self.thumb_size, *chunk)
-                ):
-                    cached[(r[0], r[1])] = r[2]
-
-            pending = []
-
-            def _read_physical(physical: str) -> bytes:
-                if self.streaming_index is not None:
-                    return self.streaming_index.get_entry(physical).read()
-                with zipfile.ZipFile(self.zip_path, 'r') as z:
-                    return z.read(physical)
-
-            # For normal zips keep a single open handle across all reads
-            _zf = None if self.streaming_index is not None else zipfile.ZipFile(self.zip_path, 'r')
-            try:
-                for ui_path in self.items:
-                    if self._stop:
-                        return
-
-                    physical  = self.path_resolver(ui_path)
-                    file_size = self.zip_info_map.get(physical, 0)
-
-                    # ── 2. Cache hit ──────────────────────────────────────────
-                    ext = os.path.splitext(physical)[1].lower()
-                    blob = cached.get((ui_path, file_size))
-                    if blob:
-                        # A genuine ffmpeg-extracted frame is always > 10 KB as
-                        # JPEG.  A blob smaller than this for a video means it
-                        # was stored before ffmpeg was available (the codec
-                        # decoded garbage from the raw container bytes).
-                        # Discard it and re-extract.
-                        stale = (ext in VIDEO_THUMB_EXTENSIONS
-                                 and len(blob) < 10_000)
-                        if not stale:
-                            img = QImage()
-                            if img.loadFromData(blob):
-                                self.thumbnail_ready.emit(ui_path, img)
-                                continue
-                        try:
-                            db.execute(
-                                'DELETE FROM thumbnails WHERE '
-                                'zip_path=? AND ui_path=? AND '
-                                'file_size=? AND thumb_size=?',
-                                (self.zip_path, ui_path,
-                                 file_size, self.thumb_size))
-                            db.commit()
-                        except sqlite3.Error:
-                            pass
-
-                    # ── 3. Cache miss: read from zip ──────────────────────────
-                    try:
-                        data = _zf.read(physical) if _zf is not None else _read_physical(physical)
-                    except Exception:
-                        continue
-
-                    if ext in VIDEO_THUMB_EXTENSIONS:
-                        data = _video_frame_bytes(data)
-                        if not data:
-                            continue
-
-                    img = QImage()
-                    if not img.loadFromData(data):
-                        continue
-                    img = img.scaled(self.thumb_size, self.thumb_size,
-                                     Qt.AspectRatioMode.KeepAspectRatio,
-                                     Qt.TransformationMode.SmoothTransformation)
-                    self.thumbnail_ready.emit(ui_path, img)
-
-                    # ── 4. Batch-write to cache ───────────────────────────────
-                    jpeg = self._encode_jpeg(img)
-                    if jpeg:
-                        pending.append((self.zip_path, ui_path, file_size,
-                                        self.thumb_size, jpeg))
-                        if len(pending) >= _THUMB_BATCH_COMMIT:
-                            try:
-                                db.executemany(
-                                    'INSERT OR REPLACE INTO thumbnails '
-                                    '(zip_path,ui_path,file_size,thumb_size,data) '
-                                    'VALUES (?,?,?,?,?)', pending)
-                                db.commit()
-                            except sqlite3.Error:
-                                pass
-                            pending.clear()
-
-            finally:
-                if _zf is not None:
-                    _zf.close()
-
-            if pending:
-                try:
-                    db.executemany(
-                        'INSERT OR REPLACE INTO thumbnails '
-                        '(zip_path,ui_path,file_size,thumb_size,data) '
-                        'VALUES (?,?,?,?,?)', pending)
-                    db.commit()
-                except sqlite3.Error:
-                    pass
-
-        finally:
-            db.close()
-        self.finished_all.emit()
-
-
-class HexLoadWorker(QThread):
-    """Fallback worker for compressed zip entries — reads via zipfile decompression."""
-    progress      = Signal(int, int)   # bytes_read, total_bytes
-    load_complete = Signal(bytes)
-    error         = Signal(str)
-
-    CHUNK = 8192
-    LIMIT = 65536
-
-    def __init__(self, entry: ZipEntry):
-        super().__init__()
-        self.entry       = entry
-        self.total_bytes = min(entry.file_size, self.LIMIT) if entry.file_size > 0 else self.LIMIT
-
-    def run(self):
-        try:
-            data = bytearray()
-            with zipfile.ZipFile(self.entry.zip_path, 'r') as z:
-                with z.open(self.entry.physical_path) as f:
-                    while len(data) < self.LIMIT:
-                        chunk = f.read(self.CHUNK)
-                        if not chunk:
-                            break
-                        data.extend(chunk)
-                        self.progress.emit(len(data), self.total_bytes)
-            self.load_complete.emit(bytes(data[:self.LIMIT]))
-        except Exception as e:
-            self.error.emit(str(e))
 
 
 _FILTER_CHUNK = 8000   # rows processed per frame during incremental filter
@@ -1167,184 +958,6 @@ class ExportProgressDialog(QDialog):
             super().reject()
 
 
-class ClickableThumb(QWidget):
-    """A thumbnail container that emits clicked(ui_path) when pressed."""
-    clicked = Signal(str)
-
-    def __init__(self, ui_path: str, parent=None):
-        super().__init__(parent)
-        self._ui_path = ui_path
-        # NoFocus prevents Qt from drawing a dotted focus rectangle over the widget.
-        # WA_StyledBackground ensures the background is always painted before children,
-        # which stops see-through paint artifacts while thumbnails are loading.
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self._ui_path)
-        super().mousePressEvent(event)
-
-    def set_selected(self, selected: bool):
-        if selected:
-            self.setStyleSheet(
-                "ClickableThumb { background-color: #1e4080; "
-                "border: 2px solid #4d94ff; border-radius: 4px; }")
-        else:
-            self.setStyleSheet("ClickableThumb { background-color: transparent; }")
-
-
-class KeywordSearchWorker(QThread):
-    """Search all STORED entries in a zip for a keyword using multiple threads.
-
-    Emits:
-        result_found(filename, offset_in_file, context_str)
-        progress(files_done, files_total)
-        finished(total_hits)
-    """
-
-    result_found  = Signal(str, int, str)   # name, offset-in-file, context
-    progress      = Signal(int, int)        # done, total
-    finished      = Signal(int)             # total hits
-    status_update = Signal(str)             # free-text status line
-
-    _CHUNK      = 1 * 1024 * 1024   # 1 MB read chunks
-    _CTX_BYTES  = 40                # bytes either side of hit for context
-
-    def __init__(self, zip_path: str, keyword: str,
-                 streaming_index=None, entries=None, scope="all", parent=None):
-        super().__init__(parent)
-        self.zip_path         = zip_path
-        self.keyword          = keyword.encode('utf-8', errors='replace')
-        self.streaming_index  = streaming_index  # None for normal zip
-        self._stop            = threading.Event()
-        self._prebuilt_entries = entries
-        self._scope           = scope
-        self.entries: list = []   # full index, populated in run() and available after worker finishes
-
-    def stop(self):
-        self._stop.set()
-
-    def _build_entries(self) -> list:
-        """Build (name, data_offset, file_size) list inside the worker thread
-        so local-header seeks never block the GUI."""
-        entries = []
-        if self.streaming_index is not None:
-            for name in self.streaming_index.namelist():
-                try:
-                    entry = self.streaming_index.get_entry(name)
-                    if entry.is_stored and entry.file_size > 0:
-                        entries.append((name, entry.data_offset, entry.file_size))
-                except Exception:
-                    pass
-        else:
-            try:
-                with zipfile.ZipFile(self.zip_path, 'r') as z:
-                    stored = [
-                        (info.filename, info.header_offset, info.file_size)
-                        for info in z.infolist()
-                        if info.compress_type == zipfile.ZIP_STORED and info.file_size > 0
-                    ]
-            except Exception:
-                stored = []
-            # Resolve data_offset for all entries with a single open file handle
-            # instead of opening the zip once per entry (critical for large archives).
-            try:
-                with open(self.zip_path, 'rb') as fh:
-                    for name, header_offset, file_size in stored:
-                        if self._stop.is_set():
-                            return entries
-                        fh.seek(header_offset + 26)
-                        fname_len, extra_len = struct.unpack('<HH', fh.read(4))
-                        data_offset = header_offset + 30 + fname_len + extra_len
-                        entries.append((name, data_offset, file_size))
-            except Exception:
-                pass
-        return entries
-
-    def run(self):
-        if self._prebuilt_entries is not None:
-            entries = self._prebuilt_entries
-        else:
-            self.status_update.emit("Preparing search index…")
-            full_entries = self._build_entries()
-            self.entries = full_entries   # expose full index for caching
-            if self._scope == "app_data":
-                entries = [e for e in full_entries if "mobile/Containers" in e[0]]
-            else:
-                entries = full_entries
-        self.status_update.emit(f"Index ready — {len(entries):,} files to search")
-        kw        = self.keyword
-        kw_len    = len(kw)
-        total     = len(entries)
-        hits      = 0
-        done      = 0
-        n_threads = min(8, os.cpu_count() or 4)
-
-        def search_entry(_name, data_offset, file_size):
-            if self._stop.is_set():
-                return []
-            results = []
-            overlap = kw_len - 1
-            chunk   = self._CHUNK
-            pos     = 0
-            try:
-                with open(self.zip_path, 'rb') as fh:
-                    fh.seek(data_offset)
-                    buf_start = 0
-                    leftover  = b''
-                    while pos < file_size and not self._stop.is_set():
-                        read_len = min(chunk, file_size - pos)
-                        raw      = fh.read(read_len)
-                        if not raw:
-                            break
-                        block      = leftover + raw
-                        block_base = buf_start
-                        idx        = 0
-                        while True:
-                            idx = block.find(kw, idx)
-                            if idx == -1:
-                                break
-                            file_offset = block_base + idx
-                            ctx_start   = max(0, idx - self._CTX_BYTES)
-                            ctx_end     = min(len(block), idx + kw_len + self._CTX_BYTES)
-                            ctx_bytes   = block[ctx_start:ctx_end]
-                            before      = ctx_bytes[:idx - ctx_start]
-                            after       = ctx_bytes[idx - ctx_start + kw_len:]
-                            hit_text    = kw.decode('utf-8', errors='replace')
-                            context     = (
-                                before.decode('utf-8', errors='replace')
-                                + f'[{hit_text}]'
-                                + after.decode('utf-8', errors='replace')
-                            )
-                            results.append((file_offset, context))
-                            idx += kw_len
-                        leftover  = block[-overlap:] if overlap > 0 else b''
-                        buf_start = block_base + len(block) - len(leftover)
-                        pos      += read_len
-            except OSError:
-                pass
-            return results
-
-        with ThreadPoolExecutor(max_workers=n_threads) as pool:
-            futures = {
-                pool.submit(search_entry, name, off, size): name
-                for name, off, size in entries
-            }
-            for fut in as_completed(futures):
-                if self._stop.is_set():
-                    break
-                name = futures[fut]
-                done += 1
-                self.progress.emit(done, total)
-                try:
-                    for file_offset, context in fut.result():
-                        hits += 1
-                        self.result_found.emit(name, file_offset, context)
-                except Exception:
-                    pass
-
-        self.finished.emit(hits)
 
 
 class CaseSettingsDialog(QDialog):
@@ -1467,167 +1080,8 @@ class CaseSettingsDialog(QDialog):
         return self._accepted_dir
 
 
-class SearchContextDelegate(QStyledItemDelegate):
-    """Renders the Context column (col 2) with the search term highlighted."""
 
-    CONTEXT_COL = 2
-    _HL_BG  = "#ffeb3b"   # highlight background (yellow)
-    _HL_FG  = "#000000"   # highlight foreground
-
-    def __init__(self, get_term, parent=None):
-        super().__init__(parent)
-        self._get_term = get_term   # callable → current search term string
-
-    def paint(self, painter, option, index):
-        if index.column() != self.CONTEXT_COL:
-            super().paint(painter, option, index)
-            return
-
-        text = index.data(Qt.ItemDataRole.DisplayRole) or ''
-        term = self._get_term()
-        if not term or not text:
-            super().paint(painter, option, index)
-            return
-
-        self.initStyleOption(option, index)
-
-        # Draw the item background / selection highlight (no text yet)
-        style = option.widget.style() if option.widget else QApplication.style()
-        option.text = ''
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, option.widget)
-
-        # Build HTML: escape both, then re-insert highlighted spans
-        import html as _html, re as _re
-        escaped = _html.escape(text)
-        pattern = _re.compile(_re.escape(_html.escape(term)), _re.IGNORECASE)
-        highlighted = pattern.sub(
-            lambda m: (f'<span style="background:{self._HL_BG};color:{self._HL_FG};">'
-                       f'{m.group()}</span>'),
-            escaped
-        )
-
-        # Choose foreground colour based on selection state
-        if option.state & QStyle.StateFlag.State_Selected:
-            fg = option.palette.highlightedText().color().name()
-        else:
-            fg = option.palette.text().color().name()
-
-        doc = QTextDocument()
-        doc.setDefaultStyleSheet(f'body {{ color: {fg}; }}')
-        doc.setHtml(f'<body>{highlighted}</body>')
-        doc.setTextWidth(option.rect.width())
-
-        text_rect = style.subElementRect(
-            QStyle.SubElement.SE_ItemViewItemText, option, option.widget)
-
-        painter.save()
-        painter.translate(text_rect.topLeft())
-        painter.setClipRect(text_rect.translated(-text_rect.topLeft()))
-        doc.drawContents(painter)
-        painter.restore()
-
-    def sizeHint(self, option, index):
-        sh = super().sizeHint(option, index)
-        return sh
-
-
-class SearchProgressDialog(QDialog):
-    """Modal progress dialog shown during a keyword search.
-
-    Displays a scrolling log of status messages followed by live
-    progress counters.  The Cancel button stops the worker but leaves
-    any hits already found intact so the user can review them.
-    """
-
-    cancelled = Signal()
-
-    def __init__(self, term: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Keyword Search")
-        self.setModal(True)
-        self.setMinimumWidth(480)
-        self.setMinimumHeight(260)
-        self._interrupted = False
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-
-        layout.addWidget(QLabel(f"<b>Searching for:</b> {term}"))
-
-        self._log = QPlainTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setFixedHeight(100)
-        self._log.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
-        layout.addWidget(self._log)
-
-        self._progress_label = QLabel("Starting…")
-        layout.addWidget(self._progress_label)
-
-        self._bar = QProgressBar()
-        self._bar.setRange(0, 0)   # indeterminate until we know total
-        layout.addWidget(self._bar)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.clicked.connect(self._on_cancel)
-        btn_row.addWidget(self._cancel_btn)
-        layout.addLayout(btn_row)
-
-    # ── Slots called by the worker signals ────────────────────────────────────
-
-    def append_status(self, text: str):
-        self._log.appendPlainText(text)
-        self._log.verticalScrollBar().setValue(
-            self._log.verticalScrollBar().maximum())
-
-    def update_progress(self, done: int, total: int, hits: int):
-        if self._bar.maximum() != total:
-            self._bar.setRange(0, total)
-        self._bar.setValue(done)
-        self._progress_label.setText(
-            f"Checked {done:,} / {total:,} files  |  "
-            f"hits in {hits:,} file{'s' if hits != 1 else ''} so far")
-
-    def mark_finished(self, n_files: int, total_hits: int):
-        self._bar.setValue(self._bar.maximum())
-        self._progress_label.setText(
-            f"Complete — {total_hits:,} hit{'s' if total_hits != 1 else ''} "
-            f"across {n_files:,} file{'s' if n_files != 1 else ''}")
-        self._cancel_btn.setText("Close")
-
-    def mark_interrupted(self, n_files: int):
-        self._interrupted = True
-        self._progress_label.setText(
-            f"Partial search — interrupted  "
-            f"({n_files:,} file{'s' if n_files != 1 else ''} with hits)")
-        self._cancel_btn.setText("Close")
-
-    @property
-    def was_interrupted(self) -> bool:
-        return self._interrupted
-
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _on_cancel(self):
-        if self._cancel_btn.text() == "Close":
-            self.accept()
-        else:
-            self.cancelled.emit()
-            # Button text changes to "Close" once the worker finishes and
-            # mark_interrupted() is called; don't close yet so the user
-            # can read the final status.
-
-    def closeEvent(self, event):
-        """Block the window-close button while searching is in progress."""
-        if self._cancel_btn.text() not in ("Close",):
-            self.cancelled.emit()
-            event.ignore()
-        else:
-            super().closeEvent(event)
-
-
-class FastZipBrowser(QMainWindow):
+class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("iOS FFS Browser")
@@ -1639,12 +1093,13 @@ class FastZipBrowser(QMainWindow):
         self.folder_map = {}
         self.guid_to_bundle = {}
         self.zip_names: frozenset = frozenset()
+        self._zip_ui_paths: frozenset | None = None
         self._real_content_cache: dict = {}
         self._zip_handle: zipfile.ZipFile | None = None
+        self._zip_open_future = None
         self._streaming_index: StreamingZipIndex | None = None
         self._hex_worker: QThread | None = None
         self._adapter = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, "filesystem2", "filesystem1")
-        self.hidden_paths = self.load_settings()
         # ffs_archives: ordered list of {"path": ..., "case_dir": ..., "label": ...}, most-recent first
         self._ffs_archives: list = _load_json_file(FFS_ARCHIVES_FILE, [])
         self.recent_paths: list = [e['path'] for e in self._ffs_archives if 'path' in e]
@@ -1670,10 +1125,11 @@ class FastZipBrowser(QMainWindow):
         self._thumb_widgets: dict = {}
         self._pending_media_selection: str | None = None
         self._media_context = None   # tracks what is currently loaded in the media grid
+        self._tree_splitter_sizes: list | None = None  # saved when search tab is active
         self._media_total_files: int | None = None
         self._media_sort_desc: str = ""
         self._load_gen = 0
-        self._hide_empty_folders = False
+        self._hide_empty_folders = True
         self._missing_plist_paths: set = set()
         self._tree_populating = False
 
@@ -1710,21 +1166,11 @@ class FastZipBrowser(QMainWindow):
         archive_bar.addWidget(self.folder_view_btn)
         layout.addLayout(archive_bar)
 
-        # ── Folder view mode — hidden behind a menu button ───────────────
-        self.view_group = QButtonGroup(self)
+        # ── Folder view options ───────────────────────────────────────────
         self._view_mode_menu = QMenu(self)
-        for i, text in enumerate(["All Folders", "Customise Filter", "Simplified View"]):
-            act = self._view_mode_menu.addAction(text)
-            act.setCheckable(True)
-            act.setChecked(i == CLEAN_MODE)
-            act.setData(i)
-            rb = QRadioButton()  # kept for button-group logic; not shown in UI
-            if i == CLEAN_MODE: rb.setChecked(True)
-            self.view_group.addButton(rb, i)
-        self._view_mode_menu.addSeparator()
         self._hide_empty_act = self._view_mode_menu.addAction("Hide Empty && Metadata-Only Folders")
         self._hide_empty_act.setCheckable(True)
-        self._hide_empty_act.setChecked(False)
+        self._hide_empty_act.setChecked(True)
         self._view_mode_menu.triggered.connect(self._on_view_mode_action)
 
         _section_style = (
@@ -1771,6 +1217,7 @@ class FastZipBrowser(QMainWindow):
         left_layout.addLayout(tree_top)
         left_layout.addWidget(self.tree_view)
         self.splitter.addWidget(left_panel)
+        self.splitter.setCollapsible(0, True)
 
         self.file_headers = ['Name', 'Created', 'Modified', 'Type', 'Size (Bytes)', 'Files', 'Path']
         self.proxy_model = MultiColumnFilterProxy()
@@ -1832,113 +1279,10 @@ class FastZipBrowser(QMainWindow):
         file_tab_layout.addWidget(self.file_view)
 
         # ── Media Browser tab ───────────────────────────────────────────────
-        self._thumb_worker: ThumbnailWorker | None = None
-        self._media_status = QLabel("Select a folder to view media")
-        self._media_status.setStyleSheet(_status_style)
-
-        self._media_grid_widget = QWidget()
-        self._media_grid = QGridLayout(self._media_grid_widget)
-        self._media_grid.setSpacing(8)
-        self._media_grid.setContentsMargins(8, 8, 8, 8)
-
-        # Wrap the grid in a container that has a stretch spacer below it.
-        # This stops QScrollArea (widgetResizable=True) from stretching the grid
-        # widget to fill the viewport, which would make QGridLayout divide the
-        # viewport height equally among rows and cause jiggling during loading.
-        _media_container = QWidget()
-        _media_container_layout = QVBoxLayout(_media_container)
-        _media_container_layout.setContentsMargins(0, 0, 0, 0)
-        _media_container_layout.setSpacing(0)
-        _media_container_layout.addWidget(self._media_grid_widget)
-        _media_container_layout.addStretch()
-
-        self._media_scroll = QScrollArea()
-        self._media_scroll.setWidgetResizable(True)
-        self._media_scroll.setWidget(_media_container)
-        media_scroll = self._media_scroll
-
-        media_tab = QWidget()
-        media_tab_layout = QVBoxLayout(media_tab)
-        media_tab_layout.setContentsMargins(0, 4, 0, 0)
-        media_tab_layout.setSpacing(2)
-        media_tab_layout.addWidget(self._media_status)
-        media_tab_layout.addWidget(media_scroll, stretch=1)
+        media_tab = self._setup_media_tab(_status_style)
 
         # ── Keyword search tab ───────────────────────────────────────────────
-        search_tab = QWidget()
-        search_tab_layout = QVBoxLayout(search_tab)
-        search_tab_layout.setContentsMargins(4, 4, 4, 4)
-        search_tab_layout.setSpacing(4)
-
-        # Controls row
-        search_ctrl = QHBoxLayout()
-        self.search_recent_combo = QComboBox()
-        self.search_recent_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.search_recent_combo.setMinimumContentsLength(20)
-        self.search_recent_combo.setMaximumWidth(260)
-        self.search_recent_combo.setToolTip("Recent searches")
-        self.search_field = QLineEdit()
-        self.search_field.setPlaceholderText("Enter keyword…")
-        self.search_field.returnPressed.connect(self._start_keyword_search)
-        self.search_btn  = QPushButton("Search")
-        self.search_btn.setFixedWidth(80)
-        self.search_btn.clicked.connect(self._start_keyword_search)
-        self.search_stop_btn = QPushButton("Stop")
-        self.search_stop_btn.setFixedWidth(60)
-        self.search_stop_btn.setEnabled(False)
-        self.search_stop_btn.clicked.connect(self._stop_keyword_search)
-        self.search_status = QLabel("No search running")
-        self.search_scope_combo = QComboBox()
-        self.search_scope_combo.addItem("All Files",  userData="all")
-        self.search_scope_combo.addItem("App Data",   userData="app_data")
-        self.search_scope_combo.setToolTip(
-            "All Files — search every stored file in the archive\n"
-            "App Data  — search only files under mobile/Containers"
-        )
-        search_ctrl.addWidget(QLabel("Recent:"))
-        search_ctrl.addWidget(self.search_recent_combo)
-        search_ctrl.addSpacing(8)
-        search_ctrl.addWidget(QLabel("Search:"))
-        search_ctrl.addWidget(self.search_field, 1)
-        search_ctrl.addWidget(self.search_scope_combo)
-        search_ctrl.addWidget(self.search_btn)
-        search_ctrl.addWidget(self.search_stop_btn)
-        search_tab_layout.addLayout(search_ctrl)
-        search_tab_layout.addWidget(self.search_status)
-
-        # Results tree: Name | Hits | Context | Offset
-        self.search_results_model = QStandardItemModel()
-        self.search_results_model.setHorizontalHeaderLabels(
-            ["Name", "Hits", "Context", "Offset"])
-        self.search_results_view = QTreeView()
-        self.search_results_view.setModel(self.search_results_model)
-        self.search_results_view.setEditTriggers(QTreeView.EditTrigger.NoEditTriggers)
-        self.search_results_view.setSelectionBehavior(QTreeView.SelectionBehavior.SelectRows)
-        self.search_results_view.setAlternatingRowColors(True)
-        self.search_results_view.setUniformRowHeights(True)
-        self.search_results_view.header().setStretchLastSection(False)
-        self.search_results_view.header().resizeSection(0, 220)
-        self.search_results_view.header().resizeSection(1, 50)
-        self.search_results_view.header().resizeSection(2, 260)
-        self.search_results_view.header().resizeSection(3, 90)
-        self.search_results_view.selectionModel().selectionChanged.connect(
-            self._on_search_row_selected)
-        self._search_context_delegate = SearchContextDelegate(
-            lambda: self.search_field.text().strip())
-        self.search_results_view.setItemDelegate(self._search_context_delegate)
-        self.search_results_view.expanded.connect(self._on_search_tree_expanded)
-        search_tab_layout.addWidget(self.search_results_view, stretch=1)
-
-        self._search_worker: KeywordSearchWorker | None = None
-        self._search_progress_dlg: SearchProgressDialog | None = None
-        self._pending_hex_jump: tuple | None = None   # (offset, keyword) set while hex loads
-        self._search_entries: list | None = None   # cached zip entry index, built once per archive
-        # Node lookup dicts for building the tree during a live search
-        self._search_folder_items: dict[str, QStandardItem] = {}
-        self._search_file_items:   dict[str, QStandardItem] = {}
-        self._recent_searches: list = []   # populated from casedata.db when a case is loaded
-        self._refresh_search_recent_combo()
-        self.search_recent_combo.activated.connect(self._on_search_recent_selected)
+        search_tab = self._setup_search_tab()
 
         # ── Tab widget ──────────────────────────────────────────────────────
         self.center_tabs = QTabWidget()
@@ -1957,47 +1301,7 @@ class FastZipBrowser(QMainWindow):
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
 
-        # Hex viewer panel
-        hex_header = QLabel("Hex Preview")
-        hex_header.setStyleSheet(_section_style)
-        self.hex_label = QLabel("No file selected")
-        self.hex_label.setStyleSheet(_status_style)
-        self.hex_view = QPlainTextEdit()
-        self.hex_view.setReadOnly(True)
-        _hex_font = QFont("Menlo", 14)
-        _hex_font.setStyleHint(QFont.StyleHint.Monospace)
-        self.hex_view.setFont(_hex_font)
-        self.hex_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.hex_view.setStyleSheet("")
-        self.hex_view.document().setDocumentMargin(10)
-        self.hex_view.setPlaceholderText("Double-click a file to preview it here, or right-click and choose 'Preview in Hex Viewer'.")
-        self.hex_view.selectionChanged.connect(self._on_hex_selection_changed)
-        self.hex_view.viewport().installEventFilter(self)
-        self.hex_view.verticalScrollBar().valueChanged.connect(self._on_hex_scroll)
-        self._fitting_hex_font = False
-        self._hex_loading_more = False
-        self._hex_entry: ZipEntry | None = None
-        self._thumb_cols = 1
-        self._hex_file_size: int = 0
-        self._hex_bytes_loaded: int = 0
-        self._hex_view_start: int = 0    # file offset of the first byte currently displayed
-        self._hex_ui_path: str = ""
-        self.hex_progress_bar = QProgressBar()
-        self.hex_progress_bar.hide()
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
-
-        hex_panel = QWidget()
-        hex_layout = QVBoxLayout(hex_panel)
-        hex_layout.setContentsMargins(0, 0, 0, 0)
-        hex_layout.setSpacing(2)
-        hex_layout.addWidget(sep)
-        hex_layout.addWidget(hex_header)
-        hex_layout.addWidget(self.hex_label)
-        hex_layout.addWidget(self.hex_progress_bar)
-        hex_layout.addWidget(self.hex_view, stretch=1)
+        hex_panel = self._setup_hex_panel(_section_style, _status_style)
 
         self.outer_splitter = QSplitter(Qt.Orientation.Vertical)
         self.outer_splitter.addWidget(self.splitter)
@@ -2053,10 +1357,19 @@ class FastZipBrowser(QMainWindow):
         if self._streaming_index is not None:
             return None
         if self._zip_handle is None:
-            self._zip_handle = zipfile.ZipFile(self.zip_path, 'r')
+            if self._zip_open_future is not None:
+                try:
+                    self._zip_handle = self._zip_open_future.result()
+                except Exception:
+                    self._zip_handle = zipfile.ZipFile(self.zip_path, 'r')
+                self._zip_open_future = None
+            else:
+                self._zip_handle = zipfile.ZipFile(self.zip_path, 'r')
         return self._zip_handle
 
     def _in_zip(self, ui_path) -> bool:
+        if self._zip_ui_paths is not None:
+            return ui_path in self._zip_ui_paths
         return self._adapter.resolve(ui_path) in self.zip_names
 
     def _is_empty_folder_entry(self, ui_path) -> bool:
@@ -2064,29 +1377,7 @@ class FastZipBrowser(QMainWindow):
         return (self._adapter.resolve(ui_path) + "/") in self.zip_names
 
     def _folder_content_status(self, folder_path) -> str:
-        """Classify a folder recursively as 'content', 'metadata_only', or 'empty'.
-        Results are memoized per archive load."""
-        if folder_path in self._real_content_cache:
-            return self._real_content_cache[folder_path]
-        has_metadata = False
-        for child in self.folder_map.get(folder_path, []):
-            if child in self.folder_map:
-                child_status = self._folder_content_status(child)
-                if child_status == "content":
-                    self._real_content_cache[folder_path] = "content"
-                    return "content"
-                if child_status == "metadata_only":
-                    has_metadata = True
-            else:
-                if self._in_zip(child):
-                    if child.split('/')[-1] in _SYSTEM_METADATA_NAMES:
-                        has_metadata = True
-                    else:
-                        self._real_content_cache[folder_path] = "content"
-                        return "content"
-        result = "metadata_only" if has_metadata else "empty"
-        self._real_content_cache[folder_path] = result
-        return result
+        return self._real_content_cache.get(folder_path, 'empty')
 
     def _bundle_for_path(self, path):
         """Return the bundle ID for the nearest GUID ancestor of path, or None."""
@@ -2116,8 +1407,16 @@ class FastZipBrowser(QMainWindow):
 
     def _on_center_tab_changed(self, index):
         if index == 2:
+            # Save current tree width and collapse it for the search view
+            sizes = self.splitter.sizes()
+            if sizes[0] > 0:
+                self._tree_splitter_sizes = sizes
+            self.splitter.setSizes([0, sum(sizes)])
             self._update_search_status_bar()
             return
+        # Switching away from search — restore tree if it was hidden by search
+        if self.splitter.sizes()[0] == 0 and self._tree_splitter_sizes:
+            self.splitter.setSizes(self._tree_splitter_sizes)
         if index == 1:
             # Determine pending selection from the file browser
             if self._selected_file_path and \
@@ -2150,142 +1449,6 @@ class FastZipBrowser(QMainWindow):
             # Switching back to File Browser — select the media file that was selected
             if self._selected_media_path:
                 self._select_file_in_table(self._selected_media_path)
-
-    def _load_media_from_file_model(self):
-        """Load the media tab using exactly the current visible file model rows —
-        same order, same filter, same selection — so media mirrors the file browser."""
-        model = self.file_model
-
-        # All non-folder rows currently visible (respects filter + sort)
-        total_files = sum(1 for r in model._rows if r[1] not in self.folder_map)
-        media_paths = [
-            r[1] for r in model._rows
-            if r[1] not in self.folder_map
-            and os.path.splitext(r[1])[1].lower() in MEDIA_EXTENSIONS
-        ]
-
-        # Store the ordered tuple as context so tab-switching is cheap
-        self._media_context = tuple(media_paths)
-
-        # Build sort description
-        if 0 <= model._sort_col < len(model._headers):
-            arrow = "↑" if model._sort_order == Qt.SortOrder.AscendingOrder else "↓"
-            sort_desc = f", sorted by {model._headers[model._sort_col]} {arrow}"
-        else:
-            sort_desc = ""
-
-        self._start_thumbnail_load(media_paths, total_files, sort_desc)
-
-    def _start_thumbnail_load(self, media_paths, total_files=None, sort_desc=""):
-        """Stop any running thumb worker, clear the grid, pre-place all containers,
-        then start the worker which only sets pixmaps — the grid never changes shape."""
-        if self._thumb_worker and self._thumb_worker.isRunning():
-            self._thumb_worker.stop()
-            self._thumb_worker.wait()
-
-        while self._media_grid.count():
-            item = self._media_grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        self._thumb_widgets = {}
-        self._thumb_img_labels: dict = {}   # ui_path -> QLabel (pixmap slot)
-        self._selected_media_path = None
-
-        if not media_paths or not self.zip_path:
-            self._media_status.setText(
-                "No media files" if self.zip_path else "Select a folder to view media")
-            return
-
-        self._media_total_files = total_files
-        self._media_sort_desc = sort_desc
-        of_total = f" of {total_files:,} file(s)" if total_files is not None else ""
-        self._media_status.setText(f"Loading {len(media_paths):,} media file(s){of_total}…")
-        n_cols = max(1, self._media_grid_widget.width() // (THUMB_SIZE + 16))
-        self._thumb_cols = n_cols
-
-        # ── Pre-place every container in the grid before the worker starts ──────
-        # All grid positions are fixed from the start.  The worker only sets pixmaps
-        # on already-placed labels, so QGridLayout never recalculates during loading.
-        self._media_grid_widget.setUpdatesEnabled(False)
-        for i, ui_path in enumerate(media_paths):
-            row, col = divmod(i, n_cols)
-            name = ui_path.split('/')[-1]
-
-            container = ClickableThumb(ui_path)
-            container.setFixedSize(THUMB_SIZE + 8, THUMB_SIZE + 28)
-            container.clicked.connect(self._on_thumb_clicked)
-
-            v = QVBoxLayout(container)
-            v.setContentsMargins(2, 2, 2, 2)
-            v.setSpacing(2)
-
-            img_label = QLabel()
-            img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            img_label.setFixedSize(THUMB_SIZE, THUMB_SIZE)
-            img_label.setToolTip(ui_path)
-
-            name_label = QLabel()
-            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            name_label.setFixedWidth(THUMB_SIZE + 4)
-            name_label.setWordWrap(False)
-            name_label.setStyleSheet("font-size: 10px;")
-            fm = name_label.fontMetrics()
-            name_label.setText(
-                fm.elidedText(name, Qt.TextElideMode.ElideMiddle, THUMB_SIZE + 4))
-            name_label.setToolTip(ui_path)
-
-            v.addWidget(img_label)
-            v.addWidget(name_label)
-
-            self._thumb_widgets[ui_path] = container
-            self._thumb_img_labels[ui_path] = img_label
-            self._media_grid.addWidget(container, row, col)
-
-        self._media_grid_widget.setUpdatesEnabled(True)
-        # ────────────────────────────────────────────────────────────────────────
-
-        zip_info_map = {
-            self._adapter.resolve(p): self.full_metadata.get(p, {}).get('size', 0)
-            for p in media_paths
-        }
-
-        self._thumb_worker = ThumbnailWorker(
-            self.zip_path, media_paths, self._adapter.resolve, THUMB_SIZE, zip_info_map,
-            streaming_index=self._streaming_index, cache_dir=self._case_dir)
-        self._thumb_worker.thumbnail_ready.connect(self._on_thumbnail_ready)
-        self._thumb_worker.finished_all.connect(self._on_thumbnails_done)
-        self._thumb_worker.start()
-
-    def _on_thumbnail_ready(self, ui_path, img):
-        """Grid position is already fixed — convert QImage to QPixmap and set it."""
-        img_label = self._thumb_img_labels.get(ui_path)
-        if img_label is not None:
-            img_label.setPixmap(QPixmap.fromImage(img))
-
-    def _on_thumb_clicked(self, ui_path):
-        """Highlight thumbnail, show path in status bar, and pre-select in File Browser."""
-        if self._selected_media_path and self._selected_media_path in self._thumb_widgets:
-            self._thumb_widgets[self._selected_media_path].set_selected(False)
-        self._selected_media_path = ui_path
-        if ui_path in self._thumb_widgets:
-            self._thumb_widgets[ui_path].set_selected(True)
-        self.status_bar.showMessage(ui_path)
-        self._select_file_in_table(ui_path)
-
-    def _on_thumbnails_done(self):
-        count = self._media_grid.count()
-        of_total = f" of {self._media_total_files:,} file(s)" \
-            if self._media_total_files is not None else ""
-        self._media_status.setText(
-            f"{count:,} media file(s){of_total}{self._media_sort_desc}")
-        # Auto-select any pending file (set when switching from File Browser)
-        if self._pending_media_selection and \
-                self._pending_media_selection in self._thumb_widgets:
-            self._on_thumb_clicked(self._pending_media_selection)
-            self._media_scroll.ensureWidgetVisible(
-                self._thumb_widgets[self._pending_media_selection])
-        self._pending_media_selection = None
 
     def _update_filter_columns(self, headers):
         self.filter_col_combo.blockSignals(True)
@@ -2351,6 +1514,33 @@ class FastZipBrowser(QMainWindow):
         elif ui_path and self._in_zip(ui_path):
             self._load_hex_preview(ui_path)
 
+    def _expand_to_private_var(self):
+        """Expand the tree down to private/var on GrayKey load so its children
+        are visible. Does not select anything or trigger the file browser."""
+        invisible_root = self.tree_model.invisibleRootItem()
+        if invisible_root.rowCount() == 0:
+            return
+        root = invisible_root.child(0)  # "/ [Full Filesystem]"
+        self._ensure_children_loaded(root)
+        self.tree_view.expand(self.tree_model.indexFromItem(root))
+        for seg in ("private", "var"):
+            found = None
+            for row in range(root.rowCount()):
+                child = root.child(row)
+                child_path = child.data(Qt.ItemDataRole.UserRole)
+                if child_path is not None and child_path.split('/')[-1] == seg:
+                    found = child
+                    break
+            if found is None:
+                break
+            self._ensure_children_loaded(found)
+            self.tree_view.expand(self.tree_model.indexFromItem(found))
+            root = found
+        # Scroll so the expanded node is visible without selecting it
+        idx = self.tree_model.indexFromItem(root)
+        QTimer.singleShot(0, lambda: self.tree_view.scrollTo(
+            idx, self.tree_view.ScrollHint.PositionAtTop))
+
     def navigate_tree_to_path(self, target_path):
         # The visible root "/ [Full Filesystem]" sits under the invisible root
         invisible_root = self.tree_model.invisibleRootItem()
@@ -2403,312 +1593,12 @@ class FastZipBrowser(QMainWindow):
                     self.file_view.scrollTo(proxy_idx)
                 break
 
-    def _load_hex_preview(self, ui_path):
-        if self._hex_worker is not None and self._hex_worker.isRunning():
-            self._hex_worker.terminate()
-            self._hex_worker.wait()
-
-        self._hex_entry        = None
-        self._hex_file_size    = 0
-        self._hex_bytes_loaded = 0
-        self._hex_view_start   = 0
-        self._hex_ui_path      = ui_path
-
-        physical_path = self._adapter.resolve(ui_path)
-
-        self.hex_view.clear()
-        self.hex_progress_bar.hide()
-
-        try:
-            if self._streaming_index is not None:
-                entry = self._streaming_index.get_entry(physical_path)
-            else:
-                zinfo = self._get_zip_handle().getinfo(physical_path)
-                entry = ZipEntry(self.zip_path, physical_path, zinfo)
-        except Exception as e:
-            self._on_hex_error(str(e))
-            return
-
-        self._hex_file_size = entry.file_size or self.full_metadata.get(ui_path, {}).get('size', 0)
-
-        if entry.is_stored:
-            # STORED entry — seek directly into the zip, display first page instantly
-            self._hex_entry = entry
-            try:
-                chunk = entry.read(min(INITIAL_HEX_BYTES, self._hex_file_size or INITIAL_HEX_BYTES))
-            except Exception as e:
-                self._on_hex_error(str(e))
-                return
-            self._hex_bytes_loaded = len(chunk)
-            self.hex_view.setPlainText(self._render_hex(chunk))
-            self._fit_hex_font()
-            self._update_hex_label()
-        else:
-            # Compressed — fall back to threaded worker
-            self.hex_label.setText(f"Loading: {ui_path}")
-            self.hex_progress_bar.setRange(0, max(self._hex_file_size, 1))
-            self.hex_progress_bar.setValue(0)
-            self.hex_progress_bar.show()
-            self._hex_worker = HexLoadWorker(entry)
-            self._hex_worker.progress.connect(self._on_hex_progress)
-            self._hex_worker.load_complete.connect(self._on_hex_ready)
-            self._hex_worker.error.connect(self._on_hex_error)
-            self._hex_worker.start()
-
-    def _update_hex_label(self):
-        view_end = self._hex_view_start + self._hex_bytes_loaded
-        total    = self._hex_file_size
-        if self._hex_view_start > 0:
-            label = (f"{self._hex_ui_path}  —  "
-                     f"bytes {self._hex_view_start:,}–{view_end:,} of {total:,}")
-        else:
-            label = f"{self._hex_ui_path}  —  {view_end:,} / {total:,} bytes shown"
-        hints = []
-        if self._hex_view_start > 0:
-            hints.append("scroll up for earlier")
-        if total == 0 or view_end < total:
-            hints.append("scroll down for more")
-        if hints:
-            label += f"  ({', '.join(hints)})"
-        self.hex_label.setText(label)
-
-    def _on_hex_scroll(self, value):
-        if self._hex_entry is None or self._hex_loading_more:
-            return
-        scrollbar = self.hex_view.verticalScrollBar()
-        view_end  = self._hex_view_start + self._hex_bytes_loaded
-
-        # ── Scroll backward: prepend earlier bytes ────────────────────────────
-        if value <= 5 and self._hex_view_start > 0:
-            self._hex_loading_more = True
-            back_start = max(0, ((self._hex_view_start - HEX_PAGE_BYTES) // 32) * 32)
-            back_len   = self._hex_view_start - back_start
-            try:
-                chunk = self._hex_entry.read_at(back_start, back_len)
-            except Exception as e:
-                self._log(f"Hex scroll load error: {e}")
-                self._hex_loading_more = False
-                return
-            if chunk:
-                new_text  = self._render_hex(chunk, back_start)
-                old_max   = scrollbar.maximum()
-                old_val   = scrollbar.value()
-                cursor    = QTextCursor(self.hex_view.document())
-                cursor.movePosition(QTextCursor.MoveOperation.Start)
-                cursor.insertText(new_text + "\n")
-                self._hex_view_start   = back_start
-                self._hex_bytes_loaded += len(chunk)
-                # Shift scroll position down by the number of lines just added
-                scrollbar.setValue(old_val + (scrollbar.maximum() - old_max))
-                self._update_hex_label()
-            self._hex_loading_more = False
-            return
-
-        # ── Scroll forward: append later bytes ───────────────────────────────
-        if value < scrollbar.maximum() - 5:
-            return
-        if self._hex_file_size > 0 and view_end >= self._hex_file_size:
-            return
-        self._hex_loading_more = True
-        remaining = (self._hex_file_size - view_end) if self._hex_file_size > 0 else HEX_PAGE_BYTES
-        try:
-            chunk = self._hex_entry.read_at(view_end, min(HEX_PAGE_BYTES, remaining))
-        except Exception as e:
-            self._log(f"Hex scroll load error: {e}")
-            self._hex_loading_more = False
-            return
-        if not chunk:
-            self._hex_loading_more = False
-            return
-        new_text = self._render_hex(chunk, view_end)
-        self._hex_bytes_loaded += len(chunk)
-        cursor = self.hex_view.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText("\n" + new_text)
-        self._update_hex_label()
-        self._hex_loading_more = False
-
-    def _on_hex_progress(self, done, total):
-        self.hex_progress_bar.setRange(0, max(total, 1))
-        self.hex_progress_bar.setValue(done)
-
-    def _on_hex_ready(self, data):
-        self.hex_progress_bar.hide()
-        self._hex_bytes_loaded = len(data)
-        truncated = len(data) == HexLoadWorker.LIMIT
-        self.hex_label.setText(
-            f"{self._hex_ui_path}  —  {len(data):,} bytes shown"
-            + ("  (truncated to 64 KB)" if truncated else "")
-        )
-        self.hex_view.setPlainText(self._render_hex(data))
-        self._fit_hex_font()
-        self._log(f"Hex preview: {self._hex_ui_path}")
-        if self._pending_hex_jump:
-            jump_to, keyword = self._pending_hex_jump
-            QTimer.singleShot(0, lambda: self._jump_to_hex_offset(jump_to, keyword))
-
-    def _on_hex_error(self, msg):
-        self.hex_progress_bar.hide()
-        self.hex_label.setText(f"Cannot preview: {msg}")
-        self.hex_view.clear()
-
-    @staticmethod
-    def _render_hex(data: bytes, base_offset: int = 0) -> str:
-        # C-level operations for the two heaviest parts
-        ascii_str = data.translate(_ASCII_XLAT).decode('latin-1')
-        h = data.hex()
-        rows = []
-        n = len(data)
-        for i in range(0, n, 32):
-            o = i * 2
-            if n - i >= 32:
-                # Fast path: full 32-byte row — no inner loops
-                s = h[o:o + 64]
-                hex_part = (
-                    f"{s[0:2]} {s[2:4]} {s[4:6]} {s[6:8]}"
-                    f"  {s[8:10]} {s[10:12]} {s[12:14]} {s[14:16]}"
-                    f"  {s[16:18]} {s[18:20]} {s[20:22]} {s[22:24]}"
-                    f"  {s[24:26]} {s[26:28]} {s[28:30]} {s[30:32]}"
-                    f"  {s[32:34]} {s[34:36]} {s[36:38]} {s[38:40]}"
-                    f"  {s[40:42]} {s[42:44]} {s[44:46]} {s[46:48]}"
-                    f"  {s[48:50]} {s[50:52]} {s[52:54]} {s[54:56]}"
-                    f"  {s[56:58]} {s[58:60]} {s[60:62]} {s[62:64]}"
-                )
-            else:
-                # Partial last row
-                row_len = n - i
-                s = h[o:o + row_len * 2]
-                grps = []
-                for g in range(8):
-                    gs = g * 8
-                    if gs >= len(s):
-                        grps.append('')
-                        continue
-                    b = s[gs:min(gs + 8, len(s))]
-                    grps.append(' '.join(b[j:j + 2] for j in range(0, len(b), 2)))
-                hex_part = '  '.join(f'{g:<11}' for g in grps)
-            rows.append(f"{base_offset + i:08x}  {hex_part}  {ascii_str[i:i + 32]}")
-        return '\n'.join(rows)
-
-    def eventFilter(self, obj, event):
-        if obj is self.hex_view.viewport() and event.type() == QEvent.Type.Resize:
-            QTimer.singleShot(0, self._fit_hex_font)
-        return super().eventFilter(obj, event)
-
-    def _fit_hex_font(self):
-        """Compute and apply the largest font size that fits a full hex line.
-        Always defers one event-loop tick so the viewport has settled after
-        setPlainText / resize before we measure."""
-        QTimer.singleShot(0, self._do_fit_hex_font)
-
-    # A representative worst-case hex line — all bytes 0xff, full 32-byte row.
-    # Used as the measurement string for font fitting so we measure actual
-    # rendered characters rather than the widest possible glyph ('W').
-    # ── Change _HEX_REF_SIZE to adjust the hex viewer font size ──────────────
-    _HEX_REF_SIZE = 15.0   # reference point size; scale up/down to taste
-
-    # Full 32-byte hex line at worst-case values — used for measurement.
-    _HEX_SAMPLE_LINE = (
-        "ffffffff  "
-        "ff ff ff ff  ff ff ff ff  ff ff ff ff  ff ff ff ff  "
-        "ff ff ff ff  ff ff ff ff  ff ff ff ff  ff ff ff ff  "
-        "................................"
-    )
-
-    def _do_fit_hex_font(self):
-        if self._fitting_hex_font:
-            return
-        vp_width = self.hex_view.viewport().width()
-        if vp_width <= 0:
-            return
-        self._fitting_hex_font = True
-        try:
-            # Measure the text width directly with QFontMetricsF at the
-            # reference size — synchronous, no layout pass required.
-            # Then add the document's left+right margins to get total content width.
-            ref_font = QFont("Menlo", self._HEX_REF_SIZE)
-            ref_font.setStyleHint(QFont.StyleHint.Monospace)
-            fm = QFontMetricsF(ref_font)
-            text_width = fm.horizontalAdvance(self._HEX_SAMPLE_LINE)
-            if text_width <= 0:
-                return
-            doc_margin = self.hex_view.document().documentMargin()
-            content_width = text_width + 2 * doc_margin
-            new_size = self._HEX_REF_SIZE * (vp_width / content_width)
-            new_size = max(6.0, min(new_size, 32.0))
-            ref_font.setPointSizeF(new_size)
-            self.hex_view.setFont(ref_font)
-        finally:
-            self._fitting_hex_font = False
-
-    def _on_hex_selection_changed(self):
-        cursor = self.hex_view.textCursor()
-        if not cursor.hasSelection():
-            self.hex_view.setExtraSelections([])
-            return
-
-        doc = self.hex_view.document()
-        sel_start = min(cursor.position(), cursor.anchor())
-        sel_end   = max(cursor.position(), cursor.anchor())
-
-        hl_fmt = QTextCharFormat()
-        hl_fmt.setBackground(QColor(255, 190, 0, 140))
-
-        extra_sels = []
-        start_block = doc.findBlock(sel_start)
-        end_block   = doc.findBlock(max(sel_end - 1, sel_start))
-        total_bytes = 0
-
-        block = start_block
-        while block.isValid():
-            bpos  = block.position()
-            btext = block.text()
-            blen  = len(btext)
-
-            cs = max(0, sel_start - bpos)
-            ce = min(blen, sel_end - bpos)
-
-            selected = set()
-            for col in range(cs, ce):
-                b = _hex_col_to_byte(col)
-                if b is None:
-                    b = _ascii_col_to_byte(col)
-                if b is not None:
-                    selected.add(b)
-
-            total_bytes += len(selected)
-            if total_bytes > MAX_HEX_HIGHLIGHT_BYTES:
-                break
-
-            for b in selected:
-                hex_col   = _HEX_OFFSET_COLS + (b // 4) * _HEX_GROUP_STRIDE + (b % 4) * 3
-                ascii_col = _HEX_ASCII_START + b
-                for col, width in ((hex_col, 2), (ascii_col, 1)):
-                    if col + width > blen:
-                        continue
-                    es = QTextEdit.ExtraSelection()
-                    es.format = hl_fmt
-                    tc = QTextCursor(doc)
-                    tc.setPosition(bpos + col)
-                    tc.setPosition(bpos + col + width, QTextCursor.MoveMode.KeepAnchor)
-                    es.cursor = tc
-                    extra_sels.append(es)
-
-            if block == end_block:
-                break
-            block = block.next()
-
-        self.hex_view.setExtraSelections(extra_sels)
-
     def on_folder_selected(self, index):
         item = self.tree_model.itemFromIndex(index)
         if not item: return
         folder_path = item.data(Qt.ItemDataRole.UserRole)
         self.status_bar.showMessage(f"{folder_path}    |    Tip: Right-click to export")
         self._log(f"Folder viewed: {folder_path}")
-
-        # Clicking a folder name always shows that folder — clears ticked view
-        self._view_is_recursive = False
 
         children = self.folder_map.get(folder_path, [])
         has_bundles = any(p.split('/')[-1] in self.guid_to_bundle for p in children)
@@ -2728,49 +1618,15 @@ class FastZipBrowser(QMainWindow):
         batch = []
         for path in sorted(children):
             name = path.split('/')[-1]
-            meta = self.full_metadata.get(path, {})
             is_folder = path in self.folder_map
-
-            # Determine type label and whether to grey out
-            if is_folder:
-                status = self._folder_content_status(path)
-                if self._hide_empty_folders and status in ("empty", "metadata_only") \
-                        and path not in self._missing_plist_paths:
-                    continue
-                if status == "content":
-                    file_type = _get_file_type(name, True)
-                    grey_row = False
-                elif status == "metadata_only":
-                    file_type = "Folder - Metadata Only"
-                    grey_row = True
-                else:
-                    file_type = "Empty Folder"
-                    grey_row = True
-            elif self._in_zip(path):
-                file_type = _get_file_type(name, False)
-                grey_row = False
-            elif self._is_empty_folder_entry(path):
-                if self._hide_empty_folders:
-                    continue
-                file_type = "Empty Folder"
-                grey_row = True
-            else:
-                file_type = "Not in Zip"
-                grey_row = True
-
+            file_type, grey_row, skip = self._classify_entry(path, name, is_folder)
+            if skip:
+                continue
+            meta = self.full_metadata.get(path, {})
             fc = self._count_files_recursive(path) if is_folder else -1
-            cols = [
-                self._display_name(name),
-                self.format_ts(meta.get('ctime')),
-                self.format_ts(meta.get('mtime')),
-                file_type,
-                f"{meta.get('size', 0):,}",
-                f"{fc:,}" if is_folder else "",
-                self._display_path(path),
-            ]
+            cols = self._build_entry_cols(path, name, meta, is_folder, file_type, fc)
             if has_bundles:
                 cols.append(name if name in self.guid_to_bundle else "")
-
             batch.append((cols, path, fc, is_folder and not grey_row, grey_row))
 
         new_model.append_rows_batch(batch)
@@ -2790,6 +1646,51 @@ class FastZipBrowser(QMainWindow):
     def _display_path(self, path: str) -> str:
         """Replace GUID segments in a full path with bundle IDs for display."""
         return '/'.join(self._display_name(seg) for seg in path.split('/'))
+
+    def _strip_archive_prefix(self, path: str) -> str:
+        """Strip the archive-format prefix so display paths start from the
+        user-partition root (e.g. 'mobile/Containers/...' not
+        'filesystem2/mobile/Containers/...')."""
+        p = path.lstrip('/')
+        prefix = self._adapter.user_prefix + '/'
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+        if p.startswith('private/var/'):
+            p = p[len('private/var/'):]
+        return p
+
+    def _classify_entry(self, path: str, name: str, is_folder: bool):
+        """Return (file_type, grey_row, skip) for one file/folder entry.
+        skip=True means the caller should exclude this entry from the view."""
+        if is_folder:
+            status = self._folder_content_status(path)
+            if self._hide_empty_folders and status in ("empty", "metadata_only") \
+                    and path not in self._missing_plist_paths:
+                return None, None, True
+            if status == "content":
+                return _get_file_type(name, True), False, False
+            if status == "metadata_only":
+                return "Folder - Metadata Only", True, False
+            return "Empty Folder", True, False
+        if self._in_zip(path):
+            return _get_file_type(name, False), False, False
+        if self._is_empty_folder_entry(path):
+            if self._hide_empty_folders:
+                return None, None, True
+            return "Empty Folder", True, False
+        return "Not in Zip", True, False
+
+    def _build_entry_cols(self, path: str, name: str, meta: dict,
+                          is_folder: bool, file_type: str, fc: int) -> list:
+        return [
+            self._display_name(name),
+            self.format_ts(meta.get('ctime')),
+            self.format_ts(meta.get('mtime')),
+            file_type,
+            f"{meta.get('size', 0):,}",
+            f"{fc:,}" if is_folder else "",
+            self._display_path(path),
+        ]
 
     def _count_files_recursive(self, folder_path: str, visited: set = None) -> int:
         """Return the total number of files under folder_path (recursive, no double-counting)."""
@@ -2832,8 +1733,7 @@ class FastZipBrowser(QMainWindow):
         item = self.tree_model.itemFromIndex(index)
         folder_path = item.data(Qt.ItemDataRole.UserRole) if item else None
         menu = QMenu(self)
-        mode = self.view_group.checkedId()
-        if mode in (0, CLEAN_MODE) and folder_path is not None:
+        if folder_path is not None:
             checked_paths = set()
             self._collect_checked_paths(item, checked_paths)
             is_ticked = bool(checked_paths)
@@ -2883,9 +1783,7 @@ class FastZipBrowser(QMainWindow):
             self._rebuild_pending = True
             QTimer.singleShot(0, self._deferred_rebuild)
 
-    # ------------------------------------------------------------------ #
-    #  Checkbox-driven file-view helpers (All Folders / Simplified modes) #
-    # ------------------------------------------------------------------ #
+    # ── Checkbox-driven file-view helpers ──────────────────────────────── #
 
     def _cascade_check(self, parent_item, state):
         """Propagate check state to all descendants of parent_item."""
@@ -2953,45 +1851,14 @@ class FastZipBrowser(QMainWindow):
                 folder = folders[state['idx']]
                 state['idx'] += 1
                 for child in self.folder_map.get(folder, []):
-                    is_folder = child in self.folder_map
-                    if is_folder and self._hide_empty_folders and \
-                            self._folder_content_status(child) in ("empty", "metadata_only") \
-                            and child not in self._missing_plist_paths:
-                        continue
                     name = child.split('/')[-1]
+                    is_folder = child in self.folder_map
+                    file_type, grey_row, skip = self._classify_entry(child, name, is_folder)
+                    if skip:
+                        continue
                     meta = self.full_metadata.get(child, {})
-                    if is_folder:
-                        status = self._folder_content_status(child)
-                        if status == "content":
-                            file_type = _get_file_type(name, True)
-                            grey_row = False
-                        elif status == "metadata_only":
-                            file_type = "Folder - Metadata Only"
-                            grey_row = True
-                        else:
-                            file_type = "Empty Folder"
-                            grey_row = True
-                    elif self._in_zip(child):
-                        file_type = _get_file_type(name, False)
-                        grey_row = False
-                    elif self._is_empty_folder_entry(child):
-                        if self._hide_empty_folders:
-                            continue
-                        file_type = "Empty Folder"
-                        grey_row = True
-                    else:
-                        file_type = "Not in Zip"
-                        grey_row = True
                     fc = self._count_files_recursive(child) if is_folder else -1
-                    cols = [
-                        self._display_name(name),
-                        self.format_ts(meta.get('ctime')),
-                        self.format_ts(meta.get('mtime')),
-                        file_type,
-                        f"{meta.get('size', 0):,}",
-                        f"{fc:,}" if is_folder else "",
-                        self._display_path(child),
-                    ]
+                    cols = self._build_entry_cols(child, name, meta, is_folder, file_type, fc)
                     batch_rows.append((cols, child, fc, is_folder and not grey_row, grey_row))
                     state['count'] += 1
                 if time.monotonic() >= deadline:
@@ -3101,15 +1968,6 @@ class FastZipBrowser(QMainWindow):
         if action is self._hide_empty_act:
             self._hide_empty_folders = action.isChecked()
             self.reload_tree_entirely()
-            return
-        mode = action.data()
-        for act in self._view_mode_menu.actions():
-            if act.data() is not None:
-                act.setChecked(act.data() == mode)
-        btn = self.view_group.button(mode)
-        if btn:
-            btn.setChecked(True)
-        self.reload_tree_entirely()
 
     def _show_jump_menu(self):
         menu = QMenu(self)
@@ -3150,12 +2008,38 @@ class FastZipBrowser(QMainWindow):
         self._case_dir = case_dir
         self._search_entries = None   # clear cached index for the new archive
         self.zip_path = zip_path
+        # Clear search UI from the previous archive
+        self._stop_keyword_search()
+        self.search_field.clear()
+        self.search_results_model.clear()
+        self.search_results_model.setHorizontalHeaderLabels(["Name", "Hits", "Context", "Offset"])
+        self._search_folder_items.clear()
+        self._search_file_items.clear()
+        self._pending_db_hits.clear()
+        self.search_status.setText("No search running")
+        self.center_tabs.setCurrentIndex(0)
         self._load_recent_searches_from_db()
+        self._start_search_index_build()
         self._log(f"SESSION START — Archive loaded: {zip_path}")
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
         self.show_selected_btn.setVisible(False)
         self.deselect_all_btn.setVisible(False)
+        # Clear hex viewer from the previous archive
+        if self._hex_worker is not None and self._hex_worker.isRunning():
+            self._hex_worker.terminate()
+            self._hex_worker.wait()
+        self._hex_entry        = None
+        self._hex_file_size    = 0
+        self._hex_bytes_loaded = 0
+        self._hex_view_start   = 0
+        self._hex_ui_path      = ""
+        self._pending_hex_jump = None
+        self._hex_loading_more = False
+        self.hex_view.clear()
+        self.hex_label.setText("No file selected")
+        self.hex_progress_bar.hide()
+
         # Stop any running thumbnail worker from the previous archive
         if self._thumb_worker and self._thumb_worker.isRunning():
             self._thumb_worker.stop()
@@ -3183,18 +2067,25 @@ class FastZipBrowser(QMainWindow):
         self.worker.metadata_ready.connect(self.on_metadata_ready)
         self.worker.start()
 
-    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, adapter, missing_plist_paths):
+    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, adapter, missing_plist_paths, content_cache, zip_ui_paths=None):
         self.full_metadata = data
         self.folder_map = folder_map
         self.guid_to_bundle = guid_map
         self.zip_names = zip_names
         self._adapter = adapter
         self._missing_plist_paths = set(missing_plist_paths)
-        self._real_content_cache = {}
+        self._real_content_cache = content_cache
+        self._zip_ui_paths = zip_ui_paths
         if self._zip_handle:
             self._zip_handle.close()
-            self._zip_handle = None   # opened lazily on first hex-preview request
+            self._zip_handle = None
+        self._zip_open_future = None
         self._streaming_index = getattr(self.worker, '_streaming_index', None)
+        if self._streaming_index is None:
+            _path = self.zip_path
+            _ex = ThreadPoolExecutor(max_workers=1)
+            self._zip_open_future = _ex.submit(lambda: zipfile.ZipFile(_path, 'r'))
+            _ex.shutdown(wait=False)
         self.progress_bar.setRange(0, 100)
         self.save_recent_list(self.zip_path)
         fmt_label = "GrayKey" if adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
@@ -3269,17 +2160,15 @@ class FastZipBrowser(QMainWindow):
         if not self.folder_map: return
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
-        mode = self.view_group.checkedId()
         self.tree_model.blockSignals(True)
         root_item = QStandardItem("/ [Full Filesystem]")
         root_item.setData("", Qt.ItemDataRole.UserRole)
         root_item.setEditable(False)
         root_item.setFont(QFont("Arial", weight=QFont.Weight.Bold))
-        if mode in (0, CLEAN_MODE):
-            root_item.setCheckable(True)
-            root_item.setCheckState(Qt.CheckState.Unchecked)
+        root_item.setCheckable(True)
+        root_item.setCheckState(Qt.CheckState.Unchecked)
         self.tree_model.invisibleRootItem().appendRow(root_item)
-        self._populate_tree_children(root_item, "", mode)
+        self._populate_tree_children(root_item, "")
         self.tree_view.expand(self.tree_model.indexFromItem(root_item))
         self.tree_model.blockSignals(False)
         if hasattr(self, '_adapter'):
@@ -3287,6 +2176,8 @@ class FastZipBrowser(QMainWindow):
             self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
         self.progress_bar.hide()
         self.status_bar.showMessage(f"Loaded: {os.path.basename(self.zip_path)}")
+        if hasattr(self, '_adapter') and self._adapter.format == FfsAdapter.FORMAT_GRAYKEY:
+            QTimer.singleShot(0, self._expand_to_private_var)
         QTimer.singleShot(0, self._fit_splitter_to_tree)
 
     def _fit_splitter_to_tree(self):
@@ -3301,15 +2192,13 @@ class FastZipBrowser(QMainWindow):
         if total > 0:
             self.splitter.setSizes([tree_w, max(total - tree_w, 200)])
 
-    def _populate_tree_children(self, parent_item, parent_path, mode):
+    def _populate_tree_children(self, parent_item, parent_path):
         """Add immediate folder children of parent_path to parent_item.
         Each child that itself has children gets a placeholder so the tree
         shows an expand arrow; actual grandchildren are loaded on demand."""
         children = sorted(self.folder_map.get(parent_path, []))
         for p in children:
             if p not in self.folder_map:
-                continue
-            if mode == CLEAN_MODE and self.is_path_hidden(p):
                 continue
             if self._hide_empty_folders and \
                     self._folder_content_status(p) in ("empty", "metadata_only"):
@@ -3318,16 +2207,8 @@ class FastZipBrowser(QMainWindow):
             item = QStandardItem(self._display_name(name))
             item.setData(p, Qt.ItemDataRole.UserRole)
             item.setEditable(False)
-            if mode == EDIT_FILTER_MODE:
-                item.setCheckable(True)
-                if self.is_path_hidden(p):
-                    item.setCheckState(Qt.CheckState.Unchecked)
-                    item.setForeground(QColor("#cc2222"))
-                else:
-                    item.setCheckState(Qt.CheckState.Checked)
-            elif mode in (0, CLEAN_MODE):
-                item.setCheckable(True)
-                item.setCheckState(Qt.CheckState.Unchecked)
+            item.setCheckable(True)
+            item.setCheckState(Qt.CheckState.Unchecked)
             parent_item.appendRow(item)
             # Add a placeholder so Qt shows the expand arrow without
             # loading all grandchildren upfront.
@@ -3336,11 +2217,6 @@ class FastZipBrowser(QMainWindow):
                 placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
                 placeholder.setEditable(False)
                 item.appendRow(placeholder)
-
-    def is_path_hidden(self, path):
-        for rule in self.hidden_paths:
-            if path.startswith(rule): return True
-        return False
 
     def _on_tree_item_expanded(self, index):
         """Lazy-load children when a tree node is expanded for the first time."""
@@ -3353,10 +2229,9 @@ class FastZipBrowser(QMainWindow):
         path = item.data(Qt.ItemDataRole.UserRole)
         if path is None:
             return
-        mode = self.view_group.checkedId()
         self._tree_populating = True
         item.removeRow(0)
-        self._populate_tree_children(item, path, mode)
+        self._populate_tree_children(item, path)
         self._tree_populating = False
 
     def _ensure_children_loaded(self, item):
@@ -3366,10 +2241,9 @@ class FastZipBrowser(QMainWindow):
             if placeholder and placeholder.data(Qt.ItemDataRole.UserRole) == _TREE_PLACEHOLDER:
                 path = item.data(Qt.ItemDataRole.UserRole)
                 if path is not None:
-                    mode = self.view_group.checkedId()
                     self._tree_populating = True
                     item.removeRow(0)
-                    self._populate_tree_children(item, path, mode)
+                    self._populate_tree_children(item, path)
                     self._tree_populating = False
 
     def _ensure_all_descendants_loaded(self, item):
@@ -3383,32 +2257,13 @@ class FastZipBrowser(QMainWindow):
     def on_tree_item_changed(self, item):
         if self._tree_populating:
             return
-        mode = self.view_group.checkedId()
-        if mode == EDIT_FILTER_MODE:
-            path = item.data(Qt.ItemDataRole.UserRole)
-            if path is None:
-                return
-            excluded = (item.checkState() == Qt.CheckState.Unchecked)
-            if excluded:
-                self.hidden_paths.add(path)
-            else:
-                self.hidden_paths.discard(path)
-            # Update text colour to reflect state; block signals to avoid re-entry
-            self.tree_model.blockSignals(True)
-            if excluded:
-                item.setForeground(QColor("#cc2222"))
-            else:
-                item.setData(None, Qt.ItemDataRole.ForegroundRole)  # restore default
-            self.tree_model.blockSignals(False)
-            self.save_settings()
-        elif mode in (0, CLEAN_MODE):
-            # Single folder tick — expand to show unticked children
-            if item.checkState() == Qt.CheckState.Checked:
-                self.tree_view.expand(self.tree_model.indexFromItem(item))
-            self.tree_view.viewport().update()
-            if not self._rebuild_pending:
-                self._rebuild_pending = True
-                QTimer.singleShot(0, self._deferred_rebuild)
+        # Single folder tick — expand to show unticked children
+        if item.checkState() == Qt.CheckState.Checked:
+            self.tree_view.expand(self.tree_model.indexFromItem(item))
+        self.tree_view.viewport().update()
+        if not self._rebuild_pending:
+            self._rebuild_pending = True
+            QTimer.singleShot(0, self._deferred_rebuild)
 
     def _update_selected_btn(self):
         """Recount ticked folders and update the status label and deselect button."""
@@ -3445,13 +2300,6 @@ class FastZipBrowser(QMainWindow):
         self._rebuild_pending = False
         self._update_selected_btn()
         self._rebuild_file_view_from_checked()
-
-    def save_settings(self):
-        with open(resource_path(SETTINGS_FILE), 'w', encoding='utf-8') as f:
-            json.dump(list(self.hidden_paths), f)
-
-    def load_settings(self):
-        return set(_load_json_file(resource_path(SETTINGS_FILE), []))
 
     def _on_recent_context_menu(self, point):
         view = self.archive_dropdown.view()
@@ -3557,6 +2405,17 @@ class FastZipBrowser(QMainWindow):
             self._save_ffs_archives()
         self.update_dropdown_ui()
 
+    @staticmethod
+    def _archive_display(path: str, label: str) -> str:
+        """Build the display string: '[X.XX GB]  [label  —  ] path'."""
+        try:
+            size_gb = os.path.getsize(path) / 1_073_741_824
+            size_str = f"{size_gb:.2f} GB"
+        except OSError:
+            size_str = "? GB"
+        prefix = f"{label}  —  " if label else ""
+        return f"[{size_str}]  {prefix}{path}"
+
     def update_dropdown_ui(self):
         self.archive_dropdown.blockSignals(True)
         self.archive_dropdown.clear()
@@ -3569,7 +2428,7 @@ class FastZipBrowser(QMainWindow):
         for p in self.recent_paths:
             entry = self._archive_entry(p)
             label = entry.get('label', '') if entry else ''
-            display = f'{label}  —  {p}' if label else p
+            display = self._archive_display(p, label)
             self.archive_dropdown.addItem(display, userData=p)
         self.archive_dropdown.setCurrentIndex(0)
         self.archive_dropdown.blockSignals(False)
@@ -3590,7 +2449,7 @@ class FastZipBrowser(QMainWindow):
         for p in self.recent_paths:
             entry = self._archive_entry(p)
             label = entry.get('label', '') if entry else ''
-            display = f'{label}  —  {p}' if label else p
+            display = self._archive_display(p, label)
             act = QAction(display, self)
             act.triggered.connect(lambda _checked, path=p: self.start_loading(path))
             self._recent_menu.addAction(act)
@@ -3605,484 +2464,16 @@ class FastZipBrowser(QMainWindow):
         self._save_ffs_archives()
         self.update_dropdown_ui()
 
-    # ── Keyword search ────────────────────────────────────────────────────────
-
-    def _refresh_search_recent_combo(self):
-        self.search_recent_combo.blockSignals(True)
-        self.search_recent_combo.clear()
-        self.search_recent_combo.addItem("Recent searches…")
-        model = self.search_recent_combo.model()
-        item  = model.item(0)
-        from PySide6.QtCore import Qt as _Qt
-        item.setFlags(item.flags() & ~(_Qt.ItemFlag.ItemIsSelectable | _Qt.ItemFlag.ItemIsEnabled))
-        for term in self._recent_searches:
-            self.search_recent_combo.addItem(term)
-        self.search_recent_combo.blockSignals(False)
-
-    def _on_search_row_selected(self):
-        indexes = self.search_results_view.selectionModel().selectedRows(0)
-        if not indexes:
-            return
-        item = self.search_results_model.itemFromIndex(indexes[0])
-        if not item:
-            return
-        _PATH_ROLE   = Qt.ItemDataRole.UserRole
-        _OFFSET_ROLE = Qt.ItemDataRole.UserRole + 1
-        _PHYS_ROLE   = Qt.ItemDataRole.UserRole + 2
-        path     = item.data(_PATH_ROLE) or ''
-        offset   = item.data(_OFFSET_ROLE)
-        physical = item.data(_PHYS_ROLE)
-
-        if physical and offset is not None:
-            # Hit node — load file in hex viewer and jump to offset
-            keyword = self.search_field.text().strip()
-            self.status_bar.showMessage(f'{path}  —  offset: {offset:,}')
-            self._open_hex_from_search(physical, path, offset, keyword)
-        elif physical:
-            # File node — just update status bar
-            self.status_bar.showMessage(path)
-        else:
-            # Folder node
-            self.status_bar.showMessage(path)
-
-    def _strip_archive_prefix(self, path: str) -> str:
-        """Strip the archive-format prefix so display paths start from the
-        user-partition root (e.g. 'mobile/Containers/...' not
-        'filesystem2/mobile/Containers/...')."""
-        p = path.lstrip('/')
-        prefix = self._adapter.user_prefix + '/'
-        if p.startswith(prefix):
-            p = p[len(prefix):]
-        # Old-layout Cellebrite and GrayKey still have 'private/var/' after the prefix
-        if p.startswith('private/var/'):
-            p = p[len('private/var/'):]
-        return p
-
-    def _hits_cell_for(self, item: QStandardItem) -> QStandardItem | None:
-        """Return the Hits (column 1) sibling of *item*."""
-        parent = item.parent()
-        if parent is None:
-            return self.search_results_model.item(item.row(), 1)
-        return parent.child(item.row(), 1)
-
-    def _search_add_hit(self, filename: str, offset: int, context: str):
-        """Insert one hit into the fully-nested path tree.
-
-        Every path segment becomes its own folder node so the tree mirrors the
-        real directory hierarchy.  GUID segments are replaced with bundle IDs.
-        Each folder node's Hits column accumulates all hits beneath it.
-        Full display paths are stored as Qt.UserRole data for the status bar."""
-        _PATH_ROLE = Qt.ItemDataRole.UserRole
-
-        folder   = filename.rsplit('/', 1)[0] if '/' in filename else ''
-        basename = filename.rsplit('/', 1)[-1]
-
-        # Build the clean display path (GUIDs → bundle IDs, archive prefix stripped)
-        display_folder   = self._strip_archive_prefix(self._display_path(folder))
-        display_basename = self._display_name(basename)
-        full_file_path   = (display_folder + '/' + display_basename) if display_folder else display_basename
-
-        # ── Folder nodes — one per path segment ──────────────────────────────
-        segments = display_folder.split('/') if display_folder else []
-        parent   = self.search_results_model.invisibleRootItem()
-        cumulative = ''
-        ancestor_hits_cells: list[QStandardItem] = []
-
-        for seg in segments:
-            cumulative = (cumulative + '/' + seg) if cumulative else seg
-            if cumulative not in self._search_folder_items:
-                folder_item = QStandardItem(f'📁  {seg}/')
-                folder_item.setEditable(False)
-                folder_item.setData(cumulative + '/', _PATH_ROLE)
-                hits_item = QStandardItem('0')
-                hits_item.setEditable(False)
-                row = [folder_item, hits_item, QStandardItem(''), QStandardItem('')]
-                for cell in row:
-                    cell.setEditable(False)
-                parent.appendRow(row)
-                self._search_folder_items[cumulative] = folder_item
-            folder_item = self._search_folder_items[cumulative]
-            ancestor_hits_cells.append(self._hits_cell_for(folder_item))
-            parent = folder_item
-
-        # ── File node ─────────────────────────────────────────────────────────
-        if filename not in self._search_file_items:
-            file_item = QStandardItem(f'📄  {display_basename}')
-            file_item.setEditable(False)
-            file_item.setData(full_file_path, _PATH_ROLE)
-            file_item.setData(filename, Qt.ItemDataRole.UserRole + 2)   # physical zip path
-            file_hits = QStandardItem('0')
-            file_hits.setEditable(False)
-            row = [file_item, file_hits, QStandardItem(''), QStandardItem('')]
-            for cell in row:
-                cell.setEditable(False)
-            parent.appendRow(row)
-            self._search_file_items[filename] = file_item
-        file_item = self._search_file_items[filename]
-
-        # ── Hit node  (cols: Name | Hits | Context | Offset) ─────────────────
-        hit_item = QStandardItem('')
-        hit_item.setData(full_file_path, _PATH_ROLE)
-        hit_item.setData(offset, Qt.ItemDataRole.UserRole + 1)
-        hit_item.setData(filename, Qt.ItemDataRole.UserRole + 2)         # physical zip path
-        hit_row = [hit_item, QStandardItem(''), QStandardItem(context), QStandardItem(str(offset))]
-        for cell in hit_row:
-            cell.setEditable(False)
-        file_item.appendRow(hit_row)
-
-        # ── Increment hit counts: file node + every ancestor folder ──────────
-        for hits_cell in [self._hits_cell_for(file_item)] + ancestor_hits_cells:
-            if hits_cell:
-                hits_cell.setText(str(int(hits_cell.text()) + 1))
-
-    def _open_hex_from_search(self, physical_path: str, display_label: str,
-                               jump_to: int | None, keyword: str):
-        """Load *physical_path* into the hex viewer.
-        If *jump_to* is given, only the window around that offset is read so
-        that very large files never freeze the UI.  Scrolling backward/forward
-        from the hit loads more data on demand."""
-        if self._hex_worker is not None and self._hex_worker.isRunning():
-            self._hex_worker.terminate()
-            self._hex_worker.wait()
-
-        self._hex_entry        = None
-        self._hex_file_size    = 0
-        self._hex_bytes_loaded = 0
-        self._hex_view_start   = 0
-        self._hex_ui_path      = display_label
-        self._pending_hex_jump = (jump_to, keyword) if jump_to is not None else None
-
-        self.hex_view.clear()
-        self.hex_progress_bar.hide()
-
-        try:
-            if self._streaming_index is not None:
-                entry = self._streaming_index.get_entry(physical_path)
-            else:
-                zinfo = self._get_zip_handle().getinfo(physical_path)
-                entry = ZipEntry(self.zip_path, physical_path, zinfo)
-        except Exception as e:
-            self._on_hex_error(str(e))
-            return
-
-        self._hex_file_size = entry.file_size
-
-        if entry.is_stored:
-            self._hex_entry = entry
-            if jump_to is not None:
-                # Windowed load: only read a small region around the hit
-                kw_len    = len(keyword.encode('utf-8', errors='replace')) if keyword else 0
-                win_start = max(0, ((jump_to - 10) // 32) * 32)
-                win_end   = ((jump_to + kw_len + HIT_WINDOW_AFTER + 31) // 32) * 32
-                if self._hex_file_size > 0:
-                    win_end = min(win_end, self._hex_file_size)
-                try:
-                    chunk = entry.read_at(win_start, win_end - win_start)
-                except Exception as e:
-                    self._on_hex_error(str(e))
-                    return
-                self._hex_view_start = win_start
-            else:
-                try:
-                    chunk = entry.read(min(INITIAL_HEX_BYTES, self._hex_file_size or INITIAL_HEX_BYTES))
-                except Exception as e:
-                    self._on_hex_error(str(e))
-                    return
-                self._hex_view_start = 0
-            self._hex_bytes_loaded = len(chunk)
-            self.hex_view.setPlainText(self._render_hex(chunk, self._hex_view_start))
-            self._fit_hex_font()
-            self._update_hex_label()
-            if jump_to is not None:
-                QTimer.singleShot(0, lambda jt=jump_to, kw=keyword: self._jump_to_hex_offset(jt, kw))
-        else:
-            # Compressed — worker loads the full file; jump fires in _on_hex_ready
-            self.hex_label.setText(f"Loading: {display_label}")
-            self.hex_progress_bar.setRange(0, max(self._hex_file_size, 1))
-            self.hex_progress_bar.setValue(0)
-            self.hex_progress_bar.show()
-            self._hex_worker = HexLoadWorker(entry)
-            self._hex_worker.progress.connect(self._on_hex_progress)
-            self._hex_worker.load_complete.connect(self._on_hex_ready)
-            self._hex_worker.error.connect(self._on_hex_error)
-            self._hex_worker.start()
-
-    def _jump_to_hex_offset(self, offset: int, keyword: str):
-        """Scroll the hex view so *offset* is visible, then highlight the keyword."""
-        self._pending_hex_jump = None
-        line  = (offset - self._hex_view_start) // _HEX_BYTES_PER_ROW
-        doc   = self.hex_view.document()
-        block = doc.findBlockByLineNumber(line)
-        if block.isValid():
-            cursor = QTextCursor(block)
-            self.hex_view.setTextCursor(cursor)
-            self.hex_view.ensureCursorVisible()
-            # nudge the view up so the hit isn't right at the bottom edge
-            sb = self.hex_view.verticalScrollBar()
-            visible = self.hex_view.viewport().height() // max(
-                1, self.hex_view.fontMetrics().lineSpacing())
-            sb.setValue(max(0, sb.value() - visible // 3))
-        if keyword:
-            kw_bytes = keyword.encode('utf-8', errors='replace')
-            self._highlight_hex_range(offset, len(kw_bytes))
-
-    def _highlight_hex_range(self, start_offset: int, length: int):
-        """Highlight *length* bytes at *start_offset* in both the hex and ASCII columns."""
-        doc    = self.hex_view.document()
-        hl_fmt = QTextCharFormat()
-        hl_fmt.setBackground(QColor(255, 235, 0, 210))   # yellow highlight
-
-        view_end   = self._hex_view_start + self._hex_bytes_loaded
-        extra_sels = []
-        for i in range(min(length, MAX_HEX_HIGHLIGHT_BYTES)):
-            byte_pos = start_offset + i
-            if byte_pos < self._hex_view_start or byte_pos >= view_end:
-                break
-            line  = (byte_pos - self._hex_view_start) // _HEX_BYTES_PER_ROW
-            b     = byte_pos % _HEX_BYTES_PER_ROW
-            block = doc.findBlockByLineNumber(line)
-            if not block.isValid():
-                break
-            bpos  = block.position()
-            blen  = len(block.text())
-            hex_col   = _HEX_OFFSET_COLS + (b // 4) * _HEX_GROUP_STRIDE + (b % 4) * 3
-            ascii_col = _HEX_ASCII_START + b
-            for col, width in ((hex_col, 2), (ascii_col, 1)):
-                if col + width > blen:
-                    continue
-                es = QTextEdit.ExtraSelection()
-                es.format = hl_fmt
-                tc = QTextCursor(doc)
-                tc.setPosition(bpos + col)
-                tc.setPosition(bpos + col + width, QTextCursor.MoveMode.KeepAnchor)
-                es.cursor = tc
-                extra_sels.append(es)
-
-        self.hex_view.setExtraSelections(extra_sels)
-
-    def _on_search_tree_expanded(self):
-        """Resize all columns to content whenever a node is expanded."""
-        for col in range(self.search_results_model.columnCount()):
-            self.search_results_view.resizeColumnToContents(col)
-
-    def _update_search_status_bar(self):
-        """Sync the status bar to the current search state."""
-        if self.center_tabs.currentIndex() != 2:
-            return
-        term = self.search_field.text().strip()
-        if not term:
-            self.status_bar.showMessage("Keyword Search")
-            return
-        n_files = len(self._search_file_items)
-        if self._search_worker and self._search_worker.isRunning():
-            self.status_bar.showMessage(
-                f"Searching: '{term}'  |  hits in {n_files:,} file{'s' if n_files != 1 else ''} so far")
-        else:
-            if n_files:
-                self.status_bar.showMessage(
-                    f"Search: '{term}'  |  hits in {n_files:,} file{'s' if n_files != 1 else ''}")
-            else:
-                self.status_bar.showMessage(f"Search: '{term}'  |  No results")
-
-    def _on_search_recent_selected(self, index):
-        if index == 0:
-            return
-        term = self.search_recent_combo.itemText(index)
-        self.search_field.setText(term)
-        # Load from DB if cached, otherwise run a fresh search
-        if self._load_search_from_db(term):
-            self._update_search_status_bar()
-            return
-        self._start_keyword_search()
-
-    def _save_recent_search(self, term: str):
-        db = self._open_case_db_conn()
-        if db:
-            try:
-                db.execute(
-                    'INSERT INTO recent_searches (term, used_at) VALUES (?, strftime(\'%s\',\'now\'))'
-                    ' ON CONFLICT(term) DO UPDATE SET used_at=excluded.used_at',
-                    (term,)
-                )
-                db.commit()
-                rows = db.execute(
-                    'SELECT term FROM recent_searches ORDER BY used_at DESC LIMIT 20'
-                ).fetchall()
-                self._recent_searches = [r[0] for r in rows]
-            finally:
-                db.close()
-        self._refresh_search_recent_combo()
-
-    def _load_recent_searches_from_db(self):
-        """Reload the recent-searches list from the current case DB."""
-        db = self._open_case_db_conn()
-        if db:
-            try:
-                rows = db.execute(
-                    'SELECT term FROM recent_searches ORDER BY used_at DESC LIMIT 20'
-                ).fetchall()
-                self._recent_searches = [r[0] for r in rows]
-            finally:
-                db.close()
-        else:
-            self._recent_searches = []
-        self._refresh_search_recent_combo()
-
-    def _open_case_db_conn(self) -> sqlite3.Connection | None:
-        """Open casedata.db for the current archive, or None if not available."""
-        if not self._case_dir:
-            return None
-        try:
-            return _open_case_db(self._case_dir)
-        except OSError:
-            return None
-
-    def _load_search_from_db(self, term: str) -> bool:
-        """Populate the results table from the DB for *term*.
-        Returns True if cached results were found, False otherwise."""
-        db = self._open_case_db_conn()
-        if db is None:
-            return False
-        try:
-            rows = db.execute(
-                'SELECT filename, offset, context FROM search_results '
-                'WHERE zip_path=? AND keyword=? ORDER BY rowid',
-                (self.zip_path, term)
-            ).fetchall()
-        finally:
-            db.close()
-        if not rows:
-            return False
-        self.search_results_model.clear()
-        self.search_results_model.setHorizontalHeaderLabels(
-            ["Name", "Hits", "Context", "Offset"])
-        self._search_folder_items.clear()
-        self._search_file_items.clear()
-        for filename, offset, context in rows:
-            self._search_add_hit(filename, offset, context)
-        total = len(rows)
-        self.search_status.setText(
-            f"'{term}' — {total:,} hit{'s' if total != 1 else ''} (loaded from cache)")
-        return True
-
-    def _start_keyword_search(self):
-        term = self.search_field.text().strip()
-        if not term or not self.zip_path:
-            return
-        self._stop_keyword_search()
-        self.search_results_model.clear()
-        self.search_results_model.setHorizontalHeaderLabels(
-            ["Name", "Hits", "Context", "Offset"])
-        self._search_folder_items.clear()
-        self._search_file_items.clear()
-        self._save_recent_search(term)
-        # Clear any stale cached results for this term so they get re-saved fresh
-        db = self._open_case_db_conn()
-        if db:
-            try:
-                db.execute('DELETE FROM search_results WHERE zip_path=? AND keyword=?',
-                           (self.zip_path, term))
-                db.commit()
-            finally:
-                db.close()
-        scope = self.search_scope_combo.currentData()
-        # If we have a cached index, apply the scope filter immediately so the
-        # worker skips the build step entirely.  Otherwise pass None and let
-        # the worker build the full index first; the scope filter is applied
-        # after the build inside the worker (see below).
-        if self._search_entries is not None and scope == "app_data":
-            scoped_entries = [e for e in self._search_entries
-                              if "mobile/Containers" in e[0]]
-        elif self._search_entries is not None:
-            scoped_entries = self._search_entries
-        else:
-            scoped_entries = None   # worker will build the full index
-
-        scope_label = "App Data" if scope == "app_data" else "all files"
-        self.search_status.setText(f"Searching {scope_label} for '{term}'…")
-        self.search_btn.setEnabled(False)
-        self.search_stop_btn.setEnabled(True)
-
-        # Create and show the modal progress dialog
-        self._search_progress_dlg = SearchProgressDialog(term, parent=self)
-        self._search_progress_dlg.cancelled.connect(self._cancel_keyword_search)
-
-        self._search_worker = KeywordSearchWorker(
-            self.zip_path, term,
-            streaming_index=self._streaming_index,
-            entries=scoped_entries,
-            scope=scope)
-        self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
-        self._search_worker.result_found.connect(self._on_search_result)
-        self._search_worker.progress.connect(self._on_search_progress)
-        self._search_worker.finished.connect(self._on_search_finished)
-        self._search_worker.start()
-
-        self._search_progress_dlg.exec()   # blocks until dialog is closed
-
-    def _cancel_keyword_search(self):
-        """Stop the running worker; keep existing hits for review."""
-        if self._search_worker and self._search_worker.isRunning():
-            self._search_worker.stop()
-            # Don't wait here — _on_search_finished will fire and close the dialog
-
-    def _stop_keyword_search(self):
-        if self._search_worker and self._search_worker.isRunning():
-            self._search_worker.stop()
-            self._search_worker.wait()
-        self.search_btn.setEnabled(True)
-        self.search_stop_btn.setEnabled(False)
-
-    def _on_search_result(self, name: str, offset: int, context: str):
-        self._search_add_hit(name, offset, context)
-        # Persist hit to DB
-        db = self._open_case_db_conn()
-        if db:
-            try:
-                term = self.search_field.text().strip()
-                db.execute(
-                    'INSERT INTO search_results (zip_path, keyword, filename, offset, context) '
-                    'VALUES (?,?,?,?,?)',
-                    (self.zip_path, term, name, offset, context)
-                )
-                db.commit()
-            finally:
-                db.close()
-
-    def _on_search_progress(self, done: int, total: int):
-        hits = len(self._search_file_items)
-        self.search_status.setText(
-            f"Searching… {done:,}/{total:,} files  |  hits in {hits:,} file{'s' if hits != 1 else ''} so far")
-        self._update_search_status_bar()
-        if self._search_progress_dlg:
-            self._search_progress_dlg.update_progress(done, total, hits)
-
-    def _on_search_finished(self, total_hits: int):
-        if self._search_entries is None and self._search_worker is not None:
-            self._search_entries = self._search_worker.entries or None
-        self.search_btn.setEnabled(True)
-        self.search_stop_btn.setEnabled(False)
-        term    = self.search_field.text().strip()
-        n_files = len(self._search_file_items)
-        dlg = self._search_progress_dlg
-        if dlg:
-            if dlg.was_interrupted:
-                dlg.mark_interrupted(n_files)
-                self.search_status.setText(
-                    f"'{term}' — partial search, interrupted  "
-                    f"({n_files:,} file{'s' if n_files != 1 else ''} with hits)")
-            else:
-                dlg.mark_finished(n_files, total_hits)
-                self.search_status.setText(
-                    f"'{term}' — hits in {n_files:,} file{'s' if n_files != 1 else ''} across archive")
-        else:
-            self.search_status.setText(
-                f"'{term}' — hits in {n_files:,} file{'s' if n_files != 1 else ''} across archive")
-        self._update_search_status_bar()
-        for col in range(self.search_results_model.columnCount()):
-            self.search_results_view.resizeColumnToContents(col)
+def _qt_message_handler(msg_type, context, message):
+    if "qt.text.font.db" in (context.category or "") and "OpenType support missing" in message:
+        return
+    if msg_type == QtMsgType.QtWarningMsg:
+        print(f"Qt warning: {message}", file=sys.stderr)
+    elif msg_type in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+        print(f"Qt error: {message}", file=sys.stderr)
 
 if __name__ == "__main__":
+    qInstallMessageHandler(_qt_message_handler)
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
     window = FastZipBrowser()

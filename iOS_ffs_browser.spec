@@ -12,7 +12,6 @@ a = Analysis(
     binaries=[],
     datas=[
         # Bundle config JSON files under config/ next to the exe
-        ('config/forensic_settings.json', 'config'),
         ('config/hardware_models.json', 'config'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),

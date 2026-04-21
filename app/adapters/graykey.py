@@ -9,6 +9,9 @@
 graykey.py — extract metadata from a Graykey full_files zip into a
 Cellebrite-compatible structure, optionally saved as msgpack.
 
+Also used for Android zips that carry UT/UX extra fields but no GrayKey
+block (e.g. Cellebrite Android FFS) via extract_with_prefix().
+
 Schema (keyed by full entry path, no leading slash):
     {
         "path/to/entry": {
@@ -32,6 +35,7 @@ Dependency: msgpack
 
 import zipfile
 from pathlib import Path
+import struct
 from struct import Struct, error as StructError
 
 import msgpack
@@ -98,10 +102,14 @@ def _parse_xattrs(extra: bytes, off: int) -> dict:
 def _parse_entry(f: zipfile.ZipInfo) -> dict:
     extra = f.extra
 
-    # Timestamps from UT block: flags(1B) mtime atime ctime btime (each 4B)
+    # Timestamps from UT block: flags(1B) mtime atime ctime [btime] (each 4B)
+    # iOS GrayKey includes btime (17 bytes); Android GrayKey omits it (13 bytes).
     ut = _find_block(extra, _TAG_UT)
-    if ut is not None:
+    if ut is not None and len(ut) >= 17:
         _, mtime, atime, ctime, btime = _unpack_date_data(ut)
+    elif ut is not None and len(ut) >= 13:
+        _, mtime, atime, ctime = struct.unpack_from('<B3I', ut)
+        btime = mtime
     else:
         mtime = atime = ctime = btime = 0
 
@@ -148,6 +156,14 @@ def _parse_entry(f: zipfile.ZipInfo) -> dict:
     }
 
 
+def _has_ut_extras(z: zipfile.ZipFile) -> bool:
+    """Return True if the first entries carry UT extra-field blocks (Unix timestamps)."""
+    for info in z.infolist()[:20]:
+        if _find_block(info.extra, _TAG_UT) is not None:
+            return True
+    return False
+
+
 def extract(zip_path: str) -> dict:
     """
     Parse a Graykey full_files zip. Returns a Cellebrite-compatible metadata
@@ -166,6 +182,25 @@ def extract(zip_path: str) -> dict:
             f.filename.rstrip('/'): _parse_entry(f)
             for f in z.infolist()
         }
+
+
+def extract_with_prefix(zip_path: str, strip_prefix: str) -> dict:
+    """
+    Parse a zip whose entries carry UT/UX extra fields but no GrayKey block.
+    Strips *strip_prefix* (e.g. 'Dump/') from entry names to produce ui_paths.
+    Returns a Cellebrite-compatible metadata dict.
+    """
+    slash = strip_prefix if strip_prefix.endswith('/') else strip_prefix + '/'
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        result = {}
+        for f in z.infolist():
+            name = f.filename.rstrip('/')
+            if name.startswith(slash):
+                name = name[len(slash):]
+            elif name == strip_prefix.rstrip('/'):
+                continue  # the prefix dir itself — skip
+            result[name] = _parse_entry(f)
+        return result
 
 
 def save(metadata: dict, out_path: str) -> None:

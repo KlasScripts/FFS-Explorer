@@ -4,6 +4,7 @@ import re
 import time
 import zipfile
 import json
+import struct
 import plistlib
 import pathlib
 import subprocess
@@ -25,7 +26,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QComboBox, QSplitter, QStatusBar,
                               QLineEdit, QLabel,
                               QTabWidget, QSizePolicy,
-                              QStyle, QMessageBox)
+                              QStyle, QMessageBox, QCheckBox)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
@@ -214,6 +215,31 @@ def _load_json_file(path, default):
 _HW_BOARD_NAMES: dict = _load_json_file(resource_path(HARDWARE_MODELS_FILE), {})
 
 
+def _read_text_from_zip(z, *candidates) -> str:
+    """Return the text content of the first matching candidate path, or ''."""
+    names = frozenset(z.namelist())
+    for path in candidates:
+        if path in names:
+            try:
+                return z.open(path).read().decode('utf-8', errors='replace')
+            except Exception:
+                pass
+    return ''
+
+
+def _parse_build_prop(content: str) -> dict:
+    """Parse an Android build.prop file and return a key→value dict."""
+    props = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' in line:
+            k, _, v = line.partition('=')
+            props[k.strip()] = v.strip()
+    return props
+
+
 def _read_plist_from_zip(z: zipfile.ZipFile, *candidates) -> dict:
     """Try each candidate path in the zip and return the first successfully
     parsed plist as a dict, or {} if none found."""
@@ -302,8 +328,47 @@ def _read_device_info(zip_path: str) -> dict:
             else:
                 label = ''
 
-            return {'make': make, 'model': model, 'ios_version': ios_version,
-                    'hw_id': hw_id, 'label': label}
+            if label:
+                return {'make': make, 'model': model, 'ios_version': ios_version,
+                        'hw_id': hw_id, 'label': label}
+
+            # ── Android fallback: read build.prop ─────────────────────────────
+            # Merge all available build.prop files — vendor overrides system for
+            # product info, system is the authority for version.
+            bp: dict = {}
+            for prop_file in ('system/build.prop', 'vendor/build.prop', 'product/build.prop'):
+                content = _read_text_from_zip(z, *adapter.system_candidates(prop_file))
+                if content:
+                    for k, v in _parse_build_prop(content).items():
+                        if v:  # never overwrite an existing value with an empty one
+                            bp[k] = v
+            if bp:
+                raw_model = (bp.get('ro.product.model')
+                             or bp.get('ro.product.vendor.model')
+                             or bp.get('ro.product.system.model', ''))
+                android_version = (bp.get('ro.build.version.release')
+                                   or bp.get('ro.vendor.build.version.release', ''))
+                hw_entry = _HW_BOARD_NAMES.get(raw_model)
+                if hw_entry:
+                    make, model = hw_entry[0], hw_entry[1]
+                else:
+                    make = (bp.get('ro.product.manufacturer')
+                            or bp.get('ro.product.vendor.manufacturer')
+                            or bp.get('ro.product.system.manufacturer')
+                            or bp.get('ro.product.brand')
+                            or bp.get('ro.product.system.brand', '')).title()
+                    model = raw_model
+                model_name = f'{make} {model}'.strip()
+                if model_name and android_version:
+                    label = f'{model_name} · Android {android_version}'
+                elif android_version:
+                    label = f'Android {android_version}'
+                elif model_name:
+                    label = model_name
+                return {'make': make, 'model': model, 'ios_version': android_version,
+                        'hw_id': '', 'label': label}
+
+            return empty
     except Exception:
         return empty
 
@@ -576,6 +641,8 @@ class ZipMetadataWorker(QThread):
                     adapter = FfsAdapter.detect(z)
                     if adapter.format == FfsAdapter.FORMAT_GRAYKEY:
                         self.status_update.emit("Graykey archive detected — extracting metadata...")
+                    elif adapter.format == FfsAdapter.FORMAT_ZIP_EXTRAS:
+                        self.status_update.emit("Android zip extras archive detected — extracting metadata...")
                     else:
                         self.status_update.emit("Reading metadata.msgpack...")
                     raw_data = adapter.load_metadata(self.zip_path, z)
@@ -743,6 +810,8 @@ class FileTableModel(QAbstractTableModel):
         self._filter_gen = 0  # bump to cancel an in-flight filter
         self._sort_col: int = -1
         self._sort_order: Qt.SortOrder = Qt.SortOrder.AscendingOrder
+        self._show_files   = True
+        self._show_folders = True
 
     # ── required overrides ──────────────────────────────────────────────────
 
@@ -778,15 +847,17 @@ class FileTableModel(QAbstractTableModel):
     # ── bulk mutation ────────────────────────────────────────────────────────
 
     def append_rows_batch(self, rows):
-        """Append rows to both _all_rows and _rows (no active filter)."""
+        """Append rows to _all_rows; only add to _rows those passing the type filter."""
         if not rows:
             return
-        first = len(self._rows)
-        last  = first + len(rows) - 1
-        self.beginInsertRows(QModelIndex(), first, last)
         self._all_rows.extend(rows)
-        self._rows.extend(rows)
-        self.endInsertRows()
+        visible = [r for r in rows if (self._show_folders if r[2] >= 0 else self._show_files)]
+        if visible:
+            first = len(self._rows)
+            last  = first + len(visible) - 1
+            self.beginInsertRows(QModelIndex(), first, last)
+            self._rows.extend(visible)
+            self.endInsertRows()
 
     # ── filtering ────────────────────────────────────────────────────────────
 
@@ -805,12 +876,19 @@ class FileTableModel(QAbstractTableModel):
         self._rows = []
         self.endResetModel()
 
+        show_files   = self._show_files
+        show_folders = self._show_folders
+
+        def _type_ok(r):
+            is_folder = r[2] >= 0  # fc == -1 for files, >= 0 for folders
+            return (show_folders if is_folder else show_files)
+
         if not needle:
-            # No filter — restore all rows in one shot
-            self.beginInsertRows(QModelIndex(), 0, total - 1)
-            self._rows = list(self._all_rows)
+            visible = [r for r in self._all_rows if _type_ok(r)]
+            self.beginInsertRows(QModelIndex(), 0, len(visible) - 1)
+            self._rows = visible
             self.endInsertRows()
-            self.filter_done.emit(total, total)
+            self.filter_done.emit(len(visible), total)
             return
 
         source = self._all_rows
@@ -822,7 +900,7 @@ class FileTableModel(QAbstractTableModel):
             end = min(idx[0] + _FILTER_CHUNK, total)
             matched = [
                 r for r in source[idx[0]:end]
-                if any(r[0][c].lower().find(needle) != -1
+                if _type_ok(r) and any(r[0][c].lower().find(needle) != -1
                        for c in check_cols if c < len(r[0]))
             ]
             if matched:
@@ -839,6 +917,11 @@ class FileTableModel(QAbstractTableModel):
                 self.filter_done.emit(len(self._rows), total)
 
         QTimer.singleShot(0, _chunk)
+
+    def set_type_filter(self, show_files: bool, show_folders: bool, current_text: str, current_col: int):
+        self._show_files   = show_files
+        self._show_folders = show_folders
+        self.set_filter(current_text, current_col)
 
     # ── sorting ──────────────────────────────────────────────────────────────
 
@@ -1100,6 +1183,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._streaming_index: StreamingZipIndex | None = None
         self._hex_worker: QThread | None = None
         self._adapter = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, "filesystem2", "filesystem1")
+        self._android_user_data_path = ''   # set at load time for Android archives
         # ffs_archives: ordered list of {"path": ..., "case_dir": ..., "label": ...}, most-recent first
         self._ffs_archives: list = _load_json_file(FFS_ARCHIVES_FILE, [])
         self.recent_paths: list = [e['path'] for e in self._ffs_archives if 'path' in e]
@@ -1234,7 +1318,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         filter_bar = QHBoxLayout()
         filter_bar.setContentsMargins(0, 2, 0, 2)
+        self.show_files_cb = QCheckBox("Files")
+        self.show_files_cb.setChecked(True)
+        self.show_folders_cb = QCheckBox("Folders")
+        self.show_folders_cb.setChecked(True)
+        self.show_files_cb.stateChanged.connect(self._on_type_filter_changed)
+        self.show_folders_cb.stateChanged.connect(self._on_type_filter_changed)
         filter_bar.addWidget(QLabel("Filter:"))
+        filter_bar.addSpacing(4)
+        filter_bar.addWidget(self.show_files_cb)
+        filter_bar.addSpacing(8)
+        filter_bar.addWidget(self.show_folders_cb)
+        filter_bar.addSpacing(6)
         self.filter_col_combo = QComboBox()
         self.filter_col_combo.setMaximumWidth(140)
         self._update_filter_columns(self.file_headers)
@@ -1321,6 +1416,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _set_file_model(self, model):
         """Set the file model, connect its filter signals, and update the proxy."""
+        if hasattr(self, 'file_model'):
+            model._show_files   = self.file_model._show_files
+            model._show_folders = self.file_model._show_folders
         self.file_model = model
         self.proxy_model.setSourceModel(model)
         model.filter_progress.connect(self._on_filter_progress)
@@ -1338,6 +1436,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         text = self.filter_input.text()
         if text:
             self._log(f"Filter applied: \"{text}\" in {col_name} — {visible:,} of {total:,} rows visible")
+
+    def _on_type_filter_changed(self):
+        col = self.filter_col_combo.currentIndex() - 1
+        text = self.filter_input.text()
+        self.file_model.set_type_filter(
+            self.show_files_cb.isChecked(),
+            self.show_folders_cb.isChecked(),
+            text, col,
+        )
 
     def _apply_filter(self):
         col = self.filter_col_combo.currentIndex() - 1  # index 0 = "All Columns" → -1
@@ -1969,9 +2076,53 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._hide_empty_folders = action.isChecked()
             self.reload_tree_entirely()
 
+    def _detect_android_user_data(self, folder_map: dict) -> str:
+        """Return the parent path of the DCIM folder, or '' if not found."""
+        for path in folder_map:
+            if path == 'DCIM' or path.endswith('/DCIM'):
+                return path.rsplit('/DCIM', 1)[0] if '/' in path else ''
+        return ''
+
+    def _is_android_archive(self) -> bool:
+        fmt = self._adapter.format
+        if fmt == FfsAdapter.FORMAT_ZIP_EXTRAS:
+            return True
+        if fmt == FfsAdapter.FORMAT_GRAYKEY:
+            return 'data/data' in self.folder_map or bool(self._android_user_data_path)
+        return False
+
+    def _android_shortcuts(self) -> list:
+        user_data = self._android_user_data_path or 'data/media/0'
+        return [
+            ("App Data",        "data/data"),
+            ("User Data",       user_data),
+            None,
+            ("Media", [
+                ("Photos (DCIM)",    user_data + "/DCIM"),
+                ("Downloads",        user_data + "/Download"),
+                ("Screenshots",      user_data + "/DCIM/Screenshots"),
+            ]),
+            ("Communications", [
+                ("SMS / MMS",        "data/data/com.android.providers.telephony/databases"),
+                ("Call History",     "data/data/com.android.providers.contacts/databases"),
+                ("Contacts",         "data/data/com.android.providers.contacts/databases"),
+            ]),
+            ("Browsing & Web", [
+                ("Chrome",           "data/data/com.android.chrome/app_chrome/Default"),
+                ("Samsung Browser",  "data/data/com.sec.android.app.sbrowser/databases"),
+            ]),
+            ("System & Device", [
+                ("Accounts",         "data/system_ce/0/accounts_ce.db"),
+                ("Device Logs",      "data/tombstones"),
+                ("Settings DB",      "data/data/com.android.providers.settings/databases"),
+                ("Location History", "data/data/com.google.android.gms/files/locationhistory"),
+            ]),
+        ]
+
     def _show_jump_menu(self):
         menu = QMenu(self)
-        self._build_jump_menu(menu, FORENSIC_SHORTCUTS)
+        shortcuts = self._android_shortcuts() if self._is_android_archive() else FORENSIC_SHORTCUTS
+        self._build_jump_menu(menu, shortcuts)
         menu.exec(self.jump_btn.mapToGlobal(self.jump_btn.rect().bottomLeft()))
 
     def _adapt_shortcut_path(self, path: str) -> str:
@@ -2083,6 +2234,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.guid_to_bundle = guid_map
         self.zip_names = zip_names
         self._adapter = adapter
+        self._android_user_data_path = self._detect_android_user_data(folder_map)
         self._missing_plist_paths = set(missing_plist_paths)
         self._real_content_cache = content_cache
         self._zip_ui_paths = zip_ui_paths

@@ -93,11 +93,12 @@ class FfsAdapter:
 
     FORMAT_GRAYKEY    = "graykey"
     FORMAT_CELLEBRITE = "cellebrite"
+    FORMAT_ZIP_EXTRAS = "zip_extras"   # Android zip with UT/UX extra fields, no msgpack
 
     def __init__(self, fmt: str, user_prefix: str, sys_prefix: str,
                  old_layout: bool = False) -> None:
         self.format      = fmt
-        self.user_prefix = user_prefix   # e.g. 'filesystem2' or 'filesystem1'
+        self.user_prefix = user_prefix   # e.g. 'filesystem2', 'private/var', or 'Dump'
         self.sys_prefix  = sys_prefix    # e.g. 'filesystem1' (Cellebrite only)
         self.old_layout  = old_layout    # True = old Cellebrite: keys include private/var/
 
@@ -108,7 +109,10 @@ class FfsAdapter:
         """Inspect an open ZipFile and return the matching adapter."""
         if _gk._is_graykey(z):
             return cls(cls.FORMAT_GRAYKEY, "private/var", "")
-        return cls.detect_from_names(frozenset(z.namelist()))
+        names = frozenset(z.namelist())
+        if any(n.startswith("Dump/") for n in names) and _gk._has_ut_extras(z):
+            return cls(cls.FORMAT_ZIP_EXTRAS, "Dump", "")
+        return cls.detect_from_names(names)
 
     @classmethod
     def detect_from_names(cls, zip_names: frozenset) -> "FfsAdapter":
@@ -137,6 +141,9 @@ class FfsAdapter:
         """
         if self.format == self.FORMAT_GRAYKEY:
             return "/" + ui_path
+
+        if self.format == self.FORMAT_ZIP_EXTRAS:
+            return f"{self.user_prefix}/{ui_path}"
 
         # Fast path: no '-' means no GUID segments (covers ~90% of paths)
         if '-' not in ui_path:
@@ -176,6 +183,10 @@ class FfsAdapter:
                 candidates.append(f"/private/var/{s}")
                 candidates.append(s)
                 candidates.append(f"/{s}")
+        elif self.format == self.FORMAT_ZIP_EXTRAS:
+            for s in suffixes:
+                candidates.append(f"{self.user_prefix}/{s}")
+                candidates.append(s)
         elif self.old_layout:
             for s in suffixes:
                 candidates.append(f"{self.user_prefix}/private/var/{s}")
@@ -194,7 +205,11 @@ class FfsAdapter:
         GrayKey extractions do not have a separate system-partition prefix so
         bare and leading-slash paths are tried directly."""
         candidates: list[str] = []
-        if self.format == self.FORMAT_GRAYKEY:
+        if self.format == self.FORMAT_ZIP_EXTRAS:
+            for s in suffixes:
+                candidates.append(f"{self.user_prefix}/{s}")
+                candidates.append(s)
+        elif self.format == self.FORMAT_GRAYKEY:
             for s in suffixes:
                 candidates.append(s)
                 candidates.append(f"/{s}")
@@ -217,6 +232,8 @@ class FfsAdapter:
         if self.format == self.FORMAT_GRAYKEY:
             raw = _gk.extract_metadata(zip_path)
             return {k.lstrip("/"): v for k, v in raw.items()}
+        if self.format == self.FORMAT_ZIP_EXTRAS:
+            return _gk.extract_with_prefix(zip_path, self.user_prefix)
         else:
             for candidate in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
                 try:

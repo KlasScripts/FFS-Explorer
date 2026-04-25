@@ -47,16 +47,14 @@ _TAG_IN     = 0x4e49   # Inode number    — inode(Q) + devID(L) + ...
 _TAG_GK     = 0x4b47   # Graykey block (newer)  — tag bytes b'GK'
 _TAG_GK_OLD = 0x0004   # Graykey block (older)  — original format tag
 
-_ST_TLV       = Struct('<HH')   # block tag + length
-_ST_DATE_DATA = Struct('<B4I')  # UT data: flags mtime atime ctime btime
-_ST_U32       = Struct('<I')    # single uint32 (xattr count / length)
+_ST_TLV = Struct('<HH')   # block tag + length
+_ST_U32 = Struct('<I')    # single uint32 (xattr count / length)
 
 _S_TO_NS = 1_000_000_000
 
 # Bind unpack_from methods to locals — avoids attribute lookup per call
-_unpack_tlv       = _ST_TLV.unpack_from
-_unpack_date_data = _ST_DATE_DATA.unpack_from
-_unpack_u32       = _ST_U32.unpack_from
+_unpack_tlv = _ST_TLV.unpack_from
+_unpack_u32 = _ST_U32.unpack_from
 
 
 def _find_block(extra: bytes, tag: int) -> bytes | None:
@@ -99,19 +97,39 @@ def _parse_xattrs(extra: bytes, off: int) -> dict:
     return xattrs
 
 
-def _parse_entry(f: zipfile.ZipInfo) -> dict:
-    extra = f.extra
+def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
+    if extra is None:
+        extra = f.extra
 
-    # Timestamps from UT block: flags(1B) mtime atime ctime [btime] (each 4B)
-    # iOS GrayKey includes btime (17 bytes); Android GrayKey omits it (13 bytes).
+    # UT block: flags(1B) then up to 4 × uint32 timestamps, each present only
+    # if the corresponding flag bit is set.  The central-directory copy of UT
+    # only carries flags + mtime (5 bytes); the local-file-header copy carries
+    # all timestamps that are flagged.  We parse flag-by-flag so both forms work.
     ut = _find_block(extra, _TAG_UT)
-    if ut is not None and len(ut) >= 17:
-        _, mtime, atime, ctime, btime = _unpack_date_data(ut)
-    elif ut is not None and len(ut) >= 13:
-        _, mtime, atime, ctime = struct.unpack_from('<B3I', ut)
-        btime = mtime
+    mtime = atime = ctime = btime = 0
+    has_ut = ut is not None and len(ut) >= 1
+    if has_ut:
+        flags = ut[0]
+        off   = 1
+        if (flags & 1) and off + 4 <= len(ut):
+            mtime = struct.unpack_from('<I', ut, off)[0]; off += 4
+        if (flags & 2) and off + 4 <= len(ut):
+            atime = struct.unpack_from('<I', ut, off)[0]; off += 4
+        if (flags & 4) and off + 4 <= len(ut):
+            ctime = struct.unpack_from('<I', ut, off)[0]; off += 4
+        if (flags & 8) and off + 4 <= len(ut):   # GrayKey btime extension
+            btime = struct.unpack_from('<I', ut, off)[0]
     else:
-        mtime = atime = ctime = btime = 0
+        # No UT block at all — fall back to DOS mod time (always present,
+        # 2-second precision).  Only used when the entry carries no Unix
+        # timestamp whatsoever; a UT block with mtime=0 is honoured as-is
+        # (displayed as "---") rather than being overwritten with the DOS date.
+        import calendar
+        dt = f.date_time   # (year, month, day, hour, min, sec)
+        try:
+            mtime = int(calendar.timegm(dt + (0, 0, -1)))
+        except (ValueError, OverflowError):
+            mtime = 0
 
     # UID/GID from UX block: version(1B) uid_sz(1B) uid(uid_sz B) gid_sz(1B) gid(gid_sz B)
     ux = _find_block(extra, _TAG_UX)
@@ -189,18 +207,58 @@ def extract_with_prefix(zip_path: str, strip_prefix: str) -> dict:
     Parse a zip whose entries carry UT/UX extra fields but no GrayKey block.
     Strips *strip_prefix* (e.g. 'Dump/') from entry names to produce ui_paths.
     Returns a Cellebrite-compatible metadata dict.
+
+    Reads the local file header extra field directly so that all UT timestamps
+    (mtime, atime, ctime) are available — the central-directory copy of UT only
+    carries mtime, so using ZipInfo.extra alone would lose atime and ctime.
     """
     slash = strip_prefix if strip_prefix.endswith('/') else strip_prefix + '/'
+    entries: list[tuple[str, zipfile.ZipInfo]] = []
     with zipfile.ZipFile(zip_path, 'r') as z:
-        result = {}
         for f in z.infolist():
             name = f.filename.rstrip('/')
             if name.startswith(slash):
                 name = name[len(slash):]
             elif name == strip_prefix.rstrip('/'):
                 continue  # the prefix dir itself — skip
+            else:
+                continue  # entry outside the prefix — not part of this extraction
+            if not name:
+                continue  # stripping the prefix produced an empty path — skip
+            entries.append((name, f))
+
+    # Probe up to 8 file entries to decide whether local file header extras
+    # carry more UT data than the central directory copy.  If every probe shows
+    # a local UT block no longer than the CD UT block, the archive only stores
+    # mtime (Cellebrite Android pattern) — skip 100K+ raw seeks and use f.extra.
+    _need_local = False
+    with open(zip_path, 'rb') as rf:
+        for _, f in entries[:8]:
+            cd_ut = _find_block(f.extra, _TAG_UT)
+            cd_len = len(cd_ut) if cd_ut else 0
+            rf.seek(f.header_offset + 26)
+            fname_len, extra_len = struct.unpack('<HH', rf.read(4))
+            rf.seek(f.header_offset + 30 + fname_len)
+            local_ut = _find_block(rf.read(extra_len), _TAG_UT)
+            local_len = len(local_ut) if local_ut else 0
+            if local_len > cd_len:
+                _need_local = True
+                break
+
+    result = {}
+    if not _need_local:
+        # Central directory has everything available — no raw seeks needed.
+        for name, f in entries:
             result[name] = _parse_entry(f)
-        return result
+    else:
+        with open(zip_path, 'rb') as rf:
+            for name, f in entries:
+                rf.seek(f.header_offset + 26)
+                fname_len, extra_len = struct.unpack('<HH', rf.read(4))
+                rf.seek(f.header_offset + 30 + fname_len)
+                local_extra = rf.read(extra_len)
+                result[name] = _parse_entry(f, local_extra if local_extra else None)
+    return result
 
 
 def save(metadata: dict, out_path: str) -> None:

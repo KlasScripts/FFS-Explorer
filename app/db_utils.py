@@ -97,8 +97,66 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
         ON search_results (term_id)
     ''')
 
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS header_types (
+            zip_path      TEXT NOT NULL,
+            ui_path       TEXT NOT NULL,
+            detected_type TEXT NOT NULL,
+            PRIMARY KEY (zip_path, ui_path)
+        )
+    ''')
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS guid_bundle (
+            zip_path  TEXT NOT NULL,
+            guid      TEXT NOT NULL,
+            bundle_id TEXT NOT NULL,
+            PRIMARY KEY (zip_path, guid)
+        )
+    ''')
+
+    # Drop any leftover content_cache table from previous versions — no longer used.
+    conn.execute('DROP TABLE IF EXISTS content_cache')
+
     conn.commit()
     return conn
+
+
+def save_guid_bundle_map(conn: 'sqlite3.Connection', zip_path: str, mapping: dict) -> None:
+    """Persist {guid: bundle_id} into the guid_bundle table."""
+    conn.execute('DELETE FROM guid_bundle WHERE zip_path=?', (zip_path,))
+    conn.executemany(
+        'INSERT INTO guid_bundle (zip_path, guid, bundle_id) VALUES (?,?,?)',
+        [(zip_path, guid, bid) for guid, bid in mapping.items()],
+    )
+    conn.commit()
+
+
+def load_guid_bundle_map(conn: 'sqlite3.Connection', zip_path: str) -> dict:
+    """Return {guid: bundle_id} previously saved for zip_path, or {} if none."""
+    rows = conn.execute(
+        'SELECT guid, bundle_id FROM guid_bundle WHERE zip_path=?', (zip_path,),
+    ).fetchall()
+    return {guid: bid for guid, bid in rows}
+
+
+
+def save_header_types(conn: 'sqlite3.Connection', zip_path: str, types: dict) -> None:
+    """Persist {ui_path: detected_type} into the header_types table."""
+    conn.executemany(
+        'INSERT OR REPLACE INTO header_types (zip_path, ui_path, detected_type) VALUES (?,?,?)',
+        [(zip_path, ui_path, t) for ui_path, t in types.items()],
+    )
+    conn.commit()
+
+
+def load_header_types(conn: 'sqlite3.Connection', zip_path: str) -> dict:
+    """Return {ui_path: detected_type} previously saved for zip_path."""
+    rows = conn.execute(
+        'SELECT ui_path, detected_type FROM header_types WHERE zip_path=?',
+        (zip_path,),
+    ).fetchall()
+    return {ui_path: t for ui_path, t in rows}
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

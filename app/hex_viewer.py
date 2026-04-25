@@ -157,7 +157,7 @@ class HexViewerMixin:
 
     # ── Event filter ─────────────────────────────────────────────────────────
 
-    def eventFilter(self, obj, event):
+    def eventFilter(self, obj: object, event: object) -> bool:
         if obj is self.hex_view.viewport() and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._fit_hex_font)
         return super().eventFilter(obj, event)

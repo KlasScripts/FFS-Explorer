@@ -22,11 +22,17 @@ Usage
     raw = adapter.load_metadata(zip_path, z)
 """
 
+import plistlib
+import re
+import struct
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 import msgpack
 
 from adapters import graykey as _gk
+
+_FS_RE = re.compile(r'^(filesystem\d+)/')
 
 # ── Cellebrite partition detection ────────────────────────────────────────────
 
@@ -84,6 +90,72 @@ def _detect_system_prefix(zip_names: frozenset) -> str:
         ):
             return prefix
     return "filesystem1"
+
+
+# ── GUID → bundle-ID mapping ─────────────────────────────────────────────────
+
+def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
+                           z: zipfile.ZipFile | None = None) -> dict:
+    """Return {guid: bundle_id} by reading MCM metadata plists in parallel.
+
+    Uses the already-open ZipFile *z* (if provided) solely to look up data
+    offsets from the central directory — a single cheap scan.  Each worker
+    thread then reads raw bytes directly without opening ZipFile at all,
+    avoiding repeated central-directory parses on large archives."""
+    meta_name = ".com.apple.mobile_container_manager.metadata.plist"
+    meta_files = [f for f in zip_names if f.endswith(meta_name)]
+    if not meta_files:
+        return {}
+
+    # Collect (guid, data_offset, file_size) using the already-open ZipFile
+    # (or open one temporarily if z was not supplied).
+    entries: list[tuple[str, int, int]] = []
+    _close = z is None
+    _z = zipfile.ZipFile(zip_path, 'r') if _close else z
+    assert _z is not None
+    try:
+        with open(zip_path, 'rb') as rf:
+            for entry in meta_files:
+                try:
+                    info = _z.getinfo(entry)
+                    rf.seek(info.header_offset + 26)
+                    fname_len, extra_len = struct.unpack('<HH', rf.read(4))
+                    data_offset = info.header_offset + 30 + fname_len + extra_len
+                    guid = entry.split('/')[-2]
+                    entries.append((guid, data_offset, info.file_size))
+                except (KeyError, OSError):
+                    pass
+    finally:
+        if _close:
+            _z.close()
+
+    if not entries:
+        return {}
+
+    def _read_batch(batch: list[tuple[str, int, int]]) -> dict:
+        result: dict = {}
+        try:
+            with open(zip_path, 'rb') as rf:
+                for guid, data_offset, file_size in batch:
+                    try:
+                        rf.seek(data_offset)
+                        bid = plistlib.loads(rf.read(file_size)).get("MCMMetadataIdentifier")
+                        if bid:
+                            result[guid] = bid
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+        return result
+
+    n = min(8, len(entries))
+    batch_size = max(1, (len(entries) + n - 1) // n)
+    batches = [entries[i:i + batch_size] for i in range(0, len(entries), batch_size)]
+    out: dict = {}
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        for batch_result in pool.map(_read_batch, batches):
+            out.update(batch_result)
+    return out
 
 
 # ── Adapter ───────────────────────────────────────────────────────────────────
@@ -251,3 +323,100 @@ class FfsAdapter:
                     }
                 return raw
             raise KeyError("metadata.msgpack not found in metadata1/ or metadata2/")
+
+    # ── Unified metadata builder ──────────────────────────────────────────────
+
+    def build_ui_metadata(
+        self,
+        zip_path: str,
+        zip_names: frozenset,
+        z: zipfile.ZipFile | None = None,
+        streaming_index=None,
+        status_cb=None,
+        guid_to_bundle: dict | None = None,
+    ) -> tuple[dict, dict, frozenset | None]:
+        """Return (ui_metadata, guid_to_bundle, zip_ui_paths).
+
+        ui_metadata      — {ui_path: metadata_dict} ready for the folder tree.
+        guid_to_bundle   — {guid: bundle_id}; empty for non-Cellebrite formats.
+        zip_ui_paths     — frozenset of ui_paths that have a physical zip entry
+                           (None when the metadata dict is the sole source).
+        """
+        def _emit(msg):
+            if status_cb:
+                status_cb(msg)
+
+        # ── Streaming Cellebrite ──────────────────────────────────────────────
+        if streaming_index is not None:
+            _emit("Reading metadata.msgpack...")
+            for mp_path in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
+                if mp_path in streaming_index:
+                    raw: dict = msgpack.unpackb(
+                        streaming_index.get_entry(mp_path).read(), raw=False)
+                    break
+            else:
+                raise KeyError("metadata.msgpack not found in metadata1/ or metadata2/")
+            if self.old_layout:
+                _PV = "private/var/"
+                raw = {(k[len(_PV):] if k.startswith(_PV) else k): v for k, v in raw.items()}
+            return raw, {}, None
+
+        assert z is not None
+
+        # ── GrayKey iOS / Cellebrite Android (zip-extras) ────────────────────
+        if self.format in (self.FORMAT_GRAYKEY, self.FORMAT_ZIP_EXTRAS):
+            if self.format == self.FORMAT_GRAYKEY:
+                _emit("Graykey archive detected — extracting metadata...")
+            else:
+                _emit("Android zip extras archive detected — extracting metadata...")
+            return self.load_metadata(zip_path, z), {}, None
+
+        # ── Cellebrite iOS non-streaming ──────────────────────────────────────
+        if guid_to_bundle is None:
+            _emit("Mapping Bundle IDs to GUIDs...")
+            guid_to_bundle = _build_guid_bundle_map(zip_path, zip_names, z=z)
+        else:
+            _emit("Bundle ID map loaded from cache.")
+
+        _emit("Reading metadata.msgpack...")
+        raw_data = self.load_metadata(zip_path, z)
+
+        _emit("Building enrichment index from metadata…")
+        meta_by_zip_path = {self.resolve(k): v for k, v in raw_data.items()}
+
+        user_prefix_slash = self.user_prefix + '/'
+        old_pv_slash      = (user_prefix_slash + 'private/var/') if self.old_layout else None
+        old_pv_len        = len(old_pv_slash) if old_pv_slash else 0
+
+        fs_prefixes = {m.group(1) + '/' for e in zip_names if (m := _FS_RE.match(e))}
+
+        # Map first path component ("filesystemN") → strip length so the main
+        # loop does one dict lookup per entry instead of N startswith() scans.
+        strip_for_fs: dict[str, int] = {p.rstrip('/'): len(p) for p in fs_prefixes}
+
+        _emit(f"Scanning {len(fs_prefixes)} filesystem partition(s)…")
+        ui_metadata: dict = {}
+        for entry in zip_names:
+            if entry[-1] == '/':
+                continue
+            slash = entry.find('/')
+            if slash < 0:
+                continue
+            base_strip = strip_for_fs.get(entry[:slash])
+            if base_strip is None:
+                continue
+            if old_pv_slash and entry.startswith(old_pv_slash):
+                ui_metadata[entry[old_pv_len:]] = meta_by_zip_path.get(entry, {})
+            else:
+                ui_metadata[entry[base_strip:]] = meta_by_zip_path.get(entry, {})
+
+        # Capture zip_ui_paths before adding msgpack-only entries (folder metadata)
+        zip_ui_paths = frozenset(ui_metadata.keys())
+
+        # Add entries from the msgpack that have no zip entry (typically folders
+        # whose directory records were omitted from the zip).
+        for ui_path, v in raw_data.items():
+            if ui_path not in ui_metadata:
+                ui_metadata[ui_path] = v
+
+        return ui_metadata, guid_to_bundle, zip_ui_paths

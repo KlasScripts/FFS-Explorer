@@ -1,0 +1,69 @@
+"""artifact_db.py — write artifact parser results to the case SQLite database.
+
+Each parser produces a list of dicts.  write_artifact_results() creates (or
+replaces) a table named  artifact_<script_name>  in the case database and
+inserts all rows.  Column names come from the dict keys of the first row.
+
+All values are stored as TEXT.  The table is always rebuilt from scratch so
+re-running a parser updates the results cleanly.
+"""
+
+import sqlite3
+
+
+def write_artifact_results(
+    case_conn: sqlite3.Connection,
+    script_name: str,
+    rows: list[dict],
+) -> int:
+    """Write rows into artifact_<script_name> in the case database.
+
+    Returns the number of rows written.  Does nothing and returns 0 if rows
+    is empty.
+    """
+    if not rows:
+        return 0
+
+    table = f"artifact_{script_name}"
+    columns = list(rows[0].keys())
+
+    col_defs = ', '.join(f'"{c}" TEXT' for c in columns)
+    case_conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+    case_conn.execute(f'CREATE TABLE "{table}" ({col_defs})')
+
+    placeholders = ', '.join('?' for _ in columns)
+    case_conn.executemany(
+        f'INSERT INTO "{table}" VALUES ({placeholders})',
+        [tuple(str(row.get(c, '') or '') for c in columns) for row in rows],
+    )
+    case_conn.commit()
+    return len(rows)
+
+
+def load_artifact_results(
+    case_conn: sqlite3.Connection,
+    script_name: str,
+) -> tuple[list[str], list[tuple]]:
+    """Return (columns, rows) for a previously written artifact table.
+
+    Returns ([], []) if the table does not exist yet.
+    """
+    table = f"artifact_{script_name}"
+    exists = case_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not exists:
+        return [], []
+
+    cursor = case_conn.execute(f'SELECT * FROM "{table}"')
+    columns = [d[0] for d in cursor.description]
+    rows = cursor.fetchall()
+    return columns, rows
+
+
+def list_completed_artifacts(case_conn: sqlite3.Connection) -> list[str]:
+    """Return script_names for all artifact tables stored in the case database."""
+    rows = case_conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'artifact_%'"
+    ).fetchall()
+    return [r[0][len('artifact_'):] for r in rows]

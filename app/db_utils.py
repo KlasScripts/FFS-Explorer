@@ -115,8 +115,20 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
-    # Drop any leftover content_cache table from previous versions — no longer used.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS folder_metadata (
+            zip_path    TEXT    NOT NULL,
+            folder_path TEXT    NOT NULL,
+            count       INTEGER,
+            status      TEXT,
+            PRIMARY KEY (zip_path, folder_path)
+        )
+    ''')
+
+    # Drop any leftover tables from previous versions — no longer used.
     conn.execute('DROP TABLE IF EXISTS content_cache')
+    conn.execute('DROP TABLE IF EXISTS folder_counts')
+    conn.execute('DROP TABLE IF EXISTS folder_content_status')
 
     conn.commit()
     return conn
@@ -157,6 +169,51 @@ def load_header_types(conn: 'sqlite3.Connection', zip_path: str) -> dict:
         (zip_path,),
     ).fetchall()
     return {ui_path: t for ui_path, t in rows}
+
+
+def save_folder_status(conn: 'sqlite3.Connection', zip_path: str, cache: dict) -> None:
+    """Persist {folder_path: status} into folder_metadata, clearing prior rows for zip_path.
+
+    Called first (from the load worker).  count is left NULL and filled in later
+    by save_folder_counts once background precomputation finishes.
+    """
+    conn.execute('DELETE FROM folder_metadata WHERE zip_path=?', (zip_path,))
+    conn.executemany(
+        'INSERT INTO folder_metadata (zip_path, folder_path, status) VALUES (?,?,?)',
+        [(zip_path, p, s) for p, s in cache.items()],
+    )
+    conn.commit()
+
+
+def save_folder_counts(conn: 'sqlite3.Connection', zip_path: str, counts: dict) -> None:
+    """Upsert {folder_path: count} into folder_metadata.
+
+    Called after background precomputation.  Uses ON CONFLICT DO UPDATE so that
+    status values written by save_folder_status are preserved.
+    """
+    conn.executemany(
+        '''INSERT INTO folder_metadata (zip_path, folder_path, count, status)
+           VALUES (?, ?, ?, NULL)
+           ON CONFLICT(zip_path, folder_path) DO UPDATE SET count=excluded.count''',
+        [(zip_path, p, c) for p, c in counts.items()],
+    )
+    conn.commit()
+
+
+def load_folder_metadata(conn: 'sqlite3.Connection', zip_path: str) -> tuple[dict, dict]:
+    """Return (counts, status_cache) previously saved for zip_path.
+
+    counts       — {folder_path: int}  (only rows where count IS NOT NULL)
+    status_cache — {folder_path: str}  (only rows where status IS NOT NULL)
+    Both dicts are empty if nothing has been saved yet.
+    """
+    rows = conn.execute(
+        'SELECT folder_path, count, status FROM folder_metadata WHERE zip_path=?',
+        (zip_path,),
+    ).fetchall()
+    counts = {p: c for p, c, s in rows if c is not None}
+    status = {p: s for p, c, s in rows if s is not None}
+    return counts, status
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

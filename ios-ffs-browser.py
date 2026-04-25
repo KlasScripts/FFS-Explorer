@@ -15,7 +15,8 @@ sys.path.insert(0, _APP_DIR)
 
 from adapters import FfsAdapter
 from db_utils import (_open_case_db, save_header_types, load_header_types,
-                      save_guid_bundle_map, load_guid_bundle_map)
+                      save_guid_bundle_map, load_guid_bundle_map,
+                      save_folder_counts, save_folder_status, load_folder_metadata)
 import header_scan
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
@@ -743,22 +744,40 @@ class ZipMetadataWorker(QThread):
                 and p.split('/')[-1] not in guid_to_bundle
             ]
 
-            self.status_update.emit("Computing folder content status...")
-            content_cache = _precompute_content_cache(
-                folder_map, zip_names, adapter,
-                progress_cb=lambda done, total: self.status_update.emit(
-                    f"Computing folder content status… {done:,}/{total:,}"),
-                zip_ui_paths=zip_ui_paths)
+            _cached_content: dict | None = None
+            if self.case_dir:
+                try:
+                    _db = _open_case_db(self.case_dir)
+                    _, _cc = load_folder_metadata(_db, self.zip_path)
+                    _db.close()
+                    if _cc:
+                        _cached_content = _cc
+                except Exception:
+                    pass
+
+            if _cached_content is not None:
+                self.status_update.emit("Folder content status loaded from cache.")
+                content_cache = _cached_content
+            else:
+                self.status_update.emit("Computing folder content status...")
+                content_cache = _precompute_content_cache(
+                    folder_map, zip_names, adapter,
+                    progress_cb=lambda done, total: self.status_update.emit(
+                        f"Computing folder content status… {done:,}/{total:,}"),
+                    zip_ui_paths=zip_ui_paths)
 
             # Emit first — UI tree appears immediately. DB write happens after.
             self.metadata_ready.emit(
                 ui_metadata, folder_map, guid_to_bundle, zip_names,
                 adapter, missing_plist_paths, content_cache, zip_ui_paths)
 
-            if self.case_dir and _need_save_guid:
+            if self.case_dir:
                 try:
                     _db = _open_case_db(self.case_dir)
-                    save_guid_bundle_map(_db, self.zip_path, guid_to_bundle)
+                    if _need_save_guid:
+                        save_guid_bundle_map(_db, self.zip_path, guid_to_bundle)
+                    if _cached_content is None:
+                        save_folder_status(_db, self.zip_path, content_cache)
                     _db.close()
                 except Exception:
                     pass
@@ -1492,6 +1511,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.zip_names: frozenset = frozenset()
         self._zip_ui_paths: frozenset | None = None
         self._real_content_cache: dict = {}
+        self._file_count_cache: dict = {}
+        self._precompute_zip_path: str = ""
         self._zip_handle: zipfile.ZipFile | None = None
         self._zip_open_future = None
         self._streaming_index: StreamingZipIndex | None = None
@@ -2141,6 +2162,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _count_files_recursive(self, folder_path: str, visited: set | None = None) -> int:
         """Return the total number of files under folder_path (recursive, no double-counting)."""
+        if folder_path in self._file_count_cache:
+            return self._file_count_cache[folder_path]
         if visited is None:
             visited = set()
         if folder_path in visited:
@@ -2152,7 +2175,46 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 count += self._count_files_recursive(child, visited)
             else:
                 count += 1
+        self._file_count_cache[folder_path] = count
         return count
+
+    def _start_precompute_folder_counts(self):
+        """Begin batch precomputation of all folder file counts on the main thread."""
+        self._precompute_zip_path = self.zip_path
+        self._precompute_folders = list(self.folder_map.keys())
+        self._precompute_batch_index = 0
+        self._precompute_counts_batch()
+
+    def _precompute_counts_batch(self):
+        if self.zip_path != self._precompute_zip_path:
+            return  # archive changed; abort stale callbacks
+        folders = self._precompute_folders
+        start = self._precompute_batch_index
+        end = min(start + 2000, len(folders))
+        for fp in folders[start:end]:
+            self._count_files_recursive(fp)
+        self._precompute_batch_index = end
+        if end < len(folders):
+            QTimer.singleShot(0, self._precompute_counts_batch)
+        else:
+            self._save_folder_counts_to_db()
+
+    def _save_folder_counts_to_db(self):
+        if not self._case_dir:
+            return
+        counts = dict(self._file_count_cache)
+        zip_path = self.zip_path
+        case_dir = self._case_dir
+        def _save():
+            try:
+                db = _open_case_db(case_dir)
+                save_folder_counts(db, zip_path, counts)
+                db.close()
+            except Exception:
+                pass
+        ex = ThreadPoolExecutor(max_workers=1)
+        ex.submit(_save)
+        ex.shutdown(wait=False)
 
     def format_ts(self, ts):
         if not ts: return "---"
@@ -2446,8 +2508,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         return cols
 
     def _detect_android_user_data(self, folder_map: dict) -> str:
-        """Return the parent path of the DCIM folder, or '' if not found."""
+        """Return the parent path of the DCIM folder, or '' if not found.
+        Skips paths under private/ which are iOS-specific."""
         for path in folder_map:
+            if path.startswith('private/'):
+                continue
             if path == 'DCIM' or path.endswith('/DCIM'):
                 return path.rsplit('/DCIM', 1)[0] if '/' in path else ''
         return ''
@@ -2457,7 +2522,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if fmt == FfsAdapter.FORMAT_ZIP_EXTRAS:
             return True
         if fmt == FfsAdapter.FORMAT_GRAYKEY:
-            return 'data/data' in self.folder_map or bool(self._android_user_data_path)
+            return 'data/data' in self.folder_map
         return False
 
     def _android_shortcuts(self) -> list:
@@ -2910,10 +2975,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._real_content_cache = content_cache
         self._zip_ui_paths = zip_ui_paths
         self._header_type_overrides = {}
+        self._file_count_cache = {}
         if self._case_dir:
             try:
                 db = _open_case_db(self._case_dir)
                 self._header_type_overrides = load_header_types(db, self.zip_path)
+                self._file_count_cache, _ = load_folder_metadata(db, self.zip_path)
                 db.close()
             except Exception:
                 pass
@@ -2942,6 +3009,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not (_entry and _entry.get('label')):
             QTimer.singleShot(0, lambda: self._fetch_and_store_label(self.zip_path))
         self._artifact_act.setEnabled(True)
+        # Start background precomputation of folder counts if not already cached.
+        if len(self._file_count_cache) < len(self.folder_map):
+            QTimer.singleShot(300, self._start_precompute_folder_counts)
 
         if missing_plist_paths:
             # Only warn about UUID folders that actually have content in the zip.

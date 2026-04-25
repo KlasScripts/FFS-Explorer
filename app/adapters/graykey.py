@@ -182,39 +182,43 @@ def _has_ut_extras(z: zipfile.ZipFile) -> bool:
     return False
 
 
-def extract(zip_path: str) -> dict:
+def extract(zip_path: str, z: zipfile.ZipFile | None = None) -> dict:
     """
     Parse a Graykey full_files zip. Returns a Cellebrite-compatible metadata
     dict keyed by full entry path (no leading slash).
 
+    If *z* is an already-open ZipFile it is used directly (no second open).
     Raises TypeError if not a valid zip or not a Graykey archive.
     """
+    if z is not None:
+        return {f.filename.rstrip('/'): _parse_entry(f) for f in z.infolist()}
     if not zipfile.is_zipfile(zip_path):
         raise TypeError(f'{zip_path!r} is not a valid zip file')
-
     with zipfile.ZipFile(zip_path, 'r') as z:
         if not _is_graykey(z):
             raise TypeError(f'{zip_path!r} does not appear to be a Graykey archive')
-
-        return {
-            f.filename.rstrip('/'): _parse_entry(f)
-            for f in z.infolist()
-        }
+        return {f.filename.rstrip('/'): _parse_entry(f) for f in z.infolist()}
 
 
-def extract_with_prefix(zip_path: str, strip_prefix: str) -> dict:
+def extract_with_prefix(zip_path: str, strip_prefix: str,
+                        z: zipfile.ZipFile | None = None) -> dict:
     """
     Parse a zip whose entries carry UT/UX extra fields but no GrayKey block.
     Strips *strip_prefix* (e.g. 'Dump/') from entry names to produce ui_paths.
     Returns a Cellebrite-compatible metadata dict.
 
-    Reads the local file header extra field directly so that all UT timestamps
-    (mtime, atime, ctime) are available — the central-directory copy of UT only
-    carries mtime, so using ZipInfo.extra alone would lose atime and ctime.
+    If *z* is an already-open ZipFile it is used for the infolist scan (no
+    second open).  Reads the local file header extra field directly so that all
+    UT timestamps (mtime, atime, ctime) are available — the central-directory
+    copy of UT only carries mtime, so using ZipInfo.extra alone would lose
+    atime and ctime.
     """
     slash = strip_prefix if strip_prefix.endswith('/') else strip_prefix + '/'
     entries: list[tuple[str, zipfile.ZipInfo]] = []
-    with zipfile.ZipFile(zip_path, 'r') as z:
+    _close = z is None
+    if _close:
+        z = zipfile.ZipFile(zip_path, 'r')
+    try:
         for f in z.infolist():
             name = f.filename.rstrip('/')
             if name.startswith(slash):
@@ -226,6 +230,9 @@ def extract_with_prefix(zip_path: str, strip_prefix: str) -> dict:
             if not name:
                 continue  # stripping the prefix produced an empty path — skip
             entries.append((name, f))
+    finally:
+        if _close:
+            z.close()
 
     # Probe up to 8 file entries to decide whether local file header extras
     # carry more UT data than the central directory copy.  If every probe shows
@@ -273,13 +280,15 @@ def load(msgpack_path: str) -> dict:
         return msgpack.unpackb(fh.read(), raw=False, strict_map_key=False)
 
 
-def extract_metadata(zip_path: str) -> dict:
+def extract_metadata(zip_path: str, z: zipfile.ZipFile | None = None) -> dict:
     """
     Parse a Graykey archive and return the metadata dict in memory.
     Nothing is written to disk — evidence-derived data must not be
     left as residual files subject to data-retention obligations (e.g. MoPI).
+
+    If *z* is an already-open ZipFile it is used directly (no second open).
     """
-    return extract(zip_path)
+    return extract(zip_path, z)
 
 
 if __name__ == '__main__':

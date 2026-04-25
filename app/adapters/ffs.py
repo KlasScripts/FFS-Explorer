@@ -95,15 +95,25 @@ def _detect_system_prefix(zip_names: frozenset) -> str:
 # ── GUID → bundle-ID mapping ─────────────────────────────────────────────────
 
 def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
-                           z: zipfile.ZipFile | None = None) -> dict:
+                           z: zipfile.ZipFile | None = None,
+                           container_prefix: str = "") -> dict:
     """Return {guid: bundle_id} by reading MCM metadata plists in parallel.
 
     Uses the already-open ZipFile *z* (if provided) solely to look up data
     offsets from the central directory — a single cheap scan.  Each worker
     thread then reads raw bytes directly without opening ZipFile at all,
-    avoiding repeated central-directory parses on large archives."""
+    avoiding repeated central-directory parses on large archives.
+
+    *container_prefix*, when set, limits the scan to entries under that path
+    (e.g. 'filesystem2/mobile/Containers/') so that system-partition and other
+    unrelated entries are rejected by a cheap startswith before the 57-char
+    endswith is evaluated."""
     meta_name = ".com.apple.mobile_container_manager.metadata.plist"
-    meta_files = [f for f in zip_names if f.endswith(meta_name)]
+    if container_prefix:
+        meta_files = [f for f in zip_names
+                      if f.startswith(container_prefix) and f.endswith(meta_name)]
+    else:
+        meta_files = [f for f in zip_names if f.endswith(meta_name)]
     if not meta_files:
         return {}
 
@@ -302,10 +312,10 @@ class FfsAdapter:
         In both cases the returned keys are ui_paths with the
         '/private/var/' prefix stripped."""
         if self.format == self.FORMAT_GRAYKEY:
-            raw = _gk.extract_metadata(zip_path)
+            raw = _gk.extract_metadata(zip_path, z)
             return {k.lstrip("/"): v for k, v in raw.items()}
         if self.format == self.FORMAT_ZIP_EXTRAS:
-            return _gk.extract_with_prefix(zip_path, self.user_prefix)
+            return _gk.extract_with_prefix(zip_path, self.user_prefix, z)
         else:
             for candidate in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
                 try:
@@ -367,34 +377,55 @@ class FfsAdapter:
         if self.format in (self.FORMAT_GRAYKEY, self.FORMAT_ZIP_EXTRAS):
             if self.format == self.FORMAT_GRAYKEY:
                 _emit("Graykey archive detected — extracting metadata...")
+                # GrayKey zip entries have a leading '/' so the prefix mirrors that.
+                if guid_to_bundle is None:
+                    _emit("Mapping Bundle IDs to GUIDs...")
+                    guid_to_bundle = _build_guid_bundle_map(
+                        zip_path, zip_names, z=z,
+                        container_prefix="/private/var/mobile/Containers/")
+                else:
+                    _emit("Bundle ID map loaded from cache.")
             else:
                 _emit("Android zip extras archive detected — extracting metadata...")
-            return self.load_metadata(zip_path, z), {}, None
+                guid_to_bundle = {}
+            ui_metadata = self.load_metadata(zip_path, z)
+            return ui_metadata, guid_to_bundle, frozenset(ui_metadata.keys())
 
         # ── Cellebrite iOS non-streaming ──────────────────────────────────────
         if guid_to_bundle is None:
             _emit("Mapping Bundle IDs to GUIDs...")
-            guid_to_bundle = _build_guid_bundle_map(zip_path, zip_names, z=z)
+            _pv = "private/var/" if self.old_layout else ""
+            _cpfx = f"{self.user_prefix}/{_pv}mobile/Containers/"
+            guid_to_bundle = _build_guid_bundle_map(zip_path, zip_names, z=z,
+                                                    container_prefix=_cpfx)
         else:
             _emit("Bundle ID map loaded from cache.")
 
         _emit("Reading metadata.msgpack...")
         raw_data = self.load_metadata(zip_path, z)
 
-        _emit("Building enrichment index from metadata…")
-        meta_by_zip_path = {self.resolve(k): v for k, v in raw_data.items()}
+        _emit("Building GUID enrichment index…")
+        # resolve() is only needed for GUID-containing paths (those with a
+        # 32-char hex suffix after the last '-').  That's ~10k out of 500k
+        # entries.  All other ui_paths are identical to the msgpack key so
+        # raw_data can be queried directly, eliminating ~490k resolve() calls
+        # and one full in-memory copy of the metadata dict.
+        guid_meta: dict = {}
+        for k, v in raw_data.items():
+            if '-' in k:
+                guid_meta[self.resolve(k)] = v
 
         user_prefix_slash = self.user_prefix + '/'
         old_pv_slash      = (user_prefix_slash + 'private/var/') if self.old_layout else None
         old_pv_len        = len(old_pv_slash) if old_pv_slash else 0
 
-        fs_prefixes = {m.group(1) + '/' for e in zip_names if (m := _FS_RE.match(e))}
+        # Only scan the user partition — system partition entries have no msgpack
+        # metadata (raw_data is from metadata2, user only) so they would be added
+        # with empty {} metadata.  sys_prefix is still known for direct file reads.
+        user_fs_slash = self.user_prefix + '/'
+        strip_for_fs = {self.user_prefix: len(user_fs_slash)}
 
-        # Map first path component ("filesystemN") → strip length so the main
-        # loop does one dict lookup per entry instead of N startswith() scans.
-        strip_for_fs: dict[str, int] = {p.rstrip('/'): len(p) for p in fs_prefixes}
-
-        _emit(f"Scanning {len(fs_prefixes)} filesystem partition(s)…")
+        _emit(f"Scanning user partition ({self.user_prefix})…")
         ui_metadata: dict = {}
         for entry in zip_names:
             if entry[-1] == '/':
@@ -406,9 +437,13 @@ class FfsAdapter:
             if base_strip is None:
                 continue
             if old_pv_slash and entry.startswith(old_pv_slash):
-                ui_metadata[entry[old_pv_len:]] = meta_by_zip_path.get(entry, {})
+                ui_path = entry[old_pv_len:]
             else:
-                ui_metadata[entry[base_strip:]] = meta_by_zip_path.get(entry, {})
+                ui_path = entry[base_strip:]
+            meta = raw_data.get(ui_path)
+            if meta is None and '-' in ui_path:
+                meta = guid_meta.get(entry, {})
+            ui_metadata[ui_path] = meta or {}
 
         # Capture zip_ui_paths before adding msgpack-only entries (folder metadata)
         zip_ui_paths = frozenset(ui_metadata.keys())

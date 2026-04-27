@@ -16,7 +16,7 @@ sys.path.insert(0, _APP_DIR)
 from adapters import FfsAdapter
 from db_utils import (_open_case_db, save_header_types, load_header_types,
                       save_guid_bundle_map, load_guid_bundle_map,
-                      save_folder_counts, save_folder_status, load_folder_metadata)
+                      save_folder_counts, save_folder_sizes, load_folder_metadata)
 import header_scan
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
@@ -89,14 +89,18 @@ def resource_path(relative):
     return os.path.join(base, relative)
   
 
-# Files that exist only to carry container metadata; a folder containing
-# nothing but these is treated as "Metadata Only" rather than user content.
+_TREE_PLACEHOLDER = "__placeholder__"
+# Minimum tree column width (px).  The column always fills the panel, but never
+# shrinks below this so deeply-indented items can be reached via horizontal scroll.
+_TREE_COL_MIN = 1000
+
+# iOS container metadata files: a folder that contains only these (and nothing else)
+# is labelled "Folder - Metadata Only" rather than a regular folder.
 _SYSTEM_METADATA_NAMES: frozenset = frozenset({
     ".com.apple.mobile_container_manager.metadata.plist",
     ".com.apple.FairPlay.MachineIdentifier",
     ".com.apple.springboard.shortcuts",
 })
-_TREE_PLACEHOLDER = "__placeholder__"
 
 # Artifact viewer tree node role values
 _ART_GROUP  = "__art_group__:"
@@ -509,70 +513,121 @@ class ExtractorWorker(QThread):
         return children
 
 
-def _precompute_content_cache(folder_map: dict, zip_names: frozenset, adapter,
-                              progress_cb=None,
-                              zip_ui_paths: frozenset | None = None) -> dict:
-    """Compute content-status for every folder in *folder_map* on the calling thread.
+def _compute_folder_sizes(
+    folder_map: dict,
+    zip_names: frozenset,
+    zip_sizes: dict,
+    adapter,
+    zip_ui_paths: frozenset | None = None,
+    progress_cb=None,
+) -> dict:
+    """Compute total bytes per folder using a bottom-up (leaf-first) algorithm.
 
-    Identical logic to FastZipBrowser._folder_content_status but standalone so
-    it can run inside ZipMetadataWorker before the signal is emitted, keeping the
-    expensive recursive traversal off the main/GUI thread.
+    Returns {folder_path: total_bytes} for every folder except the root ('').
 
-    *progress_cb*, if given, is called as progress_cb(done, total) periodically.
-
-    *zip_ui_paths*, when supplied (zip-first Cellebrite mode), is the exact set of
-    ui_paths that were derived from the zip scan.  Using it directly avoids the
-    adapter.resolve() path which only handles the user partition prefix.
-
-    Returns a dict  folder_path -> 'content' | 'metadata_only' | 'empty'."""
-    cache: dict = {}
-    total   = len(folder_map)
-    counter = [0]
+    Step 1 accumulates direct file sizes into each immediate parent.
+    Step 2 propagates child totals upward sorted deepest-first so every
+    subtotal is resolved before its parent is visited.  The root ('') is
+    intentionally excluded — it would just be the sum of every file and
+    provides no actionable insight in the UI.
+    """
+    folder_bytes: dict[str, int] = {fp: 0 for fp in folder_map}
+    total = len(folder_map)
+    done = [0]
     _REPORT_EVERY = 2000
 
-    def _in_zip_local(child: str) -> bool:
-        if zip_ui_paths is not None:
-            return child in zip_ui_paths
-        resolved = adapter.resolve(child)
-        return resolved in zip_names or resolved.lstrip('/') in zip_names
+    # Step 1: direct file contributions into each immediate parent.
+    for fp, children in folder_map.items():
+        for child in children:
+            if child in folder_map:
+                continue  # subfolder — handled in step 2
+            if zip_ui_paths is not None:
+                in_zip = child in zip_ui_paths
+            else:
+                resolved = adapter.resolve(child)
+                in_zip = resolved in zip_names or resolved.lstrip('/') in zip_names
+            if not in_zip or not zip_sizes:
+                continue
+            raw = adapter.resolve(child)
+            # Bare directory entries are keyed with a trailing slash in zip_names.
+            if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
+                continue
+            size = zip_sizes.get(raw, zip_sizes.get(raw.lstrip('/'), 0))
+            folder_bytes[fp] += size
 
-    def _status(fp: str) -> str:
+        done[0] += 1
+        if progress_cb and done[0] % _REPORT_EVERY == 0:
+            progress_cb(done[0], total)
+            time.sleep(0)
+
+    # Step 2: propagate child totals up to parents, deepest folders first.
+    for fp in sorted(folder_bytes, key=lambda p: p.count('/'), reverse=True):
+        if not fp:
+            continue  # never propagate from root
+        parent = fp.rsplit('/', 1)[0] if '/' in fp else ''
+        if parent and parent in folder_bytes:
+            folder_bytes[parent] += folder_bytes[fp]
+
+    folder_bytes.pop('', None)  # remove root
+    if progress_cb:
+        progress_cb(total, total)
+    return folder_bytes
+
+
+def _find_metadata_only_folders(
+    folder_map: dict,
+    zip_names: frozenset,
+    zip_ui_paths: frozenset | None,
+    adapter,
+) -> set:
+    """Return the set of iOS folder paths whose only in-zip content is Apple container metadata.
+
+    A folder qualifies if every file it (recursively) contains is in
+    _SYSTEM_METADATA_NAMES and at least one such file is present.  Truly
+    empty subfolders are ignored — they do not disqualify the parent.
+    Only call this for iOS archives (Graykey / Cellebrite FFS), not Android.
+    """
+    cache: dict[str, str] = {}  # fp -> "metadata_only" | "empty" | "content"
+
+    def _check(fp: str) -> str:
         if fp in cache:
             return cache[fp]
-        # Sentinel to cut cycles in malformed archives
-        cache[fp] = "empty"
+        cache[fp] = "empty"  # cycle guard
         has_metadata = False
         for child in folder_map.get(fp, []):
             if child in folder_map:
-                cs = _status(child)
+                cs = _check(child)
                 if cs == "content":
                     cache[fp] = "content"
                     return "content"
                 if cs == "metadata_only":
                     has_metadata = True
+                # "empty" subfolder — does not disqualify
             else:
-                if _in_zip_local(child):
-                    if child.split('/')[-1] in _SYSTEM_METADATA_NAMES:
-                        has_metadata = True
-                    else:
-                        cache[fp] = "content"
-                        return "content"
+                if zip_ui_paths is not None:
+                    in_zip = child in zip_ui_paths
+                else:
+                    resolved = adapter.resolve(child)
+                    in_zip = resolved in zip_names or resolved.lstrip('/') in zip_names
+                if not in_zip:
+                    continue
+                raw = adapter.resolve(child)
+                if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
+                    continue  # bare directory entry — skip
+                if child.split('/')[-1] in _SYSTEM_METADATA_NAMES:
+                    has_metadata = True
+                else:
+                    cache[fp] = "content"
+                    return "content"
         result = "metadata_only" if has_metadata else "empty"
         cache[fp] = result
         return result
 
-    for fp in list(folder_map.keys()):
-        _status(fp)
-        if progress_cb is not None:
-            counter[0] += 1
-            if counter[0] % _REPORT_EVERY == 0:
-                progress_cb(counter[0], total)
-                time.sleep(0)   # yield GIL so the main thread can process events
+    for fp in folder_map:
+        if fp:  # skip root
+            _check(fp)
 
-    if progress_cb is not None:
-        progress_cb(total, total)
-
-    return cache
+    return {fp for fp, v in cache.items() if v == "metadata_only"}
 
 
 def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
@@ -604,14 +659,6 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
             time.sleep(0)
     return {k: list(v) for k, v in folder_map_sets.items()}
 
-
-def _default_scan_folders(adapter) -> list[str]:
-    """Return the default header-scan folders for this archive format."""
-    if adapter.format == FfsAdapter.FORMAT_GRAYKEY:
-        return ['private/var/mobile/Containers/']
-    if adapter.format == FfsAdapter.FORMAT_ZIP_EXTRAS:
-        return ['data/data/']
-    return ['mobile/Containers/']
 
 
 def _collect_header_candidates(
@@ -689,10 +736,13 @@ class ZipMetadataWorker(QThread):
                 self.status_update.emit("Reading zip directory...")
                 if self._streaming_index is not None:
                     zip_names = frozenset(self._streaming_index.namelist())
+                    zip_sizes: dict[str, int] = {}
                     adapter = FfsAdapter.detect_from_names(zip_names)
                 else:
                     assert z_ctx is not None
-                    zip_names = frozenset(z_ctx.namelist())
+                    _infolist = z_ctx.infolist()
+                    zip_names = frozenset(info.filename for info in _infolist)
+                    zip_sizes = {info.filename: info.file_size for info in _infolist}
                     adapter = FfsAdapter.detect(z_ctx)
                 time.sleep(0)   # yield GIL after C-level frozenset build
 
@@ -721,7 +771,7 @@ class ZipMetadataWorker(QThread):
                 if self.scan_headers:
                     header_candidates = _collect_header_candidates(
                         self.zip_path, ui_metadata, adapter,
-                        _default_scan_folders(adapter),
+                        adapter.scan_folders(),
                         z=z_ctx, streaming_index=self._streaming_index,
                     )
             finally:
@@ -731,12 +781,7 @@ class ZipMetadataWorker(QThread):
             folder_map = _build_folder_tree(ui_metadata, status_cb=self.status_update.emit)
             time.sleep(0)   # yield GIL after folder tree build
 
-            _cp_prefix = "private/var/" if adapter.format == FfsAdapter.FORMAT_GRAYKEY else ""
-            _CONTAINER_PARENTS = (
-                _cp_prefix + "mobile/Containers/Data/Application",
-                _cp_prefix + "mobile/Containers/Data/PluginKitPlugin",
-                _cp_prefix + "mobile/Containers/Shared/AppGroup",
-            )
+            _CONTAINER_PARENTS = adapter.container_parents()
             missing_plist_paths = [
                 p for p in folder_map
                 if p.rsplit('/', 1)[0] in _CONTAINER_PARENTS
@@ -744,40 +789,40 @@ class ZipMetadataWorker(QThread):
                 and p.split('/')[-1] not in guid_to_bundle
             ]
 
-            _cached_content: dict | None = None
+            _cached_sizes: dict | None = None
             if self.case_dir:
                 try:
                     _db = _open_case_db(self.case_dir)
-                    _, _cc = load_folder_metadata(_db, self.zip_path)
+                    _, _fs = load_folder_metadata(_db, self.zip_path)
                     _db.close()
-                    if _cc:
-                        _cached_content = _cc
+                    if _fs:
+                        _cached_sizes = _fs
                 except Exception:
                     pass
 
-            if _cached_content is not None:
-                self.status_update.emit("Folder content status loaded from cache.")
-                content_cache = _cached_content
+            if _cached_sizes is not None:
+                self.status_update.emit("Folder sizes loaded from cache.")
+                folder_sizes = _cached_sizes
             else:
-                self.status_update.emit("Computing folder content status...")
-                content_cache = _precompute_content_cache(
-                    folder_map, zip_names, adapter,
+                self.status_update.emit("Computing folder sizes...")
+                folder_sizes = _compute_folder_sizes(
+                    folder_map, zip_names, zip_sizes, adapter,
+                    zip_ui_paths=zip_ui_paths,
                     progress_cb=lambda done, total: self.status_update.emit(
-                        f"Computing folder content status… {done:,}/{total:,}"),
-                    zip_ui_paths=zip_ui_paths)
+                        f"Computing folder sizes… {done:,}/{total:,}"))
 
             # Emit first — UI tree appears immediately. DB write happens after.
             self.metadata_ready.emit(
                 ui_metadata, folder_map, guid_to_bundle, zip_names,
-                adapter, missing_plist_paths, content_cache, zip_ui_paths)
+                adapter, missing_plist_paths, folder_sizes, zip_ui_paths)
 
             if self.case_dir:
                 try:
                     _db = _open_case_db(self.case_dir)
                     if _need_save_guid:
                         save_guid_bundle_map(_db, self.zip_path, guid_to_bundle)
-                    if _cached_content is None:
-                        save_folder_status(_db, self.zip_path, content_cache)
+                    if _cached_sizes is None:
+                        save_folder_sizes(_db, self.zip_path, folder_sizes)
                     _db.close()
                 except Exception:
                     pass
@@ -1510,7 +1555,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.guid_to_bundle = {}
         self.zip_names: frozenset = frozenset()
         self._zip_ui_paths: frozenset | None = None
-        self._real_content_cache: dict = {}
+        self._folder_sizes: dict = {}
+        self._metadata_only_folders: set = set()
         self._file_count_cache: dict = {}
         self._precompute_zip_path: str = ""
         self._zip_handle: zipfile.ZipFile | None = None
@@ -1615,16 +1661,19 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_view.setModel(self.tree_model)
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_tree_context_menu)
-        self.tree_view.clicked.connect(self.on_folder_selected)
+        self.tree_view.clicked.connect(self._on_tree_clicked)
         self.tree_view.expanded.connect(self._on_tree_item_expanded)
         self.tree_view.setToolTip("Right-click a folder to export")
-        # Interactive: column width is fixed until the user drags it.
-        # Long names get a horizontal scrollbar rather than pushing the splitter.
+        # Column fills the panel; a horizontal scrollbar appears for deeply
+        # indented items because the column is kept at least _TREE_COL_MIN wide.
+        # The event filter on tree_view keeps the column in sync as the panel resizes.
         self.tree_view.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.tree_view.header().setStretchLastSection(True)
-        self.tree_view.header().setDefaultSectionSize(260)
+        self.tree_view.header().setStretchLastSection(False)
         self.tree_view.setMinimumWidth(0)
         self.tree_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_view.installEventFilter(self)
+        self.tree_view.header().sectionHandleDoubleClicked.connect(
+            lambda _: QTimer.singleShot(0, self._update_tree_column))
 
         tree_header = QLabel("Folder Tree")
         tree_header.setStyleSheet(_section_style)
@@ -1833,12 +1882,27 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return ui_path in self._zip_ui_paths
         return self._adapter.resolve(ui_path) in self.zip_names
 
+    def _should_hide_folder(self, path: str) -> bool:
+        """Return True when this folder should be suppressed from both tree and browser.
+
+        Single source of truth — used by _populate_tree_children and _classify_entry
+        so the two views can never show different sets of folders.
+
+        """
+        if not self._hide_empty_folders:
+            return False
+        if path in self._missing_plist_paths:
+            return False
+        if path not in self._folder_sizes:
+            return False
+        return self._folder_total_size(path) == 0 or path in self._metadata_only_folders
+
     def _is_empty_folder_entry(self, ui_path) -> bool:
         """True when the ZIP contains a bare directory entry for this path (trailing slash)."""
         return (self._adapter.resolve(ui_path) + "/") in self.zip_names
 
-    def _folder_content_status(self, folder_path) -> str:
-        return self._real_content_cache.get(folder_path, 'empty')
+    def _folder_total_size(self, folder_path: str) -> int:
+        return self._folder_sizes.get(folder_path, 0)
 
     def _bundle_for_path(self, path):
         """Return the bundle ID for the nearest GUID ancestor of path, or None."""
@@ -2031,7 +2095,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_view.setCurrentIndex(new_idx)
         def _scroll():
             self.tree_view.scrollTo(new_idx, QTreeView.ScrollHint.PositionAtCenter)
-            self.tree_view.horizontalScrollBar().setValue(0)
+            # EnsureVisible on horizontal only: scroll left until the item's
+            # left edge (including indent) is visible, but no further.
+            rect = self.tree_view.visualRect(new_idx)
+            if rect.x() < 0:
+                hbar = self.tree_view.horizontalScrollBar()
+                hbar.setValue(hbar.value() + rect.x())
         QTimer.singleShot(0, _scroll)
         self._view_is_recursive = False
         self.on_folder_selected(new_idx)
@@ -2055,6 +2124,19 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     self.file_view.setCurrentIndex(proxy_idx)
                     self.file_view.scrollTo(proxy_idx)
                 break
+
+    def eventFilter(self, obj, event):
+        if obj is self.tree_view and event.type() == event.Type.Resize:
+            self._update_tree_column()
+        return super().eventFilter(obj, event)
+
+    def _update_tree_column(self):
+        """Keep the tree column filling the panel, with a minimum for deep nesting."""
+        vw = self.tree_view.viewport().width()
+        self.tree_view.header().resizeSection(0, max(vw, _TREE_COL_MIN))
+
+    def _on_tree_clicked(self, index):
+        self.on_folder_selected(index)
 
     def on_folder_selected(self, index):
         item = self.tree_model.itemFromIndex(index)
@@ -2115,28 +2197,31 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """Strip the archive-format prefix so display paths start from the
         user-partition root (e.g. 'mobile/Containers/...' not
         'filesystem2/mobile/Containers/...')."""
-        p = path.lstrip('/')
-        prefix = self._adapter.user_prefix + '/'
-        if p.startswith(prefix):
-            p = p[len(prefix):]
-        if p.startswith('private/var/'):
-            p = p[len('private/var/'):]
-        return p
+        return self._adapter.strip_display_prefix(path)
 
     def _classify_entry(self, path: str, name: str, is_folder: bool):
         """Return (file_type, grey_row, skip) for one file/folder entry.
         skip=True means the caller should exclude this entry from the view."""
         if is_folder:
-            status = self._folder_content_status(path)
-            if self._hide_empty_folders and status in ("empty", "metadata_only") \
-                    and path not in self._missing_plist_paths:
+            if self._should_hide_folder(path):
                 return None, None, True
-            if status == "content":
-                return _get_file_type(name, True), False, False
-            if status == "metadata_only":
+            if path in self._metadata_only_folders:
                 return "Folder - Metadata Only", True, False
-            return "Empty Folder", True, False
+            if self._folder_total_size(path) == 0:
+                return "Empty Folder", True, False
+            return _get_file_type(name, True), False, False
         if self._in_zip(path):
+            # Directory entries in FORMAT_ZIP_EXTRAS land in zip_ui_paths with
+            # their trailing slash stripped — detect them before calling
+            # _get_file_type so they never appear as "Other".
+            if self._is_empty_folder_entry(path):
+                if self._hide_empty_folders:
+                    return None, None, True
+                return "Empty Folder", True, False
+            if self._hide_empty_folders:
+                _sz = (self.full_metadata.get(path) or {}).get('size', -1)
+                if _sz == 0:
+                    return None, None, True
             ft = _get_file_type(name, False)
             if ft == 'Other' and path in self._header_type_overrides:
                 ft = self._header_type_overrides[path]
@@ -2145,6 +2230,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if self._hide_empty_folders:
                 return None, None, True
             return "Empty Folder", True, False
+        if self._hide_empty_folders:
+            _sz = (self.full_metadata.get(path) or {}).get('size', -1)
+            if _sz == 0:
+                return None, None, True
         return "Not in Zip", True, False
 
     def _build_entry_cols(self, path: str, name: str, meta: dict,
@@ -2152,9 +2241,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         cols: list = [self._display_name(name)]
         for _, key in self._time_cols:
             cols.append(self.format_ts(meta.get(key)))
+        size_val = self._folder_total_size(path) if is_folder else meta.get('size', 0)
         cols += [
             file_type,
-            f"{meta.get('size', 0):,}",
+            f"{size_val:,}",
             f"{fc:,}" if is_folder else "",
             self._display_path(path),
         ]
@@ -2562,11 +2652,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _adapt_shortcut_path(self, path: str) -> str:
         """Prefix shortcut paths for iOS GrayKey, where every ui_path starts
         with private/var/.  Android GrayKey paths need no prefix."""
-        if (self._adapter and
-                self._adapter.format == FfsAdapter.FORMAT_GRAYKEY and
-                not self._is_android_archive() and
-                not path.startswith('private/')):
-            return 'private/var/' + path
+        if self._adapter and not self._is_android_archive():
+            return self._adapter.prefix_shortcut(path)
         return path
 
     def _build_jump_menu(self, menu, items):
@@ -2964,7 +3051,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.worker.header_scan_done.connect(self._on_header_scan_done)
         self.worker.start()
 
-    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, adapter, missing_plist_paths, content_cache, zip_ui_paths=None):
+    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None):
         self.full_metadata = data
         self.folder_map = folder_map
         self.guid_to_bundle = guid_map
@@ -2972,8 +3059,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._adapter = adapter
         self._android_user_data_path = self._detect_android_user_data(folder_map)
         self._missing_plist_paths = set(missing_plist_paths)
-        self._real_content_cache = content_cache
+        self._folder_sizes = folder_sizes
         self._zip_ui_paths = zip_ui_paths
+        if adapter.format != FfsAdapter.FORMAT_ZIP_EXTRAS:
+            self._metadata_only_folders = _find_metadata_only_folders(
+                folder_map, zip_names, zip_ui_paths, adapter)
+        else:
+            self._metadata_only_folders = set()
         self._header_type_overrides = {}
         self._file_count_cache = {}
         if self._case_dir:
@@ -3018,7 +3110,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # Metadata-only or empty folders have no extractable files so the
             # missing plist does not affect the user.
             actionable = [p for p in missing_plist_paths
-                          if self._folder_content_status(p) == "content"]
+                          if self._folder_total_size(p) > 0]
             if actionable:
                 self._warn_and_select_missing(actionable)
 
@@ -3124,7 +3216,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not self.folder_map: return
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
-        self.tree_model.blockSignals(True)
+        self._tree_populating = True
         root_item = QStandardItem("/ [Full Filesystem]")
         root_item.setData("", Qt.ItemDataRole.UserRole)
         root_item.setEditable(False)
@@ -3134,7 +3226,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_model.invisibleRootItem().appendRow(root_item)
         self._populate_tree_children(root_item, "")
         self.tree_view.expand(self.tree_model.indexFromItem(root_item))
-        self.tree_model.blockSignals(False)
+        self._tree_populating = False
         if hasattr(self, '_adapter'):
             fmt_label = "GrayKey" if self._adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
             self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
@@ -3148,12 +3240,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _fit_splitter_to_tree(self):
         """Resize the splitter so the tree panel is wide enough to show its
-        content without horizontal scrolling.  The user can drag it smaller."""
+        top-level content.  The user can drag it smaller or larger."""
+        # Measure natural content width (only top-level rows are loaded due to
+        # lazy expansion).  resizeColumnToContents sets the column to content
+        # width, but _update_tree_column will immediately restore it to the
+        # correct 1000 px minimum — so we read the value first, then restore.
         self.tree_view.resizeColumnToContents(0)
-        col_w = self.tree_view.columnWidth(0)
-        # resizeColumnToContents only measures loaded rows (top-level due to
-        # lazy loading), so enforce a sensible minimum of 280px.
-        tree_w = max(col_w, 280) + self.tree_view.verticalScrollBar().sizeHint().width() + 12
+        content_w = self.tree_view.columnWidth(0)
+        self._update_tree_column()   # restore to max(viewport, _TREE_COL_MIN)
+        tree_w = max(content_w, 280) + self.tree_view.verticalScrollBar().sizeHint().width() + 12
         total = self.splitter.width()
         if total > 0:
             self.splitter.setSizes([tree_w, max(total - tree_w, 200)])
@@ -3168,10 +3263,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             is_empty_dir = not in_fm and self._is_empty_folder_entry(p)
             if not in_fm and not is_empty_dir:
                 continue  # genuine file — not a directory
+            if in_fm and self._should_hide_folder(p):
+                continue
             if is_empty_dir and self._hide_empty_folders:
-                continue  # empty dir hidden by user preference
-            if in_fm and self._hide_empty_folders and \
-                    self._folder_content_status(p) in ("empty", "metadata_only"):
                 continue
             name = p.split('/')[-1]
             item = QStandardItem(self._display_name(name))
@@ -3189,7 +3283,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 item.appendRow(placeholder)
 
     def _on_tree_item_expanded(self, index):
-        """Lazy-load children when a tree node is expanded for the first time."""
+        """Lazy-load children when a tree node is expanded for the first time.
+
+        The horizontal scroll position is saved before children are added and
+        restored after Qt's internal scrollTo settles, so expanding a node
+        never shifts the tree sideways.
+        """
+        hpos = self.tree_view.horizontalScrollBar().value()
         item = self.tree_model.itemFromIndex(index)
         if item is None or item.rowCount() != 1:
             return
@@ -3200,12 +3300,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if path is None:
             return
         self._tree_populating = True
-        self.tree_model.blockSignals(True)
         item.removeRow(0)
         self._populate_tree_children(item, path)
-        self.tree_model.blockSignals(False)
         self._tree_populating = False
-        self.tree_view.viewport().update()
+        QTimer.singleShot(0, lambda pos=hpos: self.tree_view.horizontalScrollBar().setValue(pos))
 
     def _ensure_children_loaded(self, item):
         """If item still holds only a placeholder, replace it with real children."""
@@ -3215,10 +3313,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 path = item.data(Qt.ItemDataRole.UserRole)
                 if path is not None:
                     self._tree_populating = True
-                    self.tree_model.blockSignals(True)
                     item.removeRow(0)
                     self._populate_tree_children(item, path)
-                    self.tree_model.blockSignals(False)
                     self._tree_populating = False
 
     def _ensure_all_descendants_loaded(self, item):

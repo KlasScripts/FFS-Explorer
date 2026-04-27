@@ -302,6 +302,45 @@ class FfsAdapter:
                 candidates.append(f"/{s}")
         return candidates
 
+    def container_parents(self) -> tuple[str, ...]:
+        """Return ui_path prefixes for app container parent folders."""
+        pv = "private/var/" if self.format == self.FORMAT_GRAYKEY else ""
+        return (
+            pv + "mobile/Containers/Data/Application",
+            pv + "mobile/Containers/Data/PluginKitPlugin",
+            pv + "mobile/Containers/Shared/AppGroup",
+        )
+
+    def scan_folders(self) -> list[str]:
+        """Return default header-scan folder prefixes for this format."""
+        if self.format == self.FORMAT_GRAYKEY:
+            return ['private/var/mobile/Containers/']
+        if self.format == self.FORMAT_ZIP_EXTRAS:
+            return ['data/data/']
+        return ['mobile/Containers/']
+
+    def strip_display_prefix(self, path: str) -> str:
+        """Strip the archive-format prefix for display.
+
+        Removes the physical zip prefix (e.g. 'filesystem2/' or '/private/var/')
+        so the path starts from the user-partition root."""
+        p = path.lstrip('/')
+        prefix = self.user_prefix + '/'
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+        if self.format == self.FORMAT_GRAYKEY and p.startswith('private/var/'):
+            p = p[len('private/var/'):]
+        return p
+
+    def prefix_shortcut(self, path: str) -> str:
+        """Add the format-appropriate prefix to a bare shortcut path.
+
+        GrayKey iOS ui_paths start with 'private/var/'; shortcut definitions
+        omit this prefix for readability, so it must be re-added at use time."""
+        if self.format == self.FORMAT_GRAYKEY and not path.startswith('private/'):
+            return 'private/var/' + path
+        return path
+
     # ── Metadata loading ──────────────────────────────────────────────────────
 
     def load_metadata(self, zip_path: str, z: zipfile.ZipFile) -> dict:
@@ -418,40 +457,39 @@ class FfsAdapter:
         user_prefix_slash = self.user_prefix + '/'
         old_pv_slash      = (user_prefix_slash + 'private/var/') if self.old_layout else None
         old_pv_len        = len(old_pv_slash) if old_pv_slash else 0
+        strip_for_fs      = {self.user_prefix: len(user_prefix_slash)}
 
-        # Only scan the user partition — system partition entries have no msgpack
-        # metadata (raw_data is from metadata2, user only) so they would be added
-        # with empty {} metadata.  sys_prefix is still known for direct file reads.
-        user_fs_slash = self.user_prefix + '/'
-        strip_for_fs = {self.user_prefix: len(user_fs_slash)}
-
+        # Pass 1 — discover: the zip central directory is the single source of
+        # truth for what exists.  Directory records (entry[-1]=='/') are normalised
+        # by stripping the trailing slash so they contribute folder metadata from
+        # the msgpack just like file entries do.
         _emit(f"Scanning user partition ({self.user_prefix})…")
-        ui_metadata: dict = {}
+        _zip_entries: dict[str, str] = {}   # ui_path → physical zip entry (no trailing slash)
         for entry in zip_names:
-            if entry[-1] == '/':
-                continue
-            slash = entry.find('/')
+            phys = entry.rstrip('/')        # normalise: dir records treated same as files
+            slash = phys.find('/')
             if slash < 0:
                 continue
-            base_strip = strip_for_fs.get(entry[:slash])
-            if base_strip is None:
+            if strip_for_fs.get(phys[:slash]) is None:
                 continue
-            if old_pv_slash and entry.startswith(old_pv_slash):
-                ui_path = entry[old_pv_len:]
-            else:
-                ui_path = entry[base_strip:]
-            meta = raw_data.get(ui_path)
-            if meta is None and '-' in ui_path:
-                meta = guid_meta.get(entry, {})
-            ui_metadata[ui_path] = meta or {}
+            ui_path = (phys[old_pv_len:] if old_pv_slash and phys.startswith(old_pv_slash)
+                       else phys[len(user_prefix_slash):])
+            if not ui_path:
+                continue                    # the prefix dir itself — skip
+            _zip_entries[ui_path] = phys
 
-        # Capture zip_ui_paths before adding msgpack-only entries (folder metadata)
-        zip_ui_paths = frozenset(ui_metadata.keys())
+        zip_ui_paths = frozenset(_zip_entries)
 
-        # Add entries from the msgpack that have no zip entry (typically folders
-        # whose directory records were omitted from the zip).
-        for ui_path, v in raw_data.items():
-            if ui_path not in ui_metadata:
-                ui_metadata[ui_path] = v
+        # Pass 2 — enrich: msgpack is a read-only lookup; it never introduces new
+        # keys.  Anything in the msgpack but absent from the zip simply doesn't
+        # exist as far as the browser is concerned — no "Not in Zip" entries.
+        ui_metadata: dict = {
+            ui_path: (
+                raw_data.get(ui_path)
+                or (guid_meta.get(phys) if '-' in ui_path else None)
+                or {}
+            )
+            for ui_path, phys in _zip_entries.items()
+        }
 
         return ui_metadata, guid_to_bundle, zip_ui_paths

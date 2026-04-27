@@ -3,6 +3,11 @@
 import os
 import sqlite3
 
+# Increment whenever the content-status logic changes (e.g. new status values).
+# Cached status dicts whose version marker doesn't match are discarded so the
+# folder scan re-runs with the current logic.
+_FOLDER_CACHE_VERSION = '5'
+
 
 def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     """Open (or create) the per-case database inside *cache_dir*.
@@ -121,9 +126,14 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
             folder_path TEXT    NOT NULL,
             count       INTEGER,
             status      TEXT,
+            total_size  INTEGER,
             PRIMARY KEY (zip_path, folder_path)
         )
     ''')
+    try:
+        conn.execute('ALTER TABLE folder_metadata ADD COLUMN total_size INTEGER')
+    except Exception:
+        pass  # column already exists
 
     # Drop any leftover tables from previous versions — no longer used.
     conn.execute('DROP TABLE IF EXISTS content_cache')
@@ -171,16 +181,21 @@ def load_header_types(conn: 'sqlite3.Connection', zip_path: str) -> dict:
     return {ui_path: t for ui_path, t in rows}
 
 
-def save_folder_status(conn: 'sqlite3.Connection', zip_path: str, cache: dict) -> None:
-    """Persist {folder_path: status} into folder_metadata, clearing prior rows for zip_path.
+def save_folder_sizes(conn: 'sqlite3.Connection', zip_path: str, sizes: dict) -> None:
+    """Persist {folder_path: total_bytes} into folder_metadata, clearing prior rows for zip_path.
 
-    Called first (from the load worker).  count is left NULL and filled in later
-    by save_folder_counts once background precomputation finishes.
+    A version marker row (folder_path='__v__') is written alongside the data so
+    that load_folder_metadata can detect and discard stale caches when the
+    computation logic changes.
     """
     conn.execute('DELETE FROM folder_metadata WHERE zip_path=?', (zip_path,))
     conn.executemany(
+        'INSERT INTO folder_metadata (zip_path, folder_path, total_size) VALUES (?,?,?)',
+        [(zip_path, p, s) for p, s in sizes.items()],
+    )
+    conn.execute(
         'INSERT INTO folder_metadata (zip_path, folder_path, status) VALUES (?,?,?)',
-        [(zip_path, p, s) for p, s in cache.items()],
+        (zip_path, '__v__', _FOLDER_CACHE_VERSION),
     )
     conn.commit()
 
@@ -201,19 +216,26 @@ def save_folder_counts(conn: 'sqlite3.Connection', zip_path: str, counts: dict) 
 
 
 def load_folder_metadata(conn: 'sqlite3.Connection', zip_path: str) -> tuple[dict, dict]:
-    """Return (counts, status_cache) previously saved for zip_path.
+    """Return (counts, sizes) previously saved for zip_path.
 
-    counts       — {folder_path: int}  (only rows where count IS NOT NULL)
-    status_cache — {folder_path: str}  (only rows where status IS NOT NULL)
+    counts — {folder_path: int}  (only rows where count IS NOT NULL)
+    sizes  — {folder_path: int}  (only rows where total_size IS NOT NULL)
     Both dicts are empty if nothing has been saved yet.
+
+    If the stored version marker is absent or does not match _FOLDER_CACHE_VERSION
+    sizes is returned empty so the caller recomputes with current logic.
+    Counts are always returned as-is (they are version-independent).
     """
     rows = conn.execute(
-        'SELECT folder_path, count, status FROM folder_metadata WHERE zip_path=?',
+        'SELECT folder_path, count, status, total_size FROM folder_metadata WHERE zip_path=?',
         (zip_path,),
     ).fetchall()
-    counts = {p: c for p, c, s in rows if c is not None}
-    status = {p: s for p, c, s in rows if s is not None}
-    return counts, status
+    counts = {p: c for p, c, s, ts in rows if c is not None}
+    version = next((s for p, c, s, ts in rows if p == '__v__'), None)
+    if version != _FOLDER_CACHE_VERSION:
+        return counts, {}
+    sizes = {p: ts for p, c, s, ts in rows if ts is not None and p != '__v__'}
+    return counts, sizes
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

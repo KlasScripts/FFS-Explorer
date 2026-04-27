@@ -124,12 +124,16 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
         # 2-second precision).  Only used when the entry carries no Unix
         # timestamp whatsoever; a UT block with mtime=0 is honoured as-is
         # (displayed as "---") rather than being overwritten with the DOS date.
+        # DOS year 1980 is the epoch zero for the format (meaning "not set").
         import calendar
         dt = f.date_time   # (year, month, day, hour, min, sec)
-        try:
-            mtime = int(calendar.timegm(dt + (0, 0, -1)))
-        except (ValueError, OverflowError):
+        if dt[0] <= 1980:
             mtime = 0
+        else:
+            try:
+                mtime = int(calendar.timegm(dt + (0, 0, -1)))
+            except (ValueError, OverflowError):
+                mtime = 0
 
     # UID/GID from UX block: version(1B) uid_sz(1B) uid(uid_sz B) gid_sz(1B) gid(gid_sz B)
     ux = _find_block(extra, _TAG_UX)

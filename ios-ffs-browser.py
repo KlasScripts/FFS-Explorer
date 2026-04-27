@@ -1452,12 +1452,25 @@ class ArtifactRunnerDialog(QDialog):
                 return any(c in streaming_index for c in candidates)
             return any(c in zip_names for c in candidates)
 
-        available = []
-        for script_name, mod in all_artifacts:
-            for ui_path in getattr(mod, 'target_paths', []):
-                if _exists(adapter.user_candidates(ui_path)):
-                    available.append((script_name, mod))
-                    break
+        def _mod_matches(mod):
+            # Multi-file API: app_path + files
+            if hasattr(mod, 'app_path') and hasattr(mod, 'files'):
+                app_base = mod.app_path.strip('/')
+                return any(
+                    _exists(adapter.user_candidates(f"{app_base}/{sub.lstrip('/')}"))
+                    for sub in mod.files.values()
+                )
+            # Single-file API: target_paths
+            return any(
+                _exists(adapter.user_candidates(ui_path))
+                for ui_path in getattr(mod, 'target_paths', [])
+            )
+
+        available = [
+            (script_name, mod)
+            for script_name, mod in all_artifacts
+            if _mod_matches(mod)
+        ]
 
         layout = QVBoxLayout(self)
 
@@ -2892,10 +2905,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         mod      = modules.get(script_name)
         if not mod:
             return
-        target_paths = getattr(mod, 'target_paths', [])
-        if not target_paths:
-            return
-        parent = '/'.join(target_paths[0].split('/')[:-1])
+        if hasattr(mod, 'app_path') and hasattr(mod, 'files'):
+            first_sub = next(iter(mod.files.values()), None)
+            if not first_sub:
+                return
+            first_path = mod.app_path.strip('/') + '/' + first_sub.lstrip('/')
+        else:
+            target_paths = getattr(mod, 'target_paths', [])
+            if not target_paths:
+                return
+            first_path = target_paths[0]
+        parent = '/'.join(first_path.split('/')[:-1])
         self.center_tabs.setCurrentIndex(0)   # switch to File Browser
         self.navigate_tree_to_path(parent)
 

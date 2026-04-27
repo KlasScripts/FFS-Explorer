@@ -1,14 +1,26 @@
 """artifact_runner.py — loads and runs artifact parser scripts.
 
 Artifact scripts live in artifacts/ios/ or artifacts/android/.
-Each script exposes:
-    name         (str)        — human-readable label
-    target_paths (list[str])  — ui_paths of the target file(s), relative to
-                                the user partition (e.g. "mobile/Library/SMS/sms.db")
-    run(db)                   — receives a sqlite3.Connection; returns list[dict]
+
+Two script APIs are supported:
+
+Single-file (legacy, iOS-style):
+    name         str        — human-readable label
+    target_paths list[str]  — one or more ui_paths tried in order
+                              (e.g. "mobile/Library/SMS/sms.db")
+    run(db)                 — receives a sqlite3.Connection; returns list[dict]
+
+Multi-file (new, for scripts that need several databases):
+    name      str            — human-readable label
+    app_path  str            — base path of the app within the user partition
+                               (e.g. "data/data/com.whatsapp")
+    files     dict[str,str]  — {key: subpath} where subpath is relative to
+                               app_path (e.g. {"msgstore": "databases/msgstore.db"})
+    run(paths)               — receives dict[str, str] mapping each key to the
+                               extracted file's path on disk; returns list[dict]
 
 Source files are saved to:
-    case_dir/artifact_parser_files/<Parser Name>/original_filename.db
+    case_dir/artifact_parser_files/<Parser Name>/original_filename
 
 Files are kept so investigators can open them directly, and re-running a
 parser skips extraction if the file is already present.
@@ -73,10 +85,35 @@ def _save_entry(zip_entry: ZipEntry, dest_path: str) -> None:
         f.write(data)
 
 
-# ── Opening saved files as SQLite connections ─────────────────────────────────
+def _extract_candidate(
+    candidates: list[str],
+    zip_path: str,
+    dest_path: str,
+    zip_obj: zipfile.ZipFile | None,
+    streaming_index,
+) -> bool:
+    """Try each candidate path and extract the first match to dest_path.
 
-def _open_db(file_path: str) -> sqlite3.Connection:
-    return sqlite3.connect(file_path)
+    Returns True if a file was found and saved (or already existed), False if
+    none of the candidates exist in the archive.
+    """
+    if streaming_index is not None:
+        for candidate in candidates:
+            if candidate not in streaming_index:
+                continue
+            _save_entry(streaming_index.get_entry(candidate), dest_path)
+            return True
+
+    if zip_obj is not None:
+        zip_names = set(zip_obj.namelist())
+        for candidate in candidates:
+            if candidate not in zip_names:
+                continue
+            zinfo = zip_obj.getinfo(candidate)
+            _save_entry(ZipEntry(zip_path, candidate, zinfo), dest_path)
+            return True
+
+    return False
 
 
 # ── Running ───────────────────────────────────────────────────────────────────
@@ -98,48 +135,41 @@ def run_artifact(
     Returns (rows, error).  On success rows is a list[dict] and error is ''.
     On failure rows is [] and error describes what went wrong.
     """
-    target_paths = getattr(module, 'target_paths', [])
-    if not target_paths:
-        return [], f"{script_name}: no target_paths defined"
-
     parser_name = getattr(module, 'name', script_name)
     dest_dir    = _parser_files_dir(case_dir, parser_name)
 
+    # ── Multi-file API ────────────────────────────────────────────────────────
+    if hasattr(module, 'app_path') and hasattr(module, 'files'):
+        app_base = module.app_path.strip('/')
+        paths: dict[str, str] = {}
+        for key, subpath in module.files.items():
+            ui_path    = f"{app_base}/{subpath.lstrip('/')}"
+            candidates = adapter.user_candidates(ui_path)
+            dest_path  = os.path.join(dest_dir, os.path.basename(subpath))
+            if not _extract_candidate(candidates, zip_path, dest_path, zip_obj, streaming_index):
+                return [], f"{script_name}: file not found: {ui_path}"
+            paths[key] = dest_path
+        try:
+            return module.run(paths) or [], ''
+        except Exception as exc:
+            return [], f"{script_name}: {exc}"
+
+    # ── Single-file API (legacy) ──────────────────────────────────────────────
+    target_paths = getattr(module, 'target_paths', [])
+    if not target_paths:
+        return [], f"{script_name}: no target_paths or files defined"
+
     for ui_path in target_paths:
-        candidates  = adapter.user_candidates(ui_path)
-        filename    = os.path.basename(ui_path)
-        dest_path   = os.path.join(dest_dir, filename)
-
-        # ── Streaming index ───────────────────────────────────────────────────
-        if streaming_index is not None:
-            for candidate in candidates:
-                if candidate not in streaming_index:
-                    continue
-                entry = streaming_index.get_entry(candidate)
-                try:
-                    _save_entry(entry, dest_path)
-                    db   = _open_db(dest_path)
-                    rows = module.run(db)
-                    db.close()
-                    return rows or [], ''
-                except Exception as exc:
-                    return [], f"{script_name}: {exc}"
-
-        # ── Regular zipfile ───────────────────────────────────────────────────
-        if zip_obj is not None:
-            zip_names = set(zip_obj.namelist())
-            for candidate in candidates:
-                if candidate not in zip_names:
-                    continue
-                try:
-                    zinfo = zip_obj.getinfo(candidate)
-                    entry = ZipEntry(zip_path, candidate, zinfo)
-                    _save_entry(entry, dest_path)
-                    db    = _open_db(dest_path)
-                    rows  = module.run(db)
-                    db.close()
-                    return rows or [], ''
-                except Exception as exc:
-                    return [], f"{script_name}: {exc}"
+        candidates = adapter.user_candidates(ui_path)
+        dest_path  = os.path.join(dest_dir, os.path.basename(ui_path))
+        if not _extract_candidate(candidates, zip_path, dest_path, zip_obj, streaming_index):
+            continue
+        try:
+            db   = sqlite3.connect(dest_path)
+            rows = module.run(db)
+            db.close()
+            return rows or [], ''
+        except Exception as exc:
+            return [], f"{script_name}: {exc}"
 
     return [], f"{script_name}: target file not found in archive"

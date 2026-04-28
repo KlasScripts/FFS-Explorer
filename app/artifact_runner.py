@@ -30,13 +30,19 @@ import importlib.util
 import os
 import re
 import sqlite3
+import sys
 import zipfile
 
 from zip_entry import ZipEntry
 
-_ARTIFACTS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'artifacts'
-)
+if getattr(sys, 'frozen', False):
+    # PyInstaller bundle: data files land in sys._MEIPASS
+    _ARTIFACTS_DIR = os.path.join(sys._MEIPASS, 'artifacts')
+else:
+    # Source layout: artifacts/ sits two levels above app/artifact_runner.py
+    _ARTIFACTS_DIR = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'artifacts'
+    )
 
 
 # ── Loading ───────────────────────────────────────────────────────────────────

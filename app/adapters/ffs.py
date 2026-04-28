@@ -354,7 +354,8 @@ class FfsAdapter:
             raw = _gk.extract_metadata(zip_path, z)
             return {k.lstrip("/"): v for k, v in raw.items()}
         if self.format == self.FORMAT_ZIP_EXTRAS:
-            return _gk.extract_with_prefix(zip_path, self.user_prefix, z)
+            return _gk.extract_with_prefix(zip_path, self.user_prefix, z,
+                                            cd_only=True)
         else:
             for candidate in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
                 try:

@@ -205,7 +205,8 @@ def extract(zip_path: str, z: zipfile.ZipFile | None = None) -> dict:
 
 
 def extract_with_prefix(zip_path: str, strip_prefix: str,
-                        z: zipfile.ZipFile | None = None) -> dict:
+                        z: zipfile.ZipFile | None = None,
+                        cd_only: bool = False) -> dict:
     """
     Parse a zip whose entries carry UT/UX extra fields but no GrayKey block.
     Strips *strip_prefix* (e.g. 'Dump/') from entry names to produce ui_paths.
@@ -216,6 +217,11 @@ def extract_with_prefix(zip_path: str, strip_prefix: str,
     UT timestamps (mtime, atime, ctime) are available — the central-directory
     copy of UT only carries mtime, so using ZipInfo.extra alone would lose
     atime and ctime.
+
+    *cd_only=True* skips the local-header probe entirely and uses only the
+    central-directory extra fields.  Use this when the format is known to store
+    no additional timestamp data in local headers (e.g. Cellebrite Android),
+    avoiding both the probe seeks and any risk of a costly full-archive scan.
     """
     slash = strip_prefix if strip_prefix.endswith('/') else strip_prefix + '/'
     entries: list[tuple[str, zipfile.ZipInfo]] = []
@@ -238,10 +244,13 @@ def extract_with_prefix(zip_path: str, strip_prefix: str,
         if _close:
             z.close()
 
+    if cd_only:
+        return {name: _parse_entry(f) for name, f in entries}
+
     # Probe up to 8 file entries to decide whether local file header extras
     # carry more UT data than the central directory copy.  If every probe shows
     # a local UT block no longer than the CD UT block, the archive only stores
-    # mtime (Cellebrite Android pattern) — skip 100K+ raw seeks and use f.extra.
+    # mtime — skip 100K+ raw seeks and use f.extra.
     _need_local = False
     with open(zip_path, 'rb') as rf:
         for _, f in entries[:8]:
@@ -256,19 +265,17 @@ def extract_with_prefix(zip_path: str, strip_prefix: str,
                 _need_local = True
                 break
 
-    result = {}
     if not _need_local:
-        # Central directory has everything available — no raw seeks needed.
+        return {name: _parse_entry(f) for name, f in entries}
+
+    result = {}
+    with open(zip_path, 'rb') as rf:
         for name, f in entries:
-            result[name] = _parse_entry(f)
-    else:
-        with open(zip_path, 'rb') as rf:
-            for name, f in entries:
-                rf.seek(f.header_offset + 26)
-                fname_len, extra_len = struct.unpack('<HH', rf.read(4))
-                rf.seek(f.header_offset + 30 + fname_len)
-                local_extra = rf.read(extra_len)
-                result[name] = _parse_entry(f, local_extra if local_extra else None)
+            rf.seek(f.header_offset + 26)
+            fname_len, extra_len = struct.unpack('<HH', rf.read(4))
+            rf.seek(f.header_offset + 30 + fname_len)
+            local_extra = rf.read(extra_len)
+            result[name] = _parse_entry(f, local_extra if local_extra else None)
     return result
 
 

@@ -426,7 +426,7 @@ class FfsAdapter:
                 else:
                     _emit("Bundle ID map loaded from cache.")
             else:
-                _emit("Android zip extras archive detected — extracting metadata...")
+                _emit("Cellebrite Android archive detected — reading metadata...")
                 guid_to_bundle = {}
             ui_metadata = self.load_metadata(zip_path, z)
             return ui_metadata, guid_to_bundle, frozenset(ui_metadata.keys())

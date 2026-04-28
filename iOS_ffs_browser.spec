@@ -15,6 +15,9 @@ a = Analysis(
         ('config/hardware_models.json', 'config'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),
+        # Artifact parser scripts — loaded dynamically so PyInstaller can't
+        # detect them via import analysis; must be listed explicitly.
+        ('artifacts', 'artifacts'),
     ],
     hiddenimports=[
         # msgpack sometimes needs explicit nudging

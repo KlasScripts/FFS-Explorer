@@ -354,8 +354,32 @@ class FfsAdapter:
             raw = _gk.extract_metadata(zip_path, z)
             return {k.lstrip("/"): v for k, v in raw.items()}
         if self.format == self.FORMAT_ZIP_EXTRAS:
-            return _gk.extract_with_prefix(zip_path, self.user_prefix, z,
-                                            cd_only=True)
+            # Central directory ZipInfo objects are already in memory — no
+            # local-header seeks needed.  atime and ctime are always zero in
+            # this format; mtime is read from the UT extra block (already in
+            # f.extra) and file_size comes straight from the ZipInfo.
+            slash = self.user_prefix.rstrip('/') + '/'
+            result = {}
+            for f in z.infolist():
+                name = f.filename.rstrip('/')
+                if not name.startswith(slash):
+                    continue
+                ui_path = name[len(slash):]
+                if not ui_path:
+                    continue
+                ut = _gk._find_block(f.extra, _gk._TAG_UT)
+                if ut and len(ut) >= 5 and (ut[0] & 1):
+                    mtime = struct.unpack_from('<I', ut, 1)[0] * _gk._S_TO_NS
+                else:
+                    mtime = 0
+                result[ui_path] = {
+                    'atime': 0, 'btime': 0, 'ctime': 0, 'mtime': mtime,
+                    'uid': 0, 'gid': 0, 'inode': 0,
+                    'links': None, 'mode': None, 'prot': None,
+                    'size': f.file_size,
+                    'xattr': {},
+                }
+            return result
         else:
             for candidate in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
                 try:

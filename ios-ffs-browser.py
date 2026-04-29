@@ -8,6 +8,7 @@ import struct
 import plistlib
 import pathlib
 import subprocess
+import configparser
 from concurrent.futures import ThreadPoolExecutor
 
 _APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app')
@@ -286,6 +287,59 @@ def _plist_find(d, key, _depth=0):
     return None
 
 
+def _read_device_info_from_ufd(zip_path: str) -> dict:
+    """Return device info from a companion .ufd file if one exists alongside the zip.
+
+    Cellebrite extractions ship a same-stem .ufd (INI-format) file that
+    contains make, model, and OS version — faster and more reliable than
+    parsing the zip itself.  Returns {} when no usable .ufd is found.
+    """
+    ufd_path = os.path.splitext(zip_path)[0] + '.ufd'
+    if not os.path.isfile(ufd_path):
+        return {}
+    try:
+        cp = configparser.ConfigParser(strict=False)
+        cp.read(ufd_path, encoding='utf-8-sig')
+
+        def _get(*args):
+            for section, key in args:
+                try:
+                    v = cp.get(section, key).strip()
+                    if v:
+                        return v
+                except (configparser.NoSectionError, configparser.NoOptionError):
+                    pass
+            return ''
+
+        vendor  = _get(('DeviceInfo', 'Vendor'),  ('General', 'Vendor'))
+        os_str  = _get(('DeviceInfo', 'OS'),       ('General', 'OS'))
+        # DeviceModel / FullName give a friendly name; Model is often a hw ID
+        friendly = _get(('General', 'FullName'), ('DeviceInfo', 'DeviceModel'),
+                        ('General', 'Model'))
+        hw_id   = _get(('DeviceInfo', 'Model'), ('General', 'Model'))
+
+        if not os_str:
+            return {}
+
+        is_android = os_str.lower().startswith('android')
+        if is_android:
+            version = os_str[len('android'):].strip() if os_str.lower().startswith('android') else os_str
+            label_os = f'Android {version}'
+        else:
+            version = os_str.split()[0]   # "17.5.1 (21F90)" → "17.5.1"
+            label_os = f'iOS {version}'
+
+        make = vendor.title() if vendor else ''
+        model = friendly or hw_id
+        model_name = f'{make} {model}'.strip()
+        label = f'{model_name} · {label_os}' if model_name else label_os
+
+        return {'make': make, 'model': model, 'ios_version': version,
+                'hw_id': hw_id, 'label': label}
+    except Exception:
+        return {}
+
+
 def _read_device_info(zip_path: str) -> dict:
     """Return structured device info extracted from the FFS zip.
 
@@ -295,6 +349,9 @@ def _read_device_info(zip_path: str) -> dict:
     Returns a dict with all empty strings on failure.
     """
     empty = {'make': '', 'model': '', 'ios_version': '', 'hw_id': '', 'label': ''}
+    ufd = _read_device_info_from_ufd(zip_path)
+    if ufd:
+        return ufd
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
             adapter = FfsAdapter.detect(z)

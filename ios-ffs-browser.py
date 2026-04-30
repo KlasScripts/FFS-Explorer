@@ -11,7 +11,10 @@ import subprocess
 import configparser
 from concurrent.futures import ThreadPoolExecutor
 
-_APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app')
+_APP_DIR             = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app')    # adapters, db_utils, etc.
+_CONFIG_DIR          = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config') # JSON config files
+FFS_ARCHIVES_FILE    = os.path.join(_CONFIG_DIR, 'ffs_archives.json')                     # recently opened archives
+HARDWARE_MODELS_FILE = os.path.join('config', 'hardware_models.json')                      # device make/model lookup tables (relative — used with resource_path() for PyInstaller)
 sys.path.insert(0, _APP_DIR)
 
 from adapters import FfsAdapter
@@ -22,73 +25,23 @@ import header_scan
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
 from keyword_search import KeywordSearchMixin
+from artifact_viewer import ArtifactViewerMixin
 from streaming_zip import StreamingZipIndex
 from datetime import datetime, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
                               QHBoxLayout, QWidget, QHeaderView, QPushButton,
                               QFileDialog, QProgressBar, QMenu, QDialog,
                               QComboBox, QSplitter, QStatusBar,
-                              QLineEdit, QLabel, QPlainTextEdit, QScrollArea,
+                              QLineEdit, QLabel,
                               QTabWidget, QSizePolicy, QStackedWidget,
-                              QStyle, QMessageBox, QCheckBox)
+                              QMessageBox, QCheckBox)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
                              qInstallMessageHandler, QtMsgType)
 
-_CONFIG_DIR          = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config')
-FFS_ARCHIVES_FILE    = os.path.join(_CONFIG_DIR, 'ffs_archives.json')
-HARDWARE_MODELS_FILE = os.path.join('config', 'hardware_models.json')
-
-# Hardware identifier → marketing name mapping for common iOS devices
-_HW_MODEL_NAMES = {
-    # iPhone
-    'iPhone12,1':'iPhone 11','iPhone12,3':'iPhone 11 Pro','iPhone12,5':'iPhone 11 Pro Max',
-    'iPhone13,1':'iPhone 12 mini','iPhone13,2':'iPhone 12','iPhone13,3':'iPhone 12 Pro',
-    'iPhone13,4':'iPhone 12 Pro Max',
-    'iPhone14,4':'iPhone 13 mini','iPhone14,5':'iPhone 13','iPhone14,2':'iPhone 13 Pro',
-    'iPhone14,3':'iPhone 13 Pro Max',
-    'iPhone14,7':'iPhone 14','iPhone14,8':'iPhone 14 Plus','iPhone15,2':'iPhone 14 Pro',
-    'iPhone15,3':'iPhone 14 Pro Max',
-    'iPhone15,4':'iPhone 15','iPhone15,5':'iPhone 15 Plus','iPhone16,1':'iPhone 15 Pro',
-    'iPhone16,2':'iPhone 15 Pro Max',
-    'iPhone17,3':'iPhone 16','iPhone17,4':'iPhone 16 Plus','iPhone17,1':'iPhone 16 Pro',
-    'iPhone17,2':'iPhone 16 Pro Max',
-    'iPhone10,1':'iPhone 8','iPhone10,4':'iPhone 8','iPhone10,2':'iPhone 8 Plus',
-    'iPhone10,5':'iPhone 8 Plus','iPhone10,3':'iPhone X','iPhone10,6':'iPhone X',
-    'iPhone11,2':'iPhone XS','iPhone11,4':'iPhone XS Max','iPhone11,6':'iPhone XS Max',
-    'iPhone11,8':'iPhone XR',
-    'iPhone9,1':'iPhone 7','iPhone9,3':'iPhone 7','iPhone9,2':'iPhone 7 Plus',
-    'iPhone9,4':'iPhone 7 Plus',
-    'iPhone8,1':'iPhone 6s','iPhone8,2':'iPhone 6s Plus','iPhone8,4':'iPhone SE (1st gen)',
-    'iPhone12,8':'iPhone SE (2nd gen)','iPhone14,6':'iPhone SE (3rd gen)',
-    # iPad (selection)
-    'iPad13,18':'iPad (10th gen)','iPad13,19':'iPad (10th gen)',
-    'iPad14,3':'iPad Pro 11" (4th gen)','iPad14,4':'iPad Pro 11" (4th gen)',
-    'iPad14,5':'iPad Pro 12.9" (6th gen)','iPad14,6':'iPad Pro 12.9" (6th gen)',
-    'iPad13,4':'iPad Pro 11" (3rd gen)','iPad13,5':'iPad Pro 11" (3rd gen)',
-    'iPad13,6':'iPad Pro 11" (3rd gen)','iPad13,7':'iPad Pro 11" (3rd gen)',
-    'iPad13,8':'iPad Pro 12.9" (5th gen)','iPad13,9':'iPad Pro 12.9" (5th gen)',
-    'iPad13,10':'iPad Pro 12.9" (5th gen)','iPad13,11':'iPad Pro 12.9" (5th gen)',
-    'iPad11,6':'iPad (8th gen)','iPad11,7':'iPad (8th gen)',
-    'iPad12,1':'iPad (9th gen)','iPad12,2':'iPad (9th gen)',
-    'iPad13,16':'iPad Air (5th gen)','iPad13,17':'iPad Air (5th gen)',
-    'iPad11,3':'iPad Air (3rd gen)','iPad11,4':'iPad Air (3rd gen)',
-    'iPad13,1':'iPad Air (4th gen)','iPad13,2':'iPad Air (4th gen)',
-    'iPad14,8':'iPad Air 11" (M2)','iPad14,9':'iPad Air 11" (M2)',
-    'iPad14,10':'iPad Air 13" (M2)','iPad14,11':'iPad Air 13" (M2)',
-    # iPod
-    'iPod9,1':'iPod touch (7th gen)',
-}
-
-FRAME_BUDGET_SECS = 0.016   # ~16 ms per batch (one frame budget)
-
-def resource_path(relative):
-    """Works both in development and when bundled by PyInstaller."""
-    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, relative)
-  
+FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface responsive at 60 fps while the tree builds
 
 _TREE_PLACEHOLDER = "__placeholder__"
 # Minimum tree column width (px).  The column always fills the panel, but never
@@ -103,12 +56,6 @@ _SYSTEM_METADATA_NAMES: frozenset = frozenset({
     ".com.apple.springboard.shortcuts",
 })
 
-# Artifact viewer tree node role values
-_ART_GROUP  = "__art_group__:"
-_ART_REPORT = "__art_report__:"
-_ART_SCRIPT = "__art_script__:"
-_ART_SOURCE = "__art_source__:"
-_ART_FILES  = "__art_files__:"
 _UUID_RE = re.compile(
     r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
 )
@@ -195,9 +142,14 @@ CERTIFICATE_EXTENSIONS = {
 }
 
 
-def _get_file_type(name, is_folder):
-    if is_folder:
-        return 'Folder'
+
+def resource_path(relative):
+    """Works both in development and when bundled by PyInstaller."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
+def _get_file_type(name):
     ext = os.path.splitext(name)[1].lower()
     # Check multi-part extensions first (.db-wal etc.)
     lower_name = name.lower()
@@ -230,9 +182,10 @@ def _load_json_file(path, default):
         return default
 
 
-# Board-ID → [make, model] mapping loaded from hardware_models.json.
-# Keys are Apple internal hardware board identifiers (e.g. "D22AP").
-_HW_BOARD_NAMES: dict = _load_json_file(resource_path(HARDWARE_MODELS_FILE), {})
+_hw = _load_json_file(resource_path(HARDWARE_MODELS_FILE), {})
+_HW_BOARD_NAMES: dict   = _hw.get('apple_board_ids', {})
+_HW_MODEL_NAMES: dict   = _hw.get('apple_model_ids', {})
+_HW_ANDROID_MODELS: dict = _hw.get('android_model_ids', {})
 
 
 def _read_text_from_zip(z, *candidates) -> str:
@@ -340,6 +293,89 @@ def _read_device_info_from_ufd(zip_path: str) -> dict:
         return {}
 
 
+_MG_PLIST_SUFFIX = ('containers/Shared/SystemGroup/'
+                    'systemgroup.com.apple.mobilegestaltcache/Library/Caches/'
+                    'com.apple.MobileGestalt.plist')
+
+
+def _lookup_hw_id(hw_id: str) -> tuple[str, str]:
+    """Return (make, model) for an Apple board or model identifier, or ('', hw_id) if unknown."""
+    entry = _HW_BOARD_NAMES.get(hw_id) or _HW_MODEL_NAMES.get(hw_id)
+    if entry:
+        return entry[0], entry[1]
+    return '', hw_id if hw_id else ''
+
+
+def _build_label(model_name: str, version: str, platform: str) -> str:
+    """Return a short display label e.g. 'Apple iPhone 14 Pro · iOS 17.4'."""
+    if model_name and version:
+        return f'{model_name} · {platform} {version}'
+    return model_name or (f'{platform} {version}' if version else '')
+
+
+def _read_ios_info(z: zipfile.ZipFile, adapter) -> dict:
+    """Extract iOS device info from MobileGestalt, SystemVersion, and preferences plists."""
+    mg_plist = _read_plist_from_zip(z, *adapter.user_candidates(_MG_PLIST_SUFFIX))
+
+    ios_version = _plist_find(mg_plist, 'ProductVersion') or ''
+    if not ios_version:
+        sv = _read_plist_from_zip(z,
+            *adapter.system_candidates('System/Library/CoreServices/SystemVersion.plist'),
+            *adapter.user_candidates('run/SystemVersion.plist'),
+        )
+        ios_version = sv.get('ProductVersion', '')
+
+    pref = _read_plist_from_zip(z,
+        *adapter.user_candidates('preferences/SystemConfiguration/preferences.plist'))
+    hw_id = (pref.get('Model')
+             or _plist_find(mg_plist, 'ProductType')
+             or _plist_find(mg_plist, 'HardwareModel')
+             or '')
+
+    make, model = _lookup_hw_id(hw_id) if hw_id else ('', '')
+    model_name  = f'{make} {model}'.strip()
+    label       = _build_label(model_name, ios_version, 'iOS')
+    if not label:
+        return {}
+    return {'make': make, 'model': model, 'ios_version': ios_version,
+            'hw_id': hw_id, 'label': label}
+
+
+def _read_android_info(z: zipfile.ZipFile, adapter) -> dict:
+    """Extract Android device info by merging system/vendor/product build.prop files."""
+    bp: dict = {}
+    for prop_file in ('system/build.prop', 'vendor/build.prop', 'product/build.prop'):
+        content = _read_text_from_zip(z, *adapter.system_candidates(prop_file))
+        if content:
+            for k, v in _parse_build_prop(content).items():
+                if v:  # never overwrite an existing value with an empty one
+                    bp[k] = v
+    if not bp:
+        return {}
+
+    raw_model = (bp.get('ro.product.model')
+                 or bp.get('ro.product.vendor.model')
+                 or bp.get('ro.product.system.model', ''))
+    version   = (bp.get('ro.build.version.release')
+                 or bp.get('ro.vendor.build.version.release', ''))
+
+    hw_entry = _HW_ANDROID_MODELS.get(raw_model)
+    if hw_entry:
+        make, model = hw_entry[0], hw_entry[1]
+    else:
+        make  = (bp.get('ro.product.manufacturer')
+                 or bp.get('ro.product.vendor.manufacturer')
+                 or bp.get('ro.product.system.manufacturer')
+                 or bp.get('ro.product.brand')
+                 or bp.get('ro.product.system.brand', '')).title()
+        model = raw_model
+
+    model_name = f'{make} {model}'.strip()
+    label      = _build_label(model_name, version, 'Android')
+    return {'make': make, 'model': model, 'ios_version': version,
+            'hw_id': '', 'label': label}
+
+
 def _read_device_info(zip_path: str) -> dict:
     """Return structured device info extracted from the FFS zip.
 
@@ -355,96 +391,9 @@ def _read_device_info(zip_path: str) -> dict:
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
             adapter = FfsAdapter.detect(z)
-
-            _mg_suffix = ('containers/Shared/SystemGroup/'
-                          'systemgroup.com.apple.mobilegestaltcache/Library/Caches/'
-                          'com.apple.MobileGestalt.plist')
-
-            mg_plist = _read_plist_from_zip(z, *adapter.user_candidates(_mg_suffix))
-
-            # ── iOS version ───────────────────────────────────────────────────
-            ios_version = _plist_find(mg_plist, 'ProductVersion') or ''
-            if not ios_version:
-                sv = _read_plist_from_zip(z,
-                    *adapter.system_candidates(
-                        'System/Library/CoreServices/SystemVersion.plist'),
-                    *adapter.user_candidates('run/SystemVersion.plist'),
-                )
-                ios_version = sv.get('ProductVersion', '')
-
-            # ── Hardware model identifier ─────────────────────────────────────
-            pref = _read_plist_from_zip(z, *adapter.user_candidates(
-                'preferences/SystemConfiguration/preferences.plist'))
-            hw_id = pref.get('Model', '')
-            if not hw_id:
-                hw_id = _plist_find(mg_plist, 'ProductType') or ''
-            if not hw_id:
-                hw_id = _plist_find(mg_plist, 'HardwareModel') or ''
-
-            make = ''
-            model = ''
-            if not hw_id:
-                pass
-            elif hw_id in _HW_BOARD_NAMES:
-                entry = _HW_BOARD_NAMES[hw_id]
-                make, model = entry[0], entry[1]
-            elif hw_id in _HW_MODEL_NAMES:
-                make = 'Apple'
-                model = _HW_MODEL_NAMES[hw_id]
-            else:
-                model = hw_id
-
-            model_name = f'{make} {model}'.strip() if (make or model) else ''
-            if model_name and ios_version:
-                label = f'{model_name} · iOS {ios_version}'
-            elif ios_version:
-                label = f'iOS {ios_version}'
-            elif model_name:
-                label = model_name
-            else:
-                label = ''
-
-            if label:
-                return {'make': make, 'model': model, 'ios_version': ios_version,
-                        'hw_id': hw_id, 'label': label}
-
-            # ── Android fallback: read build.prop ─────────────────────────────
-            # Merge all available build.prop files — vendor overrides system for
-            # product info, system is the authority for version.
-            bp: dict = {}
-            for prop_file in ('system/build.prop', 'vendor/build.prop', 'product/build.prop'):
-                content = _read_text_from_zip(z, *adapter.system_candidates(prop_file))
-                if content:
-                    for k, v in _parse_build_prop(content).items():
-                        if v:  # never overwrite an existing value with an empty one
-                            bp[k] = v
-            if bp:
-                raw_model = (bp.get('ro.product.model')
-                             or bp.get('ro.product.vendor.model')
-                             or bp.get('ro.product.system.model', ''))
-                android_version = (bp.get('ro.build.version.release')
-                                   or bp.get('ro.vendor.build.version.release', ''))
-                hw_entry = _HW_BOARD_NAMES.get(raw_model)
-                if hw_entry:
-                    make, model = hw_entry[0], hw_entry[1]
-                else:
-                    make = (bp.get('ro.product.manufacturer')
-                            or bp.get('ro.product.vendor.manufacturer')
-                            or bp.get('ro.product.system.manufacturer')
-                            or bp.get('ro.product.brand')
-                            or bp.get('ro.product.system.brand', '')).title()
-                    model = raw_model
-                model_name = f'{make} {model}'.strip()
-                if model_name and android_version:
-                    label = f'{model_name} · Android {android_version}'
-                elif android_version:
-                    label = f'Android {android_version}'
-                elif model_name:
-                    label = model_name
-                return {'make': make, 'model': model, 'ios_version': android_version,
-                        'hw_id': '', 'label': label}
-
-            return empty
+            return (_read_ios_info(z, adapter)
+                    or _read_android_info(z, adapter)
+                    or empty)
     except Exception:
         return empty
 
@@ -729,7 +678,7 @@ def _collect_header_candidates(
     """Return [(ui_path, data_offset, file_size)] for 'Other'-typed files in scan_folders."""
     targets = [
         ui_path for ui_path in ui_metadata
-        if _get_file_type(ui_path.rsplit('/', 1)[-1], False) == 'Other'
+        if _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
         and any(ui_path.startswith(f) for f in scan_folders)
     ]
     if not targets:
@@ -1436,183 +1385,7 @@ class ProcessDialog(QDialog):
         self.header_scan_done.emit(results)
 
 
-class ArtifactRunnerWorker(QThread):
-    log  = Signal(str)
-    done = Signal()
-
-    def __init__(self, selected, zip_path, adapter, streaming_index, case_dir):
-        super().__init__()
-        self._selected        = selected        # [(script_name, module), ...]
-        self._zip_path        = zip_path
-        self._adapter         = adapter
-        self._streaming_index = streaming_index
-        self._case_dir        = case_dir
-
-    def run(self):
-        from artifact_runner import run_artifact
-        from artifact_db import write_artifact_results
-
-        case_conn = _open_case_db(self._case_dir)
-        zip_obj   = None
-
-        if self._streaming_index is None:
-            try:
-                zip_obj = zipfile.ZipFile(self._zip_path, 'r')
-            except Exception as exc:
-                self.log.emit(f"Could not open archive: {exc}")
-                self.done.emit()
-                return
-
-        try:
-            for script_name, module in self._selected:
-                label = getattr(module, 'name', script_name)
-                self.log.emit(f"Running: {label}…")
-                rows, error = run_artifact(
-                    script_name, module,
-                    self._zip_path, self._adapter,
-                    case_dir=self._case_dir,
-                    zip_obj=zip_obj,
-                    streaming_index=self._streaming_index,
-                )
-                if error:
-                    self.log.emit(f"  Error: {error}")
-                else:
-                    count = write_artifact_results(case_conn, script_name, rows)
-                    self.log.emit(f"  Done — {count} rows written.")
-        finally:
-            case_conn.close()
-            if zip_obj:
-                zip_obj.close()
-
-        self.log.emit("\nAll selected parsers finished.")
-        self.done.emit()
-
-
-class ArtifactRunnerDialog(QDialog):
-    parsers_completed = Signal()
-
-    def __init__(self, zip_path, zip_names, adapter, streaming_index, case_dir,
-                 is_android, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Run Artifact Parsers")
-        self.setMinimumSize(480, 540)
-        self._worker = None
-
-        platform = 'android' if is_android else 'ios'
-
-        from artifact_runner import list_artifacts
-        all_artifacts = list_artifacts(platform)
-
-        # Only show parsers whose target file actually exists in this archive
-        def _exists(candidates):
-            if streaming_index is not None:
-                return any(c in streaming_index for c in candidates)
-            return any(c in zip_names for c in candidates)
-
-        def _mod_matches(mod):
-            # Multi-file API: app_path + files
-            if hasattr(mod, 'app_path') and hasattr(mod, 'files'):
-                app_base = mod.app_path.strip('/')
-                return any(
-                    _exists(adapter.user_candidates(f"{app_base}/{sub.lstrip('/')}"))
-                    for sub in mod.files.values()
-                )
-            # Single-file API: target_paths
-            return any(
-                _exists(adapter.user_candidates(ui_path))
-                for ui_path in getattr(mod, 'target_paths', [])
-            )
-
-        available = [
-            (script_name, mod)
-            for script_name, mod in all_artifacts
-            if _mod_matches(mod)
-        ]
-
-        layout = QVBoxLayout(self)
-
-        if not available:
-            layout.addWidget(QLabel("No artifact parsers matched files in the loaded archive."))
-            close_btn = QPushButton("Close")
-            close_btn.clicked.connect(self.reject)
-            layout.addWidget(close_btn)
-            return
-
-        layout.addWidget(QLabel(f"Parsers matched ({platform.upper()}) — select to run:"))
-
-        # Scrollable checkbox list
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        inner = QWidget()
-        inner_layout = QVBoxLayout(inner)
-        inner_layout.setContentsMargins(6, 6, 6, 6)
-        inner_layout.setSpacing(5)
-        self._checkboxes: list[tuple[QCheckBox, str, object]] = []
-        for script_name, mod in available:
-            cb = QCheckBox(getattr(mod, 'name', script_name))
-            cb.setChecked(True)
-            inner_layout.addWidget(cb)
-            self._checkboxes.append((cb, script_name, mod))
-        inner_layout.addStretch()
-        scroll.setWidget(inner)
-        layout.addWidget(scroll)
-
-        layout.addWidget(QLabel("Log:"))
-        self._log = QPlainTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setFixedHeight(170)
-        self._log.setFont(QFont("Courier", 10))
-        layout.addWidget(self._log)
-
-        btn_row = QHBoxLayout()
-        self._run_btn   = QPushButton("Run")
-        self._close_btn = QPushButton("Close")
-        self._run_btn.clicked.connect(self._run)
-        self._close_btn.clicked.connect(self.reject)
-        btn_row.addStretch()
-        btn_row.addWidget(self._run_btn)
-        btn_row.addWidget(self._close_btn)
-        layout.addLayout(btn_row)
-
-        self._zip_path        = zip_path
-        self._adapter         = adapter
-        self._streaming_index = streaming_index
-        self._case_dir        = case_dir
-
-    def _run(self):
-        selected = [
-            (sn, mod)
-            for cb, sn, mod in self._checkboxes
-            if cb.isChecked()
-        ]
-        if not selected:
-            return
-
-        self._run_btn.setEnabled(False)
-        self._close_btn.setEnabled(False)
-        self._log.clear()
-
-        self._worker = ArtifactRunnerWorker(
-            selected, self._zip_path, self._adapter,
-            self._streaming_index, self._case_dir,
-        )
-        self._worker.log.connect(self._log.appendPlainText)
-        self._worker.done.connect(self._on_done)
-        self._worker.start()
-
-    def _on_done(self):
-        self._run_btn.setEnabled(True)
-        self._close_btn.setEnabled(True)
-        self.parsers_completed.emit()
-
-    def closeEvent(self, event):
-        if self._worker and self._worker.isRunning():
-            event.ignore()
-        else:
-            super().closeEvent(event)
-
-
-class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin):  # type: ignore[reportIncompatibleMethodOverride]
+class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin):  # type: ignore[reportIncompatibleMethodOverride]
     def __init__(self):
         super().__init__()
         self.setWindowTitle("iOS FFS Browser")
@@ -2279,7 +2052,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 return "Folder - Metadata Only", True, False
             if self._folder_total_size(path) == 0:
                 return "Empty Folder", True, False
-            return _get_file_type(name, True), False, False
+            return 'Folder', False, False
         if self._in_zip(path):
             # Directory entries in FORMAT_ZIP_EXTRAS land in zip_ui_paths with
             # their trailing slash stripped — detect them before calling
@@ -2292,7 +2065,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 _sz = (self.full_metadata.get(path) or {}).get('size', -1)
                 if _sz == 0:
                     return None, None, True
-            ft = _get_file_type(name, False)
+            ft = _get_file_type(name)
             if ft == 'Other' and path in self._header_type_overrides:
                 ft = self._header_type_overrides[path]
             return ft, False, False
@@ -2748,294 +2521,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return
         if os.path.isfile(path):
             self.start_loading(path)
-
-    # ── Artifact Viewer tab ───────────────────────────────────────────────────
-
-    def _setup_artifact_tab(self) -> QWidget:
-        """Build the Artifact Viewer tab — own tree on the left, content on the right."""
-        self._art_tree_model = QStandardItemModel()
-        self._art_tree_model.setHorizontalHeaderLabels(["Device Artifacts"])
-
-        self._art_tree_view = QTreeView()
-        self._art_tree_view.setModel(self._art_tree_model)
-        self._art_tree_view.setEditTriggers(QTreeView.EditTrigger.NoEditTriggers)
-        self._art_tree_view.setSelectionBehavior(QTreeView.SelectionBehavior.SelectRows)
-        self._art_tree_view.setHeaderHidden(False)
-        self._art_tree_view.setMinimumWidth(200)
-        self._art_tree_view.setMaximumWidth(320)
-        self._art_tree_view.clicked.connect(self._on_art_tree_clicked)
-
-        # ── Right side: stacked widget ────────────────────────────────────────
-        self._art_placeholder = QLabel("Select a Report or Script from the tree.")
-        self._art_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._art_placeholder.setStyleSheet("color: grey; font-style: italic;")
-
-        # Report page — filter bar + QTableView with proxy
-        report_page = QWidget()
-        report_layout = QVBoxLayout(report_page)
-        report_layout.setContentsMargins(0, 0, 0, 0)
-        report_layout.setSpacing(4)
-
-        report_filter_row = QHBoxLayout()
-        self._art_filter_input = QLineEdit()
-        self._art_filter_input.setPlaceholderText("Filter…")
-        self._art_filter_col  = QComboBox()
-        self._art_filter_col.addItem("All Columns")
-        self._art_filter_input.textChanged.connect(self._apply_art_filter)
-        self._art_filter_col.currentIndexChanged.connect(self._apply_art_filter)
-        self._art_row_label = QLabel()
-        report_filter_row.addWidget(QLabel("Filter:"))
-        report_filter_row.addWidget(self._art_filter_input, 1)
-        report_filter_row.addWidget(self._art_filter_col)
-        report_filter_row.addWidget(self._art_row_label)
-        report_layout.addLayout(report_filter_row)
-
-        self._art_report_model = QStandardItemModel()
-        self._art_report_proxy = QSortFilterProxyModel()
-        self._art_report_proxy.setSourceModel(self._art_report_model)
-        self._art_report_proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self._art_report_proxy.setFilterKeyColumn(-1)
-
-        self._art_report_view = QTableView()
-        self._art_report_view.setModel(self._art_report_proxy)
-        self._art_report_view.setSortingEnabled(True)
-        self._art_report_view.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
-        self._art_report_view.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self._art_report_view.setAlternatingRowColors(True)
-        self._art_report_view.setWordWrap(True)
-        self._art_report_view.horizontalHeader().setStretchLastSection(True)
-        self._art_report_view.verticalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents)
-        report_layout.addWidget(self._art_report_view)
-
-        # Script page — read-only monospace text editor
-        self._art_script_view = QPlainTextEdit()
-        self._art_script_view.setReadOnly(True)
-        self._art_script_view.setFont(QFont("Courier", 11))
-
-        self._art_stack = QStackedWidget()
-        self._art_stack.addWidget(self._art_placeholder)  # 0
-        self._art_stack.addWidget(report_page)             # 1
-        self._art_stack.addWidget(self._art_script_view)  # 2
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._art_tree_view)
-        splitter.addWidget(self._art_stack)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-
-        tab = QWidget()
-        QHBoxLayout(tab).addWidget(splitter)
-        tab.layout().setContentsMargins(4, 4, 4, 4)
-        return tab
-
-    def _refresh_artifact_tab(self):
-        """Rebuild the artifact tree from completed parsers in the case DB."""
-        if not hasattr(self, '_art_tree_model'):
-            return
-        from artifact_db import list_completed_artifacts
-        from artifact_runner import list_artifacts
-
-        self._art_tree_model.clear()
-        self._art_tree_model.setHorizontalHeaderLabels(["Device Artifacts"])
-
-        if not self._case_dir:
-            return
-        try:
-            case_conn = _open_case_db(self._case_dir)
-            completed = list_completed_artifacts(case_conn)
-            case_conn.close()
-        except Exception:
-            return
-
-        if not completed:
-            placeholder = QStandardItem("No parsers run yet")
-            placeholder.setEditable(False)
-            self._art_tree_model.invisibleRootItem().appendRow(placeholder)
-            return
-
-        platform = 'android' if self._is_android_archive() else 'ios'
-        modules  = {sn: mod for sn, mod in list_artifacts(platform)}
-
-        def _item(text, role_val=None):
-            it = QStandardItem(text)
-            it.setEditable(False)
-            it.setCheckable(False)
-            if role_val is not None:
-                it.setData(role_val, Qt.ItemDataRole.UserRole)
-            return it
-
-        for script_name in completed:
-            mod   = modules.get(script_name)
-            label = getattr(mod, 'name', script_name) if mod else script_name
-            group = _item(label, _ART_GROUP + script_name)
-            group.setFont(QFont("Arial", weight=QFont.Weight.Bold))
-            group.appendRow(_item("Report",        _ART_REPORT + script_name))
-            group.appendRow(_item("Script",        _ART_SCRIPT + script_name))
-            group.appendRow(_item("Source in ZIP", _ART_SOURCE + script_name))
-            group.appendRow(_item("Exported Files",_ART_FILES  + script_name))
-            self._art_tree_model.invisibleRootItem().appendRow(group)
-
-        self._art_tree_view.expandAll()
-
-    def _on_art_tree_clicked(self, index):
-        role_val = index.data(Qt.ItemDataRole.UserRole)
-        if not role_val:
-            return
-        if role_val.startswith(_ART_REPORT):
-            self._art_show_report(role_val[len(_ART_REPORT):])
-        elif role_val.startswith(_ART_SCRIPT):
-            self._art_show_script(role_val[len(_ART_SCRIPT):])
-        elif role_val.startswith(_ART_SOURCE):
-            self._art_goto_source(role_val[len(_ART_SOURCE):])
-        elif role_val.startswith(_ART_FILES):
-            self._art_show_files(role_val[len(_ART_FILES):])
-
-    def _art_resize_columns(self, max_width: int = 320):
-        """Size columns to their content, then cap any that exceed max_width.
-        Capped columns will word-wrap their text across multiple row lines."""
-        self._art_report_view.resizeColumnsToContents()
-        for col in range(self._art_report_model.columnCount()):
-            if self._art_report_view.columnWidth(col) > max_width:
-                self._art_report_view.setColumnWidth(col, max_width)
-
-    def _art_show_report(self, script_name: str):
-        from artifact_db import load_artifact_results
-        try:
-            case_conn = _open_case_db(self._case_dir)
-            columns, rows = load_artifact_results(case_conn, script_name)
-            case_conn.close()
-        except Exception as exc:
-            self.status_bar.showMessage(f"Could not load report: {exc}")
-            return
-
-        self._art_report_model.clear()
-        self._art_filter_input.clear()
-        self._art_filter_col.blockSignals(True)
-        self._art_filter_col.clear()
-        self._art_filter_col.addItem("All Columns")
-        for col in columns:
-            self._art_filter_col.addItem(col)
-        self._art_filter_col.blockSignals(False)
-
-        self._art_report_model.setHorizontalHeaderLabels(columns)
-        for row in rows:
-            self._art_report_model.appendRow(
-                [QStandardItem(str(v) if v is not None else "") for v in row]
-            )
-        self._art_resize_columns()
-        self._art_row_label.setText(f"{len(rows):,} rows")
-        self._art_stack.setCurrentIndex(1)
-
-    def _apply_art_filter(self):
-        text   = self._art_filter_input.text()
-        col_idx = self._art_filter_col.currentIndex() - 1  # -1 = all columns
-        self._art_report_proxy.setFilterKeyColumn(col_idx)
-        self._art_report_proxy.setFilterFixedString(text)
-        visible = self._art_report_proxy.rowCount()
-        total   = self._art_report_model.rowCount()
-        self._art_row_label.setText(
-            f"{visible:,} of {total:,} rows" if text else f"{total:,} rows"
-        )
-
-    def _art_show_script(self, script_name: str):
-        from artifact_runner import _ARTIFACTS_DIR
-        platform    = 'android' if self._is_android_archive() else 'ios'
-        script_path = os.path.join(_ARTIFACTS_DIR, platform, f"{script_name}.py")
-        if not os.path.isfile(script_path):
-            self.status_bar.showMessage(f"Script not found: {script_path}")
-            return
-        try:
-            text = pathlib.Path(script_path).read_text(encoding='utf-8')
-        except Exception as exc:
-            self.status_bar.showMessage(f"Could not read script: {exc}")
-            return
-        self._art_script_view.setPlainText(text)
-        self._art_stack.setCurrentIndex(2)
-        self.status_bar.showMessage(f"Script: {script_path}")
-
-    def _art_goto_source(self, script_name: str):
-        """Switch to File Browser and navigate to the target folder in the zip."""
-        from artifact_runner import list_artifacts
-        platform = 'android' if self._is_android_archive() else 'ios'
-        modules  = {sn: mod for sn, mod in list_artifacts(platform)}
-        mod      = modules.get(script_name)
-        if not mod:
-            return
-        if hasattr(mod, 'app_path') and hasattr(mod, 'files'):
-            first_sub = next(iter(mod.files.values()), None)
-            if not first_sub:
-                return
-            first_path = mod.app_path.strip('/') + '/' + first_sub.lstrip('/')
-        else:
-            target_paths = getattr(mod, 'target_paths', [])
-            if not target_paths:
-                return
-            first_path = target_paths[0]
-        parent = '/'.join(first_path.split('/')[:-1])
-        self.center_tabs.setCurrentIndex(0)   # switch to File Browser
-        self.navigate_tree_to_path(parent)
-
-    def _art_show_files(self, script_name: str):
-        """Show exported source files as a simple report table."""
-        from artifact_runner import list_artifacts, safe_folder_name
-        platform    = 'android' if self._is_android_archive() else 'ios'
-        modules     = {sn: mod for sn, mod in list_artifacts(platform)}
-        mod         = modules.get(script_name)
-        parser_name = getattr(mod, 'name', script_name) if mod else script_name
-        folder      = os.path.join(self._case_dir, 'artifact_parser_files',
-                                   safe_folder_name(parser_name))
-        if not os.path.isdir(folder):
-            self.status_bar.showMessage(f"No exported files for {parser_name}")
-            return
-
-        columns = ["Name", "Size (Bytes)", "Modified", "Full Path"]
-        self._art_report_model.clear()
-        self._art_filter_input.clear()
-        self._art_filter_col.blockSignals(True)
-        self._art_filter_col.clear()
-        self._art_filter_col.addItem("All Columns")
-        for col in columns:
-            self._art_filter_col.addItem(col)
-        self._art_filter_col.blockSignals(False)
-        self._art_report_model.setHorizontalHeaderLabels(columns)
-
-        rows = []
-        for fname in sorted(os.listdir(folder)):
-            fpath = os.path.join(folder, fname)
-            if not os.path.isfile(fpath):
-                continue
-            sz    = os.path.getsize(fpath)
-            mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime('%Y-%m-%d %H:%M:%S')
-            self._art_report_model.appendRow([
-                QStandardItem(fname), QStandardItem(f"{sz:,}"),
-                QStandardItem(mtime), QStandardItem(fpath),
-            ])
-            rows.append(fname)
-        self._art_resize_columns()
-        self._art_row_label.setText(f"{len(rows)} file(s)")
-        self._art_stack.setCurrentIndex(1)
-        self.status_bar.showMessage(f"Exported files — {folder}")
-
-    def _open_artifact_runner(self):
-        if not self.zip_path:
-            return
-        if not self._case_dir:
-            QMessageBox.information(self, "No Case Folder",
-                                    "A case folder is required to store results.\n"
-                                    "Use File → Process Archive… to set one first.")
-            return
-        dlg = ArtifactRunnerDialog(
-            zip_path=self.zip_path,
-            zip_names=self.zip_names,
-            adapter=self._adapter,
-            streaming_index=self._streaming_index,
-            case_dir=self._case_dir,
-            is_android=self._is_android_archive(),
-            parent=self,
-        )
-        dlg.parsers_completed.connect(self._refresh_artifact_tab)
-        dlg.exec()
 
     def _open_process_dialog(self):
         if not self.zip_path:

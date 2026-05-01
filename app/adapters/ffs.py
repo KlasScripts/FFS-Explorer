@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import msgpack
 
-from adapters import graykey as _gk
+from . import graykey as _gk
 
 _FS_RE = re.compile(r'^(filesystem\d+)/')
 

@@ -3198,6 +3198,32 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._save_ffs_archives()
         self.update_dropdown_ui()
 
+    def _stop_all_workers(self):
+        """Stop every background QThread gracefully before the window closes.
+
+        Qt aborts with SIGABRT if QThread is destroyed while still running, so
+        all workers must be stopped before Python tears down Qt objects.
+        """
+        def _stop(worker, has_stop=False):
+            if worker is None or not worker.isRunning():
+                return
+            if has_stop:
+                worker.stop()
+            else:
+                worker.quit()
+            worker.wait(2000)
+
+        _stop(getattr(self, 'worker', None))
+        _stop(getattr(self, '_scan_worker', None))
+        _stop(getattr(self, '_hex_worker', None))
+        _stop(getattr(self, '_thumb_worker', None), has_stop=True)
+        _stop(getattr(self, '_search_index_worker', None), has_stop=True)
+
+    def closeEvent(self, event):
+        self._stop_all_workers()
+        super().closeEvent(event)
+
+
 def _qt_message_handler(msg_type, context, message):
     if "qt.text.font.db" in (context.category or "") and "OpenType support missing" in message:
         return
@@ -3211,5 +3237,6 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
     window = FastZipBrowser()
+    app.aboutToQuit.connect(window._stop_all_workers)
     window.show()
     sys.exit(app.exec())

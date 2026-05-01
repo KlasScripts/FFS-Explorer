@@ -313,20 +313,20 @@ def _build_label(model_name: str, version: str, platform: str) -> str:
     return model_name or (f'{platform} {version}' if version else '')
 
 
-def _read_ios_info(z: zipfile.ZipFile, adapter) -> dict:
+def _read_ios_info(z: zipfile.ZipFile, ffs_adapter) -> dict:
     """Extract iOS device info from MobileGestalt, SystemVersion, and preferences plists."""
-    mg_plist = _read_plist_from_zip(z, *adapter.user_candidates(_MG_PLIST_SUFFIX))
+    mg_plist = _read_plist_from_zip(z, *ffs_adapter.user_candidates(_MG_PLIST_SUFFIX))
 
     ios_version = _plist_find(mg_plist, 'ProductVersion') or ''
     if not ios_version:
         sv = _read_plist_from_zip(z,
-            *adapter.system_candidates('System/Library/CoreServices/SystemVersion.plist'),
-            *adapter.user_candidates('run/SystemVersion.plist'),
+            *ffs_adapter.system_candidates('System/Library/CoreServices/SystemVersion.plist'),
+            *ffs_adapter.user_candidates('run/SystemVersion.plist'),
         )
         ios_version = sv.get('ProductVersion', '')
 
     pref = _read_plist_from_zip(z,
-        *adapter.user_candidates('preferences/SystemConfiguration/preferences.plist'))
+        *ffs_adapter.user_candidates('preferences/SystemConfiguration/preferences.plist'))
     hw_id = (pref.get('Model')
              or _plist_find(mg_plist, 'ProductType')
              or _plist_find(mg_plist, 'HardwareModel')
@@ -341,11 +341,11 @@ def _read_ios_info(z: zipfile.ZipFile, adapter) -> dict:
             'hw_id': hw_id, 'label': label}
 
 
-def _read_android_info(z: zipfile.ZipFile, adapter) -> dict:
+def _read_android_info(z: zipfile.ZipFile, ffs_adapter) -> dict:
     """Extract Android device info by merging system/vendor/product build.prop files."""
     bp: dict = {}
     for prop_file in ('system/build.prop', 'vendor/build.prop', 'product/build.prop'):
-        content = _read_text_from_zip(z, *adapter.system_candidates(prop_file))
+        content = _read_text_from_zip(z, *ffs_adapter.system_candidates(prop_file))
         if content:
             for k, v in _parse_build_prop(content).items():
                 if v:  # never overwrite an existing value with an empty one
@@ -390,9 +390,9 @@ def _read_device_info(zip_path: str) -> dict:
         return ufd
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
-            adapter = FfsAdapter.detect(z)
-            return (_read_ios_info(z, adapter)
-                    or _read_android_info(z, adapter)
+            ffs_adapter = FfsAdapter.detect(z)
+            return (_read_ios_info(z, ffs_adapter)
+                    or _read_android_info(z, ffs_adapter)
                     or empty)
     except Exception:
         return empty
@@ -523,7 +523,7 @@ def _compute_folder_sizes(
     folder_map: dict,
     zip_names: frozenset,
     zip_sizes: dict,
-    adapter,
+    ffs_adapter,
     zip_ui_paths: frozenset | None = None,
     progress_cb=None,
 ) -> dict:
@@ -550,11 +550,11 @@ def _compute_folder_sizes(
             if zip_ui_paths is not None:
                 in_zip = child in zip_ui_paths
             else:
-                resolved = adapter.resolve(child)
+                resolved = ffs_adapter.resolve(child)
                 in_zip = resolved in zip_names or resolved.lstrip('/') in zip_names
             if not in_zip or not zip_sizes:
                 continue
-            raw = adapter.resolve(child)
+            raw = ffs_adapter.resolve(child)
             # Bare directory entries are keyed with a trailing slash in zip_names.
             if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
                 continue
@@ -584,7 +584,7 @@ def _find_metadata_only_folders(
     folder_map: dict,
     zip_names: frozenset,
     zip_ui_paths: frozenset | None,
-    adapter,
+    ffs_adapter,
 ) -> set:
     """Return the set of iOS folder paths whose only in-zip content is Apple container metadata.
 
@@ -613,11 +613,11 @@ def _find_metadata_only_folders(
                 if zip_ui_paths is not None:
                     in_zip = child in zip_ui_paths
                 else:
-                    resolved = adapter.resolve(child)
+                    resolved = ffs_adapter.resolve(child)
                     in_zip = resolved in zip_names or resolved.lstrip('/') in zip_names
                 if not in_zip:
                     continue
-                raw = adapter.resolve(child)
+                raw = ffs_adapter.resolve(child)
                 if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
                     continue  # bare directory entry — skip
                 if child.split('/')[-1] in _SYSTEM_METADATA_NAMES:
@@ -670,12 +670,12 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
 def _collect_header_candidates(
     zip_path: str,
     ui_metadata: dict,
-    adapter,
-    scan_folders: list[str],
+    ffs_adapter,
     z=None,
     streaming_index=None,
 ) -> list[tuple[str, int, int]]:
     """Return [(ui_path, data_offset, file_size)] for 'Other'-typed files in scan_folders."""
+    scan_folders = ffs_adapter.scan_folders()
     targets = [
         ui_path for ui_path in ui_metadata
         if _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
@@ -689,7 +689,7 @@ def _collect_header_candidates(
     if streaming_index is not None:
         entries = streaming_index._entries
         for ui_path in targets:
-            row = entries.get(adapter.resolve(ui_path))
+            row = entries.get(ffs_adapter.resolve(ui_path))
             if row:
                 file_size = row[2]   # [data_offset, comp, uncomp, method]
                 candidates.append((ui_path, row[0], file_size))
@@ -698,7 +698,7 @@ def _collect_header_candidates(
         with open(zip_path, 'rb') as rf:
             for ui_path in targets:
                 try:
-                    info = z.getinfo(adapter.resolve(ui_path))
+                    info = z.getinfo(ffs_adapter.resolve(ui_path))
                     rf.seek(info.header_offset + 26)
                     fname_len, extra_len = struct.unpack('<HH', rf.read(4))
                     data_offset = info.header_offset + 30 + fname_len + extra_len
@@ -710,12 +710,25 @@ def _collect_header_candidates(
 
 
 class ZipMetadataWorker(QThread):
-    status_update       = Signal(str)
-    metadata_ready      = Signal(dict, dict, dict, object, object, object, dict, object)
-    header_scan_progress = Signal(int)   # remaining file count (decreasing)
-    header_scan_done    = Signal(dict)   # {ui_path: detected_type}
+    """Background thread that loads and processes an FFS archive. Steps:
+      1. Open the zip (falls back to StreamingZipIndex if no central directory)
+      2. Detect the archive format (Graykey / Cellebrite iOS / Cellebrite Android)
+      3. Load the GUID→bundle-ID map from cache or build it from the archive
+      4. Build ui_metadata (path → timestamps/size dict) via the format adapter
+      5. Build the folder tree hierarchy
+      6. Identify UUID app-container folders with missing plist metadata
+      7. Compute folder sizes (from cache if available, otherwise calculated)
+      8. Emit metadata_ready so the UI tree can appear immediately
+      9. Persist GUID map and folder sizes to the SQLite case database
+     10. If scan_headers is set, read magic bytes of unknown-extension files
+         and emit header_scan_done with the detected type overrides
+    """
+    status_update        = Signal(str)    # message
+    metadata_ready       = Signal(dict, dict, dict, object, object, object, dict, object)  # ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths
+    header_scan_progress = Signal(int)   # remaining (decreasing)
+    header_scan_done     = Signal(dict)  # {ui_path: detected_type}
 
-    def __init__(self, zip_path, scan_headers: bool = False, case_dir: str | None = None):
+    def __init__(self, zip_path: str, scan_headers: bool = False, case_dir: str | None = None):
         super().__init__()
         self.zip_path = zip_path
         self.scan_headers = scan_headers
@@ -743,13 +756,13 @@ class ZipMetadataWorker(QThread):
                 if self._streaming_index is not None:
                     zip_names = frozenset(self._streaming_index.namelist())
                     zip_sizes: dict[str, int] = {}
-                    adapter = FfsAdapter.detect_from_names(zip_names)
+                    ffs_adapter = FfsAdapter.detect_from_names(zip_names)
                 else:
                     assert z_ctx is not None
                     _infolist = z_ctx.infolist()
                     zip_names = frozenset(info.filename for info in _infolist)
                     zip_sizes = {info.filename: info.file_size for info in _infolist}
-                    adapter = FfsAdapter.detect(z_ctx)
+                    ffs_adapter = FfsAdapter.detect(z_ctx)
                 time.sleep(0)   # yield GIL after C-level frozenset build
 
                 cached_guid_bundle: dict | None = None
@@ -763,7 +776,7 @@ class ZipMetadataWorker(QThread):
                     except Exception:
                         pass
 
-                ui_metadata, guid_to_bundle, zip_ui_paths = adapter.build_ui_metadata(
+                ui_metadata, guid_to_bundle, zip_ui_paths = ffs_adapter.build_ui_metadata(
                     self.zip_path, zip_names,
                     z=z_ctx,
                     streaming_index=self._streaming_index,
@@ -776,8 +789,7 @@ class ZipMetadataWorker(QThread):
                 header_candidates: list = []
                 if self.scan_headers:
                     header_candidates = _collect_header_candidates(
-                        self.zip_path, ui_metadata, adapter,
-                        adapter.scan_folders(),
+                        self.zip_path, ui_metadata, ffs_adapter,
                         z=z_ctx, streaming_index=self._streaming_index,
                     )
             finally:
@@ -787,7 +799,7 @@ class ZipMetadataWorker(QThread):
             folder_map = _build_folder_tree(ui_metadata, status_cb=self.status_update.emit)
             time.sleep(0)   # yield GIL after folder tree build
 
-            _CONTAINER_PARENTS = adapter.container_parents()
+            _CONTAINER_PARENTS = ffs_adapter.container_parents()
             missing_plist_paths = [
                 p for p in folder_map
                 if p.rsplit('/', 1)[0] in _CONTAINER_PARENTS
@@ -812,7 +824,7 @@ class ZipMetadataWorker(QThread):
             else:
                 self.status_update.emit("Computing folder sizes...")
                 folder_sizes = _compute_folder_sizes(
-                    folder_map, zip_names, zip_sizes, adapter,
+                    folder_map, zip_names, zip_sizes, ffs_adapter,
                     zip_ui_paths=zip_ui_paths,
                     progress_cb=lambda done, total: self.status_update.emit(
                         f"Computing folder sizes… {done:,}/{total:,}"))
@@ -820,7 +832,7 @@ class ZipMetadataWorker(QThread):
             # Emit first — UI tree appears immediately. DB write happens after.
             self.metadata_ready.emit(
                 ui_metadata, folder_map, guid_to_bundle, zip_names,
-                adapter, missing_plist_paths, folder_sizes, zip_ui_paths)
+                ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths)
 
             if self.case_dir:
                 try:
@@ -846,11 +858,6 @@ class ZipMetadataWorker(QThread):
                     f"Header scan complete — {len(results):,} types identified")
         except Exception as e:
             self.status_update.emit(f"Error: {str(e)}")
-
-
-
-
-
 
 
 
@@ -1261,11 +1268,11 @@ class HeaderScanWorker(QThread):
     progress = Signal(int)   # remaining count
     done     = Signal(dict)  # {ui_path: detected_type}
 
-    def __init__(self, zip_path, ui_metadata, adapter, streaming_index=None):
+    def __init__(self, zip_path, ui_metadata, ffs_adapter, streaming_index=None):
         super().__init__()
         self._zip_path        = zip_path
         self._ui_metadata     = ui_metadata
-        self._adapter         = adapter
+        self._adapter         = ffs_adapter
         self._streaming_index = streaming_index
 
     def run(self):
@@ -1275,7 +1282,6 @@ class HeaderScanWorker(QThread):
                 z = zipfile.ZipFile(self._zip_path, 'r')
             candidates = _collect_header_candidates(
                 self._zip_path, self._ui_metadata, self._adapter,
-                _default_scan_folders(self._adapter),
                 z=z, streaming_index=self._streaming_index,
             )
         finally:
@@ -1298,7 +1304,7 @@ class ProcessDialog(QDialog):
     """Lets the user change the case folder and re-run the file header scan."""
     header_scan_done = Signal(dict)
 
-    def __init__(self, zip_path, case_dir, adapter, ui_metadata,
+    def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
                  streaming_index=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Process Archive")
@@ -1306,7 +1312,7 @@ class ProcessDialog(QDialog):
         self.setMinimumWidth(520)
         self._zip_path        = zip_path
         self._case_dir        = case_dir
-        self._adapter         = adapter
+        self._adapter         = ffs_adapter
         self._ui_metadata     = ui_metadata
         self._streaming_index = streaming_index
         self._scan_worker: HeaderScanWorker | None = None
@@ -2613,19 +2619,19 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.worker.header_scan_done.connect(self._on_header_scan_done)
         self.worker.start()
 
-    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None):
+    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None):
         self.full_metadata = data
         self.folder_map = folder_map
         self.guid_to_bundle = guid_map
         self.zip_names = zip_names
-        self._adapter = adapter
+        self._adapter = ffs_adapter
         self._android_user_data_path = self._detect_android_user_data(folder_map)
         self._missing_plist_paths = set(missing_plist_paths)
         self._folder_sizes = folder_sizes
         self._zip_ui_paths = zip_ui_paths
-        if adapter.format != FfsAdapter.FORMAT_ZIP_EXTRAS:
+        if ffs_adapter.format != FfsAdapter.FORMAT_ZIP_EXTRAS:
             self._metadata_only_folders = _find_metadata_only_folders(
-                folder_map, zip_names, zip_ui_paths, adapter)
+                folder_map, zip_names, zip_ui_paths, ffs_adapter)
         else:
             self._metadata_only_folders = set()
         self._header_type_overrides = {}
@@ -2654,7 +2660,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._update_filter_columns(self.file_headers)
         self.progress_bar.setRange(0, 100)
         self.save_recent_list(self.zip_path)
-        fmt_label = "GrayKey" if adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
+        fmt_label = "GrayKey" if ffs_adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
         self.reload_tree_entirely()
         self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
         # Fetch device label after the archive is fully processed, so the
@@ -2786,7 +2792,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         root_item.setCheckable(True)
         root_item.setCheckState(Qt.CheckState.Unchecked)
         self.tree_model.invisibleRootItem().appendRow(root_item)
-        self._populate_tree_children(root_item, "")
+        self._populate_tree_children_batched(root_item, "", on_done=lambda: self._on_tree_loaded(root_item))
+
+    def _on_tree_loaded(self, root_item):
         self.tree_view.expand(self.tree_model.indexFromItem(root_item))
         self._tree_populating = False
         if hasattr(self, '_adapter'):
@@ -2799,6 +2807,45 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if hasattr(self, '_adapter') and self._adapter.format == FfsAdapter.FORMAT_GRAYKEY:
             QTimer.singleShot(0, self._expand_to_private_var)
         QTimer.singleShot(0, self._fit_splitter_to_tree)
+
+    def _populate_tree_children_batched(self, parent_item, parent_path, on_done=None):
+        """Add immediate folder children of parent_path in frame-sized batches
+        so the UI stays responsive for large archives or slow network paths."""
+        children = sorted(
+            p for p in self.folder_map.get(parent_path, [])
+            if p in self.folder_map or self._is_empty_folder_entry(p)
+        )
+        state = {'idx': 0}
+
+        def _batch():
+            deadline = time.monotonic() + FRAME_BUDGET_SECS
+            while state['idx'] < len(children):
+                p = children[state['idx']]
+                state['idx'] += 1
+                in_fm = p in self.folder_map
+                if in_fm and self._should_hide_folder(p):
+                    continue
+                if not in_fm and self._hide_empty_folders:
+                    continue
+                name = p.split('/')[-1]
+                item = QStandardItem(self._display_name(name))
+                item.setData(p, Qt.ItemDataRole.UserRole)
+                item.setEditable(False)
+                item.setCheckable(True)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                parent_item.appendRow(item)
+                if self.folder_map.get(p):
+                    placeholder = QStandardItem()
+                    placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
+                    placeholder.setEditable(False)
+                    item.appendRow(placeholder)
+                if time.monotonic() >= deadline:
+                    QTimer.singleShot(0, _batch)
+                    return
+            if on_done:
+                on_done()
+
+        QTimer.singleShot(0, _batch)
 
     def _fit_splitter_to_tree(self):
         """Resize the splitter so the tree panel is wide enough to show its

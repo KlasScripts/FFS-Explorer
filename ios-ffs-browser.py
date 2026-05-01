@@ -878,15 +878,20 @@ class ZipMetadataWorker(QThread):
             # can start browsing immediately while the sidecar is written.
             if _infolist_to_cache is not None and self.case_dir:
                 try:
+                    _n = len(_infolist_to_cache)
                     self.status_update.emit(
-                        f"Saving ZIP directory locally ({len(_infolist_to_cache):,} entries"
+                        f"Saving ZIP directory locally ({_n:,} entries"
                         f" — large archives may take a moment)…")
+                    _t0 = time.monotonic()
                     _cd_cache_save(
                         self.zip_path, self.case_dir, _infolist_to_cache,
                         progress_cb=lambda done, total: self.status_update.emit(
                             f"Saving ZIP directory locally… {done / max(total, 1):.0%}"),
                     )
-                    self.status_update.emit("ZIP directory saved — future opens will be instant.")
+                    _elapsed = time.monotonic() - _t0
+                    self.status_update.emit(
+                        f"ZIP directory saved — {_n:,} entries in {_elapsed:.1f}s"
+                        f" — future opens will be instant.")
                 except Exception:
                     pass   # cache write failure is non-fatal
 

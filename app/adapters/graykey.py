@@ -101,14 +101,30 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
     if extra is None:
         extra = f.extra
 
+    # Single-pass TLV scan — collect all needed blocks in one traversal
+    # instead of calling _find_block separately for each tag.
+    ut = ux = in_block = gk = None
+    off = 0
+    _unpack_tlv_local = _unpack_tlv
+    while off + 4 <= len(extra):
+        t, length = _unpack_tlv_local(extra, off)
+        off += 4
+        if   t == _TAG_UT:
+            ut       = extra[off:off + length]
+        elif t == _TAG_UX:
+            ux       = extra[off:off + length]
+        elif t == _TAG_IN:
+            in_block = extra[off:off + length]
+        elif t == _TAG_GK or t == _TAG_GK_OLD:
+            gk       = extra[off:off + length]
+        off += length
+
     # UT block: flags(1B) then up to 4 × uint32 timestamps, each present only
     # if the corresponding flag bit is set.  The central-directory copy of UT
     # only carries flags + mtime (5 bytes); the local-file-header copy carries
     # all timestamps that are flagged.  We parse flag-by-flag so both forms work.
-    ut = _find_block(extra, _TAG_UT)
     mtime = atime = ctime = btime = 0
-    has_ut = ut is not None and len(ut) >= 1
-    if has_ut:
+    if ut is not None and len(ut) >= 1:
         flags = ut[0]
         off   = 1
         if (flags & 1) and off + 4 <= len(ut):
@@ -136,21 +152,18 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
                 mtime = 0
 
     # UID/GID from UX block: version(1B) uid_sz(1B) uid(uid_sz B) gid_sz(1B) gid(gid_sz B)
-    ux = _find_block(extra, _TAG_UX)
     if ux is not None:
-        uid_sz = ux[1]
-        uid    = int.from_bytes(ux[2:2 + uid_sz], 'little')
+        uid_sz  = ux[1]
+        uid     = int.from_bytes(ux[2:2 + uid_sz], 'little')
         gid_off = 2 + uid_sz
-        gid    = int.from_bytes(ux[gid_off + 1:gid_off + 1 + ux[gid_off]], 'little')
+        gid     = int.from_bytes(ux[gid_off + 1:gid_off + 1 + ux[gid_off]], 'little')
     else:
         uid = gid = 0
 
     # Inode from IN block: inode(Q=8B) + additional fields (ignored)
-    in_block = _find_block(extra, _TAG_IN)
     inode = int.from_bytes(in_block[:8], 'little') if in_block is not None else 0
 
     # Graykey block: version(1B) flags(1B) [prot_class(4B)] [xattrs]
-    gk = _find_gk_block(extra)
     xattrs = {}
     if gk is not None and len(gk) >= 2:
         gver, gflag = gk[0], gk[1]

@@ -27,6 +27,7 @@ from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
 from keyword_search import KeywordSearchMixin
 from artifact_viewer import ArtifactViewerMixin
 from streaming_zip import StreamingZipIndex
+from zip_cd_cache import CachedZipView, is_valid as _cd_cache_valid, save as _cd_cache_save, load as _cd_cache_load
 from datetime import datetime, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
                               QHBoxLayout, QWidget, QHeaderView, QPushButton,
@@ -738,18 +739,33 @@ class ZipMetadataWorker(QThread):
         try:
             self.status_update.emit("Opening Archive...")
             self._streaming_index = None
+            _infolist_to_cache: list | None = None  # set when a fresh CD read needs caching
 
-            try:
-                z_ctx = zipfile.ZipFile(self.zip_path, 'r')
-                z_ctx.__enter__()
-            except zipfile.BadZipFile:
-                self.status_update.emit("Streaming zip detected — building index...")
-                self._streaming_index = StreamingZipIndex.open(
-                    self.zip_path,
-                    progress_cb=lambda done, total: self.status_update.emit(
-                        f"Indexing archive: {done / max(total, 1):.0%}"),
-                )
+            # ── Open the archive ──────────────────────────────────────────────
+            if self.case_dir and _cd_cache_valid(self.zip_path, self.case_dir):
+                # Cached central directory in case dir — skip the expensive network seek
+                self.status_update.emit("Loading central directory from local cache...")
+                _cached_infos = _cd_cache_load(self.zip_path, self.case_dir)
+                z_ctx = CachedZipView(self.zip_path, _cached_infos) if _cached_infos else None
+            else:
                 z_ctx = None
+
+            if z_ctx is None:
+                try:
+                    if not (self.case_dir and _cd_cache_valid(self.zip_path, self.case_dir)):
+                        self.status_update.emit(
+                            "Reading archive central directory (first open — may be slow)…")
+                    z_ctx = zipfile.ZipFile(self.zip_path, 'r')
+                    z_ctx.__enter__()
+                    _infolist_to_cache = z_ctx.infolist()  # capture before close
+                except zipfile.BadZipFile:
+                    self.status_update.emit("Streaming zip detected — building index...")
+                    self._streaming_index = StreamingZipIndex.open(
+                        self.zip_path,
+                        progress_cb=lambda done, total: self.status_update.emit(
+                            f"Indexing archive: {done / max(total, 1):.0%}"),
+                    )
+                    z_ctx = None
 
             try:
                 self.status_update.emit("Reading zip directory...")
@@ -759,7 +775,9 @@ class ZipMetadataWorker(QThread):
                     ffs_adapter = FfsAdapter.detect_from_names(zip_names)
                 else:
                     assert z_ctx is not None
-                    _infolist = z_ctx.infolist()
+                    _infolist = (_infolist_to_cache
+                                 if _infolist_to_cache is not None
+                                 else z_ctx.infolist())
                     zip_names = frozenset(info.filename for info in _infolist)
                     zip_sizes = {info.filename: info.file_size for info in _infolist}
                     ffs_adapter = FfsAdapter.detect(z_ctx)
@@ -776,12 +794,23 @@ class ZipMetadataWorker(QThread):
                     except Exception:
                         pass
 
+                # When using the local .zcd cache zip_names is already in memory,
+                # so build_zip_entries runs at pure-Python speed with no network seeks.
+                # Only Cellebrite iOS uses Pass 1; GrayKey/Android return early.
+                _precomputed_zip_entries = (
+                    ffs_adapter.build_zip_entries(zip_names)
+                    if isinstance(z_ctx, CachedZipView)
+                    and ffs_adapter.format == FfsAdapter.FORMAT_CELLEBRITE
+                    else None
+                )
+
                 ui_metadata, guid_to_bundle, zip_ui_paths = ffs_adapter.build_ui_metadata(
                     self.zip_path, zip_names,
                     z=z_ctx,
                     streaming_index=self._streaming_index,
                     status_cb=self.status_update.emit,
                     guid_to_bundle=cached_guid_bundle,
+                    zip_entries=_precomputed_zip_entries,
                 )
                 time.sleep(0)   # yield GIL after msgpack/metadata build
 
@@ -829,7 +858,7 @@ class ZipMetadataWorker(QThread):
                     progress_cb=lambda done, total: self.status_update.emit(
                         f"Computing folder sizes… {done:,}/{total:,}"))
 
-            # Emit first — UI tree appears immediately. DB write happens after.
+            # Emit first — UI tree appears immediately. DB and cache writes follow.
             self.metadata_ready.emit(
                 ui_metadata, folder_map, guid_to_bundle, zip_names,
                 ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths)
@@ -844,6 +873,21 @@ class ZipMetadataWorker(QThread):
                     _db.close()
                 except Exception:
                     pass
+
+            # Save central directory cache after the UI is live so the user
+            # can start browsing immediately while the sidecar is written.
+            if _infolist_to_cache is not None and self.case_dir:
+                try:
+                    self.status_update.emit(
+                        f"Caching central directory ({len(_infolist_to_cache):,} entries)…")
+                    _cd_cache_save(
+                        self.zip_path, self.case_dir, _infolist_to_cache,
+                        progress_cb=lambda done, total: self.status_update.emit(
+                            f"Caching central directory… {done / max(total, 1):.0%}"),
+                    )
+                    self.status_update.emit("Central directory cached — future opens will be instant.")
+                except Exception:
+                    pass   # cache write failure is non-fatal
 
             if header_candidates:
                 self.status_update.emit(

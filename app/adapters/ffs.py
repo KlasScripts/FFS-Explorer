@@ -358,20 +358,32 @@ class FfsAdapter:
             # local-header seeks needed.  atime and ctime are always zero in
             # this format; mtime is read from the UT extra block (already in
             # f.extra) and file_size comes straight from the ZipInfo.
-            slash = self.user_prefix.rstrip('/') + '/'
+            slash      = self.user_prefix.rstrip('/') + '/'
+            slash_len  = len(slash)
+            _unpack    = struct.unpack_from
+            _S_TO_NS   = _gk._S_TO_NS
+            _find_block = _gk._find_block
+            _TAG_UT    = _gk._TAG_UT
             result = {}
             for f in z.infolist():
                 name = f.filename.rstrip('/')
                 if not name.startswith(slash):
                     continue
-                ui_path = name[len(slash):]
+                ui_path = name[slash_len:]
                 if not ui_path:
                     continue
-                ut = _gk._find_block(f.extra, _gk._TAG_UT)
-                if ut and len(ut) >= 5 and (ut[0] & 1):
-                    mtime = struct.unpack_from('<I', ut, 1)[0] * _gk._S_TO_NS
+                # Fast path: UT block is almost always the first extra field in
+                # Cellebrite Android zips — check tag bytes directly before
+                # falling back to the full TLV scan.
+                extra = f.extra
+                if (len(extra) >= 9
+                        and extra[0] == 0x55 and extra[1] == 0x54  # tag 0x5455 = UT
+                        and extra[4] & 1):                          # mtime flag
+                    mtime = _unpack('<I', extra, 5)[0] * _S_TO_NS
                 else:
-                    mtime = 0
+                    ut = _find_block(extra, _TAG_UT)
+                    mtime = (_unpack('<I', ut, 1)[0] * _S_TO_NS
+                             if ut and len(ut) >= 5 and (ut[0] & 1) else 0)
                 result[ui_path] = {
                     'atime': 0, 'btime': 0, 'ctime': 0, 'mtime': mtime,
                     'uid': 0, 'gid': 0, 'inode': 0,
@@ -400,6 +412,31 @@ class FfsAdapter:
 
     # ── Unified metadata builder ──────────────────────────────────────────────
 
+    def build_zip_entries(self, zip_names: frozenset) -> dict[str, str]:
+        """Map ui_path → physical zip entry name for every user-partition entry.
+
+        Strips the format prefix (e.g. 'filesystem2/') and optionally the
+        old-layout 'private/var/' infix.  Called by ZipMetadataWorker when a
+        local .zcd cache is available so the scan runs over in-memory data
+        rather than requiring a network seek.
+        """
+        user_prefix_slash = self.user_prefix + '/'
+        old_pv_slash      = (user_prefix_slash + 'private/var/') if self.old_layout else None
+        old_pv_len        = len(old_pv_slash) if old_pv_slash else 0
+        strip_for_fs      = {self.user_prefix: True}
+        result: dict[str, str] = {}
+        for entry in zip_names:
+            phys  = entry.rstrip('/')
+            slash = phys.find('/')
+            if slash < 0 or phys[:slash] not in strip_for_fs:
+                continue
+            ui_path = (phys[old_pv_len:] if old_pv_slash and phys.startswith(old_pv_slash)
+                       else phys[len(user_prefix_slash):])
+            if not ui_path:
+                continue
+            result[ui_path] = phys
+        return result
+
     def build_ui_metadata(
         self,
         zip_path: str,
@@ -408,6 +445,7 @@ class FfsAdapter:
         streaming_index=None,
         status_cb=None,
         guid_to_bundle: dict | None = None,
+        zip_entries: dict | None = None,
     ) -> tuple[dict, dict, frozenset | None]:
         """Return (ui_metadata, guid_to_bundle, zip_ui_paths).
 
@@ -479,29 +517,32 @@ class FfsAdapter:
             if '-' in k:
                 guid_meta[self.resolve(k)] = v
 
-        user_prefix_slash = self.user_prefix + '/'
-        old_pv_slash      = (user_prefix_slash + 'private/var/') if self.old_layout else None
-        old_pv_len        = len(old_pv_slash) if old_pv_slash else 0
-        strip_for_fs      = {self.user_prefix: len(user_prefix_slash)}
-
         # Pass 1 — discover: the zip central directory is the single source of
         # truth for what exists.  Directory records (entry[-1]=='/') are normalised
         # by stripping the trailing slash so they contribute folder metadata from
         # the msgpack just like file entries do.
-        _emit(f"Scanning user partition ({self.user_prefix})…")
-        _zip_entries: dict[str, str] = {}   # ui_path → physical zip entry (no trailing slash)
-        for entry in zip_names:
-            phys = entry.rstrip('/')        # normalise: dir records treated same as files
-            slash = phys.find('/')
-            if slash < 0:
-                continue
-            if strip_for_fs.get(phys[:slash]) is None:
-                continue
-            ui_path = (phys[old_pv_len:] if old_pv_slash and phys.startswith(old_pv_slash)
-                       else phys[len(user_prefix_slash):])
-            if not ui_path:
-                continue                    # the prefix dir itself — skip
-            _zip_entries[ui_path] = phys
+        if zip_entries is not None:
+            _zip_entries = zip_entries
+        else:
+            user_prefix_slash = self.user_prefix + '/'
+            old_pv_slash      = (user_prefix_slash + 'private/var/') if self.old_layout else None
+            old_pv_len        = len(old_pv_slash) if old_pv_slash else 0
+            strip_for_fs      = {self.user_prefix: len(user_prefix_slash)}
+
+            _emit(f"Scanning user partition ({self.user_prefix})…")
+            _zip_entries: dict[str, str] = {}   # ui_path → physical zip entry (no trailing slash)
+            for entry in zip_names:
+                phys = entry.rstrip('/')        # normalise: dir records treated same as files
+                slash = phys.find('/')
+                if slash < 0:
+                    continue
+                if strip_for_fs.get(phys[:slash]) is None:
+                    continue
+                ui_path = (phys[old_pv_len:] if old_pv_slash and phys.startswith(old_pv_slash)
+                           else phys[len(user_prefix_slash):])
+                if not ui_path:
+                    continue                    # the prefix dir itself — skip
+                _zip_entries[ui_path] = phys
 
         zip_ui_paths = frozenset(_zip_entries)
 

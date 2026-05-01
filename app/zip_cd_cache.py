@@ -9,21 +9,19 @@ For actual file data reads (plist, msgpack, hex viewer etc.), CachedZipView
 uses ZipEntry's direct-seek path — seeking straight to header_offset in the
 real file rather than re-reading the central directory.
 
-Cache is automatically invalidated when the zip's file size or mtime changes.
+These archives are forensic evidence and are never modified, so no
+mtime/size validity check is performed — presence of the .zcd is sufficient.
 """
 
 import io
 import os
-import struct
 import zipfile
 
 import msgpack
 
 from zip_entry import ZipEntry
 
-_MAGIC   = b'ZCD\x01'
-_HDR_FMT = '<Qd'                      # file_size (uint64) + mtime (float64)
-_HDR_SZ  = struct.calcsize(_HDR_FMT)
+_MAGIC = b'ZCD\x01'
 
 
 # ── Cache path ────────────────────────────────────────────────────────────────
@@ -37,15 +35,10 @@ def cache_path(zip_path: str, case_dir: str) -> str:
 # ── Validity check ────────────────────────────────────────────────────────────
 
 def is_valid(zip_path: str, case_dir: str) -> bool:
-    """Return True if a valid, up-to-date .zcd cache exists in case_dir."""
-    cp = cache_path(zip_path, case_dir)
+    """Return True if a .zcd cache exists in case_dir with the correct magic."""
     try:
-        zst = os.stat(zip_path)
-        with open(cp, 'rb') as f:
-            if f.read(4) != _MAGIC:
-                return False
-            size, mtime = struct.unpack(_HDR_FMT, f.read(_HDR_SZ))
-            return size == zst.st_size and abs(mtime - zst.st_mtime) < 2
+        with open(cache_path(zip_path, case_dir), 'rb') as f:
+            return f.read(4) == _MAGIC
     except OSError:
         return False
 
@@ -73,10 +66,8 @@ def save(zip_path: str, case_dir: str, infolist: list[zipfile.ZipInfo],
         if progress_cb and i % 5_000 == 0:
             progress_cb(i, total)
 
-    zst    = os.stat(zip_path)
-    header = _MAGIC + struct.pack(_HDR_FMT, zst.st_size, zst.st_mtime)
     with open(cache_path(zip_path, case_dir), 'wb') as fh:
-        fh.write(header)
+        fh.write(_MAGIC)
         fh.write(msgpack.packb(rows, use_bin_type=True))
 
     if progress_cb:
@@ -86,12 +77,12 @@ def save(zip_path: str, case_dir: str, infolist: list[zipfile.ZipInfo],
 # ── Load ──────────────────────────────────────────────────────────────────────
 
 def load(zip_path: str, case_dir: str) -> list[zipfile.ZipInfo] | None:
-    """Return the cached ZipInfo list, or None if the cache is missing/stale."""
+    """Return the cached ZipInfo list, or None if the cache is missing."""
     if not is_valid(zip_path, case_dir):
         return None
     try:
         with open(cache_path(zip_path, case_dir), 'rb') as fh:
-            fh.read(4 + _HDR_SZ)   # skip magic + header
+            fh.read(4)   # skip magic
             rows = msgpack.unpackb(fh.read(), raw=False)
         infos: list[zipfile.ZipInfo] = []
         for fn, fs, cs, ct, ho, ex, dt in rows:

@@ -879,13 +879,14 @@ class ZipMetadataWorker(QThread):
             if _infolist_to_cache is not None and self.case_dir:
                 try:
                     self.status_update.emit(
-                        f"Caching central directory ({len(_infolist_to_cache):,} entries)…")
+                        f"Saving ZIP directory locally ({len(_infolist_to_cache):,} entries"
+                        f" — large archives may take a moment)…")
                     _cd_cache_save(
                         self.zip_path, self.case_dir, _infolist_to_cache,
                         progress_cb=lambda done, total: self.status_update.emit(
-                            f"Caching central directory… {done / max(total, 1):.0%}"),
+                            f"Saving ZIP directory locally… {done / max(total, 1):.0%}"),
                     )
-                    self.status_update.emit("Central directory cached — future opens will be instant.")
+                    self.status_update.emit("ZIP directory saved — future opens will be instant.")
                 except Exception:
                     pass   # cache write failure is non-fatal
 

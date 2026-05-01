@@ -2,6 +2,7 @@ import sys
 import os
 import re
 import time
+import atexit
 import zipfile
 import json
 import struct
@@ -3203,15 +3204,23 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         Qt aborts with SIGABRT if QThread is destroyed while still running, so
         all workers must be stopped before Python tears down Qt objects.
+        Safe to call more than once (closeEvent + atexit both call it).
         """
+        if getattr(self, '_workers_stopped', False):
+            return
+        self._workers_stopped = True
+
         def _stop(worker, has_stop=False):
-            if worker is None or not worker.isRunning():
-                return
-            if has_stop:
-                worker.stop()
-            else:
-                worker.quit()
-            worker.wait(2000)
+            try:
+                if worker is None or not worker.isRunning():
+                    return
+                if has_stop:
+                    worker.stop()
+                else:
+                    worker.quit()
+                worker.wait(2000)
+            except Exception:
+                pass
 
         _stop(getattr(self, 'worker', None))
         _stop(getattr(self, '_scan_worker', None))
@@ -3238,5 +3247,6 @@ if __name__ == "__main__":
     app.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
     window = FastZipBrowser()
     app.aboutToQuit.connect(window._stop_all_workers)
+    atexit.register(window._stop_all_workers)  # runs before Qt's atexit on exception exit
     window.show()
     sys.exit(app.exec())

@@ -420,21 +420,18 @@ class FfsAdapter:
         local .zcd cache is available so the scan runs over in-memory data
         rather than requiring a network seek.
         """
-        user_prefix_slash = self.user_prefix + '/'
-        old_pv_slash      = (user_prefix_slash + 'private/var/') if self.old_layout else None
-        old_pv_len        = len(old_pv_slash) if old_pv_slash else 0
-        strip_for_fs      = {self.user_prefix: True}
+        prefix    = self.user_prefix + '/'
+        old_strip = (prefix + 'private/var/') if self.old_layout else None
+
         result: dict[str, str] = {}
         for entry in zip_names:
-            phys  = entry.rstrip('/')
-            slash = phys.find('/')
-            if slash < 0 or phys[:slash] not in strip_for_fs:
+            phys = entry.rstrip('/')
+            if not phys.startswith(prefix):
                 continue
-            ui_path = (phys[old_pv_len:] if old_pv_slash and phys.startswith(old_pv_slash)
-                       else phys[len(user_prefix_slash):])
-            if not ui_path:
-                continue
-            result[ui_path] = phys
+            ui_path = (phys.removeprefix(old_strip) if old_strip and phys.startswith(old_strip)
+                       else phys.removeprefix(prefix))
+            if ui_path:
+                result[ui_path] = phys
         return result
 
     def build_ui_metadata(
@@ -524,25 +521,8 @@ class FfsAdapter:
         if zip_entries is not None:
             _zip_entries = zip_entries
         else:
-            user_prefix_slash = self.user_prefix + '/'
-            old_pv_slash      = (user_prefix_slash + 'private/var/') if self.old_layout else None
-            old_pv_len        = len(old_pv_slash) if old_pv_slash else 0
-            strip_for_fs      = {self.user_prefix: len(user_prefix_slash)}
-
             _emit(f"Scanning user partition ({self.user_prefix})…")
-            _zip_entries: dict[str, str] = {}   # ui_path → physical zip entry (no trailing slash)
-            for entry in zip_names:
-                phys = entry.rstrip('/')        # normalise: dir records treated same as files
-                slash = phys.find('/')
-                if slash < 0:
-                    continue
-                if strip_for_fs.get(phys[:slash]) is None:
-                    continue
-                ui_path = (phys[old_pv_len:] if old_pv_slash and phys.startswith(old_pv_slash)
-                           else phys[len(user_prefix_slash):])
-                if not ui_path:
-                    continue                    # the prefix dir itself — skip
-                _zip_entries[ui_path] = phys
+            _zip_entries = self.build_zip_entries(zip_names)
 
         zip_ui_paths = frozenset(_zip_entries)
 

@@ -3,6 +3,8 @@
 import os
 import sqlite3
 
+import msgpack
+
 # Increment whenever the content-status logic changes (e.g. new status values).
 # Cached status dicts whose version marker doesn't match are discarded so the
 # folder scan re-runs with the current logic.
@@ -135,6 +137,15 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     except Exception:
         pass  # column already exists
 
+    # Blob store for folder sizes — one row per zip, much faster than 500k individual rows.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS folder_sizes_blob (
+            zip_path TEXT PRIMARY KEY,
+            version  TEXT NOT NULL,
+            data     BLOB NOT NULL
+        )
+    ''')
+
     # Drop any leftover tables from previous versions — no longer used.
     conn.execute('DROP TABLE IF EXISTS content_cache')
     conn.execute('DROP TABLE IF EXISTS folder_counts')
@@ -182,20 +193,24 @@ def load_header_types(conn: 'sqlite3.Connection', zip_path: str) -> dict:
 
 
 def save_folder_sizes(conn: 'sqlite3.Connection', zip_path: str, sizes: dict) -> None:
-    """Persist {folder_path: total_bytes} into folder_metadata, clearing prior rows for zip_path.
+    """Persist {folder_path: total_bytes} as a single msgpack blob for fast loading.
 
-    A version marker row (folder_path='__v__') is written alongside the data so
-    that load_folder_metadata can detect and discard stale caches when the
-    computation logic changes.
+    Legacy rows in folder_metadata (total_size column) are deleted on save so
+    the DB doesn't carry duplicate data after migration.
     """
-    conn.execute('DELETE FROM folder_metadata WHERE zip_path=?', (zip_path,))
-    conn.executemany(
-        'INSERT INTO folder_metadata (zip_path, folder_path, total_size) VALUES (?,?,?)',
-        [(zip_path, p, s) for p, s in sizes.items()],
+    blob = msgpack.packb(sizes, use_bin_type=True)
+    conn.execute(
+        'INSERT OR REPLACE INTO folder_sizes_blob (zip_path, version, data) VALUES (?,?,?)',
+        (zip_path, _FOLDER_CACHE_VERSION, blob),
+    )
+    # Remove legacy per-row sizes from folder_metadata (counts are left intact).
+    conn.execute(
+        "DELETE FROM folder_metadata WHERE zip_path=? AND folder_path='__v__'",
+        (zip_path,),
     )
     conn.execute(
-        'INSERT INTO folder_metadata (zip_path, folder_path, status) VALUES (?,?,?)',
-        (zip_path, '__v__', _FOLDER_CACHE_VERSION),
+        'UPDATE folder_metadata SET total_size=NULL WHERE zip_path=?',
+        (zip_path,),
     )
     conn.commit()
 
@@ -219,22 +234,39 @@ def load_folder_metadata(conn: 'sqlite3.Connection', zip_path: str) -> tuple[dic
     """Return (counts, sizes) previously saved for zip_path.
 
     counts — {folder_path: int}  (only rows where count IS NOT NULL)
-    sizes  — {folder_path: int}  (only rows where total_size IS NOT NULL)
-    Both dicts are empty if nothing has been saved yet.
+    sizes  — {folder_path: int}  (empty if not cached or version mismatch)
 
-    If the stored version marker is absent or does not match _FOLDER_CACHE_VERSION
-    sizes is returned empty so the caller recomputes with current logic.
-    Counts are always returned as-is (they are version-independent).
+    Sizes are stored as a single msgpack blob in folder_sizes_blob for fast
+    loading.  Legacy per-row sizes in folder_metadata are read as a fallback
+    for databases written before the blob format was introduced.
     """
-    rows = conn.execute(
-        'SELECT folder_path, count, status, total_size FROM folder_metadata WHERE zip_path=?',
+    # Counts are still stored per-row (written incrementally as folders are scanned).
+    count_rows = conn.execute(
+        'SELECT folder_path, count FROM folder_metadata WHERE zip_path=? AND count IS NOT NULL',
         (zip_path,),
     ).fetchall()
-    counts = {p: c for p, c, s, ts in rows if c is not None}
-    version = next((s for p, c, s, ts in rows if p == '__v__'), None)
+    counts = {p: c for p, c in count_rows}
+
+    # Sizes: fast blob path first.
+    blob_row = conn.execute(
+        'SELECT version, data FROM folder_sizes_blob WHERE zip_path=?',
+        (zip_path,),
+    ).fetchone()
+    if blob_row is not None:
+        version, data = blob_row
+        if version == _FOLDER_CACHE_VERSION:
+            return counts, msgpack.unpackb(data, raw=False)
+        return counts, {}
+
+    # Legacy fallback — databases written before the blob format.
+    legacy_rows = conn.execute(
+        'SELECT folder_path, status, total_size FROM folder_metadata WHERE zip_path=?',
+        (zip_path,),
+    ).fetchall()
+    version = next((s for p, s, ts in legacy_rows if p == '__v__'), None)
     if version != _FOLDER_CACHE_VERSION:
         return counts, {}
-    sizes = {p: ts for p, c, s, ts in rows if ts is not None and p != '__v__'}
+    sizes = {p: ts for p, s, ts in legacy_rows if ts is not None and p != '__v__'}
     return counts, sizes
 
 

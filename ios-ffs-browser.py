@@ -19,7 +19,8 @@ HARDWARE_MODELS_FILE = os.path.join('config', 'hardware_models.json')           
 sys.path.insert(0, _APP_DIR)
 
 from adapters import FfsAdapter
-from db_utils import (_open_case_db, save_header_types, load_header_types,
+from db_utils import (_open_case_db, OldSchemaError, check_schema,
+                      save_header_types, load_header_types,
                       save_guid_bundle_map, load_guid_bundle_map,
                       save_folder_counts, save_folder_sizes, load_folder_metadata)
 import header_scan
@@ -740,6 +741,13 @@ class ZipMetadataWorker(QThread):
         try:
             self.status_update.emit("Opening Archive...")
             self._streaming_index = None
+
+            if self.case_dir:
+                try:
+                    check_schema(self.case_dir)
+                except OldSchemaError as e:
+                    self.status_update.emit(str(e))
+                    return
 
             # ── Open the archive ──────────────────────────────────────────────
             if self.case_dir:

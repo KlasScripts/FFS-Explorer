@@ -10,6 +10,15 @@ import msgpack
 # folder scan re-runs with the current logic.
 _FOLDER_CACHE_VERSION = '5'
 
+# Bump whenever the database schema changes incompatibly.  Old databases
+# (user_version=0 with existing tables, or any version != _SCHEMA_VERSION)
+# raise OldSchemaError instead of attempting a migration.
+_SCHEMA_VERSION = 1
+
+
+class OldSchemaError(Exception):
+    """Raised when casedata.db was created by an older incompatible app version."""
+
 
 def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     """Open (or create) the per-case database inside *cache_dir*.
@@ -32,6 +41,27 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=5)
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA foreign_keys=ON')
+
+    # Detect databases created by older app versions and refuse to open them.
+    _ver = conn.execute('PRAGMA user_version').fetchone()[0]
+    if _ver == 0:
+        _tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if _tables:
+            conn.close()
+            raise OldSchemaError(
+                "casedata.db was created by an older version of this app — "
+                "please delete casedata.db from the case folder and reopen "
+                "the archive to rebuild it."
+            )
+    elif _ver != _SCHEMA_VERSION:
+        conn.close()
+        raise OldSchemaError(
+            f"casedata.db schema version {_ver} is not compatible with this "
+            f"version of the app (expected {_SCHEMA_VERSION}) — please delete "
+            "casedata.db from the case folder and reopen the archive to rebuild it."
+        )
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS thumbnails (
@@ -86,11 +116,6 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
         ON search_entries (zip_path, zip_size)
     ''')
 
-    # Migration must run before search_results is created so it can safely
-    # drop the old flat table (with keyword column) before we attempt to add
-    # the new index on term_id — which doesn't exist in the old schema.
-    _migrate(conn)
-
     conn.execute('''
         CREATE TABLE IF NOT EXISTS search_results (
             term_id  INTEGER NOT NULL REFERENCES search_index(id) ON DELETE CASCADE,
@@ -132,11 +157,6 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
             PRIMARY KEY (zip_path, folder_path)
         )
     ''')
-    try:
-        conn.execute('ALTER TABLE folder_metadata ADD COLUMN total_size INTEGER')
-    except Exception:
-        pass  # column already exists
-
     # Blob store for folder sizes — one row per zip, much faster than 500k individual rows.
     conn.execute('''
         CREATE TABLE IF NOT EXISTS folder_sizes_blob (
@@ -146,11 +166,7 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
-    # Drop any leftover tables from previous versions — no longer used.
-    conn.execute('DROP TABLE IF EXISTS content_cache')
-    conn.execute('DROP TABLE IF EXISTS folder_counts')
-    conn.execute('DROP TABLE IF EXISTS folder_content_status')
-
+    conn.execute(f'PRAGMA user_version = {_SCHEMA_VERSION}')
     conn.commit()
     return conn
 
@@ -270,42 +286,34 @@ def load_folder_metadata(conn: 'sqlite3.Connection', zip_path: str) -> tuple[dic
     return counts, sizes
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    """Migrate old flat search_results schema (zip_path, keyword columns) to the
-    normalised search_index / search_results schema if needed."""
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(search_results)")}
-    if 'keyword' not in cols:
-        return  # already on new schema
+def check_schema(cache_dir: str) -> None:
+    """Raise OldSchemaError if casedata.db exists but has an incompatible schema.
 
-    # Migrate existing rows into search_index + new search_results
-    rows = conn.execute(
-        'SELECT zip_path, keyword, filename, offset, context FROM search_results'
-    ).fetchall()
-
-    conn.execute('DROP TABLE IF EXISTS search_results')
-    conn.execute('''
-        CREATE TABLE search_results (
-            term_id  INTEGER NOT NULL REFERENCES search_index(id) ON DELETE CASCADE,
-            filename TEXT    NOT NULL,
-            offset   INTEGER NOT NULL,
-            context  TEXT    NOT NULL
-        )
-    ''')
-    conn.execute('''
-        CREATE INDEX IF NOT EXISTS idx_search_results_term
-        ON search_results (term_id)
-    ''')
-
-    for zip_path, keyword, filename, offset, context in rows:
-        conn.execute(
-            'INSERT OR IGNORE INTO search_index (zip_path, keyword) VALUES (?, ?)',
-            (zip_path, keyword)
-        )
-        (term_id,) = conn.execute(
-            'SELECT id FROM search_index WHERE zip_path=? AND keyword=?',
-            (zip_path, keyword)
-        ).fetchone()
-        conn.execute(
-            'INSERT INTO search_results (term_id, filename, offset, context) VALUES (?,?,?,?)',
-            (term_id, filename, offset, context)
-        )
+    Lightweight check — opens the DB read-only, reads user_version, closes.
+    Call this early so the user gets a clear message before any work is done.
+    """
+    db_path = os.path.join(cache_dir, 'casedata.db')
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        ver = conn.execute('PRAGMA user_version').fetchone()[0]
+        if ver == _SCHEMA_VERSION:
+            conn.close()
+            return
+        if ver == 0:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            conn.close()
+            if not tables:
+                return  # new empty DB — not yet stamped
+        else:
+            conn.close()
+    except Exception:
+        return  # unreadable — let normal open handle it
+    raise OldSchemaError(
+        "casedata.db was created by an older version of this app — "
+        "please delete casedata.db from the case folder and reopen "
+        "the archive to rebuild it."
+    )

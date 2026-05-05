@@ -10,7 +10,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from adapters import FfsAdapter
-from db_utils import _open_case_db
+from db_utils import _open_case_db, OldSchemaError
 from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QPushButton, QComboBox,
     QVBoxLayout, QHBoxLayout, QTreeView, QDialog, QProgressBar,
@@ -807,6 +807,8 @@ class KeywordSearchMixin:
             return None
         try:
             return _open_case_db(self._case_dir)
+        except OldSchemaError:
+            raise   # caller must handle — old DB needs to be rebuilt
         except OSError:
             return None
 

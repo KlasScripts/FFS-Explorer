@@ -745,9 +745,13 @@ class ZipMetadataWorker(QThread):
             if self.case_dir:
                 try:
                     check_schema(self.case_dir)
-                except OldSchemaError as e:
-                    self.status_update.emit(str(e))
-                    return
+                except OldSchemaError:
+                    self.status_update.emit(
+                        "Old casedata.db detected — rebuilding case database…")
+                    try:
+                        os.remove(os.path.join(self.case_dir, 'casedata.db'))
+                    except OSError:
+                        pass
 
             # ── Open the archive ──────────────────────────────────────────────
             if self.case_dir:

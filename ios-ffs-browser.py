@@ -2595,7 +2595,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         dlg = ProcessDialog(
             zip_path=self.zip_path,
             case_dir=self._case_dir,
-            adapter=self._adapter,
+            ffs_adapter=self._adapter,
             ui_metadata=self.full_metadata,
             streaming_index=self._streaming_index,
             parent=self,

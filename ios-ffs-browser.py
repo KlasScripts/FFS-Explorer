@@ -740,46 +740,45 @@ class ZipMetadataWorker(QThread):
         try:
             self.status_update.emit("Opening Archive...")
             self._streaming_index = None
-            _infolist_to_cache: list | None = None  # set when a fresh CD read needs caching
 
             # ── Open the archive ──────────────────────────────────────────────
-            if self.case_dir and _cd_cache_valid(self.zip_path, self.case_dir):
-                # Cached central directory in case dir — skip the expensive network seek
-                self.status_update.emit("Loading central directory from local cache...")
-                _cached_infos = _cd_cache_load(self.zip_path, self.case_dir)
-                z_ctx = CachedZipView(self.zip_path, _cached_infos) if _cached_infos else None
-            else:
-                z_ctx = None
-
-            if z_ctx is None:
-                try:
-                    if not (self.case_dir and _cd_cache_valid(self.zip_path, self.case_dir)):
+            if self.case_dir:
+                # Ensure local .zcd exists — copy on first open, always use local copy
+                if not _cd_cache_valid(self.zip_path, self.case_dir):
+                    self.status_update.emit(
+                        "Copying central directory to case folder (first open — may be slow on network)…")
+                    _t0 = time.monotonic()
+                    _saved = _cd_cache_save(
+                        self.zip_path, self.case_dir,
+                        progress_cb=lambda done, total: self.status_update.emit(
+                            f"Copying central directory… {done / max(total, 1):.0%}"),
+                    )
+                    if not _saved:
+                        # No seekable CD — fall back to streaming index
+                        self.status_update.emit("Streaming zip detected — building index...")
+                        self._streaming_index = StreamingZipIndex.open(
+                            self.zip_path,
+                            progress_cb=lambda done, total: self.status_update.emit(
+                                f"Indexing archive: {done / max(total, 1):.0%}"),
+                        )
+                    else:
+                        _elapsed = time.monotonic() - _t0
                         self.status_update.emit(
-                            "Reading archive central directory (first open — may be slow)…")
+                            f"Central directory copied to case folder in {_elapsed:.1f}s.")
+
+                if self._streaming_index is None:
+                    self.status_update.emit("Loading central directory from local copy…")
+                    _cached_infos = _cd_cache_load(self.zip_path, self.case_dir)
+                    z_ctx = CachedZipView(self.zip_path, _cached_infos) if _cached_infos else None
+                    if z_ctx is None:
+                        raise RuntimeError("Failed to load central directory from local copy")
+                else:
+                    z_ctx = None
+            else:
+                # No case dir — open the network file directly
+                try:
                     z_ctx = zipfile.ZipFile(self.zip_path, 'r')
                     z_ctx.__enter__()
-                    _infolist_to_cache = z_ctx.infolist()
-                    # Write sidecar immediately — it is the foundation for all
-                    # subsequent processing. Writing here guarantees it exists
-                    # regardless of when the app closes.
-                    if _infolist_to_cache and self.case_dir:
-                        try:
-                            _n = len(_infolist_to_cache)
-                            self.status_update.emit(
-                                f"Saving ZIP directory locally ({_n:,} entries"
-                                f" — large archives may take a moment)…")
-                            _t0 = time.monotonic()
-                            _cd_cache_save(
-                                self.zip_path, self.case_dir, _infolist_to_cache,
-                                progress_cb=lambda done, total: self.status_update.emit(
-                                    f"Saving ZIP directory locally… {done / max(total, 1):.0%}"),
-                            )
-                            _elapsed = time.monotonic() - _t0
-                            self.status_update.emit(
-                                f"ZIP directory saved — {_n:,} entries in {_elapsed:.1f}s.")
-                            _infolist_to_cache = None  # prevent duplicate write below
-                        except Exception:
-                            pass
                 except zipfile.BadZipFile:
                     self.status_update.emit("Streaming zip detected — building index...")
                     self._streaming_index = StreamingZipIndex.open(
@@ -797,9 +796,7 @@ class ZipMetadataWorker(QThread):
                     ffs_adapter = FfsAdapter.detect_from_names(zip_names)
                 else:
                     assert z_ctx is not None
-                    _infolist = (_infolist_to_cache
-                                 if _infolist_to_cache is not None
-                                 else z_ctx.infolist())
+                    _infolist = z_ctx.infolist()
                     zip_names = frozenset(info.filename for info in _infolist)
                     zip_sizes = {info.filename: info.file_size for info in _infolist}
                     ffs_adapter = FfsAdapter.detect(z_ctx)

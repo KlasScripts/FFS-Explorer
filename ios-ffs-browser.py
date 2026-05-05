@@ -758,7 +758,28 @@ class ZipMetadataWorker(QThread):
                             "Reading archive central directory (first open — may be slow)…")
                     z_ctx = zipfile.ZipFile(self.zip_path, 'r')
                     z_ctx.__enter__()
-                    _infolist_to_cache = z_ctx.infolist()  # capture before close
+                    _infolist_to_cache = z_ctx.infolist()
+                    # Write sidecar immediately — it is the foundation for all
+                    # subsequent processing. Writing here guarantees it exists
+                    # regardless of when the app closes.
+                    if _infolist_to_cache and self.case_dir:
+                        try:
+                            _n = len(_infolist_to_cache)
+                            self.status_update.emit(
+                                f"Saving ZIP directory locally ({_n:,} entries"
+                                f" — large archives may take a moment)…")
+                            _t0 = time.monotonic()
+                            _cd_cache_save(
+                                self.zip_path, self.case_dir, _infolist_to_cache,
+                                progress_cb=lambda done, total: self.status_update.emit(
+                                    f"Saving ZIP directory locally… {done / max(total, 1):.0%}"),
+                            )
+                            _elapsed = time.monotonic() - _t0
+                            self.status_update.emit(
+                                f"ZIP directory saved — {_n:,} entries in {_elapsed:.1f}s.")
+                            _infolist_to_cache = None  # prevent duplicate write below
+                        except Exception:
+                            pass
                 except zipfile.BadZipFile:
                     self.status_update.emit("Streaming zip detected — building index...")
                     self._streaming_index = StreamingZipIndex.open(
@@ -874,27 +895,6 @@ class ZipMetadataWorker(QThread):
                     _db.close()
                 except Exception:
                     pass
-
-            # Save central directory cache after the UI is live so the user
-            # can start browsing immediately while the sidecar is written.
-            if _infolist_to_cache is not None and self.case_dir:
-                try:
-                    _n = len(_infolist_to_cache)
-                    self.status_update.emit(
-                        f"Saving ZIP directory locally ({_n:,} entries"
-                        f" — large archives may take a moment)…")
-                    _t0 = time.monotonic()
-                    _cd_cache_save(
-                        self.zip_path, self.case_dir, _infolist_to_cache,
-                        progress_cb=lambda done, total: self.status_update.emit(
-                            f"Saving ZIP directory locally… {done / max(total, 1):.0%}"),
-                    )
-                    _elapsed = time.monotonic() - _t0
-                    self.status_update.emit(
-                        f"ZIP directory saved — {_n:,} entries in {_elapsed:.1f}s"
-                        f" — future opens will be instant.")
-                except Exception:
-                    pass   # cache write failure is non-fatal
 
             if header_candidates:
                 self.status_update.emit(

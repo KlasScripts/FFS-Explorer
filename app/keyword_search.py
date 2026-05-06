@@ -9,8 +9,12 @@ import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import msgpack
+
 from adapters import FfsAdapter
-from db_utils import _open_case_db, OldSchemaError
+from db_utils import _open_case_db, OldSchemaError, save_blob, load_blob
+
+_SEARCH_ENTRIES_VERSION = '1'
 from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QPushButton, QComboBox,
     QVBoxLayout, QHBoxLayout, QTreeView, QDialog, QProgressBar,
@@ -101,42 +105,26 @@ class SearchIndexWorker(QThread):
 
         self.entries_ready.emit(entries)
 
-    def _zip_size(self) -> int:
-        try:
-            return os.path.getsize(self.zip_path)
-        except OSError:
-            return -1
-
     def _load_from_db(self) -> list | None:
         try:
-            zip_size = self._zip_size()
             db = _open_case_db(self.case_dir)
             try:
-                rows = db.execute(
-                    'SELECT filename, data_offset, file_size FROM search_entries '
-                    'WHERE zip_path=? AND zip_size=? ORDER BY rowid',
-                    (self.zip_path, zip_size)
-                ).fetchall()
+                raw = load_blob(db, 'search_entries', _SEARCH_ENTRIES_VERSION)
             finally:
                 db.close()
-            return rows if rows else None
+            if raw is None:
+                return None
+            rows = msgpack.unpackb(raw, raw=False)
+            return [tuple(r) for r in rows] if rows else None
         except Exception:
             return None
 
     def _save_to_db(self, entries: list) -> None:
         try:
-            zip_size = self._zip_size()
-            db = _open_case_db(self.case_dir)
+            raw = msgpack.packb(entries, use_bin_type=True)
+            db  = _open_case_db(self.case_dir)
             try:
-                db.execute('DELETE FROM search_entries WHERE zip_path=?',
-                           (self.zip_path,))
-                db.executemany(
-                    'INSERT INTO search_entries '
-                    '(zip_path, zip_size, filename, data_offset, file_size) '
-                    'VALUES (?,?,?,?,?)',
-                    [(self.zip_path, zip_size, n, o, s) for n, o, s in entries]
-                )
-                db.commit()
+                save_blob(db, 'search_entries', _SEARCH_ENTRIES_VERSION, raw)
             finally:
                 db.close()
         except Exception:
@@ -295,10 +283,9 @@ class DbSearchLoader(QThread):
 
     BATCH_SIZE = 200
 
-    def __init__(self, case_dir: str, zip_path: str, term: str, parent=None):
+    def __init__(self, case_dir: str, term: str, parent=None):
         super().__init__(parent)
         self._case_dir = case_dir
-        self._zip_path = zip_path
         self._term     = term
 
     def run(self):
@@ -309,9 +296,9 @@ class DbSearchLoader(QThread):
                     'SELECT r.filename, r.offset, r.context '
                     'FROM search_results r '
                     'JOIN search_index i ON r.term_id = i.id '
-                    'WHERE i.zip_path=? AND i.keyword=? '
+                    'WHERE i.keyword=? '
                     'ORDER BY r.rowid',
-                    (self._zip_path, self._term)
+                    (self._term,)
                 ).fetchall()
             finally:
                 db.close()
@@ -864,8 +851,8 @@ class KeywordSearchMixin:
             return False
         try:
             row = db.execute(
-                'SELECT id FROM search_index WHERE zip_path=? AND keyword=?',
-                (self.zip_path, term)
+                'SELECT id FROM search_index WHERE keyword=?',
+                (term,)
             ).fetchone()
             if row is None:
                 return False  # never searched
@@ -900,7 +887,7 @@ class KeywordSearchMixin:
         self.search_status.setText(f"Loading '{term}' from cache…")
 
         self._db_loader_term = term
-        self._db_loader = DbSearchLoader(self._case_dir, self.zip_path, term)
+        self._db_loader = DbSearchLoader(self._case_dir, term)
         self._db_loader.rows_ready.connect(self._on_db_loader_rows)
         self._db_loader.finished.connect(self._on_db_loader_finished)
         self._db_loader.start()
@@ -956,8 +943,8 @@ class KeywordSearchMixin:
             try:
                 db.execute(
                     'DELETE FROM search_results '
-                    'WHERE term_id=(SELECT id FROM search_index WHERE zip_path=? AND keyword=?)',
-                    (self.zip_path, term)
+                    'WHERE term_id=(SELECT id FROM search_index WHERE keyword=?)',
+                    (term,)
                 )
                 db.commit()
             finally:
@@ -1042,13 +1029,13 @@ class KeywordSearchMixin:
                     # Always record that this search ran (even 0 hits) so that
                     # re-selecting from recent doesn't trigger a new search.
                     db.execute(
-                        'INSERT OR IGNORE INTO search_index (zip_path, keyword) VALUES (?, ?)',
-                        (self.zip_path, term)
+                        'INSERT OR IGNORE INTO search_index (keyword) VALUES (?)',
+                        (term,)
                     )
                 if self._pending_db_hits:
                     (term_id,) = db.execute(
-                        'SELECT id FROM search_index WHERE zip_path=? AND keyword=?',
-                        (self.zip_path, term)
+                        'SELECT id FROM search_index WHERE keyword=?',
+                        (term,)
                     ).fetchone()
                     db.executemany(
                         'INSERT INTO search_results (term_id, filename, offset, context) '

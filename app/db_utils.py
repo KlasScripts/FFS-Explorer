@@ -1,19 +1,23 @@
-"""db_utils.py — shared case-database utilities."""
+"""db_utils.py — shared case-database utilities.
+
+One casedata.db per case folder.  Each case folder belongs to exactly one
+exhibit (FFS archive), so no zip_path key is needed in any table — all rows
+implicitly belong to that one archive.
+"""
 
 import os
 import sqlite3
 
 import msgpack
 
-# Increment whenever the content-status logic changes (e.g. new status values).
-# Cached status dicts whose version marker doesn't match are discarded so the
-# folder scan re-runs with the current logic.
-_FOLDER_CACHE_VERSION = '5'
+# Per-key blob versions — increment a version string to invalidate stale data.
+_FOLDER_DATA_VERSION    = '6'
+_SEARCH_ENTRIES_VERSION = '1'
 
 # Bump whenever the database schema changes incompatibly.  Old databases
-# (user_version=0 with existing tables, or any version != _SCHEMA_VERSION)
-# raise OldSchemaError instead of attempting a migration.
-_SCHEMA_VERSION = 1
+# (user_version != _SCHEMA_VERSION) are auto-deleted and rebuilt rather than
+# migrated — all content is reconstructable cache or per-case user data.
+_SCHEMA_VERSION = 4
 
 
 class OldSchemaError(Exception):
@@ -24,14 +28,19 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     """Open (or create) the per-case database inside *cache_dir*.
 
     Tables:
-      thumbnails      — cached media thumbnails
-      search_index    — normalised (zip_path, keyword) → id lookup
-      search_results  — hit rows keyed by search_index.id (term_id)
-      device_info     — cached device labels per zip
-      recent_searches — MRU list of search terms
+      thumbnails    — cached media thumbnails
+      search_index  — normalised keyword → id lookup
+      search_results— hit rows keyed by search_index.id (term_id)
+      device_info   — per-field device metadata
+      recent_searches— MRU list of search terms
+      header_types  — detected file types for 'Other' entries
+      guid_bundle   — GUID → bundle-ID map
+      blobs         — key/version/data store for msgpack-encoded caches:
+                        'folder_data'    → {folder_path: [count, size_bytes]}
+                        'search_entries' → [[filename, data_offset, file_size], ...]
 
-    Raises ValueError if cache_dir is falsy so callers that hold a None
-    case_dir are forced to guard before calling.
+    Raises ValueError if cache_dir is falsy.
+    Raises OldSchemaError if casedata.db has an incompatible schema.
     """
     if not cache_dir:
         raise ValueError("cache_dir must be set; no global fallback exists")
@@ -42,7 +51,6 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA foreign_keys=ON')
 
-    # Detect databases created by older app versions and refuse to open them.
     _ver = conn.execute('PRAGMA user_version').fetchone()[0]
     if _ver == 0:
         _tables = {r[0] for r in conn.execute(
@@ -65,55 +73,35 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS thumbnails (
-            zip_path   TEXT    NOT NULL,
             ui_path    TEXT    NOT NULL,
             file_size  INTEGER NOT NULL,
             thumb_size INTEGER NOT NULL,
             data       BLOB    NOT NULL,
-            PRIMARY KEY (zip_path, ui_path, file_size, thumb_size)
+            PRIMARY KEY (ui_path, file_size, thumb_size)
         )
     ''')
 
-    # Normalised search index — deduplicates the long zip_path + keyword strings
-    # that would otherwise repeat on every result row.
     conn.execute('''
         CREATE TABLE IF NOT EXISTS search_index (
-            id       INTEGER PRIMARY KEY,
-            zip_path TEXT    NOT NULL,
-            keyword  TEXT    NOT NULL,
-            UNIQUE (zip_path, keyword)
+            id      INTEGER PRIMARY KEY,
+            keyword TEXT    NOT NULL UNIQUE
         )
     ''')
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS device_info (
-            zip_path    TEXT PRIMARY KEY,
-            make        TEXT NOT NULL DEFAULT '',
-            model       TEXT NOT NULL DEFAULT '',
-            ios_version TEXT NOT NULL DEFAULT '',
-            hw_id       TEXT NOT NULL DEFAULT ''
+            field_name TEXT NOT NULL PRIMARY KEY,
+            data       TEXT NOT NULL DEFAULT '',
+            source     TEXT NOT NULL DEFAULT ''
         )
     ''')
+
     conn.execute('''
         CREATE TABLE IF NOT EXISTS recent_searches (
             term    TEXT    NOT NULL,
             used_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
             PRIMARY KEY (term)
         )
-    ''')
-
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS search_entries (
-            zip_path    TEXT    NOT NULL,
-            zip_size    INTEGER NOT NULL,
-            filename    TEXT    NOT NULL,
-            data_offset INTEGER NOT NULL,
-            file_size   INTEGER NOT NULL
-        )
-    ''')
-    conn.execute('''
-        CREATE INDEX IF NOT EXISTS idx_search_entries_zip
-        ON search_entries (zip_path, zip_size)
     ''')
 
     conn.execute('''
@@ -131,38 +119,23 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS header_types (
-            zip_path      TEXT NOT NULL,
-            ui_path       TEXT NOT NULL,
-            detected_type TEXT NOT NULL,
-            PRIMARY KEY (zip_path, ui_path)
+            ui_path       TEXT NOT NULL PRIMARY KEY,
+            detected_type TEXT NOT NULL
         )
     ''')
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS guid_bundle (
-            zip_path  TEXT NOT NULL,
-            guid      TEXT NOT NULL,
-            bundle_id TEXT NOT NULL,
-            PRIMARY KEY (zip_path, guid)
+            guid      TEXT NOT NULL PRIMARY KEY,
+            bundle_id TEXT NOT NULL
         )
     ''')
 
     conn.execute('''
-        CREATE TABLE IF NOT EXISTS folder_metadata (
-            zip_path    TEXT    NOT NULL,
-            folder_path TEXT    NOT NULL,
-            count       INTEGER,
-            status      TEXT,
-            total_size  INTEGER,
-            PRIMARY KEY (zip_path, folder_path)
-        )
-    ''')
-    # Blob store for folder sizes — one row per zip, much faster than 500k individual rows.
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS folder_sizes_blob (
-            zip_path TEXT PRIMARY KEY,
-            version  TEXT NOT NULL,
-            data     BLOB NOT NULL
+        CREATE TABLE IF NOT EXISTS blobs (
+            key     TEXT NOT NULL PRIMARY KEY,
+            version TEXT NOT NULL,
+            data    BLOB NOT NULL
         )
     ''')
 
@@ -171,127 +144,127 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     return conn
 
 
-def save_guid_bundle_map(conn: 'sqlite3.Connection', zip_path: str, mapping: dict) -> None:
+# ── GUID / bundle-ID map ──────────────────────────────────────────────────────
+
+def save_guid_bundle_map(conn: 'sqlite3.Connection', mapping: dict) -> None:
     """Persist {guid: bundle_id} into the guid_bundle table."""
-    conn.execute('DELETE FROM guid_bundle WHERE zip_path=?', (zip_path,))
+    conn.execute('DELETE FROM guid_bundle')
     conn.executemany(
-        'INSERT INTO guid_bundle (zip_path, guid, bundle_id) VALUES (?,?,?)',
-        [(zip_path, guid, bid) for guid, bid in mapping.items()],
+        'INSERT INTO guid_bundle (guid, bundle_id) VALUES (?,?)',
+        list(mapping.items()),
     )
     conn.commit()
 
 
-def load_guid_bundle_map(conn: 'sqlite3.Connection', zip_path: str) -> dict:
-    """Return {guid: bundle_id} previously saved for zip_path, or {} if none."""
-    rows = conn.execute(
-        'SELECT guid, bundle_id FROM guid_bundle WHERE zip_path=?', (zip_path,),
-    ).fetchall()
+def load_guid_bundle_map(conn: 'sqlite3.Connection') -> dict:
+    """Return {guid: bundle_id}, or {} if none saved."""
+    rows = conn.execute('SELECT guid, bundle_id FROM guid_bundle').fetchall()
     return {guid: bid for guid, bid in rows}
 
 
+# ── Header types ──────────────────────────────────────────────────────────────
 
-def save_header_types(conn: 'sqlite3.Connection', zip_path: str, types: dict) -> None:
+def save_header_types(conn: 'sqlite3.Connection', types: dict) -> None:
     """Persist {ui_path: detected_type} into the header_types table."""
     conn.executemany(
-        'INSERT OR REPLACE INTO header_types (zip_path, ui_path, detected_type) VALUES (?,?,?)',
-        [(zip_path, ui_path, t) for ui_path, t in types.items()],
+        'INSERT OR REPLACE INTO header_types (ui_path, detected_type) VALUES (?,?)',
+        list(types.items()),
     )
     conn.commit()
 
 
-def load_header_types(conn: 'sqlite3.Connection', zip_path: str) -> dict:
-    """Return {ui_path: detected_type} previously saved for zip_path."""
-    rows = conn.execute(
-        'SELECT ui_path, detected_type FROM header_types WHERE zip_path=?',
-        (zip_path,),
-    ).fetchall()
+def load_header_types(conn: 'sqlite3.Connection') -> dict:
+    """Return {ui_path: detected_type} previously saved."""
+    rows = conn.execute('SELECT ui_path, detected_type FROM header_types').fetchall()
     return {ui_path: t for ui_path, t in rows}
 
 
-def save_folder_sizes(conn: 'sqlite3.Connection', zip_path: str, sizes: dict) -> None:
-    """Persist {folder_path: total_bytes} as a single msgpack blob for fast loading.
+# ── Generic blob store ────────────────────────────────────────────────────────
 
-    Legacy rows in folder_metadata (total_size column) are deleted on save so
-    the DB doesn't carry duplicate data after migration.
-    """
-    blob = msgpack.packb(sizes, use_bin_type=True)
+def save_blob(conn: 'sqlite3.Connection', key: str, version: str, data: bytes) -> None:
+    """Write a versioned bytes blob under *key*."""
     conn.execute(
-        'INSERT OR REPLACE INTO folder_sizes_blob (zip_path, version, data) VALUES (?,?,?)',
-        (zip_path, _FOLDER_CACHE_VERSION, blob),
-    )
-    # Remove legacy per-row sizes from folder_metadata (counts are left intact).
-    conn.execute(
-        "DELETE FROM folder_metadata WHERE zip_path=? AND folder_path='__v__'",
-        (zip_path,),
-    )
-    conn.execute(
-        'UPDATE folder_metadata SET total_size=NULL WHERE zip_path=?',
-        (zip_path,),
+        'INSERT OR REPLACE INTO blobs (key, version, data) VALUES (?,?,?)',
+        (key, version, data),
     )
     conn.commit()
 
 
-def save_folder_counts(conn: 'sqlite3.Connection', zip_path: str, counts: dict) -> None:
-    """Upsert {folder_path: count} into folder_metadata.
-
-    Called after background precomputation.  Uses ON CONFLICT DO UPDATE so that
-    status values written by save_folder_status are preserved.
-    """
-    conn.executemany(
-        '''INSERT INTO folder_metadata (zip_path, folder_path, count, status)
-           VALUES (?, ?, ?, NULL)
-           ON CONFLICT(zip_path, folder_path) DO UPDATE SET count=excluded.count''',
-        [(zip_path, p, c) for p, c in counts.items()],
-    )
-    conn.commit()
-
-
-def load_folder_metadata(conn: 'sqlite3.Connection', zip_path: str) -> tuple[dict, dict]:
-    """Return (counts, sizes) previously saved for zip_path.
-
-    counts — {folder_path: int}  (only rows where count IS NOT NULL)
-    sizes  — {folder_path: int}  (empty if not cached or version mismatch)
-
-    Sizes are stored as a single msgpack blob in folder_sizes_blob for fast
-    loading.  Legacy per-row sizes in folder_metadata are read as a fallback
-    for databases written before the blob format was introduced.
-    """
-    # Counts are still stored per-row (written incrementally as folders are scanned).
-    count_rows = conn.execute(
-        'SELECT folder_path, count FROM folder_metadata WHERE zip_path=? AND count IS NOT NULL',
-        (zip_path,),
-    ).fetchall()
-    counts = {p: c for p, c in count_rows}
-
-    # Sizes: fast blob path first.
-    blob_row = conn.execute(
-        'SELECT version, data FROM folder_sizes_blob WHERE zip_path=?',
-        (zip_path,),
+def load_blob(conn: 'sqlite3.Connection', key: str, version: str) -> bytes | None:
+    """Return the stored bytes for *key* if the version matches, else None."""
+    row = conn.execute(
+        'SELECT version, data FROM blobs WHERE key=?', (key,)
     ).fetchone()
-    if blob_row is not None:
-        version, data = blob_row
-        if version == _FOLDER_CACHE_VERSION:
-            return counts, msgpack.unpackb(data, raw=False)
-        return counts, {}
+    if row is None or row[0] != version:
+        return None
+    return row[1]
 
-    # Legacy fallback — databases written before the blob format.
-    legacy_rows = conn.execute(
-        'SELECT folder_path, status, total_size FROM folder_metadata WHERE zip_path=?',
-        (zip_path,),
-    ).fetchall()
-    version = next((s for p, s, ts in legacy_rows if p == '__v__'), None)
-    if version != _FOLDER_CACHE_VERSION:
-        return counts, {}
-    sizes = {p: ts for p, s, ts in legacy_rows if ts is not None and p != '__v__'}
+
+# ── Folder sizes and counts ───────────────────────────────────────────────────
+
+def load_folder_data(conn: 'sqlite3.Connection') -> tuple[dict, dict]:
+    """Return (counts, sizes) from the blob.
+
+    counts — {folder_path: int}
+    sizes  — {folder_path: int}
+    Both empty if not cached or version mismatch.
+    """
+    raw = load_blob(conn, 'folder_data', _FOLDER_DATA_VERSION)
+    if raw is None:
+        return {}, {}
+    combined = msgpack.unpackb(raw, raw=False)
+    counts: dict = {}
+    sizes:  dict = {}
+    for path, value in combined.items():
+        if isinstance(value, list) and len(value) == 2:
+            counts[path] = value[0]
+            sizes[path]  = value[1]
     return counts, sizes
 
 
-def check_schema(cache_dir: str) -> None:
-    """Raise OldSchemaError if casedata.db exists but has an incompatible schema.
+def save_folder_sizes(conn: 'sqlite3.Connection', sizes: dict) -> None:
+    """Merge {folder_path: total_bytes} into the blob, preserving existing counts."""
+    existing_counts, _ = load_folder_data(conn)
+    combined = {path: [existing_counts.get(path, 0), size] for path, size in sizes.items()}
+    save_blob(conn, 'folder_data', _FOLDER_DATA_VERSION, msgpack.packb(combined, use_bin_type=True))
 
-    Lightweight check — opens the DB read-only, reads user_version, closes.
-    Call this early so the user gets a clear message before any work is done.
+
+def save_folder_counts(conn: 'sqlite3.Connection', counts: dict) -> None:
+    """Merge {folder_path: count} into the blob, preserving existing sizes."""
+    _, existing_sizes = load_folder_data(conn)
+    paths    = set(existing_sizes) | set(counts)
+    combined = {path: [counts.get(path, 0), existing_sizes.get(path, 0)] for path in paths}
+    save_blob(conn, 'folder_data', _FOLDER_DATA_VERSION, msgpack.packb(combined, use_bin_type=True))
+
+
+# ── Device info ───────────────────────────────────────────────────────────────
+
+def save_device_info(conn: 'sqlite3.Connection',
+                     fields: list[tuple[str, str, str]]) -> None:
+    """Persist [(field_name, data, source)] into device_info.
+
+    Each row records one piece of device information and where it came from,
+    e.g. ('Make', 'Apple', 'UFD') or ('iOS Version', '17.4', 'MobileGestalt.plist').
     """
+    conn.execute('DELETE FROM device_info')
+    conn.executemany(
+        'INSERT INTO device_info (field_name, data, source) VALUES (?,?,?)',
+        fields,
+    )
+    conn.commit()
+
+
+def load_device_info(conn: 'sqlite3.Connection') -> list[tuple[str, str, str]]:
+    """Return [(field_name, data, source)] in insertion order, or []."""
+    return conn.execute(
+        'SELECT field_name, data, source FROM device_info ORDER BY rowid'
+    ).fetchall()
+
+
+# ── Schema check (lightweight, no table creation) ─────────────────────────────
+
+def check_schema(cache_dir: str) -> None:
+    """Raise OldSchemaError if casedata.db exists with an incompatible schema."""
     db_path = os.path.join(cache_dir, 'casedata.db')
     if not os.path.exists(db_path):
         return
@@ -307,11 +280,11 @@ def check_schema(cache_dir: str) -> None:
             )}
             conn.close()
             if not tables:
-                return  # new empty DB — not yet stamped
+                return  # brand new empty DB
         else:
             conn.close()
     except Exception:
-        return  # unreadable — let normal open handle it
+        return
     raise OldSchemaError(
         "casedata.db was created by an older version of this app — "
         "please delete casedata.db from the case folder and reopen "

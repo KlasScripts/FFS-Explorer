@@ -22,7 +22,8 @@ from adapters import FfsAdapter
 from db_utils import (_open_case_db, OldSchemaError, check_schema,
                       save_header_types, load_header_types,
                       save_guid_bundle_map, load_guid_bundle_map,
-                      save_folder_counts, save_folder_sizes, load_folder_metadata)
+                      save_folder_counts, save_folder_sizes, load_folder_data,
+                      save_device_info, load_device_info)
 import header_scan
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
@@ -243,16 +244,15 @@ def _plist_find(d, key, _depth=0):
     return None
 
 
-def _read_device_info_from_ufd(zip_path: str) -> dict:
-    """Return device info from a companion .ufd file if one exists alongside the zip.
+def _read_device_info_from_ufd(zip_path: str) -> tuple[list[tuple[str,str,str]], str]:
+    """Return (fields, label) from a companion .ufd file, or ([], '') if none.
 
-    Cellebrite extractions ship a same-stem .ufd (INI-format) file that
-    contains make, model, and OS version — faster and more reliable than
-    parsing the zip itself.  Returns {} when no usable .ufd is found.
+    fields — [(field_name, data, source), ...] where source is 'UFD'.
+    label  — short display string suitable for the archive dropdown.
     """
     ufd_path = os.path.splitext(zip_path)[0] + '.ufd'
     if not os.path.isfile(ufd_path):
-        return {}
+        return [], ''
     try:
         cp = configparser.ConfigParser(strict=False)
         cp.read(ufd_path, encoding='utf-8-sig')
@@ -267,33 +267,38 @@ def _read_device_info_from_ufd(zip_path: str) -> dict:
                     pass
             return ''
 
-        vendor  = _get(('DeviceInfo', 'Vendor'),  ('General', 'Vendor'))
-        os_str  = _get(('DeviceInfo', 'OS'),       ('General', 'OS'))
-        # DeviceModel / FullName give a friendly name; Model is often a hw ID
+        vendor   = _get(('DeviceInfo', 'Vendor'),  ('General', 'Vendor'))
+        os_str   = _get(('DeviceInfo', 'OS'),       ('General', 'OS'))
         friendly = _get(('General', 'FullName'), ('DeviceInfo', 'DeviceModel'),
                         ('General', 'Model'))
-        hw_id   = _get(('DeviceInfo', 'Model'), ('General', 'Model'))
+        hw_id    = _get(('DeviceInfo', 'Model'), ('General', 'Model'))
 
         if not os_str:
-            return {}
+            return [], ''
 
         is_android = os_str.lower().startswith('android')
         if is_android:
-            version = os_str[len('android'):].strip() if os_str.lower().startswith('android') else os_str
-            label_os = f'Android {version}'
+            version  = os_str[len('android'):].strip() or os_str
+            os_field = 'Android Version'
+            platform = 'Android'
         else:
-            version = os_str.split()[0]   # "17.5.1 (21F90)" → "17.5.1"
-            label_os = f'iOS {version}'
+            version  = os_str.split()[0]   # "17.5.1 (21F90)" → "17.5.1"
+            os_field = 'iOS Version'
+            platform = 'iOS'
 
-        make = vendor.title() if vendor else ''
+        make  = vendor.title() if vendor else ''
         model = friendly or hw_id
-        model_name = f'{make} {model}'.strip()
-        label = f'{model_name} · {label_os}' if model_name else label_os
 
-        return {'make': make, 'model': model, 'ios_version': version,
-                'hw_id': hw_id, 'label': label}
+        fields: list[tuple[str,str,str]] = []
+        if make:    fields.append(('Make',        make,    'UFD'))
+        if model:   fields.append(('Model',       model,   'UFD'))
+        if version: fields.append((os_field,      version, 'UFD'))
+        if hw_id:   fields.append(('Hardware ID', hw_id,   'UFD'))
+
+        label = _build_label(f'{make} {model}'.strip(), version, platform)
+        return fields, label
     except Exception:
-        return {}
+        return [], ''
 
 
 _MG_PLIST_SUFFIX = ('containers/Shared/SystemGroup/'
@@ -316,89 +321,127 @@ def _build_label(model_name: str, version: str, platform: str) -> str:
     return model_name or (f'{platform} {version}' if version else '')
 
 
-def _read_ios_info(z: zipfile.ZipFile, ffs_adapter) -> dict:
-    """Extract iOS device info from MobileGestalt, SystemVersion, and preferences plists."""
+def _read_ios_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,str,str]], str]:
+    """Extract iOS device info from MobileGestalt, SystemVersion, and preferences plists.
+
+    Returns (fields, label) where fields are (field_name, data, source) triples.
+    Returns ([], '') if no usable data is found.
+    """
     mg_plist = _read_plist_from_zip(z, *ffs_adapter.user_candidates(_MG_PLIST_SUFFIX))
 
     ios_version = _plist_find(mg_plist, 'ProductVersion') or ''
+    ios_version_source = 'MobileGestalt.plist' if ios_version else ''
     if not ios_version:
         sv = _read_plist_from_zip(z,
             *ffs_adapter.system_candidates('System/Library/CoreServices/SystemVersion.plist'),
             *ffs_adapter.user_candidates('run/SystemVersion.plist'),
         )
         ios_version = sv.get('ProductVersion', '')
+        if ios_version:
+            ios_version_source = 'SystemVersion.plist'
 
     pref = _read_plist_from_zip(z,
         *ffs_adapter.user_candidates('preferences/SystemConfiguration/preferences.plist'))
-    hw_id = (pref.get('Model')
-             or _plist_find(mg_plist, 'ProductType')
-             or _plist_find(mg_plist, 'HardwareModel')
-             or '')
+
+    hw_id        = ''
+    hw_id_source = ''
+    if pref.get('Model'):
+        hw_id        = pref['Model']
+        hw_id_source = 'preferences.plist'
+    elif _plist_find(mg_plist, 'ProductType'):
+        hw_id        = _plist_find(mg_plist, 'ProductType')
+        hw_id_source = 'MobileGestalt.plist'
+    elif _plist_find(mg_plist, 'HardwareModel'):
+        hw_id        = _plist_find(mg_plist, 'HardwareModel')
+        hw_id_source = 'MobileGestalt.plist'
 
     make, model = _lookup_hw_id(hw_id) if hw_id else ('', '')
     model_name  = f'{make} {model}'.strip()
     label       = _build_label(model_name, ios_version, 'iOS')
     if not label:
-        return {}
-    return {'make': make, 'model': model, 'ios_version': ios_version,
-            'hw_id': hw_id, 'label': label}
+        return [], ''
+
+    fields: list[tuple[str,str,str]] = []
+    if make:        fields.append(('Make',         make,        'Hardware model database'))
+    if model:       fields.append(('Model',        model,       'Hardware model database'))
+    if ios_version: fields.append(('iOS Version',  ios_version, ios_version_source))
+    if hw_id:       fields.append(('Hardware ID',  hw_id,       hw_id_source))
+    return fields, label
 
 
-def _read_android_info(z: zipfile.ZipFile, ffs_adapter) -> dict:
-    """Extract Android device info by merging system/vendor/product build.prop files."""
-    bp: dict = {}
+def _read_android_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,str,str]], str]:
+    """Extract Android device info by merging system/vendor/product build.prop files.
+
+    Returns (fields, label) where fields are (field_name, data, source) triples.
+    Returns ([], '') if no usable data is found.
+    """
+    bp: dict[str, tuple[str, str]] = {}   # key → (value, source_file)
     for prop_file in ('system/build.prop', 'vendor/build.prop', 'product/build.prop'):
         content = _read_text_from_zip(z, *ffs_adapter.system_candidates(prop_file))
         if content:
             for k, v in _parse_build_prop(content).items():
-                if v:  # never overwrite an existing value with an empty one
-                    bp[k] = v
+                if v and k not in bp:
+                    bp[k] = (v, prop_file)
     if not bp:
-        return {}
+        return [], ''
 
-    raw_model = (bp.get('ro.product.model')
-                 or bp.get('ro.product.vendor.model')
-                 or bp.get('ro.product.system.model', ''))
-    version   = (bp.get('ro.build.version.release')
-                 or bp.get('ro.vendor.build.version.release', ''))
+    def _first(*keys: str) -> tuple[str, str]:
+        for k in keys:
+            v, src = bp.get(k, ('', ''))
+            if v:
+                return v, src
+        return '', ''
 
+    raw_model, raw_model_src = _first(
+        'ro.product.model', 'ro.product.vendor.model', 'ro.product.system.model')
+    version, version_src = _first(
+        'ro.build.version.release', 'ro.vendor.build.version.release')
+
+    make_src = 'Hardware model database'
     hw_entry = _HW_ANDROID_MODELS.get(raw_model)
     if hw_entry:
         make, model = hw_entry[0], hw_entry[1]
+        model_src = 'Hardware model database'
     else:
-        make  = (bp.get('ro.product.manufacturer')
-                 or bp.get('ro.product.vendor.manufacturer')
-                 or bp.get('ro.product.system.manufacturer')
-                 or bp.get('ro.product.brand')
-                 or bp.get('ro.product.system.brand', '')).title()
-        model = raw_model
+        raw_make, make_src = _first(
+            'ro.product.manufacturer', 'ro.product.vendor.manufacturer',
+            'ro.product.system.manufacturer', 'ro.product.brand',
+            'ro.product.system.brand')
+        make      = raw_make.title() if raw_make else ''
+        model     = raw_model
+        model_src = raw_model_src
 
     model_name = f'{make} {model}'.strip()
     label      = _build_label(model_name, version, 'Android')
-    return {'make': make, 'model': model, 'ios_version': version,
-            'hw_id': '', 'label': label}
+    if not label:
+        return [], ''
+
+    fields: list[tuple[str,str,str]] = []
+    if make:    fields.append(('Make',            make,    make_src))
+    if model:   fields.append(('Model',           model,   model_src))
+    if version: fields.append(('Android Version', version, version_src))
+    return fields, label
 
 
-def _read_device_info(zip_path: str) -> dict:
-    """Return structured device info extracted from the FFS zip.
+def _read_device_info(zip_path: str) -> tuple[list[tuple[str,str,str]], str]:
+    """Return (fields, label) extracted from the FFS zip.
 
-    Keys: make, model, ios_version, hw_id, label
-    All values are strings; label is a short display string like
-    'Apple iPhone 14 Pro · iOS 17.4.1' suitable for the dropdown.
-    Returns a dict with all empty strings on failure.
+    fields — [(field_name, data, source), ...]
+    label  — short display string like 'Apple iPhone 14 Pro · iOS 17.4.1'
+    Returns ([], '') on failure.
     """
-    empty = {'make': '', 'model': '', 'ios_version': '', 'hw_id': '', 'label': ''}
-    ufd = _read_device_info_from_ufd(zip_path)
-    if ufd:
-        return ufd
+    fields, label = _read_device_info_from_ufd(zip_path)
+    if fields:
+        return fields, label
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
             ffs_adapter = FfsAdapter.detect(z)
-            return (_read_ios_info(z, ffs_adapter)
-                    or _read_android_info(z, ffs_adapter)
-                    or empty)
+            result = _read_ios_info(z, ffs_adapter)
+            if not result[0]:
+                result = _read_android_info(z, ffs_adapter)
+            return result
     except Exception:
-        return empty
+        return [], ''
 
 
 class ExtractorWorker(QThread):
@@ -818,7 +861,7 @@ class ZipMetadataWorker(QThread):
                 if self.case_dir:
                     try:
                         _db = _open_case_db(self.case_dir)
-                        _cached = load_guid_bundle_map(_db, self.zip_path)
+                        _cached = load_guid_bundle_map(_db)
                         _db.close()
                         if _cached:
                             cached_guid_bundle = _cached
@@ -871,7 +914,7 @@ class ZipMetadataWorker(QThread):
             if self.case_dir:
                 try:
                     _db = _open_case_db(self.case_dir)
-                    _, _fs = load_folder_metadata(_db, self.zip_path)
+                    _, _fs = load_folder_data(_db)
                     _db.close()
                     if _fs:
                         _cached_sizes = _fs
@@ -898,9 +941,9 @@ class ZipMetadataWorker(QThread):
                 try:
                     _db = _open_case_db(self.case_dir)
                     if _need_save_guid:
-                        save_guid_bundle_map(_db, self.zip_path, guid_to_bundle)
+                        save_guid_bundle_map(_db, guid_to_bundle)
                     if _cached_sizes is None:
-                        save_folder_sizes(_db, self.zip_path, folder_sizes)
+                        save_folder_sizes(_db, folder_sizes)
                     _db.close()
                 except Exception:
                     pass
@@ -1444,7 +1487,7 @@ class ProcessDialog(QDialog):
         if results and self._case_dir:
             try:
                 db = _open_case_db(self._case_dir)
-                save_header_types(db, self._zip_path, results)
+                save_header_types(db, results)
                 db.close()
             except Exception:
                 pass
@@ -2202,12 +2245,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not self._case_dir:
             return
         counts = dict(self._file_count_cache)
-        zip_path = self.zip_path
         case_dir = self._case_dir
         def _save():
             try:
                 db = _open_case_db(case_dir)
-                save_folder_counts(db, zip_path, counts)
+                save_folder_counts(db, counts)
                 db.close()
             except Exception:
                 pass
@@ -2699,8 +2741,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if self._case_dir:
             try:
                 db = _open_case_db(self._case_dir)
-                self._header_type_overrides = load_header_types(db, self.zip_path)
-                self._file_count_cache, _ = load_folder_metadata(db, self.zip_path)
+                self._header_type_overrides = load_header_types(db)
+                self._file_count_cache, _ = load_folder_data(db)
                 db.close()
             except Exception:
                 pass
@@ -2753,7 +2795,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if self._case_dir:
             try:
                 db = _open_case_db(self._case_dir)
-                save_header_types(db, self.zip_path, results)
+                save_header_types(db, results)
                 db.close()
             except Exception:
                 pass
@@ -3125,25 +3167,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.update_dropdown_ui()
 
     def _fetch_and_store_label(self, path):
-        info = _read_device_info(path)
-        # Write structured device info to casedata.db
-        try:
-            if not self._case_dir:
-                return
-            db = _open_case_db(self._case_dir)
-            db.execute(
-                'INSERT OR REPLACE INTO device_info (zip_path, make, model, ios_version, hw_id) '
-                'VALUES (?, ?, ?, ?, ?)',
-                (path, info['make'], info['model'], info['ios_version'], info['hw_id'])
-            )
-            db.commit()
-            db.close()
-        except Exception:
-            pass
-        # Store label in ffs_archives entry for easy dropdown population
+        fields, label = _read_device_info(path)
+        if fields and self._case_dir:
+            try:
+                db = _open_case_db(self._case_dir)
+                save_device_info(db, fields)
+                db.close()
+            except Exception:
+                pass
         entry = self._archive_entry(path)
         if entry is not None:
-            entry['label'] = info['label']
+            entry['label'] = label
             self._save_ffs_archives()
         self.update_dropdown_ui()
 

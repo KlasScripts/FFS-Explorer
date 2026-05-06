@@ -1,8 +1,15 @@
 """db_utils.py — shared case-database utilities.
 
-One casedata.db per case folder.  Each case folder belongs to exactly one
-exhibit (FFS archive), so no zip_path key is needed in any table — all rows
-implicitly belong to that one archive.
+One case folder per exhibit (FFS archive).  The case folder contains two
+SQLite databases:
+
+  casecache.db   — reconstructable cache; can be deleted and rebuilt:
+                     thumbnails, blobs (folder sizes, search entry index),
+                     header_types, guid_bundle
+
+  caseresults.db — precious user-generated results; never auto-deleted:
+                     search_index, search_results, device_info,
+                     artifact_<name> tables (written by artifact_db.py)
 """
 
 import os
@@ -14,62 +21,43 @@ import msgpack
 _FOLDER_DATA_VERSION    = '6'
 _SEARCH_ENTRIES_VERSION = '1'
 
-# Bump whenever the database schema changes incompatibly.  Old databases
-# (user_version != _SCHEMA_VERSION) are auto-deleted and rebuilt rather than
-# migrated — all content is reconstructable cache or per-case user data.
-_SCHEMA_VERSION = 4
+# Bump whenever the schema changes incompatibly.
+# Cache DB is auto-deleted on mismatch; results DB raises OldSchemaError.
+_CACHE_SCHEMA_VERSION   = 1
+_RESULTS_SCHEMA_VERSION = 1
 
 
 class OldSchemaError(Exception):
-    """Raised when casedata.db was created by an older incompatible app version."""
+    """Raised when a case database has an incompatible schema version."""
 
 
-def _open_case_db(cache_dir: str) -> sqlite3.Connection:
-    """Open (or create) the per-case database inside *cache_dir*.
+# ── Cache DB ──────────────────────────────────────────────────────────────────
 
-    Tables:
-      thumbnails    — cached media thumbnails
-      search_index  — normalised keyword → id lookup
-      search_results— hit rows keyed by search_index.id (term_id)
-      device_info   — per-field device metadata
-      recent_searches— MRU list of search terms
-      header_types  — detected file types for 'Other' entries
-      guid_bundle   — GUID → bundle-ID map
-      blobs         — key/version/data store for msgpack-encoded caches:
-                        'folder_data'    → {folder_path: [count, size_bytes]}
-                        'search_entries' → [[filename, data_offset, file_size], ...]
+def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
+    """Open (or create) casecache.db inside *cache_dir*.
+
+    Reconstructable cache — auto-deletes and recreates on schema mismatch.
+    Tables: thumbnails, blobs, header_types, guid_bundle.
 
     Raises ValueError if cache_dir is falsy.
-    Raises OldSchemaError if casedata.db has an incompatible schema.
     """
     if not cache_dir:
-        raise ValueError("cache_dir must be set; no global fallback exists")
+        raise ValueError("cache_dir must be set")
     os.makedirs(cache_dir, exist_ok=True)
-    db_path = os.path.join(cache_dir, 'casedata.db')
+    db_path = os.path.join(cache_dir, 'casecache.db')
 
     conn = sqlite3.connect(db_path, timeout=5)
     conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA foreign_keys=ON')
 
-    _ver = conn.execute('PRAGMA user_version').fetchone()[0]
-    if _ver == 0:
-        _tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )}
-        if _tables:
-            conn.close()
-            raise OldSchemaError(
-                "casedata.db was created by an older version of this app — "
-                "please delete casedata.db from the case folder and reopen "
-                "the archive to rebuild it."
-            )
-    elif _ver != _SCHEMA_VERSION:
+    ver = conn.execute('PRAGMA user_version').fetchone()[0]
+    if ver != 0 and ver != _CACHE_SCHEMA_VERSION:
         conn.close()
-        raise OldSchemaError(
-            f"casedata.db schema version {_ver} is not compatible with this "
-            f"version of the app (expected {_SCHEMA_VERSION}) — please delete "
-            "casedata.db from the case folder and reopen the archive to rebuild it."
-        )
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute('PRAGMA journal_mode=WAL')
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS thumbnails (
@@ -82,25 +70,71 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     ''')
 
     conn.execute('''
+        CREATE TABLE IF NOT EXISTS blobs (
+            key     TEXT NOT NULL PRIMARY KEY,
+            version TEXT NOT NULL,
+            data    BLOB NOT NULL
+        )
+    ''')
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS header_types (
+            ui_path       TEXT NOT NULL PRIMARY KEY,
+            detected_type TEXT NOT NULL
+        )
+    ''')
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS guid_bundle (
+            guid      TEXT NOT NULL PRIMARY KEY,
+            bundle_id TEXT NOT NULL
+        )
+    ''')
+
+    conn.execute(f'PRAGMA user_version = {_CACHE_SCHEMA_VERSION}')
+    conn.commit()
+    return conn
+
+
+# ── Results DB ────────────────────────────────────────────────────────────────
+
+def _open_results_db(cache_dir: str) -> sqlite3.Connection:
+    """Open (or create) caseresults.db inside *cache_dir*.
+
+    Precious results — raises OldSchemaError on schema mismatch, never
+    auto-deletes.  Artifact tables (artifact_*) are written dynamically by
+    artifact_db.py and are not declared here.
+    Tables: search_index, search_results, device_info.
+
+    Raises ValueError if cache_dir is falsy.
+    Raises OldSchemaError if caseresults.db has an incompatible schema.
+    """
+    if not cache_dir:
+        raise ValueError("cache_dir must be set")
+    os.makedirs(cache_dir, exist_ok=True)
+    db_path = os.path.join(cache_dir, 'caseresults.db')
+
+    conn = sqlite3.connect(db_path, timeout=5)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA foreign_keys=ON')
+
+    ver = conn.execute('PRAGMA user_version').fetchone()[0]
+    if ver != 0 and ver != _RESULTS_SCHEMA_VERSION:
+        conn.close()
+        raise OldSchemaError(
+            f"caseresults.db schema version {ver} is not compatible with this "
+            f"version of the app (expected {_RESULTS_SCHEMA_VERSION}). "
+            "Search results and artifact data are preserved in the existing file."
+        )
+
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS search_index (
-            id      INTEGER PRIMARY KEY,
-            keyword TEXT    NOT NULL UNIQUE
-        )
-    ''')
-
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS device_info (
-            field_name TEXT NOT NULL PRIMARY KEY,
-            data       TEXT NOT NULL DEFAULT '',
-            source     TEXT NOT NULL DEFAULT ''
-        )
-    ''')
-
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS recent_searches (
-            term    TEXT    NOT NULL,
-            used_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-            PRIMARY KEY (term)
+            id             INTEGER PRIMARY KEY,
+            keyword        TEXT    NOT NULL UNIQUE,
+            used_at        INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            complete       INTEGER NOT NULL DEFAULT 1,
+            files_searched INTEGER NOT NULL DEFAULT 0,
+            total_files    INTEGER NOT NULL DEFAULT 0
         )
     ''')
 
@@ -118,30 +152,55 @@ def _open_case_db(cache_dir: str) -> sqlite3.Connection:
     ''')
 
     conn.execute('''
-        CREATE TABLE IF NOT EXISTS header_types (
-            ui_path       TEXT NOT NULL PRIMARY KEY,
-            detected_type TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS device_info (
+            field_name TEXT NOT NULL PRIMARY KEY,
+            data       TEXT NOT NULL DEFAULT '',
+            source     TEXT NOT NULL DEFAULT ''
         )
     ''')
 
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS guid_bundle (
-            guid      TEXT NOT NULL PRIMARY KEY,
-            bundle_id TEXT NOT NULL
-        )
-    ''')
-
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS blobs (
-            key     TEXT NOT NULL PRIMARY KEY,
-            version TEXT NOT NULL,
-            data    BLOB NOT NULL
-        )
-    ''')
-
-    conn.execute(f'PRAGMA user_version = {_SCHEMA_VERSION}')
+    conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
     return conn
+
+
+# ── Schema checks (lightweight, no table creation) ────────────────────────────
+
+def check_cache_schema(cache_dir: str) -> None:
+    """Raise OldSchemaError if casecache.db exists with an incompatible schema."""
+    db_path = os.path.join(cache_dir, 'casecache.db')
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        ver  = conn.execute('PRAGMA user_version').fetchone()[0]
+        conn.close()
+    except Exception:
+        return
+    if ver != 0 and ver != _CACHE_SCHEMA_VERSION:
+        raise OldSchemaError(
+            f"casecache.db schema version {ver} is incompatible "
+            f"(expected {_CACHE_SCHEMA_VERSION}). The cache will be rebuilt."
+        )
+
+
+def check_results_schema(cache_dir: str) -> None:
+    """Raise OldSchemaError if caseresults.db exists with an incompatible schema."""
+    db_path = os.path.join(cache_dir, 'caseresults.db')
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        ver  = conn.execute('PRAGMA user_version').fetchone()[0]
+        conn.close()
+    except Exception:
+        return
+    if ver != 0 and ver != _RESULTS_SCHEMA_VERSION:
+        raise OldSchemaError(
+            f"caseresults.db schema version {ver} is incompatible "
+            f"(expected {_RESULTS_SCHEMA_VERSION}). "
+            "Search results and artifact data are preserved."
+        )
 
 
 # ── GUID / bundle-ID map ──────────────────────────────────────────────────────
@@ -259,34 +318,3 @@ def load_device_info(conn: 'sqlite3.Connection') -> list[tuple[str, str, str]]:
     return conn.execute(
         'SELECT field_name, data, source FROM device_info ORDER BY rowid'
     ).fetchall()
-
-
-# ── Schema check (lightweight, no table creation) ─────────────────────────────
-
-def check_schema(cache_dir: str) -> None:
-    """Raise OldSchemaError if casedata.db exists with an incompatible schema."""
-    db_path = os.path.join(cache_dir, 'casedata.db')
-    if not os.path.exists(db_path):
-        return
-    try:
-        conn = sqlite3.connect(db_path, timeout=5)
-        ver = conn.execute('PRAGMA user_version').fetchone()[0]
-        if ver == _SCHEMA_VERSION:
-            conn.close()
-            return
-        if ver == 0:
-            tables = {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )}
-            conn.close()
-            if not tables:
-                return  # brand new empty DB
-        else:
-            conn.close()
-    except Exception:
-        return
-    raise OldSchemaError(
-        "casedata.db was created by an older version of this app — "
-        "please delete casedata.db from the case folder and reopen "
-        "the archive to rebuild it."
-    )

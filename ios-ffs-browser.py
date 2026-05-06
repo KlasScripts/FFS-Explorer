@@ -19,7 +19,8 @@ HARDWARE_MODELS_FILE = os.path.join('config', 'hardware_models.json')           
 sys.path.insert(0, _APP_DIR)
 
 from adapters import FfsAdapter
-from db_utils import (_open_case_db, OldSchemaError, check_schema,
+from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
+                      check_cache_schema, check_results_schema,
                       save_header_types, load_header_types,
                       save_guid_bundle_map, load_guid_bundle_map,
                       save_folder_counts, save_folder_sizes, load_folder_data,
@@ -361,11 +362,12 @@ def _read_ios_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,str,
     if not label:
         return [], ''
 
+    hw_db_src = f'HW DB ({hw_id} via {hw_id_source})' if hw_id else 'Hardware model database'
     fields: list[tuple[str,str,str]] = []
-    if make:        fields.append(('Make',         make,        'Hardware model database'))
-    if model:       fields.append(('Model',        model,       'Hardware model database'))
-    if ios_version: fields.append(('iOS Version',  ios_version, ios_version_source))
-    if hw_id:       fields.append(('Hardware ID',  hw_id,       hw_id_source))
+    if make:        fields.append(('Make',        make,        hw_db_src))
+    if model:       fields.append(('Model',       model,       hw_db_src))
+    if ios_version: fields.append(('iOS Version', ios_version, ios_version_source))
+    if hw_id:       fields.append(('Hardware ID', hw_id,       hw_id_source))
     return fields, label
 
 
@@ -397,11 +399,12 @@ def _read_android_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,
     version, version_src = _first(
         'ro.build.version.release', 'ro.vendor.build.version.release')
 
-    make_src = 'Hardware model database'
     hw_entry = _HW_ANDROID_MODELS.get(raw_model)
     if hw_entry:
         make, model = hw_entry[0], hw_entry[1]
-        model_src = 'Hardware model database'
+        hw_db_src = f'HW DB ({raw_model} via {raw_model_src})'
+        make_src  = hw_db_src
+        model_src = hw_db_src
     else:
         raw_make, make_src = _first(
             'ro.product.manufacturer', 'ro.product.vendor.manufacturer',
@@ -787,14 +790,19 @@ class ZipMetadataWorker(QThread):
 
             if self.case_dir:
                 try:
-                    check_schema(self.case_dir)
+                    check_cache_schema(self.case_dir)
                 except OldSchemaError:
                     self.status_update.emit(
-                        "Old casedata.db detected — rebuilding case database…")
+                        "Old casecache.db detected — rebuilding cache database…")
                     try:
-                        os.remove(os.path.join(self.case_dir, 'casedata.db'))
+                        os.remove(os.path.join(self.case_dir, 'casecache.db'))
                     except OSError:
                         pass
+                try:
+                    check_results_schema(self.case_dir)
+                except OldSchemaError as e:
+                    self.status_update.emit(
+                        f"Warning: {e}")
 
             # ── Open the archive ──────────────────────────────────────────────
             if self.case_dir:
@@ -860,7 +868,7 @@ class ZipMetadataWorker(QThread):
                 cached_guid_bundle: dict | None = None
                 if self.case_dir:
                     try:
-                        _db = _open_case_db(self.case_dir)
+                        _db = _open_cache_db(self.case_dir)
                         _cached = load_guid_bundle_map(_db)
                         _db.close()
                         if _cached:
@@ -913,7 +921,7 @@ class ZipMetadataWorker(QThread):
             _cached_sizes: dict | None = None
             if self.case_dir:
                 try:
-                    _db = _open_case_db(self.case_dir)
+                    _db = _open_cache_db(self.case_dir)
                     _, _fs = load_folder_data(_db)
                     _db.close()
                     if _fs:
@@ -939,7 +947,7 @@ class ZipMetadataWorker(QThread):
 
             if self.case_dir:
                 try:
-                    _db = _open_case_db(self.case_dir)
+                    _db = _open_cache_db(self.case_dir)
                     if _need_save_guid:
                         save_guid_bundle_map(_db, guid_to_bundle)
                     if _cached_sizes is None:
@@ -1486,7 +1494,7 @@ class ProcessDialog(QDialog):
         self._scan_btn.setEnabled(True)
         if results and self._case_dir:
             try:
-                db = _open_case_db(self._case_dir)
+                db = _open_cache_db(self._case_dir)
                 save_header_types(db, results)
                 db.close()
             except Exception:
@@ -2248,7 +2256,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         case_dir = self._case_dir
         def _save():
             try:
-                db = _open_case_db(case_dir)
+                db = _open_cache_db(case_dir)
                 save_folder_counts(db, counts)
                 db.close()
             except Exception:
@@ -2740,7 +2748,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._file_count_cache = {}
         if self._case_dir:
             try:
-                db = _open_case_db(self._case_dir)
+                db = _open_cache_db(self._case_dir)
                 self._header_type_overrides = load_header_types(db)
                 self._file_count_cache, _ = load_folder_data(db)
                 db.close()
@@ -2765,11 +2773,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         fmt_label = "GrayKey" if ffs_adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
         self.reload_tree_entirely()
         self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
-        # Fetch device label after the archive is fully processed, so the
-        # dropdown shows only the filepath until loading is complete.
-        _entry = self._archive_entry(self.zip_path)
-        if not (_entry and _entry.get('label')):
-            QTimer.singleShot(0, lambda: self._fetch_and_store_label(self.zip_path))
+        # Fetch device label and populate device_info after archive is loaded.
+        # Always schedule so device_info is repopulated after a schema rebuild
+        # even when the label is already cached in ffs_archives.json.
+        QTimer.singleShot(0, lambda: self._fetch_and_store_label(self.zip_path))
+        self._refresh_artifact_tab()
         self._artifact_act.setEnabled(True)
         # Start background precomputation of folder counts if not already cached.
         if len(self._file_count_cache) < len(self.folder_map):
@@ -2794,7 +2802,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._header_type_overrides.update(results)
         if self._case_dir:
             try:
-                db = _open_case_db(self._case_dir)
+                db = _open_cache_db(self._case_dir)
                 save_header_types(db, results)
                 db.close()
             except Exception:
@@ -3167,19 +3175,32 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.update_dropdown_ui()
 
     def _fetch_and_store_label(self, path):
-        fields, label = _read_device_info(path)
-        if fields and self._case_dir:
+        entry      = self._archive_entry(path)
+        has_label  = bool(entry and entry.get('label'))
+        has_db_info = False
+        if self._case_dir:
             try:
-                db = _open_case_db(self._case_dir)
+                db = _open_results_db(self._case_dir)
+                has_db_info = bool(load_device_info(db))
+                db.close()
+            except Exception:
+                pass
+        if has_label and has_db_info:
+            return
+
+        fields, label = _read_device_info(path)
+
+        if fields and not has_db_info and self._case_dir:
+            try:
+                db = _open_results_db(self._case_dir)
                 save_device_info(db, fields)
                 db.close()
             except Exception:
                 pass
-        entry = self._archive_entry(path)
-        if entry is not None:
+        if entry is not None and not has_label:
             entry['label'] = label
             self._save_ffs_archives()
-        self.update_dropdown_ui()
+            self.update_dropdown_ui()
 
     @staticmethod
     def _archive_display(path: str, label: str) -> str:

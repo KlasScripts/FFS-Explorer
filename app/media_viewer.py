@@ -5,7 +5,7 @@ import subprocess
 import sqlite3
 import zipfile
 
-from db_utils import _open_case_db
+from db_utils import _open_cache_db
 from PySide6.QtWidgets import (
     QWidget, QLabel, QScrollArea, QGridLayout, QVBoxLayout,
 )
@@ -136,7 +136,7 @@ class ThumbnailWorker(QThread):
 
     def run(self):
         use_cache = bool(self.cache_dir)
-        db = _open_case_db(self.cache_dir) if use_cache else None
+        db = _open_cache_db(self.cache_dir) if use_cache else None
         _DB_BATCH = 50   # items per DB query — small so first thumbnails emit fast
 
         try:
@@ -155,8 +155,8 @@ class ThumbnailWorker(QThread):
                         try:
                             for r in db.execute(
                                 f'SELECT ui_path, file_size, data FROM thumbnails '
-                                f'WHERE zip_path=? AND thumb_size=? AND ui_path IN ({placeholders})',
-                                (self.zip_path, self.thumb_size, *batch)
+                                f'WHERE thumb_size=? AND ui_path IN ({placeholders})',
+                                (self.thumb_size, *batch)
                             ):
                                 cached[(r[0], r[1])] = r[2]
                         except sqlite3.Error:
@@ -182,8 +182,8 @@ class ThumbnailWorker(QThread):
                                 try:
                                     db.execute(
                                         'DELETE FROM thumbnails WHERE '
-                                        'zip_path=? AND ui_path=? AND file_size=? AND thumb_size=?',
-                                        (self.zip_path, ui_path, file_size, self.thumb_size))
+                                        'ui_path=? AND file_size=? AND thumb_size=?',
+                                        (ui_path, file_size, self.thumb_size))
                                     db.commit()
                                 except sqlite3.Error:
                                     pass
@@ -212,14 +212,13 @@ class ThumbnailWorker(QThread):
                         if db is not None:
                             jpeg = self._encode_jpeg(img)
                             if jpeg:
-                                pending.append((self.zip_path, ui_path, file_size,
-                                                self.thumb_size, jpeg))
+                                pending.append((ui_path, file_size, self.thumb_size, jpeg))
                                 if len(pending) >= _THUMB_BATCH_COMMIT:
                                     try:
                                         db.executemany(
                                             'INSERT OR REPLACE INTO thumbnails '
-                                            '(zip_path,ui_path,file_size,thumb_size,data) '
-                                            'VALUES (?,?,?,?,?)', pending)
+                                            '(ui_path,file_size,thumb_size,data) '
+                                            'VALUES (?,?,?,?)', pending)
                                         db.commit()
                                     except sqlite3.Error:
                                         pass
@@ -233,8 +232,8 @@ class ThumbnailWorker(QThread):
                 try:
                     db.executemany(
                         'INSERT OR REPLACE INTO thumbnails '
-                        '(zip_path,ui_path,file_size,thumb_size,data) '
-                        'VALUES (?,?,?,?,?)', pending)
+                        '(ui_path,file_size,thumb_size,data) '
+                        'VALUES (?,?,?,?)', pending)
                     db.commit()
                 except sqlite3.Error:
                     pass

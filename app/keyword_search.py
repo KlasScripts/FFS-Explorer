@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import msgpack
 
 from adapters import FfsAdapter
-from db_utils import _open_case_db, OldSchemaError, save_blob, load_blob
+from db_utils import _open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob
 
 _SEARCH_ENTRIES_VERSION = '1'
 from PySide6.QtWidgets import (
@@ -107,7 +107,7 @@ class SearchIndexWorker(QThread):
 
     def _load_from_db(self) -> list | None:
         try:
-            db = _open_case_db(self.case_dir)
+            db = _open_cache_db(self.case_dir)
             try:
                 raw = load_blob(db, 'search_entries', _SEARCH_ENTRIES_VERSION)
             finally:
@@ -122,7 +122,7 @@ class SearchIndexWorker(QThread):
     def _save_to_db(self, entries: list) -> None:
         try:
             raw = msgpack.packb(entries, use_bin_type=True)
-            db  = _open_case_db(self.case_dir)
+            db  = _open_cache_db(self.case_dir)
             try:
                 save_blob(db, 'search_entries', _SEARCH_ENTRIES_VERSION, raw)
             finally:
@@ -144,7 +144,7 @@ class KeywordSearchWorker(QThread):
 
     result_found  = Signal(str, int, str)   # name, offset-in-file, context
     progress      = Signal(int, int)        # done, total
-    finished      = Signal(int)             # total hits
+    finished      = Signal(int, int, int, bool)  # total hits, files_done, files_total, stopped
     status_update = Signal(str)             # free-text status line
 
     _CHUNK     = 1 * 1024 * 1024   # 1 MB read chunks
@@ -267,7 +267,7 @@ class KeywordSearchWorker(QThread):
                 except Exception:
                     pass
 
-        self.finished.emit(hits)
+        self.finished.emit(hits, done, total, self._stop.is_set())
 
 
 # ── DbSearchLoader ────────────────────────────────────────────────────────────
@@ -290,7 +290,7 @@ class DbSearchLoader(QThread):
 
     def run(self):
         try:
-            db = _open_case_db(self._case_dir)
+            db = _open_results_db(self._case_dir)
             try:
                 rows = db.execute(
                     'SELECT r.filename, r.offset, r.context '
@@ -325,10 +325,10 @@ class DbRecentLoader(QThread):
 
     def run(self):
         try:
-            db = _open_case_db(self._case_dir)
+            db = _open_results_db(self._case_dir)
             try:
                 rows = db.execute(
-                    'SELECT term FROM recent_searches ORDER BY used_at DESC LIMIT 20'
+                    'SELECT keyword FROM search_index ORDER BY used_at DESC LIMIT 20'
                 ).fetchall()
                 terms = [r[0] for r in rows]
             finally:
@@ -498,7 +498,9 @@ class KeywordSearchMixin:
         self._recent_loader: DbRecentLoader | None = None
         self._search_progress_dlg: SearchProgressDialog | None = None
         self._pending_db_hits: list[tuple] = []
-        self._search_entries: list | None = None
+        self._search_entries:     list | None = None
+        self._search_incomplete:  bool = False
+        self._search_incomplete_files: tuple[int,int] = (0, 0)  # (done, total)
         self._search_folder_items: dict[str, QStandardItem] = {}
         self._search_file_items:   dict[str, QStandardItem] = {}
         self._recent_searches: list = []
@@ -541,8 +543,16 @@ class KeywordSearchMixin:
         search_ctrl.addWidget(self.search_scope_combo)
         search_ctrl.addWidget(self.search_btn)
         search_ctrl.addWidget(self.search_stop_btn)
+        self._incomplete_banner = QLabel()
+        self._incomplete_banner.setWordWrap(True)
+        self._incomplete_banner.setStyleSheet(
+            "background:#fff3cd; color:#856404; border:1px solid #ffc107;"
+            "border-radius:4px; padding:4px 8px;")
+        self._incomplete_banner.setVisible(False)
+
         search_tab_layout.addLayout(search_ctrl)
         search_tab_layout.addWidget(self.search_status)
+        search_tab_layout.addWidget(self._incomplete_banner)
 
         self.search_results_model = QStandardItemModel()
         self.search_results_model.setHorizontalHeaderLabels(
@@ -581,6 +591,16 @@ class KeywordSearchMixin:
         return search_tab
 
     # ── Recent combo ─────────────────────────────────────────────────────────
+
+    def _set_incomplete_banner(self, files_done: int = 0, total_files: int = 0):
+        """Show the incomplete-search warning banner, or hide it if called with no args."""
+        if files_done or total_files:
+            self._incomplete_banner.setText(
+                f"⚠️  Incomplete search — stopped after {files_done:,} of "
+                f"{total_files:,} files. Results may be missing.")
+            self._incomplete_banner.setVisible(True)
+        else:
+            self._incomplete_banner.setVisible(False)
 
     def _refresh_search_recent_combo(self):
         self.search_recent_combo.blockSignals(True)
@@ -788,29 +808,29 @@ class KeywordSearchMixin:
 
     # ── Database persistence ──────────────────────────────────────────────────
 
-    def _open_case_db_conn(self) -> sqlite3.Connection | None:
-        """Open casedata.db for the current archive, or None if unavailable."""
+    def _open_results_db_conn(self) -> sqlite3.Connection | None:
+        """Open caseresults.db for the current archive, or None if unavailable."""
         if not self._case_dir:
             return None
         try:
-            return _open_case_db(self._case_dir)
+            return _open_results_db(self._case_dir)
         except OldSchemaError:
-            raise   # caller must handle — old DB needs to be rebuilt
+            raise   # caller must handle
         except OSError:
             return None
 
     def _save_recent_search(self, term: str):
-        db = self._open_case_db_conn()
+        db = self._open_results_db_conn()
         if db:
             try:
                 db.execute(
-                    "INSERT INTO recent_searches (term, used_at) VALUES (?, strftime('%s','now'))"
-                    " ON CONFLICT(term) DO UPDATE SET used_at=excluded.used_at",
+                    "INSERT INTO search_index (keyword, used_at) VALUES (?, strftime('%s','now'))"
+                    " ON CONFLICT(keyword) DO UPDATE SET used_at=strftime('%s','now')",
                     (term,)
                 )
                 db.commit()
                 rows = db.execute(
-                    'SELECT term FROM recent_searches ORDER BY used_at DESC LIMIT 20'
+                    'SELECT keyword FROM search_index ORDER BY used_at DESC LIMIT 20'
                 ).fetchall()
                 self._recent_searches = [r[0] for r in rows]
             finally:
@@ -845,23 +865,41 @@ class KeywordSearchMixin:
         if not self._case_dir or not self.zip_path:
             return False
 
-        # Check whether this (zip, term) pair was ever searched.
-        db = self._open_case_db_conn()
+        self._set_incomplete_banner()   # always reset before loading any result
+        db = self._open_results_db_conn()
         if db is None:
             return False
         try:
             row = db.execute(
-                'SELECT id FROM search_index WHERE keyword=?',
+                'SELECT id, complete, files_searched, total_files '
+                'FROM search_index WHERE keyword=?',
                 (term,)
             ).fetchone()
             if row is None:
                 return False  # never searched
-            (term_id,) = row
+            term_id, complete, files_searched, total_files = row
             (count,) = db.execute(
                 'SELECT COUNT(*) FROM search_results WHERE term_id=?', (term_id,)
             ).fetchone()
         finally:
             db.close()
+
+        if not complete:
+            from PySide6.QtWidgets import QMessageBox
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Incomplete Search")
+            msg.setText(
+                f"The previous search for '{term}' was stopped after "
+                f"{files_searched:,} of {total_files:,} files.\n\n"
+                f"Results may be missing. Redo the search from the beginning?"
+            )
+            redo_btn = msg.addButton("Redo Search",             QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("View Incomplete Results", QMessageBox.ButtonRole.RejectRole)
+            msg.setDefaultButton(redo_btn)
+            msg.exec()
+            if msg.clickedButton() == redo_btn:
+                self._start_keyword_search()
+                return True
 
         if count == 0:
             self.search_results_model.clear()
@@ -869,8 +907,14 @@ class KeywordSearchMixin:
                 ["Name", "Hits", "Context", "Offset"])
             self._search_folder_items.clear()
             self._search_file_items.clear()
-            self.search_status.setText(f"'{term}' — 0 hits (from cache)")
+            if not complete:
+                self._set_incomplete_banner(files_searched, total_files)
+                self.search_status.setText(f"'{term}' — 0 hits in searched files (incomplete)")
+            else:
+                self.search_status.setText(f"'{term}' — 0 hits (from cache)")
             return True
+
+        self._search_incomplete_files = (files_searched, total_files) if not complete else (0, 0)
 
         # Stop any in-flight loader for a previous term.
         if self._db_loader and self._db_loader.isRunning():
@@ -903,8 +947,15 @@ class KeywordSearchMixin:
 
     def _on_db_loader_finished(self, total: int):
         term = self._db_loader_term
-        self.search_status.setText(
-            f"'{term}' — {total:,} hit{'s' if total != 1 else ''} (loaded from cache)")
+        done, total_files = self._search_incomplete_files
+        if done or total_files:
+            self._set_incomplete_banner(done, total_files)
+            self.search_status.setText(
+                f"'{term}' — {total:,} hit{'s' if total != 1 else ''} "
+                f"(incomplete — {done:,} of {total_files:,} files searched)")
+        else:
+            self.search_status.setText(
+                f"'{term}' — {total:,} hit{'s' if total != 1 else ''} (from cache)")
 
     # ── Search lifecycle ──────────────────────────────────────────────────────
 
@@ -931,6 +982,7 @@ class KeywordSearchMixin:
         if not term or not self.zip_path:
             return
         self._stop_keyword_search()
+        self._set_incomplete_banner()
         self.search_results_model.clear()
         self.search_results_model.setHorizontalHeaderLabels(
             ["Name", "Hits", "Context", "Offset"])
@@ -938,7 +990,7 @@ class KeywordSearchMixin:
         self._search_file_items.clear()
         self._pending_db_hits.clear()
         self._save_recent_search(term)
-        db = self._open_case_db_conn()
+        db = self._open_results_db_conn()
         if db:
             try:
                 db.execute(
@@ -1012,7 +1064,8 @@ class KeywordSearchMixin:
         if self._search_progress_dlg:
             self._search_progress_dlg.update_progress(done, total, hits)
 
-    def _on_search_finished(self, total_hits: int):
+    def _on_search_finished(self, total_hits: int, files_done: int, files_total: int,
+                            stopped: bool):
         if self._search_entries is None and self._search_worker is not None:
             self._search_entries = self._search_worker.entries or None
         self.search_btn.setEnabled(True)
@@ -1020,44 +1073,48 @@ class KeywordSearchMixin:
         term    = self.search_field.text().strip()
         n_files = len(self._search_file_items)
         dlg     = self._search_progress_dlg
-        interrupted = dlg.was_interrupted if dlg else False
 
-        db = self._open_case_db_conn()
+        complete       = 0 if stopped else 1
+        files_searched = files_done  if stopped else files_total
+        total_files    = files_total
+
+        db = self._open_results_db_conn()
         if db:
             try:
-                if not interrupted:
-                    # Always record that this search ran (even 0 hits) so that
-                    # re-selecting from recent doesn't trigger a new search.
-                    db.execute(
-                        'INSERT OR IGNORE INTO search_index (keyword) VALUES (?)',
-                        (term,)
-                    )
+                db.execute(
+                    'UPDATE search_index SET complete=?, files_searched=?, total_files=? '
+                    'WHERE keyword=?',
+                    (complete, files_searched, total_files, term)
+                )
                 if self._pending_db_hits:
-                    (term_id,) = db.execute(
-                        'SELECT id FROM search_index WHERE keyword=?',
-                        (term,)
+                    row = db.execute(
+                        'SELECT id FROM search_index WHERE keyword=?', (term,)
                     ).fetchone()
-                    db.executemany(
-                        'INSERT INTO search_results (term_id, filename, offset, context) '
-                        'VALUES (?,?,?,?)',
-                        [(term_id, f, o, c) for f, o, c in self._pending_db_hits]
-                    )
+                    if row:
+                        db.executemany(
+                            'INSERT INTO search_results (term_id, filename, offset, context) '
+                            'VALUES (?,?,?,?)',
+                            [(row[0], f, o, c) for f, o, c in self._pending_db_hits]
+                        )
                 db.commit()
             finally:
                 db.close()
         self._pending_db_hits.clear()
 
         if dlg:
-            if interrupted:
+            if stopped:
                 dlg.mark_interrupted(n_files)
+                self._set_incomplete_banner(files_searched, total_files)
                 self.search_status.setText(
                     f"'{term}' — partial search, interrupted  "
                     f"({n_files:,} file{'s' if n_files != 1 else ''} with hits)")
             else:
                 dlg.mark_finished(n_files, total_hits)
+                self._set_incomplete_banner()
                 self.search_status.setText(
                     f"'{term}' — hits in {n_files:,} file{'s' if n_files != 1 else ''} across archive")
         else:
+            self._set_incomplete_banner()
             self.search_status.setText(
                 f"'{term}' — hits in {n_files:,} file{'s' if n_files != 1 else ''} across archive")
         self._update_search_status_bar()

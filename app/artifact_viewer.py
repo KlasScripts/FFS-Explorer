@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QSortFilterProxyModel
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
 
-from db_utils import _open_case_db
+from db_utils import _open_results_db
 
 # ── Tree node role sentinels ──────────────────────────────────────────────────
 # Each item in the artifact tree stores one of these prefixes + the script name
@@ -42,14 +42,20 @@ class ArtifactRunnerWorker(QThread):
         from artifact_runner import run_artifact
         from artifact_db import write_artifact_results
 
-        case_conn = _open_case_db(self._case_dir)
-        zip_obj   = None
+        try:
+            case_conn = _open_results_db(self._case_dir)
+        except Exception as exc:
+            self.log.emit(f"Could not open results database: {exc}")
+            self.done.emit()
+            return
 
+        zip_obj = None
         if self._streaming_index is None:
             try:
                 zip_obj = zipfile.ZipFile(self._zip_path, 'r')
             except Exception as exc:
                 self.log.emit(f"Could not open archive: {exc}")
+                case_conn.close()
                 self.done.emit()
                 return
 
@@ -69,6 +75,8 @@ class ArtifactRunnerWorker(QThread):
                 else:
                     count = write_artifact_results(case_conn, script_name, rows)
                     self.log.emit(f"  Done — {count} rows written.")
+        except Exception as exc:
+            self.log.emit(f"\nUnexpected error: {exc}")
         finally:
             case_conn.close()
             if zip_obj:
@@ -288,11 +296,13 @@ class ArtifactViewerMixin:
 
         self._art_tree_model.clear()
         self._art_tree_model.setHorizontalHeaderLabels(["Device Artifacts"])
+        self._art_report_model.clear()
+        self._art_stack.setCurrentIndex(0)   # back to placeholder
 
         if not self._case_dir:
             return
         try:
-            case_conn = _open_case_db(self._case_dir)
+            case_conn = _open_results_db(self._case_dir)
             completed = list_completed_artifacts(case_conn)
             case_conn.close()
         except Exception:
@@ -352,7 +362,7 @@ class ArtifactViewerMixin:
     def _art_show_report(self, script_name: str):
         from artifact_db import load_artifact_results
         try:
-            case_conn = _open_case_db(self._case_dir)
+            case_conn = _open_results_db(self._case_dir)
             columns, rows = load_artifact_results(case_conn, script_name)
             case_conn.close()
         except Exception as exc:

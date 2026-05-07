@@ -561,9 +561,10 @@ class ArtifactViewerMixin:
         self._art_report_view.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         self._art_report_view.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self._art_report_view.setAlternatingRowColors(True)
-        self._art_report_view.setWordWrap(False)
+        self._art_report_view.setWordWrap(True)
         self._art_report_view.horizontalHeader().setStretchLastSection(True)
         self._art_report_view.verticalHeader().hide()
+        self._art_report_view.verticalHeader().setDefaultSectionSize(80)
         self._art_highlight_delegate = ArtifactHighlightDelegate(
             lambda: self._art_active_filter)
         self._art_report_view.setItemDelegate(self._art_highlight_delegate)

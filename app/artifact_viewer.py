@@ -1,7 +1,10 @@
 """artifact_viewer.py — ArtifactRunnerWorker, ArtifactRunnerDialog, and ArtifactViewerMixin."""
 
+import html
 import os
 import pathlib
+import re
+import sqlite3
 import zipfile
 from datetime import datetime
 
@@ -9,16 +12,312 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QComboBox, QHBoxLayout, QVBoxLayout,
     QTableView, QTreeView, QPlainTextEdit, QStackedWidget, QSplitter,
     QHeaderView, QScrollArea, QCheckBox, QPushButton, QDialog, QMessageBox,
+    QApplication, QStyle, QStyledItemDelegate,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSortFilterProxyModel
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
+from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QTextDocument
 
 from db_utils import _open_results_db
 
+
+# ── DB-backed virtual table model ─────────────────────────────────────────────
+
+class ArtifactTableModel(QAbstractTableModel):
+    """Virtual model backed by SQLite — only visible rows are fetched.
+
+    Supports two modes:
+      DB mode   — opened via load_from_db(); holds an open sqlite3.Connection.
+                  Rows are fetched on demand using a page cache keyed by rowid.
+                  Memory use is bounded to _MAX_PAGES × _PAGE_SIZE rows at once.
+      List mode — opened via load_rows(); stores a plain list for small tables
+                  (e.g. the Exported Files view) where a DB connection is not needed.
+
+    The model owns its connection and closes it on clear() / load_from_db().
+    """
+
+    _PAGE_SIZE = 300   # rows fetched per cache page
+    _MAX_PAGES = 12    # evict LRU page above this limit
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._conn:    sqlite3.Connection | None = None
+        self._table:   str  = ''
+        self._columns: list = []
+        self._rowids:  list = []   # current view order (all or filtered/sorted)
+        self._all_ids: list = []   # unfiltered rowids (used by clear_filter)
+        self._rows:    list = []   # list mode only
+        self._cache:   dict = {}   # page_num -> [tuple, …]
+        self._lru:     list = []   # LRU eviction order
+        # Retained filter clause so sort() can re-apply it
+        self._where: str  = ''
+        self._wargs: list = []
+
+    # ── Connection ────────────────────────────────────────────────────────
+
+    def _close_conn(self):
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    # ── Loading ───────────────────────────────────────────────────────────
+
+    def load_from_db(self, conn: sqlite3.Connection, table: str,
+                     columns: list, rowids: list) -> None:
+        """DB mode: rows fetched on demand; conn is owned by this model."""
+        self.beginResetModel()
+        self._close_conn()
+        self._conn    = conn
+        self._table   = table
+        self._columns = list(columns)
+        self._rowids  = list(rowids)
+        self._all_ids = list(rowids)
+        self._rows    = []
+        self._cache.clear()
+        self._lru.clear()
+        self._where = ''
+        self._wargs = []
+        self.endResetModel()
+
+    def load_rows(self, columns: list, rows: list) -> None:
+        """List mode: small in-memory dataset (e.g. exported-files view)."""
+        self.beginResetModel()
+        self._close_conn()
+        self._columns = list(columns)
+        self._rows    = list(rows)
+        self._rowids  = list(range(len(rows)))
+        self._all_ids = list(self._rowids)
+        self._table   = ''
+        self._cache.clear()
+        self._lru.clear()
+        self._where = ''
+        self._wargs = []
+        self.endResetModel()
+
+    def clear(self) -> None:
+        self.beginResetModel()
+        self._close_conn()
+        self._columns = []
+        self._rowids  = []
+        self._all_ids = []
+        self._rows    = []
+        self._table   = ''
+        self._cache.clear()
+        self._lru.clear()
+        self._where = ''
+        self._wargs = []
+        self.endResetModel()
+
+    # ── Filter / sort ─────────────────────────────────────────────────────
+
+    def apply_rowids(self, rowids: list, where: str = '', wargs: list = None) -> None:
+        """Update the visible row set (result of filtering or sorting)."""
+        self.beginResetModel()
+        self._rowids = list(rowids)
+        self._where  = where
+        self._wargs  = wargs or []
+        self._cache.clear()
+        self._lru.clear()
+        self.endResetModel()
+
+    def clear_filter(self) -> None:
+        self.apply_rowids(self._all_ids)
+
+    def filter_rows_inmem(self, term: str, col_idx: int) -> int:
+        """List-mode synchronous filter. Returns visible count."""
+        t = term.lower()
+        if col_idx < 0:
+            ids = [i for i, row in enumerate(self._rows)
+                   if any(t in str(v).lower() for v in row)]
+        else:
+            ids = [i for i, row in enumerate(self._rows)
+                   if t in str(self._rows[i][col_idx]).lower()]
+        self.apply_rowids(ids)
+        return len(ids)
+
+    # ── Page cache ────────────────────────────────────────────────────────
+
+    def _fetch_page(self, page_num: int) -> list:
+        start = page_num * self._PAGE_SIZE
+        batch = self._rowids[start: start + self._PAGE_SIZE]
+        if not batch:
+            return []
+
+        if self._conn is None:
+            # List mode: batch contains plain list indices
+            return [self._rows[i] for i in batch if i < len(self._rows)]
+
+        # DB mode: fetch by rowid, preserving _rowids order
+        ph = ','.join('?' * len(batch))
+        try:
+            by_id = {r[0]: r[1:] for r in self._conn.execute(
+                f'SELECT rowid, * FROM "{self._table}" WHERE rowid IN ({ph})', batch)}
+        except Exception:
+            by_id = {}
+        empty = (None,) * len(self._columns)
+        return [by_id.get(rid, empty) for rid in batch]
+
+    def _get_row(self, model_row: int):
+        pg  = model_row // self._PAGE_SIZE
+        off = model_row  % self._PAGE_SIZE
+        if pg not in self._cache:
+            if len(self._cache) >= self._MAX_PAGES:
+                old = self._lru.pop(0)
+                del self._cache[old]
+            self._cache[pg] = self._fetch_page(pg)
+            self._lru.append(pg)
+        page = self._cache[pg]
+        return page[off] if off < len(page) else None
+
+    # ── Convenience properties ────────────────────────────────────────────
+
+    @property
+    def total_rows(self) -> int:
+        return len(self._all_ids)
+
+    @property
+    def visible_rows(self) -> int:
+        return len(self._rowids)
+
+    # ── QAbstractTableModel interface ─────────────────────────────────────
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._rowids)
+
+    def columnCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._columns)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+            return None
+        row = self._get_row(index.row())
+        if row is None:
+            return ''
+        val = row[index.column()] if index.column() < len(row) else None
+        return str(val) if val is not None else ''
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return self._columns[section] if section < len(self._columns) else None
+        return str(section + 1)
+
+    def sort(self, col: int, order: Qt.SortOrder) -> None:
+        """Re-query rowids from SQLite using ORDER BY — fast C-level sort."""
+        if not self._conn or not self._columns or col >= len(self._columns):
+            return
+        direction = 'DESC' if order == Qt.SortOrder.DescendingOrder else 'ASC'
+        col_name  = self._columns[col]
+        try:
+            if self._where:
+                sql  = (f'SELECT rowid FROM "{self._table}" WHERE {self._where}'
+                        f' ORDER BY "{col_name}" {direction}')
+                args = self._wargs
+            else:
+                sql  = f'SELECT rowid FROM "{self._table}" ORDER BY "{col_name}" {direction}'
+                args = []
+            new_ids = [r[0] for r in self._conn.execute(sql, args)]
+        except Exception:
+            return
+        self.beginResetModel()
+        self._rowids = new_ids
+        self._cache.clear()
+        self._lru.clear()
+        self.endResetModel()
+
+
+# ── Background SQL filter worker ──────────────────────────────────────────────
+
+class ArtifactFilterWorker(QThread):
+    """Runs a SQLite LIKE filter on a background thread.
+
+    Opens its own read-only connection so the model's main-thread connection
+    is never touched from the worker thread."""
+
+    done = Signal(list, str, list)   # (rowids, where_clause, where_args)
+
+    def __init__(self, db_path: str, table: str, columns: list,
+                 term: str, col_idx: int, parent=None):
+        super().__init__(parent)
+        self._db_path = db_path
+        self._table   = table
+        self._columns = columns
+        self._pattern = f'%{term}%'
+        self._col_idx = col_idx
+
+    def run(self) -> None:
+        p = self._pattern
+        if self._col_idx < 0:
+            where = ' OR '.join(f'"{c}" LIKE ?' for c in self._columns)
+            args  = [p] * len(self._columns)
+        else:
+            where = f'"{self._columns[self._col_idx]}" LIKE ?'
+            args  = [p]
+        try:
+            conn   = sqlite3.connect(self._db_path, timeout=5)
+            rowids = [r[0] for r in conn.execute(
+                f'SELECT rowid FROM "{self._table}" WHERE {where}', args)]
+            conn.close()
+        except Exception:
+            rowids = []
+        self.done.emit(rowids, where, args)
+
+
+# ── Highlight delegate ────────────────────────────────────────────────────────
+
+class ArtifactHighlightDelegate(QStyledItemDelegate):
+    """Renders cells with the active filter term highlighted in yellow."""
+
+    _HL_BG = "#ffeb3b"
+    _HL_FG = "#000000"
+
+    def __init__(self, get_term, parent=None):
+        super().__init__(parent)
+        self._get_term = get_term
+
+    def paint(self, painter, option, index):
+        term = self._get_term()
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ''
+        if not term or not text:
+            super().paint(painter, option, index)
+            return
+
+        self.initStyleOption(option, index)
+        style = option.widget.style() if option.widget else QApplication.style()
+        option.text = ''
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, option.widget)
+
+        escaped     = html.escape(text)
+        pattern     = re.compile(re.escape(html.escape(term)), re.IGNORECASE)
+        highlighted = pattern.sub(
+            lambda m: (f'<span style="background:{self._HL_BG};color:{self._HL_FG};">'
+                       f'{m.group()}</span>'),
+            escaped,
+        )
+
+        if option.state & QStyle.StateFlag.State_Selected:
+            fg = option.palette.highlightedText().color().name()
+        else:
+            fg = option.palette.text().color().name()
+
+        doc = QTextDocument()
+        doc.setDefaultStyleSheet(f'body {{ color: {fg}; }}')
+        doc.setHtml(f'<body>{highlighted}</body>')
+        doc.setTextWidth(option.rect.width())
+
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, option, option.widget)
+        painter.save()
+        painter.translate(text_rect.topLeft())
+        painter.setClipRect(text_rect.translated(-text_rect.topLeft()))
+        doc.drawContents(painter)
+        painter.restore()
+
+
 # ── Tree node role sentinels ──────────────────────────────────────────────────
-# Each item in the artifact tree stores one of these prefixes + the script name
-# as its UserRole data.  The click handler strips the prefix to determine what
-# action to take and which script to act on.
 _ART_GROUP  = "__art_group__:"
 _ART_REPORT = "__art_report__:"
 _ART_SCRIPT = "__art_script__:"
@@ -32,7 +331,7 @@ class ArtifactRunnerWorker(QThread):
 
     def __init__(self, selected, zip_path, adapter, streaming_index, case_dir):
         super().__init__()
-        self._selected        = selected        # [(script_name, module), ...]
+        self._selected        = selected
         self._zip_path        = zip_path
         self._adapter         = adapter
         self._streaming_index = streaming_index
@@ -228,7 +527,7 @@ class ArtifactViewerMixin:
         self._art_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._art_placeholder.setStyleSheet("color: grey; font-style: italic;")
 
-        # Report page — filter bar + QTableView with proxy
+        # Report page — filter bar + virtual table view
         report_page = QWidget()
         report_layout = QVBoxLayout(report_page)
         report_layout.setContentsMargins(0, 0, 0, 0)
@@ -237,33 +536,37 @@ class ArtifactViewerMixin:
         report_filter_row = QHBoxLayout()
         self._art_filter_input = QLineEdit()
         self._art_filter_input.setPlaceholderText("Filter…")
-        self._art_filter_col  = QComboBox()
+        self._art_filter_input.returnPressed.connect(self._apply_art_filter)
+        self._art_filter_col = QComboBox()
         self._art_filter_col.addItem("All Columns")
-        self._art_filter_input.textChanged.connect(self._apply_art_filter)
         self._art_filter_col.currentIndexChanged.connect(self._apply_art_filter)
+        self._art_filter_btn = QPushButton("Filter")
+        self._art_filter_btn.setFixedWidth(60)
+        self._art_filter_btn.clicked.connect(self._apply_art_filter)
         self._art_row_label = QLabel()
         report_filter_row.addWidget(QLabel("Filter:"))
         report_filter_row.addWidget(self._art_filter_input, 1)
         report_filter_row.addWidget(self._art_filter_col)
+        report_filter_row.addWidget(self._art_filter_btn)
         report_filter_row.addWidget(self._art_row_label)
         report_layout.addLayout(report_filter_row)
 
-        self._art_report_model = QStandardItemModel()
-        self._art_report_proxy = QSortFilterProxyModel()
-        self._art_report_proxy.setSourceModel(self._art_report_model)
-        self._art_report_proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self._art_report_proxy.setFilterKeyColumn(-1)
+        self._art_table_model   = ArtifactTableModel()
+        self._art_active_filter = ''
+        self._art_filter_worker: ArtifactFilterWorker | None = None
 
         self._art_report_view = QTableView()
-        self._art_report_view.setModel(self._art_report_proxy)
+        self._art_report_view.setModel(self._art_table_model)
         self._art_report_view.setSortingEnabled(True)
         self._art_report_view.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         self._art_report_view.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self._art_report_view.setAlternatingRowColors(True)
-        self._art_report_view.setWordWrap(True)
+        self._art_report_view.setWordWrap(False)
         self._art_report_view.horizontalHeader().setStretchLastSection(True)
-        self._art_report_view.verticalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents)
+        self._art_report_view.verticalHeader().hide()
+        self._art_highlight_delegate = ArtifactHighlightDelegate(
+            lambda: self._art_active_filter)
+        self._art_report_view.setItemDelegate(self._art_highlight_delegate)
         report_layout.addWidget(self._art_report_view)
 
         # Script page — read-only monospace text editor
@@ -294,10 +597,12 @@ class ArtifactViewerMixin:
         from artifact_db import list_completed_artifacts
         from artifact_runner import list_artifacts
 
+        self._cancel_art_filter_worker()
         self._art_tree_model.clear()
         self._art_tree_model.setHorizontalHeaderLabels(["Device Artifacts"])
-        self._art_report_model.clear()
-        self._art_stack.setCurrentIndex(0)   # back to placeholder
+        self._art_table_model.clear()   # closes any open SQLite connection
+        self._art_active_filter = ''
+        self._art_stack.setCurrentIndex(0)
 
         if not self._case_dir:
             return
@@ -330,10 +635,10 @@ class ArtifactViewerMixin:
             label = getattr(mod, 'name', script_name) if mod else script_name
             group = _item(label, _ART_GROUP + script_name)
             group.setFont(QFont("Arial", weight=QFont.Weight.Bold))
-            group.appendRow(_item("Report",        _ART_REPORT + script_name))
-            group.appendRow(_item("Script",        _ART_SCRIPT + script_name))
-            group.appendRow(_item("Source in ZIP", _ART_SOURCE + script_name))
-            group.appendRow(_item("Exported Files",_ART_FILES  + script_name))
+            group.appendRow(_item("Report",         _ART_REPORT + script_name))
+            group.appendRow(_item("Script",         _ART_SCRIPT + script_name))
+            group.appendRow(_item("Source in ZIP",  _ART_SOURCE + script_name))
+            group.appendRow(_item("Exported Files", _ART_FILES  + script_name))
             self._art_tree_model.invisibleRootItem().appendRow(group)
 
         self._art_tree_view.expandAll()
@@ -351,25 +656,12 @@ class ArtifactViewerMixin:
         elif role_val.startswith(_ART_FILES):
             self._art_show_files(role_val[len(_ART_FILES):])
 
-    def _art_resize_columns(self, max_width: int = 320):
-        """Size columns to their content, then cap any that exceed max_width.
-        Capped columns will word-wrap their text across multiple row lines."""
-        self._art_report_view.resizeColumnsToContents()
-        for col in range(self._art_report_model.columnCount()):
-            if self._art_report_view.columnWidth(col) > max_width:
-                self._art_report_view.setColumnWidth(col, max_width)
+    # ── Report display ────────────────────────────────────────────────────────
 
-    def _art_show_report(self, script_name: str):
-        from artifact_db import load_artifact_results
-        try:
-            case_conn = _open_results_db(self._case_dir)
-            columns, rows = load_artifact_results(case_conn, script_name)
-            case_conn.close()
-        except Exception as exc:
-            self.status_bar.showMessage(f"Could not load report: {exc}")
-            return
-
-        self._art_report_model.clear()
+    def _setup_report_filter_ui(self, columns: list):
+        """Reset filter controls for a newly loaded report."""
+        self._cancel_art_filter_worker()
+        self._art_active_filter = ''
         self._art_filter_input.clear()
         self._art_filter_col.blockSignals(True)
         self._art_filter_col.clear()
@@ -377,26 +669,99 @@ class ArtifactViewerMixin:
         for col in columns:
             self._art_filter_col.addItem(col)
         self._art_filter_col.blockSignals(False)
+        self._art_filter_btn.setEnabled(True)
 
-        self._art_report_model.setHorizontalHeaderLabels(columns)
-        for row in rows:
-            self._art_report_model.appendRow(
-                [QStandardItem(str(v) if v is not None else "") for v in row]
-            )
+    def _art_resize_columns(self, max_width: int = 320):
+        """Estimate column widths by sampling the first 200 visible rows."""
+        fm     = self._art_report_view.fontMetrics()
+        n_cols = self._art_table_model.columnCount()
+        n_rows = min(200, self._art_table_model.rowCount())
+        for col in range(n_cols):
+            header = self._art_table_model.headerData(col, Qt.Orientation.Horizontal) or ''
+            w = fm.horizontalAdvance(str(header)) + 24
+            for row in range(n_rows):
+                text = self._art_table_model.data(
+                    self._art_table_model.index(row, col)) or ''
+                w = max(w, fm.horizontalAdvance(text) + 12)
+            self._art_report_view.setColumnWidth(col, min(w, max_width))
+
+    def _art_show_report(self, script_name: str):
+        self._cancel_art_filter_worker()
+        table = f'artifact_{script_name}'
+        try:
+            conn = _open_results_db(self._case_dir)
+            cur  = conn.execute(f'SELECT * FROM "{table}" LIMIT 0')
+            cols = [d[0] for d in cur.description]
+            ids  = [r[0] for r in conn.execute(
+                f'SELECT rowid FROM "{table}" ORDER BY rowid')]
+        except Exception as exc:
+            self.status_bar.showMessage(f"Could not load report: {exc}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+
+        # Transfer connection ownership to the model
+        self._art_table_model.load_from_db(conn, table, cols, ids)
+        self._setup_report_filter_ui(cols)
         self._art_resize_columns()
-        self._art_row_label.setText(f"{len(rows):,} rows")
+        self._art_row_label.setText(f"{len(ids):,} rows")
         self._art_stack.setCurrentIndex(1)
 
+    # ── Filtering ─────────────────────────────────────────────────────────────
+
     def _apply_art_filter(self):
-        text    = self._art_filter_input.text()
-        col_idx = self._art_filter_col.currentIndex() - 1  # -1 = all columns
-        self._art_report_proxy.setFilterKeyColumn(col_idx)
-        self._art_report_proxy.setFilterFixedString(text)
-        visible = self._art_report_proxy.rowCount()
-        total   = self._art_report_model.rowCount()
-        self._art_row_label.setText(
-            f"{visible:,} of {total:,} rows" if text else f"{total:,} rows"
+        term    = self._art_filter_input.text()
+        col_idx = self._art_filter_col.currentIndex() - 1   # -1 = all columns
+        total   = self._art_table_model.total_rows
+
+        self._art_active_filter = term
+
+        if not term:
+            self._cancel_art_filter_worker()
+            self._art_table_model.clear_filter()
+            self._art_row_label.setText(f"{total:,} rows")
+            return
+
+        # List-mode (small datasets, e.g. exported files): filter in Python
+        if self._art_table_model._conn is None:
+            self._cancel_art_filter_worker()
+            count = self._art_table_model.filter_rows_inmem(term, col_idx)
+            self._art_row_label.setText(f"{count:,} of {total:,} rows")
+            return
+
+        # DB mode: run SQLite LIKE on a background thread
+        self._cancel_art_filter_worker()
+        self._art_filter_btn.setEnabled(False)
+        self._art_row_label.setText(f"Filtering {total:,} rows…")
+
+        db_path = os.path.join(self._case_dir, 'caseresults.db')
+        worker  = ArtifactFilterWorker(
+            db_path,
+            self._art_table_model._table,
+            self._art_table_model._columns,
+            term, col_idx,
         )
+        worker.done.connect(self._on_art_filter_done)
+        self._art_filter_worker = worker
+        worker.start()
+
+    def _on_art_filter_done(self, rowids: list, where: str, wargs: list):
+        self._art_table_model.apply_rowids(rowids, where, wargs)
+        total = self._art_table_model.total_rows
+        self._art_row_label.setText(f"{len(rowids):,} of {total:,} rows")
+        self._art_filter_btn.setEnabled(True)
+
+    def _cancel_art_filter_worker(self):
+        if self._art_filter_worker and self._art_filter_worker.isRunning():
+            try:
+                self._art_filter_worker.done.disconnect()
+            except Exception:
+                pass
+        self._art_filter_worker = None
+
+    # ── Script / source / files views ─────────────────────────────────────────
 
     def _art_show_script(self, script_name: str):
         from artifact_runner import _ARTIFACTS_DIR
@@ -415,7 +780,6 @@ class ArtifactViewerMixin:
         self.status_bar.showMessage(f"Script: {script_path}")
 
     def _art_goto_source(self, script_name: str):
-        """Switch to File Browser and navigate to the target folder in the zip."""
         from artifact_runner import list_artifacts
         platform = 'android' if self._is_android_archive() else 'ios'
         modules  = {sn: mod for sn, mod in list_artifacts(platform)}
@@ -433,11 +797,10 @@ class ArtifactViewerMixin:
                 return
             first_path = target_paths[0]
         parent = '/'.join(first_path.split('/')[:-1])
-        self.center_tabs.setCurrentIndex(0)   # switch to File Browser
+        self.center_tabs.setCurrentIndex(0)
         self.navigate_tree_to_path(parent)
 
     def _art_show_files(self, script_name: str):
-        """Show exported source files as a simple report table."""
         from artifact_runner import list_artifacts, safe_folder_name
         platform    = 'android' if self._is_android_archive() else 'ios'
         modules     = {sn: mod for sn, mod in list_artifacts(platform)}
@@ -450,28 +813,17 @@ class ArtifactViewerMixin:
             return
 
         columns = ["Name", "Size (Bytes)", "Modified", "Full Path"]
-        self._art_report_model.clear()
-        self._art_filter_input.clear()
-        self._art_filter_col.blockSignals(True)
-        self._art_filter_col.clear()
-        self._art_filter_col.addItem("All Columns")
-        for col in columns:
-            self._art_filter_col.addItem(col)
-        self._art_filter_col.blockSignals(False)
-        self._art_report_model.setHorizontalHeaderLabels(columns)
-
-        rows = []
+        rows    = []
         for fname in sorted(os.listdir(folder)):
             fpath = os.path.join(folder, fname)
             if not os.path.isfile(fpath):
                 continue
             sz    = os.path.getsize(fpath)
             mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime('%Y-%m-%d %H:%M:%S')
-            self._art_report_model.appendRow([
-                QStandardItem(fname), QStandardItem(f"{sz:,}"),
-                QStandardItem(mtime), QStandardItem(fpath),
-            ])
-            rows.append(fname)
+            rows.append((fname, f"{sz:,}", mtime, fpath))
+
+        self._art_table_model.load_rows(columns, rows)
+        self._setup_report_filter_ui(columns)
         self._art_resize_columns()
         self._art_row_label.setText(f"{len(rows)} file(s)")
         self._art_stack.setCurrentIndex(1)

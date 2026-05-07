@@ -13,6 +13,7 @@ import msgpack
 
 from adapters import FfsAdapter
 from db_utils import _open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob
+from zip_cd_cache import load as _zcd_load
 
 _SEARCH_ENTRIES_VERSION = '1'
 from PySide6.QtWidgets import (
@@ -30,9 +31,12 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSortFilterProxyModel
 
 # ── Shared zip-entry scanner ─────────────────────────────────────────────────
 
-def _build_zip_entries(zip_path: str, streaming_index, stop) -> list:
+def _build_zip_entries(zip_path: str, streaming_index, stop,
+                       case_dir: str | None = None) -> list:
     """Return list of (name, data_offset, file_size) for all STORED entries.
-    *stop* is a threading.Event; set it to abort early."""
+    *stop* is a threading.Event; set it to abort early.
+    *case_dir*, when set, allows using the local .zcd sidecar to avoid
+    reading the central directory from the network."""
     entries = []
     if streaming_index is not None:
         for name in streaming_index.namelist():
@@ -44,15 +48,31 @@ def _build_zip_entries(zip_path: str, streaming_index, stop) -> list:
                 pass
         return entries
 
+    # Use the local .zcd sidecar when available — avoids a full network CD read.
+    infolist = None
+    if case_dir:
+        try:
+            infolist = _zcd_load(zip_path, case_dir)
+        except Exception:
+            pass
+
     try:
-        with zipfile.ZipFile(zip_path, 'r') as z:
+        if infolist is not None:
             stored = [
                 (info.filename, info.header_offset, info.file_size)
-                for info in z.infolist()
+                for info in infolist
                 if info.compress_type == zipfile.ZIP_STORED and info.file_size > 0
             ]
+        else:
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                stored = [
+                    (info.filename, info.header_offset, info.file_size)
+                    for info in z.infolist()
+                    if info.compress_type == zipfile.ZIP_STORED and info.file_size > 0
+                ]
     except Exception:
         return entries
+
     try:
         with open(zip_path, 'rb') as fh:
             for name, header_offset, file_size in stored:
@@ -96,7 +116,8 @@ class SearchIndexWorker(QThread):
                 self.entries_ready.emit(cached)
                 return
 
-        entries = _build_zip_entries(self.zip_path, self.streaming_index, self._stop)
+        entries = _build_zip_entries(self.zip_path, self.streaming_index, self._stop,
+                                     case_dir=self.case_dir)
         if self._stop.is_set():
             return
 

@@ -899,6 +899,8 @@ class ZipMetadataWorker(QThread):
                 _need_save_guid = cached_guid_bundle is None and bool(guid_to_bundle)
                 header_candidates: list = []
                 if self.scan_headers:
+                    self.status_update.emit(
+                        "Collecting header scan candidates from archive (may be slow on network)…")
                     header_candidates = _collect_header_candidates(
                         self.zip_path, ui_metadata, ffs_adapter,
                         z=z_ctx, streaming_index=self._streaming_index,
@@ -1301,7 +1303,7 @@ class CaseSettingsDialog(QDialog):
 
         # Header scan option
         self._scan_cb = QCheckBox("Scan unknown file headers for precise type detection")
-        self._scan_cb.setChecked(True)
+        self._scan_cb.setChecked(False)
         layout.addWidget(self._scan_cb)
 
         # Buttons

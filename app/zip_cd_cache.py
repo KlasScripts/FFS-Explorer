@@ -19,6 +19,7 @@ metadata operations use the local copy.
 
 import io
 import os
+import random
 import struct
 import zipfile
 
@@ -248,3 +249,106 @@ class CachedZipView:
 
     def __exit__(self, *_):
         pass
+
+
+# ── Data offset resolution ────────────────────────────────────────────────────
+
+_PROBE_N = 5   # entries sampled to detect a consistent CD→local extra delta
+
+
+def probe_delta(zip_path: str, infos: list[zipfile.ZipInfo]) -> int | None:
+    """Return the consistent CD→local extra_len delta across a sample of *infos*.
+
+    Returns None if the delta differs between entries (fall back to per-entry
+    seeks) or if the file cannot be read.  Call once at archive-open time and
+    pass the result to compute_data_offsets() to avoid re-probing later.
+    """
+    if not infos:
+        return None
+    sample = random.sample(infos, min(_PROBE_N, len(infos)))
+    delta: int | None = None
+    try:
+        with open(zip_path, 'rb') as fh:
+            for info in sample:
+                fh.seek(info.header_offset + 26)
+                local_fname_len, local_extra_len = struct.unpack('<HH', fh.read(4))
+                if local_fname_len != len(
+                        info.filename.encode('utf-8', errors='surrogatepass')):
+                    return None
+                d = local_extra_len - len(info.extra)
+                if delta is None:
+                    delta = d
+                elif d != delta:
+                    return None
+    except OSError:
+        return None
+    return delta
+
+
+def compute_data_offsets(
+    zip_path: str,
+    infos: list[zipfile.ZipInfo],
+    delta: int | None = None,
+) -> dict[str, int]:
+    """Return {filename: data_offset} for each ZipInfo in *infos*.
+
+    If *delta* (obtained from probe_delta()) is provided, offsets are computed
+    arithmetically with no file I/O.  Without it, the function probes a sample
+    internally and falls back to per-entry seeks if the delta is inconsistent.
+    """
+    if not infos:
+        return {}
+
+    result: dict[str, int] = {}
+
+    if delta is not None:
+        # Known delta — pure arithmetic, no file I/O needed.
+        for info in infos:
+            fname_len = len(info.filename.encode('utf-8', errors='surrogatepass'))
+            result[info.filename] = (
+                info.header_offset + 30 + fname_len + len(info.extra) + delta)
+        return result
+
+    # No pre-computed delta — probe and compute in a single file open.
+    sample = random.sample(infos, min(_PROBE_N, len(infos)))
+    _delta: int | None = None
+    probe_ok = True
+    probed: dict[str, int] = {}
+
+    try:
+        with open(zip_path, 'rb') as fh:
+            for info in sample:
+                fh.seek(info.header_offset + 26)
+                local_fname_len, local_extra_len = struct.unpack('<HH', fh.read(4))
+                cd_fname_len = len(info.filename.encode('utf-8', errors='surrogatepass'))
+                if local_fname_len != cd_fname_len:
+                    probe_ok = False
+                    break
+                d = local_extra_len - len(info.extra)
+                if _delta is None:
+                    _delta = d
+                elif d != _delta:
+                    probe_ok = False
+                    break
+                probed[info.filename] = (
+                    info.header_offset + 30 + local_fname_len + local_extra_len)
+
+            if probe_ok and _delta is not None:
+                for info in infos:
+                    if info.filename in probed:
+                        result[info.filename] = probed[info.filename]
+                    else:
+                        fname_len = len(
+                            info.filename.encode('utf-8', errors='surrogatepass'))
+                        result[info.filename] = (
+                            info.header_offset + 30 + fname_len + len(info.extra) + _delta)
+            else:
+                for info in infos:
+                    fh.seek(info.header_offset + 26)
+                    fname_len, extra_len = struct.unpack('<HH', fh.read(4))
+                    result[info.filename] = info.header_offset + 30 + fname_len + extra_len
+
+    except OSError:
+        pass
+
+    return result

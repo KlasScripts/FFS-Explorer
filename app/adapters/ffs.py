@@ -314,7 +314,7 @@ class FfsAdapter:
     def scan_folders(self) -> list[str]:
         """Return default header-scan folder prefixes for this format."""
         if self.format == self.FORMAT_GRAYKEY:
-            return ['private/var/mobile/Containers/']
+            return ['private/var/mobile/Containers/', 'data/data/']
         if self.format == self.FORMAT_ZIP_EXTRAS:
             return ['data/data/']
         return ['mobile/Containers/']

@@ -13,7 +13,7 @@ import msgpack
 
 from adapters import FfsAdapter
 from db_utils import _open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob
-from zip_cd_cache import load as _zcd_load
+from zip_cd_cache import load as _zcd_load, compute_data_offsets as _compute_data_offsets
 
 _SEARCH_ENTRIES_VERSION = '1'
 from PySide6.QtWidgets import (
@@ -32,7 +32,8 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSortFilterProxyModel
 # ── Shared zip-entry scanner ─────────────────────────────────────────────────
 
 def _build_zip_entries(zip_path: str, streaming_index, stop,
-                       case_dir: str | None = None) -> list:
+                       case_dir: str | None = None,
+                       delta: int | None = None) -> list:
     """Return list of (name, data_offset, file_size) for all STORED entries.
     *stop* is a threading.Event; set it to abort early.
     *case_dir*, when set, allows using the local .zcd sidecar to avoid
@@ -59,31 +60,24 @@ def _build_zip_entries(zip_path: str, streaming_index, stop,
     try:
         if infolist is not None:
             stored = [
-                (info.filename, info.header_offset, info.file_size)
-                for info in infolist
+                info for info in infolist
                 if info.compress_type == zipfile.ZIP_STORED and info.file_size > 0
             ]
         else:
             with zipfile.ZipFile(zip_path, 'r') as z:
                 stored = [
-                    (info.filename, info.header_offset, info.file_size)
-                    for info in z.infolist()
+                    info for info in z.infolist()
                     if info.compress_type == zipfile.ZIP_STORED and info.file_size > 0
                 ]
     except Exception:
         return entries
 
-    try:
-        with open(zip_path, 'rb') as fh:
-            for name, header_offset, file_size in stored:
-                if stop.is_set():
-                    return entries
-                fh.seek(header_offset + 26)
-                fname_len, extra_len = struct.unpack('<HH', fh.read(4))
-                data_offset = header_offset + 30 + fname_len + extra_len
-                entries.append((name, data_offset, file_size))
-    except Exception:
-        pass
+    offsets = _compute_data_offsets(zip_path, stored, delta=delta)
+    for info in stored:
+        if stop.is_set():
+            return entries
+        if info.filename in offsets:
+            entries.append((info.filename, offsets[info.filename], info.file_size))
     return entries
 
 
@@ -98,11 +92,13 @@ class SearchIndexWorker(QThread):
     entries_ready = Signal(list)   # list of (name, data_offset, file_size)
 
     def __init__(self, zip_path: str, streaming_index=None,
-                 case_dir: str | None = None, parent=None):
+                 case_dir: str | None = None, delta: int | None = None,
+                 parent=None):
         super().__init__(parent)
         self.zip_path        = zip_path
         self.streaming_index = streaming_index
         self.case_dir        = case_dir
+        self.delta           = delta
         self._stop           = threading.Event()
 
     def stop(self):
@@ -117,7 +113,7 @@ class SearchIndexWorker(QThread):
                 return
 
         entries = _build_zip_entries(self.zip_path, self.streaming_index, self._stop,
-                                     case_dir=self.case_dir)
+                                     case_dir=self.case_dir, delta=self.delta)
         if self._stop.is_set():
             return
 
@@ -990,6 +986,7 @@ class KeywordSearchMixin:
             self.zip_path,
             streaming_index=self._streaming_index,
             case_dir=self._case_dir,
+            delta=self._local_extra_delta,
         )
         worker.entries_ready.connect(self._on_search_index_ready)
         self._search_index_worker = worker

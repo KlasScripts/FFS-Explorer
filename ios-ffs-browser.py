@@ -31,7 +31,10 @@ from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
 from keyword_search import KeywordSearchMixin
 from artifact_viewer import ArtifactViewerMixin
 from streaming_zip import StreamingZipIndex
-from zip_cd_cache import CachedZipView, is_valid as _cd_cache_valid, save as _cd_cache_save, load as _cd_cache_load
+from zip_cd_cache import (CachedZipView, is_valid as _cd_cache_valid,
+                          save as _cd_cache_save, load as _cd_cache_load,
+                          probe_delta as _probe_delta,
+                          compute_data_offsets as _compute_data_offsets)
 from datetime import datetime, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
                               QHBoxLayout, QWidget, QHeaderView, QPushButton,
@@ -722,6 +725,7 @@ def _collect_header_candidates(
     ffs_adapter,
     z=None,
     streaming_index=None,
+    delta: int | None = None,
 ) -> list[tuple[str, int, int]]:
     """Return [(ui_path, data_offset, file_size)] for 'Other'-typed files in scan_folders."""
     scan_folders = ffs_adapter.scan_folders()
@@ -740,20 +744,23 @@ def _collect_header_candidates(
         for ui_path in targets:
             row = entries.get(ffs_adapter.resolve(ui_path))
             if row:
-                file_size = row[2]   # [data_offset, comp, uncomp, method]
-                candidates.append((ui_path, row[0], file_size))
+                candidates.append((ui_path, row[0], row[2]))
     else:
         assert z is not None
-        with open(zip_path, 'rb') as rf:
-            for ui_path in targets:
-                try:
-                    info = z.getinfo(ffs_adapter.resolve(ui_path))
-                    rf.seek(info.header_offset + 26)
-                    fname_len, extra_len = struct.unpack('<HH', rf.read(4))
-                    data_offset = info.header_offset + 30 + fname_len + extra_len
-                    candidates.append((ui_path, data_offset, info.file_size))
-                except (KeyError, OSError):
-                    pass
+        resolve = ffs_adapter.resolve
+        target_infos = []
+        target_meta: dict[str, tuple[str, int]] = {}  # filename → (ui_path, file_size)
+        for ui_path in targets:
+            try:
+                info = z.getinfo(resolve(ui_path))
+                target_infos.append(info)
+                target_meta[info.filename] = (ui_path, info.file_size)
+            except KeyError:
+                pass
+        offsets = _compute_data_offsets(zip_path, target_infos, delta=delta)
+        for filename, data_offset in offsets.items():
+            ui_path, file_size = target_meta[filename]
+            candidates.append((ui_path, data_offset, file_size))
 
     return candidates
 
@@ -786,7 +793,8 @@ class ZipMetadataWorker(QThread):
     def run(self):
         try:
             self.status_update.emit("Opening Archive...")
-            self._streaming_index = None
+            self._streaming_index    = None
+            self._local_extra_delta: int | None = None
 
             if self.case_dir:
                 try:
@@ -863,6 +871,9 @@ class ZipMetadataWorker(QThread):
                     zip_names = frozenset(info.filename for info in _infolist)
                     zip_sizes = {info.filename: info.file_size for info in _infolist}
                     ffs_adapter = FfsAdapter.detect(z_ctx)
+                    _stored = [i for i in _infolist
+                               if i.compress_type == zipfile.ZIP_STORED and i.file_size > 0]
+                    self._local_extra_delta = _probe_delta(self.zip_path, _stored)
                 time.sleep(0)   # yield GIL after C-level frozenset build
 
                 cached_guid_bundle: dict | None = None
@@ -904,6 +915,7 @@ class ZipMetadataWorker(QThread):
                     header_candidates = _collect_header_candidates(
                         self.zip_path, ui_metadata, ffs_adapter,
                         z=z_ctx, streaming_index=self._streaming_index,
+                        delta=self._local_extra_delta,
                     )
             finally:
                 if z_ctx is not None:
@@ -1381,12 +1393,14 @@ class HeaderScanWorker(QThread):
     progress = Signal(int)   # remaining count
     done     = Signal(dict)  # {ui_path: detected_type}
 
-    def __init__(self, zip_path, ui_metadata, ffs_adapter, streaming_index=None):
+    def __init__(self, zip_path, ui_metadata, ffs_adapter, streaming_index=None,
+                 delta=None):
         super().__init__()
         self._zip_path        = zip_path
         self._ui_metadata     = ui_metadata
         self._adapter         = ffs_adapter
         self._streaming_index = streaming_index
+        self._delta           = delta
 
     def run(self):
         z = None
@@ -1396,6 +1410,7 @@ class HeaderScanWorker(QThread):
             candidates = _collect_header_candidates(
                 self._zip_path, self._ui_metadata, self._adapter,
                 z=z, streaming_index=self._streaming_index,
+                delta=self._delta,
             )
         finally:
             if z:
@@ -1418,7 +1433,7 @@ class ProcessDialog(QDialog):
     header_scan_done = Signal(dict)
 
     def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
-                 streaming_index=None, parent=None):
+                 streaming_index=None, delta=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Process Archive")
         self.setModal(True)
@@ -1428,6 +1443,7 @@ class ProcessDialog(QDialog):
         self._adapter         = ffs_adapter
         self._ui_metadata     = ui_metadata
         self._streaming_index = streaming_index
+        self._delta           = delta
         self._scan_worker: HeaderScanWorker | None = None
 
         layout = QVBoxLayout(self)
@@ -1479,6 +1495,7 @@ class ProcessDialog(QDialog):
         self._scan_worker = HeaderScanWorker(
             self._zip_path, self._ui_metadata,
             self._adapter, self._streaming_index,
+            delta=self._delta,
         )
         self._scan_worker.progress.connect(self._on_progress)
         self._scan_worker.done.connect(self._on_done)
@@ -1524,6 +1541,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._zip_handle: zipfile.ZipFile | None = None
         self._zip_open_future = None
         self._streaming_index: StreamingZipIndex | None = None
+        self._local_extra_delta: int | None = None
         self._header_type_overrides: dict = {}   # {ui_path: detected_type}
         self._hex_worker: QThread | None = None
         self._adapter = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, "filesystem2", "filesystem1")
@@ -2650,6 +2668,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             ffs_adapter=self._adapter,
             ui_metadata=self.full_metadata,
             streaming_index=self._streaming_index,
+            delta=self._local_extra_delta,
             parent=self,
         )
         dlg.header_scan_done.connect(self._on_header_scan_done)
@@ -2760,7 +2779,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._zip_handle.close()
             self._zip_handle = None
         self._zip_open_future = None
-        self._streaming_index = getattr(self.worker, '_streaming_index', None)
+        self._streaming_index    = getattr(self.worker, '_streaming_index', None)
+        self._local_extra_delta  = getattr(self.worker, '_local_extra_delta', None)
         if self._streaming_index is None:
             _path = self.zip_path
             _ex = ThreadPoolExecutor(max_workers=1)

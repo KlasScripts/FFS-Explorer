@@ -2928,6 +2928,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _on_tree_loaded(self, root_item):
         self.tree_view.expand(self.tree_model.indexFromItem(root_item))
+        self.tree_view.horizontalScrollBar().setValue(0)
         self._tree_populating = False
         if hasattr(self, '_adapter'):
             fmt_label = "GrayKey" if self._adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"

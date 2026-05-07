@@ -982,6 +982,10 @@ class KeywordSearchMixin:
             self._search_index_worker.stop()
             self._search_index_worker.wait()
         self._search_entries = None
+        self._set_incomplete_banner()   # clear any banner left from the previous archive
+        self.search_results_model.clear()
+        self.search_field.clear()
+        self.search_status.setText("")
         worker = SearchIndexWorker(
             self.zip_path,
             streaming_index=self._streaming_index,

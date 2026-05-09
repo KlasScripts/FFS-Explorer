@@ -1623,12 +1623,24 @@ class ProcessDialog(QDialog):
     def _browse_case(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Case Folder",
                                                   self._case_edit.text())
-        if folder:
-            if not _do_path_change_check(self, self._zip_path, folder):
-                return   # mismatch — error shown, keep current case folder
-            self._case_dir = folder
-            self._case_edit.setText(folder)
-            self._refresh_stats()
+        if not folder:
+            return
+        has_sidecar = _cd_sidecar_hash(self._zip_path, folder) is not None
+        if not has_sidecar:
+            btn = QMessageBox.question(
+                self, "New Case Folder",
+                f"The selected folder does not contain any existing case data "
+                f"for this archive:\n\n{folder}\n\n"
+                "Are you sure you want to use this as the case folder?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if btn != QMessageBox.StandardButton.Yes:
+                return
+        elif not _do_path_change_check(self, self._zip_path, folder):
+            return   # mismatch — error shown, keep current case folder
+        self._case_dir = folder
+        self._case_edit.setText(folder)
+        self._refresh_stats()
 
     # ── Scan ──────────────────────────────────────────────────────────────────
 

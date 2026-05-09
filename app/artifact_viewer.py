@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QTextDocument
 
-from db_utils import _open_results_db, start_run_log, complete_run_log
+from db_utils import _open_results_db, start_run_log, complete_run_log, load_last_run
 
 
 # ── DB-backed virtual table model ─────────────────────────────────────────────
@@ -445,6 +445,19 @@ class ArtifactRunnerDialog(QDialog):
 
         layout.addWidget(QLabel(f"Parsers matched ({platform.upper()}) — select to run:"))
 
+        # Load run history for all available parsers in one DB open
+        run_history: dict[str, dict] = {}
+        if case_dir:
+            try:
+                _rdb = _open_results_db(case_dir)
+                for _sn, _ in available:
+                    _last = load_last_run(_rdb, f'artifact_{_sn}')
+                    if _last:
+                        run_history[_sn] = _last
+                _rdb.close()
+            except Exception:
+                pass
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         inner = QWidget()
@@ -455,7 +468,25 @@ class ArtifactRunnerDialog(QDialog):
         for script_name, mod in available:
             cb = QCheckBox(getattr(mod, 'name', script_name))
             cb.setChecked(True)
-            inner_layout.addWidget(cb)
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            row.addWidget(cb)
+            last = run_history.get(script_name)
+            if last:
+                rows   = last['output_rows'] or 0
+                run_at = (last['run_at'] or '')[:10]
+                if last['complete']:
+                    info_text  = f"last run {run_at} · {rows:,} rows"
+                    info_color = 'grey'
+                else:
+                    info_text  = f"last run {run_at} · incomplete"
+                    info_color = '#b8860b'
+                info_lbl = QLabel(info_text)
+                info_lbl.setStyleSheet(
+                    f"color: {info_color}; font-size: 11px; font-style: italic;")
+                row.addWidget(info_lbl)
+            row.addStretch()
+            inner_layout.addLayout(row)
             self._checkboxes.append((cb, script_name, mod))
         inner_layout.addStretch()
         scroll.setWidget(inner)

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QTextDocument
 
-from db_utils import _open_results_db
+from db_utils import _open_results_db, start_run_log, complete_run_log
 
 
 # ── DB-backed virtual table model ─────────────────────────────────────────────
@@ -362,6 +362,11 @@ class ArtifactRunnerWorker(QThread):
             for script_name, module in self._selected:
                 label = getattr(module, 'name', script_name)
                 self.log.emit(f"Running: {label}…")
+                run_id = None
+                try:
+                    run_id = start_run_log(case_conn, f'artifact_{script_name}')
+                except Exception:
+                    pass
                 rows, error = run_artifact(
                     script_name, module,
                     self._zip_path, self._adapter,
@@ -374,6 +379,12 @@ class ArtifactRunnerWorker(QThread):
                 else:
                     count = write_artifact_results(case_conn, script_name, rows)
                     self.log.emit(f"  Done — {count} rows written.")
+                    if run_id is not None:
+                        try:
+                            complete_run_log(case_conn, run_id,
+                                             processed=count, output_rows=count)
+                        except Exception:
+                            pass
         except Exception as exc:
             self.log.emit(f"\nUnexpected error: {exc}")
         finally:

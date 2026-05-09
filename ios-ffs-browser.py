@@ -21,10 +21,11 @@ sys.path.insert(0, _APP_DIR)
 from adapters import FfsAdapter
 from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       check_cache_schema, check_results_schema,
-                      save_header_types, load_header_types,
+                      save_header_types, load_header_types, clear_header_types,
                       save_guid_bundle_map, load_guid_bundle_map,
                       save_folder_counts, save_folder_sizes, load_folder_data,
-                      save_device_info, load_device_info)
+                      save_device_info, load_device_info,
+                      start_run_log, complete_run_log, load_last_run)
 import header_scan
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
@@ -717,6 +718,16 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
             time.sleep(0)
     return {k: list(v) for k, v in folder_map_sets.items()}
 
+
+
+def _count_header_candidates(ui_metadata: dict, ffs_adapter) -> int:
+    """Count 'Other'-typed files in scan_folders — no I/O, used for dialog display."""
+    scan_folders = ffs_adapter.scan_folders()
+    return sum(
+        1 for ui_path in ui_metadata
+        if _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
+        and any(ui_path.startswith(f) for f in scan_folders)
+    )
 
 
 def _collect_header_candidates(
@@ -1429,21 +1440,25 @@ class HeaderScanWorker(QThread):
 
 
 class ProcessDialog(QDialog):
-    """Lets the user change the case folder and re-run the file header scan."""
-    header_scan_done = Signal(dict)
+    """Lets the user view header-scan history and re-run the file header scan."""
+    header_scan_done    = Signal(dict)
+    header_types_cleared = Signal()   # emitted before a rescan so the main window can reset
+
+    _RUN_TYPE = 'header_scan'
 
     def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
                  streaming_index=None, delta=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Process Archive")
         self.setModal(True)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(540)
         self._zip_path        = zip_path
         self._case_dir        = case_dir
         self._adapter         = ffs_adapter
         self._ui_metadata     = ui_metadata
         self._streaming_index = streaming_index
         self._delta           = delta
+        self._candidate_count = _count_header_candidates(ui_metadata, ffs_adapter)
         self._scan_worker: HeaderScanWorker | None = None
 
         layout = QVBoxLayout(self)
@@ -1463,18 +1478,22 @@ class ProcessDialog(QDialog):
         case_row.addWidget(browse_btn)
         layout.addLayout(case_row)
 
-        layout.addWidget(QLabel(
-            "<hr><b>File Header Scan</b><br>"
+        layout.addWidget(QLabel("<hr><b>File Header Scan</b><br>"
             "Reads the first bytes of files currently labelled <i>Other</i> "
-            "in app container folders to detect their real type."
-        ))
+            "in app container folders to detect their real type."))
 
-        self._status_label = QLabel("Ready.")
+        # Stats block
+        self._stats_label = QLabel()
+        self._stats_label.setWordWrap(True)
+        layout.addWidget(self._stats_label)
+
+        # Progress / status
+        self._status_label = QLabel()
         layout.addWidget(self._status_label)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self._scan_btn = QPushButton("Scan File Headers")
+        self._scan_btn = QPushButton()
         self._scan_btn.clicked.connect(self._run_scan)
         btn_row.addWidget(self._scan_btn)
         close_btn = QPushButton("Close")
@@ -1482,15 +1501,85 @@ class ProcessDialog(QDialog):
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
+        self._refresh_stats()
+
+    # ── Stats display ─────────────────────────────────────────────────────────
+
+    def _load_last_run(self) -> dict | None:
+        if not self._case_dir:
+            return None
+        try:
+            db = _open_results_db(self._case_dir)
+            result = load_last_run(db, self._RUN_TYPE)
+            db.close()
+            return result
+        except Exception:
+            return None
+
+    def _refresh_stats(self):
+        n = self._candidate_count
+        last = self._load_last_run()
+
+        lines = [f"<b>Other-typed files in scan folders:</b> {n:,}"]
+
+        if last is None:
+            lines.append("No previous scan recorded.")
+            self._scan_btn.setText("Scan File Headers")
+        else:
+            run_at   = last['run_at'].replace('T', ' ')
+            scanned  = last['processed'] or 0
+            changed  = last['output_rows'] or 0
+            complete = last['complete']
+            status   = "Complete" if complete else "⚠ Incomplete"
+            lines.append(
+                f"<b>Last scan:</b> {run_at} — "
+                f"{scanned:,} scanned, {changed:,} types identified — {status}"
+            )
+            if not complete:
+                lines.append(
+                    "<i>Previous scan was incomplete. "
+                    "Rescanning will clear previous results and start fresh.</i>"
+                )
+            self._scan_btn.setText("Rescan File Headers")
+
+        self._stats_label.setText("<br>".join(lines))
+        self._status_label.setText("")
+
+    # ── Case folder browse ────────────────────────────────────────────────────
+
     def _browse_case(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Case Folder",
                                                   self._case_edit.text())
         if folder:
             self._case_dir = folder
             self._case_edit.setText(folder)
+            self._refresh_stats()
+
+    # ── Scan ──────────────────────────────────────────────────────────────────
 
     def _run_scan(self):
         self._scan_btn.setEnabled(False)
+        self._run_id: int | None = None
+
+        # Clear previous results if this is a rescan
+        if self._case_dir:
+            try:
+                cache_db = _open_cache_db(self._case_dir)
+                clear_header_types(cache_db)
+                cache_db.close()
+            except Exception:
+                pass
+        self.header_types_cleared.emit()
+
+        if self._case_dir:
+            try:
+                results_db = _open_results_db(self._case_dir)
+                self._run_id = start_run_log(results_db, self._RUN_TYPE,
+                                             total=self._candidate_count)
+                results_db.close()
+            except Exception:
+                pass
+
         self._status_label.setText("Starting scan…")
         self._scan_worker = HeaderScanWorker(
             self._zip_path, self._ui_metadata,
@@ -1507,17 +1596,29 @@ class ProcessDialog(QDialog):
         )
 
     def _on_done(self, results: dict):
+        n_found  = len(results)
+        n_total  = self._candidate_count
         self._status_label.setText(
-            f"Done — {len(results):,} type{'s' if len(results) != 1 else ''} identified."
+            f"Done — {n_found:,} type{'s' if n_found != 1 else ''} identified "
+            f"from {n_total:,} candidate{'s' if n_total != 1 else ''}."
         )
         self._scan_btn.setEnabled(True)
-        if results and self._case_dir:
+
+        if self._case_dir:
             try:
-                db = _open_cache_db(self._case_dir)
-                save_header_types(db, results)
-                db.close()
+                cache_db = _open_cache_db(self._case_dir)
+                if results:
+                    save_header_types(cache_db, results)
+                cache_db.close()
+                if self._run_id is not None:
+                    results_db = _open_results_db(self._case_dir)
+                    complete_run_log(results_db, self._run_id,
+                                     processed=n_total, output_rows=n_found)
+                    results_db.close()
             except Exception:
                 pass
+
+        self._refresh_stats()
         self.header_scan_done.emit(results)
 
 
@@ -2671,6 +2772,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             delta=self._local_extra_delta,
             parent=self,
         )
+        dlg.header_types_cleared.connect(self._on_header_types_cleared)
         dlg.header_scan_done.connect(self._on_header_scan_done)
         dlg.exec()
 
@@ -2817,6 +2919,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _on_header_scan_progress(self, remaining: int):
         if remaining > 0:
             self.status_bar.showMessage(f"Scanning headers: {remaining:,} files remaining…")
+
+    def _on_header_types_cleared(self):
+        """Called before a rescan — clear in-memory overrides and refresh."""
+        self._header_type_overrides.clear()
+        self._refresh_folder_view()
 
     def _on_header_scan_done(self, results: dict):
         if not results:

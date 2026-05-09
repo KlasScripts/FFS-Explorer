@@ -159,6 +159,29 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS run_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_type     TEXT    NOT NULL,
+            run_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now')),
+            completed_at TEXT,
+            total        INTEGER,
+            processed    INTEGER,
+            output_rows  INTEGER,
+            complete     INTEGER NOT NULL DEFAULT 0,
+            notes        TEXT
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_run_log_type
+        ON run_log (run_type)
+    ''')
+    # Migration: add completed_at to existing run_log tables created before this column existed.
+    try:
+        conn.execute('ALTER TABLE run_log ADD COLUMN completed_at TEXT')
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
     return conn
@@ -236,6 +259,63 @@ def load_header_types(conn: 'sqlite3.Connection') -> dict:
     """Return {ui_path: detected_type} previously saved."""
     rows = conn.execute('SELECT ui_path, detected_type FROM header_types').fetchall()
     return {ui_path: t for ui_path, t in rows}
+
+
+def clear_header_types(conn: 'sqlite3.Connection') -> None:
+    """Delete all header_types rows (used before a full rescan)."""
+    conn.execute('DELETE FROM header_types')
+    conn.commit()
+
+
+# ── Run log ───────────────────────────────────────────────────────────────────
+
+def start_run_log(conn: 'sqlite3.Connection', run_type: str,
+                  total: int | None = None,
+                  notes: str | None = None) -> int:
+    """Insert an in-progress run record and return its id.
+
+    Call this when a scan/artifact run begins, then call complete_run_log()
+    when it finishes.  run_type should be 'header_scan' or 'artifact_<script_name>'.
+    """
+    cur = conn.execute(
+        'INSERT INTO run_log (run_type, total, complete, notes) VALUES (?, ?, 0, ?)',
+        (run_type, total, notes),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def complete_run_log(conn: 'sqlite3.Connection', run_id: int,
+                     processed: int, output_rows: int) -> None:
+    """Mark a run as complete, recording the finish time and output counts."""
+    conn.execute(
+        "UPDATE run_log SET completed_at=strftime('%Y-%m-%dT%H:%M:%S','now'), "
+        "processed=?, output_rows=?, complete=1 WHERE id=?",
+        (processed, output_rows, run_id),
+    )
+    conn.commit()
+
+
+def load_last_run(conn: 'sqlite3.Connection', run_type: str) -> dict | None:
+    """Return the most recent run_log entry for *run_type*, or None."""
+    row = conn.execute(
+        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes '
+        'FROM run_log WHERE run_type=? ORDER BY id DESC LIMIT 1',
+        (run_type,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        'run_at': row[0], 'completed_at': row[1], 'total': row[2],
+        'processed': row[3], 'output_rows': row[4],
+        'complete': bool(row[5]), 'notes': row[6],
+    }
+
+
+def clear_run_log(conn: 'sqlite3.Connection', run_type: str) -> None:
+    """Delete all run_log rows for *run_type*."""
+    conn.execute('DELETE FROM run_log WHERE run_type=?', (run_type,))
+    conn.commit()
 
 
 # ── Generic blob store ────────────────────────────────────────────────────────

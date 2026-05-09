@@ -2270,11 +2270,21 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 new_case = QFileDialog.getExistingDirectory(
                     self, "Locate Case Folder", os.path.dirname(stored))
                 if new_case and os.path.isdir(new_case):
-                    if not _do_path_change_check(self, zip_path, new_case):
-                        pass   # mismatch — error shown, fall through to dialog
-                    else:
+                    has_sidecar = _cd_sidecar_hash(zip_path, new_case) is not None
+                    if not has_sidecar:
+                        # A moved case folder always carries its sidecar with it.
+                        # No sidecar here means this is not the right folder.
+                        QMessageBox.warning(
+                            self, "No Case Data Found",
+                            "The selected folder does not contain case data for "
+                            f"this archive:\n\n{new_case}\n\n"
+                            "Please select the folder that was previously used as "
+                            "the case folder, or create a new one below.",
+                        )
+                    elif _do_path_change_check(self, zip_path, new_case):
                         self._upsert_archive(zip_path, new_case)
                         return new_case, False
+                    # else: mismatch error shown by _do_path_change_check
             # User declined or didn't pick — fall through to CaseSettingsDialog
 
         last_base = None

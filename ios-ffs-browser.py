@@ -1435,6 +1435,7 @@ class HeaderScanWorker(QThread):
         results = header_scan.scan_entries(
             self._zip_path, candidates,
             progress_cb=self.progress.emit,
+            cancel_check=self.isInterruptionRequested,
         )
         self.done.emit(results)
 
@@ -1496,6 +1497,10 @@ class ProcessDialog(QDialog):
         self._scan_btn = QPushButton()
         self._scan_btn.clicked.connect(self._run_scan)
         btn_row.addWidget(self._scan_btn)
+        self._cancel_scan_btn = QPushButton("Cancel Scan")
+        self._cancel_scan_btn.setVisible(False)
+        self._cancel_scan_btn.clicked.connect(self._on_cancel_scan)
+        btn_row.addWidget(self._cancel_scan_btn)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
@@ -1559,7 +1564,10 @@ class ProcessDialog(QDialog):
 
     def _run_scan(self):
         self._scan_btn.setEnabled(False)
+        self._cancel_scan_btn.setEnabled(True)
+        self._cancel_scan_btn.setVisible(True)
         self._run_id: int | None = None
+        self._scan_cancelled = False
 
         # Clear previous results if this is a rescan
         if self._case_dir:
@@ -1590,19 +1598,54 @@ class ProcessDialog(QDialog):
         self._scan_worker.done.connect(self._on_done)
         self._scan_worker.start()
 
+    def _on_cancel_scan(self):
+        if self._scan_worker and self._scan_worker.isRunning():
+            self._cancel_scan_btn.setEnabled(False)
+            self._status_label.setText("Cancelling…")
+            self._scan_cancelled = True
+            self._scan_worker.requestInterruption()
+
+    def _is_scanning(self) -> bool:
+        return bool(self._scan_worker and self._scan_worker.isRunning())
+
+    def closeEvent(self, event):
+        if self._is_scanning():
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+    def accept(self):
+        if self._is_scanning():
+            return
+        super().accept()
+
+    def reject(self):
+        if self._is_scanning():
+            return
+        super().reject()
+
     def _on_progress(self, remaining: int):
         self._status_label.setText(
             f"Scanning: {remaining:,} files remaining…" if remaining > 0 else "Finishing…"
         )
 
     def _on_done(self, results: dict):
+        self._cancel_scan_btn.setVisible(False)
+        self._scan_btn.setEnabled(True)
+
         n_found  = len(results)
         n_total  = self._candidate_count
-        self._status_label.setText(
-            f"Done — {n_found:,} type{'s' if n_found != 1 else ''} identified "
-            f"from {n_total:,} candidate{'s' if n_total != 1 else ''}."
-        )
-        self._scan_btn.setEnabled(True)
+        cancelled = getattr(self, '_scan_cancelled', False)
+        if cancelled:
+            self._status_label.setText(
+                f"Cancelled — {n_found:,} type{'s' if n_found != 1 else ''} identified "
+                f"before cancellation."
+            )
+        else:
+            self._status_label.setText(
+                f"Done — {n_found:,} type{'s' if n_found != 1 else ''} identified "
+                f"from {n_total:,} candidate{'s' if n_total != 1 else ''}."
+            )
 
         if self._case_dir:
             try:
@@ -1610,7 +1653,7 @@ class ProcessDialog(QDialog):
                 if results:
                     save_header_types(cache_db, results)
                 cache_db.close()
-                if self._run_id is not None:
+                if self._run_id is not None and not cancelled:
                     results_db = _open_results_db(self._case_dir)
                     complete_run_log(results_db, self._run_id,
                                      processed=n_total, output_rows=n_found)

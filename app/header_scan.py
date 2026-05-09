@@ -89,6 +89,7 @@ def scan_entries(
     zip_path: str,
     candidates: list[tuple[str, int, int]],
     progress_cb=None,
+    cancel_check=None,
     batch_size: int = 200,
 ) -> dict[str, str]:
     """Return {ui_path: detected_type} for entries with a positively identified type.
@@ -108,6 +109,8 @@ def scan_entries(
     total = len(candidates)
     with open(zip_path, 'rb') as f:
         for i, (ui_path, data_offset, file_size) in enumerate(candidates):
+            if cancel_check and cancel_check():
+                break
             f.seek(data_offset)
             header = f.read(16)
             detected = classify_magic(header)

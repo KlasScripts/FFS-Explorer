@@ -17,6 +17,7 @@ The network file is touched exactly once (the CD read during save).  All
 metadata operations use the local copy.
 """
 
+import hashlib
 import io
 import os
 import random
@@ -352,3 +353,24 @@ def compute_data_offsets(
         pass
 
     return result
+
+
+# ── CD hash ───────────────────────────────────────────────────────────────────
+
+def compute_hash(zip_path: str, case_dir: str) -> str | None:
+    """Return the SHA-256 hex digest of the central-directory payload.
+
+    Uses the .zcd sidecar when it exists (fast, no network seek); otherwise
+    extracts the CD directly from the ZIP.  Returns None if neither succeeds
+    (e.g. streaming archives with no central directory).
+    """
+    zcd = cache_path(zip_path, case_dir)
+    try:
+        if os.path.isfile(zcd):
+            with open(zcd, 'rb') as f:
+                f.read(4)           # skip magic
+                return hashlib.sha256(f.read()).hexdigest()
+        payload = _extract_cd_payload(zip_path)
+        return hashlib.sha256(payload).hexdigest()
+    except Exception:
+        return None

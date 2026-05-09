@@ -37,7 +37,8 @@ from zip_cd_cache import (CachedZipView, is_valid as _cd_cache_valid,
                           save as _cd_cache_save, load as _cd_cache_load,
                           probe_delta as _probe_delta,
                           compute_data_offsets as _compute_data_offsets,
-                          compute_hash as _compute_cd_hash)
+                          sidecar_hash as _cd_sidecar_hash,
+                          extract_cd_hash as _cd_extract_hash)
 from datetime import datetime, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
                               QHBoxLayout, QWidget, QHeaderView, QPushButton,
@@ -1623,6 +1624,8 @@ class ProcessDialog(QDialog):
         folder = QFileDialog.getExistingDirectory(self, "Select Case Folder",
                                                   self._case_edit.text())
         if folder:
+            if not _do_path_change_check(self, self._zip_path, folder):
+                return   # mismatch — error shown, keep current case folder
             self._case_dir = folder
             self._case_edit.setText(folder)
             self._refresh_stats()
@@ -1730,6 +1733,55 @@ class ProcessDialog(QDialog):
 
         self._refresh_stats()
         self.header_scan_done.emit(results)
+
+
+def _do_path_change_check(
+    parent,
+    zip_path: str,
+    case_dir: str,
+    old_zip_path: str | None = None,
+) -> bool:
+    """Verify zip_path belongs to case_dir after a user-initiated path change.
+
+    Compares the .zcd sidecar hash (trusted fingerprint already in case_dir)
+    against a fresh CD extraction from zip_path.  Called only when the user
+    relocates an archive or picks a different case folder — never on ordinary opens.
+
+    old_zip_path: the previous archive path, used to locate the sidecar when
+                  the archive file has been moved (sidecar is named after the
+                  original basename).
+
+    Returns True if the check passes or is inconclusive (no sidecar present,
+    or archive is unreadable).  Shows an error dialog and returns False on mismatch.
+    """
+    sidecar_lookup = old_zip_path if old_zip_path else zip_path
+    trusted = _cd_sidecar_hash(sidecar_lookup, case_dir)
+    if not trusted:
+        return True   # no sidecar in this case folder — nothing to compare
+
+    new_hash = _cd_extract_hash(zip_path)
+    if new_hash is None:
+        return True   # archive unreadable or streaming — allow
+
+    passed = trusted == new_hash
+    try:
+        db = _open_results_db(case_dir)
+        run_id = start_run_log(db, 'cd_integrity_check', total=1, notes=new_hash)
+        complete_run_log(db, run_id, processed=1, output_rows=1 if passed else 0)
+        db.close()
+    except Exception:
+        pass
+
+    if not passed:
+        QMessageBox.critical(
+            parent, "Archive Mismatch",
+            "The selected archive does not match this case folder's stored "
+            "fingerprint.  They may belong to different extractions.\n\n"
+            f"Case folder fingerprint: {trusted[:24]}…\n"
+            f"New archive fingerprint: {new_hash[:24]}…\n\n"
+            "Please create a new case folder for this archive.",
+        )
+    return passed
 
 
 class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin):  # type: ignore[reportIncompatibleMethodOverride]
@@ -2206,8 +2258,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 new_case = QFileDialog.getExistingDirectory(
                     self, "Locate Case Folder", os.path.dirname(stored))
                 if new_case and os.path.isdir(new_case):
-                    self._upsert_archive(zip_path, new_case)
-                    return new_case, False
+                    if not _do_path_change_check(self, zip_path, new_case):
+                        pass   # mismatch — error shown, fall through to dialog
+                    else:
+                        self._upsert_archive(zip_path, new_case)
+                        return new_case, False
             # User declined or didn't pick — fall through to CaseSettingsDialog
 
         last_base = None
@@ -2913,8 +2968,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 self, "Locate Archive", os.path.dirname(path), "ZIP (*.zip)")
             if not new_path or not os.path.isfile(new_path):
                 return
-            # Update path in-place so case_dir and label are preserved
+            # Integrity check before committing the path change
             entry = self._archive_entry(path)
+            case_dir_for_check = entry.get('case_dir') if entry else None
+            if case_dir_for_check and not _do_path_change_check(
+                    self, new_path, case_dir_for_check, old_zip_path=path):
+                return   # mismatch — error shown, keep original path
+            # Update path in-place so case_dir and label are preserved
             if entry:
                 entry['path'] = new_path
                 self.recent_paths = [e['path'] for e in self._ffs_archives]
@@ -2945,58 +3005,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if path:
             self.start_loading(path)
 
-    def _check_cd_integrity(self, zip_path: str, case_dir: str) -> bool:
-        """Verify zip_path belongs to case_dir by comparing CD hashes.
-
-        Reads the stored cd_hash from device_info.  If one exists and the
-        current archive's hash differs, shows an error and returns False.
-        Logs every check in run_log as 'cd_integrity_check'.
-        Returns True when no stored hash is present (first use) or hashes match.
-        """
-        stored_hash = None
-        try:
-            db = _open_results_db(case_dir)
-            stored_hash = next(
-                (d for f, d, _ in load_device_info(db) if f == 'cd_hash'), None)
-            db.close()
-        except Exception:
-            return True   # db unreadable — allow and let normal load handle it
-
-        if not stored_hash:
-            return True   # first use: no fingerprint yet
-
-        current_hash = _compute_cd_hash(zip_path, case_dir)
-        if current_hash is None:
-            return True   # streaming archive or unreadable — allow
-
-        passed = current_hash == stored_hash
-        try:
-            db = _open_results_db(case_dir)
-            run_id = start_run_log(db, 'cd_integrity_check', total=1,
-                                   notes=current_hash)
-            complete_run_log(db, run_id, processed=1,
-                             output_rows=1 if passed else 0)
-            db.close()
-        except Exception:
-            pass
-
-        if not passed:
-            QMessageBox.critical(
-                self, "Archive Mismatch",
-                "This case folder belongs to a different archive and cannot "
-                "be used with the selected file.\n\n"
-                f"Stored fingerprint:  {stored_hash[:24]}…\n"
-                f"Current fingerprint: {current_hash[:24]}…\n\n"
-                "Please create a new case folder for this archive.",
-            )
-        return passed
-
     def start_loading(self, zip_path):
         case_dir, scan_headers = self._get_or_ask_case_dir(zip_path)
         if case_dir is None:
             return   # user cancelled the dialog
-        if not self._check_cd_integrity(zip_path, case_dir):
-            return   # mismatch — error already shown
         self._case_dir = case_dir
         self._search_entries = None   # clear cached index for the new archive
         self.zip_path = zip_path
@@ -3606,15 +3618,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     save_device_info(db, fields)
                 # Always record which archive this case folder belongs to
                 upsert_device_info_field(db, 'zip_path', path, 'archive')
-                # Store CD fingerprint once — never overwrite after first use
-                has_hash = any(f == 'cd_hash' for f, *_ in load_device_info(db))
-                if not has_hash:
-                    h = _compute_cd_hash(path, self._case_dir)
-                    if h:
-                        upsert_device_info_field(db, 'cd_hash', h, 'zip_cd_cache')
-                        run_id = start_run_log(db, 'cd_integrity_check',
-                                               total=1, notes=h)
-                        complete_run_log(db, run_id, processed=1, output_rows=1)
                 db.close()
             except Exception:
                 pass

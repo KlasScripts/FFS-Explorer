@@ -357,20 +357,30 @@ def compute_data_offsets(
 
 # ── CD hash ───────────────────────────────────────────────────────────────────
 
-def compute_hash(zip_path: str, case_dir: str) -> str | None:
-    """Return the SHA-256 hex digest of the central-directory payload.
-
-    Uses the .zcd sidecar when it exists (fast, no network seek); otherwise
-    extracts the CD directly from the ZIP.  Returns None if neither succeeds
-    (e.g. streaming archives with no central directory).
-    """
+def sidecar_hash(zip_path: str, case_dir: str) -> str | None:
+    """Return SHA-256 of the existing .zcd sidecar, or None if absent/unreadable."""
     zcd = cache_path(zip_path, case_dir)
     try:
-        if os.path.isfile(zcd):
-            with open(zcd, 'rb') as f:
-                f.read(4)           # skip magic
-                return hashlib.sha256(f.read()).hexdigest()
-        payload = _extract_cd_payload(zip_path)
-        return hashlib.sha256(payload).hexdigest()
+        with open(zcd, 'rb') as f:
+            f.read(4)   # skip magic
+            return hashlib.sha256(f.read()).hexdigest()
     except Exception:
         return None
+
+
+def extract_cd_hash(zip_path: str) -> str | None:
+    """Return SHA-256 of the CD extracted directly from zip_path (no sidecar).
+
+    Returns None if the archive has no seekable central directory (e.g. streaming)
+    or if the file cannot be read.
+    """
+    try:
+        return hashlib.sha256(_extract_cd_payload(zip_path)).hexdigest()
+    except Exception:
+        return None
+
+
+def compute_hash(zip_path: str, case_dir: str) -> str | None:
+    """Return SHA-256 of the CD payload — sidecar first, raw ZIP fallback."""
+    h = sidecar_hash(zip_path, case_dir)
+    return h if h is not None else extract_cd_hash(zip_path)

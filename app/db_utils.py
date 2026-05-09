@@ -384,10 +384,8 @@ def save_device_info(conn: 'sqlite3.Connection',
 
     Each row records one piece of device information and where it came from,
     e.g. ('Make', 'Apple', 'UFD') or ('iOS Version', '17.4', 'MobileGestalt.plist').
-    The cd_hash row is preserved — it is managed separately by the integrity
-    check and must never be overwritten by a device-info rescan.
     """
-    conn.execute("DELETE FROM device_info WHERE field_name != 'cd_hash'")
+    conn.execute('DELETE FROM device_info')
     conn.executemany(
         'INSERT OR REPLACE INTO device_info (field_name, data, source) VALUES (?,?,?)',
         fields,

@@ -776,6 +776,46 @@ def _collect_header_candidates(
     return candidates
 
 
+def _resolve_file_candidates(
+    zip_path: str,
+    ui_paths: list,
+    ffs_adapter,
+    streaming_index=None,
+    delta: int | None = None,
+) -> list[tuple[str, int, int]]:
+    """Return [(ui_path, data_offset, file_size)] for explicit ui_paths."""
+    candidates: list[tuple[str, int, int]] = []
+    if streaming_index is not None:
+        entries = streaming_index._entries
+        for ui_path in ui_paths:
+            row = entries.get(ffs_adapter.resolve(ui_path))
+            if row:
+                candidates.append((ui_path, row[0], row[2]))
+    else:
+        try:
+            z = zipfile.ZipFile(zip_path, 'r')
+        except Exception:
+            return []
+        try:
+            resolve = ffs_adapter.resolve
+            target_infos = []
+            target_meta: dict[str, tuple[str, int]] = {}
+            for ui_path in ui_paths:
+                try:
+                    info = z.getinfo(resolve(ui_path))
+                    target_infos.append(info)
+                    target_meta[info.filename] = (ui_path, info.file_size)
+                except KeyError:
+                    pass
+            offsets = _compute_data_offsets(zip_path, target_infos, delta=delta)
+            for filename, data_offset in offsets.items():
+                ui_path, file_size = target_meta[filename]
+                candidates.append((ui_path, data_offset, file_size))
+        finally:
+            z.close()
+    return candidates
+
+
 class ZipMetadataWorker(QThread):
     """Background thread that loads and processes an FFS archive. Steps:
       1. Open the zip (falls back to StreamingZipIndex if no central directory)
@@ -1437,6 +1477,31 @@ class HeaderScanWorker(QThread):
             progress_cb=self.progress.emit,
             cancel_check=self.isInterruptionRequested,
         )
+        self.done.emit(results)
+
+
+class SingleFileScanWorker(QThread):
+    """Scan file headers for a specific list of ui_paths (not just 'Other' files)."""
+    done = Signal(dict)   # {ui_path: detected_type}
+
+    def __init__(self, zip_path, ui_paths, ffs_adapter,
+                 streaming_index=None, delta=None):
+        super().__init__()
+        self._zip_path        = zip_path
+        self._ui_paths        = ui_paths
+        self._ffs_adapter     = ffs_adapter
+        self._streaming_index = streaming_index
+        self._delta           = delta
+
+    def run(self):
+        candidates = _resolve_file_candidates(
+            self._zip_path, self._ui_paths, self._ffs_adapter,
+            self._streaming_index, self._delta,
+        )
+        if not candidates:
+            self.done.emit({})
+            return
+        results = header_scan.scan_entries(self._zip_path, candidates)
         self.done.emit(results)
 
 
@@ -2629,6 +2694,22 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             parent_act.triggered.connect(lambda: self.navigate_tree_to_path(parent_path))
             menu.addAction(parent_act)
 
+        # Collect file paths from all selected rows for header scan
+        _scan_paths = []
+        for _idx in self.file_view.selectionModel().selectedRows():
+            _src = self.proxy_model.mapToSource(_idx)
+            _p = self.file_model.index(_src.row(), 0).data(Qt.ItemDataRole.UserRole)
+            if _p and _p not in self.folder_map and self._in_zip(_p):
+                _scan_paths.append(_p)
+        if _scan_paths and self.zip_path:
+            _n = len(_scan_paths)
+            menu.addSeparator()
+            scan_hdr_act = QAction(
+                f"🔬 Scan File Header{'s' if _n > 1 else ''} ({_n})", self)
+            scan_hdr_act.triggered.connect(
+                lambda checked=False, paths=_scan_paths: self._scan_selected_headers(paths))
+            menu.addAction(scan_hdr_act)
+
         menu.exec(self.file_view.viewport().mapToGlobal(point))
 
     def handle_export_request(self, is_tree=True):
@@ -2979,10 +3060,64 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 db.close()
             except Exception:
                 pass
-        self._refresh_folder_view()
+        self._refresh_folder_view(preserve_filter=True)
 
-    def _refresh_folder_view(self):
-        """Rebuild the file model for the currently displayed folder."""
+    def _scan_selected_headers(self, ui_paths: list):
+        if not self.zip_path or not ui_paths:
+            return
+        n = len(ui_paths)
+        self.status_bar.showMessage(f"Scanning {n} file header(s)…")
+        self._single_scan_paths   = ui_paths
+        self._single_scan_run_id: int | None = None
+        if self._case_dir:
+            try:
+                db = _open_results_db(self._case_dir)
+                self._single_scan_run_id = start_run_log(
+                    db, 'header_scan_single',
+                    total=n,
+                    notes='\n'.join(ui_paths),
+                )
+                db.close()
+            except Exception:
+                pass
+        self._single_scan_worker = SingleFileScanWorker(
+            self.zip_path, ui_paths, self._adapter,
+            self._streaming_index, self._local_extra_delta,
+        )
+        self._single_scan_worker.done.connect(self._on_single_scan_done)
+        self._single_scan_worker.start()
+
+    def _on_single_scan_done(self, results: dict):
+        n_total   = len(self._single_scan_paths)
+        n_updated = len(results)
+        if results:
+            self._header_type_overrides.update(results)
+            if self._case_dir:
+                try:
+                    db = _open_cache_db(self._case_dir)
+                    save_header_types(db, results)
+                    db.close()
+                except Exception:
+                    pass
+        if self._case_dir and self._single_scan_run_id is not None:
+            try:
+                db = _open_results_db(self._case_dir)
+                complete_run_log(db, self._single_scan_run_id,
+                                 processed=n_total, output_rows=n_updated)
+                db.close()
+            except Exception:
+                pass
+        self._refresh_folder_view(preserve_filter=True)
+        self.status_bar.showMessage(
+            f"Header scan: {n_updated} of {n_total} file(s) identified"
+        )
+
+    def _refresh_folder_view(self, preserve_filter: bool = False):
+        """Rebuild the file model for the currently displayed folder.
+
+        Pass preserve_filter=True when refreshing in-place (e.g. after a
+        header scan) so the user's active filter and scroll position are kept.
+        """
         if not self._view_path and self._view_path != "":
             return
         folder_path = self._view_path
@@ -2991,8 +3126,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         headers = self.file_headers + (['UUID'] if has_bundles else [])
         new_model = FileTableModel(headers)
         self._update_filter_columns(headers)
-        self.filter_input.clear()
-        self.proxy_model.set_filter("", -1)
+
+        if preserve_filter:
+            _filter_text = self.filter_input.text()
+            _filter_col  = self.filter_col_combo.currentIndex() - 1
+            _scroll_val  = self.file_view.verticalScrollBar().value()
+        else:
+            self.filter_input.clear()
+            self.proxy_model.set_filter("", -1)
+
         batch = []
         for path in sorted(children):
             name = path.split('/')[-1]
@@ -3008,6 +3150,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             batch.append((cols, path, fc, is_folder and not grey_row, grey_row))
         new_model.append_rows_batch(batch)
         self._set_file_model(new_model)
+
+        if preserve_filter:
+            if _filter_text:
+                self.proxy_model.set_filter(_filter_text, _filter_col)
+            self.file_view.verticalScrollBar().setValue(_scroll_val)
+
         self.file_view.resizeColumnsToContents()
         self._refresh_table_status()
 
@@ -3461,6 +3609,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         _stop(getattr(self, 'worker', None))
         _stop(getattr(self, '_scan_worker', None))
+        _stop(getattr(self, '_single_scan_worker', None))
         _stop(getattr(self, '_hex_worker', None))
         _stop(getattr(self, '_thumb_worker', None), has_stop=True)
         _stop(getattr(self, '_search_index_worker', None), has_stop=True)

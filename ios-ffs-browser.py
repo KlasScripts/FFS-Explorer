@@ -2190,11 +2190,29 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """Return (case_dir, scan_headers) for zip_path, showing dialog if needed."""
         existing = self._archive_entry(zip_path)
         if existing and existing.get('case_dir'):
-            return existing['case_dir'], False   # no auto-scan for known archives
+            stored = existing['case_dir']
+            if os.path.isdir(stored):
+                return stored, False   # valid — no auto-scan for known archives
+            # Case folder has moved or been deleted
+            btn = QMessageBox.question(
+                self, "Case Folder Not Found",
+                f"The case folder could not be found:\n\n{stored}\n\n"
+                "Would you like to locate it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if btn == QMessageBox.StandardButton.Yes:
+                new_case = QFileDialog.getExistingDirectory(
+                    self, "Locate Case Folder", os.path.dirname(stored))
+                if new_case and os.path.isdir(new_case):
+                    self._upsert_archive(zip_path, new_case)
+                    return new_case, False
+            # User declined or didn't pick — fall through to CaseSettingsDialog
+
         last_base = None
         for e in self._ffs_archives:
-            if e.get('case_dir'):
-                last_base = os.path.dirname(e['case_dir'])
+            cd = e.get('case_dir', '')
+            if cd and os.path.isdir(cd):
+                last_base = os.path.dirname(cd)
                 break
         dlg = CaseSettingsDialog(zip_path, last_base, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -2880,8 +2898,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         path = self.archive_dropdown.itemData(index)
         if not path:
             return
-        if os.path.isfile(path):
-            self.start_loading(path)
+        if not os.path.isfile(path):
+            btn = QMessageBox.question(
+                self, "Archive Not Found",
+                f"The archive file could not be found:\n\n{path}\n\n"
+                "Would you like to locate it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if btn != QMessageBox.StandardButton.Yes:
+                return
+            new_path, _ = QFileDialog.getOpenFileName(
+                self, "Locate Archive", os.path.dirname(path), "ZIP (*.zip)")
+            if not new_path or not os.path.isfile(new_path):
+                return
+            # Update path in-place so case_dir and label are preserved
+            entry = self._archive_entry(path)
+            if entry:
+                entry['path'] = new_path
+                self.recent_paths = [e['path'] for e in self._ffs_archives]
+                self._save_ffs_archives()
+                self.update_dropdown_ui()
+            path = new_path
+        self.start_loading(path)
 
     def _open_process_dialog(self):
         if not self.zip_path:

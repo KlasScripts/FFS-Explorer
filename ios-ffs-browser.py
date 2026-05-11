@@ -1,12 +1,16 @@
 import sys
 import os
 import re
+import io
 import time
 import atexit
 import zipfile
+import gzip
 import json
+import hashlib
 import struct
 import plistlib
+import xml.dom.minidom
 import pathlib
 import subprocess
 import configparser
@@ -26,7 +30,9 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       save_folder_counts, save_folder_sizes, load_folder_data,
                       save_device_info, load_device_info,
                       upsert_device_info_field,
-                      start_run_log, complete_run_log, load_last_run)
+                      start_run_log, complete_run_log, load_last_run,
+                      save_nested_archive, save_nested_archive_entries,
+                      load_nested_archives, load_nested_archive_entries)
 import header_scan
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
@@ -140,9 +146,10 @@ AUDIO_EXTENSIONS = {
     '.caf', '.opus', '.ogg', '.amr', '.wma',
 }
 ARCHIVE_EXTENSIONS = {
-    '.zip', '.gz', '.tar', '.bz2', '.xz', '.ipa',
+    '.zip', '.gz', '.tar', '.bz2', '.xz',
     '.tgz', '.tbz', '.zst', '.aar',
 }
+APPLICATION_EXTENSIONS = {'.ipa', '.apk', '.apks', '.jar'}
 JSON_EXTENSIONS = {'.json', '.jsonl', '.ndjson'}
 XML_EXTENSIONS  = {'.xml', '.xsl', '.xslt', '.xsd', '.gpx', '.kml', '.rss', '.svg'}
 WEB_DATA_EXTENSIONS = {
@@ -159,6 +166,13 @@ def resource_path(relative):
     """Works both in development and when bundled by PyInstaller."""
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative)
+
+
+_TEXT_RENDERABLE_EXTENSIONS = frozenset({
+    'json', 'xml', 'plist', 'html', 'htm', 'xhtml',
+    'txt', 'log', 'csv', 'md', 'yaml', 'yml', 'ini', 'conf', 'cfg',
+    'js', 'ts', 'css', 'py', 'java', 'kt', 'swift', 'm', 'h', 'c', 'cpp',
+})
 
 
 def _get_file_type(name):
@@ -178,6 +192,7 @@ def _get_file_type(name):
     if ext in DOCUMENT_EXTENSIONS:      return 'Document'
     if ext in AUDIO_EXTENSIONS:         return 'Audio'
     if ext in ARCHIVE_EXTENSIONS:       return 'Archive'
+    if ext in APPLICATION_EXTENSIONS:   return 'Application'
     if ext in JSON_EXTENSIONS:          return 'JSON'
     if ext in XML_EXTENSIONS:           return 'XML'
     if ext in WEB_DATA_EXTENSIONS:      return 'Web / Data'
@@ -731,6 +746,35 @@ def _count_header_candidates(ui_metadata: dict, ffs_adapter) -> int:
         if _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
         and any(ui_path.startswith(f) for f in scan_folders)
     )
+
+
+_EXTRACTABLE_TYPES = {'Archive', 'Compressed'}
+
+def _collect_nested_archive_candidates(
+    ui_metadata: dict,
+    ffs_adapter,
+    header_type_overrides: dict,
+) -> list[str]:
+    """Return ui_paths of Archive- or Compressed-type files in app data scan folders.
+
+    Covers iOS (mobile/Containers/) and Android (data/data/) paths via
+    scan_folders(). Type is determined by extension (_get_file_type) or,
+    for extensionless files, by the header scan result in header_type_overrides.
+    'Archive' = ZIP containers; 'Compressed' = gzip/bzip2/xz streams.
+    """
+    scan_roots = ffs_adapter.scan_folders()
+    results = []
+    for ui_path in ui_metadata:
+        if not any(ui_path.startswith(p) for p in scan_roots):
+            continue
+        name = ui_path.rsplit('/', 1)[-1]
+        ft   = _get_file_type(name)
+        if ft == 'Other':
+            ft = header_type_overrides.get(ui_path, 'Other')
+        if ft not in _EXTRACTABLE_TYPES:
+            continue
+        results.append(ui_path)
+    return results
 
 
 def _collect_header_candidates(
@@ -1508,10 +1552,190 @@ class SingleFileScanWorker(QThread):
         self.done.emit(results)
 
 
+class NestedArchiveWorker(QThread):
+    """Extracts Archive-type files from the FFS zip, repacks as ZIP_STORED,
+    saves to case_dir/nested_archives/, and records each in casecache.db."""
+
+    progress      = Signal(int, int)      # (done, total)
+    item_done     = Signal(str, bool)    # (ui_path, success)
+    item_error    = Signal(str, str)     # (ui_path, error_message)
+    types_updated = Signal(dict)         # {ui_path: "JSON — gzip", ...}
+    finished      = Signal(int, int)     # (success_count, error_count)
+
+    _MEM_LIMIT = 100 * 1024 * 1024   # 100 MB — larger files written to temp first
+
+    def __init__(self, zip_path, case_dir, candidates, ui_metadata,
+                 ffs_adapter, streaming_index=None, delta=None, parent=None):
+        super().__init__(parent)
+        self._zip_path        = zip_path
+        self._case_dir        = case_dir
+        self._candidates      = candidates      # list of ui_path strings
+        self._ui_metadata     = ui_metadata
+        self._adapter         = ffs_adapter
+        self._streaming_index = streaming_index
+        self._delta           = delta
+
+    def _load_completed(self, out_dir: str) -> set[str]:
+        """Return ui_paths already fully extracted: DB entry + file on disk + entry count match."""
+        try:
+            db   = _open_cache_db(self._case_dir)
+            rows = load_nested_archives(db)
+            completed: set[str] = set()
+            for row in rows:
+                ui_path        = row['ui_path']
+                stored_filename = row['stored_filename']
+                expected_count  = row['entry_count']
+                disk_path       = os.path.join(out_dir, stored_filename)
+                if not os.path.isfile(disk_path):
+                    continue
+                actual_count = len(load_nested_archive_entries(db, ui_path))
+                if actual_count == expected_count:
+                    completed.add(ui_path)
+            db.close()
+            return completed
+        except Exception:
+            return set()
+
+    def run(self):
+        out_dir  = os.path.join(self._case_dir, 'nested_archives')
+        os.makedirs(out_dir, exist_ok=True)
+        log_path = os.path.join(self._case_dir, 'nested_archive_errors.log')
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
+        completed  = self._load_completed(out_dir)
+        ok = err = skipped = 0
+        total       = len(self._candidates)
+        gzip_types: dict[str, str] = {}
+        for i, ui_path in enumerate(self._candidates):
+            if self.isInterruptionRequested():
+                break
+            self.progress.emit(i, total)
+            if ui_path in completed:
+                skipped += 1
+                ok += 1
+                self.item_done.emit(ui_path, True)
+                continue
+            success, gzip_type = self._process_one(ui_path, out_dir)
+            if success:
+                ok += 1
+                if gzip_type:
+                    gzip_types[ui_path] = gzip_type
+            else:
+                err += 1
+            self.item_done.emit(ui_path, success)
+        self.progress.emit(total, total)
+        if gzip_types:
+            self.types_updated.emit(gzip_types)
+        self.finished.emit(ok, err)
+
+    def _process_one(self, ui_path: str, out_dir: str) -> tuple[bool, str | None]:
+        """Process one candidate.  Returns (success, compound_type_or_None).
+
+        compound_type is set for gzip files where the decompressed content
+        type is known, e.g. 'JSON — gzip'.  None for zip files or unknown.
+        """
+        try:
+            physical  = self._adapter.resolve(ui_path)
+            meta      = self._ui_metadata.get(ui_path, {})
+            file_size = meta.get('size', 0)
+
+            # ── Read raw bytes from FFS zip ───────────────────────────────────
+            if self._streaming_index is not None:
+                raw = self._streaming_index.get_entry(physical).read()
+            else:
+                with zipfile.ZipFile(self._zip_path, 'r') as zf:
+                    raw = zf.read(physical)
+
+            key             = hashlib.sha1(ui_path.encode()).hexdigest()[:12]
+            basename        = os.path.basename(ui_path) or 'content'
+            stored_filename = f"{key}_{basename}"
+            out_path        = os.path.join(out_dir, stored_filename)
+
+            if raw[:2] == b'\x1f\x8b':
+                # ── Gzip: decompress and store the raw decompressed file ──────
+                decompressed = gzip.decompress(raw)
+                with open(out_path, 'wb') as f:
+                    f.write(decompressed)
+                ft = _get_file_type(basename)
+                if ft == 'Other' and decompressed:
+                    ft = header_scan.classify_magic(decompressed[:16]) or 'Other'
+                gz_mtime = struct.unpack_from('<I', raw, 4)[0] if len(raw) >= 8 else 0
+                gz_mdate = (datetime.fromtimestamp(gz_mtime, tz=timezone.utc)
+                            .strftime('%Y-%m-%d %H:%M:%S') if gz_mtime else None)
+                content_rows  = [(basename, gz_mdate, len(decompressed), ft)]
+                entry_count   = 1
+                compound_type = f"{ft} — gzip" if ft != 'Other' else None
+
+            else:
+                # ── ZIP: repack as ZIP_STORED ─────────────────────────────────
+                tmp_path = out_path + '.tmp'
+                if file_size > self._MEM_LIMIT:
+                    with open(tmp_path, 'wb') as f:
+                        f.write(raw)
+                    src_arg = tmp_path
+                else:
+                    src_arg = None
+
+                entry_count   = 0
+                content_rows  = []
+                compound_type = None
+                src_handle   = open(src_arg, 'rb') if src_arg else io.BytesIO(raw)
+                try:
+                    with zipfile.ZipFile(src_handle, 'r') as src_zip, \
+                         zipfile.ZipFile(out_path, 'w',
+                                         compression=zipfile.ZIP_STORED) as dst_zip:
+                        for info in src_zip.infolist():
+                            if info.filename.endswith('/'):
+                                continue   # skip directory entries
+                            data = src_zip.read(info.filename)
+                            dst_zip.writestr(info, data)
+                            entry_count += 1
+                            name = info.filename
+                            ft   = _get_file_type(name.rsplit('/', 1)[-1])
+                            if ft == 'Other' and data:
+                                ft = header_scan.classify_magic(data[:16]) or 'Other'
+                            dt    = info.date_time
+                            mdate = (f"{dt[0]:04d}-{dt[1]:02d}-{dt[2]:02d} "
+                                     f"{dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}"
+                                     if any(dt) else None)
+                            content_rows.append((info.filename, mdate,
+                                                 info.file_size, ft))
+                finally:
+                    if src_arg:
+                        src_handle.close()
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+
+            # ── Record in casecache.db ────────────────────────────────────────
+            db = _open_cache_db(self._case_dir)
+            save_nested_archive(db, ui_path, stored_filename,
+                                file_size, entry_count)
+            save_nested_archive_entries(db, ui_path, content_rows)
+            db.close()
+            return True, compound_type
+
+        except Exception as exc:
+            msg = str(exc)
+            self.item_error.emit(ui_path, msg)
+            try:
+                log_path = os.path.join(self._case_dir, 'nested_archive_errors.log')
+                ts = datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                with open(log_path, 'a', encoding='utf-8') as lf:
+                    lf.write(f"[{ts}] FAILED: {ui_path}\n  {msg}\n")
+            except OSError:
+                pass
+            return False, None
+
+
 class ProcessDialog(QDialog):
     """Lets the user view header-scan history and re-run the file header scan."""
-    header_scan_done    = Signal(dict)
-    header_types_cleared = Signal()   # emitted before a rescan so the main window can reset
+    header_scan_done       = Signal(dict)
+    header_types_cleared   = Signal()   # emitted before a rescan so the main window can reset
+    nested_extraction_done = Signal()   # emitted after NestedArchiveWorker finishes
 
     _RUN_TYPE = 'header_scan'
 
@@ -1527,8 +1751,9 @@ class ProcessDialog(QDialog):
         self._ui_metadata     = ui_metadata
         self._streaming_index = streaming_index
         self._delta           = delta
-        self._candidate_count = _count_header_candidates(ui_metadata, ffs_adapter)
-        self._scan_worker: HeaderScanWorker | None = None
+        self._candidate_count  = _count_header_candidates(ui_metadata, ffs_adapter)
+        self._scan_worker:   HeaderScanWorker   | None = None
+        self._nested_worker: NestedArchiveWorker | None = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -1547,9 +1772,20 @@ class ProcessDialog(QDialog):
         case_row.addWidget(browse_btn)
         layout.addLayout(case_row)
 
-        layout.addWidget(QLabel("<hr><b>File Header Scan</b><br>"
-            "Reads the first bytes of files currently labelled <i>Other</i> "
-            "in app container folders to detect their real type."))
+        layout.addWidget(QLabel("<hr><b>Operations</b>"))
+
+        self._chk_header = QCheckBox("Scan file headers")
+        self._chk_header.setChecked(False)
+        layout.addWidget(self._chk_header)
+
+        self._chk_nested = QCheckBox("Uncompress ZIPs in app data")
+        self._chk_nested.setChecked(False)
+        self._chk_nested.setToolTip(
+            "Finds Archive-type files in app containers, repacks them as "
+            "uncompressed ZIPs,\nand records them in the case database. "
+            "Requires header scan.")
+        self._chk_nested.toggled.connect(self._on_nested_toggled)
+        layout.addWidget(self._chk_nested)
 
         # Stats block
         self._stats_label = QLabel()
@@ -1562,13 +1798,13 @@ class ProcessDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self._scan_btn = QPushButton()
-        self._scan_btn.clicked.connect(self._run_scan)
-        btn_row.addWidget(self._scan_btn)
-        self._cancel_scan_btn = QPushButton("Cancel Scan")
-        self._cancel_scan_btn.setVisible(False)
-        self._cancel_scan_btn.clicked.connect(self._on_cancel_scan)
-        btn_row.addWidget(self._cancel_scan_btn)
+        self._run_btn = QPushButton("Run")
+        self._run_btn.clicked.connect(self._run_operations)
+        btn_row.addWidget(self._run_btn)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        btn_row.addWidget(self._cancel_btn)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
@@ -1589,6 +1825,17 @@ class ProcessDialog(QDialog):
         except Exception:
             return None
 
+    def _load_nested_archives_summary(self) -> list[dict]:
+        if not self._case_dir:
+            return []
+        try:
+            db = _open_cache_db(self._case_dir)
+            records = load_nested_archives(db)
+            db.close()
+            return records
+        except Exception:
+            return []
+
     def _refresh_stats(self):
         n = self._candidate_count
         last = self._load_last_run()
@@ -1596,8 +1843,7 @@ class ProcessDialog(QDialog):
         lines = [f"<b>Other-typed files in scan folders:</b> {n:,}"]
 
         if last is None:
-            lines.append("No previous scan recorded.")
-            self._scan_btn.setText("Scan File Headers")
+            lines.append("No previous header scan recorded.")
         else:
             run_at   = last['run_at'].replace('T', ' ')
             scanned  = last['processed'] or 0
@@ -1605,18 +1851,26 @@ class ProcessDialog(QDialog):
             complete = last['complete']
             status   = "Complete" if complete else "⚠ Incomplete"
             lines.append(
-                f"<b>Last scan:</b> {run_at} — "
+                f"<b>Last header scan:</b> {run_at} — "
                 f"{scanned:,} scanned, {changed:,} types identified — {status}"
             )
             if not complete:
                 lines.append(
                     "<i>Previous scan was incomplete. "
-                    "Rescanning will clear previous results and start fresh.</i>"
+                    "Re-running will clear previous results and start fresh.</i>"
                 )
-            self._scan_btn.setText("Rescan File Headers")
+
+        nested = self._load_nested_archives_summary()
+        if nested:
+            last_at = max(r['processed_at'] for r in nested).replace('T', ' ')
+            lines.append(
+                f"<b>Nested archives extracted:</b> {len(nested):,} — "
+                f"last run {last_at}"
+            )
+        else:
+            lines.append("No nested archives extracted yet.")
 
         self._stats_label.setText("<br>".join(lines))
-        self._status_label.setText("")
 
     # ── Case folder browse ────────────────────────────────────────────────────
 
@@ -1642,16 +1896,64 @@ class ProcessDialog(QDialog):
         self._case_edit.setText(folder)
         self._refresh_stats()
 
-    # ── Scan ──────────────────────────────────────────────────────────────────
+    # ── Operations ────────────────────────────────────────────────────────────
 
-    def _run_scan(self):
-        self._scan_btn.setEnabled(False)
-        self._cancel_scan_btn.setEnabled(True)
-        self._cancel_scan_btn.setVisible(True)
-        self._run_id: int | None = None
+    def _on_nested_toggled(self, checked: bool):
+        if checked:
+            last = self._load_last_run()
+            scan_done = last is not None and last.get('complete')
+            if not scan_done:
+                # No complete scan on record — must run one first.
+                self._chk_header.setChecked(True)
+                self._chk_header.setEnabled(False)
+            # If scan already done, leave the checkbox state as-is and enabled
+            # so the user can optionally re-run it alongside extraction.
+        else:
+            self._chk_header.setEnabled(True)
+
+    def _confirm_rerun(self) -> bool:
+        """Return True if user confirms (re-)running already-completed operations."""
+        parts: list[str] = []
+        last = self._load_last_run()
+        if self._chk_header.isChecked() and last and last.get('complete'):
+            parts.append("header scan")
+        nested = self._load_nested_archives_summary()
+        if self._chk_nested.isChecked() and nested:
+            parts.append(
+                f"nested archive extraction "
+                f"({len(nested):,} archive{'s' if len(nested) != 1 else ''} "
+                f"already extracted)"
+            )
+        if not parts:
+            return True
+        what = " and ".join(parts)
+        result = QMessageBox.question(
+            self, "Confirm Re-run",
+            f"A previous {what} has already been completed for this archive.\n\n"
+            "Running again will overwrite the previous results.\n\n"
+            "Are you sure you want to continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return result == QMessageBox.StandardButton.Yes
+
+    def _run_operations(self):
+        if not self._chk_header.isChecked() and not self._chk_nested.isChecked():
+            return
+        if not self._confirm_rerun():
+            return
+        self._run_btn.setEnabled(False)
+        self._cancel_btn.setVisible(True)
         self._scan_cancelled = False
+        self._status_label.setText("")
 
-        # Clear previous results if this is a rescan
+        if self._chk_header.isChecked():
+            self._start_header_scan()
+        else:
+            self._start_nested_extraction()
+
+    def _start_header_scan(self):
+        self._run_id: int | None = None
+
         if self._case_dir:
             try:
                 cache_db = _open_cache_db(self._case_dir)
@@ -1670,25 +1972,154 @@ class ProcessDialog(QDialog):
             except Exception:
                 pass
 
-        self._status_label.setText("Starting scan…")
+        self._status_label.setText("Starting header scan…")
         self._scan_worker = HeaderScanWorker(
             self._zip_path, self._ui_metadata,
             self._adapter, self._streaming_index,
             delta=self._delta,
         )
-        self._scan_worker.progress.connect(self._on_progress)
-        self._scan_worker.done.connect(self._on_done)
+        self._scan_worker.progress.connect(self._on_header_progress)
+        self._scan_worker.done.connect(self._on_header_done)
         self._scan_worker.start()
 
-    def _on_cancel_scan(self):
+    def _on_header_progress(self, remaining: int):
+        self._status_label.setText(
+            f"Scanning headers: {remaining:,} files remaining…"
+            if remaining > 0 else "Finishing header scan…"
+        )
+
+    def _on_header_done(self, results: dict):
+        n_found   = len(results)
+        n_total   = self._candidate_count
+        cancelled = self._scan_cancelled
+
+        if self._case_dir:
+            try:
+                cache_db = _open_cache_db(self._case_dir)
+                if results:
+                    save_header_types(cache_db, results)
+                cache_db.close()
+                if self._run_id is not None and not cancelled:
+                    results_db = _open_results_db(self._case_dir)
+                    complete_run_log(results_db, self._run_id,
+                                     processed=n_total, output_rows=n_found)
+                    results_db.close()
+            except Exception:
+                pass
+
+        self.header_scan_done.emit(results)
+
+        if self._chk_nested.isChecked() and not cancelled:
+            self._start_nested_extraction()
+        else:
+            msg = (f"Cancelled — {n_found:,} type{'s' if n_found != 1 else ''} "
+                   "identified before cancellation."
+                   if cancelled else
+                   f"Header scan done — {n_found:,} type{'s' if n_found != 1 else ''} "
+                   f"identified from {n_total:,} candidate{'s' if n_total != 1 else ''}.")
+            self._status_label.setText(msg)
+            self._finish_operations()
+
+    def _start_nested_extraction(self):
+        overrides = {}
+        if self._case_dir:
+            try:
+                db = _open_cache_db(self._case_dir)
+                overrides = load_header_types(db)
+                db.close()
+            except Exception:
+                pass
+
+        candidates = _collect_nested_archive_candidates(
+            self._ui_metadata, self._adapter, overrides)
+
+        if not candidates:
+            self._status_label.setText("No Archive-type files found in app data.")
+            self._finish_operations()
+            return
+
+        self._status_label.setText(
+            f"Extracting {len(candidates):,} archive(s)")
+        self._nested_worker = NestedArchiveWorker(
+            self._zip_path, self._case_dir, candidates,
+            self._ui_metadata, self._adapter,
+            self._streaming_index, self._delta,
+        )
+        self._nested_errors: list[str] = []
+        self._nested_worker.progress.connect(self._on_nested_progress)
+        self._nested_worker.item_error.connect(self._on_nested_error)
+        self._nested_worker.types_updated.connect(self.header_scan_done.emit)
+        self._nested_worker.finished.connect(self._on_nested_done)
+        self._nested_worker.start()
+
+    def _on_nested_progress(self, done: int, total: int):
+        self._status_label.setText(
+            f"Extracting nested archives: {done:,} / {total:,}")
+
+    def _on_nested_error(self, ui_path: str, msg: str):
+        self._nested_errors.append(f"{os.path.basename(ui_path)}: {msg}")
+
+    def _on_nested_done(self, ok: int, err: int):
+        msg = f"Nested archives: {ok:,} extracted"
+        if err:
+            first = self._nested_errors[0] if self._nested_errors else "unknown error"
+            msg += f", {err:,} failed ({first})"
+        msg += "."
+        self._status_label.setText(msg)
+        # Rebuild compound gzip type overrides from the DB and push to the file
+        # browser.  Done here (main thread) so it covers skipped files too and
+        # avoids cross-thread signal chain issues.
+        self._apply_gzip_type_overrides()
+        self.nested_extraction_done.emit()
+        self._finish_operations()
+
+    def _apply_gzip_type_overrides(self):
+        """Read all single-entry gzip-extracted archives from the DB and emit
+        their detected content type (e.g. 'JSON — gzip') as header_scan_done
+        so the file browser Type column updates immediately."""
+        if not self._case_dir:
+            return
+        try:
+            out_dir = os.path.join(self._case_dir, 'nested_archives')
+            db      = _open_cache_db(self._case_dir)
+            records = load_nested_archives(db)
+            gzip_types: dict[str, str] = {}
+            for rec in records:
+                if rec['entry_count'] != 1:
+                    continue
+                stored_path = os.path.join(out_dir, rec['stored_filename'])
+                if not os.path.isfile(stored_path):
+                    continue
+                with open(stored_path, 'rb') as f:
+                    magic = f.read(2)
+                if magic == b'PK':
+                    continue  # stored ZIP, not a gzip extract
+                entries = load_nested_archive_entries(db, rec['ui_path'])
+                if entries:
+                    ft = entries[0].get('file_type') or 'Other'
+                    if ft != 'Other':
+                        gzip_types[rec['ui_path']] = f"{ft} — gzip"
+            db.close()
+            if gzip_types:
+                self.header_scan_done.emit(gzip_types)
+        except Exception:
+            pass
+
+    def _on_cancel(self):
+        self._scan_cancelled = True
         if self._scan_worker and self._scan_worker.isRunning():
-            self._cancel_scan_btn.setEnabled(False)
-            self._status_label.setText("Cancelling…")
-            self._scan_cancelled = True
             self._scan_worker.requestInterruption()
+        if self._nested_worker and self._nested_worker.isRunning():
+            self._nested_worker.requestInterruption()
+
+    def _finish_operations(self):
+        self._run_btn.setEnabled(True)
+        self._cancel_btn.setVisible(False)
+        self._refresh_stats()
 
     def _is_scanning(self) -> bool:
-        return bool(self._scan_worker and self._scan_worker.isRunning())
+        return ((bool(self._scan_worker and self._scan_worker.isRunning())) or
+                (bool(self._nested_worker and self._nested_worker.isRunning())))
 
     def closeEvent(self, event):
         if self._is_scanning():
@@ -1705,46 +2136,6 @@ class ProcessDialog(QDialog):
         if self._is_scanning():
             return
         super().reject()
-
-    def _on_progress(self, remaining: int):
-        self._status_label.setText(
-            f"Scanning: {remaining:,} files remaining…" if remaining > 0 else "Finishing…"
-        )
-
-    def _on_done(self, results: dict):
-        self._cancel_scan_btn.setVisible(False)
-        self._scan_btn.setEnabled(True)
-
-        n_found  = len(results)
-        n_total  = self._candidate_count
-        cancelled = getattr(self, '_scan_cancelled', False)
-        if cancelled:
-            self._status_label.setText(
-                f"Cancelled — {n_found:,} type{'s' if n_found != 1 else ''} identified "
-                f"before cancellation."
-            )
-        else:
-            self._status_label.setText(
-                f"Done — {n_found:,} type{'s' if n_found != 1 else ''} identified "
-                f"from {n_total:,} candidate{'s' if n_total != 1 else ''}."
-            )
-
-        if self._case_dir:
-            try:
-                cache_db = _open_cache_db(self._case_dir)
-                if results:
-                    save_header_types(cache_db, results)
-                cache_db.close()
-                if self._run_id is not None and not cancelled:
-                    results_db = _open_results_db(self._case_dir)
-                    complete_run_log(results_db, self._run_id,
-                                     processed=n_total, output_rows=n_found)
-                    results_db.close()
-            except Exception:
-                pass
-
-        self._refresh_stats()
-        self.header_scan_done.emit(results)
 
 
 def _do_path_change_check(
@@ -1818,6 +2209,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._streaming_index: StreamingZipIndex | None = None
         self._local_extra_delta: int | None = None
         self._header_type_overrides: dict = {}   # {ui_path: detected_type}
+        self._nested_archive_map:   dict        = {}   # archive_ui_path → {stored_path, entries}
+        self._nested_virtual_paths: frozenset   = frozenset()  # virtual file paths (leaves)
+        self._nested_virtual_folders: frozenset = frozenset()  # virtual folder paths (non-root)
         self._hex_worker: QThread | None = None
         self._adapter = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, "filesystem2", "filesystem1")
         self._android_user_data_path = ''   # set at load time for Android archives
@@ -1927,6 +2321,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_view.setMinimumWidth(0)
         self.tree_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.tree_view.installEventFilter(self)
+        self.tree_view.viewport().installEventFilter(self)
         self.tree_view.header().sectionHandleDoubleClicked.connect(
             lambda _: QTimer.singleShot(0, self._update_tree_column))
 
@@ -2146,6 +2541,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """
         if not self._hide_empty_folders:
             return False
+        if path in self._nested_archive_map:
+            return False  # extracted archives are always browseable
         if path in self._missing_plist_paths:
             return False
         if path not in self._folder_sizes:
@@ -2324,8 +2721,101 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         ui_path = self.file_model.index(source.row(), 0).data(Qt.ItemDataRole.UserRole)
         if ui_path in self.folder_map:
             self.navigate_tree_to_path(ui_path)
+        elif ui_path in self._nested_virtual_paths:
+            self._load_nested_entry_preview(ui_path)
         elif ui_path and self._in_zip(ui_path):
+            self._load_file_preview(ui_path)
+
+    def _render_as_text(self, data: bytes, name: str) -> str | None:
+        """Return a (possibly pretty-printed) string for *data*, or None if binary."""
+        if data[:6] == b'bplist':
+            return None
+
+        ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+        stripped = data.lstrip()
+        is_json_content = stripped[:1] in (b'{', b'[')
+        is_xml_content  = stripped[:1] == b'<'
+
+        if ext not in _TEXT_RENDERABLE_EXTENSIONS and not is_json_content and not is_xml_content:
+            return None
+
+        try:
+            text = data.decode('utf-8', errors='strict')
+        except UnicodeDecodeError:
+            if ext not in _TEXT_RENDERABLE_EXTENSIONS:
+                return None
+            text = data.decode('utf-8', errors='replace')
+
+        if ext == 'json' or (ext not in _TEXT_RENDERABLE_EXTENSIONS and is_json_content):
+            try:
+                text = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        elif ext in ('xml', 'plist', 'html', 'htm', 'xhtml') or (
+                ext not in _TEXT_RENDERABLE_EXTENSIONS and is_xml_content):
+            try:
+                dom = xml.dom.minidom.parseString(data)
+                pretty = dom.toprettyxml(indent='  ')
+                lines = pretty.splitlines()
+                if lines and lines[0].startswith('<?xml') and not stripped.startswith(b'<?xml'):
+                    pretty = '\n'.join(lines[1:]).lstrip('\n')
+                text = pretty
+            except Exception:
+                pass
+
+        return text
+
+    def _load_file_preview(self, ui_path: str) -> None:
+        """Load a file for preview — text/JSON/XML in text tab + hex tab; others hex only."""
+        raw = self._read_zip_bytes(ui_path)
+        if raw is None:
+            self._clear_text_preview()
             self._load_hex_preview(ui_path)
+            return
+
+        data = raw
+        if raw[:2] == b'\x1f\x8b':
+            try:
+                data = gzip.decompress(raw)
+            except Exception:
+                pass
+
+        name = os.path.basename(ui_path)
+        text = self._render_as_text(data, name)
+
+        self._load_hex_preview(ui_path)
+        if text is not None:
+            self._load_text_preview(text, ui_path)
+        else:
+            self._clear_text_preview()
+
+    def _load_nested_entry_preview(self, ui_path: str) -> None:
+        """Read an entry from an extracted nested archive and display it."""
+        meta      = self.full_metadata.get(ui_path, {})
+        arch_path = meta.get('_archive_path')
+        arch      = self._nested_archive_map.get(arch_path) if arch_path else None
+        if not arch:
+            return
+        entry_path = ui_path[len(arch_path) + 1:]
+        try:
+            with zipfile.ZipFile(arch['stored_path'], 'r') as zf:
+                data = zf.read(entry_path)
+        except zipfile.BadZipFile:
+            try:
+                with open(arch['stored_path'], 'rb') as f:
+                    data = f.read()
+            except Exception:
+                return
+        except Exception:
+            return
+
+        name = meta.get('_display_name') or ui_path.rsplit('/', 1)[-1]
+        text = self._render_as_text(data, name)
+        self._load_hex_preview_from_bytes(data, ui_path)
+        if text is not None:
+            self._load_text_preview(text, ui_path)
+        else:
+            self._clear_text_preview()
 
     def _expand_to_private_var(self):
         """Expand the tree down to private/var on GrayKey load so its children
@@ -2414,6 +2904,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def eventFilter(self, obj, event):
         if obj is self.tree_view and event.type() == event.Type.Resize:
             self._update_tree_column()
+        if obj is self.tree_view.viewport() and event.type() == event.Type.MouseButtonPress:
+            self._tree_click_hpos = self.tree_view.horizontalScrollBar().value()
         return super().eventFilter(obj, event)
 
     def _update_tree_column(self):
@@ -2422,7 +2914,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_view.header().resizeSection(0, max(vw, _TREE_COL_MIN))
 
     def _on_tree_clicked(self, index):
+        hpos = getattr(self, '_tree_click_hpos', self.tree_view.horizontalScrollBar().value())
         self.on_folder_selected(index)
+        QTimer.singleShot(150, lambda pos=hpos: self.tree_view.horizontalScrollBar().setValue(pos))
 
     def on_folder_selected(self, index):
         item = self.tree_model.itemFromIndex(index)
@@ -2455,6 +2949,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if skip:
                 continue
             meta = self.full_metadata.get(path, {})
+            if path in self._nested_virtual_paths:
+                name = meta.get('_display_name') or name
             fc = self._count_files_recursive(path) if is_folder else -1
             cols = self._build_entry_cols(path, name, meta, is_folder, file_type, fc)
             if has_bundles:
@@ -2489,6 +2985,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """Return (file_type, grey_row, skip) for one file/folder entry.
         skip=True means the caller should exclude this entry from the view."""
         if is_folder:
+            if path in self._nested_archive_map:
+                return 'Archive', False, False  # extracted archive browseable as folder
             if self._should_hide_folder(path):
                 return None, None, True
             if path in self._metadata_only_folders:
@@ -2496,6 +2994,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if self._folder_total_size(path) == 0:
                 return "Empty Folder", True, False
             return 'Folder', False, False
+        if path in self._nested_virtual_paths:
+            ft = _get_file_type(name)
+            if ft == 'Other':
+                ft = self._header_type_overrides.get(path, 'Other')
+            return ft, False, False
         if self._in_zip(path):
             # Directory entries in FORMAT_ZIP_EXTRAS land in zip_ui_paths with
             # their trailing slash stripped — detect them before calling
@@ -2527,7 +3030,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         cols: list = [self._display_name(name)]
         for _, key in self._time_cols:
             cols.append(self.format_ts(meta.get(key)))
-        size_val = self._folder_total_size(path) if is_folder else meta.get('size', 0)
+        if is_folder and path in self._nested_archive_map:
+            size_val = meta.get('size', 0)   # show original archive file size
+        elif is_folder:
+            size_val = self._folder_total_size(path)
+        else:
+            size_val = meta.get('size', 0)
         cols += [
             file_type,
             f"{size_val:,}",
@@ -3020,6 +3528,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         )
         dlg.header_types_cleared.connect(self._on_header_types_cleared)
         dlg.header_scan_done.connect(self._on_header_scan_done)
+        dlg.nested_extraction_done.connect(self._on_nested_extraction_done)
         dlg.exec()
 
     def _open_new_ffs(self):
@@ -3045,10 +3554,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.search_status.setText("No search running")
         self.center_tabs.setCurrentIndex(0)
         self._load_recent_searches_from_db()
-        self._start_search_index_build()
+        # Stop the old index worker before replacing the tree model — a running
+        # worker thread can trigger Python GC which traverses freed Qt wrappers.
+        if self._search_index_worker and self._search_index_worker.isRunning():
+            self._search_index_worker.stop()
+            self._search_index_worker.wait()
         self._log(f"SESSION START — Archive loaded: {zip_path}")
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
+        self._start_search_index_build()
         self.show_selected_btn.setVisible(False)
         self.deselect_all_btn.setVisible(False)
         # Clear hex viewer from the previous archive
@@ -3141,6 +3655,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.progress_bar.setRange(0, 100)
         self.save_recent_list(self.zip_path)
         fmt_label = "GrayKey" if ffs_adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
+        self._inject_nested_archives()
         self.reload_tree_entirely()
         self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
         # Fetch device label and populate device_info after archive is loaded.
@@ -3183,6 +3698,87 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
         self._refresh_folder_view(preserve_filter=True)
+
+    def _inject_nested_archives(self):
+        """Inject extracted nested-archive entries into folder_map and full_metadata
+        so each archive appears as a navigable folder in the tree and file list.
+
+        Flat layout: every entry in the archive becomes a direct child of the
+        archive node.  The full relative path within the archive (e.g. subdir/file.txt)
+        is stored in _display_name so the file browser can show it as the entry name.
+        """
+        if not self._case_dir:
+            return
+        db = None
+        try:
+            db      = _open_cache_db(self._case_dir)
+            records = load_nested_archives(db)
+        except Exception:
+            if db:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            return
+
+        # Reset all virtual state before rebuilding.
+        self._nested_archive_map    = {}
+        self._nested_virtual_paths  = frozenset()
+        self._nested_virtual_folders = frozenset()
+        virtual_paths = set()
+        out_dir = os.path.join(self._case_dir, 'nested_archives')
+
+        for rec in records:
+            ui_path     = rec['ui_path']
+            stored_path = os.path.join(out_dir, rec['stored_filename'])
+            if not os.path.isfile(stored_path):
+                continue
+            try:
+                entries = load_nested_archive_entries(db, ui_path)
+            except Exception:
+                entries = []
+
+            self._nested_archive_map[ui_path] = {
+                'stored_path': stored_path,
+                'entries':     entries,
+            }
+
+            children = []
+            for e in entries:
+                if e['entry_path'].endswith('/'):
+                    continue   # skip directory entries
+                ep = e['entry_path']
+                if not ep:
+                    continue
+                vpath = f"{ui_path}/{ep}"
+                virtual_paths.add(vpath)
+                children.append(vpath)
+                mtime = None
+                if e.get('mdate'):
+                    try:
+                        dt = datetime.strptime(e['mdate'], '%Y-%m-%d %H:%M:%S')
+                        mtime = dt.replace(tzinfo=timezone.utc).timestamp()
+                    except ValueError:
+                        pass
+                self.full_metadata[vpath] = {
+                    'size':          e['size'] or 0,
+                    '_display_name': ep,
+                    '_archive_path': ui_path,
+                    'mtime':         mtime,
+                }
+                ft = e.get('file_type') or 'Other'
+                if ft != 'Other':
+                    self._header_type_overrides[vpath] = ft
+
+            # Register archive as a navigable folder with its entries as children.
+            self.folder_map[ui_path] = children
+
+        db.close()
+        self._nested_virtual_paths = frozenset(virtual_paths)
+
+    def _on_nested_extraction_done(self):
+        self._inject_nested_archives()
+        self.reload_tree_entirely()
 
     def _scan_selected_headers(self, ui_paths: list):
         if not self.zip_path or not ui_paths:
@@ -3334,6 +3930,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def reload_tree_entirely(self):
         if not self.folder_map: return
+        if self._search_index_worker and self._search_index_worker.isRunning():
+            self._search_index_worker.stop()
+            self._search_index_worker.wait()
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
         self._tree_populating = True

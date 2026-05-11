@@ -5,7 +5,7 @@ import zipfile
 from zip_entry import ZipEntry
 from PySide6.QtWidgets import (
     QWidget, QLabel, QProgressBar, QVBoxLayout, QFrame,
-    QPlainTextEdit, QTextEdit, QApplication,
+    QPlainTextEdit, QTextEdit, QApplication, QTabWidget,
 )
 from PySide6.QtGui import (
     QFont, QFontMetricsF, QTextCursor, QTextCharFormat, QColor,
@@ -106,7 +106,7 @@ class HexViewerMixin:
     )
 
     def _setup_hex_panel(self, section_style: str, status_style: str) -> QWidget:
-        """Build the hex-viewer panel widget and initialise all hex instance state.
+        """Build the file-preview panel (Hex + Text tabs) and initialise hex state.
         Returns the panel QWidget to be added to the outer splitter."""
         self._fitting_hex_font  = False
         self._hex_loading_more  = False
@@ -117,8 +117,7 @@ class HexViewerMixin:
         self._hex_ui_path:      str = ""
         self._pending_hex_jump: tuple | None = None
 
-        hex_header = QLabel("Hex Preview")
-        hex_header.setStyleSheet(section_style)
+        # ── Hex tab ───────────────────────────────────────────────────────────
         self.hex_label = QLabel("No file selected")
         self.hex_label.setStyleSheet(status_style)
 
@@ -140,20 +139,56 @@ class HexViewerMixin:
         self.hex_progress_bar = QProgressBar()
         self.hex_progress_bar.hide()
 
+        hex_tab = QWidget()
+        hex_tab_layout = QVBoxLayout(hex_tab)
+        hex_tab_layout.setContentsMargins(0, 0, 0, 0)
+        hex_tab_layout.setSpacing(2)
+        hex_tab_layout.addWidget(self.hex_label)
+        hex_tab_layout.addWidget(self.hex_progress_bar)
+        hex_tab_layout.addWidget(self.hex_view, stretch=1)
+
+        # ── Text tab ──────────────────────────────────────────────────────────
+        self.text_label = QLabel("No file selected")
+        self.text_label.setStyleSheet(status_style)
+
+        self.text_view = QPlainTextEdit()
+        self.text_view.setReadOnly(True)
+        _text_font = QFont("Menlo", 13)
+        _text_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.text_view.setFont(_text_font)
+        self.text_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.text_view.document().setDocumentMargin(10)
+        self.text_view.setPlaceholderText(
+            "Decoded text content of the selected file appears here.")
+
+        text_tab = QWidget()
+        text_tab_layout = QVBoxLayout(text_tab)
+        text_tab_layout.setContentsMargins(0, 0, 0, 0)
+        text_tab_layout.setSpacing(2)
+        text_tab_layout.addWidget(self.text_label)
+        text_tab_layout.addWidget(self.text_view, stretch=1)
+
+        # ── Tab widget ────────────────────────────────────────────────────────
+        self.preview_tabs = QTabWidget()
+        self.preview_tabs.addTab(hex_tab,  "Hex")    # 0
+        self.preview_tabs.addTab(text_tab, "Text")   # 1
+
+        # ── Outer panel ───────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setFrameShadow(QFrame.Shadow.Sunken)
 
-        hex_panel = QWidget()
-        hex_layout = QVBoxLayout(hex_panel)
-        hex_layout.setContentsMargins(0, 0, 0, 0)
-        hex_layout.setSpacing(2)
-        hex_layout.addWidget(sep)
-        hex_layout.addWidget(hex_header)
-        hex_layout.addWidget(self.hex_label)
-        hex_layout.addWidget(self.hex_progress_bar)
-        hex_layout.addWidget(self.hex_view, stretch=1)
-        return hex_panel
+        section_label = QLabel("File Preview")
+        section_label.setStyleSheet(section_style)
+
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        outer_layout.addWidget(sep)
+        outer_layout.addWidget(section_label)
+        outer_layout.addWidget(self.preview_tabs, stretch=1)
+        return outer
 
     # ── Event filter ─────────────────────────────────────────────────────────
 
@@ -165,6 +200,8 @@ class HexViewerMixin:
     # ── Loading ───────────────────────────────────────────────────────────────
 
     def _load_hex_preview(self, ui_path):
+        self.preview_tabs.setCurrentIndex(0)
+
         if self._hex_worker is not None and self._hex_worker.isRunning():
             self._hex_worker.terminate()
             self._hex_worker.wait()
@@ -212,6 +249,24 @@ class HexViewerMixin:
             self._hex_worker.load_complete.connect(self._on_hex_ready)
             self._hex_worker.error.connect(self._on_hex_error)
             self._hex_worker.start()
+
+    def _load_hex_preview_from_bytes(self, data: bytes, label: str) -> None:
+        """Populate the Hex tab from raw bytes without reading the FFS zip."""
+        self.preview_tabs.setCurrentIndex(0)
+        if self._hex_worker is not None and self._hex_worker.isRunning():
+            self._hex_worker.terminate()
+            self._hex_worker.wait()
+        self._hex_entry        = None
+        self._hex_file_size    = len(data)
+        self._hex_bytes_loaded = len(data)
+        self._hex_view_start   = 0
+        self._hex_ui_path      = label
+        self.hex_view.clear()
+        self.hex_progress_bar.hide()
+        chunk = data[:INITIAL_HEX_BYTES]
+        self.hex_view.setPlainText(self._render_hex(chunk))
+        self._fit_hex_font()
+        self._update_hex_label()
 
     def _open_hex_from_search(self, physical_path: str, display_label: str,
                                jump_to: int | None, keyword: str):
@@ -554,3 +609,35 @@ class HexViewerMixin:
                 extra_sels.append(es)
 
         self.hex_view.setExtraSelections(extra_sels)
+
+    # ── Text viewer ───────────────────────────────────────────────────────────
+
+    def _clear_text_preview(self) -> None:
+        """Wipe the Text tab without switching to it."""
+        self.text_label.setText('')
+        self.text_view.clear()
+
+    def _load_text_preview(self, text: str, label: str) -> None:
+        """Display *text* in the Text tab with *label* shown above it."""
+        self.text_label.setText(label)
+        self.text_view.setPlainText(text)
+        self.preview_tabs.setCurrentIndex(1)
+
+    # ── Raw byte reader ───────────────────────────────────────────────────────
+
+    def _read_zip_bytes(self, ui_path: str, max_bytes: int = -1) -> bytes | None:
+        """Read raw (stored/decompressed) bytes for *ui_path* from the FFS zip.
+
+        max_bytes=-1 reads the entire entry.  Returns None on any error.
+        """
+        physical = self._adapter.resolve(ui_path)
+        try:
+            if self._streaming_index is not None:
+                entry = self._streaming_index.get_entry(physical)
+            else:
+                zinfo = self._get_zip_handle().getinfo(physical)
+                entry = ZipEntry(self.zip_path, physical, zinfo)
+            n = entry.file_size if max_bytes < 0 else min(max_bytes, entry.file_size)
+            return entry.read(n)
+        except Exception:
+            return None

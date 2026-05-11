@@ -21,11 +21,11 @@ _SIGNATURES: list[tuple[bytes, str | None]] = [
     (b'II*\x00',             'Picture'),   # TIFF LE
     (b'MM\x00*',             'Picture'),   # TIFF BE
     (b'%PDF',                'Document'),
-    (b'PK\x03\x04',         'Archive'),   # ZIP
-    (b'PK\x05\x06',         'Archive'),   # empty ZIP
-    (b'\x1f\x8b',           'Archive'),   # gzip
-    (b'BZh',                'Archive'),   # bzip2
-    (b'\xfd7zXZ\x00',       'Archive'),   # xz
+    (b'PK\x03\x04',         'Archive'),    # ZIP
+    (b'PK\x05\x06',         'Archive'),    # empty ZIP
+    (b'\x1f\x8b',           'Compressed'), # gzip
+    (b'BZh',                'Compressed'), # bzip2
+    (b'\xfd7zXZ\x00',       'Compressed'), # xz
     (b'bplist',             'Property List'),
     (b'<?xml',              'XML'),
     (b'<html',              'Web / Data'),

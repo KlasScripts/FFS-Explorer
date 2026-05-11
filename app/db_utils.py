@@ -91,6 +91,32 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS nested_archives (
+            ui_path         TEXT    NOT NULL PRIMARY KEY,
+            stored_filename TEXT    NOT NULL,
+            original_size   INTEGER NOT NULL,
+            entry_count     INTEGER NOT NULL DEFAULT 0,
+            processed_at    TEXT    NOT NULL
+                             DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
+        )
+    ''')
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS nested_archive_entries (
+            archive_ui_path TEXT    NOT NULL,
+            entry_path      TEXT    NOT NULL,
+            mdate           TEXT,
+            size            INTEGER NOT NULL DEFAULT 0,
+            file_type       TEXT,
+            PRIMARY KEY (archive_ui_path, entry_path)
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_nae_archive
+        ON nested_archive_entries (archive_ui_path)
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_CACHE_SCHEMA_VERSION}')
     conn.commit()
     return conn
@@ -409,3 +435,60 @@ def load_device_info(conn: 'sqlite3.Connection') -> list[tuple[str, str, str]]:
     return conn.execute(
         'SELECT field_name, data, source FROM device_info ORDER BY rowid'
     ).fetchall()
+
+
+# ── Nested archives ───────────────────────────────────────────────────────────
+
+def save_nested_archive(conn: 'sqlite3.Connection',
+                        ui_path: str, stored_filename: str,
+                        original_size: int, entry_count: int) -> None:
+    """Record one extracted nested archive in the nested_archives table."""
+    conn.execute(
+        'INSERT OR REPLACE INTO nested_archives '
+        '(ui_path, stored_filename, original_size, entry_count) VALUES (?,?,?,?)',
+        (ui_path, stored_filename, original_size, entry_count),
+    )
+    conn.commit()
+
+
+def save_nested_archive_entries(conn: 'sqlite3.Connection',
+                                archive_ui_path: str,
+                                entries: list) -> None:
+    """Persist [(entry_path, mdate, size, file_type)] for one nested archive."""
+    conn.execute('DELETE FROM nested_archive_entries WHERE archive_ui_path=?',
+                 (archive_ui_path,))
+    conn.executemany(
+        'INSERT INTO nested_archive_entries '
+        '(archive_ui_path, entry_path, mdate, size, file_type) VALUES (?,?,?,?,?)',
+        [(archive_ui_path, ep, md, sz, ft) for ep, md, sz, ft in entries],
+    )
+    conn.commit()
+
+
+def load_nested_archives(conn: 'sqlite3.Connection') -> list:
+    """Return list of dicts for all extracted nested archives."""
+    rows = conn.execute(
+        'SELECT ui_path, stored_filename, original_size, entry_count, processed_at '
+        'FROM nested_archives ORDER BY processed_at'
+    ).fetchall()
+    return [{'ui_path': r[0], 'stored_filename': r[1], 'original_size': r[2],
+             'entry_count': r[3], 'processed_at': r[4]} for r in rows]
+
+
+def load_nested_archive_entries(conn: 'sqlite3.Connection',
+                                archive_ui_path: str) -> list:
+    """Return list of dicts for all entries inside one nested archive."""
+    rows = conn.execute(
+        'SELECT entry_path, mdate, size, file_type '
+        'FROM nested_archive_entries WHERE archive_ui_path=? ORDER BY entry_path',
+        (archive_ui_path,),
+    ).fetchall()
+    return [{'entry_path': r[0], 'mdate': r[1], 'size': r[2], 'file_type': r[3]}
+            for r in rows]
+
+
+def clear_nested_archives(conn: 'sqlite3.Connection') -> None:
+    """Delete all nested archive records (entries first, then index)."""
+    conn.execute('DELETE FROM nested_archive_entries')
+    conn.execute('DELETE FROM nested_archives')
+    conn.commit()

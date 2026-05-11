@@ -1658,13 +1658,15 @@ class NestedArchiveWorker(QThread):
                 decompressed = gzip.decompress(raw)
                 with open(out_path, 'wb') as f:
                     f.write(decompressed)
-                ft = _get_file_type(basename)
+                child_name = (basename[:-3] if basename.lower().endswith('.gz')
+                              else basename)
+                ft = _get_file_type(child_name)
                 if ft == 'Other' and decompressed:
                     ft = header_scan.classify_magic(decompressed[:16]) or 'Other'
                 gz_mtime = struct.unpack_from('<I', raw, 4)[0] if len(raw) >= 8 else 0
                 gz_mdate = (datetime.fromtimestamp(gz_mtime, tz=timezone.utc)
                             .strftime('%Y-%m-%d %H:%M:%S') if gz_mtime else None)
-                content_rows  = [(basename, gz_mdate, len(decompressed), ft)]
+                content_rows  = [(child_name, gz_mdate, len(decompressed), ft)]
                 entry_count   = 1
                 compound_type = f"{ft} — gzip" if ft != 'Other' else None
 
@@ -1690,7 +1692,8 @@ class NestedArchiveWorker(QThread):
                             if info.filename.endswith('/'):
                                 continue   # skip directory entries
                             data = src_zip.read(info.filename)
-                            dst_zip.writestr(info, data)
+                            dst_zip.writestr(info, data,
+                                             compress_type=zipfile.ZIP_STORED)
                             entry_count += 1
                             name = info.filename
                             ft   = _get_file_type(name.rsplit('/', 1)[-1])
@@ -3315,6 +3318,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 lambda checked=False, paths=_scan_paths: self._scan_selected_headers(paths))
             menu.addAction(scan_hdr_act)
 
+        # Extract nested archive option — shown for unextracted Archive/Compressed files
+        if ui_path and ui_path not in self.folder_map and self._in_zip(ui_path) \
+                and ui_path not in self._nested_archive_map and self._case_dir:
+            _name = ui_path.rsplit('/', 1)[-1]
+            _ft   = _get_file_type(_name)
+            if _ft == 'Other':
+                _ft = self._header_type_overrides.get(ui_path, 'Other')
+            if _ft in _EXTRACTABLE_TYPES:
+                menu.addSeparator()
+                extract_act = QAction("📦 Extract as Nested Archive", self)
+                extract_act.triggered.connect(
+                    lambda checked=False, p=ui_path: self._extract_from_context_menu(p))
+                menu.addAction(extract_act)
+
         menu.exec(self.file_view.viewport().mapToGlobal(point))
 
     def handle_export_request(self, is_tree=True):
@@ -3779,6 +3796,38 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _on_nested_extraction_done(self):
         self._inject_nested_archives()
         self.reload_tree_entirely()
+
+    def _extract_from_context_menu(self, ui_path: str) -> None:
+        """Extract a single archive right-click entry without opening ProcessDialog."""
+        if not self.zip_path or not self._case_dir:
+            return
+        self.status_bar.showMessage(f"Extracting {os.path.basename(ui_path)}…")
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        worker = NestedArchiveWorker(
+            self.zip_path,
+            self._case_dir,
+            [ui_path],
+            self.full_metadata,
+            self._adapter,
+            self._streaming_index,
+            self._local_extra_delta,
+        )
+        worker.finished.connect(
+            lambda ok, err, p=ui_path: self._on_context_extract_done(p, ok, err))
+        self._context_extract_worker = worker
+        worker.start()
+
+    def _on_context_extract_done(self, ui_path: str, ok: int, err: int) -> None:
+        QApplication.restoreOverrideCursor()
+        if ok > 0:
+            self._inject_nested_archives()
+            self.reload_tree_entirely()
+            self.navigate_tree_to_path(ui_path)
+            self.status_bar.showMessage(
+                f"Extracted: {os.path.basename(ui_path)}", 5000)
+        else:
+            self.status_bar.showMessage(
+                f"Extraction failed ({err} error(s)): {os.path.basename(ui_path)}", 5000)
 
     def _scan_selected_headers(self, ui_paths: list):
         if not self.zip_path or not ui_paths:

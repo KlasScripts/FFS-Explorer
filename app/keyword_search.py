@@ -287,6 +287,109 @@ class KeywordSearchWorker(QThread):
         self.finished.emit(hits, done, total, self._stop.is_set())
 
 
+# ── NestedArchiveSearchWorker ─────────────────────────────────────────────────
+
+class NestedArchiveSearchWorker(QThread):
+    """Search entries inside repacked nested archive ZIPs for a keyword.
+
+    result_found carries five arguments so the click handler can reopen
+    the exact entry from the stored ZIP, not from the FFS zip.
+    """
+
+    result_found = Signal(str, int, str, str, str)  # (virtual_ui_path, offset, context, stored_path, entry_path)
+    progress     = Signal(int, int)                  # (done, total)
+    finished     = Signal(int, int, int)             # (hits, files_done, files_total)
+
+    _CTX_BYTES = 40
+
+    def __init__(self, nested_archive_map: dict, keyword: str, parent=None):
+        super().__init__(parent)
+        self._map      = nested_archive_map
+        self._stop     = threading.Event()
+        self._patterns: list = []
+        for _enc in ('utf-8', 'utf-16-le', 'utf-16-be'):
+            _pat = keyword.encode(_enc, errors='replace')
+            self._patterns.append((_pat.lower(), len(_pat), _enc))
+
+    def stop(self):
+        self._stop.set()
+
+    @staticmethod
+    def _read_entry(stored_path: str, entry_path: str) -> bytes | None:
+        """Read one entry's bytes from stored_path.
+
+        stored_path is either a repackaged ZIP (for ZIP sources) or a raw
+        decompressed blob (for gzip sources).  Try ZIP first; if the file
+        is not a ZIP at all fall back to reading the whole blob directly —
+        matching the logic in _load_nested_entry_preview.
+        """
+        try:
+            with zipfile.ZipFile(stored_path, 'r') as zf:
+                return zf.read(entry_path)
+        except zipfile.BadZipFile:
+            pass
+        except Exception:
+            return None
+        try:
+            with open(stored_path, 'rb') as f:
+                return f.read()
+        except Exception:
+            return None
+
+    def run(self):
+        # Build the work list from the already-loaded entries dict (avoids
+        # reopening every stored ZIP just to enumerate filenames).
+        all_entries: list[tuple[str, str, str]] = []
+        for archive_ui_path, arch in self._map.items():
+            for e in arch.get('entries', []):
+                ep = e.get('entry_path', '') if isinstance(e, dict) else str(e)
+                if ep and not ep.endswith('/'):
+                    all_entries.append((archive_ui_path, arch['stored_path'], ep))
+
+        total = len(all_entries)
+        self.progress.emit(0, total)
+        hits = done = 0
+
+        for archive_ui_path, stored_path, entry_path in all_entries:
+            if self._stop.is_set():
+                break
+            data = self._read_entry(stored_path, entry_path)
+            if data is None:
+                done += 1
+                self.progress.emit(done, total)
+                continue
+
+            data_lower = data.lower()
+            vpath = f"{archive_ui_path}/{entry_path}"
+            for pat, pat_len, enc in self._patterns:
+                idx = 0
+                while True:
+                    idx = data_lower.find(pat, idx)
+                    if idx == -1:
+                        break
+                    ctx_start = max(0, idx - self._CTX_BYTES)
+                    ctx_end   = min(len(data), idx + pat_len + self._CTX_BYTES)
+                    ctx_bytes = data[ctx_start:ctx_end]
+                    before    = ctx_bytes[:idx - ctx_start]
+                    after     = ctx_bytes[idx - ctx_start + pat_len:]
+                    try:
+                        hit_text = data[idx:idx + pat_len].decode(enc, errors='replace')
+                    except Exception:
+                        hit_text = ''
+                    context = (
+                        before.decode('utf-8', errors='replace')
+                        + f'[{hit_text}]'
+                        + after.decode('utf-8', errors='replace')
+                    )
+                    hits += 1
+                    self.result_found.emit(vpath, idx, context, stored_path, entry_path)
+                    idx += pat_len
+            done += 1
+            self.progress.emit(done, total)
+
+        self.finished.emit(hits, done, total)
+
+
 # ── DbSearchLoader ────────────────────────────────────────────────────────────
 
 class DbSearchLoader(QThread):
@@ -509,6 +612,7 @@ class KeywordSearchMixin:
         """Build the keyword-search tab widget and initialise all search instance state.
         Returns the tab QWidget to be added to center_tabs."""
         self._search_worker: KeywordSearchWorker | None = None
+        self._nested_search_worker: NestedArchiveSearchWorker | None = None
         self._search_index_worker: SearchIndexWorker | None = None
         self._db_loader: DbSearchLoader | None = None
         self._db_loader_term: str = ""
@@ -649,19 +753,25 @@ class KeywordSearchMixin:
         item = self.search_results_model.itemFromIndex(indexes[0])
         if not item:
             return
-        _PATH_ROLE   = Qt.ItemDataRole.UserRole
-        _OFFSET_ROLE = Qt.ItemDataRole.UserRole + 1
-        _PHYS_ROLE   = Qt.ItemDataRole.UserRole + 2
-        path     = item.data(_PATH_ROLE) or ''
-        offset   = item.data(_OFFSET_ROLE)
-        physical = item.data(_PHYS_ROLE)
+        _PATH_ROLE        = Qt.ItemDataRole.UserRole
+        _OFFSET_ROLE      = Qt.ItemDataRole.UserRole + 1
+        _PHYS_ROLE        = Qt.ItemDataRole.UserRole + 2
+        _STORED_PATH_ROLE = Qt.ItemDataRole.UserRole + 3
+        _ENTRY_PATH_ROLE  = Qt.ItemDataRole.UserRole + 4
 
-        if physical and offset is not None:
-            keyword = self.search_field.text().strip()
+        path        = item.data(_PATH_ROLE) or ''
+        offset      = item.data(_OFFSET_ROLE)
+        physical    = item.data(_PHYS_ROLE)
+        stored_path = item.data(_STORED_PATH_ROLE)
+        entry_path  = item.data(_ENTRY_PATH_ROLE)
+
+        keyword = self.search_field.text().strip()
+        if stored_path and entry_path and offset is not None:
+            self.status_bar.showMessage(f'{path}  —  offset: {offset:,}')
+            self._open_nested_hex_from_search(stored_path, entry_path, path, offset, keyword)
+        elif physical and offset is not None:
             self.status_bar.showMessage(f'{path}  —  offset: {offset:,}')
             self._open_hex_from_search(physical, path, offset, keyword)
-        elif physical:
-            self.status_bar.showMessage(path)
         else:
             self.status_bar.showMessage(path)
 
@@ -674,8 +784,13 @@ class KeywordSearchMixin:
             return self.search_results_model.item(item.row(), 1)
         return parent.child(item.row(), 1)
 
-    def _search_add_hit(self, filename: str, offset: int, context: str):
-        """Insert one hit into the fully-nested path tree."""
+    def _search_add_hit(self, filename: str, offset: int, context: str,
+                        stored_path: str | None = None, entry_path: str | None = None):
+        """Insert one hit into the fully-nested path tree.
+
+        stored_path / entry_path are set for nested-archive hits so the
+        click handler can reopen the entry from the stored ZIP.
+        """
         _PATH_ROLE = Qt.ItemDataRole.UserRole
 
         folder   = filename.rsplit('/', 1)[0] if '/' in filename else ''
@@ -712,6 +827,9 @@ class KeywordSearchMixin:
             file_item.setEditable(False)
             file_item.setData(full_file_path, _PATH_ROLE)
             file_item.setData(filename, Qt.ItemDataRole.UserRole + 2)
+            if stored_path:
+                file_item.setData(stored_path, Qt.ItemDataRole.UserRole + 3)
+                file_item.setData(entry_path,  Qt.ItemDataRole.UserRole + 4)
             file_hits = QStandardItem('0')
             file_hits.setEditable(False)
             row = [file_item, file_hits, QStandardItem(''), QStandardItem('')]
@@ -725,6 +843,9 @@ class KeywordSearchMixin:
         hit_item.setData(full_file_path, _PATH_ROLE)
         hit_item.setData(offset, Qt.ItemDataRole.UserRole + 1)
         hit_item.setData(filename, Qt.ItemDataRole.UserRole + 2)
+        if stored_path:
+            hit_item.setData(stored_path, Qt.ItemDataRole.UserRole + 3)
+            hit_item.setData(entry_path,  Qt.ItemDataRole.UserRole + 4)
         hit_row = [hit_item, QStandardItem(''), QStandardItem(context), QStandardItem(str(offset))]
         for cell in hit_row:
             cell.setEditable(False)
@@ -1061,22 +1182,40 @@ class KeywordSearchMixin:
         self._search_worker.finished.connect(self._on_search_finished)
         self._search_worker.start()
 
+        # Start nested archive search in parallel — results trickle in after
+        # the modal dialog closes (main search finishes first).
+        nested_map = getattr(self, '_nested_archive_map', {})
+        if nested_map:
+            self._nested_search_worker = NestedArchiveSearchWorker(nested_map, term)
+            self._nested_search_worker.result_found.connect(self._on_nested_search_result)
+            self._nested_search_worker.start()
+
         self._search_progress_dlg.exec()
 
     def _cancel_keyword_search(self):
         if self._search_worker and self._search_worker.isRunning():
             self._search_worker.stop()
+        if self._nested_search_worker and self._nested_search_worker.isRunning():
+            self._nested_search_worker.stop()
 
     def _stop_keyword_search(self):
         if self._search_worker and self._search_worker.isRunning():
             self._search_worker.stop()
             self._search_worker.wait()
+        if self._nested_search_worker and self._nested_search_worker.isRunning():
+            self._nested_search_worker.stop()
+            self._nested_search_worker.wait()
         self.search_btn.setEnabled(True)
         self.search_stop_btn.setEnabled(False)
 
     def _on_search_result(self, name: str, offset: int, context: str):
         self._search_add_hit(name, offset, context)
         self._pending_db_hits.append((name, offset, context))
+
+    def _on_nested_search_result(self, virtual_ui_path: str, offset: int,
+                                  context: str, stored_path: str, entry_path: str):
+        self._search_add_hit(virtual_ui_path, offset, context,
+                             stored_path=stored_path, entry_path=entry_path)
 
     def _on_search_progress(self, done: int, total: int):
         hits = len(self._search_file_items)

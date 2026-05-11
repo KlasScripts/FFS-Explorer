@@ -335,6 +335,62 @@ class HexViewerMixin:
             self._hex_worker.error.connect(self._on_hex_error)
             self._hex_worker.start()
 
+    def _open_nested_hex_from_search(self, stored_path: str, entry_path: str,
+                                      display_label: str, jump_to: int | None,
+                                      keyword: str) -> None:
+        """Load an entry from a repacked nested archive ZIP into the hex viewer.
+
+        Positions the view around *jump_to* and highlights the keyword,
+        mirroring the behaviour of _open_hex_from_search for FFS zip entries.
+        """
+        if self._hex_worker is not None and self._hex_worker.isRunning():
+            self._hex_worker.terminate()
+            self._hex_worker.wait()
+
+        self._hex_entry        = None
+        self._hex_ui_path      = display_label
+        self._pending_hex_jump = None
+
+        self.hex_view.clear()
+        self.hex_progress_bar.hide()
+
+        try:
+            with zipfile.ZipFile(stored_path, 'r') as zf:
+                data = zf.read(entry_path)
+        except zipfile.BadZipFile:
+            # Gzip-extracted files are stored as raw decompressed blobs.
+            try:
+                with open(stored_path, 'rb') as f:
+                    data = f.read()
+            except Exception as e:
+                self._on_hex_error(str(e))
+                return
+        except Exception as e:
+            self._on_hex_error(str(e))
+            return
+
+        self._hex_file_size  = len(data)
+        self._hex_bytes_buf  = data   # store full buffer so scrolling can page further
+
+        if jump_to is not None:
+            kw_len    = len(keyword.encode('utf-8', errors='replace')) if keyword else 0
+            win_start = max(0, ((jump_to - 10) // 32) * 32)
+            win_end   = min(len(data),
+                            ((jump_to + kw_len + HIT_WINDOW_AFTER + 31) // 32) * 32)
+            chunk = data[win_start:win_end]
+            self._hex_view_start = win_start
+        else:
+            chunk = data[:INITIAL_HEX_BYTES]
+            self._hex_view_start = 0
+
+        self._hex_bytes_loaded = len(chunk)
+        self.hex_view.setPlainText(self._render_hex(chunk, self._hex_view_start))
+        self.preview_tabs.setCurrentIndex(0)
+        self._fit_hex_font()
+        self._update_hex_label()
+        if jump_to is not None:
+            QTimer.singleShot(0, lambda jt=jump_to, kw=keyword: self._jump_to_hex_offset(jt, kw))
+
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _update_hex_label(self):

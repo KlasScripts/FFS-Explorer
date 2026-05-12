@@ -2899,7 +2899,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     self.file_view.setCurrentIndex(proxy_idx)
                     self.file_view.scrollTo(proxy_idx)
                 break
-
+git add .
     def eventFilter(self, obj, event):
         if obj is self.tree_view and event.type() == event.Type.Resize:
             self._update_tree_column()

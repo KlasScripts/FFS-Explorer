@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QComboBox, QSplitter, QStatusBar,
                               QLineEdit, QLabel,
                               QTabWidget, QSizePolicy, QStackedWidget,
-                              QMessageBox, QCheckBox)
+                              QMessageBox, QCheckBox, QAbstractItemView)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
@@ -2312,6 +2312,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.tree_model)
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree_view.setAutoScroll(False)  # Prevent auto-scroll to selection
         self.tree_view.customContextMenuRequested.connect(self.show_tree_context_menu)
         self.tree_view.clicked.connect(self._on_tree_clicked)
         self.tree_view.expanded.connect(self._on_tree_item_expanded)
@@ -2872,15 +2873,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         new_idx = self.tree_model.indexFromItem(current)
         self.tree_view.setCurrentIndex(new_idx)
-        def _scroll():
-            self.tree_view.scrollTo(new_idx, QTreeView.ScrollHint.PositionAtCenter)
-            # EnsureVisible on horizontal only: scroll left until the item's
-            # left edge (including indent) is visible, but no further.
-            rect = self.tree_view.visualRect(new_idx)
-            if rect.x() < 0:
-                hbar = self.tree_view.horizontalScrollBar()
-                hbar.setValue(hbar.value() + rect.x())
-        QTimer.singleShot(0, _scroll)
+        # For programmatic navigation, only scroll when the target is not already visible.
+        rect = self.tree_view.visualRect(new_idx)
+        if not self.tree_view.viewport().rect().contains(rect):
+            self.tree_view.scrollTo(new_idx, QAbstractItemView.ScrollHint.EnsureVisible)
         self._view_is_recursive = False
         self.on_folder_selected(new_idx)
 
@@ -2917,9 +2913,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_view.header().resizeSection(0, max(vw, _TREE_COL_MIN))
 
     def _on_tree_clicked(self, index):
+        # Preserve the horizontal scroll position when a tree item is clicked.
         hpos = getattr(self, '_tree_click_hpos', self.tree_view.horizontalScrollBar().value())
         self.on_folder_selected(index)
-        QTimer.singleShot(150, lambda pos=hpos: self.tree_view.horizontalScrollBar().setValue(pos))
+        QTimer.singleShot(0, lambda hpos=hpos: self.tree_view.horizontalScrollBar().setValue(hpos))
 
     def on_folder_selected(self, index):
         item = self.tree_model.itemFromIndex(index)
@@ -2963,7 +2960,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         new_model.append_rows_batch(batch)
         self._set_file_model(new_model)
 
+        # Resize columns but preserve splitter position
+        splitter_sizes = self.splitter.sizes()
         self.file_view.resizeColumnsToContents()
+        self.splitter.setSizes(splitter_sizes)
         self._refresh_table_status()
 
         # Refresh media tab if it's currently visible
@@ -4095,11 +4095,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _on_tree_item_expanded(self, index):
         """Lazy-load children when a tree node is expanded for the first time.
 
-        The horizontal scroll position is saved before children are added and
-        restored after Qt's internal scrollTo settles, so expanding a node
-        never shifts the tree sideways.
+        The scroll position is saved before children are added and restored
+        after Qt's internal scrollTo settles, so expanding a node keeps the
+        viewport stable.
         """
         hpos = self.tree_view.horizontalScrollBar().value()
+        vpos = self.tree_view.verticalScrollBar().value()
         item = self.tree_model.itemFromIndex(index)
         if item is None or item.rowCount() != 1:
             return
@@ -4113,7 +4114,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         item.removeRow(0)
         self._populate_tree_children(item, path)
         self._tree_populating = False
-        QTimer.singleShot(0, lambda pos=hpos: self.tree_view.horizontalScrollBar().setValue(pos))
+        QTimer.singleShot(0, lambda hpos=hpos, vpos=vpos: (
+            self.tree_view.horizontalScrollBar().setValue(hpos),
+            self.tree_view.verticalScrollBar().setValue(vpos)
+        ))
 
     def _ensure_children_loaded(self, item):
         """If item still holds only a placeholder, replace it with real children."""

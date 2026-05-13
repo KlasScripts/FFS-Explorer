@@ -28,14 +28,14 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller ios_ffs_browser.spec
+          pyinstaller ffs_explorer.spec
 
       - name: Zip the dist folder
         run: |
-          Compress-Archive -Path dist\ios-ffs-browser\* -DestinationPath ios-ffs-browser-windows.zip
+          Compress-Archive -Path dist\ffs-explorer\* -DestinationPath ffs-explorer-windows.zip
 
       - name: Create GitHub Release and upload asset
         uses: softprops/action-gh-release@v2
         with:
-          files: ios-ffs-browser-windows.zip
+          files: ffs-explorer-windows.zip
           generate_release_notes: true   # auto-generates changelog from commits

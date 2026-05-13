@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 block_cipher = None
 
 a = Analysis(
-    ['ios-ffs-browser.py'],
+    ['ffs-explorer.py'],
     pathex=['app'],
     binaries=[],
     datas=[
@@ -52,7 +52,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,          # onedir mode — keeps Qt DLLs alongside exe
-    name='ios-ffs-browser',
+    name='ffs-explorer',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -73,5 +73,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='ios-ffs-browser',         # output folder name inside dist/
+    name='ffs-explorer',         # output folder name inside dist/
 )

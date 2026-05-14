@@ -175,7 +175,7 @@ class FfsAdapter:
 
     FORMAT_GRAYKEY    = "graykey"
     FORMAT_CELLEBRITE = "cellebrite"
-    FORMAT_ZIP_EXTRAS = "zip_extras"   # Android zip with UT/UX extra fields, no msgpack
+    FORMAT_CELLEBRITE_ANDROID = "cellebrite_android"
 
     def __init__(self, fmt: str, user_prefix: str, sys_prefix: str,
                  old_layout: bool = False) -> None:
@@ -193,7 +193,7 @@ class FfsAdapter:
             return cls(cls.FORMAT_GRAYKEY, "private/var", "")
         names = frozenset(z.namelist())
         if any(n.startswith("Dump/") for n in names) and _gk._has_ut_extras(z):
-            return cls(cls.FORMAT_ZIP_EXTRAS, "Dump", "")
+            return cls(cls.FORMAT_CELLEBRITE_ANDROID, "Dump", "")
         return cls.detect_from_names(names)
 
     @classmethod
@@ -224,7 +224,7 @@ class FfsAdapter:
         if self.format == self.FORMAT_GRAYKEY:
             return "/" + ui_path
 
-        if self.format == self.FORMAT_ZIP_EXTRAS:
+        if self.format == self.FORMAT_CELLEBRITE_ANDROID:
             return f"{self.user_prefix}/{ui_path}"
 
         # Fast path: no '-' means no GUID segments (covers ~90% of paths)
@@ -265,7 +265,7 @@ class FfsAdapter:
                 candidates.append(f"/private/var/{s}")
                 candidates.append(s)
                 candidates.append(f"/{s}")
-        elif self.format == self.FORMAT_ZIP_EXTRAS:
+        elif self.format == self.FORMAT_CELLEBRITE_ANDROID:
             for s in suffixes:
                 candidates.append(f"{self.user_prefix}/{s}")
                 candidates.append(s)
@@ -287,7 +287,7 @@ class FfsAdapter:
         GrayKey extractions do not have a separate system-partition prefix so
         bare and leading-slash paths are tried directly."""
         candidates: list[str] = []
-        if self.format == self.FORMAT_ZIP_EXTRAS:
+        if self.format == self.FORMAT_CELLEBRITE_ANDROID:
             for s in suffixes:
                 candidates.append(f"{self.user_prefix}/{s}")
                 candidates.append(s)
@@ -315,7 +315,7 @@ class FfsAdapter:
         """Return default header-scan folder prefixes for this format."""
         if self.format == self.FORMAT_GRAYKEY:
             return ['private/var/mobile/Containers/', 'data/data/']
-        if self.format == self.FORMAT_ZIP_EXTRAS:
+        if self.format == self.FORMAT_CELLEBRITE_ANDROID:
             return ['data/data/']
         return ['mobile/Containers/']
 
@@ -353,7 +353,7 @@ class FfsAdapter:
         if self.format == self.FORMAT_GRAYKEY:
             raw = _gk.extract_metadata(zip_path, z)
             return {k.lstrip("/"): v for k, v in raw.items()}
-        if self.format == self.FORMAT_ZIP_EXTRAS:
+        if self.format == self.FORMAT_CELLEBRITE_ANDROID:
             # Central directory ZipInfo objects are already in memory — no
             # local-header seeks needed.  atime and ctime are always zero in
             # this format; mtime is read from the UT extra block (already in
@@ -473,7 +473,7 @@ class FfsAdapter:
         assert z is not None
 
         # ── GrayKey iOS / Cellebrite Android (zip-extras) ────────────────────
-        if self.format in (self.FORMAT_GRAYKEY, self.FORMAT_ZIP_EXTRAS):
+        if self.format in (self.FORMAT_GRAYKEY, self.FORMAT_CELLEBRITE_ANDROID):
             if self.format == self.FORMAT_GRAYKEY:
                 _emit("Graykey archive detected — extracting metadata...")
                 # GrayKey zip entries have a leading '/' so the prefix mirrors that.

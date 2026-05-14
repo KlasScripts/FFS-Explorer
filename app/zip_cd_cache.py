@@ -243,6 +243,9 @@ class CachedZipView:
         entry = ZipEntry(self._zip_path, info.filename, info)
         return io.BytesIO(entry.read())
 
+    def close(self) -> None:
+        pass
+
     # ── Context manager ───────────────────────────────────────────────────────
 
     def __enter__(self):

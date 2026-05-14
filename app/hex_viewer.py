@@ -57,7 +57,7 @@ def _ascii_col_to_byte(col: int) -> int | None:
 # ── Worker ────────────────────────────────────────────────────────────────────
 
 class HexLoadWorker(QThread):
-    """Fallback worker for compressed zip entries — reads via zipfile decompression."""
+    """Background worker that reads up to LIMIT bytes from a ZipEntry."""
     progress      = Signal(int, int)   # bytes_read, total_bytes
     load_complete = Signal(bytes)
     error         = Signal(str)
@@ -72,16 +72,9 @@ class HexLoadWorker(QThread):
 
     def run(self):
         try:
-            data = bytearray()
-            with zipfile.ZipFile(self.entry.zip_path, 'r') as z:
-                with z.open(self.entry.physical_path) as f:
-                    while len(data) < self.LIMIT:
-                        chunk = f.read(self.CHUNK)
-                        if not chunk:
-                            break
-                        data.extend(chunk)
-                        self.progress.emit(len(data), self.total_bytes)
-            self.load_complete.emit(bytes(data[:self.LIMIT]))
+            data = self.entry.read(self.LIMIT)
+            self.progress.emit(len(data), self.total_bytes)
+            self.load_complete.emit(data)
         except Exception as e:
             self.error.emit(str(e))
 

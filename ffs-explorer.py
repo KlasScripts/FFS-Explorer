@@ -448,17 +448,26 @@ def _read_android_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,
     return fields, label
 
 
-def _read_device_info(zip_path: str) -> tuple[list[tuple[str,str,str]], str]:
+def _read_device_info(zip_path: str, z=None) -> tuple[list[tuple[str,str,str]], str]:
     """Return (fields, label) extracted from the FFS zip.
 
     fields — [(field_name, data, source), ...]
     label  — short display string like 'Apple iPhone 14 Pro · iOS 17.4.1'
     Returns ([], '') on failure.
+
+    *z* may be a CachedZipView (or any zipfile-compatible object); if supplied
+    the zip is not re-opened, avoiding a network central-directory read.
     """
     fields, label = _read_device_info_from_ufd(zip_path)
     if fields:
         return fields, label
     try:
+        if z is not None:
+            ffs_adapter = FfsAdapter.detect(z)
+            result = _read_ios_info(z, ffs_adapter)
+            if not result[0]:
+                result = _read_android_info(z, ffs_adapter)
+            return result
         with zipfile.ZipFile(zip_path, 'r') as z:
             ffs_adapter = FfsAdapter.detect(z)
             result = _read_ios_info(z, ffs_adapter)
@@ -1605,6 +1614,14 @@ class NestedArchiveWorker(QThread):
         except OSError:
             pass
         completed  = self._load_completed(out_dir)
+        cached_view = None
+        if self._streaming_index is None:
+            try:
+                infos = _cd_cache_load(self._zip_path, self._case_dir)
+                if infos:
+                    cached_view = CachedZipView(self._zip_path, infos)
+            except Exception:
+                pass
         ok = err = skipped = 0
         total       = len(self._candidates)
         gzip_types: dict[str, str] = {}
@@ -1617,7 +1634,7 @@ class NestedArchiveWorker(QThread):
                 ok += 1
                 self.item_done.emit(ui_path, True)
                 continue
-            success, gzip_type = self._process_one(ui_path, out_dir)
+            success, gzip_type = self._process_one(ui_path, out_dir, cached_view)
             if success:
                 ok += 1
                 if gzip_type:
@@ -1630,7 +1647,8 @@ class NestedArchiveWorker(QThread):
             self.types_updated.emit(gzip_types)
         self.finished.emit(ok, err)
 
-    def _process_one(self, ui_path: str, out_dir: str) -> tuple[bool, str | None]:
+    def _process_one(self, ui_path: str, out_dir: str,
+                     cached_view=None) -> tuple[bool, str | None]:
         """Process one candidate.  Returns (success, compound_type_or_None).
 
         compound_type is set for gzip files where the decompressed content
@@ -1644,6 +1662,8 @@ class NestedArchiveWorker(QThread):
             # ── Read raw bytes from FFS zip ───────────────────────────────────
             if self._streaming_index is not None:
                 raw = self._streaming_index.get_entry(physical).read()
+            elif cached_view is not None:
+                raw = cached_view.open(physical).read()
             else:
                 with zipfile.ZipFile(self._zip_path, 'r') as zf:
                     raw = zf.read(physical)
@@ -2207,7 +2227,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._metadata_only_folders: set = set()
         self._file_count_cache: dict = {}
         self._precompute_zip_path: str = ""
-        self._zip_handle: zipfile.ZipFile | None = None
+        self._zip_handle: zipfile.ZipFile | CachedZipView | None = None
         self._zip_open_future = None
         self._streaming_index: StreamingZipIndex | None = None
         self._local_extra_delta: int | None = None
@@ -2515,8 +2535,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.proxy_model.set_filter("", -1)
         self._log(f"Filter cleared in: {self._view_path}")
 
-    def _get_zip_handle(self) -> zipfile.ZipFile | None:
-        """Return the shared ZipFile handle, opening it lazily on first use.
+    def _get_zip_handle(self) -> zipfile.ZipFile | CachedZipView | None:
+        """Return the shared zip handle, opening it lazily on first use.
         Returns None for streaming zips — use _streaming_index instead."""
         if self._streaming_index is not None:
             return None
@@ -3003,7 +3023,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 ft = self._header_type_overrides.get(path, 'Other')
             return ft, False, False
         if self._in_zip(path):
-            # Directory entries in FORMAT_ZIP_EXTRAS land in zip_ui_paths with
+            # Directory entries in FORMAT_CELLEBRITE_ANDROID land in zip_ui_paths with
             # their trailing slash stripped — detect them before calling
             # _get_file_type so they never appear as "Other".
             if self._is_empty_folder_entry(path):
@@ -3435,7 +3455,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _is_android_archive(self) -> bool:
         fmt = self._adapter.format
-        if fmt == FfsAdapter.FORMAT_ZIP_EXTRAS:
+        if fmt == FfsAdapter.FORMAT_CELLEBRITE_ANDROID:
             return True
         if fmt == FfsAdapter.FORMAT_GRAYKEY:
             return 'data/data' in self.folder_map
@@ -3639,7 +3659,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._missing_plist_paths = set(missing_plist_paths)
         self._folder_sizes = folder_sizes
         self._zip_ui_paths = zip_ui_paths
-        if ffs_adapter.format != FfsAdapter.FORMAT_ZIP_EXTRAS:
+        if ffs_adapter.format != FfsAdapter.FORMAT_CELLEBRITE_ANDROID:
             self._metadata_only_folders = _find_metadata_only_folders(
                 folder_map, zip_names, zip_ui_paths, ffs_adapter)
         else:
@@ -3661,10 +3681,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._streaming_index    = getattr(self.worker, '_streaming_index', None)
         self._local_extra_delta  = getattr(self.worker, '_local_extra_delta', None)
         if self._streaming_index is None:
-            _path = self.zip_path
-            _ex = ThreadPoolExecutor(max_workers=1)
-            self._zip_open_future = _ex.submit(lambda: zipfile.ZipFile(_path, 'r'))
-            _ex.shutdown(wait=False)
+            # Prefer a CachedZipView built from the local .zcd — avoids
+            # re-reading the central directory from the network zip entirely.
+            if self._case_dir:
+                try:
+                    infos = _cd_cache_load(self.zip_path, self._case_dir)
+                    if infos:
+                        self._zip_handle = CachedZipView(self.zip_path, infos)
+                except Exception:
+                    pass
+            if self._zip_handle is None:
+                _path = self.zip_path
+                _ex = ThreadPoolExecutor(max_workers=1)
+                self._zip_open_future = _ex.submit(lambda: zipfile.ZipFile(_path, 'r'))
+                _ex.shutdown(wait=False)
         self._time_cols = self._detect_time_columns(data)
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'Path'])
@@ -4061,7 +4091,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         tree_w = max(content_w, 280) + self.tree_view.verticalScrollBar().sizeHint().width() + 12
         total = self.splitter.width()
         if total > 0:
-            self.splitter.setSizes([tree_w, max(total - tree_w, 200)])
+            # Cap tree_w so the right panel never drops below 200 px and the
+            # window is never forced to grow — long paths scroll horizontally.
+            tree_w = min(tree_w, total - 200)
+            self.splitter.setSizes([tree_w, total - tree_w])
 
     def _populate_tree_children(self, parent_item, parent_path):
         """Add immediate folder children of parent_path to parent_item.
@@ -4283,7 +4316,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if has_label and has_db_info:
             return
 
-        fields, label = _read_device_info(path)
+        cached_z = None
+        if self._case_dir:
+            try:
+                infos = _cd_cache_load(path, self._case_dir)
+                if infos:
+                    cached_z = CachedZipView(path, infos)
+            except Exception:
+                pass
+        fields, label = _read_device_info(path, z=cached_z)
 
         if self._case_dir:
             try:

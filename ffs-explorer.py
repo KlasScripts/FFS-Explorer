@@ -1103,8 +1103,9 @@ class FileTableModel(QAbstractTableModel):
     filter_progress = Signal(int, int)   # (visible, total)
     filter_done     = Signal(int, int)   # (visible, total)
 
-    _GREY_COLOR = QColor(Qt.GlobalColor.darkGray)
-    _BOLD_FONT  = QFont("Arial", weight=QFont.Weight.ExtraBold)
+    _GREY_COLOR        = QColor(Qt.GlobalColor.darkGray)
+    _BOLD_FONT         = QFont("Arial", weight=QFont.Weight.ExtraBold)
+    _BOLD_ITALIC_FONT  = QFont("Arial", weight=QFont.Weight.ExtraBold, italic=True)
 
     def __init__(self, headers, parent=None):
         super().__init__(parent)
@@ -1142,7 +1143,9 @@ class FileTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.ForegroundRole:
             return self._GREY_COLOR if row[4] else None
         if role == Qt.ItemDataRole.FontRole:
-            return self._BOLD_FONT if row[3] else None
+            if row[3]:
+                return self._BOLD_ITALIC_FONT if (len(row) > 5 and row[5]) else self._BOLD_FONT
+            return None
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
@@ -2955,7 +2958,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             cols = self._build_entry_cols(path, name, meta, is_folder, file_type, fc)
             if has_bundles:
                 cols.append(name if name in self.guid_to_bundle else "")
-            batch.append((cols, path, fc, is_folder and not grey_row, grey_row))
+            is_opened_archive = path in self._nested_archive_map
+            batch.append((cols, path, fc, is_folder and not grey_row, grey_row, is_opened_archive))
 
         new_model.append_rows_batch(batch)
         self._set_file_model(new_model)
@@ -3254,7 +3258,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     meta = self.full_metadata.get(child, {})
                     fc = self._count_files_recursive(child) if is_folder else -1
                     cols = self._build_entry_cols(child, name, meta, is_folder, file_type, fc)
-                    batch_rows.append((cols, child, fc, is_folder and not grey_row, grey_row))
+                    is_opened_archive = child in self._nested_archive_map
+                    batch_rows.append((cols, child, fc, is_folder and not grey_row, grey_row, is_opened_archive))
                     state['count'] += 1
                 if time.monotonic() >= deadline:
                     break  # yield back to the event loop
@@ -3943,7 +3948,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             cols = self._build_entry_cols(path, name, meta, is_folder, file_type, fc)
             if has_bundles:
                 cols.append(name if name in self.guid_to_bundle else "")
-            batch.append((cols, path, fc, is_folder and not grey_row, grey_row))
+            is_opened_archive = path in self._nested_archive_map
+            batch.append((cols, path, fc, is_folder and not grey_row, grey_row, is_opened_archive))
         new_model.append_rows_batch(batch)
         self._set_file_model(new_model)
 

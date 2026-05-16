@@ -3205,7 +3205,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     result.add(path)
             self._collect_checked_paths(item, result)
 
-    def _rebuild_file_view_from_checked(self):
+    def _rebuild_file_view_from_checked(self, preserve_filter: bool = False):
         checked = set()
         self._collect_checked_paths(self.tree_model.invisibleRootItem(), checked)
         self._view_path = ""
@@ -3214,6 +3214,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if checked:
             self.tree_view.clearSelection()
             self.tree_view.setCurrentIndex(QModelIndex())
+
+        # Capture filter state before swapping models (new model has no filter).
+        if preserve_filter:
+            _filter_text = self.filter_input.text()
+            _filter_col  = self.filter_col_combo.currentIndex() - 1
+        else:
+            _filter_text = ""
+            _filter_col  = -1
 
         # Bump generation — any in-flight batch will see the change and abort
         self._load_gen += 1
@@ -3274,6 +3282,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 QTimer.singleShot(0, _process_batch)
             else:
                 self.file_view.resizeColumnsToContents()
+                if _filter_text:
+                    self.proxy_model.set_filter(_filter_text, _filter_col)
                 self._refresh_table_status()
                 self.status_bar.showMessage(
                     f"{state['count']:,} files from {total_folders:,} selected folders")
@@ -3720,7 +3730,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
         if self._view_is_recursive:
-            self._rebuild_file_view_from_checked()
+            self._rebuild_file_view_from_checked(preserve_filter=True)
         else:
             self._refresh_folder_view(preserve_filter=True)
 
@@ -3912,7 +3922,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
         if self._view_is_recursive:
-            self._rebuild_file_view_from_checked()
+            self._rebuild_file_view_from_checked(preserve_filter=True)
         else:
             self._refresh_folder_view(preserve_filter=True)
         self.status_bar.showMessage(

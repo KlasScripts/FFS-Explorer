@@ -1103,8 +1103,9 @@ class FileTableModel(QAbstractTableModel):
     filter_progress = Signal(int, int)   # (visible, total)
     filter_done     = Signal(int, int)   # (visible, total)
 
-    _GREY_COLOR = QColor(Qt.GlobalColor.darkGray)
-    _BOLD_FONT  = QFont("Arial", weight=QFont.Weight.Bold)
+    _GREY_COLOR   = QColor(Qt.GlobalColor.darkGray)
+    _FOLDER_COLOR = QColor(74, 144, 226)   # steel blue — signals clickable folder/archive
+    _BOLD_FONT    = QFont("Arial", weight=QFont.Weight.Bold)
 
     def __init__(self, headers, parent=None):
         super().__init__(parent)
@@ -1140,7 +1141,11 @@ class FileTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.UserRole + 1:
             return row[2]
         if role == Qt.ItemDataRole.ForegroundRole:
-            return self._GREY_COLOR if row[4] else None
+            if row[4]:
+                return self._GREY_COLOR
+            if row[3]:
+                return self._FOLDER_COLOR
+            return None
         if role == Qt.ItemDataRole.FontRole:
             return self._BOLD_FONT if row[3] else None
         return None

@@ -3719,7 +3719,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 db.close()
             except Exception:
                 pass
-        self._refresh_folder_view(preserve_filter=True)
+        if self._view_is_recursive:
+            self._rebuild_file_view_from_checked()
+        else:
+            self._refresh_folder_view(preserve_filter=True)
 
     def _inject_nested_archives(self):
         """Inject extracted nested-archive entries into folder_map and full_metadata
@@ -3908,7 +3911,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 db.close()
             except Exception:
                 pass
-        self._refresh_folder_view(preserve_filter=True)
+        if self._view_is_recursive:
+            self._rebuild_file_view_from_checked()
+        else:
+            self._refresh_folder_view(preserve_filter=True)
         self.status_bar.showMessage(
             f"Header scan: {n_updated} of {n_total} file(s) identified"
         )

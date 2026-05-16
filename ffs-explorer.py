@@ -3820,9 +3820,38 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _on_context_extract_done(self, ui_path: str, ok: int, err: int) -> None:
         QApplication.restoreOverrideCursor()
         if ok > 0:
+            saved_view_path    = self._view_path
+            saved_checked      = set(self._checked_folders)
+            saved_is_recursive = self._view_is_recursive
+            saved_tree_index   = self.tree_view.currentIndex()
+            parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ''
+
             self._inject_nested_archives()
-            self.reload_tree_entirely()
-            self.navigate_tree_to_path(ui_path)
+
+            # Targeted tree update — insert the archive as a navigable folder
+            # without rebuilding the whole tree and losing the user's location.
+            parent_item = self._find_tree_item(parent_path)
+            if parent_item is not None and not self._item_has_placeholder(parent_item):
+                check_state = (Qt.CheckState.Checked
+                               if parent_path in saved_checked
+                               else Qt.CheckState.Unchecked)
+                self._insert_tree_folder_item(parent_item, ui_path, check_state)
+
+            # If the parent folder was checked, include the new archive too.
+            if parent_path in saved_checked:
+                self._checked_folders.add(ui_path)
+
+            # Restore tree selection so the user stays where they were.
+            if saved_tree_index.isValid():
+                self.tree_view.setCurrentIndex(saved_tree_index)
+
+            # Refresh the file view in place — don't navigate away.
+            if saved_is_recursive or saved_checked:
+                self._rebuild_file_view_from_checked()
+            elif saved_view_path == parent_path:
+                self._view_path = saved_view_path
+                self._refresh_folder_view(preserve_filter=True)
+
             self.status_bar.showMessage(
                 f"Extracted: {os.path.basename(ui_path)}", 5000)
         else:
@@ -4138,6 +4167,56 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             child = item.child(row)
             if child is not None:
                 self._ensure_all_descendants_loaded(child)
+
+    def _find_tree_item(self, path: str):
+        """Return the tree QStandardItem for *path* if already loaded, else None."""
+        invisible_root = self.tree_model.invisibleRootItem()
+        if invisible_root.rowCount() == 0:
+            return None
+        current = invisible_root.child(0)  # "/ [Full Filesystem]"
+        if not path:
+            return current
+        for part in (p for p in path.split('/') if p):
+            found = None
+            for row in range(current.rowCount()):
+                child = current.child(row)
+                child_path = child.data(Qt.ItemDataRole.UserRole)
+                if child_path is not None and child_path.split('/')[-1] == part:
+                    found = child
+                    break
+            if found is None:
+                return None
+            current = found
+        return current
+
+    def _item_has_placeholder(self, item) -> bool:
+        """Return True if item's only child is an unloaded placeholder."""
+        return (item.rowCount() == 1
+                and item.child(0) is not None
+                and item.child(0).data(Qt.ItemDataRole.UserRole) == _TREE_PLACEHOLDER)
+
+    def _insert_tree_folder_item(self, parent_item, ui_path: str, check_state):
+        """Insert a folder item for *ui_path* under *parent_item* if not already present."""
+        for row in range(parent_item.rowCount()):
+            child = parent_item.child(row)
+            if child.data(Qt.ItemDataRole.UserRole) == ui_path:
+                return child
+        name = ui_path.split('/')[-1]
+        item = QStandardItem(self._display_name(name))
+        item.setData(ui_path, Qt.ItemDataRole.UserRole)
+        item.setEditable(False)
+        item.setCheckable(True)
+        item.setCheckState(check_state)
+        if self.folder_map.get(ui_path):
+            placeholder = QStandardItem()
+            placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
+            item.appendRow(placeholder)
+        self._tree_populating = True
+        try:
+            parent_item.appendRow(item)
+        finally:
+            self._tree_populating = False
+        return item
 
     def on_tree_item_changed(self, item):
         if self._tree_populating:

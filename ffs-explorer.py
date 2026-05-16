@@ -3205,7 +3205,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     result.add(path)
             self._collect_checked_paths(item, result)
 
-    def _rebuild_file_view_from_checked(self, preserve_filter: bool = False):
+    def _rebuild_file_view_from_checked(self, preserve_filter: bool = False, select_path: str | None = None):
         checked = set()
         self._collect_checked_paths(self.tree_model.invisibleRootItem(), checked)
         self._view_path = ""
@@ -3283,7 +3283,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             else:
                 self.file_view.resizeColumnsToContents()
                 if _filter_text:
+                    if select_path:
+                        _model = self.file_model
+                        def _on_filter_done_select(*_):
+                            _model.filter_done.disconnect(_on_filter_done_select)
+                            self._select_file_by_path(select_path)
+                        _model.filter_done.connect(_on_filter_done_select)
                     self.proxy_model.set_filter(_filter_text, _filter_col)
+                elif select_path:
+                    self._select_file_by_path(select_path)
                 self._refresh_table_status()
                 self.status_bar.showMessage(
                     f"{state['count']:,} files from {total_folders:,} selected folders")
@@ -3330,7 +3338,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             scan_hdr_act = QAction(
                 f"🔬 Scan File Header{'s' if _n > 1 else ''} ({_n})", self)
             scan_hdr_act.triggered.connect(
-                lambda checked=False, paths=_scan_paths: self._scan_selected_headers(paths))
+                lambda checked=False, paths=_scan_paths, primary=ui_path:
+                    self._scan_selected_headers(paths, primary_path=primary))
             menu.addAction(scan_hdr_act)
 
         # Extract nested archive option — shown for unextracted Archive/Compressed files
@@ -3876,12 +3885,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.status_bar.showMessage(
                 f"Extraction failed ({err} error(s)): {os.path.basename(ui_path)}", 5000)
 
-    def _scan_selected_headers(self, ui_paths: list):
+    def _scan_selected_headers(self, ui_paths: list, primary_path: str | None = None):
         if not self.zip_path or not ui_paths:
             return
         n = len(ui_paths)
         self.status_bar.showMessage(f"Scanning {n} file header(s)…")
-        self._single_scan_paths   = ui_paths
+        self._single_scan_paths        = ui_paths
+        self._single_scan_primary_path = primary_path
         self._single_scan_run_id: int | None = None
         if self._case_dir:
             try:
@@ -3921,19 +3931,21 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 db.close()
             except Exception:
                 pass
+        primary = getattr(self, '_single_scan_primary_path', None)
         if self._view_is_recursive:
-            self._rebuild_file_view_from_checked(preserve_filter=True)
+            self._rebuild_file_view_from_checked(preserve_filter=True, select_path=primary)
         else:
-            self._refresh_folder_view(preserve_filter=True)
+            self._refresh_folder_view(preserve_filter=True, select_path=primary)
         self.status_bar.showMessage(
             f"Header scan: {n_updated} of {n_total} file(s) identified"
         )
 
-    def _refresh_folder_view(self, preserve_filter: bool = False):
+    def _refresh_folder_view(self, preserve_filter: bool = False, select_path: str | None = None):
         """Rebuild the file model for the currently displayed folder.
 
         Pass preserve_filter=True when refreshing in-place (e.g. after a
         header scan) so the user's active filter and scroll position are kept.
+        Pass select_path to scroll to and re-select a specific row after refresh.
         """
         if not self._view_path and self._view_path != "":
             return
@@ -3971,8 +3983,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         if preserve_filter:
             if _filter_text:
+                if select_path:
+                    def _on_filter_done_select(*_):
+                        new_model.filter_done.disconnect(_on_filter_done_select)
+                        self._select_file_by_path(select_path)
+                    new_model.filter_done.connect(_on_filter_done_select)
                 self.proxy_model.set_filter(_filter_text, _filter_col)
-            self.file_view.verticalScrollBar().setValue(_scroll_val)
+            else:
+                self.file_view.verticalScrollBar().setValue(_scroll_val)
+                if select_path:
+                    self._select_file_by_path(select_path)
+        elif select_path:
+            self._select_file_by_path(select_path)
 
         self.file_view.resizeColumnsToContents()
         self._refresh_table_status()
@@ -4239,6 +4261,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         finally:
             self._tree_populating = False
         return item
+
+    def _select_file_by_path(self, path: str) -> None:
+        """Select and scroll to the file-browser row for *path*, if visible."""
+        for row in range(self.file_model.rowCount()):
+            if self.file_model._rows[row][1] == path:
+                src_idx   = self.file_model.index(row, 0)
+                proxy_idx = self.proxy_model.mapFromSource(src_idx)
+                if proxy_idx.isValid():
+                    self.file_view.selectRow(proxy_idx.row())
+                    self.file_view.scrollTo(
+                        proxy_idx, QAbstractItemView.ScrollHint.EnsureVisible)
+                return
 
     def on_tree_item_changed(self, item):
         if self._tree_populating:

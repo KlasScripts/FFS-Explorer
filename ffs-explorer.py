@@ -3825,16 +3825,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _on_context_extract_done(self, ui_path: str, ok: int, err: int) -> None:
         QApplication.restoreOverrideCursor()
         if ok > 0:
-            saved_view_path    = self._view_path
             saved_checked      = set(self._checked_folders)
             saved_is_recursive = self._view_is_recursive
-            saved_tree_index   = self.tree_view.currentIndex()
             parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ''
 
             self._inject_nested_archives()
 
-            # Targeted tree update — insert the archive as a navigable folder
-            # without rebuilding the whole tree and losing the user's location.
+            # Insert the archive into the tree as an unchecked navigable folder,
+            # or checked if its parent folder was already ticked.
             parent_item = self._find_tree_item(parent_path)
             if parent_item is not None and not self._item_has_placeholder(parent_item):
                 check_state = (Qt.CheckState.Checked
@@ -3842,20 +3840,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                                else Qt.CheckState.Unchecked)
                 self._insert_tree_folder_item(parent_item, ui_path, check_state)
 
-            # If the parent folder was checked, include the new archive too.
-            if parent_path in saved_checked:
-                self._checked_folders.add(ui_path)
-
-            # Restore tree selection so the user stays where they were.
-            if saved_tree_index.isValid():
-                self.tree_view.setCurrentIndex(saved_tree_index)
-
-            # Refresh the file view in place — don't navigate away.
             if saved_is_recursive or saved_checked:
+                # Multi-folder mode — include the new archive if its parent was ticked.
+                if parent_path in saved_checked:
+                    self._checked_folders.add(ui_path)
                 self._rebuild_file_view_from_checked()
-            elif saved_view_path == parent_path:
-                self._view_path = saved_view_path
-                self._refresh_folder_view(preserve_filter=True)
+            else:
+                # Navigate into the extracted archive: select it in the tree
+                # (no tick) and show its contents in the file browser.
+                self.navigate_tree_to_path(ui_path)
 
             self.status_bar.showMessage(
                 f"Extracted: {os.path.basename(ui_path)}", 5000)

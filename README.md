@@ -2,7 +2,7 @@
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PySide6](https://img.shields.io/badge/UI-PySide6-green.svg)](https://pypi.org/project/PySide6/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 A forensic-grade desktop application for browsing **iOS & Android Full File System (FFS)** extractions. This tool allows you to explore images from **GrayKey** and **Cellebrite UFED** directly from the ZIP archive with no unpacking required.
 
@@ -74,3 +74,11 @@ Standard ZIP libraries often fail to reconstruct forensic images correctly becau
 ## 🤝 Contributing
 
 This tool is designed for the DF community. Pull requests for new vendor formats or artefact shortcuts are welcome.
+
+---
+
+## 📄 Licence
+
+FFS Explorer is released under the **GNU General Public License v3.0**.
+
+You are free to use, modify, and distribute this software. If you distribute a modified version — including bundling it in a commercial product — you must release the source code of your modifications under the same GPL v3 licence. See [LICENSE](LICENSE) for the full terms.

@@ -32,7 +32,11 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       upsert_device_info_field,
                       start_run_log, complete_run_log, load_last_run,
                       save_nested_archive, save_nested_archive_entries,
-                      load_nested_archives, load_nested_archive_entries)
+                      save_nested_archive_failure,
+                      load_nested_archives, load_nested_archive_entries,
+                      load_bookmark_groups, save_bookmark_group,
+                      save_bookmark_entries, load_bookmark_entries,
+                      delete_bookmark_group, delete_bookmark_entry)
 import header_scan
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
@@ -53,7 +57,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QLineEdit, QLabel,
                               QTabWidget, QSizePolicy, QStackedWidget,
                               QMessageBox, QCheckBox, QAbstractItemView,
-                              QTreeWidget, QTreeWidgetItem)
+                              QTreeWidget, QTreeWidgetItem, QTextEdit,
+                              QListWidget, QListWidgetItem)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
@@ -62,7 +67,9 @@ from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
 
 FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface responsive at 60 fps while the tree builds
 
-_TREE_PLACEHOLDER = "__placeholder__"
+_TREE_PLACEHOLDER  = "__placeholder__"
+_BM_ROOT           = "__bookmarks__"
+_BM_GROUP_PREFIX   = "__bm_group_"
 # Minimum tree column width (px).  The column always fills the panel, but never
 # shrinks below this so deeply-indented items can be reached via horizontal scroll.
 _TREE_COL_MIN = 1000
@@ -1802,6 +1809,12 @@ class NestedArchiveWorker(QThread):
             msg = str(exc)
             self.item_error.emit(ui_path, msg)
             try:
+                db = _open_cache_db(self._case_dir)
+                save_nested_archive_failure(db, ui_path, msg)
+                db.close()
+            except Exception:
+                pass
+            try:
                 log_path = os.path.join(self._case_dir, 'nested_archive_errors.log')
                 ts = datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
                 with open(log_path, 'a', encoding='utf-8') as lf:
@@ -2093,23 +2106,52 @@ class ProcessDialog(QDialog):
         """Load header overrides, discover archives, show selection dialog, then extract."""
         overrides = {}
         guid_to_bundle = {}
-        already_extracted: set[str] = set()
         if self._case_dir:
             try:
                 db = _open_cache_db(self._case_dir)
                 overrides = load_header_types(db)
                 guid_to_bundle = load_guid_bundle_map(db)
-                already_extracted = {r['ui_path'] for r in load_nested_archives(db)}
                 db.close()
             except Exception:
                 pass
 
         archives = _discover_all_archives(self._ui_metadata, self._adapter, overrides)
-        # Split into new (selectable) and already-done (display-only)
-        new_archives  = [a for a in archives if a['ui_path'] not in already_extracted]
+
+        # Build lookup: ui_path -> DB record (includes error_msg)
+        db_records: dict[str, dict] = {}
+        if self._case_dir:
+            try:
+                db = _open_cache_db(self._case_dir)
+                for r in load_nested_archives(db):
+                    db_records[r['ui_path']] = r
+                db.close()
+            except Exception:
+                pass
+
+        already_extracted = {p for p, r in db_records.items() if not r.get('error_msg')}
+        already_failed    = {p for p, r in db_records.items() if r.get('error_msg')}
+
+        # New: not yet attempted. Done: succeeded. Failed: previously errored (retryable).
+        new_archives  = [a for a in archives if a['ui_path'] not in db_records]
         done_archives = [a for a in archives if a['ui_path'] in already_extracted]
 
-        if not new_archives and not done_archives:
+        # Include ALL DB failure records — even ones outside current scan paths.
+        arch_lookup = {a['ui_path']: a for a in archives}
+        failed_archives = []
+        for path in already_failed:
+            err = db_records[path].get('error_msg', '')
+            discovered = arch_lookup.get(path)
+            if discovered:
+                failed_archives.append(dict(discovered, error_msg=err))
+            else:
+                failed_archives.append({
+                    'ui_path':   path,
+                    'file_type': _get_file_type(path.rsplit('/', 1)[-1]),
+                    'error_msg': err,
+                    'mtime':     0,
+                })
+
+        if not new_archives and not done_archives and not failed_archives:
             self._status_label.setText("No archive files found across all scanned locations.")
             self._finish_operations()
             return
@@ -2118,7 +2160,8 @@ class ProcessDialog(QDialog):
                       any(a['category'] in ('AndroidApp', 'AndroidMedia') for a in archives))
         dlg = ArchiveSelectionDialog(new_archives, guid_to_bundle=guid_to_bundle,
                                      is_android=is_android,
-                                     done_archives=done_archives, parent=self)
+                                     done_archives=done_archives,
+                                     failed_archives=failed_archives, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.selected_paths:
             self._status_label.setText("Archive selection cancelled.")
             self._finish_operations()
@@ -2267,6 +2310,7 @@ class ArchiveSelectionDialog(QDialog):
 
     def __init__(self, archives: list[dict], guid_to_bundle: dict | None = None,
                  is_android: bool = False, done_archives: list[dict] | None = None,
+                 failed_archives: list[dict] | None = None,
                  parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select Archives for Extraction")
@@ -2275,6 +2319,7 @@ class ArchiveSelectionDialog(QDialog):
         self.selected_paths: list[str] = []
         self._archives = archives
         self._done_archives = done_archives or []
+        self._failed_archives = failed_archives or []
         self._guid_to_bundle = guid_to_bundle or {}
         self._is_android = is_android
         self._updating = False
@@ -2284,13 +2329,18 @@ class ArchiveSelectionDialog(QDialog):
 
         n = len(archives)
         n_done = len(self._done_archives)
+        n_fail = len(self._failed_archives)
+        parts = []
+        if n_done:
+            parts.append(f"{n_done:,} previously extracted")
+        if n_fail:
+            parts.append(f"{n_fail:,} previously failed")
         if n == 0:
-            header = (f"All {n_done:,} archive{'s' if n_done != 1 else ''} have already "
-                      "been extracted. Previously extracted archives are shown below.")
+            header = (", ".join(parts).capitalize() + ". "
+                      if parts else "") + "No new archives to extract."
         else:
             header = (f"<b>{n:,} archive{'s' if n != 1 else ''} available for extraction.</b>"
-                      + (f" ({n_done:,} previously extracted, shown below.)"
-                         if n_done else ""))
+                      + (f" ({', '.join(parts)}, shown below.)" if parts else ""))
         layout.addWidget(QLabel(header))
 
         self._tree = QTreeWidget()
@@ -2380,8 +2430,39 @@ class ArchiveSelectionDialog(QDialog):
             self._build_tree_android()
         else:
             self._build_tree_ios()
+        if self._failed_archives:
+            self._build_tree_failed()
         if self._done_archives:
             self._build_tree_done()
+
+    def _build_tree_failed(self):
+        """Append a collapsed, pre-checked 'Previously Failed' section (retryable)."""
+        n = len(self._failed_archives)
+        group = QTreeWidgetItem(self._tree)
+        group.setText(0, f"Previously Failed — retry?  ({n:,})")
+        group.setText(1, "")
+        group.setCheckState(0, Qt.CheckState.Checked)
+        group.setExpanded(False)
+        red = group.foreground(0)
+        red.setColor(Qt.GlobalColor.red)
+        group.setForeground(0, red)
+        group.setForeground(1, red)
+        font = group.font(0)
+        font.setBold(True)
+        group.setFont(0, font)
+
+        for arc in sorted(self._failed_archives,
+                          key=lambda a: a.get('mtime', 0), reverse=True):
+            item = QTreeWidgetItem(group)
+            item.setText(0, _display_path(arc['ui_path'], self._guid_to_bundle))
+            item.setText(1, arc.get('file_type', ''))
+            item.setCheckState(0, Qt.CheckState.Checked)
+            item.setData(0, Qt.ItemDataRole.UserRole, arc['ui_path'])
+            err = arc.get('error_msg', '')
+            if err:
+                item.setToolTip(0, err)
+            item.setForeground(0, red)
+            item.setForeground(1, red)
 
     def _build_tree_done(self):
         """Append a collapsed, non-checkable 'Previously Extracted' section."""
@@ -2533,7 +2614,7 @@ class ArchiveSelectionDialog(QDialog):
     def _refresh_count(self):
         selected = self._collect_selected()
         n = len(selected)
-        total = len(self._archives)
+        total = len(self._archives) + len(self._failed_archives)
         self._count_label.setText(f"{n:,} of {total:,} archives selected")
         self._extract_btn.setText(f"Extract Selected ({n:,})")
         self._extract_btn.setEnabled(n > 0)
@@ -2705,23 +2786,19 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.action_btn.clicked.connect(self._open_new_ffs)
         self.open_export_btn = QPushButton("Open Export Folder")
         self.open_export_btn.clicked.connect(self.ensure_and_open_export_dir)
-        self.folder_view_btn = QPushButton("Folder View ▾")
-        self.folder_view_btn.clicked.connect(self._show_view_mode_menu)
+        self.folder_view_btn = QPushButton("Show Empty Folders")
+        self.folder_view_btn.setCheckable(True)
+        self.folder_view_btn.setChecked(False)
+        self.folder_view_btn.toggled.connect(self._on_folder_view_toggled)
         self.action_btn.setFixedWidth(90)
         self.open_export_btn.setFixedWidth(150)
-        self.folder_view_btn.setFixedWidth(110)
+        self.folder_view_btn.setFixedWidth(150)
         archive_bar.addWidget(self.archive_dropdown, 1)
         archive_bar.addWidget(self.action_btn)
         archive_bar.addWidget(self.open_export_btn)
         archive_bar.addWidget(self.folder_view_btn)
         layout.addLayout(archive_bar)
 
-        # ── Folder view options ───────────────────────────────────────────
-        self._view_mode_menu = QMenu(self)
-        self._hide_empty_act = self._view_mode_menu.addAction("Hide Empty && Metadata-Only Folders")
-        self._hide_empty_act.setCheckable(True)
-        self._hide_empty_act.setChecked(True)
-        self._view_mode_menu.triggered.connect(self._on_view_mode_action)
 
         _section_style = (
             "font-weight: bold; padding: 3px 6px;"
@@ -2770,7 +2847,34 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(2)
         left_layout.addLayout(tree_top)
-        left_layout.addWidget(self.tree_view)
+
+        # Vertical splitter: tree_view top, bookmark panel bottom.
+        self.left_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.left_splitter.addWidget(self.tree_view)
+
+        self._bookmark_panel = QWidget()
+        _bm_layout = QVBoxLayout(self._bookmark_panel)
+        _bm_layout.setContentsMargins(0, 0, 0, 0)
+        _bm_layout.setSpacing(0)
+        _bm_hdr = QLabel("Bookmarks")
+        _bm_hdr.setStyleSheet(
+            "font-size: 11px; font-weight: bold; padding: 2px 4px;"
+            " background: palette(mid); border-top: 1px solid palette(dark);")
+        _bm_layout.addWidget(_bm_hdr)
+        self._bookmark_list = QListWidget()
+        self._bookmark_list.setFrameShape(QListWidget.Shape.NoFrame)
+        self._bookmark_list.clicked.connect(self._on_bookmark_item_clicked)
+        self._bookmark_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._bookmark_list.customContextMenuRequested.connect(
+            self._show_bookmark_panel_menu)
+        _bm_layout.addWidget(self._bookmark_list)
+        self.left_splitter.addWidget(self._bookmark_panel)
+        self.left_splitter.setStretchFactor(0, 1)   # tree takes all extra space
+        self.left_splitter.setStretchFactor(1, 0)   # bookmark panel stays compact
+        self.left_splitter.setCollapsible(1, True)
+
+        left_layout.addWidget(self.left_splitter)
         self.splitter.addWidget(left_panel)
         self.splitter.setCollapsible(0, True)
 
@@ -3563,6 +3667,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 rec_act.triggered.connect(lambda: self._recursive_tick_folder(index))
             menu.addAction(rec_act)
             menu.addSeparator()
+            # Bookmark: all files recursively under this folder
+            tree_bm_paths = [
+                (p, p.rsplit('/', 1)[-1])
+                for p in self._collect_files_recursive(folder_path)
+            ]
+            if tree_bm_paths:
+                self._bookmark_submenu(menu, tree_bm_paths)
+                menu.addSeparator()
         export_act = QAction("📁 Export Folder (Recursive)", self)
         export_act.triggered.connect(lambda: self.handle_export_request(is_tree=True))
         menu.addAction(export_act)
@@ -3775,6 +3887,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     lambda checked=False, p=ui_path: self._extract_from_context_menu(p))
                 menu.addAction(extract_act)
 
+        # Bookmarks submenu
+        bm_paths = self._get_paths_for_bookmark()
+        if bm_paths:
+            menu.addSeparator()
+            self._bookmark_submenu(menu, bm_paths)
+
         menu.exec(self.file_view.viewport().mapToGlobal(point))
 
     def handle_export_request(self, is_tree=True):
@@ -3828,14 +3946,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if root:
             self.tree_view.expand(self.tree_model.indexFromItem(root))
 
-    def _show_view_mode_menu(self):
-        self._view_mode_menu.exec(
-            self.folder_view_btn.mapToGlobal(self.folder_view_btn.rect().bottomLeft()))
-
-    def _on_view_mode_action(self, action):
-        if action is self._hide_empty_act:
-            self._hide_empty_folders = action.isChecked()
-            self.reload_tree_entirely()
+    def _on_folder_view_toggled(self, checked: bool):
+        self._hide_empty_folders = not checked
+        self.folder_view_btn.setText(
+            "Hide Empty Folders" if checked else "Show Empty Folders"
+        )
+        self.reload_tree_entirely()
 
     def _detect_time_columns(self, ui_metadata: dict) -> list[tuple[str, str]]:
         """Return [(header, meta_key)] for the time columns to show for this archive.
@@ -4240,8 +4356,39 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._nested_virtual_paths = frozenset(virtual_paths)
 
     def _on_nested_extraction_done(self):
+        saved_checked = set(self._checked_folders)
+        before = set(self._nested_archive_map.keys())
+
         self._inject_nested_archives()
-        self.reload_tree_entirely()
+
+        new_archives = set(self._nested_archive_map.keys()) - before
+
+        # Insert newly-extracted archive folders into the tree where their
+        # parent is already visible, and auto-tick them when their parent
+        # was checked so children appear in the aggregate file view.
+        for ui_path in sorted(new_archives):
+            parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ''
+            parent_item = self._find_tree_item(parent_path)
+            if parent_item is None:
+                continue
+            # Collect existing sibling paths before inserting the new item.
+            sibling_paths = []
+            if not self._item_has_placeholder(parent_item):
+                for row in range(parent_item.rowCount()):
+                    child = parent_item.child(row)
+                    cp = child.data(Qt.ItemDataRole.UserRole)
+                    if cp and cp != _TREE_PLACEHOLDER:
+                        sibling_paths.append(cp)
+            # Auto-tick when the parent was ticked AND every existing sibling
+            # was already ticked (vacuously true when there are no siblings).
+            auto_tick = (parent_path in saved_checked and
+                         all(s in saved_checked for s in sibling_paths))
+            check_state = (Qt.CheckState.Checked if auto_tick
+                           else Qt.CheckState.Unchecked)
+            self._insert_tree_folder_item(parent_item, ui_path, check_state)
+
+        if new_archives:
+            self._rebuild_file_view_from_checked(preserve_filter=True)
 
     def _extract_from_context_menu(self, ui_path: str) -> None:
         """Extract a single archive right-click entry without opening ProcessDialog."""
@@ -4500,6 +4647,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if hasattr(self, '_adapter') and self._adapter.format == FfsAdapter.FORMAT_GRAYKEY:
             QTimer.singleShot(0, self._expand_to_private_var)
         QTimer.singleShot(0, self._fit_splitter_to_tree)
+        QTimer.singleShot(0, self._refresh_bookmark_panel)
 
     def _populate_tree_children_batched(self, parent_item, parent_path, on_done=None):
         """Add immediate folder children of parent_path in frame-sized batches
@@ -4554,6 +4702,259 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         total = self.splitter.width()
         if total > 0:
             self.splitter.setSizes([tree_w, max(total - tree_w, 200)])
+
+    # ── Bookmarks ─────────────────────────────────────────────────────────────
+
+    def _refresh_bookmark_panel(self):
+        """Repopulate the bookmark list panel below the folder tree."""
+        if not getattr(self, '_case_dir', None):
+            return
+        try:
+            db = _open_results_db(self._case_dir)
+            groups = load_bookmark_groups(db)
+            if not groups:
+                save_bookmark_group(db, 'Evidence', 'Files directly relevant to the investigation')
+                save_bookmark_group(db, 'Interesting', 'Files worth reviewing further')
+                groups = load_bookmark_groups(db)
+            db.close()
+        except Exception:
+            return
+        self._bookmark_list.clear()
+        for g in groups:
+            item = QListWidgetItem(f"{g['name']}  ({g['count']:,})")
+            item.setData(Qt.ItemDataRole.UserRole, g['id'])
+            if g.get('description'):
+                item.setToolTip(g['description'])
+            self._bookmark_list.addItem(item)
+        # Fix the list height to exactly fit its rows (up to a cap), then scroll.
+        MAX_VISIBLE = 8
+        row_h = self._bookmark_list.sizeHintForRow(0) if groups else 22
+        if row_h <= 0:
+            row_h = 22
+        list_h = row_h * min(len(groups), MAX_VISIBLE) + 2
+        self._bookmark_list.setFixedHeight(list_h)
+        # Keep search scope combo in sync with current bookmark groups.
+        if hasattr(self, 'search_scope_combo'):
+            self._refresh_search_scope_combo()
+
+    def _on_bookmark_item_clicked(self, index):
+        group_id = self._bookmark_list.item(index.row()).data(Qt.ItemDataRole.UserRole)
+        if group_id is not None:
+            self._show_bookmark_group(int(group_id))
+
+    def _show_bookmark_panel_menu(self, point):
+        item = self._bookmark_list.itemAt(point)
+        menu = QMenu(self)
+        new_act = QAction("New Group…", self)
+        new_act.triggered.connect(lambda: self._new_bookmark_group_dialog([]))
+        menu.addAction(new_act)
+        if item is not None:
+            group_id = item.data(Qt.ItemDataRole.UserRole)
+            menu.addSeparator()
+            del_act = QAction(f"Delete '{item.text().split('  (')[0]}'", self)
+            del_act.triggered.connect(
+                lambda _, gid=group_id: self._delete_bookmark_group(gid))
+            menu.addAction(del_act)
+        menu.exec(self._bookmark_list.viewport().mapToGlobal(point))
+
+    def _delete_bookmark_group(self, group_id: int):
+        try:
+            db = _open_results_db(self._case_dir)
+            delete_bookmark_group(db, group_id)
+            db.close()
+        except Exception as e:
+            QMessageBox.warning(self, "Bookmark Error", str(e))
+            return
+        self._refresh_bookmark_panel()
+
+    def _show_bookmark_group(self, group_id: int):
+        """Populate the file browser with entries from a bookmark group."""
+        if not self._case_dir:
+            return
+        try:
+            db = _open_results_db(self._case_dir)
+            entries = load_bookmark_entries(db, group_id)
+            groups  = load_bookmark_groups(db)
+            db.close()
+        except Exception:
+            return
+        group = next((g for g in groups if g['id'] == group_id), None)
+        group_name = group['name'] if group else 'Bookmarks'
+
+        headers = self.file_headers + ['Bookmarked']
+        new_model = FileTableModel(headers)
+        self._update_filter_columns(headers)
+        self.filter_input.clear()
+        self.proxy_model.set_filter("", -1)
+
+        batch = []
+        for entry in entries:
+            ui_path = entry['ui_path']
+            meta = self.full_metadata.get(ui_path, {})
+            name = (meta.get('_display_name')
+                    or entry.get('display_name')
+                    or ui_path.rsplit('/', 1)[-1])
+            is_folder = ui_path in self.folder_map
+            file_type, grey_row, skip = self._classify_entry(ui_path, name, is_folder)
+            if skip:
+                continue
+            fc = self._count_files_recursive(ui_path) if is_folder else -1
+            cols = self._build_entry_cols(ui_path, name, meta, is_folder, file_type, fc)
+            # Append bookmarked timestamp as plain readable string.
+            bm_ts = entry.get('bookmarked_at', '')
+            if bm_ts:
+                bm_ts = bm_ts.replace('T', ' ')
+            cols.append(bm_ts)
+            batch.append((cols, ui_path, fc, is_folder and not grey_row,
+                          grey_row, ui_path in self._nested_archive_map))
+
+        new_model.append_rows_batch(batch)
+        self._view_path = f"{_BM_GROUP_PREFIX}{group_id}"
+        self._view_is_recursive = False
+        self._set_file_model(new_model)
+        n = len(entries)
+        self.status_bar.showMessage(
+            f"Bookmarks: {group_name}  —  {n:,} entr{'y' if n == 1 else 'ies'}")
+
+    def _is_folder_path(self, ui_path: str) -> bool:
+        """True if ui_path is a folder (real or empty directory entry)."""
+        return ui_path in self.folder_map or self._is_empty_folder_entry(ui_path)
+
+    def _collect_files_recursive(self, folder_path: str) -> list[str]:
+        """Return all file paths under folder_path, depth-first, excluding folders."""
+        files: list[str] = []
+        seen: set[str] = {folder_path}   # also prevents folder_path itself appearing in output
+        stack = [folder_path]
+        while stack:
+            current = stack.pop()
+            for child in self.folder_map.get(current, []):
+                if child in seen:
+                    continue
+                seen.add(child)
+                if self._is_folder_path(child):
+                    stack.append(child)
+                else:
+                    files.append(child)
+        return files
+
+    def _get_paths_for_bookmark(self) -> list[tuple[str, str]]:
+        """Return [(ui_path, display_name)] for the current file-browser selection.
+
+        Folder rows are expanded to their immediate file children.
+        """
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for idx in self.file_view.selectionModel().selectedRows():
+            src = self.proxy_model.mapToSource(idx)
+            ui_path = self.file_model.index(src.row(), 0).data(Qt.ItemDataRole.UserRole)
+            if not ui_path or ui_path in seen:
+                continue
+            if ui_path in self.folder_map:
+                for child in self._collect_files_recursive(ui_path):
+                    if child not in seen:
+                        seen.add(child)
+                        result.append((child, child.rsplit('/', 1)[-1]))
+            else:
+                seen.add(ui_path)
+                result.append((ui_path, ui_path.rsplit('/', 1)[-1]))
+        return result
+
+    def _bookmark_submenu(self, menu: 'QMenu', paths: list) -> None:
+        """Append a populated Bookmarks submenu to *menu*."""
+        if not paths or not self._case_dir:
+            return
+        try:
+            db = _open_results_db(self._case_dir)
+            groups = load_bookmark_groups(db)
+            db.close()
+        except Exception:
+            groups = []
+        bm_menu = menu.addMenu("Bookmarks")
+        for g in groups:
+            act = QAction(f"{g['name']}  ({g['count']:,})", self)
+            act.triggered.connect(
+                lambda _, gid=g['id']: self._add_to_bookmark_group(paths, gid))
+            bm_menu.addAction(act)
+        if groups:
+            bm_menu.addSeparator()
+        new_act = QAction("New Group…", self)
+        new_act.triggered.connect(lambda: self._new_bookmark_group_dialog(paths))
+        bm_menu.addAction(new_act)
+
+    def _add_to_bookmark_group(self, paths: list, group_id: int):
+        """Save *paths* into an existing bookmark group."""
+        if not self._case_dir:
+            return
+        try:
+            db = _open_results_db(self._case_dir)
+            save_bookmark_entries(db, group_id, paths)
+            groups = load_bookmark_groups(db)
+            db.close()
+        except Exception as e:
+            QMessageBox.warning(self, "Bookmark Error", str(e))
+            return
+        group = next((g for g in groups if g['id'] == group_id), None)
+        name = group['name'] if group else ''
+        n = len(paths)
+        self.status_bar.showMessage(
+            f"Added {n:,} file{'s' if n != 1 else ''} to '{name}'", 4000)
+        self._refresh_bookmark_panel()
+
+    def _new_bookmark_group_dialog(self, paths: list):
+        """Show a dialog to name and describe a new bookmark group, then save."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("New Bookmark Group")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(400)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(f"Creating bookmark group for {len(paths):,} "
+                                f"file{'s' if len(paths) != 1 else ''}."))
+        layout.addWidget(QLabel("Group name (required):"))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("e.g. Suspect documents")
+        layout.addWidget(name_edit)
+        layout.addWidget(QLabel("Description (optional):"))
+        desc_edit = QTextEdit()
+        desc_edit.setFixedHeight(60)
+        desc_edit.setPlaceholderText("Purpose or notes about this group…")
+        layout.addWidget(desc_edit)
+        err_label = QLabel()
+        err_label.setStyleSheet("color: red;")
+        layout.addWidget(err_label)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        ok_btn = QPushButton("Create && Add")
+        ok_btn.setDefault(True)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        def _try_create():
+            name = name_edit.text().strip()
+            if not name:
+                err_label.setText("Name cannot be blank.")
+                return
+            desc = desc_edit.toPlainText().strip()
+            try:
+                db = _open_results_db(self._case_dir)
+                group_id = save_bookmark_group(db, name, desc)
+                save_bookmark_entries(db, group_id, paths)
+                db.close()
+            except Exception as e:
+                err_label.setText(str(e))
+                return
+            dlg.accept()
+            n = len(paths)
+            self.status_bar.showMessage(
+                f"Created '{name}' with {n:,} file{'s' if n != 1 else ''}", 4000)
+            self._refresh_bookmark_panel()
+
+        ok_btn.clicked.connect(_try_create)
+        dlg.exec()
+
+    # ── End bookmarks ──────────────────────────────────────────────────────────
 
     def _populate_tree_children(self, parent_item, parent_path):
         """Add immediate folder children of parent_path to parent_item.

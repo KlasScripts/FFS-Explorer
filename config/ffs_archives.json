@@ -1,13 +1,8 @@
 [
   {
-    "path": "/Users/klastveita/script/test data/Android 14 CTF26 Magnet/R5CW32F0PQH_files_full.zip",
-    "case_dir": "/Users/klastveita/script/case_data/Android 14 CTF26 Magnet",
-    "label": "Samsung Galaxy A53 5G \u00b7 Android 14"
-  },
-  {
-    "path": "/Users/klastveita/script/test data/IOS17 JoshHickman/EXTRACTION_FFS.zip",
-    "case_dir": "/Users/klastveita/script/case_data/IOS17 JoshHickman/",
-    "label": "Apple iPhone 11 \u00b7 iOS 17.3"
+    "path": "/Users/klastveita/script/test data/Android 15 CTF25 Cellebrite/EXTRACTION_FFS.zip",
+    "case_dir": "/Users/klastveita/script/case_data/Android 15 CTF25 Cellebrite",
+    "label": "Xiaomi Poco x7 pro \u00b7 Android 15"
   },
   {
     "path": "/Users/klastveita/script/test data/IOS18 CTF25 Magnet/00008110-0008196A2299401E_files_full.zip",
@@ -15,8 +10,13 @@
     "label": "Apple iPhone 14 Plus \u00b7 iOS 18.0"
   },
   {
-    "path": "/Users/klastveita/script/test data/Android 15 CTF25 Cellebrite/EXTRACTION_FFS.zip",
-    "case_dir": "/Users/klastveita/script/case_data/Android 15 CTF25 Cellebrite",
-    "label": "Xiaomi Poco x7 pro \u00b7 Android 15"
+    "path": "/Users/klastveita/script/test data/Android 14 CTF26 Magnet/R5CW32F0PQH_files_full.zip",
+    "case_dir": "/Users/klastveita/script/case_data/Android 14 CTF26 Magnet",
+    "label": "Samsung Galaxy A53 5G \u00b7 Android 14"
+  },
+  {
+    "path": "/Users/klastveita/script/test data/IOS17 JoshHickman/EXTRACTION_FFS.zip",
+    "case_dir": "/Users/klastveita/script/case_data/IOS17 JoshHickman",
+    "label": "Apple iPhone 11 \u00b7 iOS 17.3"
   }
 ]

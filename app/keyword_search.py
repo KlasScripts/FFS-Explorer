@@ -12,10 +12,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import msgpack
 
 from adapters import FfsAdapter
-from db_utils import _open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob
+from db_utils import (_open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob,
+                      load_bookmark_groups, load_bookmark_entries)
 from zip_cd_cache import load as _zcd_load, compute_data_offsets as _compute_data_offsets
 
 _SEARCH_ENTRIES_VERSION = '1'
+
+# Separator used to encode scope into the DB cache key.
+# \x00 cannot appear in a user-typed search term.
+_SCOPE_SEP = '\x00'
+
+
+def _encode_search_key(term: str, scope_label: str) -> str:
+    """Return the DB key for (term, scope_label).  'all files' scope uses just term."""
+    if scope_label == 'all files':
+        return term
+    return f"{term}{_SCOPE_SEP}{scope_label}"
+
+
+def _decode_search_key(db_key: str) -> tuple:
+    """Return (term, scope_label) from a DB key."""
+    if _SCOPE_SEP in db_key:
+        term, scope_label = db_key.split(_SCOPE_SEP, 1)
+        return term, scope_label
+    return db_key, 'all files'
 from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QPushButton, QComboBox,
     QVBoxLayout, QHBoxLayout, QTreeView, QDialog, QProgressBar,
@@ -616,6 +636,8 @@ class KeywordSearchMixin:
         self._search_index_worker: SearchIndexWorker | None = None
         self._db_loader: DbSearchLoader | None = None
         self._db_loader_term: str = ""
+        self._db_loader_db_key: str = ""
+        self._current_search_db_key: str = ""
         self._recent_loader: DbRecentLoader | None = None
         self._search_progress_dlg: SearchProgressDialog | None = None
         self._pending_db_hits: list[tuple] = []
@@ -650,12 +672,8 @@ class KeywordSearchMixin:
         self.search_stop_btn.clicked.connect(self._stop_keyword_search)
         self.search_status = QLabel("No search running")
         self.search_scope_combo = QComboBox()
-        self.search_scope_combo.addItem("All Files", userData="all")
-        self.search_scope_combo.addItem("App Data",  userData="app_data")
-        self.search_scope_combo.setToolTip(
-            "All Files — search every stored file in the archive\n"
-            "App Data  — search only files under mobile/Containers"
-        )
+        self.search_scope_combo.setMinimumWidth(160)
+        self._refresh_search_scope_combo()
         search_ctrl.addWidget(QLabel("Recent:"))
         search_ctrl.addWidget(self.search_recent_combo)
         search_ctrl.addSpacing(8)
@@ -711,6 +729,152 @@ class KeywordSearchMixin:
         self.search_recent_combo.activated.connect(self._on_search_recent_selected)
         return search_tab
 
+    # ── Scope combo ──────────────────────────────────────────────────────────
+
+    def _refresh_search_scope_combo(self):
+        """Rebuild the scope dropdown: fixed options + current bookmark groups."""
+        prev = self.search_scope_combo.currentData()
+        self.search_scope_combo.blockSignals(True)
+        self.search_scope_combo.clear()
+        self.search_scope_combo.addItem("All Files",      userData="all")
+        self.search_scope_combo.addItem("App Data",       userData="app_data")
+        self.search_scope_combo.addItem("Selected Files", userData="selected")
+        self.search_scope_combo.setToolTip(
+            "All Files      — search every stored file in the archive\n"
+            "App Data       — search only files under mobile/Containers\n"
+            "Selected Files — search only currently selected files/folders\n"
+            "BM: <group>    — search only files in that bookmark group"
+        )
+        groups = []
+        if getattr(self, '_case_dir', None):
+            try:
+                db = _open_results_db(self._case_dir)
+                groups = load_bookmark_groups(db)
+                db.close()
+            except Exception:
+                pass
+        if groups:
+            self.search_scope_combo.insertSeparator(self.search_scope_combo.count())
+            for g in groups:
+                lbl = f"BM: {g['name']}"
+                if g['count']:
+                    lbl += f"  ({g['count']:,})"
+                self.search_scope_combo.addItem(
+                    lbl,
+                    userData={'type': 'bookmark', 'group_id': g['id'], 'name': g['name']},
+                )
+        # Restore previous selection (match by group_id for bookmark entries)
+        restored = False
+        for i in range(self.search_scope_combo.count()):
+            d = self.search_scope_combo.itemData(i)
+            if d == prev:
+                self.search_scope_combo.setCurrentIndex(i)
+                restored = True
+                break
+            if (isinstance(d, dict) and isinstance(prev, dict)
+                    and d.get('group_id') == prev.get('group_id')):
+                self.search_scope_combo.setCurrentIndex(i)
+                restored = True
+                break
+        if not restored:
+            self.search_scope_combo.setCurrentIndex(0)
+        self.search_scope_combo.blockSignals(False)
+
+    def _filter_entries_by_ui_paths(self, ui_paths: list, nested_map: dict) -> tuple:
+        """Return (filtered_zip_entries, filtered_nested_map) for the given ui_paths.
+
+        Regular files are resolved to physical zip-entry names and matched against
+        self._search_entries.  Extracted archives (in nested_map) are routed to the
+        NestedArchiveSearchWorker — their content lives outside the FFS zip.
+        """
+        physical_names: set = set()
+        scoped_nested: dict = {}
+
+        for ui_path in ui_paths:
+            # File is a previously-extracted nested archive — search its stored copy.
+            if ui_path in nested_map:
+                scoped_nested[ui_path] = nested_map[ui_path]
+                continue
+            # Virtual path *inside* an extracted archive (e.g. archive.zip/entry.txt).
+            nested_found = False
+            for archive_path in nested_map:
+                if ui_path.startswith(archive_path + '/'):
+                    if archive_path not in scoped_nested:
+                        scoped_nested[archive_path] = nested_map[archive_path]
+                    nested_found = True
+                    break
+            if nested_found:
+                continue
+            # Regular file — resolve ui_path to physical zip-entry name.
+            try:
+                physical = self._adapter.resolve(ui_path)
+                physical_names.add(physical.lstrip('/'))
+            except Exception:
+                pass
+
+        if not physical_names or self._search_entries is None:
+            return [], scoped_nested
+
+        filtered = [e for e in self._search_entries
+                    if e[0].lstrip('/') in physical_names]
+        return filtered, scoped_nested
+
+    def _resolve_search_scope(self, scope) -> tuple:
+        """Return (scoped_entries, scoped_nested_map, scope_label).
+
+        scoped_entries=None means pass all entries to the worker (it handles filtering).
+        """
+        nested_map = getattr(self, '_nested_archive_map', {})
+
+        if isinstance(scope, dict) and scope.get('type') == 'bookmark':
+            group_id   = scope['group_id']
+            group_name = scope.get('name', 'Bookmarks')
+            ui_paths   = self._get_ui_paths_for_search_scope(group_id)
+            entries, nm = self._filter_entries_by_ui_paths(ui_paths, nested_map)
+            return entries, nm, f"BM: {group_name}"
+
+        if scope == 'selected':
+            get_bm   = getattr(self, '_get_paths_for_bookmark', None)
+            pairs    = get_bm() if get_bm else []
+            ui_paths = [p for p, _ in pairs]
+            entries, nm = self._filter_entries_by_ui_paths(ui_paths, nested_map)
+            return entries, nm, f"selected files ({len(ui_paths):,})"
+
+        if scope == 'app_data':
+            entries = (
+                [e for e in self._search_entries if 'mobile/Containers' in e[0]]
+                if self._search_entries is not None else None
+            )
+            return entries, nested_map, "App Data"
+
+        # "all" — exclude Cellebrite internal metadata entries
+        _cellebrite_excludes = ('metadata1/', 'metadata2/')
+        exclude = (
+            _cellebrite_excludes
+            if self._adapter.format == FfsAdapter.FORMAT_CELLEBRITE
+            else ()
+        )
+        if self._search_entries is not None and exclude:
+            entries = [e for e in self._search_entries
+                       if not any(e[0].lstrip('/').startswith(p) for p in exclude)]
+        elif self._search_entries is not None:
+            entries = self._search_entries
+        else:
+            entries = None
+        return entries, nested_map, "all files"
+
+    def _get_ui_paths_for_search_scope(self, group_id: int) -> list:
+        """Return ui_paths for all entries in a bookmark group."""
+        if not getattr(self, '_case_dir', None):
+            return []
+        try:
+            db = _open_results_db(self._case_dir)
+            entries = load_bookmark_entries(db, group_id)
+            db.close()
+            return [e['ui_path'] for e in entries]
+        except Exception:
+            return []
+
     # ── Recent combo ─────────────────────────────────────────────────────────
 
     def _set_incomplete_banner(self, files_done: int = 0, total_files: int = 0):
@@ -730,19 +894,44 @@ class KeywordSearchMixin:
         model = self.search_recent_combo.model()
         item  = model.item(0)
         item.setFlags(item.flags() & ~(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled))
-        for term in self._recent_searches:
-            self.search_recent_combo.addItem(term)
+        for db_key in self._recent_searches:
+            term, scope_label = _decode_search_key(db_key)
+            display = f"{term}  [{scope_label}]" if scope_label != 'all files' else term
+            self.search_recent_combo.addItem(display, userData=db_key)
         self.search_recent_combo.blockSignals(False)
 
     def _on_search_recent_selected(self, index):
         if index == 0:
             return
-        term = self.search_recent_combo.itemText(index)
+        db_key = self.search_recent_combo.itemData(index)
+        if not db_key:
+            db_key = self.search_recent_combo.itemText(index)  # fallback for old entries
+        term, scope_label = _decode_search_key(db_key)
         self.search_field.setText(term)
-        if self._load_search_from_db(term):
+        self._set_search_scope_by_label(scope_label)
+        if self._load_search_from_db(db_key):
             self._update_search_status_bar()
             return
         self._start_keyword_search()
+
+    def _set_search_scope_by_label(self, scope_label: str):
+        """Set the scope combo to the entry matching scope_label."""
+        for i in range(self.search_scope_combo.count()):
+            d = self.search_scope_combo.itemData(i)
+            if d == 'all' and scope_label == 'all files':
+                self.search_scope_combo.setCurrentIndex(i)
+                return
+            if d == 'app_data' and scope_label == 'App Data':
+                self.search_scope_combo.setCurrentIndex(i)
+                return
+            if d == 'selected' and scope_label.startswith('selected files'):
+                self.search_scope_combo.setCurrentIndex(i)
+                return
+            if (isinstance(d, dict) and d.get('type') == 'bookmark'
+                    and f"BM: {d.get('name','')}" == scope_label):
+                self.search_scope_combo.setCurrentIndex(i)
+                return
+        self.search_scope_combo.setCurrentIndex(0)  # default to All Files
 
     # ── Row selection ─────────────────────────────────────────────────────────
 
@@ -957,14 +1146,14 @@ class KeywordSearchMixin:
         except OSError:
             return None
 
-    def _save_recent_search(self, term: str):
+    def _save_recent_search(self, db_key: str):
         db = self._open_results_db_conn()
         if db:
             try:
                 db.execute(
                     "INSERT INTO search_index (keyword, used_at) VALUES (?, strftime('%s','now'))"
                     " ON CONFLICT(keyword) DO UPDATE SET used_at=strftime('%s','now')",
-                    (term,)
+                    (db_key,)
                 )
                 db.commit()
                 rows = db.execute(
@@ -997,11 +1186,14 @@ class KeywordSearchMixin:
         self._recent_searches = terms
         self._refresh_search_recent_combo()
 
-    def _load_search_from_db(self, term: str) -> bool:
-        """Kick off async population of the results table from the DB for *term*.
+    def _load_search_from_db(self, db_key: str) -> bool:
+        """Kick off async population of the results table from the DB for *db_key*.
         Returns True immediately if the DB has cached results, False if none."""
         if not self._case_dir or not self.zip_path:
             return False
+
+        term, scope_label = _decode_search_key(db_key)
+        scope_tag = f" in {scope_label}" if scope_label != 'all files' else ''
 
         self._set_incomplete_banner()   # always reset before loading any result
         db = self._open_results_db_conn()
@@ -1011,7 +1203,7 @@ class KeywordSearchMixin:
             row = db.execute(
                 'SELECT id, complete, files_searched, total_files '
                 'FROM search_index WHERE keyword=?',
-                (term,)
+                (db_key,)
             ).fetchone()
             if row is None:
                 return False  # never searched
@@ -1027,7 +1219,7 @@ class KeywordSearchMixin:
             msg = QMessageBox(self)
             msg.setWindowTitle("Incomplete Search")
             msg.setText(
-                f"The previous search for '{term}' was stopped after "
+                f"The previous search for '{term}'{scope_tag} was stopped after "
                 f"{files_searched:,} of {total_files:,} files.\n\n"
                 f"Results may be missing. Redo the search from the beginning?"
             )
@@ -1047,9 +1239,10 @@ class KeywordSearchMixin:
             self._search_file_items.clear()
             if not complete:
                 self._set_incomplete_banner(files_searched, total_files)
-                self.search_status.setText(f"'{term}' — 0 hits in searched files (incomplete)")
+                self.search_status.setText(
+                    f"'{term}'{scope_tag} — 0 hits in searched files (incomplete)")
             else:
-                self.search_status.setText(f"'{term}' — 0 hits (from cache)")
+                self.search_status.setText(f"'{term}'{scope_tag} — 0 hits (from cache)")
             return True
 
         self._search_incomplete_files = (files_searched, total_files) if not complete else (0, 0)
@@ -1066,10 +1259,11 @@ class KeywordSearchMixin:
             ["Name", "Hits", "Context", "Offset"])
         self._search_folder_items.clear()
         self._search_file_items.clear()
-        self.search_status.setText(f"Loading '{term}' from cache…")
+        self.search_status.setText(f"Loading '{term}'{scope_tag} from cache…")
 
-        self._db_loader_term = term
-        self._db_loader = DbSearchLoader(self._case_dir, term)
+        self._db_loader_term   = term
+        self._db_loader_db_key = db_key
+        self._db_loader = DbSearchLoader(self._case_dir, db_key)
         self._db_loader.rows_ready.connect(self._on_db_loader_rows)
         self._db_loader.finished.connect(self._on_db_loader_finished)
         self._db_loader.start()
@@ -1084,16 +1278,18 @@ class KeywordSearchMixin:
             self.search_results_view.setUpdatesEnabled(True)
 
     def _on_db_loader_finished(self, total: int):
-        term = self._db_loader_term
+        db_key = self._db_loader_db_key or self._db_loader_term
+        term, scope_label = _decode_search_key(db_key)
+        scope_tag = f" in {scope_label}" if scope_label != 'all files' else ''
         done, total_files = self._search_incomplete_files
         if done or total_files:
             self._set_incomplete_banner(done, total_files)
             self.search_status.setText(
-                f"'{term}' — {total:,} hit{'s' if total != 1 else ''} "
+                f"'{term}'{scope_tag} — {total:,} hit{'s' if total != 1 else ''} "
                 f"(incomplete — {done:,} of {total_files:,} files searched)")
         else:
             self.search_status.setText(
-                f"'{term}' — {total:,} hit{'s' if total != 1 else ''} (from cache)")
+                f"'{term}'{scope_tag} — {total:,} hit{'s' if total != 1 else ''} (from cache)")
 
     # ── Search lifecycle ──────────────────────────────────────────────────────
 
@@ -1121,6 +1317,7 @@ class KeywordSearchMixin:
         self._search_entries = entries or None
 
     def _start_keyword_search(self):
+        from PySide6.QtWidgets import QMessageBox
         term = self.search_field.text().strip()
         if not term or not self.zip_path:
             return
@@ -1132,38 +1329,54 @@ class KeywordSearchMixin:
         self._search_folder_items.clear()
         self._search_file_items.clear()
         self._pending_db_hits.clear()
-        self._save_recent_search(term)
+
+        scope = self.search_scope_combo.currentData()
+        is_restricted = isinstance(scope, dict) or scope == 'selected'
+
+        # For restricted scopes (bookmark / selected), we need the index to already
+        # be ready so we can resolve ui_paths to physical entry names.
+        if is_restricted and self._search_entries is None:
+            QMessageBox.information(
+                self, "Index Building",
+                "The search index is still building — please wait a moment and try again.")
+            return
+
+        scoped_entries, scoped_nested_map, scope_label = self._resolve_search_scope(scope)
+
+        if is_restricted and not scoped_entries and not scoped_nested_map:
+            what = ("No files are currently selected."
+                    if scope == 'selected'
+                    else "This bookmark group has no entries yet.")
+            QMessageBox.information(self, "Nothing to Search", what)
+            return
+
+        db_key = _encode_search_key(term, scope_label)
+        self._current_search_db_key = db_key
+        self._save_recent_search(db_key)
         db = self._open_results_db_conn()
         if db:
             try:
                 db.execute(
                     'DELETE FROM search_results '
                     'WHERE term_id=(SELECT id FROM search_index WHERE keyword=?)',
-                    (term,)
+                    (db_key,)
                 )
                 db.commit()
             finally:
                 db.close()
-        scope = self.search_scope_combo.currentData()
-        _cellebrite_excludes = ("metadata1/", "metadata2/")
-        exclude_prefixes = (
+
+        # For the fallback case (entries=None, worker builds its own list) the
+        # worker still needs scope/exclude_prefixes to do its own filtering.
+        worker_scope = scope if scope in ('app_data', 'all') else 'all'
+        _cellebrite_excludes = ('metadata1/', 'metadata2/')
+        worker_exclude = (
             _cellebrite_excludes
-            if self._adapter.format == FfsAdapter.FORMAT_CELLEBRITE
+            if worker_scope == 'all' and self._adapter.format == FfsAdapter.FORMAT_CELLEBRITE
             else ()
         )
-        if self._search_entries is not None and scope == "app_data":
-            scoped_entries = [e for e in self._search_entries
-                              if "mobile/Containers" in e[0]]
-        elif self._search_entries is not None and exclude_prefixes:
-            scoped_entries = [e for e in self._search_entries
-                              if not any(e[0].lstrip('/').startswith(p) for p in exclude_prefixes)]
-        elif self._search_entries is not None:
-            scoped_entries = self._search_entries
-        else:
-            scoped_entries = None
 
-        scope_label = "App Data" if scope == "app_data" else "all files"
-        self.search_status.setText(f"Searching {scope_label} for '{term}'…")
+        scope_tag = f" in {scope_label}" if scope_label != 'all files' else ''
+        self.search_status.setText(f"Searching '{term}'{scope_tag}…")
         self.search_btn.setEnabled(False)
         self.search_stop_btn.setEnabled(True)
 
@@ -1174,19 +1387,19 @@ class KeywordSearchMixin:
             self.zip_path, term,
             streaming_index=self._streaming_index,
             entries=scoped_entries,
-            scope=scope,
-            exclude_prefixes=exclude_prefixes)
+            scope=worker_scope,
+            exclude_prefixes=worker_exclude)
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
         self._search_worker.result_found.connect(self._on_search_result)
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.finished.connect(self._on_search_finished)
         self._search_worker.start()
 
-        # Start nested archive search in parallel — results trickle in after
-        # the modal dialog closes (main search finishes first).
-        nested_map = getattr(self, '_nested_archive_map', {})
-        if nested_map:
-            self._nested_search_worker = NestedArchiveSearchWorker(nested_map, term)
+        # Start nested archive search in parallel (scoped_nested_map is already
+        # filtered for restricted scopes; for unrestricted scopes it equals
+        # the full nested_archive_map).
+        if scoped_nested_map:
+            self._nested_search_worker = NestedArchiveSearchWorker(scoped_nested_map, term)
             self._nested_search_worker.result_found.connect(self._on_nested_search_result)
             self._nested_search_worker.start()
 
@@ -1231,7 +1444,9 @@ class KeywordSearchMixin:
             self._search_entries = self._search_worker.entries or None
         self.search_btn.setEnabled(True)
         self.search_stop_btn.setEnabled(False)
-        term    = self.search_field.text().strip()
+        db_key  = self._current_search_db_key or self.search_field.text().strip()
+        term, scope_label = _decode_search_key(db_key)
+        scope_tag = f" in {scope_label}" if scope_label != 'all files' else ''
         n_files = len(self._search_file_items)
         dlg     = self._search_progress_dlg
 
@@ -1245,11 +1460,11 @@ class KeywordSearchMixin:
                 db.execute(
                     'UPDATE search_index SET complete=?, files_searched=?, total_files=? '
                     'WHERE keyword=?',
-                    (complete, files_searched, total_files, term)
+                    (complete, files_searched, total_files, db_key)
                 )
                 if self._pending_db_hits:
                     row = db.execute(
-                        'SELECT id FROM search_index WHERE keyword=?', (term,)
+                        'SELECT id FROM search_index WHERE keyword=?', (db_key,)
                     ).fetchone()
                     if row:
                         db.executemany(
@@ -1267,17 +1482,17 @@ class KeywordSearchMixin:
                 dlg.mark_interrupted(n_files)
                 self._set_incomplete_banner(files_searched, total_files)
                 self.search_status.setText(
-                    f"'{term}' — partial search, interrupted  "
+                    f"'{term}'{scope_tag} — partial search, interrupted  "
                     f"({n_files:,} file{'s' if n_files != 1 else ''} with hits)")
             else:
                 dlg.mark_finished(n_files, total_hits)
                 self._set_incomplete_banner()
                 self.search_status.setText(
-                    f"'{term}' — hits in {n_files:,} file{'s' if n_files != 1 else ''} across archive")
+                    f"'{term}'{scope_tag} — hits in {n_files:,} file{'s' if n_files != 1 else ''}")
         else:
             self._set_incomplete_banner()
             self.search_status.setText(
-                f"'{term}' — hits in {n_files:,} file{'s' if n_files != 1 else ''} across archive")
+                f"'{term}'{scope_tag} — hits in {n_files:,} file{'s' if n_files != 1 else ''}")
         self._update_search_status_bar()
         for col in range(self.search_results_model.columnCount()):
             self.search_results_view.resizeColumnToContents(col)

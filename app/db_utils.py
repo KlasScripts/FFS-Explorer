@@ -23,7 +23,7 @@ _SEARCH_ENTRIES_VERSION = '1'
 
 # Bump whenever the schema changes incompatibly.
 # Cache DB is auto-deleted on mismatch; results DB raises OldSchemaError.
-_CACHE_SCHEMA_VERSION   = 1
+_CACHE_SCHEMA_VERSION   = 2
 _RESULTS_SCHEMA_VERSION = 1
 
 
@@ -98,7 +98,8 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
             original_size   INTEGER NOT NULL,
             entry_count     INTEGER NOT NULL DEFAULT 0,
             processed_at    TEXT    NOT NULL
-                             DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
+                             DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now')),
+            error_msg       TEXT
         )
     ''')
 
@@ -207,6 +208,29 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         conn.execute('ALTER TABLE run_log ADD COLUMN completed_at TEXT')
     except sqlite3.OperationalError:
         pass  # column already exists
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS bookmark_groups (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT    NOT NULL UNIQUE,
+            description TEXT,
+            created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS bookmark_entries (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id      INTEGER NOT NULL REFERENCES bookmark_groups(id) ON DELETE CASCADE,
+            ui_path       TEXT    NOT NULL,
+            display_name  TEXT,
+            bookmarked_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now')),
+            UNIQUE(group_id, ui_path)
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_bm_entries_group
+        ON bookmark_entries (group_id)
+    ''')
 
     conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
@@ -466,13 +490,27 @@ def save_nested_archive_entries(conn: 'sqlite3.Connection',
 
 
 def load_nested_archives(conn: 'sqlite3.Connection') -> list:
-    """Return list of dicts for all extracted nested archives."""
+    """Return list of dicts for all nested archive records (successes and failures)."""
     rows = conn.execute(
-        'SELECT ui_path, stored_filename, original_size, entry_count, processed_at '
+        'SELECT ui_path, stored_filename, original_size, entry_count, '
+        'processed_at, error_msg '
         'FROM nested_archives ORDER BY processed_at'
     ).fetchall()
     return [{'ui_path': r[0], 'stored_filename': r[1], 'original_size': r[2],
-             'entry_count': r[3], 'processed_at': r[4]} for r in rows]
+             'entry_count': r[3], 'processed_at': r[4], 'error_msg': r[5]}
+            for r in rows]
+
+
+def save_nested_archive_failure(conn: 'sqlite3.Connection',
+                                ui_path: str, error_msg: str) -> None:
+    """Record a failed extraction attempt in nested_archives."""
+    conn.execute(
+        'INSERT OR REPLACE INTO nested_archives '
+        '(ui_path, stored_filename, original_size, entry_count, error_msg) '
+        'VALUES (?, \'\', 0, 0, ?)',
+        (ui_path, error_msg),
+    )
+    conn.commit()
 
 
 def load_nested_archive_entries(conn: 'sqlite3.Connection',
@@ -491,4 +529,72 @@ def clear_nested_archives(conn: 'sqlite3.Connection') -> None:
     """Delete all nested archive records (entries first, then index)."""
     conn.execute('DELETE FROM nested_archive_entries')
     conn.execute('DELETE FROM nested_archives')
+    conn.commit()
+
+
+# ── Bookmarks ─────────────────────────────────────────────────────────────────
+
+def load_bookmark_groups(conn: 'sqlite3.Connection') -> list:
+    """Return [{id, name, description, created_at, count}] ordered by creation."""
+    rows = conn.execute(
+        'SELECT g.id, g.name, g.description, g.created_at, COUNT(e.id) '
+        'FROM bookmark_groups g '
+        'LEFT JOIN bookmark_entries e ON e.group_id = g.id '
+        'GROUP BY g.id ORDER BY g.created_at'
+    ).fetchall()
+    return [{'id': r[0], 'name': r[1], 'description': r[2],
+             'created_at': r[3], 'count': r[4]} for r in rows]
+
+
+def save_bookmark_group(conn: 'sqlite3.Connection',
+                        name: str, description: str = '') -> int:
+    """Create a new bookmark group and return its id."""
+    cur = conn.execute(
+        'INSERT INTO bookmark_groups (name, description) VALUES (?, ?)',
+        (name, description or None),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def save_bookmark_entries(conn: 'sqlite3.Connection',
+                          group_id: int,
+                          entries: list) -> None:
+    """Upsert bookmark entries for a group.
+
+    *entries* is a list of (ui_path, display_name) pairs.
+    INSERT OR REPLACE refreshes bookmarked_at on re-add.
+    """
+    conn.executemany(
+        'INSERT OR REPLACE INTO bookmark_entries '
+        '(group_id, ui_path, display_name) VALUES (?, ?, ?)',
+        [(group_id, ui_path, display_name) for ui_path, display_name in entries],
+    )
+    conn.commit()
+
+
+def load_bookmark_entries(conn: 'sqlite3.Connection', group_id: int) -> list:
+    """Return [{ui_path, display_name, bookmarked_at}] for a group."""
+    rows = conn.execute(
+        'SELECT ui_path, display_name, bookmarked_at '
+        'FROM bookmark_entries WHERE group_id=? ORDER BY bookmarked_at',
+        (group_id,),
+    ).fetchall()
+    return [{'ui_path': r[0], 'display_name': r[1], 'bookmarked_at': r[2]}
+            for r in rows]
+
+
+def delete_bookmark_group(conn: 'sqlite3.Connection', group_id: int) -> None:
+    """Delete a bookmark group and all its entries (CASCADE handles entries)."""
+    conn.execute('DELETE FROM bookmark_groups WHERE id=?', (group_id,))
+    conn.commit()
+
+
+def delete_bookmark_entry(conn: 'sqlite3.Connection',
+                          group_id: int, ui_path: str) -> None:
+    """Remove a single entry from a bookmark group."""
+    conn.execute(
+        'DELETE FROM bookmark_entries WHERE group_id=? AND ui_path=?',
+        (group_id, ui_path),
+    )
     conn.commit()

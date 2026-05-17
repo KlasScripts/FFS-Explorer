@@ -52,7 +52,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QComboBox, QSplitter, QStatusBar,
                               QLineEdit, QLabel,
                               QTabWidget, QSizePolicy, QStackedWidget,
-                              QMessageBox, QCheckBox, QAbstractItemView)
+                              QMessageBox, QCheckBox, QAbstractItemView,
+                              QTreeWidget, QTreeWidgetItem)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
@@ -749,6 +750,79 @@ def _count_header_candidates(ui_metadata: dict, ffs_adapter) -> int:
 
 
 _EXTRACTABLE_TYPES = {'Archive', 'Compressed'}
+
+
+def _classify_archive(ui_path: str, ffs_adapter) -> str:
+    """Return the top-level category for an archive ui_path.
+
+    Android returns: 'AndroidApp', 'AndroidMedia'
+    iOS returns:     'SMS', 'Mail', 'Files', 'App'
+    """
+    if ffs_adapter.format == ffs_adapter.FORMAT_ZIP_EXTRAS:
+        return 'AndroidMedia' if ui_path.startswith('data/media/') else 'AndroidApp'
+    # GrayKey can hold an Android device — check Android paths before iOS paths
+    if ffs_adapter.format == ffs_adapter.FORMAT_GRAYKEY:
+        if ui_path.startswith('data/data/'):
+            return 'AndroidApp'
+        if ui_path.startswith('data/media/'):
+            return 'AndroidMedia'
+    pv = 'private/var/' if ffs_adapter.format == ffs_adapter.FORMAT_GRAYKEY else ''
+    lib = pv + 'mobile/Library/'
+    if ui_path.startswith(lib + 'SMS/Attachments/'):
+        return 'SMS'
+    if ui_path.startswith(lib + 'Mail/'):
+        return 'Mail'
+    if ui_path.startswith(lib + 'Mobile Documents/'):
+        return 'Files'
+    return 'App'
+
+
+def _android_package(ui_path: str) -> str:
+    """Return the package name from a data/data/<package>/... path."""
+    parts = ui_path.split('/')
+    if len(parts) >= 3 and parts[0] == 'data' and parts[1] == 'data':
+        return parts[2]
+    return ''
+
+
+def _android_media_parts(ui_path: str) -> tuple[str, str]:
+    """Return (volume_label, subfolder) for a data/media/<volume>/[subfolder]/... path."""
+    parts = ui_path.split('/')
+    if len(parts) < 3:
+        return 'Internal Storage', '(root)'
+    volume = parts[2]
+    volume_label = 'Internal Storage' if volume == '0' else f'SD Card ({volume})'
+    subfolder = parts[3] if len(parts) > 3 else '(root)'
+    return volume_label, subfolder
+
+
+def _discover_all_archives(
+    ui_metadata: dict,
+    ffs_adapter,
+    header_type_overrides: dict,
+) -> list[dict]:
+    """Return all archives across container + Library paths.
+
+    Each entry: {'ui_path', 'category', 'file_type', 'mtime'}
+    mtime is nanoseconds since epoch (0 if unknown).
+    """
+    scan_roots = ffs_adapter.archive_discovery_folders()
+    results = []
+    for ui_path, meta in ui_metadata.items():
+        if not any(ui_path.startswith(r) for r in scan_roots):
+            continue
+        name = ui_path.rsplit('/', 1)[-1]
+        ft = _get_file_type(name)
+        if ft == 'Other':
+            ft = header_type_overrides.get(ui_path, 'Other')
+        if ft not in _EXTRACTABLE_TYPES:
+            continue
+        category = _classify_archive(ui_path, ffs_adapter)
+        mtime = meta.get('mtime', 0) if isinstance(meta, dict) else 0
+        results.append({'ui_path': ui_path, 'category': category,
+                        'file_type': ft, 'mtime': mtime})
+    return results
+
 
 def _collect_nested_archive_candidates(
     ui_metadata: dict,
@@ -1784,12 +1858,12 @@ class ProcessDialog(QDialog):
         self._chk_header.setChecked(False)
         layout.addWidget(self._chk_header)
 
-        self._chk_nested = QCheckBox("Uncompress ZIPs in app data")
+        self._chk_nested = QCheckBox("Find and select archives for extraction")
         self._chk_nested.setChecked(False)
         self._chk_nested.setToolTip(
-            "Finds Archive-type files in app containers, repacks them as "
-            "uncompressed ZIPs,\nand records them in the case database. "
-            "Requires header scan.")
+            "Scans app containers, iCloud/Files, Mail and SMS locations for archive "
+            "files,\nthen shows a selection dialog so you can choose which to extract.\n"
+            "Requires a completed header scan to catch extensionless archives.")
         self._chk_nested.toggled.connect(self._on_nested_toggled)
         layout.addWidget(self._chk_nested)
 
@@ -1955,7 +2029,7 @@ class ProcessDialog(QDialog):
         if self._chk_header.isChecked():
             self._start_header_scan()
         else:
-            self._start_nested_extraction()
+            self._show_archive_selection()
 
     def _start_header_scan(self):
         self._run_id: int | None = None
@@ -2016,7 +2090,7 @@ class ProcessDialog(QDialog):
         self.header_scan_done.emit(results)
 
         if self._chk_nested.isChecked() and not cancelled:
-            self._start_nested_extraction()
+            self._show_archive_selection()
         else:
             msg = (f"Cancelled — {n_found:,} type{'s' if n_found != 1 else ''} "
                    "identified before cancellation."
@@ -2026,18 +2100,48 @@ class ProcessDialog(QDialog):
             self._status_label.setText(msg)
             self._finish_operations()
 
-    def _start_nested_extraction(self):
+    def _show_archive_selection(self):
+        """Load header overrides, discover archives, show selection dialog, then extract."""
         overrides = {}
+        guid_to_bundle = {}
         if self._case_dir:
             try:
                 db = _open_cache_db(self._case_dir)
                 overrides = load_header_types(db)
+                guid_to_bundle = load_guid_bundle_map(db)
                 db.close()
             except Exception:
                 pass
 
-        candidates = _collect_nested_archive_candidates(
-            self._ui_metadata, self._adapter, overrides)
+        archives = _discover_all_archives(self._ui_metadata, self._adapter, overrides)
+        if not archives:
+            self._status_label.setText("No archive files found across all scanned locations.")
+            self._finish_operations()
+            return
+
+        is_android = (self._adapter.format == self._adapter.FORMAT_ZIP_EXTRAS or
+                      any(a['category'] in ('AndroidApp', 'AndroidMedia') for a in archives))
+        dlg = ArchiveSelectionDialog(archives, guid_to_bundle=guid_to_bundle,
+                                     is_android=is_android, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.selected_paths:
+            self._status_label.setText("Archive selection cancelled.")
+            self._finish_operations()
+            return
+
+        self._start_nested_extraction(candidates=dlg.selected_paths)
+
+    def _start_nested_extraction(self, candidates: list[str] | None = None):
+        if candidates is None:
+            overrides = {}
+            if self._case_dir:
+                try:
+                    db = _open_cache_db(self._case_dir)
+                    overrides = load_header_types(db)
+                    db.close()
+                except Exception:
+                    pass
+            candidates = _collect_nested_archive_candidates(
+                self._ui_metadata, self._adapter, overrides)
 
         if not candidates:
             self._status_label.setText("No Archive-type files found in app data.")
@@ -2142,6 +2246,289 @@ class ProcessDialog(QDialog):
         if self._is_scanning():
             return
         super().reject()
+
+
+def _display_path(ui_path: str, guid_to_bundle: dict) -> str:
+    """Return ui_path with any container UUID replaced by its resolved bundle ID."""
+    parts = ui_path.split('/')
+    for i, part in enumerate(parts):
+        if _UUID_RE.match(part):
+            parts[i] = guid_to_bundle.get(part, part)
+            break
+    return '/'.join(parts)
+
+
+def _bundle_id_for_path(ui_path: str, guid_to_bundle: dict) -> str:
+    """Return the bundle ID (or raw UUID if unresolved) for the container in this path."""
+    for part in ui_path.split('/'):
+        if _UUID_RE.match(part):
+            return guid_to_bundle.get(part, part)
+    return ''
+
+
+class ArchiveSelectionDialog(QDialog):
+    """Tree dialog for selecting which discovered archives to extract."""
+
+    def __init__(self, archives: list[dict], guid_to_bundle: dict | None = None,
+                 is_android: bool = False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Archives for Extraction")
+        self.setModal(True)
+        self.setMinimumSize(820, 520)
+        self.selected_paths: list[str] = []
+        self._archives = archives
+        self._guid_to_bundle = guid_to_bundle or {}
+        self._is_android = is_android
+        self._updating = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        n = len(archives)
+        layout.addWidget(QLabel(
+            f"<b>{n:,} archive{'s' if n != 1 else ''} found</b> across all scanned locations. "
+            "Select which to extract."
+        ))
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["Path", "Type"])
+        self._tree.setColumnWidth(0, 620)
+        self._tree.setAlternatingRowColors(True)
+        self._tree.setSortingEnabled(False)
+        layout.addWidget(self._tree)
+
+        self._count_label = QLabel()
+        layout.addWidget(self._count_label)
+
+        btn_row = QHBoxLayout()
+        sel_all = QPushButton("Select All")
+        sel_all.clicked.connect(self._select_all)
+        btn_row.addWidget(sel_all)
+        desel_all = QPushButton("Deselect All")
+        desel_all.clicked.connect(self._deselect_all)
+        btn_row.addWidget(desel_all)
+        btn_row.addStretch()
+        self._extract_btn = QPushButton("Extract Selected")
+        self._extract_btn.setDefault(True)
+        self._extract_btn.clicked.connect(self._accept)
+        btn_row.addWidget(self._extract_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        self._build_tree()
+        self._tree.itemChanged.connect(self._on_item_changed)
+        self._refresh_count()
+
+    # ── Shared tree helpers ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _mtime_key(arc: dict) -> int:
+        return arc.get('mtime', 0)
+
+    @staticmethod
+    def _max_mtime(arcs: list) -> int:
+        return max((a.get('mtime', 0) for a in arcs), default=0)
+
+    @staticmethod
+    def _mtime_label(ns: int) -> str:
+        if not ns:
+            return ''
+        try:
+            return ('  — ' + datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
+                    .strftime('%Y-%m-%d'))
+        except Exception:
+            return ''
+
+    def _make_file_item(self, parent, arc: dict) -> QTreeWidgetItem:
+        item = QTreeWidgetItem(parent)
+        item.setText(0, _display_path(arc['ui_path'], self._guid_to_bundle))
+        item.setText(1, arc['file_type'])
+        item.setCheckState(0, Qt.CheckState.Unchecked)
+        item.setData(0, Qt.ItemDataRole.UserRole, arc['ui_path'])
+        return item
+
+    def _make_app_node(self, parent, label: str, arcs: list[dict]) -> QTreeWidgetItem:
+        mt = self._max_mtime(arcs)
+        node = QTreeWidgetItem(parent)
+        node.setText(0, f"{label}  ({len(arcs):,}){self._mtime_label(mt)}")
+        node.setCheckState(0, Qt.CheckState.Unchecked)
+        node.setExpanded(False)
+        for arc in sorted(arcs, key=self._mtime_key, reverse=True):
+            self._make_file_item(node, arc)
+        return node
+
+    def _make_app_group(self, label: str, buckets: dict) -> None:
+        if not buckets:
+            return
+        total = sum(len(v) for v in buckets.values())
+        group = QTreeWidgetItem(self._tree)
+        group.setText(0, f"{label}  ({total:,})")
+        group.setCheckState(0, Qt.CheckState.Unchecked)
+        group.setExpanded(True)
+        for key in sorted(buckets, key=lambda k: self._max_mtime(buckets[k]), reverse=True):
+            self._make_app_node(group, key, buckets[key])
+
+    # ── Platform-specific tree builders ──────────────────────────────────────
+
+    def _build_tree(self):
+        if self._is_android:
+            self._build_tree_android()
+        else:
+            self._build_tree_ios()
+
+    def _build_tree_ios(self):
+        g2b = self._guid_to_bundle
+        sms_items:   list[dict] = []
+        mail_items:  list[dict] = []
+        files_items: list[dict] = []
+        app_buckets: dict[str, list[dict]] = {}
+
+        for arc in self._archives:
+            cat = arc['category']
+            if cat == 'SMS':
+                sms_items.append(arc)
+            elif cat == 'Mail':
+                mail_items.append(arc)
+            elif cat == 'Files':
+                files_items.append(arc)
+            else:
+                bid = _bundle_id_for_path(arc['ui_path'], g2b) or 'Unknown'
+                app_buckets.setdefault(bid, []).append(arc)
+
+        def make_top_level(label: str, items: list[dict]) -> QTreeWidgetItem:
+            node = QTreeWidgetItem(self._tree)
+            node.setText(0, f"{label}  ({len(items):,})")
+            node.setCheckState(0, Qt.CheckState.Unchecked)
+            node.setExpanded(True)
+            for arc in sorted(items, key=self._mtime_key, reverse=True):
+                self._make_file_item(node, arc)
+            return node
+
+        if sms_items:
+            make_top_level("SMS Attachments", sms_items)
+        if mail_items:
+            make_top_level("Mail", mail_items)
+        if files_items:
+            make_top_level("Files / iCloud", files_items)
+
+        apple      = {b: a for b, a in app_buckets.items() if b.startswith('com.apple.')}
+        third_party = {b: a for b, a in app_buckets.items() if not b.startswith('com.apple.')}
+        self._make_app_group("Default Apps", apple)
+        self._make_app_group("Third-Party Apps", third_party)
+
+    def _build_tree_android(self):
+        app_buckets:   dict[str, list[dict]] = {}
+        media_buckets: dict[str, dict[str, list[dict]]] = {}  # volume → subfolder → archives
+
+        for arc in self._archives:
+            if arc['category'] == 'AndroidMedia':
+                vol, sub = _android_media_parts(arc['ui_path'])
+                media_buckets.setdefault(vol, {}).setdefault(sub, []).append(arc)
+            else:
+                pkg = _android_package(arc['ui_path']) or 'Unknown'
+                app_buckets.setdefault(pkg, []).append(arc)
+
+        # App Data — all packages sorted by most recently active
+        self._make_app_group("App Data", app_buckets)
+
+        # User Storage — one top-level node per volume (Internal first, then SD cards)
+        for vol_label in sorted(media_buckets,
+                                key=lambda v: (0 if v == 'Internal Storage' else 1, v)):
+            sub_map = media_buckets[vol_label]
+            vol_total = sum(len(v) for v in sub_map.values())
+            vol_node = QTreeWidgetItem(self._tree)
+            vol_node.setText(0, f"User Storage — {vol_label}  ({vol_total:,})")
+            vol_node.setCheckState(0, Qt.CheckState.Unchecked)
+            vol_node.setExpanded(True)
+            for sub in sorted(sub_map):
+                arcs = sub_map[sub]
+                sub_node = QTreeWidgetItem(vol_node)
+                sub_node.setText(0, f"{sub}  ({len(arcs):,})")
+                sub_node.setCheckState(0, Qt.CheckState.Unchecked)
+                sub_node.setExpanded(True)
+                for arc in sorted(arcs, key=self._mtime_key, reverse=True):
+                    self._make_file_item(sub_node, arc)
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
+        if column != 0 or self._updating:
+            return
+        self._updating = True
+        state = item.checkState(0)
+        # Propagate downward to children
+        self._set_children(item, state)
+        # Update parent group/location tri-state
+        parent = item.parent()
+        while parent is not None:
+            self._sync_parent(parent)
+            parent = parent.parent()
+        self._updating = False
+        self._refresh_count()
+
+    def _set_children(self, item: QTreeWidgetItem, state: Qt.CheckState):
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(0, state)
+            self._set_children(child, state)
+
+    def _sync_parent(self, item: QTreeWidgetItem):
+        n = item.childCount()
+        checked = sum(
+            1 for i in range(n)
+            if item.child(i).checkState(0) == Qt.CheckState.Checked
+        )
+        if checked == 0:
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+        elif checked == n:
+            item.setCheckState(0, Qt.CheckState.Checked)
+        else:
+            item.setCheckState(0, Qt.CheckState.PartiallyChecked)
+
+    def _collect_selected(self) -> list[str]:
+        selected = []
+        root = self._tree.invisibleRootItem()
+        self._walk(root, selected)
+        return selected
+
+    def _walk(self, item: QTreeWidgetItem, out: list[str]):
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path and item.checkState(0) == Qt.CheckState.Checked:
+            out.append(path)
+        for i in range(item.childCount()):
+            self._walk(item.child(i), out)
+
+    def _refresh_count(self):
+        selected = self._collect_selected()
+        n = len(selected)
+        total = len(self._archives)
+        self._count_label.setText(f"{n:,} of {total:,} archives selected")
+        self._extract_btn.setText(f"Extract Selected ({n:,})")
+        self._extract_btn.setEnabled(n > 0)
+
+    def _select_all(self):
+        self._updating = True
+        root = self._tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group = root.child(i)
+            group.setCheckState(0, Qt.CheckState.Checked)
+            self._set_children(group, Qt.CheckState.Checked)
+        self._updating = False
+        self._refresh_count()
+
+    def _deselect_all(self):
+        self._updating = True
+        root = self._tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group = root.child(i)
+            group.setCheckState(0, Qt.CheckState.Unchecked)
+            self._set_children(group, Qt.CheckState.Unchecked)
+        self._updating = False
+        self._refresh_count()
+
+    def _accept(self):
+        self.selected_paths = self._collect_selected()
+        self.accept()
 
 
 def _do_path_change_check(

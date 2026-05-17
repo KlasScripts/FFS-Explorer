@@ -314,10 +314,41 @@ class FfsAdapter:
     def scan_folders(self) -> list[str]:
         """Return default header-scan folder prefixes for this format."""
         if self.format == self.FORMAT_GRAYKEY:
-            return ['private/var/mobile/Containers/', 'data/data/']
+            pv = 'private/var/'
+            return [
+                pv + 'mobile/Containers/',
+                pv + 'mobile/Library/Mobile Documents/',
+                pv + 'mobile/Library/Mail/',
+                pv + 'mobile/Library/SMS/Attachments/',
+                'data/data/',
+            ]
         if self.format == self.FORMAT_ZIP_EXTRAS:
-            return ['data/data/']
-        return ['mobile/Containers/']
+            return ['data/data/', 'data/media/']
+        return [
+            'mobile/Containers/',
+            'mobile/Library/Mobile Documents/',
+            'mobile/Library/Mail/',
+            'mobile/Library/SMS/Attachments/',
+        ]
+
+    def archive_discovery_folders(self) -> list[str]:
+        """Paths to scan for archive discovery — containers plus high-value Library locations.
+
+        For GrayKey the zip may hold an Android device (data/data/, data/media/)
+        rather than iOS, so both sets of paths are included."""
+        if self.format == self.FORMAT_ZIP_EXTRAS:
+            return ['data/data/', 'data/media/']
+        pv = 'private/var/' if self.format == self.FORMAT_GRAYKEY else ''
+        base = pv + 'mobile/'
+        paths = [
+            base + 'Containers/',
+            base + 'Library/Mobile Documents/',
+            base + 'Library/Mail/',
+            base + 'Library/SMS/Attachments/',
+        ]
+        if self.format == self.FORMAT_GRAYKEY:
+            paths += ['data/data/', 'data/media/']
+        return paths
 
     def strip_display_prefix(self, path: str) -> str:
         """Strip the archive-format prefix for display.

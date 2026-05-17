@@ -1992,24 +1992,13 @@ class ProcessDialog(QDialog):
             self._chk_header.setEnabled(True)
 
     def _confirm_rerun(self) -> bool:
-        """Return True if user confirms (re-)running already-completed operations."""
-        parts: list[str] = []
+        """Return True if user confirms re-running an already-completed header scan."""
         last = self._load_last_run()
-        if self._chk_header.isChecked() and last and last.get('complete'):
-            parts.append("header scan")
-        nested = self._load_nested_archives_summary()
-        if self._chk_nested.isChecked() and nested:
-            parts.append(
-                f"nested archive extraction "
-                f"({len(nested):,} archive{'s' if len(nested) != 1 else ''} "
-                f"already extracted)"
-            )
-        if not parts:
+        if not (self._chk_header.isChecked() and last and last.get('complete')):
             return True
-        what = " and ".join(parts)
         result = QMessageBox.question(
             self, "Confirm Re-run",
-            f"A previous {what} has already been completed for this archive.\n\n"
+            "A previous header scan has already been completed for this archive.\n\n"
             "Running again will overwrite the previous results.\n\n"
             "Are you sure you want to continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2104,25 +2093,32 @@ class ProcessDialog(QDialog):
         """Load header overrides, discover archives, show selection dialog, then extract."""
         overrides = {}
         guid_to_bundle = {}
+        already_extracted: set[str] = set()
         if self._case_dir:
             try:
                 db = _open_cache_db(self._case_dir)
                 overrides = load_header_types(db)
                 guid_to_bundle = load_guid_bundle_map(db)
+                already_extracted = {r['ui_path'] for r in load_nested_archives(db)}
                 db.close()
             except Exception:
                 pass
 
         archives = _discover_all_archives(self._ui_metadata, self._adapter, overrides)
-        if not archives:
+        # Split into new (selectable) and already-done (display-only)
+        new_archives  = [a for a in archives if a['ui_path'] not in already_extracted]
+        done_archives = [a for a in archives if a['ui_path'] in already_extracted]
+
+        if not new_archives and not done_archives:
             self._status_label.setText("No archive files found across all scanned locations.")
             self._finish_operations()
             return
 
         is_android = (self._adapter.format == self._adapter.FORMAT_ZIP_EXTRAS or
                       any(a['category'] in ('AndroidApp', 'AndroidMedia') for a in archives))
-        dlg = ArchiveSelectionDialog(archives, guid_to_bundle=guid_to_bundle,
-                                     is_android=is_android, parent=self)
+        dlg = ArchiveSelectionDialog(new_archives, guid_to_bundle=guid_to_bundle,
+                                     is_android=is_android,
+                                     done_archives=done_archives, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.selected_paths:
             self._status_label.setText("Archive selection cancelled.")
             self._finish_operations()
@@ -2270,13 +2266,15 @@ class ArchiveSelectionDialog(QDialog):
     """Tree dialog for selecting which discovered archives to extract."""
 
     def __init__(self, archives: list[dict], guid_to_bundle: dict | None = None,
-                 is_android: bool = False, parent=None):
+                 is_android: bool = False, done_archives: list[dict] | None = None,
+                 parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select Archives for Extraction")
         self.setModal(True)
         self.setMinimumSize(820, 520)
         self.selected_paths: list[str] = []
         self._archives = archives
+        self._done_archives = done_archives or []
         self._guid_to_bundle = guid_to_bundle or {}
         self._is_android = is_android
         self._updating = False
@@ -2285,10 +2283,15 @@ class ArchiveSelectionDialog(QDialog):
         layout.setSpacing(8)
 
         n = len(archives)
-        layout.addWidget(QLabel(
-            f"<b>{n:,} archive{'s' if n != 1 else ''} found</b> across all scanned locations. "
-            "Select which to extract."
-        ))
+        n_done = len(self._done_archives)
+        if n == 0:
+            header = (f"All {n_done:,} archive{'s' if n_done != 1 else ''} have already "
+                      "been extracted. Previously extracted archives are shown below.")
+        else:
+            header = (f"<b>{n:,} archive{'s' if n != 1 else ''} available for extraction.</b>"
+                      + (f" ({n_done:,} previously extracted, shown below.)"
+                         if n_done else ""))
+        layout.addWidget(QLabel(header))
 
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["Path", "Type"])
@@ -2377,6 +2380,35 @@ class ArchiveSelectionDialog(QDialog):
             self._build_tree_android()
         else:
             self._build_tree_ios()
+        if self._done_archives:
+            self._build_tree_done()
+
+    def _build_tree_done(self):
+        """Append a collapsed, non-checkable 'Previously Extracted' section."""
+        n = len(self._done_archives)
+        group = QTreeWidgetItem(self._tree)
+        group.setText(0, f"Previously Extracted  ({n:,})")
+        group.setText(1, "")
+        # No check box — set flags without ItemIsUserCheckable
+        group.setFlags(group.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        grey = group.foreground(0)
+        grey.setColor(Qt.GlobalColor.gray)
+        group.setForeground(0, grey)
+        group.setForeground(1, grey)
+        font = group.font(0)
+        font.setItalic(True)
+        group.setFont(0, font)
+        group.setExpanded(False)
+
+        for arc in sorted(self._done_archives,
+                          key=lambda a: a.get('mtime', 0), reverse=True):
+            item = QTreeWidgetItem(group)
+            item.setText(0, _display_path(arc['ui_path'], self._guid_to_bundle))
+            item.setText(1, arc.get('file_type', ''))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
+                                       & ~Qt.ItemFlag.ItemIsEnabled)
+            item.setForeground(0, grey)
+            item.setForeground(1, grey)
 
     def _build_tree_ios(self):
         g2b = self._guid_to_bundle

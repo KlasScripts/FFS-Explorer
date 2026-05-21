@@ -1,13 +1,11 @@
 """keyword_search.py — keyword search worker, dialogs, and FastZipBrowser mixin."""
 
 import html
-import os
 import re
 import sqlite3
 import struct
 import threading
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import msgpack
 
@@ -15,6 +13,7 @@ from adapters import FfsAdapter
 from db_utils import (_open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob,
                       load_bookmark_groups, load_bookmark_entries)
 from zip_cd_cache import load as _zcd_load, compute_data_offsets as _compute_data_offsets
+from zip_reader import ZipReader
 
 _SEARCH_ENTRIES_VERSION = '1'
 
@@ -231,7 +230,7 @@ class KeywordSearchWorker(QThread):
         total    = len(entries)
         hits     = 0
         done     = 0
-        n_threads = min(8, os.cpu_count() or 4)
+        reader   = ZipReader(self.zip_path)
 
         def _decode_ctx(data: bytes, enc: str) -> str:
             if enc == 'utf-8':
@@ -240,69 +239,57 @@ class KeywordSearchWorker(QThread):
                 data = data[1:]
             return data.decode(enc, errors='replace')
 
-        def search_entry(_name, data_offset, file_size):
+        def search_entry(entry):
+            _name, data_offset, file_size = entry
             if self._stop.is_set():
                 return []
-            results = []
-            chunk   = self._CHUNK
-            pos     = 0
+            results  = []
+            buf_start = 0
+            leftover  = b''
             try:
-                with open(self.zip_path, 'rb') as fh:
-                    fh.seek(data_offset)
-                    buf_start = 0
-                    leftover  = b''
-                    while pos < file_size and not self._stop.is_set():
-                        read_len    = min(chunk, file_size - pos)
-                        raw         = fh.read(read_len)
-                        if not raw:
-                            break
-                        block       = leftover + raw
-                        block_lower = block.lower()
-                        block_base  = buf_start
-                        for pat, pat_len, enc in patterns:
-                            idx = 0
-                            while True:
-                                idx = block_lower.find(pat, idx)
-                                if idx == -1:
-                                    break
-                                file_offset = block_base + idx
-                                ctx_start   = max(0, idx - self._CTX_BYTES)
-                                ctx_end     = min(len(block), idx + pat_len + self._CTX_BYTES)
-                                ctx_bytes   = block[ctx_start:ctx_end]
-                                before      = ctx_bytes[:idx - ctx_start]
-                                after       = ctx_bytes[idx - ctx_start + pat_len:]
-                                hit_text    = block[idx:idx + pat_len].decode(enc, errors='replace')
-                                context     = (
-                                    _decode_ctx(before, enc)
-                                    + f'[{hit_text}]'
-                                    + _decode_ctx(after, enc)
-                                )
-                                results.append((file_offset, context))
-                                idx += pat_len
-                        leftover  = block[-overlap:] if overlap > 0 else b''
-                        buf_start = block_base + len(block) - len(leftover)
-                        pos      += read_len
+                for raw in reader.read_chunked_at(data_offset, file_size,
+                                                  chunk_size=self._CHUNK,
+                                                  stop_fn=self._stop.is_set):
+                    block       = leftover + raw
+                    block_lower = block.lower()
+                    block_base  = buf_start
+                    for pat, pat_len, enc in patterns:
+                        idx = 0
+                        while True:
+                            idx = block_lower.find(pat, idx)
+                            if idx == -1:
+                                break
+                            file_offset = block_base + idx
+                            ctx_start   = max(0, idx - self._CTX_BYTES)
+                            ctx_end     = min(len(block), idx + pat_len + self._CTX_BYTES)
+                            ctx_bytes   = block[ctx_start:ctx_end]
+                            before      = ctx_bytes[:idx - ctx_start]
+                            after       = ctx_bytes[idx - ctx_start + pat_len:]
+                            hit_text    = block[idx:idx + pat_len].decode(enc, errors='replace')
+                            context     = (
+                                _decode_ctx(before, enc)
+                                + f'[{hit_text}]'
+                                + _decode_ctx(after, enc)
+                            )
+                            results.append((file_offset, context))
+                            idx += pat_len
+                    leftover  = block[-overlap:] if overlap > 0 else b''
+                    buf_start = block_base + len(block) - len(leftover)
             except OSError:
                 pass
             return results
 
-        with ThreadPoolExecutor(max_workers=n_threads) as pool:
-            futures = {
-                pool.submit(search_entry, name, off, size): name
-                for name, off, size in entries
-            }
-            for fut in as_completed(futures):
-                if self._stop.is_set():
-                    break
-                name = futures[fut]
-                done += 1
-                self.progress.emit(done, total)
-                try:
-                    for file_offset, context in fut.result():
-                        hits += 1
-                        self.result_found.emit(name, file_offset, context)
-                except Exception:
-                    pass
+        for entry, entry_results in reader.run_parallel(
+                entries, search_entry, cancel_check=self._stop.is_set):
+            done += 1
+            self.progress.emit(done, total)
+            try:
+                name = entry[0]
+                for file_offset, context in entry_results:
+                    hits += 1
+                    self.result_found.emit(name, file_offset, context)
+            except Exception:
+                pass
 
         self.finished.emit(hits, done, total, self._stop.is_set())
 

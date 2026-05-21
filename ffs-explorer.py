@@ -2696,7 +2696,7 @@ def _do_path_change_check(
 class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin):  # type: ignore[reportIncompatibleMethodOverride]
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("iOS FFS Browser")
+        self.setWindowTitle("FFS Explorer")
         self.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
         self.resize(1350, 850)
 

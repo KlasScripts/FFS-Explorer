@@ -320,6 +320,7 @@ class FfsAdapter:
                 pv + 'mobile/Library/Mobile Documents/',
                 pv + 'mobile/Library/Mail/',
                 pv + 'mobile/Library/SMS/Attachments/',
+                pv + 'mobile/Library/Biome/streams/',
                 'data/data/',
             ]
         if self.format == self.FORMAT_ZIP_EXTRAS:
@@ -329,6 +330,7 @@ class FfsAdapter:
             'mobile/Library/Mobile Documents/',
             'mobile/Library/Mail/',
             'mobile/Library/SMS/Attachments/',
+            'mobile/Library/Biome/streams/',
         ]
 
     def archive_discovery_folders(self) -> list[str]:
@@ -397,6 +399,8 @@ class FfsAdapter:
             _TAG_UT    = _gk._TAG_UT
             result = {}
             for f in z.infolist():
+                if f.filename.endswith('/'):
+                    continue
                 name = f.filename.rstrip('/')
                 if not name.startswith(slash):
                     continue
@@ -507,12 +511,15 @@ class FfsAdapter:
         if self.format in (self.FORMAT_GRAYKEY, self.FORMAT_ZIP_EXTRAS):
             if self.format == self.FORMAT_GRAYKEY:
                 _emit("Graykey archive detected — extracting metadata...")
-                # GrayKey zip entries have a leading '/' so the prefix mirrors that.
-                if guid_to_bundle is None:
+                _ios_containers = "/private/var/mobile/Containers/"
+                _is_gk_ios = any(n.startswith(_ios_containers) for n in zip_names)
+                if not _is_gk_ios:
+                    guid_to_bundle = {}
+                elif guid_to_bundle is None:
                     _emit("Mapping Bundle IDs to GUIDs...")
                     guid_to_bundle = _build_guid_bundle_map(
                         zip_path, zip_names, z=z,
-                        container_prefix="/private/var/mobile/Containers/")
+                        container_prefix=_ios_containers)
                 else:
                     _emit("Bundle ID map loaded from cache.")
             else:

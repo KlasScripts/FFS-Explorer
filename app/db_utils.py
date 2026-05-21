@@ -18,7 +18,7 @@ import sqlite3
 import msgpack
 
 # Per-key blob versions — increment a version string to invalidate stale data.
-_FOLDER_DATA_VERSION    = '6'
+_FOLDER_DATA_VERSION    = '8'
 _SEARCH_ENTRIES_VERSION = '1'
 
 # Bump whenever the schema changes incompatibly.
@@ -397,6 +397,7 @@ def load_folder_data(conn: 'sqlite3.Connection') -> tuple[dict, dict]:
     counts — {folder_path: int}
     sizes  — {folder_path: int}
     Both empty if not cached or version mismatch.
+    Entries with count == -1 (sentinel: not yet computed) are excluded from counts.
     """
     raw = load_blob(conn, 'folder_data', _FOLDER_DATA_VERSION)
     if raw is None:
@@ -406,15 +407,21 @@ def load_folder_data(conn: 'sqlite3.Connection') -> tuple[dict, dict]:
     sizes:  dict = {}
     for path, value in combined.items():
         if isinstance(value, list) and len(value) == 2:
-            counts[path] = value[0]
-            sizes[path]  = value[1]
+            if value[0] != -1:   # -1 = sentinel written by save_folder_sizes before counts known
+                counts[path] = value[0]
+            sizes[path] = value[1]
     return counts, sizes
 
 
 def save_folder_sizes(conn: 'sqlite3.Connection', sizes: dict) -> None:
-    """Merge {folder_path: total_bytes} into the blob, preserving existing counts."""
+    """Merge {folder_path: total_bytes} into the blob, preserving existing counts.
+
+    When no prior count exists for a path, stores -1 as a sentinel so that
+    load_folder_data knows the count has not been computed yet (0 would be
+    ambiguous with a legitimately empty folder).
+    """
     existing_counts, _ = load_folder_data(conn)
-    combined = {path: [existing_counts.get(path, 0), size] for path, size in sizes.items()}
+    combined = {path: [existing_counts.get(path, -1), size] for path, size in sizes.items()}
     save_blob(conn, 'folder_data', _FOLDER_DATA_VERSION, msgpack.packb(combined, use_bin_type=True))
 
 

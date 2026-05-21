@@ -11,6 +11,8 @@ file_size is the uncompressed byte count; it gates the full-text check.
 
 import struct
 
+from zip_reader import ZipReader
+
 # (signature, category) — first match wins.
 _SIGNATURES: list[tuple[bytes, str | None]] = [
     (b'SQLite format 3\x00', 'Database'),
@@ -26,6 +28,7 @@ _SIGNATURES: list[tuple[bytes, str | None]] = [
     (b'\x1f\x8b',           'Compressed'), # gzip
     (b'BZh',                'Compressed'), # bzip2
     (b'\xfd7zXZ\x00',       'Compressed'), # xz
+    (b'SEGB',               'Biome Stream'),  # iOS Biome event stream (v1 & v2)
     (b'bplist',             'Property List'),
     (b'<?xml',              'XML'),
     (b'<html',              'Web / Data'),
@@ -98,31 +101,32 @@ def scan_entries(
       data_offset — byte position where the entry's raw data starts in zip_path.
       file_size   — uncompressed size in bytes; controls the text-check limit.
 
-    For each entry:
-      1. Read 16 bytes and run classify_magic().
-      2. If unrecognised and file_size <= TEXT_SIZE_LIMIT, read the full content
-         and classify as 'Text' if every byte is printable ASCII / whitespace.
+    For each entry: reads up to TEXT_SIZE_LIMIT bytes in a single I/O, runs
+    classify_magic(), then falls back to a full-content text check if the file
+    is small enough and unrecognised.  Entries are processed concurrently using
+    up to 8 threads (each opens its own file handle).
 
     progress_cb(remaining: int) called after each batch.
     """
+    reader = ZipReader(zip_path)
+
+    def _scan_one(item: tuple[str, int, int]) -> str | None:
+        ui_path, data_offset, file_size = item
+        max_b = TEXT_SIZE_LIMIT if 0 < file_size <= TEXT_SIZE_LIMIT else 16
+        buf = reader.read_at(data_offset, file_size, max_bytes=max_b)
+        detected = classify_magic(buf)
+        if detected is None and 0 < file_size <= TEXT_SIZE_LIMIT:
+            if _is_text(buf):
+                detected = 'Text'
+        return detected
+
     results: dict[str, str] = {}
-    total = len(candidates)
-    with open(zip_path, 'rb') as f:
-        for i, (ui_path, data_offset, file_size) in enumerate(candidates):
-            if cancel_check and cancel_check():
-                break
-            f.seek(data_offset)
-            header = f.read(16)
-            detected = classify_magic(header)
-            if detected is None and 0 < file_size <= TEXT_SIZE_LIMIT:
-                # Re-read full content (header already read, seek back).
-                f.seek(data_offset)
-                if _is_text(f.read(file_size)):
-                    detected = 'Text'
-            if detected:
-                results[ui_path] = detected
-            if progress_cb and (i + 1) % batch_size == 0:
-                progress_cb(total - i - 1)
-    if progress_cb:
-        progress_cb(0)
+    _pcb = (lambda d, t: progress_cb(t - d)) if progress_cb else None
+    for (ui_path, _, __), detected in reader.run_parallel(
+            candidates, _scan_one,
+            progress_cb=_pcb,
+            cancel_check=cancel_check,
+            batch_size=batch_size):
+        if detected:
+            results[ui_path] = detected
     return results

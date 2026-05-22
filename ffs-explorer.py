@@ -63,13 +63,31 @@ from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
-                             qInstallMessageHandler, QtMsgType)
+                             qInstallMessageHandler, QtMsgType, QStandardPaths)
+from PySide6.QtCore import QSettings as _QSettings
 
 FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface responsive at 60 fps while the tree builds
 
 _TREE_PLACEHOLDER  = "__placeholder__"
 _BM_ROOT           = "__bookmarks__"
 _BM_GROUP_PREFIX   = "__bm_group_"
+
+_SETTINGS_ORG = "KlasScripts"
+_SETTINGS_APP = "FFS Explorer"
+
+
+def _load_prefs() -> dict:
+    s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    return {
+        'case_data_root': s.value('case_data_root', '', type=str),
+    }
+
+
+def _save_prefs(prefs: dict):
+    s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    s.setValue('case_data_root', prefs.get('case_data_root', ''))
+
+
 # Minimum tree column width (px).  The column always fills the panel, but never
 # shrinks below this so deeply-indented items can be reached via horizontal scroll.
 _TREE_COL_MIN = 1000
@@ -1450,55 +1468,45 @@ class CaseSettingsDialog(QDialog):
       • Export/        — extracted files
     """
 
-    def __init__(self, zip_path: str, last_base: str | None, parent=None):
+    def __init__(self, zip_path: str, base_folder: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Case Folder Settings")
         self.setModal(True)
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(620)
 
         self._accepted_dir: str | None = None
+        self._base_folder = base_folder
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
-        layout.addWidget(QLabel(
-            "<b>Choose where to store the cache and exports for this FFS archive.</b><br>"
-            "A subfolder will be created inside the base location you select."
-        ))
+        # FFS path display — read-only, selectable so the user can copy exhibit references
+        layout.addWidget(QLabel("<b>Archive path</b>"))
+        hint = QLabel("Select and copy any part of the path to use as the case name below.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
-        # Base folder row
-        base_row = QHBoxLayout()
-        base_row.addWidget(QLabel("Base folder:"))
-        self._base_edit = QLineEdit()
-        self._base_edit.setPlaceholderText("Select a folder…")
-        if last_base and os.path.isdir(last_base):
-            self._base_edit.setText(last_base)
-        self._base_edit.textChanged.connect(self._update_preview)
-        base_row.addWidget(self._base_edit, 1)
-        browse_btn = QPushButton("Browse…")
-        browse_btn.setFixedWidth(80)
-        browse_btn.clicked.connect(self._browse)
-        base_row.addWidget(browse_btn)
-        layout.addLayout(base_row)
+        dir_edit = QLineEdit(zip_path)
+        dir_edit.setReadOnly(True)
+        dir_edit.setFrame(False)
+        dir_edit.setStyleSheet("background: transparent;")
+        layout.addWidget(dir_edit)
 
-        # Case folder name row
-        name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Case folder name:"))
+        layout.addSpacing(6)
+
+        # Case folder name
+        layout.addWidget(QLabel("<b>Case folder name</b>"))
         self._name_edit = QLineEdit()
         self._name_edit.setText(pathlib.Path(zip_path).stem)
-        self._name_edit.textChanged.connect(self._update_preview)
-        name_row.addWidget(self._name_edit, 1)
-        layout.addLayout(name_row)
-
-        # Preview
-        self._preview_label = QLabel()
-        self._preview_label.setWordWrap(True)
-        layout.addWidget(self._preview_label)
+        self._name_edit.textChanged.connect(self._on_name_changed)
+        layout.addWidget(self._name_edit)
 
         # Header scan option
         self._scan_cb = QCheckBox("Scan unknown file headers for precise type detection")
         self._scan_cb.setChecked(False)
         layout.addWidget(self._scan_cb)
+
+        layout.addStretch()
 
         # Buttons
         btn_row = QHBoxLayout()
@@ -1512,38 +1520,22 @@ class CaseSettingsDialog(QDialog):
         btn_row.addWidget(self._save_btn)
         layout.addLayout(btn_row)
 
-        # Populate preview now that _save_btn exists
-        self._update_preview()
+        self._on_name_changed()
 
-    def _browse(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Base Folder",
-                                                  self._base_edit.text())
-        if folder:
-            self._base_edit.setText(folder)
-
-    def _update_preview(self):
-        base = self._base_edit.text().strip()
-        name = self._name_edit.text().strip()
-        if not base or not name:
-            self._preview_label.setText("<i>No folder selected.</i>")
-            self._save_btn.setEnabled(False)
-            return
-        case_dir  = os.path.join(base, name)
-        cache_loc = os.path.join(case_dir, 'casedata.db')
-        export_loc = os.path.join(case_dir, 'Export', '')
-        exists_note = " <b>(already exists)</b>" if os.path.isdir(case_dir) else ""
-        self._preview_label.setText(
-            f"<b>Case folder:</b> {case_dir}{exists_note}<br>"
-            f"<b>Thumbnail cache:</b> {cache_loc}<br>"
-            f"<b>Export folder:</b> {export_loc}"
-        )
-        self._save_btn.setEnabled(True)
+    def _on_name_changed(self):
+        self._save_btn.setEnabled(bool(self._name_edit.text().strip()))
 
     def _on_save(self):
-        base = self._base_edit.text().strip()
+        base = self._base_folder
         name = self._name_edit.text().strip()
-        if not base or not name:
+        if not name:
             return
+        if not base:
+            # No global root set — ask user to pick a folder directly
+            base = QFileDialog.getExistingDirectory(self, "Select Base Folder")
+            if not base:
+                return
+            self._base_folder = base
         case_dir = os.path.join(base, name)
         if os.path.isdir(case_dir):
             from PySide6.QtWidgets import QMessageBox
@@ -1568,6 +1560,65 @@ class CaseSettingsDialog(QDialog):
     @property
     def scan_headers(self) -> bool:
         return self._scan_cb.isChecked()
+
+
+class PreferencesDialog(QDialog):
+    """Global (cross-case) application preferences."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+        prefs = _load_prefs()
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        layout.addWidget(QLabel("<b>Case Data Root</b>"))
+        layout.addWidget(QLabel(
+            "New archives will store their cache and exports inside a subfolder here. "
+            "Leave blank to be prompted each time."
+        ))
+        ssd_note = QLabel(
+            "<i>Tip: Use an SSD for this location. The cache involves many small random "
+            "reads and writes — an SSD will significantly improve load and scan times.</i>"
+        )
+        ssd_note.setWordWrap(True)
+        layout.addWidget(ssd_note)
+
+        root_row = QHBoxLayout()
+        self._root_edit = QLineEdit(prefs.get('case_data_root', ''))
+        self._root_edit.setPlaceholderText("Not set — will ask each time")
+        root_row.addWidget(self._root_edit, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setFixedWidth(80)
+        browse_btn.clicked.connect(self._browse)
+        root_row.addWidget(browse_btn)
+        layout.addLayout(root_row)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def _browse(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Case Data Root",
+                                                  self._root_edit.text())
+        if folder:
+            self._root_edit.setText(folder)
+
+    def _on_save(self):
+        _save_prefs({'case_data_root': self._root_edit.text().strip()})
+        self.accept()
 
 
 class HeaderScanWorker(QThread):
@@ -2721,8 +2772,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._hex_worker: QThread | None = None
         self._adapter = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, "filesystem2", "filesystem1")
         self._android_user_data_path = ''   # set at load time for Android archives
-        # ffs_archives: ordered list of {"path": ..., "case_dir": ..., "label": ...}, most-recent first
-        self._ffs_archives: list = _load_json_file(FFS_ARCHIVES_FILE, [])
+        # ffs_archives: ordered list of {"path": ..., "case_dir": ..., "label": ..., "last_opened": ...}
+        self._ffs_archives: list = self._load_ffs_archives()
         self.recent_paths: list = [e['path'] for e in self._ffs_archives if 'path' in e]
         self._migrate_device_labels()
         self._case_dir: str | None = None   # case folder for the currently loaded zip
@@ -2743,8 +2794,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._artifact_act.setEnabled(False)
         file_menu.addAction(self._artifact_act)
         file_menu.addSeparator()
-        self._recent_menu = file_menu.addMenu("Recently Opened FFS")
+        self._recent_menu = file_menu.addMenu("Cases")
         self._recent_menu.aboutToShow.connect(self._populate_recent_menu)
+        file_menu.addSeparator()
+        prefs_act = QAction("Preferences…", self)
+        prefs_act.triggered.connect(self._open_preferences)
+        file_menu.addAction(prefs_act)
         self._view_path = ""
         self._view_is_recursive = False
         self._checked_folders: set = set()
@@ -3214,13 +3269,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     # else: mismatch error shown by _do_path_change_check
             # User declined or didn't pick — fall through to CaseSettingsDialog
 
-        last_base = None
-        for e in self._ffs_archives:
-            cd = e.get('case_dir', '')
-            if cd and os.path.isdir(cd):
-                last_base = os.path.dirname(cd)
-                break
-        dlg = CaseSettingsDialog(zip_path, last_base, parent=self)
+        prefs = _load_prefs()
+        base_folder = prefs.get('case_data_root', '').strip()
+        if not base_folder or not os.path.isdir(base_folder):
+            for e in self._ffs_archives:
+                cd = e.get('case_dir', '')
+                if cd and os.path.isdir(cd):
+                    base_folder = os.path.dirname(cd)
+                    break
+        dlg = CaseSettingsDialog(zip_path, base_folder, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None, False
         case_dir = dlg.case_dir
@@ -4088,6 +4145,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 self.update_dropdown_ui()
             path = new_path
         self.start_loading(path)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, '_prefs_checked', False):
+            self._prefs_checked = True
+            prefs = _load_prefs()
+            if not prefs.get('case_data_root', '').strip():
+                QTimer.singleShot(0, self._open_preferences)
+
+    def _open_preferences(self):
+        PreferencesDialog(parent=self).exec()
 
     def _open_process_dialog(self):
         if not self.zip_path:
@@ -5158,6 +5226,72 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     # ── ffs_archives helpers ──────────────────────────────────────────────────
 
+    def _archives_file_path(self) -> str:
+        """Return the path to ffs_archives.json — in case root if set, else config/."""
+        prefs = _load_prefs()
+        root = prefs.get('case_data_root', '').strip()
+        if root and os.path.isdir(root):
+            return os.path.join(root, 'ffs_archives.json')
+        return FFS_ARCHIVES_FILE
+
+    def _load_ffs_archives(self) -> list:
+        """Load and return the merged, sorted archive list.
+
+        If a case root is configured, scans it for case folders not already in
+        the JSON (identified by the presence of caseresults.db) and adds them,
+        reading the zip path from the DB.  Entries whose case_dir no longer
+        exists are removed.  Result is sorted by last_opened descending.
+        """
+        archives_path = self._archives_file_path()
+        stored: list = _load_json_file(archives_path, [])
+
+        # Also try the old config location if we moved to case root
+        if archives_path != FFS_ARCHIVES_FILE:
+            old = _load_json_file(FFS_ARCHIVES_FILE, [])
+            known_dirs = {e.get('case_dir') for e in stored}
+            for e in old:
+                if e.get('case_dir') and e['case_dir'] not in known_dirs:
+                    stored.append(e)
+
+        by_case_dir: dict = {e['case_dir']: e for e in stored if e.get('case_dir')}
+
+        # Scan case root for any case folders not already in the list
+        prefs = _load_prefs()
+        root = prefs.get('case_data_root', '').strip()
+        if root and os.path.isdir(root):
+            for name in os.listdir(root):
+                case_dir = os.path.join(root, name)
+                if not os.path.isdir(case_dir):
+                    continue
+                if case_dir in by_case_dir:
+                    continue
+                db_path = os.path.join(case_dir, 'caseresults.db')
+                if not os.path.exists(db_path):
+                    continue
+                # Found a case folder — try to read zip_path from DB
+                zip_path = ''
+                try:
+                    db = _open_results_db(case_dir)
+                    rows = load_device_info(db)
+                    db.close()
+                    for field, data, _src in rows:
+                        if field == 'zip_path':
+                            zip_path = data
+                            break
+                except Exception:
+                    pass
+                entry: dict = {'case_dir': case_dir}
+                if zip_path:
+                    entry['path'] = zip_path
+                by_case_dir[case_dir] = entry
+
+        # Drop entries whose case_dir no longer exists
+        result = [e for e in by_case_dir.values() if os.path.isdir(e.get('case_dir', ''))]
+
+        # Sort by last_opened descending (missing → oldest)
+        result.sort(key=lambda e: e.get('last_opened', ''), reverse=True)
+        return result
+
     def _migrate_device_labels(self):
         """One-time migration: copy labels from the old device_labels.json into
         ffs_archives entries, then delete the file."""
@@ -5192,24 +5326,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _save_ffs_archives(self):
         """Persist the in-memory _ffs_archives list to disk."""
         try:
-            with open(FFS_ARCHIVES_FILE, 'w', encoding='utf-8') as f:
+            with open(self._archives_file_path(), 'w', encoding='utf-8') as f:
                 json.dump(self._ffs_archives, f, indent=2)
         except OSError:
             pass
 
     def _upsert_archive(self, path: str, case_dir: str | None = None):
-        """Move *path* to front of _ffs_archives (max 5), optionally setting case_dir."""
-        # Preserve any existing label when reinserting
+        """Update or insert an archive entry, stamping last_opened and moving to front."""
         existing = self._archive_entry(path)
         existing_label = existing.get('label', '') if existing else ''
+        existing_case  = existing.get('case_dir', '') if existing else ''
         self._ffs_archives = [e for e in self._ffs_archives if e.get('path') != path]
-        entry: dict = {'path': path}
+        entry: dict = {
+            'path':        path,
+            'last_opened': datetime.now(tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+        }
         if case_dir is not None:
             entry['case_dir'] = case_dir
+        elif existing_case:
+            entry['case_dir'] = existing_case
         if existing_label:
             entry['label'] = existing_label
         self._ffs_archives.insert(0, entry)
-        self._ffs_archives = self._ffs_archives[:5]
         self.recent_paths = [e['path'] for e in self._ffs_archives]
         self._save_ffs_archives()
 
@@ -5270,18 +5408,23 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.archive_dropdown.blockSignals(True)
         self.archive_dropdown.clear()
         # Header item — always index 0, not selectable
-        self.archive_dropdown.addItem("Recently Opened FFS")
+        self.archive_dropdown.addItem("Cases")
         from PySide6.QtGui import QStandardItemModel as _QStdModel
         model = self.archive_dropdown.model()
         assert isinstance(model, _QStdModel)
         item = model.item(0)
         from PySide6.QtCore import Qt as _Qt
         item.setFlags(item.flags() & ~(_Qt.ItemFlag.ItemIsSelectable | _Qt.ItemFlag.ItemIsEnabled))
-        for p in self.recent_paths:
-            entry = self._archive_entry(p)
-            label = entry.get('label', '') if entry else ''
-            display = self._archive_display(p, label)
-            self.archive_dropdown.addItem(display, userData=p)
+        for entry in self._ffs_archives:
+            p    = entry.get('path', '')
+            cd   = entry.get('case_dir', '')
+            label = entry.get('label', '')
+            if p:
+                display = self._archive_display(p, label)
+            else:
+                name = os.path.basename(cd) if cd else '?'
+                display = f"[case folder only]  {label + '  —  ' if label else ''}{name}"
+            self.archive_dropdown.addItem(display, userData=p or cd)
         self.archive_dropdown.setCurrentIndex(0)
         self.archive_dropdown.blockSignals(False)
         # Re-select the currently loaded archive if any
@@ -5293,20 +5436,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _populate_recent_menu(self):
         self._recent_menu.clear()
-        if not self.recent_paths:
-            empty_act = QAction("No recently opened archives", self)
+        if not self._ffs_archives:
+            empty_act = QAction("No cases found", self)
             empty_act.setEnabled(False)
             self._recent_menu.addAction(empty_act)
             return
-        for p in self.recent_paths:
-            entry = self._archive_entry(p)
-            label = entry.get('label', '') if entry else ''
-            display = self._archive_display(p, label)
+        for entry in self._ffs_archives:
+            p    = entry.get('path', '')
+            cd   = entry.get('case_dir', '')
+            label = entry.get('label', '')
+            if p:
+                display = self._archive_display(p, label)
+            else:
+                # Discovered case folder with no known zip path
+                name = os.path.basename(cd) if cd else '?'
+                display = f"[case folder only]  {label + '  —  ' if label else ''}{name}"
             act = QAction(display, self)
-            act.triggered.connect(lambda _checked, path=p: self.start_loading(path))
+            act.setEnabled(bool(p))
+            if p:
+                act.triggered.connect(lambda _checked, path=p: self.start_loading(path))
             self._recent_menu.addAction(act)
         self._recent_menu.addSeparator()
-        clear_act = QAction("Clear Recent List", self)
+        clear_act = QAction("Clear List", self)
         clear_act.triggered.connect(self._clear_recent_list)
         self._recent_menu.addAction(clear_act)
 

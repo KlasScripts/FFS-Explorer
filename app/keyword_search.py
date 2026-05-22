@@ -217,7 +217,7 @@ class KeywordSearchWorker(QThread):
             full_entries = self._build_entries()
             self.entries = full_entries
             if self._scope == "app_data":
-                entries = [e for e in full_entries if "mobile/Containers" in e[0]]
+                entries = [e for e in full_entries if "mobile/Containers" in e[0] or "data/data" in e[0]]
             elif self._exclude_prefixes:
                 entries = [e for e in full_entries
                            if not any(e[0].lstrip('/').startswith(p)
@@ -728,7 +728,7 @@ class KeywordSearchMixin:
         self.search_scope_combo.addItem("Selected Files", userData="selected")
         self.search_scope_combo.setToolTip(
             "All Files      — search every stored file in the archive\n"
-            "App Data       — search only files under mobile/Containers\n"
+            "App Data       — search only files under mobile/Containers (iOS) or data/data (Android)\n"
             "Selected Files — search only currently selected files/folders\n"
             "BM: <group>    — search only files in that bookmark group"
         )
@@ -821,15 +821,21 @@ class KeywordSearchMixin:
             return entries, nm, f"BM: {group_name}"
 
         if scope == 'selected':
-            get_bm   = getattr(self, '_get_paths_for_bookmark', None)
-            pairs    = get_bm() if get_bm else []
-            ui_paths = [p for p, _ in pairs]
+            checked    = getattr(self, '_checked_folders', set())
+            folder_map = getattr(self, 'folder_map', {})
+            seen: set  = set()
+            ui_paths: list = []
+            for folder in checked:
+                for child in folder_map.get(folder, []):
+                    if child not in seen:
+                        seen.add(child)
+                        ui_paths.append(child)
             entries, nm = self._filter_entries_by_ui_paths(ui_paths, nested_map)
             return entries, nm, f"selected files ({len(ui_paths):,})"
 
         if scope == 'app_data':
             entries = (
-                [e for e in self._search_entries if 'mobile/Containers' in e[0]]
+                [e for e in self._search_entries if 'mobile/Containers' in e[0] or 'data/data' in e[0]]
                 if self._search_entries is not None else None
             )
             return entries, nested_map, "App Data"

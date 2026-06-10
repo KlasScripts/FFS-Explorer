@@ -3,14 +3,15 @@
 import zipfile
 
 from zip_entry import ZipEntry
+from zip_reader import read_nested_entry
 from PySide6.QtWidgets import (
     QWidget, QLabel, QProgressBar, QVBoxLayout, QFrame,
-    QPlainTextEdit, QTextEdit, QApplication, QTabWidget,
+    QPlainTextEdit, QTextEdit, QTabWidget,
 )
 from PySide6.QtGui import (
     QFont, QFontMetricsF, QTextCursor, QTextCharFormat, QColor,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent
+from PySide6.QtCore import QThread, Signal, QTimer, QEvent
 
 # ── Layout constants ──────────────────────────────────────────────────────────
 # Format: "XXXXXXXX  [GRP0]  [GRP1]  …  [GRP7]  ASCII…"
@@ -354,19 +355,9 @@ class HexViewerMixin:
         self.hex_view.clear()
         self.hex_progress_bar.hide()
 
-        try:
-            with zipfile.ZipFile(stored_path, 'r') as zf:
-                data = zf.read(entry_path)
-        except zipfile.BadZipFile:
-            # Gzip-extracted files are stored as raw decompressed blobs.
-            try:
-                with open(stored_path, 'rb') as f:
-                    data = f.read()
-            except Exception as e:
-                self._on_hex_error(str(e))
-                return
-        except Exception as e:
-            self._on_hex_error(str(e))
+        data = read_nested_entry(stored_path, entry_path)
+        if data is None:
+            self._on_hex_error(f"Cannot read nested entry: {entry_path}")
             return
 
         self._hex_file_size  = len(data)

@@ -27,6 +27,7 @@ import re
 import struct
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from itertools import batched
 
 import msgpack
 
@@ -160,10 +161,9 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
 
     n = min(8, len(entries))
     batch_size = max(1, (len(entries) + n - 1) // n)
-    batches = [entries[i:i + batch_size] for i in range(0, len(entries), batch_size)]
     out: dict = {}
     with ThreadPoolExecutor(max_workers=n) as pool:
-        for batch_result in pool.map(_read_batch, batches):
+        for batch_result in pool.map(_read_batch, batched(entries, batch_size)):
             out.update(batch_result)
     return out
 
@@ -187,11 +187,15 @@ class FfsAdapter:
     # ── Detection ─────────────────────────────────────────────────────────────
 
     @classmethod
-    def detect(cls, z: zipfile.ZipFile) -> "FfsAdapter":
-        """Inspect an open ZipFile and return the matching adapter."""
+    def detect(cls, z: zipfile.ZipFile, names: frozenset | None = None) -> "FfsAdapter":
+        """Inspect an open ZipFile and return the matching adapter.
+
+        Pass *names* when a frozenset of entry names is already built — it
+        saves a second full namelist scan on 500k-entry archives."""
         if _gk._is_graykey(z):
             return cls(cls.FORMAT_GRAYKEY, "private/var", "")
-        names = frozenset(z.namelist())
+        if names is None:
+            names = frozenset(z.namelist())
         if any(n.startswith("Dump/") for n in names) and _gk._has_ut_extras(z):
             return cls(cls.FORMAT_ZIP_EXTRAS, "Dump", "")
         return cls.detect_from_names(names)
@@ -357,12 +361,9 @@ class FfsAdapter:
 
         Removes the physical zip prefix (e.g. 'filesystem2/' or '/private/var/')
         so the path starts from the user-partition root."""
-        p = path.lstrip('/')
-        prefix = self.user_prefix + '/'
-        if p.startswith(prefix):
-            p = p[len(prefix):]
-        if self.format == self.FORMAT_GRAYKEY and p.startswith('private/var/'):
-            p = p[len('private/var/'):]
+        p = path.lstrip('/').removeprefix(self.user_prefix + '/')
+        if self.format == self.FORMAT_GRAYKEY:
+            p = p.removeprefix('private/var/')
         return p
 
     def prefix_shortcut(self, path: str) -> str:
@@ -437,11 +438,7 @@ class FfsAdapter:
                 if self.old_layout:
                     # Strip the 'private/var/' prefix so ui_paths are bare
                     # (matching new-layout Cellebrite and GrayKey)
-                    _PV = "private/var/"
-                    return {
-                        (k[len(_PV):] if k.startswith(_PV) else k): v
-                        for k, v in raw.items()
-                    }
+                    return {k.removeprefix("private/var/"): v for k, v in raw.items()}
                 return raw
             raise KeyError("metadata.msgpack not found in metadata1/ or metadata2/")
 
@@ -501,8 +498,7 @@ class FfsAdapter:
             else:
                 raise KeyError("metadata.msgpack not found in metadata1/ or metadata2/")
             if self.old_layout:
-                _PV = "private/var/"
-                raw = {(k[len(_PV):] if k.startswith(_PV) else k): v for k, v in raw.items()}
+                raw = {k.removeprefix("private/var/"): v for k, v in raw.items()}
             return raw, {}, None
 
         assert z is not None

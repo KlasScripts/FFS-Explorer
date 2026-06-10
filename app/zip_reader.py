@@ -1,10 +1,33 @@
 """zip_reader.py — raw zip entry I/O primitives shared by header_scan and keyword_search."""
 
 import os
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Iterator
 
 THREAD_WORKERS: int = min(8, os.cpu_count() or 4)
+
+
+def read_nested_entry(stored_path: str, entry_path: str) -> bytes | None:
+    """Read one entry's bytes from an extracted nested-archive file.
+
+    stored_path is either a repackaged ZIP (for ZIP sources) or a raw
+    decompressed blob (for gzip sources).  Tries ZIP first; if the file is
+    not a ZIP at all, falls back to returning the whole blob.
+    Returns None on any read error.
+    """
+    try:
+        with zipfile.ZipFile(stored_path, 'r') as zf:
+            return zf.read(entry_path)
+    except zipfile.BadZipFile:
+        pass
+    except Exception:
+        return None
+    try:
+        with open(stored_path, 'rb') as f:
+            return f.read()
+    except Exception:
+        return None
 
 
 class ZipReader:

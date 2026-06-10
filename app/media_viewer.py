@@ -4,6 +4,7 @@ import os
 import subprocess
 import sqlite3
 import zipfile
+from itertools import batched
 
 from db_utils import _open_cache_db
 from PySide6.QtWidgets import (
@@ -145,9 +146,7 @@ class ThumbnailWorker(QThread):
 
             _zf = None if self.streaming_index is not None else zipfile.ZipFile(self.zip_path, 'r')
             try:
-                for batch_start in range(0, len(items_list), _DB_BATCH):
-                    batch = items_list[batch_start:batch_start + _DB_BATCH]
-
+                for batch in batched(items_list, _DB_BATCH):
                     # Query DB for just this batch
                     cached = {}
                     if db is not None:
@@ -319,9 +318,10 @@ class MediaViewerMixin:
         """Stop any running thumb worker, clear the grid, then start the worker.
         Containers are created lazily in _on_thumbnail_ready so the main thread
         is never blocked pre-building hundreds of widgets up front."""
-        if self._thumb_worker and self._thumb_worker.isRunning():
-            self._thumb_worker.stop()
-            self._thumb_worker.wait()
+        # Retire (don't wait) — the worker may be stuck inside a long ffmpeg
+        # call and wait() would freeze the GUI until it returns.
+        self._retire_worker(self._thumb_worker)
+        self._thumb_worker = None
 
         while self._media_grid.count():
             item = self._media_grid.takeAt(0)

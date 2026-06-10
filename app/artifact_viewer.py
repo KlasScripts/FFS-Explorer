@@ -1,23 +1,22 @@
 """artifact_viewer.py — ArtifactRunnerWorker, ArtifactRunnerDialog, and ArtifactViewerMixin."""
 
-import html
 import os
 import pathlib
-import re
 import sqlite3
 import zipfile
+from contextlib import closing
 from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QComboBox, QHBoxLayout, QVBoxLayout,
     QTableView, QTreeView, QPlainTextEdit, QStackedWidget, QSplitter,
-    QHeaderView, QScrollArea, QCheckBox, QPushButton, QDialog, QMessageBox,
-    QApplication, QStyle, QStyledItemDelegate,
+    QScrollArea, QCheckBox, QPushButton, QDialog, QMessageBox,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QTextDocument
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
 
 from db_utils import _open_results_db, start_run_log, complete_run_log, load_last_run
+from highlight_delegate import HighlightDelegate
 
 
 # ── DB-backed virtual table model ─────────────────────────────────────────────
@@ -127,13 +126,13 @@ class ArtifactTableModel(QAbstractTableModel):
 
     def filter_rows_inmem(self, term: str, col_idx: int) -> int:
         """List-mode synchronous filter. Returns visible count."""
-        t = term.lower()
+        t = term.casefold()
         if col_idx < 0:
             ids = [i for i, row in enumerate(self._rows)
-                   if any(t in str(v).lower() for v in row)]
+                   if any(t in str(v).casefold() for v in row)]
         else:
             ids = [i for i, row in enumerate(self._rows)
-                   if t in str(self._rows[i][col_idx]).lower()]
+                   if t in str(row[col_idx]).casefold()]
         self.apply_rowids(ids)
         return len(ids)
 
@@ -264,57 +263,6 @@ class ArtifactFilterWorker(QThread):
         except Exception:
             rowids = []
         self.done.emit(rowids, where, args)
-
-
-# ── Highlight delegate ────────────────────────────────────────────────────────
-
-class ArtifactHighlightDelegate(QStyledItemDelegate):
-    """Renders cells with the active filter term highlighted in yellow."""
-
-    _HL_BG = "#ffeb3b"
-    _HL_FG = "#000000"
-
-    def __init__(self, get_term, parent=None):
-        super().__init__(parent)
-        self._get_term = get_term
-
-    def paint(self, painter, option, index):
-        term = self._get_term()
-        text = index.data(Qt.ItemDataRole.DisplayRole) or ''
-        if not term or not text:
-            super().paint(painter, option, index)
-            return
-
-        self.initStyleOption(option, index)
-        style = option.widget.style() if option.widget else QApplication.style()
-        option.text = ''
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, option.widget)
-
-        escaped     = html.escape(text)
-        pattern     = re.compile(re.escape(html.escape(term)), re.IGNORECASE)
-        highlighted = pattern.sub(
-            lambda m: (f'<span style="background:{self._HL_BG};color:{self._HL_FG};">'
-                       f'{m.group()}</span>'),
-            escaped,
-        )
-
-        if option.state & QStyle.StateFlag.State_Selected:
-            fg = option.palette.highlightedText().color().name()
-        else:
-            fg = option.palette.text().color().name()
-
-        doc = QTextDocument()
-        doc.setDefaultStyleSheet(f'body {{ color: {fg}; }}')
-        doc.setHtml(f'<body>{highlighted}</body>')
-        doc.setTextWidth(option.rect.width())
-
-        text_rect = style.subElementRect(
-            QStyle.SubElement.SE_ItemViewItemText, option, option.widget)
-        painter.save()
-        painter.translate(text_rect.topLeft())
-        painter.setClipRect(text_rect.translated(-text_rect.topLeft()))
-        doc.drawContents(painter)
-        painter.restore()
 
 
 # ── Tree node role sentinels ──────────────────────────────────────────────────
@@ -449,12 +397,11 @@ class ArtifactRunnerDialog(QDialog):
         run_history: dict[str, dict] = {}
         if case_dir:
             try:
-                _rdb = _open_results_db(case_dir)
-                for _sn, _ in available:
-                    _last = load_last_run(_rdb, f'artifact_{_sn}')
-                    if _last:
-                        run_history[_sn] = _last
-                _rdb.close()
+                with closing(_open_results_db(case_dir)) as rdb:
+                    for _sn, _ in available:
+                        _last = load_last_run(rdb, f'artifact_{_sn}')
+                        if _last:
+                            run_history[_sn] = _last
             except Exception:
                 pass
 
@@ -607,7 +554,7 @@ class ArtifactViewerMixin:
         self._art_report_view.horizontalHeader().setStretchLastSection(True)
         self._art_report_view.verticalHeader().hide()
         self._art_report_view.verticalHeader().setDefaultSectionSize(80)
-        self._art_highlight_delegate = ArtifactHighlightDelegate(
+        self._art_highlight_delegate = HighlightDelegate(
             lambda: self._art_active_filter)
         self._art_report_view.setItemDelegate(self._art_highlight_delegate)
         report_layout.addWidget(self._art_report_view)
@@ -650,9 +597,8 @@ class ArtifactViewerMixin:
         if not self._case_dir:
             return
         try:
-            case_conn = _open_results_db(self._case_dir)
-            completed = list_completed_artifacts(case_conn)
-            case_conn.close()
+            with closing(_open_results_db(self._case_dir)) as case_conn:
+                completed = list_completed_artifacts(case_conn)
         except Exception:
             return
 
@@ -857,13 +803,15 @@ class ArtifactViewerMixin:
 
         columns = ["Name", "Size (Bytes)", "Modified", "Full Path"]
         rows    = []
-        for fname in sorted(os.listdir(folder)):
-            fpath = os.path.join(folder, fname)
-            if not os.path.isfile(fpath):
-                continue
-            sz    = os.path.getsize(fpath)
-            mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime('%Y-%m-%d %H:%M:%S')
-            rows.append((fname, f"{sz:,}", mtime, fpath))
+        # scandir caches stat info per entry — one directory pass instead of
+        # three stat calls per file.
+        with os.scandir(folder) as it:
+            for entry in sorted(it, key=lambda e: e.name):
+                if not entry.is_file():
+                    continue
+                st    = entry.stat()
+                mtime = datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                rows.append((entry.name, f"{st.st_size:,}", mtime, entry.path))
 
         self._art_table_model.load_rows(columns, rows)
         self._setup_report_filter_ui(columns)

@@ -23,6 +23,9 @@ import zipfile
 class ZipEntry:
     """A handle to one file inside a zip archive."""
 
+    __slots__ = ('zip_path', 'physical_path', '_file_size',
+                 '_compress_type', '_header_offset', '_data_offset')
+
     def __init__(self, zip_path: str, physical_path: str,
                  zinfo: zipfile.ZipInfo) -> None:
         self.zip_path      = zip_path

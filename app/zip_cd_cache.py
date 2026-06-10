@@ -56,7 +56,7 @@ def is_valid(zip_path: str, case_dir: str) -> bool:
 # ── Internal: find and extract the CD from the source zip ────────────────────
 
 def _read_chunks(fh, total: int, progress_cb=None) -> bytes:
-    chunk = 1 << 20   # 1 MiB per read
+    chunk = 1 << 23   # 8 MiB per read — larger requests amortise network latency
     buf = bytearray()
     done = 0
     while done < total:

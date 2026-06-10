@@ -1,21 +1,46 @@
 """keyword_search.py — keyword search worker, dialogs, and FastZipBrowser mixin."""
 
-import html
-import re
 import sqlite3
-import struct
 import threading
 import zipfile
+from contextlib import closing
+from itertools import batched
 
 import msgpack
 
 from adapters import FfsAdapter
 from db_utils import (_open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob,
-                      load_bookmark_groups, load_bookmark_entries)
+                      load_bookmark_groups, load_bookmark_entries,
+                      save_search_scope_files, load_search_scope_files)
+from highlight_delegate import HighlightDelegate
 from zip_cd_cache import load as _zcd_load, compute_data_offsets as _compute_data_offsets
-from zip_reader import ZipReader
+from zip_reader import ZipReader, read_nested_entry
 
 _SEARCH_ENTRIES_VERSION = '1'
+
+# Cellebrite internal metadata entries — excluded from "all files" searches.
+_CELLEBRITE_META_PREFIXES = ('metadata1/', 'metadata2/')
+
+
+def _make_patterns(keyword: str) -> list:
+    """Return [(lowercase_pattern, pattern_len, encoding), …] for a keyword."""
+    patterns = []
+    for enc in ('utf-8', 'utf-16-le', 'utf-16-be'):
+        pat = keyword.encode(enc, errors='replace')
+        patterns.append((pat.lower(), len(pat), enc))
+    return patterns
+
+
+def _iter_pattern_hits(data_lower: bytes, patterns: list):
+    """Yield (idx, pat_len, enc) for every pattern occurrence in data_lower."""
+    for pat, pat_len, enc in patterns:
+        idx = 0
+        while True:
+            idx = data_lower.find(pat, idx)
+            if idx == -1:
+                break
+            yield idx, pat_len, enc
+            idx += pat_len
 
 # Separator used to encode scope into the DB cache key.
 # \x00 cannot appear in a user-typed search term.
@@ -37,15 +62,15 @@ def _decode_search_key(db_key: str) -> tuple:
     return db_key, 'all files'
 from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QPushButton, QComboBox,
-    QVBoxLayout, QHBoxLayout, QTreeView, QDialog, QProgressBar,
-    QPlainTextEdit, QMenu, QApplication, QStyle, QStyledItemDelegate,
+    QVBoxLayout, QHBoxLayout, QTreeView, QTableWidget, QTableWidgetItem,
+    QDialog, QProgressBar,
+    QPlainTextEdit, QMenu,
     QHeaderView,
 )
 from PySide6.QtGui import (
-    QStandardItemModel, QStandardItem, QFont, QFontDatabase,
-    QTextDocument, QTextCharFormat,
+    QStandardItemModel, QStandardItem, QFontDatabase, QColor,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSortFilterProxyModel
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 
 
 # ── Shared zip-entry scanner ─────────────────────────────────────────────────
@@ -143,11 +168,8 @@ class SearchIndexWorker(QThread):
 
     def _load_from_db(self) -> list | None:
         try:
-            db = _open_cache_db(self.case_dir)
-            try:
+            with closing(_open_cache_db(self.case_dir)) as db:
                 raw = load_blob(db, 'search_entries', _SEARCH_ENTRIES_VERSION)
-            finally:
-                db.close()
             if raw is None:
                 return None
             rows = msgpack.unpackb(raw, raw=False)
@@ -158,11 +180,8 @@ class SearchIndexWorker(QThread):
     def _save_to_db(self, entries: list) -> None:
         try:
             raw = msgpack.packb(entries, use_bin_type=True)
-            db  = _open_cache_db(self.case_dir)
-            try:
+            with closing(_open_cache_db(self.case_dir)) as db:
                 save_blob(db, 'search_entries', _SEARCH_ENTRIES_VERSION, raw)
-            finally:
-                db.close()
         except Exception:
             pass
 
@@ -198,10 +217,7 @@ class KeywordSearchWorker(QThread):
         self._scope            = scope
         self._exclude_prefixes = exclude_prefixes
         self.entries: list     = []
-        self._patterns: list   = []
-        for _enc in ('utf-8', 'utf-16-le', 'utf-16-be'):
-            _pat = keyword.encode(_enc, errors='replace')
-            self._patterns.append((_pat.lower(), len(_pat), _enc))
+        self._patterns: list   = _make_patterns(keyword)
 
     def stop(self):
         self._stop.set()
@@ -253,26 +269,20 @@ class KeywordSearchWorker(QThread):
                     block       = leftover + raw
                     block_lower = block.lower()
                     block_base  = buf_start
-                    for pat, pat_len, enc in patterns:
-                        idx = 0
-                        while True:
-                            idx = block_lower.find(pat, idx)
-                            if idx == -1:
-                                break
-                            file_offset = block_base + idx
-                            ctx_start   = max(0, idx - self._CTX_BYTES)
-                            ctx_end     = min(len(block), idx + pat_len + self._CTX_BYTES)
-                            ctx_bytes   = block[ctx_start:ctx_end]
-                            before      = ctx_bytes[:idx - ctx_start]
-                            after       = ctx_bytes[idx - ctx_start + pat_len:]
-                            hit_text    = block[idx:idx + pat_len].decode(enc, errors='replace')
-                            context     = (
-                                _decode_ctx(before, enc)
-                                + f'[{hit_text}]'
-                                + _decode_ctx(after, enc)
-                            )
-                            results.append((file_offset, context))
-                            idx += pat_len
+                    for idx, pat_len, enc in _iter_pattern_hits(block_lower, patterns):
+                        file_offset = block_base + idx
+                        ctx_start   = max(0, idx - self._CTX_BYTES)
+                        ctx_end     = min(len(block), idx + pat_len + self._CTX_BYTES)
+                        ctx_bytes   = block[ctx_start:ctx_end]
+                        before      = ctx_bytes[:idx - ctx_start]
+                        after       = ctx_bytes[idx - ctx_start + pat_len:]
+                        hit_text    = block[idx:idx + pat_len].decode(enc, errors='replace')
+                        context     = (
+                            _decode_ctx(before, enc)
+                            + f'[{hit_text}]'
+                            + _decode_ctx(after, enc)
+                        )
+                        results.append((file_offset, context))
                     leftover  = block[-overlap:] if overlap > 0 else b''
                     buf_start = block_base + len(block) - len(leftover)
             except OSError:
@@ -313,35 +323,10 @@ class NestedArchiveSearchWorker(QThread):
         super().__init__(parent)
         self._map      = nested_archive_map
         self._stop     = threading.Event()
-        self._patterns: list = []
-        for _enc in ('utf-8', 'utf-16-le', 'utf-16-be'):
-            _pat = keyword.encode(_enc, errors='replace')
-            self._patterns.append((_pat.lower(), len(_pat), _enc))
+        self._patterns: list = _make_patterns(keyword)
 
     def stop(self):
         self._stop.set()
-
-    @staticmethod
-    def _read_entry(stored_path: str, entry_path: str) -> bytes | None:
-        """Read one entry's bytes from stored_path.
-
-        stored_path is either a repackaged ZIP (for ZIP sources) or a raw
-        decompressed blob (for gzip sources).  Try ZIP first; if the file
-        is not a ZIP at all fall back to reading the whole blob directly —
-        matching the logic in _load_nested_entry_preview.
-        """
-        try:
-            with zipfile.ZipFile(stored_path, 'r') as zf:
-                return zf.read(entry_path)
-        except zipfile.BadZipFile:
-            pass
-        except Exception:
-            return None
-        try:
-            with open(stored_path, 'rb') as f:
-                return f.read()
-        except Exception:
-            return None
 
     def run(self):
         # Build the work list from the already-loaded entries dict (avoids
@@ -360,7 +345,7 @@ class NestedArchiveSearchWorker(QThread):
         for archive_ui_path, stored_path, entry_path in all_entries:
             if self._stop.is_set():
                 break
-            data = self._read_entry(stored_path, entry_path)
+            data = read_nested_entry(stored_path, entry_path)
             if data is None:
                 done += 1
                 self.progress.emit(done, total)
@@ -368,29 +353,23 @@ class NestedArchiveSearchWorker(QThread):
 
             data_lower = data.lower()
             vpath = f"{archive_ui_path}/{entry_path}"
-            for pat, pat_len, enc in self._patterns:
-                idx = 0
-                while True:
-                    idx = data_lower.find(pat, idx)
-                    if idx == -1:
-                        break
-                    ctx_start = max(0, idx - self._CTX_BYTES)
-                    ctx_end   = min(len(data), idx + pat_len + self._CTX_BYTES)
-                    ctx_bytes = data[ctx_start:ctx_end]
-                    before    = ctx_bytes[:idx - ctx_start]
-                    after     = ctx_bytes[idx - ctx_start + pat_len:]
-                    try:
-                        hit_text = data[idx:idx + pat_len].decode(enc, errors='replace')
-                    except Exception:
-                        hit_text = ''
-                    context = (
-                        before.decode('utf-8', errors='replace')
-                        + f'[{hit_text}]'
-                        + after.decode('utf-8', errors='replace')
-                    )
-                    hits += 1
-                    self.result_found.emit(vpath, idx, context, stored_path, entry_path)
-                    idx += pat_len
+            for idx, pat_len, enc in _iter_pattern_hits(data_lower, self._patterns):
+                ctx_start = max(0, idx - self._CTX_BYTES)
+                ctx_end   = min(len(data), idx + pat_len + self._CTX_BYTES)
+                ctx_bytes = data[ctx_start:ctx_end]
+                before    = ctx_bytes[:idx - ctx_start]
+                after     = ctx_bytes[idx - ctx_start + pat_len:]
+                try:
+                    hit_text = data[idx:idx + pat_len].decode(enc, errors='replace')
+                except Exception:
+                    hit_text = ''
+                context = (
+                    before.decode('utf-8', errors='replace')
+                    + f'[{hit_text}]'
+                    + after.decode('utf-8', errors='replace')
+                )
+                hits += 1
+                self.result_found.emit(vpath, idx, context, stored_path, entry_path)
             done += 1
             self.progress.emit(done, total)
 
@@ -417,8 +396,7 @@ class DbSearchLoader(QThread):
 
     def run(self):
         try:
-            db = _open_results_db(self._case_dir)
-            try:
+            with closing(_open_results_db(self._case_dir)) as db:
                 rows = db.execute(
                     'SELECT r.filename, r.offset, r.context '
                     'FROM search_results r '
@@ -427,14 +405,12 @@ class DbSearchLoader(QThread):
                     'ORDER BY r.rowid',
                     (self._term,)
                 ).fetchall()
-            finally:
-                db.close()
         except Exception:
             self.finished.emit(0)
             return
 
-        for i in range(0, len(rows), self.BATCH_SIZE):
-            self.rows_ready.emit(rows[i:i + self.BATCH_SIZE])
+        for batch in batched(rows, self.BATCH_SIZE):
+            self.rows_ready.emit(list(batch))
 
         self.finished.emit(len(rows))
 
@@ -452,75 +428,12 @@ class DbRecentLoader(QThread):
 
     def run(self):
         try:
-            db = _open_results_db(self._case_dir)
-            try:
-                rows = db.execute(
-                    'SELECT keyword FROM search_index ORDER BY used_at DESC LIMIT 20'
-                ).fetchall()
-                terms = [r[0] for r in rows]
-            finally:
-                db.close()
+            with closing(_open_results_db(self._case_dir)) as db:
+                terms = [r[0] for r in db.execute(
+                    'SELECT keyword FROM search_index ORDER BY used_at DESC LIMIT 20')]
         except Exception:
             terms = []
         self.loaded.emit(terms)
-
-
-# ── SearchContextDelegate ─────────────────────────────────────────────────────
-
-class SearchContextDelegate(QStyledItemDelegate):
-    """Renders the Context column (col 2) with the search term highlighted."""
-
-    CONTEXT_COL = 2
-    _HL_BG = "#ffeb3b"
-    _HL_FG = "#000000"
-
-    def __init__(self, get_term, parent=None):
-        super().__init__(parent)
-        self._get_term = get_term
-
-    def paint(self, painter, option, index):
-        if index.column() != self.CONTEXT_COL:
-            super().paint(painter, option, index)
-            return
-
-        text = index.data(Qt.ItemDataRole.DisplayRole) or ''
-        term = self._get_term()
-        if not term or not text:
-            super().paint(painter, option, index)
-            return
-
-        self.initStyleOption(option, index)
-
-        style = option.widget.style() if option.widget else QApplication.style()
-        option.text = ''
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, option.widget)
-
-        escaped = html.escape(text)
-        pattern = re.compile(re.escape(html.escape(term)), re.IGNORECASE)
-        highlighted = pattern.sub(
-            lambda m: (f'<span style="background:{self._HL_BG};color:{self._HL_FG};">'
-                       f'{m.group()}</span>'),
-            escaped
-        )
-
-        if option.state & QStyle.StateFlag.State_Selected:
-            fg = option.palette.highlightedText().color().name()
-        else:
-            fg = option.palette.text().color().name()
-
-        doc = QTextDocument()
-        doc.setDefaultStyleSheet(f'body {{ color: {fg}; }}')
-        doc.setHtml(f'<body>{highlighted}</body>')
-        doc.setTextWidth(option.rect.width())
-
-        text_rect = style.subElementRect(
-            QStyle.SubElement.SE_ItemViewItemText, option, option.widget)
-
-        painter.save()
-        painter.translate(text_rect.topLeft())
-        painter.setClipRect(text_rect.translated(-text_rect.topLeft()))
-        doc.drawContents(painter)
-        painter.restore()
 
 
 # ── SearchProgressDialog ──────────────────────────────────────────────────────
@@ -628,12 +541,15 @@ class KeywordSearchMixin:
         self._recent_loader: DbRecentLoader | None = None
         self._search_progress_dlg: SearchProgressDialog | None = None
         self._pending_db_hits: list[tuple] = []
+        self._live_hit_buffer: list[tuple] = []
+        self._live_hit_flush_scheduled = False
         self._search_entries:     list | None = None
         self._search_incomplete:  bool = False
         self._search_incomplete_files: tuple[int,int] = (0, 0)  # (done, total)
         self._search_folder_items: dict[str, QStandardItem] = {}
         self._search_file_items:   dict[str, QStandardItem] = {}
         self._recent_searches: list = []
+        self._current_scope_ui_paths: list | None = None
 
         search_tab = QWidget()
         search_tab_layout = QVBoxLayout(search_tab)
@@ -677,7 +593,17 @@ class KeywordSearchMixin:
         self._incomplete_banner.setVisible(False)
 
         search_tab_layout.addLayout(search_ctrl)
-        search_tab_layout.addWidget(self.search_status)
+
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.addWidget(self.search_status, stretch=1)
+        self._search_scope_files_btn = QPushButton()
+        self._search_scope_files_btn.setFlat(True)
+        self._search_scope_files_btn.setVisible(False)
+        self._search_scope_files_btn.clicked.connect(self._show_search_scope_files_dialog)
+        status_row.addWidget(self._search_scope_files_btn)
+        search_tab_layout.addLayout(status_row)
+
         search_tab_layout.addWidget(self._incomplete_banner)
 
         self.search_results_model = QStandardItemModel()
@@ -701,8 +627,8 @@ class KeywordSearchMixin:
         hdr.resizeSection(2, 300)
         self.search_results_view.selectionModel().selectionChanged.connect(
             self._on_search_row_selected)
-        self._search_context_delegate = SearchContextDelegate(
-            lambda: self.search_field.text().strip())
+        self._search_context_delegate = HighlightDelegate(
+            lambda: self.search_field.text().strip(), column=2)
         self.search_results_view.setItemDelegate(self._search_context_delegate)
         self.search_results_view.expanded.connect(self._on_search_tree_expanded)
         self.search_results_view.setExpandsOnDoubleClick(False)
@@ -735,9 +661,8 @@ class KeywordSearchMixin:
         groups = []
         if getattr(self, '_case_dir', None):
             try:
-                db = _open_results_db(self._case_dir)
-                groups = load_bookmark_groups(db)
-                db.close()
+                with closing(_open_results_db(self._case_dir)) as db:
+                    groups = load_bookmark_groups(db)
             except Exception:
                 pass
         if groups:
@@ -807,9 +732,10 @@ class KeywordSearchMixin:
         return filtered, scoped_nested
 
     def _resolve_search_scope(self, scope) -> tuple:
-        """Return (scoped_entries, scoped_nested_map, scope_label).
+        """Return (scoped_entries, scoped_nested_map, scope_label, scope_ui_paths).
 
         scoped_entries=None means pass all entries to the worker (it handles filtering).
+        scope_ui_paths is the list of ui_paths for BM/selected scopes, None otherwise.
         """
         nested_map = getattr(self, '_nested_archive_map', {})
 
@@ -818,7 +744,7 @@ class KeywordSearchMixin:
             group_name = scope.get('name', 'Bookmarks')
             ui_paths   = self._get_ui_paths_for_search_scope(group_id)
             entries, nm = self._filter_entries_by_ui_paths(ui_paths, nested_map)
-            return entries, nm, f"BM: {group_name}"
+            return entries, nm, f"BM: {group_name}", ui_paths
 
         if scope == 'selected':
             checked    = getattr(self, '_checked_folders', set())
@@ -831,19 +757,18 @@ class KeywordSearchMixin:
                         seen.add(child)
                         ui_paths.append(child)
             entries, nm = self._filter_entries_by_ui_paths(ui_paths, nested_map)
-            return entries, nm, f"selected files ({len(ui_paths):,})"
+            return entries, nm, f"selected files ({len(ui_paths):,})", ui_paths
 
         if scope == 'app_data':
             entries = (
                 [e for e in self._search_entries if 'mobile/Containers' in e[0] or 'data/data' in e[0]]
                 if self._search_entries is not None else None
             )
-            return entries, nested_map, "App Data"
+            return entries, nested_map, "App Data", None
 
         # "all" — exclude Cellebrite internal metadata entries
-        _cellebrite_excludes = ('metadata1/', 'metadata2/')
         exclude = (
-            _cellebrite_excludes
+            _CELLEBRITE_META_PREFIXES
             if self._adapter.format == FfsAdapter.FORMAT_CELLEBRITE
             else ()
         )
@@ -854,16 +779,15 @@ class KeywordSearchMixin:
             entries = self._search_entries
         else:
             entries = None
-        return entries, nested_map, "all files"
+        return entries, nested_map, "all files", None
 
     def _get_ui_paths_for_search_scope(self, group_id: int) -> list:
         """Return ui_paths for all entries in a bookmark group."""
         if not getattr(self, '_case_dir', None):
             return []
         try:
-            db = _open_results_db(self._case_dir)
-            entries = load_bookmark_entries(db, group_id)
-            db.close()
+            with closing(_open_results_db(self._case_dir)) as db:
+                entries = load_bookmark_entries(db, group_id)
             return [e['ui_path'] for e in entries]
         except Exception:
             return []
@@ -879,6 +803,65 @@ class KeywordSearchMixin:
             self._incomplete_banner.setVisible(True)
         else:
             self._incomplete_banner.setVisible(False)
+
+    def _show_search_scope_files_dialog(self):
+        """Show a two-column list of files in scope with their sizes."""
+        ui_paths = self._current_scope_ui_paths or []
+        full_meta = getattr(self, 'full_metadata', {})
+        _zero_colour = QColor(160, 160, 160)
+
+        def _fmt_size(sz):
+            if sz is None or sz < 0:
+                return "—"
+            if sz == 0:
+                return "0 B"
+            for unit in ('B', 'KB', 'MB', 'GB'):
+                if sz < 1024:
+                    return f"{sz:,.0f} {unit}" if unit == 'B' else f"{sz:,.1f} {unit}"
+                sz /= 1024
+            return f"{sz:,.1f} TB"
+
+        dlg = QDialog(self)
+        n = len(ui_paths)
+        dlg.setWindowTitle(f"Files in Search Scope ({n:,})")
+        dlg.setMinimumWidth(760)
+        dlg.setMinimumHeight(420)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel(f"{n:,} file{'s' if n != 1 else ''} were in scope for this search:"))
+
+        table = QTableWidget(n, 2)
+        table.setHorizontalHeaderLabels(["File", "Size"])
+        table.verticalHeader().setVisible(False)
+        table.setWordWrap(True)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        table.horizontalHeader().resizeSection(1, 65)
+        table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+
+        for row, path in enumerate(ui_paths):
+            sz = (full_meta.get(path) or {}).get('size', None)
+            path_item = QTableWidgetItem(path)
+            size_item = QTableWidgetItem(_fmt_size(sz))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if sz == 0:
+                path_item.setForeground(_zero_colour)
+                size_item.setForeground(_zero_colour)
+            table.setItem(row, 0, path_item)
+            table.setItem(row, 1, size_item)
+
+        layout.addWidget(table, stretch=1)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        dlg.exec()
 
     def _refresh_search_recent_combo(self):
         self.search_recent_combo.blockSignals(True)
@@ -902,6 +885,8 @@ class KeywordSearchMixin:
         term, scope_label = _decode_search_key(db_key)
         self.search_field.setText(term)
         self._set_search_scope_by_label(scope_label)
+        self._search_scope_files_btn.setVisible(False)
+        self._current_scope_ui_paths = None
         if self._load_search_from_db(db_key):
             self._update_search_status_bar()
             return
@@ -1142,19 +1127,15 @@ class KeywordSearchMixin:
     def _save_recent_search(self, db_key: str):
         db = self._open_results_db_conn()
         if db:
-            try:
+            with closing(db):
                 db.execute(
                     "INSERT INTO search_index (keyword, used_at) VALUES (?, strftime('%s','now'))"
                     " ON CONFLICT(keyword) DO UPDATE SET used_at=strftime('%s','now')",
                     (db_key,)
                 )
                 db.commit()
-                rows = db.execute(
-                    'SELECT keyword FROM search_index ORDER BY used_at DESC LIMIT 20'
-                ).fetchall()
-                self._recent_searches = [r[0] for r in rows]
-            finally:
-                db.close()
+                self._recent_searches = [r[0] for r in db.execute(
+                    'SELECT keyword FROM search_index ORDER BY used_at DESC LIMIT 20')]
         self._refresh_search_recent_combo()
 
     def _load_recent_searches_from_db(self):
@@ -1192,7 +1173,7 @@ class KeywordSearchMixin:
         db = self._open_results_db_conn()
         if db is None:
             return False
-        try:
+        with closing(db):
             row = db.execute(
                 'SELECT id, complete, files_searched, total_files '
                 'FROM search_index WHERE keyword=?',
@@ -1204,8 +1185,8 @@ class KeywordSearchMixin:
             (count,) = db.execute(
                 'SELECT COUNT(*) FROM search_results WHERE term_id=?', (term_id,)
             ).fetchone()
-        finally:
-            db.close()
+            scope_files = load_search_scope_files(db, term_id)
+        self._current_scope_ui_paths = scope_files if scope_files else None
 
         if not complete:
             from PySide6.QtWidgets import QMessageBox
@@ -1236,6 +1217,12 @@ class KeywordSearchMixin:
                     f"'{term}'{scope_tag} — 0 hits in searched files (incomplete)")
             else:
                 self.search_status.setText(f"'{term}'{scope_tag} — 0 hits (from cache)")
+            if self._current_scope_ui_paths:
+                n = len(self._current_scope_ui_paths)
+                self._search_scope_files_btn.setText(f"Files searched ({n:,})")
+                self._search_scope_files_btn.setVisible(True)
+            else:
+                self._search_scope_files_btn.setVisible(False)
             return True
 
         self._search_incomplete_files = (files_searched, total_files) if not complete else (0, 0)
@@ -1283,6 +1270,12 @@ class KeywordSearchMixin:
         else:
             self.search_status.setText(
                 f"'{term}'{scope_tag} — {total:,} hit{'s' if total != 1 else ''} (from cache)")
+        if self._current_scope_ui_paths:
+            n = len(self._current_scope_ui_paths)
+            self._search_scope_files_btn.setText(f"Files searched ({n:,})")
+            self._search_scope_files_btn.setVisible(True)
+        else:
+            self._search_scope_files_btn.setVisible(False)
 
     # ── Search lifecycle ──────────────────────────────────────────────────────
 
@@ -1292,10 +1285,12 @@ class KeywordSearchMixin:
             self._search_index_worker.stop()
             self._search_index_worker.wait()
         self._search_entries = None
+        self._current_scope_ui_paths = None
         self._set_incomplete_banner()   # clear any banner left from the previous archive
         self.search_results_model.clear()
         self.search_field.clear()
         self.search_status.setText("")
+        self._search_scope_files_btn.setVisible(False)
         worker = SearchIndexWorker(
             self.zip_path,
             streaming_index=self._streaming_index,
@@ -1322,6 +1317,7 @@ class KeywordSearchMixin:
         self._search_folder_items.clear()
         self._search_file_items.clear()
         self._pending_db_hits.clear()
+        self._live_hit_buffer.clear()
 
         scope = self.search_scope_combo.currentData()
         is_restricted = isinstance(scope, dict) or scope == 'selected'
@@ -1334,7 +1330,9 @@ class KeywordSearchMixin:
                 "The search index is still building — please wait a moment and try again.")
             return
 
-        scoped_entries, scoped_nested_map, scope_label = self._resolve_search_scope(scope)
+        scoped_entries, scoped_nested_map, scope_label, scope_ui_paths = self._resolve_search_scope(scope)
+        self._current_scope_ui_paths = scope_ui_paths
+        self._search_scope_files_btn.setVisible(False)
 
         if is_restricted and not scoped_entries and not scoped_nested_map:
             what = ("No files are currently selected."
@@ -1348,22 +1346,19 @@ class KeywordSearchMixin:
         self._save_recent_search(db_key)
         db = self._open_results_db_conn()
         if db:
-            try:
+            with closing(db):
                 db.execute(
                     'DELETE FROM search_results '
                     'WHERE term_id=(SELECT id FROM search_index WHERE keyword=?)',
                     (db_key,)
                 )
                 db.commit()
-            finally:
-                db.close()
 
         # For the fallback case (entries=None, worker builds its own list) the
         # worker still needs scope/exclude_prefixes to do its own filtering.
         worker_scope = scope if scope in ('app_data', 'all') else 'all'
-        _cellebrite_excludes = ('metadata1/', 'metadata2/')
         worker_exclude = (
-            _cellebrite_excludes
+            _CELLEBRITE_META_PREFIXES
             if worker_scope == 'all' and self._adapter.format == FfsAdapter.FORMAT_CELLEBRITE
             else ()
         )
@@ -1415,13 +1410,35 @@ class KeywordSearchMixin:
         self.search_stop_btn.setEnabled(False)
 
     def _on_search_result(self, name: str, offset: int, context: str):
-        self._search_add_hit(name, offset, context)
+        # Buffer hits and insert them into the tree in batches — one tree
+        # insert per signal freezes the GUI on terms with many thousands of hits.
         self._pending_db_hits.append((name, offset, context))
+        self._live_hit_buffer.append((name, offset, context, None, None))
+        self._schedule_live_hit_flush()
 
     def _on_nested_search_result(self, virtual_ui_path: str, offset: int,
                                   context: str, stored_path: str, entry_path: str):
-        self._search_add_hit(virtual_ui_path, offset, context,
-                             stored_path=stored_path, entry_path=entry_path)
+        self._live_hit_buffer.append(
+            (virtual_ui_path, offset, context, stored_path, entry_path))
+        self._schedule_live_hit_flush()
+
+    def _schedule_live_hit_flush(self):
+        if not self._live_hit_flush_scheduled:
+            self._live_hit_flush_scheduled = True
+            QTimer.singleShot(100, self._flush_live_hits)
+
+    def _flush_live_hits(self):
+        self._live_hit_flush_scheduled = False
+        if not self._live_hit_buffer:
+            return
+        buf, self._live_hit_buffer = self._live_hit_buffer, []
+        self.search_results_view.setUpdatesEnabled(False)
+        try:
+            for name, offset, context, stored_path, entry_path in buf:
+                self._search_add_hit(name, offset, context,
+                                     stored_path=stored_path, entry_path=entry_path)
+        finally:
+            self.search_results_view.setUpdatesEnabled(True)
 
     def _on_search_progress(self, done: int, total: int):
         hits = len(self._search_file_items)
@@ -1433,6 +1450,7 @@ class KeywordSearchMixin:
 
     def _on_search_finished(self, total_hits: int, files_done: int, files_total: int,
                             stopped: bool):
+        self._flush_live_hits()   # drain any buffered hits before counting
         if self._search_entries is None and self._search_worker is not None:
             self._search_entries = self._search_worker.entries or None
         self.search_btn.setEnabled(True)
@@ -1449,26 +1467,31 @@ class KeywordSearchMixin:
 
         db = self._open_results_db_conn()
         if db:
-            try:
+            with closing(db):
                 db.execute(
                     'UPDATE search_index SET complete=?, files_searched=?, total_files=? '
                     'WHERE keyword=?',
                     (complete, files_searched, total_files, db_key)
                 )
-                if self._pending_db_hits:
-                    row = db.execute(
-                        'SELECT id FROM search_index WHERE keyword=?', (db_key,)
-                    ).fetchone()
-                    if row:
+                term_row = db.execute(
+                    'SELECT id FROM search_index WHERE keyword=?', (db_key,)
+                ).fetchone()
+                if term_row:
+                    term_id = term_row[0]
+                    if self._pending_db_hits:
                         db.executemany(
                             'INSERT INTO search_results (term_id, filename, offset, context) '
                             'VALUES (?,?,?,?)',
-                            [(row[0], f, o, c) for f, o, c in self._pending_db_hits]
+                            [(term_id, f, o, c) for f, o, c in self._pending_db_hits]
                         )
+                    if self._current_scope_ui_paths is not None:
+                        save_search_scope_files(db, term_id, self._current_scope_ui_paths)
                 db.commit()
-            finally:
-                db.close()
         self._pending_db_hits.clear()
+        if self._current_scope_ui_paths is not None:
+            n = len(self._current_scope_ui_paths)
+            self._search_scope_files_btn.setText(f"Files searched ({n:,})")
+            self._search_scope_files_btn.setVisible(True)
 
         if dlg:
             if stopped:

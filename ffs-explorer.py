@@ -9,12 +9,18 @@ import gzip
 import json
 import hashlib
 import struct
+import msgpack
 import plistlib
 import xml.dom.minidom
 import pathlib
 import subprocess
 import configparser
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from functools import lru_cache, partial
+from itertools import islice
+from operator import itemgetter
 
 _APP_DIR             = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app')    # adapters, db_utils, etc.
 _CONFIG_DIR          = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config') # JSON config files
@@ -25,6 +31,7 @@ sys.path.insert(0, _APP_DIR)
 from adapters import FfsAdapter
 from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       check_cache_schema, check_results_schema,
+                      save_blob, load_blob,
                       save_header_types, load_header_types, clear_header_types,
                       save_guid_bundle_map, load_guid_bundle_map,
                       save_folder_counts, save_folder_sizes, load_folder_data,
@@ -36,37 +43,47 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       load_nested_archives, load_nested_archive_entries,
                       load_bookmark_groups, save_bookmark_group,
                       save_bookmark_entries, load_bookmark_entries,
-                      delete_bookmark_group, delete_bookmark_entry)
+                      delete_bookmark_group)
 import header_scan
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
 from keyword_search import KeywordSearchMixin
 from artifact_viewer import ArtifactViewerMixin
 from streaming_zip import StreamingZipIndex
+from zip_reader import read_nested_entry
 from zip_cd_cache import (CachedZipView, is_valid as _cd_cache_valid,
                           save as _cd_cache_save, load as _cd_cache_load,
                           probe_delta as _probe_delta,
                           compute_data_offsets as _compute_data_offsets,
                           sidecar_hash as _cd_sidecar_hash,
                           extract_cd_hash as _cd_extract_hash)
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
-                              QHBoxLayout, QWidget, QHeaderView, QPushButton,
+                              QHBoxLayout, QGridLayout, QWidget, QHeaderView, QPushButton,
                               QFileDialog, QProgressBar, QMenu, QDialog,
-                              QComboBox, QSplitter, QStatusBar,
+                              QComboBox, QSplitter, QStatusBar, QFrame,
                               QLineEdit, QLabel,
-                              QTabWidget, QSizePolicy, QStackedWidget,
+                              QTabWidget, QSizePolicy,
                               QMessageBox, QCheckBox, QAbstractItemView,
                               QTreeWidget, QTreeWidgetItem, QTextEdit,
                               QListWidget, QListWidgetItem)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
-                           QCursor, QColor, QIcon)
+                           QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
-                             qInstallMessageHandler, QtMsgType, QStandardPaths)
+                             qInstallMessageHandler, QtMsgType)
 from PySide6.QtCore import QSettings as _QSettings
 
 FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface responsive at 60 fps while the tree builds
+
+# Shared pool for small fire-and-forget background jobs (cache DB writes,
+# zip pre-opening) — replaces creating a throwaway ThreadPoolExecutor per call.
+_BG_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ffs-bg')
+
+# Load-snapshot cache: the complete result of a first archive load, stored in
+# casecache.db so re-opens skip the CD parse, metadata read, and derivations.
+_SNAPSHOT_KEY     = 'load_snapshot'
+_SNAPSHOT_VERSION = '1'
 
 _TREE_PLACEHOLDER  = "__placeholder__"
 _BM_ROOT           = "__bookmarks__"
@@ -75,17 +92,81 @@ _BM_GROUP_PREFIX   = "__bm_group_"
 _SETTINGS_ORG = "KlasScripts"
 _SETTINGS_APP = "FFS Explorer"
 
+_DEFAULT_CASE_NAME_SLOTS = ['case_folder', 'make_model', 'os_version', 'ffs_path', 'ffs_size']
+
+# Ordered list of (display label, pref key) for case-name slot dropdowns.
+CASE_SLOT_OPTIONS = [
+    ("Make & Model",     "make_model"),
+    ("OS & Version",     "os_version"),
+    ("Case Folder Name", "case_folder"),
+    ("FFS File Size",    "ffs_size"),
+    ("Full Path",        "ffs_path"),
+    ("(not required)",   "none"),
+]
+
 
 def _load_prefs() -> dict:
     s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    slots = [s.value(f'case_name_slot_{i}', _DEFAULT_CASE_NAME_SLOTS[i], type=str)
+             for i in range(5)]
     return {
-        'case_data_root': s.value('case_data_root', '', type=str),
+        'case_data_root':  s.value('case_data_root', '', type=str),
+        'case_name_slots': slots,
+        'case_sort_order': s.value('case_sort_order', 'recent', type=str),
     }
 
 
 def _save_prefs(prefs: dict):
     s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
     s.setValue('case_data_root', prefs.get('case_data_root', ''))
+    for i, slot in enumerate(prefs.get('case_name_slots', _DEFAULT_CASE_NAME_SLOTS)):
+        s.setValue(f'case_name_slot_{i}', slot)
+    s.setValue('case_sort_order', prefs.get('case_sort_order', 'recent'))
+
+
+# Formatted archive sizes, keyed by path.  Stat-ing every archive on each
+# dropdown/menu rebuild blocks the GUI when archives live on network shares,
+# and forensic archives never change size — so cache the first result.
+_FFS_SIZE_CACHE: dict = {}
+
+
+def _slot_value(entry: dict, slot_key: str) -> str:
+    """Return the display string for one slot key from an archive entry dict."""
+    label = entry.get('label', '')
+    match slot_key:
+        case '' | None | 'none':
+            return ''
+        case 'case_folder':
+            cd = entry.get('case_dir', '')
+            return os.path.basename(cd) if cd else ''
+        case 'ffs_size':
+            path = entry.get('path', '')
+            if not path:
+                return ''
+            cached = _FFS_SIZE_CACHE.get(path)
+            if cached is None:
+                try:
+                    cached = f"{os.path.getsize(path) / 1_073_741_824:.2f} GB"
+                except OSError:
+                    return '? GB'
+                _FFS_SIZE_CACHE[path] = cached
+            return cached
+        case 'ffs_path':
+            return entry.get('path', '')
+        case 'make_model':
+            return label.split(' · ')[0].strip() if ' · ' in label else label.strip()
+        case 'os_version':
+            parts = label.split(' · ', 1)
+            return parts[1].strip() if len(parts) > 1 else ''
+        case _:
+            return ''
+
+
+def _format_archive_entry(entry: dict, prefs: dict) -> str:
+    """Format a case menu entry using the slot preferences."""
+    slots  = prefs.get('case_name_slots', _DEFAULT_CASE_NAME_SLOTS)
+    parts  = [v for slot in slots if (v := _slot_value(entry, slot))]
+    return '  —  '.join(parts) if parts else (entry.get('path') or entry.get('case_dir') or '?')
 
 
 # Minimum tree column width (px).  The column always fills the panel, but never
@@ -201,29 +282,33 @@ _TEXT_RENDERABLE_EXTENSIONS = frozenset({
 })
 
 
+# Single extension → type lookup table.  One O(1) dict hit replaces a cascade
+# of set-membership tests — _get_file_type runs once per entry in several
+# full-archive loops.  The extension sets are mutually disjoint.
+_EXT_TO_TYPE: dict = {
+    **{e: 'Picture'       for e in PICTURE_EXTENSIONS},
+    **{e: 'Video'         for e in VIDEO_EXTENSIONS},
+    **{e: 'Database'      for e in DATABASE_EXTENSIONS},
+    '.plist': 'Property List',
+    **{e: 'Log'           for e in LOG_EXTENSIONS},
+    **{e: 'Document'      for e in DOCUMENT_EXTENSIONS},
+    **{e: 'Audio'         for e in AUDIO_EXTENSIONS},
+    **{e: 'Archive'       for e in ARCHIVE_EXTENSIONS},
+    **{e: 'Application'   for e in APPLICATION_EXTENSIONS},
+    **{e: 'JSON'          for e in JSON_EXTENSIONS},
+    **{e: 'XML'           for e in XML_EXTENSIONS},
+    **{e: 'Web / Data'    for e in WEB_DATA_EXTENSIONS},
+    **{e: 'Certificate'   for e in CERTIFICATE_EXTENSIONS},
+}
+
+
 def _get_file_type(name):
-    ext = os.path.splitext(name)[1].lower()
-    # Check multi-part extensions first (.db-wal etc.)
-    lower_name = name.lower()
-    for db_ext in ('.db-wal', '.db-shm', '.db-journal',
-                   '.sqlite-wal', '.sqlite-shm', '.sqlite-journal',
-                   '-wal', '-shm'):
-        if lower_name.endswith(db_ext):
-            return 'Database'
-    if ext in PICTURE_EXTENSIONS:       return 'Picture'
-    if ext in VIDEO_EXTENSIONS:         return 'Video'
-    if ext in DATABASE_EXTENSIONS:      return 'Database'
-    if ext == '.plist':                 return 'Property List'
-    if ext in LOG_EXTENSIONS:           return 'Log'
-    if ext in DOCUMENT_EXTENSIONS:      return 'Document'
-    if ext in AUDIO_EXTENSIONS:         return 'Audio'
-    if ext in ARCHIVE_EXTENSIONS:       return 'Archive'
-    if ext in APPLICATION_EXTENSIONS:   return 'Application'
-    if ext in JSON_EXTENSIONS:          return 'JSON'
-    if ext in XML_EXTENSIONS:           return 'XML'
-    if ext in WEB_DATA_EXTENSIONS:      return 'Web / Data'
-    if ext in CERTIFICATE_EXTENSIONS:   return 'Certificate'
-    return 'Other'
+    # Dotted sidecar extensions (.db-wal, .sqlite-journal, …) are all in the
+    # table; only bare dotless companions ('foo-wal') need the endswith fallback.
+    ft = _EXT_TO_TYPE.get(os.path.splitext(name)[1].lower())
+    if ft is not None:
+        return ft
+    return 'Database' if name.lower().endswith(('-wal', '-shm')) else 'Other'
 
 
 
@@ -241,9 +326,8 @@ _HW_MODEL_NAMES: dict   = _hw.get('apple_model_ids', {})
 _HW_ANDROID_MODELS: dict = _hw.get('android_model_ids', {})
 
 
-def _read_text_from_zip(z, *candidates) -> str:
+def _read_text_from_zip(z, names: frozenset, *candidates) -> str:
     """Return the text content of the first matching candidate path, or ''."""
-    names = frozenset(z.namelist())
     for path in candidates:
         if path in names:
             try:
@@ -266,10 +350,9 @@ def _parse_build_prop(content: str) -> dict:
     return props
 
 
-def _read_plist_from_zip(z: zipfile.ZipFile, *candidates) -> dict:
+def _read_plist_from_zip(z: zipfile.ZipFile, names: frozenset, *candidates) -> dict:
     """Try each candidate path in the zip and return the first successfully
     parsed plist as a dict, or {} if none found."""
-    names = frozenset(z.namelist())
     for path in candidates:
         if path in names:
             try:
@@ -370,18 +453,18 @@ def _build_label(model_name: str, version: str, platform: str) -> str:
     return model_name or (f'{platform} {version}' if version else '')
 
 
-def _read_ios_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,str,str]], str]:
+def _read_ios_info(z: zipfile.ZipFile, names: frozenset, ffs_adapter) -> tuple[list[tuple[str,str,str]], str]:
     """Extract iOS device info from MobileGestalt, SystemVersion, and preferences plists.
 
     Returns (fields, label) where fields are (field_name, data, source) triples.
     Returns ([], '') if no usable data is found.
     """
-    mg_plist = _read_plist_from_zip(z, *ffs_adapter.user_candidates(_MG_PLIST_SUFFIX))
+    mg_plist = _read_plist_from_zip(z, names, *ffs_adapter.user_candidates(_MG_PLIST_SUFFIX))
 
     ios_version = _plist_find(mg_plist, 'ProductVersion') or ''
     ios_version_source = 'MobileGestalt.plist' if ios_version else ''
     if not ios_version:
-        sv = _read_plist_from_zip(z,
+        sv = _read_plist_from_zip(z, names,
             *ffs_adapter.system_candidates('System/Library/CoreServices/SystemVersion.plist'),
             *ffs_adapter.user_candidates('run/SystemVersion.plist'),
         )
@@ -389,7 +472,7 @@ def _read_ios_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,str,
         if ios_version:
             ios_version_source = 'SystemVersion.plist'
 
-    pref = _read_plist_from_zip(z,
+    pref = _read_plist_from_zip(z, names,
         *ffs_adapter.user_candidates('preferences/SystemConfiguration/preferences.plist'))
 
     hw_id        = ''
@@ -419,7 +502,7 @@ def _read_ios_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,str,
     return fields, label
 
 
-def _read_android_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,str,str]], str]:
+def _read_android_info(z: zipfile.ZipFile, names: frozenset, ffs_adapter) -> tuple[list[tuple[str,str,str]], str]:
     """Extract Android device info by merging system/vendor/product build.prop files.
 
     Returns (fields, label) where fields are (field_name, data, source) triples.
@@ -427,7 +510,7 @@ def _read_android_info(z: zipfile.ZipFile, ffs_adapter) -> tuple[list[tuple[str,
     """
     bp: dict[str, tuple[str, str]] = {}   # key → (value, source_file)
     for prop_file in ('system/build.prop', 'vendor/build.prop', 'product/build.prop'):
-        content = _read_text_from_zip(z, *ffs_adapter.system_candidates(prop_file))
+        content = _read_text_from_zip(z, names, *ffs_adapter.system_candidates(prop_file))
         if content:
             for k, v in _parse_build_prop(content).items():
                 if v and k not in bp:
@@ -486,10 +569,11 @@ def _read_device_info(zip_path: str) -> tuple[list[tuple[str,str,str]], str]:
         return fields, label
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
-            ffs_adapter = FfsAdapter.detect(z)
-            result = _read_ios_info(z, ffs_adapter)
+            names = frozenset(z.namelist())
+            ffs_adapter = FfsAdapter.detect(z, names)
+            result = _read_ios_info(z, names, ffs_adapter)
             if not result[0]:
-                result = _read_android_info(z, ffs_adapter)
+                result = _read_android_info(z, names, ffs_adapter)
             return result
     except Exception:
         return [], ''
@@ -733,16 +817,57 @@ def _find_metadata_only_folders(
     return {fp for fp, v in cache.items() if v == "metadata_only"}
 
 
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+@lru_cache(maxsize=4096)
+def _date_prefix(days: int) -> str:
+    """'YYYY-MM-DD' for a day number since the epoch (cached — few unique days)."""
+    return (_EPOCH_UTC + timedelta(days=days)).strftime('%Y-%m-%d')
+
+
+@lru_cache(maxsize=1 << 16)
+def _format_ts_cached(ts) -> str:
+    """Format an epoch timestamp (s or APFS ns) as a UTC display string.
+
+    strftime per row dominated recursive-view row building, so the date part
+    is cached per day and the time of day is computed arithmetically —
+    ~5x faster on archives with diverse timestamps, identical output.
+    """
+    try:
+        if ts > 1e10:
+            ts = ts / 1e9   # APFS stores timestamps as nanoseconds since epoch
+        days, rem = divmod(int(ts // 1), 86400)
+        h, rem = divmod(rem, 3600)
+        m, s = divmod(rem, 60)
+        return f"{_date_prefix(days)} {h:02d}:{m:02d}:{s:02d} UTC"
+    except (ValueError, OSError, OverflowError):
+        return "---"
+
+
+def _find_missing_plists(folder_map: dict, ffs_adapter, guid_to_bundle: dict) -> list:
+    """Return UUID container folders whose MCM metadata plist is unresolved."""
+    parents = ffs_adapter.container_parents()
+    return [
+        p for p in folder_map
+        if p.rsplit('/', 1)[0] in parents
+        and _UUID_RE.match(p.split('/')[-1])
+        and p.split('/')[-1] not in guid_to_bundle
+    ]
+
+
 def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
     """Build and return folder_map from ui_metadata paths."""
     if status_cb:
         status_cb(f"Building folder tree ({len(ui_metadata):,} entries)...")
-    folder_map_sets: dict[str, set] = {}
+    # defaultdict avoids allocating a throwaway set() per iteration the way
+    # setdefault(parent, set()) would — this loop runs once per archive entry.
+    folder_map_sets: defaultdict[str, set] = defaultdict(set)
     for i, ui_path in enumerate(ui_metadata):
         if not ui_path:
             continue  # skip empty-string keys from malformed archives
         parent = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ""
-        folder_map_sets.setdefault(parent, set()).add(ui_path)
+        folder_map_sets[parent].add(ui_path)
         if i % 20_000 == 0:
             time.sleep(0)   # yield GIL so the main thread can process events
     if status_cb:
@@ -766,11 +891,11 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
 
 def _count_header_candidates(ui_metadata: dict, ffs_adapter) -> int:
     """Count 'Other'-typed files in scan_folders — no I/O, used for dialog display."""
-    scan_folders = ffs_adapter.scan_folders()
+    scan_folders = tuple(ffs_adapter.scan_folders())
     return sum(
         1 for ui_path in ui_metadata
-        if _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
-        and any(ui_path.startswith(f) for f in scan_folders)
+        if ui_path.startswith(scan_folders)
+        and _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
     )
 
 
@@ -831,10 +956,10 @@ def _discover_all_archives(
     Each entry: {'ui_path', 'category', 'file_type', 'mtime'}
     mtime is nanoseconds since epoch (0 if unknown).
     """
-    scan_roots = ffs_adapter.archive_discovery_folders()
+    scan_roots = tuple(ffs_adapter.archive_discovery_folders())
     results = []
     for ui_path, meta in ui_metadata.items():
-        if not any(ui_path.startswith(r) for r in scan_roots):
+        if not ui_path.startswith(scan_roots):
             continue
         name = ui_path.rsplit('/', 1)[-1]
         ft = _get_file_type(name)
@@ -861,10 +986,10 @@ def _collect_nested_archive_candidates(
     for extensionless files, by the header scan result in header_type_overrides.
     'Archive' = ZIP containers; 'Compressed' = gzip/bzip2/xz streams.
     """
-    scan_roots = ffs_adapter.scan_folders()
+    scan_roots = tuple(ffs_adapter.scan_folders())
     results = []
     for ui_path in ui_metadata:
-        if not any(ui_path.startswith(p) for p in scan_roots):
+        if not ui_path.startswith(scan_roots):
             continue
         name = ui_path.rsplit('/', 1)[-1]
         ft   = _get_file_type(name)
@@ -876,38 +1001,41 @@ def _collect_nested_archive_candidates(
     return results
 
 
-def _collect_header_candidates(
+def _resolve_file_candidates(
     zip_path: str,
-    ui_metadata: dict,
+    ui_paths: list,
     ffs_adapter,
     z=None,
     streaming_index=None,
     delta: int | None = None,
 ) -> list[tuple[str, int, int]]:
-    """Return [(ui_path, data_offset, file_size)] for 'Other'-typed files in scan_folders."""
-    scan_folders = ffs_adapter.scan_folders()
-    targets = [
-        ui_path for ui_path in ui_metadata
-        if _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
-        and any(ui_path.startswith(f) for f in scan_folders)
-    ]
-    if not targets:
-        return []
+    """Return [(ui_path, data_offset, file_size)] for the given ui_paths.
 
+    Opens its own ZipFile when neither *z* nor *streaming_index* is supplied.
+    """
+    if not ui_paths:
+        return []
     candidates: list[tuple[str, int, int]] = []
+    resolve = ffs_adapter.resolve
 
     if streaming_index is not None:
         entries = streaming_index._entries
-        for ui_path in targets:
-            row = entries.get(ffs_adapter.resolve(ui_path))
+        for ui_path in ui_paths:
+            row = entries.get(resolve(ui_path))
             if row:
                 candidates.append((ui_path, row[0], row[2]))
-    else:
-        assert z is not None
-        resolve = ffs_adapter.resolve
+        return candidates
+
+    close_z = z is None
+    if close_z:
+        try:
+            z = zipfile.ZipFile(zip_path, 'r')
+        except Exception:
+            return []
+    try:
         target_infos = []
         target_meta: dict[str, tuple[str, int]] = {}  # filename → (ui_path, file_size)
-        for ui_path in targets:
+        for ui_path in ui_paths:
             try:
                 info = z.getinfo(resolve(ui_path))
                 target_infos.append(info)
@@ -918,48 +1046,29 @@ def _collect_header_candidates(
         for filename, data_offset in offsets.items():
             ui_path, file_size = target_meta[filename]
             candidates.append((ui_path, data_offset, file_size))
-
+    finally:
+        if close_z:
+            z.close()
     return candidates
 
 
-def _resolve_file_candidates(
+def _collect_header_candidates(
     zip_path: str,
-    ui_paths: list,
+    ui_metadata: dict,
     ffs_adapter,
+    z=None,
     streaming_index=None,
     delta: int | None = None,
 ) -> list[tuple[str, int, int]]:
-    """Return [(ui_path, data_offset, file_size)] for explicit ui_paths."""
-    candidates: list[tuple[str, int, int]] = []
-    if streaming_index is not None:
-        entries = streaming_index._entries
-        for ui_path in ui_paths:
-            row = entries.get(ffs_adapter.resolve(ui_path))
-            if row:
-                candidates.append((ui_path, row[0], row[2]))
-    else:
-        try:
-            z = zipfile.ZipFile(zip_path, 'r')
-        except Exception:
-            return []
-        try:
-            resolve = ffs_adapter.resolve
-            target_infos = []
-            target_meta: dict[str, tuple[str, int]] = {}
-            for ui_path in ui_paths:
-                try:
-                    info = z.getinfo(resolve(ui_path))
-                    target_infos.append(info)
-                    target_meta[info.filename] = (ui_path, info.file_size)
-                except KeyError:
-                    pass
-            offsets = _compute_data_offsets(zip_path, target_infos, delta=delta)
-            for filename, data_offset in offsets.items():
-                ui_path, file_size = target_meta[filename]
-                candidates.append((ui_path, data_offset, file_size))
-        finally:
-            z.close()
-    return candidates
+    """Return [(ui_path, data_offset, file_size)] for 'Other'-typed files in scan_folders."""
+    scan_folders = tuple(ffs_adapter.scan_folders())
+    targets = [
+        ui_path for ui_path in ui_metadata
+        if ui_path.startswith(scan_folders)
+        and _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
+    ]
+    return _resolve_file_candidates(zip_path, targets, ffs_adapter,
+                                    z=z, streaming_index=streaming_index, delta=delta)
 
 
 class ZipMetadataWorker(QThread):
@@ -977,7 +1086,7 @@ class ZipMetadataWorker(QThread):
          and emit header_scan_done with the detected type overrides
     """
     status_update        = Signal(str)    # message
-    metadata_ready       = Signal(dict, dict, dict, object, object, object, dict, object)  # ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths
+    metadata_ready       = Signal(dict, dict, dict, object, object, object, dict, object, object)  # ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths, metadata_only_folders
     header_scan_progress = Signal(int)   # remaining (decreasing)
     header_scan_done     = Signal(dict)  # {ui_path: detected_type}
 
@@ -986,6 +1095,43 @@ class ZipMetadataWorker(QThread):
         self.zip_path = zip_path
         self.scan_headers = scan_headers
         self.case_dir = case_dir
+
+    def _try_load_from_snapshot(self) -> bool:
+        """Fast re-open: restore the previous load's full result from casecache.db.
+
+        Skips the .zcd parse, format detection, metadata read (msgpack /
+        extra fields), folder-tree build, and metadata-only scan.  Returns
+        True if the snapshot was emitted, False to fall back to a full load.
+        """
+        try:
+            with closing(_open_cache_db(self.case_dir)) as db:
+                raw = load_blob(db, _SNAPSHOT_KEY, _SNAPSHOT_VERSION)
+                if raw is None:
+                    return False
+                _, folder_sizes = load_folder_data(db)
+                guid_to_bundle  = load_guid_bundle_map(db)
+            if not folder_sizes:
+                return False   # sizes are required downstream — do a full load
+            self.status_update.emit("Loading archive metadata from local cache…")
+            snap = msgpack.unpackb(raw, raw=False, strict_map_key=False)
+            fmt, user_pfx, sys_pfx, old_layout = snap['adapter']
+            ffs_adapter = FfsAdapter(fmt, user_pfx, sys_pfx, bool(old_layout))
+            self._local_extra_delta = snap['delta']
+            zip_names = frozenset(snap['zip_names'])
+            zui = snap['zip_ui_paths']
+            zip_ui_paths = frozenset(zui) if zui is not None else None
+            ui_metadata = snap['ui_metadata']
+            folder_map  = snap['folder_map']
+            metadata_only_folders = set(snap['metadata_only'])
+        except Exception:
+            return False
+
+        missing_plist_paths = _find_missing_plists(folder_map, ffs_adapter, guid_to_bundle)
+        self.metadata_ready.emit(
+            ui_metadata, folder_map, guid_to_bundle, zip_names,
+            ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
+            metadata_only_folders)
+        return True
 
     def run(self):
         try:
@@ -1008,6 +1154,12 @@ class ZipMetadataWorker(QThread):
                 except OldSchemaError as e:
                     self.status_update.emit(
                         f"Warning: {e}")
+
+            # Fast path: a previous load of this archive left a snapshot in the
+            # cache DB — re-emit it and skip all archive I/O and derivations.
+            # (Header scans need an open archive handle, so they take the full path.)
+            if self.case_dir and not self.scan_headers and self._try_load_from_snapshot():
+                return
 
             # ── Open the archive ──────────────────────────────────────────────
             if self.case_dir:
@@ -1065,9 +1217,10 @@ class ZipMetadataWorker(QThread):
                 else:
                     assert z_ctx is not None
                     _infolist = z_ctx.infolist()
-                    zip_names = frozenset(info.filename for info in _infolist)
+                    # One pass: the size dict's keys double as the name set.
                     zip_sizes = {info.filename: info.file_size for info in _infolist}
-                    ffs_adapter = FfsAdapter.detect(z_ctx)
+                    zip_names = frozenset(zip_sizes)
+                    ffs_adapter = FfsAdapter.detect(z_ctx, zip_names)
                     _stored = [i for i in _infolist
                                if i.compress_type == zipfile.ZIP_STORED and i.file_size > 0]
                     self._local_extra_delta = _probe_delta(self.zip_path, _stored)
@@ -1076,9 +1229,8 @@ class ZipMetadataWorker(QThread):
                 cached_guid_bundle: dict | None = None
                 if self.case_dir:
                     try:
-                        _db = _open_cache_db(self.case_dir)
-                        _cached = load_guid_bundle_map(_db)
-                        _db.close()
+                        with closing(_open_cache_db(self.case_dir)) as _db:
+                            _cached = load_guid_bundle_map(_db)
                         if _cached:
                             cached_guid_bundle = _cached
                     except Exception:
@@ -1121,20 +1273,14 @@ class ZipMetadataWorker(QThread):
             folder_map = _build_folder_tree(ui_metadata, status_cb=self.status_update.emit)
             time.sleep(0)   # yield GIL after folder tree build
 
-            _CONTAINER_PARENTS = ffs_adapter.container_parents()
-            missing_plist_paths = [
-                p for p in folder_map
-                if p.rsplit('/', 1)[0] in _CONTAINER_PARENTS
-                and _UUID_RE.match(p.split('/')[-1])
-                and p.split('/')[-1] not in guid_to_bundle
-            ]
+            missing_plist_paths = _find_missing_plists(
+                folder_map, ffs_adapter, guid_to_bundle)
 
             _cached_sizes: dict | None = None
             if self.case_dir:
                 try:
-                    _db = _open_cache_db(self.case_dir)
-                    _, _fs = load_folder_data(_db)
-                    _db.close()
+                    with closing(_open_cache_db(self.case_dir)) as _db:
+                        _, _fs = load_folder_data(_db)
                     if _fs:
                         _cached_sizes = _fs
                 except Exception:
@@ -1151,19 +1297,58 @@ class ZipMetadataWorker(QThread):
                     progress_cb=lambda done, total: self.status_update.emit(
                         f"Computing folder sizes… {done:,}/{total:,}"))
 
+            # Metadata-only detection looks for Apple container metadata files,
+            # so run it only for iOS archives (Cellebrite iOS, GrayKey iOS).
+            # GrayKey Android has no private/var tree — the walk would find nothing.
+            _is_ios = (
+                ffs_adapter.format == FfsAdapter.FORMAT_CELLEBRITE
+                or (ffs_adapter.format == FfsAdapter.FORMAT_GRAYKEY
+                    and 'private/var' in folder_map)
+            )
+            if _is_ios:
+                self.status_update.emit("Identifying metadata-only folders...")
+                metadata_only_folders = _find_metadata_only_folders(
+                    folder_map, zip_names, zip_ui_paths, ffs_adapter)
+            else:
+                metadata_only_folders = set()
+
+            # Pack the re-open snapshot BEFORE emitting — once the main thread
+            # processes metadata_ready it mutates these dicts (nested-archive
+            # injection), which would race with serialisation.
+            snapshot_blob = None
+            if self.case_dir and self._streaming_index is None:
+                self.status_update.emit("Saving load cache…")
+                try:
+                    snapshot_blob = msgpack.packb({
+                        'adapter': [ffs_adapter.format, ffs_adapter.user_prefix,
+                                    ffs_adapter.sys_prefix, ffs_adapter.old_layout],
+                        'delta':         self._local_extra_delta,
+                        'zip_names':     list(zip_names),
+                        'zip_ui_paths':  (list(zip_ui_paths)
+                                          if zip_ui_paths is not None else None),
+                        'ui_metadata':   ui_metadata,
+                        'folder_map':    folder_map,
+                        'metadata_only': list(metadata_only_folders),
+                    }, use_bin_type=True)
+                except Exception:
+                    snapshot_blob = None
+
             # Emit first — UI tree appears immediately. DB and cache writes follow.
             self.metadata_ready.emit(
                 ui_metadata, folder_map, guid_to_bundle, zip_names,
-                ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths)
+                ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
+                metadata_only_folders)
 
             if self.case_dir:
                 try:
-                    _db = _open_cache_db(self.case_dir)
-                    if _need_save_guid:
-                        save_guid_bundle_map(_db, guid_to_bundle)
-                    if _cached_sizes is None:
-                        save_folder_sizes(_db, folder_sizes)
-                    _db.close()
+                    with closing(_open_cache_db(self.case_dir)) as _db:
+                        if _need_save_guid:
+                            save_guid_bundle_map(_db, guid_to_bundle)
+                        if _cached_sizes is None:
+                            save_folder_sizes(_db, folder_sizes)
+                        if snapshot_blob is not None:
+                            save_blob(_db, _SNAPSHOT_KEY, _SNAPSHOT_VERSION,
+                                      snapshot_blob)
                 except Exception:
                     pass
 
@@ -1277,7 +1462,7 @@ class FileTableModel(QAbstractTableModel):
         adds matching rows in chunks so the UI count updates live."""
         self._filter_gen += 1
         my_gen = self._filter_gen
-        needle = text.lower()
+        needle = text.casefold()
         ncols  = self.columnCount()
         check_cols = list(range(ncols)) if col < 0 else [col]
         total  = len(self._all_rows)
@@ -1311,7 +1496,7 @@ class FileTableModel(QAbstractTableModel):
             end = min(idx[0] + _FILTER_CHUNK, total)
             matched = [
                 r for r in source[idx[0]:end]
-                if _type_ok(r) and any(r[0][c].lower().find(needle) != -1
+                if _type_ok(r) and any(needle in r[0][c].casefold()
                        for c in check_cols if c < len(r[0]))
             ]
             if matched:
@@ -1343,7 +1528,7 @@ class FileTableModel(QAbstractTableModel):
         self._sort_order = order
         reverse = (order == Qt.SortOrder.DescendingOrder)
         if column == self._files_col:
-            key = lambda r: r[2]
+            key = itemgetter(2)   # C-level accessor — faster than a lambda on large row lists
         elif column == self._size_col:
             key = lambda r: int(r[0][column].replace(',', '')) if column < len(r[0]) and r[0][column] else 0
         else:
@@ -1565,16 +1750,24 @@ class CaseSettingsDialog(QDialog):
 class PreferencesDialog(QDialog):
     """Global (cross-case) application preferences."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, example_archive: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Preferences")
         self.setModal(True)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(560)
         prefs = _load_prefs()
+
+        # Example archive used for the live preview; fall back to placeholder.
+        self._example_archive = example_archive or {
+            'path':     '/case_data/MyCase/extraction.zip',
+            'case_dir': '/case_data/MyCase',
+            'label':    'Apple iPhone 14 · iOS 17.4',
+        }
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
+        # ── Case Data Root ────────────────────────────────────────────────────
         layout.addWidget(QLabel("<b>Case Data Root</b>"))
         layout.addWidget(QLabel(
             "New archives will store their cache and exports inside a subfolder here. "
@@ -1597,8 +1790,56 @@ class PreferencesDialog(QDialog):
         root_row.addWidget(browse_btn)
         layout.addLayout(root_row)
 
-        layout.addStretch()
+        # ── Case Menu Display ─────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep)
+        layout.addWidget(QLabel("<b>Case Menu Display</b>"))
+        layout.addWidget(QLabel(
+            "Choose up to five pieces of information to show for each case. "
+            "Slots are joined left to right; empty slots are skipped."
+        ))
 
+        slots_grid = QGridLayout()
+        slots_grid.setColumnStretch(1, 1)
+        current_slots = prefs.get('case_name_slots', _DEFAULT_CASE_NAME_SLOTS)
+        self._slot_combos: list[QComboBox] = []
+        for i in range(5):
+            slots_grid.addWidget(QLabel(f"Slot {i + 1}:"), i, 0)
+            combo = QComboBox()
+            for display, key in CASE_SLOT_OPTIONS:
+                combo.addItem(display, userData=key)
+            target = current_slots[i] if i < len(current_slots) else 'none'
+            idx = next((j for j, (_, k) in enumerate(CASE_SLOT_OPTIONS) if k == target),
+                       len(CASE_SLOT_OPTIONS) - 1)
+            combo.setCurrentIndex(idx)
+            combo.currentIndexChanged.connect(self._update_preview)
+            slots_grid.addWidget(combo, i, 1)
+            self._slot_combos.append(combo)
+        layout.addLayout(slots_grid)
+
+        sort_row = QHBoxLayout()
+        sort_row.addWidget(QLabel("Sort order:"))
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItem("Most Recent First", userData="recent")
+        self._sort_combo.addItem("Alphabetical",      userData="alphabetical")
+        self._sort_combo.setCurrentIndex(
+            0 if prefs.get('case_sort_order', 'recent') == 'recent' else 1)
+        sort_row.addWidget(self._sort_combo)
+        sort_row.addStretch()
+        layout.addLayout(sort_row)
+
+        layout.addWidget(QLabel("Preview:"))
+        self._preview_label = QLabel()
+        self._preview_label.setWordWrap(True)
+        self._preview_label.setStyleSheet(
+            "background:#f5f5f5; border:1px solid #ccc; border-radius:4px; padding:4px 8px;")
+        layout.addWidget(self._preview_label)
+        self._update_preview()
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        layout.addStretch()
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         save_btn = QPushButton("Save")
@@ -1616,8 +1857,18 @@ class PreferencesDialog(QDialog):
         if folder:
             self._root_edit.setText(folder)
 
+    def _update_preview(self):
+        slots = [combo.currentData() for combo in self._slot_combos]
+        text  = _format_archive_entry(self._example_archive, {'case_name_slots': slots})
+        self._preview_label.setText(text or "<i>(empty — select at least one slot)</i>")
+
     def _on_save(self):
-        _save_prefs({'case_data_root': self._root_edit.text().strip()})
+        slots = [combo.currentData() for combo in self._slot_combos]
+        _save_prefs({
+            'case_data_root':  self._root_edit.text().strip(),
+            'case_name_slots': slots,
+            'case_sort_order': self._sort_combo.currentData(),
+        })
         self.accept()
 
 
@@ -1678,13 +1929,30 @@ class SingleFileScanWorker(QThread):
     def run(self):
         candidates = _resolve_file_candidates(
             self._zip_path, self._ui_paths, self._ffs_adapter,
-            self._streaming_index, self._delta,
+            streaming_index=self._streaming_index, delta=self._delta,
         )
         if not candidates:
             self.done.emit({})
             return
         results = header_scan.scan_entries(self._zip_path, candidates)
         self.done.emit(results)
+
+
+class DeviceInfoWorker(QThread):
+    """Reads device make/model/OS info from the archive off the GUI thread.
+
+    _read_device_info opens the zip (a full central-directory read, slow on
+    network shares) — running it on the main thread froze the UI after load.
+    """
+    done = Signal(list, str)   # fields, label
+
+    def __init__(self, zip_path: str, parent=None):
+        super().__init__(parent)
+        self._zip_path = zip_path
+
+    def run(self):
+        fields, label = _read_device_info(self._zip_path)
+        self.done.emit(fields, label)
 
 
 class NestedArchiveWorker(QThread):
@@ -1713,20 +1981,18 @@ class NestedArchiveWorker(QThread):
     def _load_completed(self, out_dir: str) -> set[str]:
         """Return ui_paths already fully extracted: DB entry + file on disk + entry count match."""
         try:
-            db   = _open_cache_db(self._case_dir)
-            rows = load_nested_archives(db)
             completed: set[str] = set()
-            for row in rows:
-                ui_path        = row['ui_path']
-                stored_filename = row['stored_filename']
-                expected_count  = row['entry_count']
-                disk_path       = os.path.join(out_dir, stored_filename)
-                if not os.path.isfile(disk_path):
-                    continue
-                actual_count = len(load_nested_archive_entries(db, ui_path))
-                if actual_count == expected_count:
-                    completed.add(ui_path)
-            db.close()
+            with closing(_open_cache_db(self._case_dir)) as db:
+                for row in load_nested_archives(db):
+                    ui_path        = row['ui_path']
+                    stored_filename = row['stored_filename']
+                    expected_count  = row['entry_count']
+                    disk_path       = os.path.join(out_dir, stored_filename)
+                    if not os.path.isfile(disk_path):
+                        continue
+                    actual_count = len(load_nested_archive_entries(db, ui_path))
+                    if actual_count == expected_count:
+                        completed.add(ui_path)
             return completed
         except Exception:
             return set()
@@ -1849,20 +2115,18 @@ class NestedArchiveWorker(QThread):
                             pass
 
             # ── Record in casecache.db ────────────────────────────────────────
-            db = _open_cache_db(self._case_dir)
-            save_nested_archive(db, ui_path, stored_filename,
-                                file_size, entry_count)
-            save_nested_archive_entries(db, ui_path, content_rows)
-            db.close()
+            with closing(_open_cache_db(self._case_dir)) as db:
+                save_nested_archive(db, ui_path, stored_filename,
+                                    file_size, entry_count)
+                save_nested_archive_entries(db, ui_path, content_rows)
             return True, compound_type
 
         except Exception as exc:
             msg = str(exc)
             self.item_error.emit(ui_path, msg)
             try:
-                db = _open_cache_db(self._case_dir)
-                save_nested_archive_failure(db, ui_path, msg)
-                db.close()
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    save_nested_archive_failure(db, ui_path, msg)
             except Exception:
                 pass
             try:
@@ -1962,10 +2226,8 @@ class ProcessDialog(QDialog):
         if not self._case_dir:
             return None
         try:
-            db = _open_results_db(self._case_dir)
-            result = load_last_run(db, self._RUN_TYPE)
-            db.close()
-            return result
+            with closing(_open_results_db(self._case_dir)) as db:
+                return load_last_run(db, self._RUN_TYPE)
         except Exception:
             return None
 
@@ -1973,10 +2235,8 @@ class ProcessDialog(QDialog):
         if not self._case_dir:
             return []
         try:
-            db = _open_cache_db(self._case_dir)
-            records = load_nested_archives(db)
-            db.close()
-            return records
+            with closing(_open_cache_db(self._case_dir)) as db:
+                return load_nested_archives(db)
         except Exception:
             return []
 
@@ -2089,19 +2349,17 @@ class ProcessDialog(QDialog):
 
         if self._case_dir:
             try:
-                cache_db = _open_cache_db(self._case_dir)
-                clear_header_types(cache_db)
-                cache_db.close()
+                with closing(_open_cache_db(self._case_dir)) as cache_db:
+                    clear_header_types(cache_db)
             except Exception:
                 pass
         self.header_types_cleared.emit()
 
         if self._case_dir:
             try:
-                results_db = _open_results_db(self._case_dir)
-                self._run_id = start_run_log(results_db, self._RUN_TYPE,
-                                             total=self._candidate_count)
-                results_db.close()
+                with closing(_open_results_db(self._case_dir)) as results_db:
+                    self._run_id = start_run_log(results_db, self._RUN_TYPE,
+                                                 total=self._candidate_count)
             except Exception:
                 pass
 
@@ -2128,15 +2386,13 @@ class ProcessDialog(QDialog):
 
         if self._case_dir:
             try:
-                cache_db = _open_cache_db(self._case_dir)
-                if results:
-                    save_header_types(cache_db, results)
-                cache_db.close()
+                with closing(_open_cache_db(self._case_dir)) as cache_db:
+                    if results:
+                        save_header_types(cache_db, results)
                 if self._run_id is not None and not cancelled:
-                    results_db = _open_results_db(self._case_dir)
-                    complete_run_log(results_db, self._run_id,
-                                     processed=n_total, output_rows=n_found)
-                    results_db.close()
+                    with closing(_open_results_db(self._case_dir)) as results_db:
+                        complete_run_log(results_db, self._run_id,
+                                         processed=n_total, output_rows=n_found)
             except Exception:
                 pass
 
@@ -2159,10 +2415,9 @@ class ProcessDialog(QDialog):
         guid_to_bundle = {}
         if self._case_dir:
             try:
-                db = _open_cache_db(self._case_dir)
-                overrides = load_header_types(db)
-                guid_to_bundle = load_guid_bundle_map(db)
-                db.close()
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    overrides = load_header_types(db)
+                    guid_to_bundle = load_guid_bundle_map(db)
             except Exception:
                 pass
 
@@ -2172,10 +2427,8 @@ class ProcessDialog(QDialog):
         db_records: dict[str, dict] = {}
         if self._case_dir:
             try:
-                db = _open_cache_db(self._case_dir)
-                for r in load_nested_archives(db):
-                    db_records[r['ui_path']] = r
-                db.close()
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    db_records = {r['ui_path']: r for r in load_nested_archives(db)}
             except Exception:
                 pass
 
@@ -2225,9 +2478,8 @@ class ProcessDialog(QDialog):
             overrides = {}
             if self._case_dir:
                 try:
-                    db = _open_cache_db(self._case_dir)
-                    overrides = load_header_types(db)
-                    db.close()
+                    with closing(_open_cache_db(self._case_dir)) as db:
+                        overrides = load_header_types(db)
                 except Exception:
                     pass
             candidates = _collect_nested_archive_candidates(
@@ -2281,25 +2533,23 @@ class ProcessDialog(QDialog):
             return
         try:
             out_dir = os.path.join(self._case_dir, 'nested_archives')
-            db      = _open_cache_db(self._case_dir)
-            records = load_nested_archives(db)
             gzip_types: dict[str, str] = {}
-            for rec in records:
-                if rec['entry_count'] != 1:
-                    continue
-                stored_path = os.path.join(out_dir, rec['stored_filename'])
-                if not os.path.isfile(stored_path):
-                    continue
-                with open(stored_path, 'rb') as f:
-                    magic = f.read(2)
-                if magic == b'PK':
-                    continue  # stored ZIP, not a gzip extract
-                entries = load_nested_archive_entries(db, rec['ui_path'])
-                if entries:
-                    ft = entries[0].get('file_type') or 'Other'
-                    if ft != 'Other':
-                        gzip_types[rec['ui_path']] = f"{ft} — gzip"
-            db.close()
+            with closing(_open_cache_db(self._case_dir)) as db:
+                for rec in load_nested_archives(db):
+                    if rec['entry_count'] != 1:
+                        continue
+                    stored_path = os.path.join(out_dir, rec['stored_filename'])
+                    if not os.path.isfile(stored_path):
+                        continue
+                    with open(stored_path, 'rb') as f:
+                        magic = f.read(2)
+                    if magic == b'PK':
+                        continue  # stored ZIP, not a gzip extract
+                    entries = load_nested_archive_entries(db, rec['ui_path'])
+                    if entries:
+                        ft = entries[0].get('file_type') or 'Other'
+                        if ft != 'Other':
+                            gzip_types[rec['ui_path']] = f"{ft} — gzip"
             if gzip_types:
                 self.header_scan_done.emit(gzip_types)
         except Exception:
@@ -2427,13 +2677,13 @@ class ArchiveSelectionDialog(QDialog):
 
     # ── Shared tree helpers ───────────────────────────────────────────────────
 
-    @staticmethod
-    def _mtime_key(arc: dict) -> int:
-        return arc.get('mtime', 0)
+    # Every archive dict carries an 'mtime' key (discovery and the DB-failure
+    # fallback both set it), so the C-level itemgetter is safe here.
+    _mtime_key = staticmethod(itemgetter('mtime'))
 
-    @staticmethod
-    def _max_mtime(arcs: list) -> int:
-        return max((a.get('mtime', 0) for a in arcs), default=0)
+    @classmethod
+    def _max_mtime(cls, arcs: list) -> int:
+        return max(map(cls._mtime_key, arcs), default=0)
 
     @staticmethod
     def _mtime_label(ns: int) -> str:
@@ -2502,8 +2752,7 @@ class ArchiveSelectionDialog(QDialog):
         font.setBold(True)
         group.setFont(0, font)
 
-        for arc in sorted(self._failed_archives,
-                          key=lambda a: a.get('mtime', 0), reverse=True):
+        for arc in sorted(self._failed_archives, key=self._mtime_key, reverse=True):
             item = QTreeWidgetItem(group)
             item.setText(0, _display_path(arc['ui_path'], self._guid_to_bundle))
             item.setText(1, arc.get('file_type', ''))
@@ -2532,8 +2781,7 @@ class ArchiveSelectionDialog(QDialog):
         group.setFont(0, font)
         group.setExpanded(False)
 
-        for arc in sorted(self._done_archives,
-                          key=lambda a: a.get('mtime', 0), reverse=True):
+        for arc in sorted(self._done_archives, key=self._mtime_key, reverse=True):
             item = QTreeWidgetItem(group)
             item.setText(0, _display_path(arc['ui_path'], self._guid_to_bundle))
             item.setText(1, arc.get('file_type', ''))
@@ -2725,10 +2973,9 @@ def _do_path_change_check(
 
     passed = trusted == new_hash
     try:
-        db = _open_results_db(case_dir)
-        run_id = start_run_log(db, 'cd_integrity_check', total=1, notes=new_hash)
-        complete_run_log(db, run_id, processed=1, output_rows=1 if passed else 0)
-        db.close()
+        with closing(_open_results_db(case_dir)) as db:
+            run_id = start_run_log(db, 'cd_integrity_check', total=1, notes=new_hash)
+            complete_run_log(db, run_id, processed=1, output_rows=1 if passed else 0)
     except Exception:
         pass
 
@@ -2770,6 +3017,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._nested_virtual_paths: frozenset   = frozenset()  # virtual file paths (leaves)
         self._nested_virtual_folders: frozenset = frozenset()  # virtual folder paths (non-root)
         self._hex_worker: QThread | None = None
+        self._device_info_worker: QThread | None = None
+        self._retired_workers: list = []   # stopped workers awaiting thread exit
         self._adapter = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, "filesystem2", "filesystem1")
         self._android_user_data_path = ''   # set at load time for Android archives
         # ffs_archives: ordered list of {"path": ..., "case_dir": ..., "label": ..., "last_opened": ...}
@@ -3384,16 +3633,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not arch:
             return
         entry_path = ui_path[len(arch_path) + 1:]
-        try:
-            with zipfile.ZipFile(arch['stored_path'], 'r') as zf:
-                data = zf.read(entry_path)
-        except zipfile.BadZipFile:
-            try:
-                with open(arch['stored_path'], 'rb') as f:
-                    data = f.read()
-            except Exception:
-                return
-        except Exception:
+        data = read_nested_entry(arch['stored_path'], entry_path)
+        if data is None:
             return
 
         name = meta.get('_display_name') or ui_path.rsplit('/', 1)[-1]
@@ -3509,50 +3750,42 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.status_bar.showMessage(f"{folder_path}    |    Tip: Right-click to export")
         self._log(f"Folder viewed: {folder_path}")
 
-        children = self.folder_map.get(folder_path, [])
-        has_bundles = any(p.split('/')[-1] in self.guid_to_bundle for p in children)
-
-        if has_bundles:
-            headers = self.file_headers + ['UUID']
-        else:
-            headers = self.file_headers
-
-        new_model = FileTableModel(headers)
-        self._update_filter_columns(headers)
-        self.filter_input.clear()
-        self.proxy_model.set_filter("", -1)
         self._view_path = folder_path
         self._view_is_recursive = False
-
-        batch = []
-        for path in sorted(children):
-            name = path.split('/')[-1]
-            is_folder = path in self.folder_map
-            file_type, grey_row, skip = self._classify_entry(path, name, is_folder)
-            if skip:
-                continue
-            meta = self.full_metadata.get(path, {})
-            if path in self._nested_virtual_paths:
-                name = meta.get('_display_name') or name
-            fc = self._count_files_recursive(path) if is_folder else -1
-            cols = self._build_entry_cols(path, name, meta, is_folder, file_type, fc)
-            if has_bundles:
-                cols.append(name if name in self.guid_to_bundle else "")
-            is_opened_archive = path in self._nested_archive_map
-            batch.append((cols, path, fc, is_folder and not grey_row, grey_row, is_opened_archive))
-
-        new_model.append_rows_batch(batch)
-        self._set_file_model(new_model)
-
-        # Resize columns but preserve splitter position
-        splitter_sizes = self.splitter.sizes()
-        self.file_view.resizeColumnsToContents()
-        self.splitter.setSizes(splitter_sizes)
-        self._refresh_table_status()
+        self._refresh_folder_view()
 
         # Refresh media tab if it's currently visible
         if self.center_tabs.currentIndex() == 1:
             self._load_media_from_file_model()
+
+    def _build_entry_row(self, path: str, has_bundles: bool = False,
+                         display_parent: str | None = None):
+        """Return one file-model row tuple for *path*, or None if hidden.
+
+        Single source of truth for building file-browser rows — used by the
+        folder view, the refresh path, and the checked-folders aggregate view.
+
+        display_parent — the parent folder's display path, precomputed once
+        per folder by callers iterating folder children.  Avoids re-resolving
+        GUID segments of the same folder prefix for every row.
+        """
+        seg = path.rsplit('/', 1)[-1]
+        is_folder = path in self.folder_map
+        meta = self.full_metadata.get(path, {})
+        file_type, grey_row, skip = self._classify_entry(
+            path, seg, is_folder, size_hint=meta.get('size', 0))
+        if skip:
+            return None
+        name = seg
+        if path in self._nested_virtual_paths:
+            name = meta.get('_display_name') or seg
+        fc = self._count_files_recursive(path) if is_folder else -1
+        cols = self._build_entry_cols(path, name, meta, is_folder, file_type, fc,
+                                      display_parent=display_parent, seg=seg)
+        if has_bundles:
+            cols.append(name if name in self.guid_to_bundle else "")
+        return (cols, path, fc, is_folder and not grey_row, grey_row,
+                path in self._nested_archive_map)
 
     def _display_name(self, segment: str) -> str:
         """Return the bundle ID for a GUID segment, otherwise the segment itself."""
@@ -3560,6 +3793,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _display_path(self, path: str) -> str:
         """Replace GUID segments in a full path with bundle IDs for display."""
+        # GUID segments always contain '-'; most paths have none to replace.
+        if not self.guid_to_bundle or '-' not in path:
+            return path
         return '/'.join(self._display_name(seg) for seg in path.split('/'))
 
     def _strip_archive_prefix(self, path: str) -> str:
@@ -3568,9 +3804,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         'filesystem2/mobile/Containers/...')."""
         return self._adapter.strip_display_prefix(path)
 
-    def _classify_entry(self, path: str, name: str, is_folder: bool):
+    def _classify_entry(self, path: str, name: str, is_folder: bool,
+                        size_hint: int | None = None):
         """Return (file_type, grey_row, skip) for one file/folder entry.
-        skip=True means the caller should exclude this entry from the view."""
+        skip=True means the caller should exclude this entry from the view.
+
+        size_hint — the entry's metadata size when the caller already has it.
+        Bare directory entries always have size 0, so a non-zero size skips
+        the (resolve-heavy) directory-entry probe entirely."""
         if is_folder:
             if path in self._nested_archive_map:
                 return 'Archive', False, False  # extracted archive browseable as folder
@@ -3590,14 +3831,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # Directory entries in FORMAT_ZIP_EXTRAS land in zip_ui_paths with
             # their trailing slash stripped — detect them before calling
             # _get_file_type so they never appear as "Other".
-            if self._is_empty_folder_entry(path):
+            if not size_hint and self._is_empty_folder_entry(path):
                 if self._hide_empty_folders:
                     return None, None, True
                 return "Empty Folder", True, False
-            if self._hide_empty_folders:
-                _sz = (self.full_metadata.get(path) or {}).get('size', -1)
-                if _sz == 0:
-                    return None, None, True
             ft = _get_file_type(name)
             if ft == 'Other' and path in self._header_type_overrides:
                 ft = self._header_type_overrides[path]
@@ -3606,14 +3843,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if self._hide_empty_folders:
                 return None, None, True
             return "Empty Folder", True, False
-        if self._hide_empty_folders:
-            _sz = (self.full_metadata.get(path) or {}).get('size', -1)
-            if _sz == 0:
-                return None, None, True
         return "Not in Zip", True, False
 
     def _build_entry_cols(self, path: str, name: str, meta: dict,
-                          is_folder: bool, file_type: str | None, fc: int) -> list:
+                          is_folder: bool, file_type: str | None, fc: int,
+                          display_parent: str | None = None,
+                          seg: str | None = None) -> list:
         cols: list = [self._display_name(name)]
         for _, key in self._time_cols:
             cols.append(self.format_ts(meta.get(key)))
@@ -3623,11 +3858,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             size_val = self._folder_total_size(path)
         else:
             size_val = meta.get('size', 0)
+        if display_parent is None:
+            disp_path = self._display_path(path)
+        else:
+            tail = self._display_name(seg if seg is not None else name)
+            disp_path = f"{display_parent}/{tail}" if display_parent else tail
         cols += [
             file_type,
             f"{size_val:,}",
             f"{fc:,}" if is_folder else "",
-            self._display_path(path),
+            disp_path,
         ]
         return cols
 
@@ -3677,24 +3917,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         case_dir = self._case_dir
         def _save():
             try:
-                db = _open_cache_db(case_dir)
-                save_folder_counts(db, counts)
-                db.close()
+                with closing(_open_cache_db(case_dir)) as db:
+                    save_folder_counts(db, counts)
             except Exception:
                 pass
-        ex = ThreadPoolExecutor(max_workers=1)
-        ex.submit(_save)
-        ex.shutdown(wait=False)
+        _BG_POOL.submit(_save)
 
     def format_ts(self, ts):
         if not ts: return "---"
-        try:
-            # APFS stores timestamps as nanoseconds since epoch
-            if ts > 1e10:
-                ts = ts / 1e9
-            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        except (ValueError, OSError, OverflowError):
-            return "---"
+        return _format_ts_cached(ts)
 
     def ensure_and_open_export_dir(self):
         if not self.zip_path: return
@@ -3713,64 +3944,99 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         folder_path = item.data(Qt.ItemDataRole.UserRole) if item else None
         menu = QMenu(self)
         if folder_path is not None:
-            checked_paths = set()
-            self._collect_checked_paths(item, checked_paths)
-            is_ticked = bool(checked_paths)
-            if is_ticked:
+            if self._branch_has_checked(folder_path):
                 rec_act = QAction("☐ Recursively Deselect", self)
-                rec_act.triggered.connect(lambda: self._recursive_untick_folder(index))
+                rec_act.triggered.connect(partial(self._recursive_untick_folder, index))
             else:
                 rec_act = QAction("☑ Recursively Add All Files", self)
-                rec_act.triggered.connect(lambda: self._recursive_tick_folder(index))
+                rec_act.triggered.connect(partial(self._recursive_tick_folder, index))
             menu.addAction(rec_act)
             menu.addSeparator()
-            # Bookmark: all files recursively under this folder
-            tree_bm_paths = [
-                (p, p.rsplit('/', 1)[-1])
-                for p in self._collect_files_recursive(folder_path)
-            ]
-            if tree_bm_paths:
-                self._bookmark_submenu(menu, tree_bm_paths)
-                menu.addSeparator()
+            # Bookmark all files under this folder — collected lazily: walking
+            # a big branch is O(archive), so defer it until a bookmark action
+            # is actually clicked instead of paying it on every right-click.
+            self._bookmark_submenu(
+                menu, partial(self._collect_bookmark_paths, folder_path))
+            menu.addSeparator()
         export_act = QAction("📁 Export Folder (Recursive)", self)
-        export_act.triggered.connect(lambda: self.handle_export_request(is_tree=True))
+        export_act.triggered.connect(partial(self.handle_export_request, is_tree=True))
         menu.addAction(export_act)
         menu.exec(self.tree_view.viewport().mapToGlobal(point))
 
-    def _recursive_tick_folder(self, index):
-        """Tick the folder and all its descendants."""
+    def _descendant_folders(self, root: str) -> list[str]:
+        """Return *root* and every descendant folder path, from folder_map.
+
+        Pure dict traversal — never touches the tree widgets, so it stays
+        fast (<0.5 s) even for the archive root on 500k-entry archives.
+        """
+        fm = self.folder_map
+        if root not in fm:
+            return []
+        seen = {root}
+        out = [root]
+        stack = [root]
+        while stack:
+            for child in fm.get(stack.pop(), ()):
+                if child in fm and child not in seen:
+                    seen.add(child)
+                    out.append(child)
+                    stack.append(child)
+        return out
+
+    def _set_branch_checked(self, index, checked: bool):
+        """Tick/untick a folder and all its descendants.
+
+        _checked_folders (the source of truth) is updated from folder_map
+        directly; only already-loaded tree items get their visual state set.
+        Lazily-loaded children pick their state up from the set when populated
+        — the tree is never force-materialised (which used to create ~100k
+        QStandardItems and freeze the UI on large archives).
+        """
         item = self.tree_model.itemFromIndex(index)
         if item is None:
             return
-        self._tree_populating = True
-        self._ensure_all_descendants_loaded(item)
-        self._tree_populating = False
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path is None:
+            return
+        descendants = self._descendant_folders(path)
+        if checked:
+            self._checked_folders.update(descendants)
+            state = Qt.CheckState.Checked
+        else:
+            self._checked_folders.difference_update(descendants)
+            state = Qt.CheckState.Unchecked
         self.tree_model.blockSignals(True)
         if item.isCheckable():
-            item.setCheckState(Qt.CheckState.Checked)
-        self._cascade_check(item, Qt.CheckState.Checked)
+            item.setCheckState(state)
+        self._cascade_check(item, state)   # loaded descendants only
         self.tree_model.blockSignals(False)
         self.tree_view.viewport().update()
         if not self._rebuild_pending:
             self._rebuild_pending = True
             QTimer.singleShot(0, self._deferred_rebuild)
+
+    def _recursive_tick_folder(self, index):
+        self._set_branch_checked(index, True)
 
     def _recursive_untick_folder(self, index):
-        """Untick the folder and all its descendants."""
-        item = self.tree_model.itemFromIndex(index)
-        if item is None:
-            return
-        self.tree_model.blockSignals(True)
-        if item.isCheckable():
-            item.setCheckState(Qt.CheckState.Unchecked)
-        self._cascade_check(item, Qt.CheckState.Unchecked)
-        self.tree_model.blockSignals(False)
-        self.tree_view.viewport().update()
-        if not self._rebuild_pending:
-            self._rebuild_pending = True
-            QTimer.singleShot(0, self._deferred_rebuild)
+        self._set_branch_checked(index, False)
 
     # ── Checkbox-driven file-view helpers ──────────────────────────────── #
+
+    def _branch_has_checked(self, path: str) -> bool:
+        """True when *path* or any folder beneath it is ticked."""
+        if not self._checked_folders:
+            return False
+        if not path:
+            return True   # root — any ticked folder is beneath it
+        prefix = path + '/'
+        return (path in self._checked_folders
+                or any(p.startswith(prefix) for p in self._checked_folders))
+
+    def _collect_bookmark_paths(self, folder_path: str) -> list:
+        """Return [(ui_path, display_name)] for every file under folder_path."""
+        return [(p, p.rsplit('/', 1)[-1])
+                for p in self._collect_files_recursive(folder_path)]
 
     def _cascade_check(self, parent_item, state):
         """Propagate check state to all descendants of parent_item."""
@@ -3782,23 +4048,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 child.setCheckState(state)
             self._cascade_check(child, state)
 
-    def _collect_checked_paths(self, parent_item, result):
-        for row in range(parent_item.rowCount()):
-            item = parent_item.child(row)
-            if item is None:
-                continue
-            if item.isCheckable() and item.checkState() == Qt.CheckState.Checked:
-                path = item.data(Qt.ItemDataRole.UserRole)
-                if path is not None:
-                    result.add(path)
-            self._collect_checked_paths(item, result)
-
     def _rebuild_file_view_from_checked(self, preserve_filter: bool = False, select_path: str | None = None):
-        checked = set()
-        self._collect_checked_paths(self.tree_model.invisibleRootItem(), checked)
+        checked = set(self._checked_folders)   # copy — set may change while batches run
         self._view_path = ""
         self._view_is_recursive = bool(checked)
-        self._checked_folders = checked
         if checked:
             self.tree_view.clearSelection()
             self.tree_view.setCurrentIndex(QModelIndex())
@@ -3845,17 +4098,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             while state['idx'] < total_folders:
                 folder = folders[state['idx']]
                 state['idx'] += 1
+                disp_parent = self._display_path(folder)
                 for child in self.folder_map.get(folder, []):
-                    name = child.split('/')[-1]
-                    is_folder = child in self.folder_map
-                    file_type, grey_row, skip = self._classify_entry(child, name, is_folder)
-                    if skip:
+                    row = self._build_entry_row(child, display_parent=disp_parent)
+                    if row is None:
                         continue
-                    meta = self.full_metadata.get(child, {})
-                    fc = self._count_files_recursive(child) if is_folder else -1
-                    cols = self._build_entry_cols(child, name, meta, is_folder, file_type, fc)
-                    is_opened_archive = child in self._nested_archive_map
-                    batch_rows.append((cols, child, fc, is_folder and not grey_row, grey_row, is_opened_archive))
+                    batch_rows.append(row)
                     state['count'] += 1
                 if time.monotonic() >= deadline:
                     break  # yield back to the event loop
@@ -3896,7 +4144,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         menu = QMenu(self)
         count = len(self.file_view.selectionModel().selectedRows())
         export_act = QAction(f"💾 Export Selected ({count} items)", self)
-        export_act.triggered.connect(lambda: self.handle_export_request(is_tree=False))
+        export_act.triggered.connect(partial(self.handle_export_request, is_tree=False))
         menu.addAction(export_act)
 
         source = self.proxy_model.mapToSource(index)
@@ -3904,13 +4152,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         if ui_path and ui_path not in self.folder_map and self._in_zip(ui_path):
             hex_act = QAction("🔍 Preview in Hex Viewer", self)
-            hex_act.triggered.connect(lambda: self._load_hex_preview(ui_path))
+            hex_act.triggered.connect(partial(self._load_hex_preview, ui_path))
             menu.addAction(hex_act)
 
         if ui_path and '/' in ui_path:
             parent_path = ui_path.rsplit('/', 1)[0]
             parent_act = QAction("📂 Open Parent Folder in Tree", self)
-            parent_act.triggered.connect(lambda: self.navigate_tree_to_path(parent_path))
+            parent_act.triggered.connect(partial(self.navigate_tree_to_path, parent_path))
             menu.addAction(parent_act)
 
         # Collect file paths from all selected rows for header scan
@@ -3926,8 +4174,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             scan_hdr_act = QAction(
                 f"🔬 Scan File Header{'s' if _n > 1 else ''} ({_n})", self)
             scan_hdr_act.triggered.connect(
-                lambda checked=False, paths=_scan_paths, primary=ui_path:
-                    self._scan_selected_headers(paths, primary_path=primary))
+                partial(self._scan_selected_headers, _scan_paths, primary_path=ui_path))
             menu.addAction(scan_hdr_act)
 
         # Extract nested archive option — shown for unextracted Archive/Compressed files
@@ -3941,7 +4188,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 menu.addSeparator()
                 extract_act = QAction("📦 Extract as Nested Archive", self)
                 extract_act.triggered.connect(
-                    lambda checked=False, p=ui_path: self._extract_from_context_menu(p))
+                    partial(self._extract_from_context_menu, ui_path))
                 menu.addAction(extract_act)
 
         # Bookmarks submenu
@@ -3954,7 +4201,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def handle_export_request(self, is_tree=True):
         if not self.zip_path: return
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         tasks = []
 
         if is_tree:
@@ -3985,7 +4231,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         dlg.exec()
 
     def on_export_finished(self, success, message, dest_path):
-        QApplication.restoreOverrideCursor()
         if success:
             self._log(f"Export succeeded: {message} → {dest_path}")
         else:
@@ -4020,16 +4265,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return [('Created', 'btime'), ('Changed', 'ctime'), ('Modified', 'mtime')]
         # Sample up to 500 metadata dicts to detect which timestamps are present.
         has_ctime = has_btime = False
-        checked = 0
-        for v in ui_metadata.values():
-            if not v:
-                continue
-            if v.get('ctime'):
-                has_ctime = True
-            if v.get('btime'):
-                has_btime = True
-            checked += 1
-            if checked >= 500 or (has_ctime and has_btime):
+        for v in islice((v for v in ui_metadata.values() if v), 500):
+            has_ctime = has_ctime or bool(v.get('ctime'))
+            has_btime = has_btime or bool(v.get('btime'))
+            if has_ctime and has_btime:
                 break
         cols: list[tuple[str, str]] = []
         if has_btime:
@@ -4155,7 +4394,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 QTimer.singleShot(0, self._open_preferences)
 
     def _open_preferences(self):
-        PreferencesDialog(parent=self).exec()
+        example = self._ffs_archives[0] if self._ffs_archives else None
+        dlg = PreferencesDialog(parent=self, example_archive=example)
+        if dlg.exec():
+            self._ffs_archives = self._load_ffs_archives()
+            self.update_dropdown_ui()
+            self._populate_recent_menu()
 
     def _open_process_dialog(self):
         if not self.zip_path:
@@ -4224,10 +4468,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.hex_label.setText("No file selected")
         self.hex_progress_bar.hide()
 
-        # Stop any running thumbnail worker from the previous archive
-        if self._thumb_worker and self._thumb_worker.isRunning():
-            self._thumb_worker.stop()
-            self._thumb_worker.wait()
+        # Retire any running thumbnail worker from the previous archive
+        # (no blocking wait — it may be inside a long ffmpeg call)
+        self._retire_worker(self._thumb_worker)
+        self._thumb_worker = None
         while self._media_grid.count():
             item = self._media_grid.takeAt(0)
             w = item.widget() if item else None
@@ -4256,7 +4500,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.worker.header_scan_done.connect(self._on_header_scan_done)
         self.worker.start()
 
-    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None):
+    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None, metadata_only_folders=None):
         self.full_metadata = data
         self.folder_map = folder_map
         self.guid_to_bundle = guid_map
@@ -4266,19 +4510,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._missing_plist_paths = set(missing_plist_paths)
         self._folder_sizes = folder_sizes
         self._zip_ui_paths = zip_ui_paths
-        if ffs_adapter.format != FfsAdapter.FORMAT_ZIP_EXTRAS:
-            self._metadata_only_folders = _find_metadata_only_folders(
-                folder_map, zip_names, zip_ui_paths, ffs_adapter)
-        else:
-            self._metadata_only_folders = set()
+        self._metadata_only_folders = metadata_only_folders or set()
         self._header_type_overrides = {}
         self._file_count_cache = {}
         if self._case_dir:
             try:
-                db = _open_cache_db(self._case_dir)
-                self._header_type_overrides = load_header_types(db)
-                self._file_count_cache, _ = load_folder_data(db)
-                db.close()
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    self._header_type_overrides = load_header_types(db)
+                    self._file_count_cache, _ = load_folder_data(db)
             except Exception:
                 pass
         if self._zip_handle:
@@ -4288,10 +4527,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._streaming_index    = getattr(self.worker, '_streaming_index', None)
         self._local_extra_delta  = getattr(self.worker, '_local_extra_delta', None)
         if self._streaming_index is None:
-            _path = self.zip_path
-            _ex = ThreadPoolExecutor(max_workers=1)
-            self._zip_open_future = _ex.submit(lambda: zipfile.ZipFile(_path, 'r'))
-            _ex.shutdown(wait=False)
+            self._zip_open_future = _BG_POOL.submit(zipfile.ZipFile, self.zip_path, 'r')
         self._time_cols = self._detect_time_columns(data)
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'Path'])
@@ -4305,7 +4541,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Fetch device label and populate device_info after archive is loaded.
         # Always schedule so device_info is repopulated after a schema rebuild
         # even when the label is already cached in ffs_archives.json.
-        QTimer.singleShot(0, lambda: self._fetch_and_store_label(self.zip_path))
+        QTimer.singleShot(0, partial(self._fetch_and_store_label, self.zip_path))
         self._refresh_artifact_tab()
         self._artifact_act.setEnabled(True)
         # Start background precomputation of folder counts if not already cached.
@@ -4336,9 +4572,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._header_type_overrides.update(results)
         if self._case_dir:
             try:
-                db = _open_cache_db(self._case_dir)
-                save_header_types(db, results)
-                db.close()
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    save_header_types(db, results)
             except Exception:
                 pass
         if self._view_is_recursive:
@@ -4356,16 +4591,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """
         if not self._case_dir:
             return
-        db = None
         try:
-            db      = _open_cache_db(self._case_dir)
-            records = load_nested_archives(db)
+            db = _open_cache_db(self._case_dir)
         except Exception:
-            if db:
-                try:
-                    db.close()
-                except Exception:
-                    pass
             return
 
         # Reset all virtual state before rebuilding.
@@ -4375,52 +4603,55 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         virtual_paths = set()
         out_dir = os.path.join(self._case_dir, 'nested_archives')
 
-        for rec in records:
-            ui_path     = rec['ui_path']
-            stored_path = os.path.join(out_dir, rec['stored_filename'])
-            if not os.path.isfile(stored_path):
-                continue
+        with closing(db):
             try:
-                entries = load_nested_archive_entries(db, ui_path)
+                records = load_nested_archives(db)
             except Exception:
-                entries = []
+                return
 
-            self._nested_archive_map[ui_path] = {
-                'stored_path': stored_path,
-                'entries':     entries,
-            }
-
-            children = []
-            for e in entries:
-                if e['entry_path'].endswith('/'):
-                    continue   # skip directory entries
-                ep = e['entry_path']
-                if not ep:
+            for rec in records:
+                ui_path     = rec['ui_path']
+                stored_path = os.path.join(out_dir, rec['stored_filename'])
+                if not os.path.isfile(stored_path):
                     continue
-                vpath = f"{ui_path}/{ep}"
-                virtual_paths.add(vpath)
-                children.append(vpath)
-                mtime = None
-                if e.get('mdate'):
-                    try:
-                        dt = datetime.strptime(e['mdate'], '%Y-%m-%d %H:%M:%S')
-                        mtime = dt.replace(tzinfo=timezone.utc).timestamp()
-                    except ValueError:
-                        pass
-                self.full_metadata[vpath] = {
-                    'size':          e['size'] or 0,
-                    '_display_name': ep,
-                    '_archive_path': ui_path,
-                    'mtime':         mtime,
+                try:
+                    entries = load_nested_archive_entries(db, ui_path)
+                except Exception:
+                    entries = []
+
+                self._nested_archive_map[ui_path] = {
+                    'stored_path': stored_path,
+                    'entries':     entries,
                 }
-                ft = e.get('file_type') or 'Other'
-                if ft != 'Other':
-                    self._header_type_overrides[vpath] = ft
 
-            # Register archive as a navigable folder with its entries as children.
-            self.folder_map[ui_path] = children
+                children = []
+                for e in entries:
+                    ep = e['entry_path']
+                    if not ep or ep.endswith('/'):
+                        continue   # skip directory entries
+                    vpath = f"{ui_path}/{ep}"
+                    virtual_paths.add(vpath)
+                    children.append(vpath)
+                    mtime = None
+                    if e.get('mdate'):
+                        try:
+                            dt = datetime.strptime(e['mdate'], '%Y-%m-%d %H:%M:%S')
+                            mtime = dt.replace(tzinfo=timezone.utc).timestamp()
+                        except ValueError:
+                            pass
+                    self.full_metadata[vpath] = {
+                        'size':          e['size'] or 0,
+                        '_display_name': ep,
+                        '_archive_path': ui_path,
+                        'mtime':         mtime,
+                    }
+                    ft = e.get('file_type') or 'Other'
+                    if ft != 'Other':
+                        self._header_type_overrides[vpath] = ft
 
-        db.close()
+                # Register archive as a navigable folder with its entries as children.
+                self.folder_map[ui_path] = children
+
         self._nested_virtual_paths = frozenset(virtual_paths)
 
     def _on_nested_extraction_done(self):
@@ -4451,6 +4682,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # was already ticked (vacuously true when there are no siblings).
             auto_tick = (parent_path in saved_checked and
                          all(s in saved_checked for s in sibling_paths))
+            if auto_tick:
+                self._checked_folders.add(ui_path)
             check_state = (Qt.CheckState.Checked if auto_tick
                            else Qt.CheckState.Unchecked)
             self._insert_tree_folder_item(parent_item, ui_path, check_state)
@@ -4463,7 +4696,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not self.zip_path or not self._case_dir:
             return
         self.status_bar.showMessage(f"Extracting {os.path.basename(ui_path)}…")
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         worker = NestedArchiveWorker(
             self.zip_path,
             self._case_dir,
@@ -4473,13 +4705,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._streaming_index,
             self._local_extra_delta,
         )
-        worker.finished.connect(
-            lambda ok, err, p=ui_path: self._on_context_extract_done(p, ok, err))
+        # partial binds ui_path; the signal appends (ok, err).
+        worker.finished.connect(partial(self._on_context_extract_done, ui_path))
         self._context_extract_worker = worker
         worker.start()
 
     def _on_context_extract_done(self, ui_path: str, ok: int, err: int) -> None:
-        QApplication.restoreOverrideCursor()
         if ok > 0:
             saved_checked = set(self._checked_folders)
             parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ''
@@ -4529,13 +4760,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._single_scan_run_id: int | None = None
         if self._case_dir:
             try:
-                db = _open_results_db(self._case_dir)
-                self._single_scan_run_id = start_run_log(
-                    db, 'header_scan_single',
-                    total=n,
-                    notes='\n'.join(ui_paths),
-                )
-                db.close()
+                with closing(_open_results_db(self._case_dir)) as db:
+                    self._single_scan_run_id = start_run_log(
+                        db, 'header_scan_single',
+                        total=n,
+                        notes='\n'.join(ui_paths),
+                    )
             except Exception:
                 pass
         self._single_scan_worker = SingleFileScanWorker(
@@ -4552,17 +4782,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._header_type_overrides.update(results)
             if self._case_dir:
                 try:
-                    db = _open_cache_db(self._case_dir)
-                    save_header_types(db, results)
-                    db.close()
+                    with closing(_open_cache_db(self._case_dir)) as db:
+                        save_header_types(db, results)
                 except Exception:
                     pass
         if self._case_dir and self._single_scan_run_id is not None:
             try:
-                db = _open_results_db(self._case_dir)
-                complete_run_log(db, self._single_scan_run_id,
-                                 processed=n_total, output_rows=n_updated)
-                db.close()
+                with closing(_open_results_db(self._case_dir)) as db:
+                    complete_run_log(db, self._single_scan_run_id,
+                                     processed=n_total, output_rows=n_updated)
             except Exception:
                 pass
         primary = getattr(self, '_single_scan_primary_path', None)
@@ -4599,19 +4827,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.proxy_model.set_filter("", -1)
 
         batch = []
+        disp_parent = self._display_path(folder_path)
         for path in sorted(children):
-            name = path.split('/')[-1]
-            is_folder = path in self.folder_map
-            file_type, grey_row, skip = self._classify_entry(path, name, is_folder)
-            if skip:
-                continue
-            meta = self.full_metadata.get(path, {})
-            fc = self._count_files_recursive(path) if is_folder else -1
-            cols = self._build_entry_cols(path, name, meta, is_folder, file_type, fc)
-            if has_bundles:
-                cols.append(name if name in self.guid_to_bundle else "")
-            is_opened_archive = path in self._nested_archive_map
-            batch.append((cols, path, fc, is_folder and not grey_row, grey_row, is_opened_archive))
+            row = self._build_entry_row(path, has_bundles, display_parent=disp_parent)
+            if row is not None:
+                batch.append(row)
         new_model.append_rows_batch(batch)
         self._set_file_model(new_model)
 
@@ -4630,7 +4850,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         elif select_path:
             self._select_file_by_path(select_path)
 
+        # Resize columns but preserve the splitter position
+        splitter_sizes = self.splitter.sizes()
         self.file_view.resizeColumnsToContents()
+        self.splitter.setSizes(splitter_sizes)
         self._refresh_table_status()
 
     def _warn_and_select_missing(self, paths):
@@ -4655,6 +4878,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _tick_items_by_path(self, path_set):
         """Check the tree item for every path in path_set.
         Descends only the branches needed, loading lazily as it goes."""
+        # Record in the checked set first — the tree walk below only updates
+        # the visual state of items it can reach.
+        self._checked_folders.update(p for p in path_set if p in self.folder_map)
         for path in path_set:
             self._tick_single_path(path)
         self.tree_view.viewport().update()
@@ -4697,7 +4923,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         root_item.setEditable(False)
         root_item.setFont(QFont("Arial", weight=QFont.Weight.Bold))
         root_item.setCheckable(True)
-        root_item.setCheckState(Qt.CheckState.Unchecked)
+        root_item.setCheckState(Qt.CheckState.Checked if "" in self._checked_folders
+                                else Qt.CheckState.Unchecked)
         self.tree_model.invisibleRootItem().appendRow(root_item)
         self._populate_tree_children_batched(root_item, "", on_done=lambda: self._on_tree_loaded(root_item))
 
@@ -4741,7 +4968,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 item.setData(p, Qt.ItemDataRole.UserRole)
                 item.setEditable(False)
                 item.setCheckable(True)
-                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setCheckState(Qt.CheckState.Checked if p in self._checked_folders
+                                   else Qt.CheckState.Unchecked)
                 parent_item.appendRow(item)
                 if self.folder_map.get(p):
                     placeholder = QStandardItem()
@@ -4778,13 +5006,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not getattr(self, '_case_dir', None):
             return
         try:
-            db = _open_results_db(self._case_dir)
-            groups = load_bookmark_groups(db)
-            if not groups:
-                save_bookmark_group(db, 'Evidence', 'Files directly relevant to the investigation')
-                save_bookmark_group(db, 'Interesting', 'Files worth reviewing further')
+            with closing(_open_results_db(self._case_dir)) as db:
                 groups = load_bookmark_groups(db)
-            db.close()
+                if not groups:
+                    save_bookmark_group(db, 'Evidence', 'Files directly relevant to the investigation')
+                    save_bookmark_group(db, 'Interesting', 'Files worth reviewing further')
+                    groups = load_bookmark_groups(db)
         except Exception:
             return
         self._bookmark_list.clear()
@@ -4801,9 +5028,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             row_h = 22
         list_h = row_h * min(len(groups), MAX_VISIBLE) + 2
         self._bookmark_list.setFixedHeight(list_h)
+        QTimer.singleShot(0, self._fit_bookmark_panel_size)
         # Keep search scope combo in sync with current bookmark groups.
         if hasattr(self, 'search_scope_combo'):
             self._refresh_search_scope_combo()
+
+    def _fit_bookmark_panel_size(self):
+        """Shrink the left splitter's bookmark panel to exactly fit its content."""
+        total_h = self.left_splitter.height()
+        if total_h <= 0:
+            return
+        panel_h = self._bookmark_panel.sizeHint().height()
+        self.left_splitter.setSizes([max(50, total_h - panel_h), panel_h])
 
     def _on_bookmark_item_clicked(self, index):
         group_id = self._bookmark_list.item(index.row()).data(Qt.ItemDataRole.UserRole)
@@ -4814,22 +5050,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         item = self._bookmark_list.itemAt(point)
         menu = QMenu(self)
         new_act = QAction("New Group…", self)
-        new_act.triggered.connect(lambda: self._new_bookmark_group_dialog([]))
+        new_act.triggered.connect(partial(self._new_bookmark_group_dialog, []))
         menu.addAction(new_act)
         if item is not None:
             group_id = item.data(Qt.ItemDataRole.UserRole)
             menu.addSeparator()
             del_act = QAction(f"Delete '{item.text().split('  (')[0]}'", self)
-            del_act.triggered.connect(
-                lambda _, gid=group_id: self._delete_bookmark_group(gid))
+            del_act.triggered.connect(partial(self._delete_bookmark_group, group_id))
             menu.addAction(del_act)
         menu.exec(self._bookmark_list.viewport().mapToGlobal(point))
 
     def _delete_bookmark_group(self, group_id: int):
         try:
-            db = _open_results_db(self._case_dir)
-            delete_bookmark_group(db, group_id)
-            db.close()
+            with closing(_open_results_db(self._case_dir)) as db:
+                delete_bookmark_group(db, group_id)
         except Exception as e:
             QMessageBox.warning(self, "Bookmark Error", str(e))
             return
@@ -4840,10 +5074,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not self._case_dir:
             return
         try:
-            db = _open_results_db(self._case_dir)
-            entries = load_bookmark_entries(db, group_id)
-            groups  = load_bookmark_groups(db)
-            db.close()
+            with closing(_open_results_db(self._case_dir)) as db:
+                entries = load_bookmark_entries(db, group_id)
+                groups  = load_bookmark_groups(db)
         except Exception:
             return
         group = next((g for g in groups if g['id'] == group_id), None)
@@ -4927,37 +5160,41 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 result.append((ui_path, ui_path.rsplit('/', 1)[-1]))
         return result
 
-    def _bookmark_submenu(self, menu: 'QMenu', paths: list) -> None:
-        """Append a populated Bookmarks submenu to *menu*."""
-        if not paths or not self._case_dir:
+    def _bookmark_submenu(self, menu: 'QMenu', paths) -> None:
+        """Append a populated Bookmarks submenu to *menu*.
+
+        *paths* is either a list of (ui_path, display_name) pairs or a
+        zero-arg callable returning one — the callable form defers an
+        expensive recursive collection until an action is actually clicked.
+        """
+        if not self._case_dir or (not callable(paths) and not paths):
             return
         try:
-            db = _open_results_db(self._case_dir)
-            groups = load_bookmark_groups(db)
-            db.close()
+            with closing(_open_results_db(self._case_dir)) as db:
+                groups = load_bookmark_groups(db)
         except Exception:
             groups = []
         bm_menu = menu.addMenu("Bookmarks")
         for g in groups:
             act = QAction(f"{g['name']}  ({g['count']:,})", self)
-            act.triggered.connect(
-                lambda _, gid=g['id']: self._add_to_bookmark_group(paths, gid))
+            act.triggered.connect(partial(self._add_to_bookmark_group, paths, g['id']))
             bm_menu.addAction(act)
         if groups:
             bm_menu.addSeparator()
         new_act = QAction("New Group…", self)
-        new_act.triggered.connect(lambda: self._new_bookmark_group_dialog(paths))
+        new_act.triggered.connect(partial(self._new_bookmark_group_dialog, paths))
         bm_menu.addAction(new_act)
 
-    def _add_to_bookmark_group(self, paths: list, group_id: int):
-        """Save *paths* into an existing bookmark group."""
+    def _add_to_bookmark_group(self, paths, group_id: int):
+        """Save *paths* (list or lazy callable) into an existing bookmark group."""
         if not self._case_dir:
             return
+        if callable(paths):
+            paths = paths()
         try:
-            db = _open_results_db(self._case_dir)
-            save_bookmark_entries(db, group_id, paths)
-            groups = load_bookmark_groups(db)
-            db.close()
+            with closing(_open_results_db(self._case_dir)) as db:
+                save_bookmark_entries(db, group_id, paths)
+                groups = load_bookmark_groups(db)
         except Exception as e:
             QMessageBox.warning(self, "Bookmark Error", str(e))
             return
@@ -4968,8 +5205,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             f"Added {n:,} file{'s' if n != 1 else ''} to '{name}'", 4000)
         self._refresh_bookmark_panel()
 
-    def _new_bookmark_group_dialog(self, paths: list):
+    def _new_bookmark_group_dialog(self, paths):
         """Show a dialog to name and describe a new bookmark group, then save."""
+        if callable(paths):
+            paths = paths()
         dlg = QDialog(self)
         dlg.setWindowTitle("New Bookmark Group")
         dlg.setModal(True)
@@ -5006,10 +5245,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 return
             desc = desc_edit.toPlainText().strip()
             try:
-                db = _open_results_db(self._case_dir)
-                group_id = save_bookmark_group(db, name, desc)
-                save_bookmark_entries(db, group_id, paths)
-                db.close()
+                with closing(_open_results_db(self._case_dir)) as db:
+                    group_id = save_bookmark_group(db, name, desc)
+                    save_bookmark_entries(db, group_id, paths)
             except Exception as e:
                 err_label.setText(str(e))
                 return
@@ -5043,7 +5281,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             item.setData(p, Qt.ItemDataRole.UserRole)
             item.setEditable(False)
             item.setCheckable(True)
-            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setCheckState(Qt.CheckState.Checked if p in self._checked_folders
+                               else Qt.CheckState.Unchecked)
             parent_item.appendRow(item)
             # Add a placeholder so Qt shows the expand arrow without
             # loading all grandchildren upfront.
@@ -5091,14 +5330,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     item.removeRow(0)
                     self._populate_tree_children(item, path)
                     self._tree_populating = False
-
-    def _ensure_all_descendants_loaded(self, item):
-        """Recursively force-load every level under item (used for recursive tick)."""
-        self._ensure_children_loaded(item)
-        for row in range(item.rowCount()):
-            child = item.child(row)
-            if child is not None:
-                self._ensure_all_descendants_loaded(child)
 
     def _find_tree_item(self, path: str):
         """Return the tree QStandardItem for *path* if already loaded, else None."""
@@ -5165,9 +5396,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def on_tree_item_changed(self, item):
         if self._tree_populating:
             return
-        # Single folder tick — expand to show unticked children
-        if item.checkState() == Qt.CheckState.Checked:
-            self.tree_view.expand(self.tree_model.indexFromItem(item))
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path is not None and path != _TREE_PLACEHOLDER:
+            if item.checkState() == Qt.CheckState.Checked:
+                self._checked_folders.add(path)
+                # Single folder tick — expand to show unticked children
+                self.tree_view.expand(self.tree_model.indexFromItem(item))
+            else:
+                self._checked_folders.discard(path)
         self.tree_view.viewport().update()
         if not self._rebuild_pending:
             self._rebuild_pending = True
@@ -5175,8 +5411,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _update_selected_btn(self):
         """Recount ticked folders and update the status label and deselect button."""
-        checked = set()
-        self._collect_checked_paths(self.tree_model.invisibleRootItem(), checked)
+        checked = self._checked_folders
         if not checked:
             self.show_selected_btn.setVisible(False)
             self.deselect_all_btn.setVisible(False)
@@ -5188,6 +5423,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _deselect_all_files(self):
         """Untick all folders in the tree and clear the file browser."""
+        self._checked_folders.clear()
         self.tree_model.blockSignals(True)
         root = self.tree_model.invisibleRootItem()
         self._cascade_check(root, Qt.CheckState.Unchecked)
@@ -5220,7 +5456,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return
         menu = QMenu(self)
         act = QAction("Remove from recent list", self)
-        act.triggered.connect(lambda: self._remove_recent(path))
+        act.triggered.connect(partial(self._remove_recent, path))
         menu.addAction(act)
         menu.exec(view.viewport().mapToGlobal(point))
 
@@ -5259,10 +5495,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         prefs = _load_prefs()
         root = prefs.get('case_data_root', '').strip()
         if root and os.path.isdir(root):
-            for name in os.listdir(root):
-                case_dir = os.path.join(root, name)
-                if not os.path.isdir(case_dir):
-                    continue
+            # scandir caches the is_dir result per entry — one directory pass
+            # instead of a stat call per name (matters on network case roots).
+            with os.scandir(root) as it:
+                dir_entries = [e for e in it if e.is_dir()]
+            for dir_entry in dir_entries:
+                case_dir = dir_entry.path
                 if case_dir in by_case_dir:
                     continue
                 db_path = os.path.join(case_dir, 'caseresults.db')
@@ -5271,13 +5509,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 # Found a case folder — try to read zip_path from DB
                 zip_path = ''
                 try:
-                    db = _open_results_db(case_dir)
-                    rows = load_device_info(db)
-                    db.close()
-                    for field, data, _src in rows:
-                        if field == 'zip_path':
-                            zip_path = data
-                            break
+                    with closing(_open_results_db(case_dir)) as db:
+                        rows = load_device_info(db)
+                    zip_path = next(
+                        (data for field, data, _src in rows if field == 'zip_path'), '')
                 except Exception:
                     pass
                 entry: dict = {'case_dir': case_dir}
@@ -5288,8 +5523,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Drop entries whose case_dir no longer exists
         result = [e for e in by_case_dir.values() if os.path.isdir(e.get('case_dir', ''))]
 
-        # Sort by last_opened descending (missing → oldest)
-        result.sort(key=lambda e: e.get('last_opened', ''), reverse=True)
+        # Sort according to preference
+        sort_order = prefs.get('case_sort_order', 'recent')
+        if sort_order == 'alphabetical':
+            def _alpha_key(e):
+                label = e.get('label', '')
+                return (label or os.path.basename(e.get('case_dir', '')) or e.get('path', '')).lower()
+            result.sort(key=_alpha_key)
+        else:
+            result.sort(key=lambda e: e.get('last_opened', ''), reverse=True)
         return result
 
     def _migrate_device_labels(self):
@@ -5368,43 +5610,51 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         has_db_info = False
         if self._case_dir:
             try:
-                db = _open_results_db(self._case_dir)
-                has_db_info = bool(load_device_info(db))
-                db.close()
+                with closing(_open_results_db(self._case_dir)) as db:
+                    has_db_info = bool(load_device_info(db))
             except Exception:
                 pass
         if has_label and has_db_info:
             return
 
-        fields, label = _read_device_info(path)
+        # Reading device info opens the zip — run it off the GUI thread.
+        # partial binds the context up front; the signal appends (fields, label).
+        worker = DeviceInfoWorker(path)
+        worker.done.connect(partial(self._on_device_info_ready,
+                                    path, self._case_dir, has_db_info, has_label))
+        self._device_info_worker = worker
+        worker.start()
 
-        if self._case_dir:
+    def _on_device_info_ready(self, path, case_dir, has_db_info, has_label,
+                              fields, label):
+        if case_dir:
             try:
-                db = _open_results_db(self._case_dir)
-                if fields and not has_db_info:
-                    save_device_info(db, fields)
-                # Always record which archive this case folder belongs to
-                upsert_device_info_field(db, 'zip_path', path, 'archive')
-                db.close()
+                with closing(_open_results_db(case_dir)) as db:
+                    if fields and not has_db_info:
+                        save_device_info(db, fields)
+                    # Always record which archive this case folder belongs to
+                    upsert_device_info_field(db, 'zip_path', path, 'archive')
             except Exception:
                 pass
+        entry = self._archive_entry(path)
         if entry is not None and not has_label:
             entry['label'] = label
             self._save_ffs_archives()
             self.update_dropdown_ui()
 
-    @staticmethod
-    def _archive_display(path: str, label: str) -> str:
-        """Build the display string: '[X.XX GB]  [label  —  ] path'."""
-        try:
-            size_gb = os.path.getsize(path) / 1_073_741_824
-            size_str = f"{size_gb:.2f} GB"
-        except OSError:
-            size_str = "? GB"
-        prefix = f"{label}  —  " if label else ""
-        return f"[{size_str}]  {prefix}{path}"
+    def _entry_display(self, entry: dict, prefs: dict) -> str:
+        """Build the display string for one archive entry using slot preferences."""
+        p  = entry.get('path', '')
+        cd = entry.get('case_dir', '')
+        if not p:
+            label = entry.get('label', '')
+            name  = os.path.basename(cd) if cd else '?'
+            prefix = f"{label}  —  " if label else ""
+            return f"[case folder only]  {prefix}{name}"
+        return _format_archive_entry(entry, prefs)
 
     def update_dropdown_ui(self):
+        prefs = _load_prefs()
         self.archive_dropdown.blockSignals(True)
         self.archive_dropdown.clear()
         # Header item — always index 0, not selectable
@@ -5416,14 +5666,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         from PySide6.QtCore import Qt as _Qt
         item.setFlags(item.flags() & ~(_Qt.ItemFlag.ItemIsSelectable | _Qt.ItemFlag.ItemIsEnabled))
         for entry in self._ffs_archives:
-            p    = entry.get('path', '')
-            cd   = entry.get('case_dir', '')
-            label = entry.get('label', '')
-            if p:
-                display = self._archive_display(p, label)
-            else:
-                name = os.path.basename(cd) if cd else '?'
-                display = f"[case folder only]  {label + '  —  ' if label else ''}{name}"
+            p  = entry.get('path', '')
+            cd = entry.get('case_dir', '')
+            display = self._entry_display(entry, prefs)
             self.archive_dropdown.addItem(display, userData=p or cd)
         self.archive_dropdown.setCurrentIndex(0)
         self.archive_dropdown.blockSignals(False)
@@ -5435,6 +5680,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     break
 
     def _populate_recent_menu(self):
+        prefs = _load_prefs()
         self._recent_menu.clear()
         if not self._ffs_archives:
             empty_act = QAction("No cases found", self)
@@ -5442,19 +5688,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._recent_menu.addAction(empty_act)
             return
         for entry in self._ffs_archives:
-            p    = entry.get('path', '')
-            cd   = entry.get('case_dir', '')
-            label = entry.get('label', '')
-            if p:
-                display = self._archive_display(p, label)
-            else:
-                # Discovered case folder with no known zip path
-                name = os.path.basename(cd) if cd else '?'
-                display = f"[case folder only]  {label + '  —  ' if label else ''}{name}"
+            p = entry.get('path', '')
+            display = self._entry_display(entry, prefs)
             act = QAction(display, self)
             act.setEnabled(bool(p))
             if p:
-                act.triggered.connect(lambda _checked, path=p: self.start_loading(path))
+                act.triggered.connect(partial(self.start_loading, p))
             self._recent_menu.addAction(act)
         self._recent_menu.addSeparator()
         clear_act = QAction("Clear List", self)
@@ -5466,6 +5705,35 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.recent_paths.clear()
         self._save_ffs_archives()
         self.update_dropdown_ui()
+
+    def _retire_worker(self, worker):
+        """Stop a QThread without blocking the GUI.
+
+        Disconnects all its signals (so stale results are ignored), requests a
+        stop, and keeps a reference until the thread actually finishes — Qt
+        aborts if a running QThread is garbage-collected.  Use this instead of
+        stop()+wait() when the worker may take seconds to notice the stop
+        (e.g. a thumbnail worker inside an ffmpeg call).
+        """
+        if worker is None or not worker.isRunning():
+            return
+        try:
+            worker.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        if hasattr(worker, 'stop'):
+            worker.stop()
+        else:
+            worker.requestInterruption()
+        self._retired_workers.append(worker)
+        worker.finished.connect(partial(self._reap_retired_worker, worker))
+
+    def _reap_retired_worker(self, worker):
+        try:
+            self._retired_workers.remove(worker)
+        except ValueError:
+            pass
+        worker.deleteLater()
 
     def _stop_all_workers(self):
         """Stop every background QThread gracefully before the window closes.
@@ -5494,8 +5762,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _stop(getattr(self, '_scan_worker', None))
         _stop(getattr(self, '_single_scan_worker', None))
         _stop(getattr(self, '_hex_worker', None))
+        _stop(getattr(self, '_device_info_worker', None))
         _stop(getattr(self, '_thumb_worker', None), has_stop=True)
         _stop(getattr(self, '_search_index_worker', None), has_stop=True)
+        for w in list(getattr(self, '_retired_workers', [])):
+            _stop(w, has_stop=hasattr(w, 'stop'))
 
     def closeEvent(self, event):
         self._stop_all_workers()

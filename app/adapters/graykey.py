@@ -9,8 +9,9 @@
 graykey.py — extract metadata from a Graykey full_files zip into a
 Cellebrite-compatible structure, optionally saved as msgpack.
 
-Also used for Android zips that carry UT/UX extra fields but no GrayKey
-block (e.g. Cellebrite Android FFS) via extract_with_prefix().
+The UT/UX/inode extra-field parsers here are also used by FfsAdapter for
+Cellebrite Android zips (format detection via _has_ut_extras, and mtime
+from the UT block — the only timestamp that format carries).
 
 Schema (keyed by full entry path, no leading slash):
     {
@@ -36,7 +37,7 @@ Dependency: msgpack
 import zipfile
 from pathlib import Path
 import struct
-from struct import Struct, error as StructError
+from struct import Struct
 
 import msgpack
 
@@ -217,91 +218,10 @@ def extract(zip_path: str, z: zipfile.ZipFile | None = None) -> dict:
         return {f.filename.rstrip('/'): _parse_entry(f) for f in z.infolist()}
 
 
-def extract_with_prefix(zip_path: str, strip_prefix: str,
-                        z: zipfile.ZipFile | None = None,
-                        cd_only: bool = False) -> dict:
-    """
-    Parse a zip whose entries carry UT/UX extra fields but no GrayKey block.
-    Strips *strip_prefix* (e.g. 'Dump/') from entry names to produce ui_paths.
-    Returns a Cellebrite-compatible metadata dict.
-
-    If *z* is an already-open ZipFile it is used for the infolist scan (no
-    second open).  Reads the local file header extra field directly so that all
-    UT timestamps (mtime, atime, ctime) are available — the central-directory
-    copy of UT only carries mtime, so using ZipInfo.extra alone would lose
-    atime and ctime.
-
-    *cd_only=True* skips the local-header probe entirely and uses only the
-    central-directory extra fields.  Use this when the format is known to store
-    no additional timestamp data in local headers (e.g. Cellebrite Android),
-    avoiding both the probe seeks and any risk of a costly full-archive scan.
-    """
-    slash = strip_prefix if strip_prefix.endswith('/') else strip_prefix + '/'
-    entries: list[tuple[str, zipfile.ZipInfo]] = []
-    _close = z is None
-    if _close:
-        z = zipfile.ZipFile(zip_path, 'r')
-    try:
-        for f in z.infolist():
-            name = f.filename.rstrip('/')
-            if name.startswith(slash):
-                name = name[len(slash):]
-            elif name == strip_prefix.rstrip('/'):
-                continue  # the prefix dir itself — skip
-            else:
-                continue  # entry outside the prefix — not part of this extraction
-            if not name:
-                continue  # stripping the prefix produced an empty path — skip
-            entries.append((name, f))
-    finally:
-        if _close:
-            z.close()
-
-    if cd_only:
-        return {name: _parse_entry(f) for name, f in entries}
-
-    # Probe up to 8 file entries to decide whether local file header extras
-    # carry more UT data than the central directory copy.  If every probe shows
-    # a local UT block no longer than the CD UT block, the archive only stores
-    # mtime — skip 100K+ raw seeks and use f.extra.
-    _need_local = False
-    with open(zip_path, 'rb') as rf:
-        for _, f in entries[:8]:
-            cd_ut = _find_block(f.extra, _TAG_UT)
-            cd_len = len(cd_ut) if cd_ut else 0
-            rf.seek(f.header_offset + 26)
-            fname_len, extra_len = struct.unpack('<HH', rf.read(4))
-            rf.seek(f.header_offset + 30 + fname_len)
-            local_ut = _find_block(rf.read(extra_len), _TAG_UT)
-            local_len = len(local_ut) if local_ut else 0
-            if local_len > cd_len:
-                _need_local = True
-                break
-
-    if not _need_local:
-        return {name: _parse_entry(f) for name, f in entries}
-
-    result = {}
-    with open(zip_path, 'rb') as rf:
-        for name, f in entries:
-            rf.seek(f.header_offset + 26)
-            fname_len, extra_len = struct.unpack('<HH', rf.read(4))
-            rf.seek(f.header_offset + 30 + fname_len)
-            local_extra = rf.read(extra_len)
-            result[name] = _parse_entry(f, local_extra if local_extra else None)
-    return result
-
-
 def save(metadata: dict, out_path: str) -> None:
-    """Serialise metadata dict to a msgpack file."""
+    """Serialise metadata dict to a msgpack file (used by the CLI mode below)."""
     with open(out_path, 'wb') as fh:
         fh.write(msgpack.packb(metadata, use_bin_type=True))
-
-
-def load(msgpack_path: str) -> dict:
-    """Load a msgpack metadata file and return the dict."""
-    with open(msgpack_path, 'rb') as fh:
-        return msgpack.unpackb(fh.read(), raw=False, strict_map_key=False)
 
 
 def extract_metadata(zip_path: str, z: zipfile.ZipFile | None = None) -> dict:

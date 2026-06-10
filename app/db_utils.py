@@ -232,6 +232,17 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         ON bookmark_entries (group_id)
     ''')
 
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS search_scope_files (
+            term_id  INTEGER NOT NULL REFERENCES search_index(id) ON DELETE CASCADE,
+            ui_path  TEXT    NOT NULL
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_ssf_term
+        ON search_scope_files (term_id)
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
     return conn
@@ -290,8 +301,7 @@ def save_guid_bundle_map(conn: 'sqlite3.Connection', mapping: dict) -> None:
 
 def load_guid_bundle_map(conn: 'sqlite3.Connection') -> dict:
     """Return {guid: bundle_id}, or {} if none saved."""
-    rows = conn.execute('SELECT guid, bundle_id FROM guid_bundle').fetchall()
-    return {guid: bid for guid, bid in rows}
+    return dict(conn.execute('SELECT guid, bundle_id FROM guid_bundle'))
 
 
 # ── Header types ──────────────────────────────────────────────────────────────
@@ -307,8 +317,7 @@ def save_header_types(conn: 'sqlite3.Connection', types: dict) -> None:
 
 def load_header_types(conn: 'sqlite3.Connection') -> dict:
     """Return {ui_path: detected_type} previously saved."""
-    rows = conn.execute('SELECT ui_path, detected_type FROM header_types').fetchall()
-    return {ui_path: t for ui_path, t in rows}
+    return dict(conn.execute('SELECT ui_path, detected_type FROM header_types'))
 
 
 def clear_header_types(conn: 'sqlite3.Connection') -> None:
@@ -605,3 +614,24 @@ def delete_bookmark_entry(conn: 'sqlite3.Connection',
         (group_id, ui_path),
     )
     conn.commit()
+
+
+def save_search_scope_files(conn: 'sqlite3.Connection',
+                            term_id: int,
+                            ui_paths: list) -> None:
+    """Snapshot the ui_paths that were in scope when a scoped search ran."""
+    conn.execute('DELETE FROM search_scope_files WHERE term_id=?', (term_id,))
+    conn.executemany(
+        'INSERT INTO search_scope_files (term_id, ui_path) VALUES (?,?)',
+        [(term_id, p) for p in ui_paths],
+    )
+    conn.commit()
+
+
+def load_search_scope_files(conn: 'sqlite3.Connection', term_id: int) -> list:
+    """Return the snapshotted ui_paths for a scoped search, or []."""
+    rows = conn.execute(
+        'SELECT ui_path FROM search_scope_files WHERE term_id=? ORDER BY rowid',
+        (term_id,),
+    ).fetchall()
+    return [r[0] for r in rows]

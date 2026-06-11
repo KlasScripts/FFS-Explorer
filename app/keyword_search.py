@@ -1305,10 +1305,37 @@ class KeywordSearchMixin:
         self._search_entries = entries or None
 
     def _start_keyword_search(self):
-        from PySide6.QtWidgets import QMessageBox
+        from PySide6.QtWidgets import QMessageBox, QCheckBox
         term = self.search_field.text().strip()
         if not term or not self.zip_path:
             return
+        skip_once = getattr(self, '_skip_search_reminder_once', False)
+        self._skip_search_reminder_once = False
+        if (not skip_once
+                and not getattr(self, '_search_coverage_reminder_muted', False)
+                and self._unextracted_archive_count() > 0):
+            box = QMessageBox(self)
+            box.setWindowTitle("Search Coverage")
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(
+                "Keyword search only scans uncompressed files.\n\n"
+                "Do you want to review compressed files to see if you want "
+                "to decompress any?")
+            process_btn = box.addButton("Select Archives to Decompress…",
+                                        QMessageBox.ButtonRole.ActionRole)
+            search_btn = box.addButton("Search Now",
+                                       QMessageBox.ButtonRole.AcceptRole)
+            box.setDefaultButton(search_btn)
+            mute_chk = QCheckBox("Don't remind me again this session")
+            box.setCheckBox(mute_chk)
+            box.exec()
+            if mute_chk.isChecked():
+                self._search_coverage_reminder_muted = True
+            if box.clickedButton() is process_btn:
+                self._open_process_dialog(preselect_nested=True,
+                                          resume_search=True,
+                                          auto_archive_selection=True)
+                return
         self._stop_keyword_search()
         self._set_incomplete_banner()
         self.search_results_model.clear()

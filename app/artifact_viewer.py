@@ -826,7 +826,7 @@ class ArtifactViewerMixin:
         if not self._case_dir:
             QMessageBox.information(self, "No Case Folder",
                                     "A case folder is required to store results.\n"
-                                    "Use File → Process Archive… to set one first.")
+                                    "Use File → Process Case… to set one first.")
             return
         dlg = ArtifactRunnerDialog(
             zip_path=self.zip_path,

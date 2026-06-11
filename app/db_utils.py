@@ -371,6 +371,21 @@ def load_last_run(conn: 'sqlite3.Connection', run_type: str) -> dict | None:
     }
 
 
+def load_run_history(conn: 'sqlite3.Connection', run_type: str) -> list:
+    """Return all run_log entries for *run_type*, newest first."""
+    rows = conn.execute(
+        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes '
+        'FROM run_log WHERE run_type=? ORDER BY id DESC',
+        (run_type,),
+    ).fetchall()
+    return [
+        {'run_at': r[0], 'completed_at': r[1], 'total': r[2],
+         'processed': r[3], 'output_rows': r[4],
+         'complete': bool(r[5]), 'notes': r[6]}
+        for r in rows
+    ]
+
+
 def clear_run_log(conn: 'sqlite3.Connection', run_type: str) -> None:
     """Delete all run_log rows for *run_type*."""
     conn.execute('DELETE FROM run_log WHERE run_type=?', (run_type,))

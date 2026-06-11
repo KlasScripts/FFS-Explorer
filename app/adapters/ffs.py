@@ -326,6 +326,7 @@ class FfsAdapter:
                 pv + 'mobile/Library/SMS/Attachments/',
                 pv + 'mobile/Library/Biome/streams/',
                 'data/data/',
+                'data/media/',
             ]
         if self.format == self.FORMAT_ZIP_EXTRAS:
             return ['data/data/', 'data/media/']

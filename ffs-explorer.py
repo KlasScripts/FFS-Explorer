@@ -6,6 +6,7 @@ import time
 import atexit
 import zipfile
 import gzip
+import zlib
 import json
 import hashlib
 import struct
@@ -38,6 +39,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       save_device_info, load_device_info,
                       upsert_device_info_field,
                       start_run_log, complete_run_log, load_last_run,
+                      load_run_history,
                       save_nested_archive, save_nested_archive_entries,
                       save_nested_archive_failure,
                       load_nested_archives, load_nested_archive_entries,
@@ -901,6 +903,18 @@ def _count_header_candidates(ui_metadata: dict, ffs_adapter) -> int:
 
 _EXTRACTABLE_TYPES = {'Archive', 'Compressed'}
 
+# Modern Office/iWork documents are ZIP containers, so they can be extracted
+# like nested archives — that is what makes their inner XML keyword-searchable.
+# Legacy .doc/.xls/.ppt are OLE2, not zip, and stay out.
+_ZIP_DOCUMENT_EXTENSIONS = {'.docx', '.xlsx', '.pptx',
+                            '.pages', '.numbers', '.key'}
+
+
+def _is_extractable(name: str, ft: str) -> bool:
+    """True if the file can go through nested-archive extraction."""
+    return (ft in _EXTRACTABLE_TYPES or
+            os.path.splitext(name)[1].lower() in _ZIP_DOCUMENT_EXTENSIONS)
+
 
 def _classify_archive(ui_path: str, ffs_adapter) -> str:
     """Return the top-level category for an archive ui_path.
@@ -965,7 +979,7 @@ def _discover_all_archives(
         ft = _get_file_type(name)
         if ft == 'Other':
             ft = header_type_overrides.get(ui_path, 'Other')
-        if ft not in _EXTRACTABLE_TYPES:
+        if not _is_extractable(name, ft):
             continue
         category = _classify_archive(ui_path, ffs_adapter)
         mtime = meta.get('mtime', 0) if isinstance(meta, dict) else 0
@@ -995,7 +1009,7 @@ def _collect_nested_archive_candidates(
         ft   = _get_file_type(name)
         if ft == 'Other':
             ft = header_type_overrides.get(ui_path, 'Other')
-        if ft not in _EXTRACTABLE_TYPES:
+        if not _is_extractable(name, ft):
             continue
         results.append(ui_path)
     return results
@@ -2139,20 +2153,168 @@ class NestedArchiveWorker(QThread):
             return False, None
 
 
+_SHA256_HEX_RE = re.compile(rb'[0-9a-fA-F]{64}')
+
+
+def _integrity_sidecar_path(zip_path: str, ffs_adapter) -> tuple:
+    """Return (sidecar_path | None, kind_label, candidate_names) for the
+    capture record file.
+
+    Cellebrite extractions ship a .ufd named like the FFS zip.  GrayKey
+    ships a .pdf report named after the bare device UDID — the zip adds a
+    suffix (e.g. 00008110-0008196A2299401E_files_full.zip comes with
+    00008110-0008196A2299401E.pdf) — so the stem truncated at the first
+    underscore is also tried."""
+    base = os.path.splitext(zip_path)[0]
+    if ffs_adapter.format == FfsAdapter.FORMAT_GRAYKEY:
+        # 1. Hash sidecar shipped with the extraction: <name>.zip.sha256
+        candidates = [zip_path + ext for ext in ('.sha256', '.SHA256')]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path, 'SHA256 hash file', candidates
+        # 2. PDF report named after the device UDID
+        folder, stem = os.path.split(base)
+        stem = stem.split('_', 1)[0]
+        pdf_candidates = [os.path.join(folder, stem + ext)
+                          for ext in ('.pdf', '.PDF')]
+        candidates += pdf_candidates
+        for path in pdf_candidates:
+            if os.path.isfile(path):
+                return path, 'GrayKey PDF report', candidates
+        # The report's serial does not always match the zip's, but the model
+        # prefix before the dash (e.g. '00008110-') is shared — look for a
+        # PDF starting with it, then fall back to a lone PDF in the folder.
+        try:
+            pdfs = [os.path.join(folder, n) for n in os.listdir(folder)
+                    if n.lower().endswith('.pdf')]
+        except OSError:
+            pdfs = []
+        if '-' in stem:
+            prefix = stem.split('-', 1)[0] + '-'
+            prefixed = [p for p in pdfs
+                        if os.path.basename(p).startswith(prefix)]
+            if len(prefixed) == 1:
+                return prefixed[0], 'GrayKey PDF report', candidates
+        if len(pdfs) == 1:
+            return pdfs[0], 'GrayKey PDF report', candidates
+        return None, 'GrayKey capture record (.sha256 or PDF report)', candidates
+    kind = 'Cellebrite UFD file'
+    candidates = [base + ext for ext in ('.ufd', '.UFD')]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path, kind, candidates
+    return None, kind, candidates
+
+
+_PDF_ESCAPES = {0x6e: 10, 0x72: 13, 0x74: 9, 0x62: 8, 0x66: 12,
+                0x28: 0x28, 0x29: 0x29, 0x5c: 0x5c}
+
+
+def _pdf_unescape(b: bytes) -> bytes:
+    """Resolve backslash escapes (\\(, \\), \\\\, \\n, octal…) in a PDF string."""
+    out, i = bytearray(), 0
+    while i < len(b):
+        c = b[i]
+        if c == 0x5c and i + 1 < len(b):
+            n = b[i + 1]
+            if n in _PDF_ESCAPES:
+                out.append(_PDF_ESCAPES[n])
+                i += 2
+                continue
+            if 0x30 <= n <= 0x37:           # octal escape, 1-3 digits
+                j, digits = i + 1, b''
+                while j < len(b) and len(digits) < 3 and 0x30 <= b[j] <= 0x37:
+                    digits += bytes([b[j]])
+                    j += 1
+                out.append(int(digits, 8) & 0xFF)
+                i = j
+                continue
+        out.append(c)
+        i += 1
+    return bytes(out)
+
+
+def _extract_sidecar_hashes(path: str) -> set:
+    """Return every 64-hex-digit string in the sidecar file, lowercased.
+
+    For PDFs, FlateDecode streams are decompressed and the text-show
+    strings unescaped.  GrayKey/VeraKey reports encode text as UTF-16BE
+    (each character preceded by a NUL byte), so a null-stripped variant
+    of the text is scanned as well.  Over-collecting is harmless: a stray
+    candidate can never equal the zip's real SHA256 by accident."""
+    with open(path, 'rb') as f:
+        raw = f.read()
+    hashes = {m.group(0).lower().decode() for m in _SHA256_HEX_RE.finditer(raw)}
+    if path.lower().endswith('.pdf'):
+        string_re = re.compile(rb'\(((?:[^()\\]|\\.)*)\)')
+        for m in re.finditer(rb'stream\r?\n(.*?)endstream', raw, re.DOTALL):
+            try:
+                data = zlib.decompress(m.group(1))
+            except zlib.error:
+                continue
+            segs = [_pdf_unescape(s.group(1))
+                    for s in string_re.finditer(data)]
+            for text in (data,
+                         b'\n'.join(segs),                       # one string per cell
+                         b''.join(segs),                         # hash split across strings
+                         b'\n'.join(segs).replace(b'\x00', b''),  # UTF-16BE text
+                         b''.join(segs).replace(b'\x00', b'')):
+                hashes.update(h.group(0).lower().decode()
+                              for h in _SHA256_HEX_RE.finditer(text))
+    return hashes
+
+
+class IntegrityCheckWorker(QThread):
+    """Computes the SHA256 of the FFS zip in a background thread."""
+    # 'qint64' — a plain int signal is 32-bit in C++ and overflows past 2 GB
+    progress = Signal('qint64', 'qint64')   # (bytes_done, bytes_total)
+    done     = Signal(str)                  # computed hex digest, '' on cancel/error
+
+    def __init__(self, zip_path: str, parent=None):
+        super().__init__(parent)
+        self._zip_path = zip_path
+
+    def run(self):
+        sha = hashlib.sha256()
+        try:
+            total = os.path.getsize(self._zip_path)
+            done_bytes = 0
+            last_emit = 0.0
+            with open(self._zip_path, 'rb') as f:
+                while True:
+                    if self.isInterruptionRequested():
+                        self.done.emit('')
+                        return
+                    chunk = f.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    sha.update(chunk)
+                    done_bytes += len(chunk)
+                    now = time.monotonic()
+                    if now - last_emit >= 0.2:
+                        last_emit = now
+                        self.progress.emit(done_bytes, total)
+            self.done.emit(sha.hexdigest())
+        except OSError:
+            self.done.emit('')
+
+
 class ProcessDialog(QDialog):
     """Lets the user view header-scan history and re-run the file header scan."""
     header_scan_done       = Signal(dict)
     header_types_cleared   = Signal()   # emitted before a rescan so the main window can reset
     nested_extraction_done = Signal()   # emitted after NestedArchiveWorker finishes
 
-    _RUN_TYPE = 'header_scan'
+    _RUN_TYPE           = 'header_scan'
+    _RUN_TYPE_INTEGRITY = 'integrity_check'
 
     def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
-                 streaming_index=None, delta=None, parent=None):
+                 streaming_index=None, delta=None, preselect_nested=False,
+                 auto_archive_selection=False, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Process Archive")
+        self.setWindowTitle("Process Case")
         self.setModal(True)
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(620)
         self._zip_path        = zip_path
         self._case_dir        = case_dir
         self._adapter         = ffs_adapter
@@ -2160,8 +2322,9 @@ class ProcessDialog(QDialog):
         self._streaming_index = streaming_index
         self._delta           = delta
         self._candidate_count  = _count_header_candidates(ui_metadata, ffs_adapter)
-        self._scan_worker:   HeaderScanWorker   | None = None
-        self._nested_worker: NestedArchiveWorker | None = None
+        self._scan_worker:      HeaderScanWorker     | None = None
+        self._nested_worker:    NestedArchiveWorker  | None = None
+        self._integrity_worker: IntegrityCheckWorker | None = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -2180,11 +2343,41 @@ class ProcessDialog(QDialog):
         case_row.addWidget(browse_btn)
         layout.addLayout(case_row)
 
+        self._chk_integrity = QCheckBox("Check data integrity")
+        self._chk_integrity.setToolTip(
+            "Computes the SHA256 of the FFS zip and compares it against the "
+            "value recorded at capture\n(the .ufd file for Cellebrite, the "
+            ".pdf report for GrayKey, next to the zip).\n"
+            "A mismatch means the data has changed since acquisition.")
+        # Ticked by default for a fresh case; once a check is on record it
+        # starts unticked so a huge zip isn't re-hashed on every Run.
+        self._chk_integrity.setChecked(
+            self._load_last_integrity_run() is None)
+        layout.addWidget(self._chk_integrity)
+
+        integrity_row = QHBoxLayout()
+        integrity_row.setContentsMargins(22, 0, 0, 0)   # align under checkbox text
+        self._integrity_label = QLabel()
+        self._integrity_label.setWordWrap(True)
+        integrity_row.addWidget(self._integrity_label, 1)
+        self._integrity_hist_btn = QPushButton("Full History…")
+        self._integrity_hist_btn.clicked.connect(self._show_integrity_history)
+        integrity_row.addWidget(self._integrity_hist_btn)
+        layout.addLayout(integrity_row)
+
         layout.addWidget(QLabel("<hr><b>Operations</b>"))
 
+        header_row = QHBoxLayout()
         self._chk_header = QCheckBox("Scan file headers")
         self._chk_header.setChecked(False)
-        layout.addWidget(self._chk_header)
+        header_row.addWidget(self._chk_header, 1)
+        scan_folders_btn = QPushButton("Scanned Folders…")
+        scan_folders_btn.setToolTip(
+            "Show which folders the header scan covers — files outside "
+            "these are not scanned.")
+        scan_folders_btn.clicked.connect(self._show_scan_folders)
+        header_row.addWidget(scan_folders_btn)
+        layout.addLayout(header_row)
 
         self._chk_nested = QCheckBox("Find and select archives for extraction")
         self._chk_nested.setChecked(False)
@@ -2219,6 +2412,15 @@ class ProcessDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._refresh_stats()
+        self._sync_header_checkbox()
+        if preselect_nested:
+            self._chk_nested.setChecked(True)
+        if auto_archive_selection and self._scan_complete():
+            # Came from keyword search with the scan already done — jump
+            # straight to the archive-selection step.
+            self._chk_integrity.setChecked(False)
+            self._chk_nested.setChecked(True)
+            QTimer.singleShot(0, self._run_operations)
 
     # ── Stats display ─────────────────────────────────────────────────────────
 
@@ -2230,6 +2432,99 @@ class ProcessDialog(QDialog):
                 return load_last_run(db, self._RUN_TYPE)
         except Exception:
             return None
+
+    def _load_last_integrity_run(self) -> dict | None:
+        if not self._case_dir:
+            return None
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                return load_last_run(db, self._RUN_TYPE_INTEGRITY)
+        except Exception:
+            return None
+
+    def _load_integrity_history(self) -> list[dict]:
+        if not self._case_dir:
+            return []
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                return load_run_history(db, self._RUN_TYPE_INTEGRITY)
+        except Exception:
+            return []
+
+    def _refresh_integrity_status(self):
+        last = self._load_last_integrity_run()
+        if last is None:
+            self._integrity_label.setText(
+                "<i>No data integrity check recorded.</i>")
+            self._integrity_hist_btn.setVisible(False)
+            return
+        run_at  = last['run_at'].replace('T', ' ')
+        passed  = (last['output_rows'] or 0) > 0
+        verdict = ("<span style='color:#2e7d32'>Passed</span>" if passed else
+                   "<span style='color:#c62828'>⚠ FAILED — data may be "
+                   "compromised</span>")
+        self._integrity_label.setText(
+            f"<b>Last check:</b> {run_at} — {verdict}")
+        self._integrity_hist_btn.setVisible(True)
+
+    def _show_scan_folders(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Header Scan Coverage")
+        dlg.setMinimumSize(520, 300)
+        lay = QVBoxLayout(dlg)
+        intro = QLabel(
+            "The header scan only examines files <b>without a recognised "
+            "extension</b> inside the folders below. Files anywhere else "
+            "keep their extension-based type and are <b>not</b> scanned.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        folder_list = QListWidget()
+        for prefix in self._adapter.scan_folders():
+            QListWidgetItem(prefix, folder_list)
+        lay.addWidget(folder_list)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+        dlg.exec()
+
+    def _show_integrity_history(self):
+        history = self._load_integrity_history()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Data Integrity Check History")
+        dlg.setMinimumSize(620, 280)
+        lay = QVBoxLayout(dlg)
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Checked At (UTC)", "Result", "Computed SHA256"])
+        tree.setRootIsDecorated(False)
+        tree.setAlternatingRowColors(True)
+        for run in history:
+            passed = (run['output_rows'] or 0) > 0
+            notes  = run['notes'] or ''
+            sha    = ''
+            m = re.search(r'sha256=([0-9a-f]{64})', notes)
+            if m:
+                sha = m.group(1)
+            item = QTreeWidgetItem([
+                run['run_at'].replace('T', ' '),
+                "Passed" if passed else "FAILED",
+                sha,
+            ])
+            if not passed:
+                item.setForeground(1, QColor('#c62828'))
+            tree.addTopLevelItem(item)
+        for col in range(3):
+            tree.resizeColumnToContents(col)
+        lay.addWidget(tree)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+        dlg.exec()
 
     def _load_nested_archives_summary(self) -> list[dict]:
         if not self._case_dir:
@@ -2252,17 +2547,17 @@ class ProcessDialog(QDialog):
             run_at   = last['run_at'].replace('T', ' ')
             scanned  = last['processed'] or 0
             changed  = last['output_rows'] or 0
-            complete = last['complete']
-            status   = "Complete" if complete else "⚠ Incomplete"
             lines.append(
-                f"<b>Last header scan:</b> {run_at} — "
-                f"{scanned:,} scanned, {changed:,} types identified — {status}"
+                f"<b>Header scan:</b> {run_at} — "
+                f"{scanned:,} scanned, {changed:,} types identified"
             )
-            if not complete:
+            if not last['complete']:
                 lines.append(
-                    "<i>Previous scan was incomplete. "
+                    "<i>⚠ Previous scan was incomplete. "
                     "Re-running will clear previous results and start fresh.</i>"
                 )
+
+        self._refresh_integrity_status()
 
         nested = self._load_nested_archives_summary()
         if nested:
@@ -2299,50 +2594,170 @@ class ProcessDialog(QDialog):
         self._case_dir = folder
         self._case_edit.setText(folder)
         self._refresh_stats()
+        self._sync_header_checkbox()
 
     # ── Operations ────────────────────────────────────────────────────────────
 
-    def _on_nested_toggled(self, checked: bool):
-        if checked:
-            last = self._load_last_run()
-            scan_done = last is not None and last.get('complete')
-            if not scan_done:
-                # No complete scan on record — must run one first.
-                self._chk_header.setChecked(True)
-                self._chk_header.setEnabled(False)
-            # If scan already done, leave the checkbox state as-is and enabled
-            # so the user can optionally re-run it alongside extraction.
+    def _scan_complete(self) -> bool:
+        last = self._load_last_run()
+        return last is not None and bool(last.get('complete'))
+
+    def _sync_header_checkbox(self):
+        """Lock the header-scan checkbox to reflect what Run will actually do."""
+        if self._scan_complete():
+            # Already done — show ticked and locked; Run will not redo it.
+            self._chk_header.setChecked(True)
+            self._chk_header.setEnabled(False)
+            self._chk_header.setToolTip(
+                "Header scan already completed for this case — it will not be re-run.")
+        elif self._chk_nested.isChecked():
+            # Extraction needs a completed scan first — force it on.
+            self._chk_header.setChecked(True)
+            self._chk_header.setEnabled(False)
+            self._chk_header.setToolTip(
+                "A header scan is required before archive extraction.")
         else:
             self._chk_header.setEnabled(True)
+            self._chk_header.setToolTip("")
 
-    def _confirm_rerun(self) -> bool:
-        """Return True if user confirms re-running an already-completed header scan."""
-        last = self._load_last_run()
-        if not (self._chk_header.isChecked() and last and last.get('complete')):
-            return True
-        result = QMessageBox.question(
-            self, "Confirm Re-run",
-            "A previous header scan has already been completed for this archive.\n\n"
-            "Running again will overwrite the previous results.\n\n"
-            "Are you sure you want to continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        return result == QMessageBox.StandardButton.Yes
+    def _on_nested_toggled(self, checked: bool):
+        self._sync_header_checkbox()
 
     def _run_operations(self):
-        if not self._chk_header.isChecked() and not self._chk_nested.isChecked():
-            return
-        if not self._confirm_rerun():
+        run_scan      = self._chk_header.isChecked() and not self._scan_complete()
+        run_integrity = self._chk_integrity.isChecked()
+        if not run_integrity and not run_scan and not self._chk_nested.isChecked():
+            self._status_label.setText(
+                "Nothing to do — header scan already completed."
+                if self._chk_header.isChecked() else
+                "Nothing to do — no operations selected.")
             return
         self._run_btn.setEnabled(False)
         self._cancel_btn.setVisible(True)
         self._scan_cancelled = False
         self._status_label.setText("")
+        self._post_integrity_scan = run_scan
 
-        if self._chk_header.isChecked():
-            self._start_header_scan()
+        if run_integrity:
+            self._start_integrity_check()
         else:
+            self._continue_after_integrity()
+
+    def _continue_after_integrity(self):
+        if self._post_integrity_scan:
+            self._start_header_scan()
+        elif self._chk_nested.isChecked():
             self._show_archive_selection()
+        else:
+            self._finish_operations()
+
+    # ── Data integrity check ──────────────────────────────────────────────────
+
+    def _start_integrity_check(self):
+        sidecar, kind, candidates = _integrity_sidecar_path(
+            self._zip_path, self._adapter)
+        if sidecar is None:
+            tried = "\n".join(
+                f"  • {os.path.basename(c)}" for c in candidates
+                if not c.endswith(('.PDF', '.UFD', '.SHA256')))
+            if 'PDF' in kind:
+                stem = os.path.splitext(
+                    os.path.basename(self._zip_path))[0].split('_', 1)[0]
+                if '-' in stem:
+                    prefix = stem.split('-', 1)[0] + '-'
+                    tried += f"\n  • a .pdf starting with '{prefix}'"
+                tried += "\n  • any single .pdf file in the same folder"
+            QMessageBox.warning(
+                self, "Integrity Check Skipped",
+                f"No {kind} was found next to the archive — there is "
+                "nothing to check the data against.\n\n"
+                f"Looked for:\n{tried}\n\n"
+                "The data integrity check was skipped.")
+            self._continue_after_integrity()
+            return
+        if 'PDF' in kind:
+            udid_re = re.compile(r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}$')
+            zip_id = os.path.splitext(
+                os.path.basename(self._zip_path))[0].split('_', 1)[0]
+            pdf_id = os.path.splitext(
+                os.path.basename(sidecar))[0].split('_', 1)[0]
+            if (udid_re.match(zip_id) and udid_re.match(pdf_id)
+                    and zip_id.lower() != pdf_id.lower()):
+                QMessageBox.warning(
+                    self, "Integrity Check Skipped",
+                    "The GrayKey report found next to the archive belongs to "
+                    "a DIFFERENT device:\n\n"
+                    f"  Archive UDID: {zip_id}\n"
+                    f"  Report UDID:  {pdf_id}\n\n"
+                    "The archive cannot be verified against this report.\n"
+                    "The data integrity check was skipped.")
+                self._continue_after_integrity()
+                return
+        try:
+            self._expected_hashes = _extract_sidecar_hashes(sidecar)
+        except OSError as exc:
+            QMessageBox.warning(self, "Integrity Check Skipped",
+                                f"Could not read {os.path.basename(sidecar)}:\n"
+                                f"{exc}\n\nThe data integrity check was skipped.")
+            self._continue_after_integrity()
+            return
+        if not self._expected_hashes:
+            QMessageBox.warning(
+                self, "Integrity Check Skipped",
+                f"No SHA256 value could be found in "
+                f"{os.path.basename(sidecar)}.\n\n"
+                "The data integrity check was skipped.")
+            self._continue_after_integrity()
+            return
+        self._status_label.setText("Hashing archive (SHA256)…")
+        self._integrity_worker = IntegrityCheckWorker(self._zip_path)
+        self._integrity_worker.progress.connect(self._on_integrity_progress)
+        self._integrity_worker.done.connect(self._on_integrity_done)
+        self._integrity_worker.start()
+
+    def _on_integrity_progress(self, done_bytes: int, total: int):
+        gb = 1024 ** 3
+        pct = (done_bytes / total * 100) if total else 0
+        self._status_label.setText(
+            f"Hashing archive (SHA256): {done_bytes / gb:.1f} / "
+            f"{total / gb:.1f} GB ({pct:.0f}%)")
+
+    def _on_integrity_done(self, digest: str):
+        if not digest:
+            self._status_label.setText(
+                "Integrity check cancelled." if self._scan_cancelled
+                else "Integrity check failed — could not read the archive.")
+            self._finish_operations()
+            return
+        matched = digest in self._expected_hashes
+        if self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    run_id = start_run_log(
+                        db, self._RUN_TYPE_INTEGRITY, total=1,
+                        notes=f"sha256={digest} "
+                              f"{'match' if matched else 'MISMATCH'}")
+                    complete_run_log(db, run_id, processed=1,
+                                     output_rows=1 if matched else 0)
+            except Exception:
+                pass
+        if matched:
+            self._status_label.setText(
+                "Integrity check passed — SHA256 matches the capture record.")
+        else:
+            QMessageBox.warning(
+                self, "Data Integrity Warning",
+                "The SHA256 hash of the FFS archive does NOT match the value "
+                "recorded at capture.\n\n"
+                f"Computed: {digest}\n\n"
+                "The data has changed since it was captured and may be "
+                "compromised.")
+            self._status_label.setText(
+                "⚠ Integrity check FAILED — archive hash does not match the "
+                "capture record.")
+        self._chk_integrity.setChecked(False)
+        self._refresh_stats()
+        self._continue_after_integrity()
 
     def _start_header_scan(self):
         self._run_id: int | None = None
@@ -2561,15 +2976,20 @@ class ProcessDialog(QDialog):
             self._scan_worker.requestInterruption()
         if self._nested_worker and self._nested_worker.isRunning():
             self._nested_worker.requestInterruption()
+        if self._integrity_worker and self._integrity_worker.isRunning():
+            self._integrity_worker.requestInterruption()
 
     def _finish_operations(self):
         self._run_btn.setEnabled(True)
         self._cancel_btn.setVisible(False)
         self._refresh_stats()
+        self._sync_header_checkbox()
 
     def _is_scanning(self) -> bool:
         return ((bool(self._scan_worker and self._scan_worker.isRunning())) or
-                (bool(self._nested_worker and self._nested_worker.isRunning())))
+                (bool(self._nested_worker and self._nested_worker.isRunning())) or
+                (bool(self._integrity_worker and
+                      self._integrity_worker.isRunning())))
 
     def closeEvent(self, event):
         if self._is_scanning():
@@ -3035,8 +3455,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         open_act.triggered.connect(self._open_new_ffs)
         file_menu.addAction(open_act)
         file_menu.addSeparator()
-        process_act = QAction("Process Archive…", self)
-        process_act.triggered.connect(self._open_process_dialog)
+        process_act = QAction("Process Case…", self)
+        process_act.triggered.connect(lambda: self._open_process_dialog())
         file_menu.addAction(process_act)
         self._artifact_act = QAction("Run Artifact Parsers…", self)
         self._artifact_act.triggered.connect(self._open_artifact_runner)
@@ -3221,7 +3641,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.filter_go_btn.setMaximumWidth(40)
         self.filter_go_btn.clicked.connect(self._apply_filter)
         self.filter_clear_btn = QPushButton("Clear")
-        self.filter_clear_btn.setMaximumWidth(50)
+        self.filter_clear_btn.setMaximumWidth(70)
         self.filter_clear_btn.clicked.connect(self._clear_filter)
         filter_bar.addWidget(self.filter_go_btn)
         filter_bar.addWidget(self.filter_clear_btn)
@@ -4184,7 +4604,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             _ft   = _get_file_type(_name)
             if _ft == 'Other':
                 _ft = self._header_type_overrides.get(ui_path, 'Other')
-            if _ft in _EXTRACTABLE_TYPES:
+            if _is_extractable(_name, _ft):
                 menu.addSeparator()
                 extract_act = QAction("📦 Extract as Nested Archive", self)
                 extract_act.triggered.connect(
@@ -4401,7 +4821,29 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.update_dropdown_ui()
             self._populate_recent_menu()
 
-    def _open_process_dialog(self):
+    def _unextracted_archive_count(self) -> int:
+        """Number of discoverable archives not yet successfully extracted.
+
+        Used by keyword search to skip the coverage reminder when there is
+        nothing left to extract."""
+        overrides = getattr(self, '_header_type_overrides', {}) or {}
+        archives = _discover_all_archives(self.full_metadata, self._adapter,
+                                          overrides)
+        if not archives:
+            return 0
+        records: dict = {}
+        if self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    records = {r['ui_path']: r
+                               for r in load_nested_archives(db)}
+            except Exception:
+                records = {}
+        extracted = {p for p, r in records.items() if not r.get('error_msg')}
+        return sum(1 for a in archives if a['ui_path'] not in extracted)
+
+    def _open_process_dialog(self, preselect_nested=False, resume_search=False,
+                             auto_archive_selection=False):
         if not self.zip_path:
             QMessageBox.information(self, "No Archive", "Open an FFS archive first.")
             return
@@ -4412,12 +4854,19 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             ui_metadata=self.full_metadata,
             streaming_index=self._streaming_index,
             delta=self._local_extra_delta,
+            preselect_nested=preselect_nested,
+            auto_archive_selection=auto_archive_selection,
             parent=self,
         )
         dlg.header_types_cleared.connect(self._on_header_types_cleared)
         dlg.header_scan_done.connect(self._on_header_scan_done)
         dlg.nested_extraction_done.connect(self._on_nested_extraction_done)
         dlg.exec()
+        # Came here from a keyword search — run that search automatically
+        # once the dialog closes, whether or not anything was extracted.
+        if resume_search and self.search_field.text().strip():
+            self._skip_search_reminder_once = True
+            self._start_keyword_search()
 
     def _open_new_ffs(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open ZIP", "", "ZIP (*.zip)")

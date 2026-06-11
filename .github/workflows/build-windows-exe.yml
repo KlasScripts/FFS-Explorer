@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v0.24.1)'
+        required: true
 
 permissions:
   contents: write     # needed to create releases and upload assets
@@ -37,5 +42,6 @@ jobs:
       - name: Create GitHub Release and upload asset
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           files: ffs-explorer-windows.zip
           generate_release_notes: true   # auto-generates changelog from commits

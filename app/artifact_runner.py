@@ -16,6 +16,11 @@ Multi-file (new, for scripts that need several databases):
                                (e.g. "data/data/com.whatsapp")
     files     dict[str,str]  — {key: subpath} where subpath is relative to
                                app_path (e.g. {"msgstore": "databases/msgstore.db"})
+    optional_files dict[str,str]
+                             — like files, but extracted only when present in the
+                               archive; a missing optional file is not an error
+                               and its key is simply absent from paths
+                               (e.g. {"wal": "Photos.sqlite-wal"})
     run(paths)               — receives dict[str, str] mapping each key to the
                                extracted file's path on disk; returns list[dict]
 
@@ -155,6 +160,12 @@ def run_artifact(
             if not _extract_candidate(candidates, zip_path, dest_path, zip_obj, streaming_index):
                 return [], f"{script_name}: file not found: {ui_path}"
             paths[key] = dest_path
+        for key, subpath in getattr(module, 'optional_files', {}).items():
+            ui_path    = f"{app_base}/{subpath.lstrip('/')}"
+            candidates = adapter.user_candidates(ui_path)
+            dest_path  = os.path.join(dest_dir, os.path.basename(subpath))
+            if _extract_candidate(candidates, zip_path, dest_path, zip_obj, streaming_index):
+                paths[key] = dest_path
         try:
             return module.run(paths) or [], ''
         except Exception as exc:

@@ -51,6 +51,7 @@ from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
 from keyword_search import KeywordSearchMixin
 from artifact_viewer import ArtifactViewerMixin
+from artifact_db import load_artifact_results
 from streaming_zip import StreamingZipIndex
 from zip_reader import read_nested_entry
 from zip_cd_cache import (CachedZipView, is_valid as _cd_cache_valid,
@@ -68,10 +69,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QTabWidget, QSizePolicy,
                               QMessageBox, QCheckBox, QAbstractItemView,
                               QTreeWidget, QTreeWidgetItem, QTextEdit,
-                              QListWidget, QListWidgetItem)
+                              QListWidget, QListWidgetItem, QDateEdit)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QColor, QIcon)
-from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer,
+from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QDate,
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
                              qInstallMessageHandler, QtMsgType)
 from PySide6.QtCore import QSettings as _QSettings
@@ -916,6 +917,49 @@ def _is_extractable(name: str, ft: str) -> bool:
             os.path.splitext(name)[1].lower() in _ZIP_DOCUMENT_EXTENSIONS)
 
 
+# File-browser columns appended for images matched in the Photos Metadata
+# artifact results (Hidden and Trashed are merged into 'Status' to keep the
+# browser compact).
+_PHOTO_HEADERS = ['Flags', 'Taken', 'Added', 'Original Name', 'Album', 'Labels',
+                  'Origin', 'Camera', 'Place', 'GPS', 'Faces',
+                  'Face Ages', 'Status']
+
+# Triage flags derived from the photo Labels (Apple's scene/object classes).
+# A clean overlay over the messy raw label list — sortable/filterable.  These
+# are review-prioritisation aids, never detection: Apple does not classify
+# drugs or abuse material.  Overridable via config/photo_flags.json.
+_DEFAULT_PHOTO_FLAGS: dict = {
+    'Weapon':   {'firearm', 'gun', 'pistol', 'revolver', 'rifle', 'shotgun',
+                 'ammunition', 'bullet', 'cartridge', 'knife', 'blade',
+                 'sword', 'holster', 'weapon'},
+    'Document': {'document', 'receipt', 'ticket', 'passport', 'license plate',
+                 'identity document', 'credit card', 'id card'},
+    'Vehicle':  {'car', 'truck', 'motorcycle', 'motor home', 'sportscar',
+                 'vehicle', 'license plate'},
+    'People':   {'people', 'crowd', 'person'},
+    'Drug':     {'pill', 'tablet', 'syringe', 'needle', 'cannabis',
+                 'marijuana', 'bong', 'pipe', 'powder', 'drug'},
+}
+
+
+def _load_photo_flag_rules() -> dict:
+    """Return {flag_name: frozenset(lowercased terms)} from
+    config/photo_flags.json, falling back to the built-in defaults."""
+    rules = {k: set(v) for k, v in _DEFAULT_PHOTO_FLAGS.items()}
+    path = os.path.join(_CONFIG_DIR, 'photo_flags.json')
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        loaded = {k: {str(t).lower() for t in v}
+                  for k, v in data.items()
+                  if not k.startswith('_') and isinstance(v, list)}
+        if loaded:
+            rules = loaded
+    except (OSError, ValueError):
+        pass
+    return {k: frozenset(v) for k, v in rules.items()}
+
+
 def _classify_archive(ui_path: str, ffs_adapter) -> str:
     """Return the top-level category for an archive ui_path.
 
@@ -1388,6 +1432,19 @@ _HEADER_TOOLTIPS: dict[str, str] = {
     'Created': 'btime — file birth time (when first created)',
     'Changed': 'ctime — last metadata change (permissions, ownership, or content write)',
     'Modified': 'mtime — last content write',
+    'Taken':         'Photos.sqlite — when the photo was taken (ZDATECREATED; from EXIF, not a filesystem date)',
+    'Added':         'Photos.sqlite — when the photo was added to this device\'s library (ZADDEDDATE); a large gap from Taken means it was received/imported, not captured here',
+    'Original Name': 'Photos.sqlite — filename before any rename by the Photos library',
+    'Album':         'Photos.sqlite — album(s) containing this asset',
+    'Flags':         'Triage categories derived from Labels (Weapon, Document, Vehicle…) plus Minor (face) from the face-age estimate. A review aid for prioritising images — NOT detection; Apple does not classify drugs or abuse material. Edit config/photo_flags.json to customise.',
+    'Labels':        'psi.sqlite — Apple\'s scene/object classification (e.g. Dog, Beach, Receipt)',
+    'Origin':        'Photos.sqlite ZIMPORTEDBY — how the photo entered this library, naming the source: Back/Front Camera = captured on this device; an app name (WhatsApp, Instagram…), AirDrop, Messages, Safari or Screenshot = arrived another way',
+    'Camera':        'Photos.sqlite — EXIF camera make and model; a model differing from the device suggests an imported/received photo',
+    'Place':         'Photos.sqlite — reverse-geocoded location recorded by Apple',
+    'GPS':           'Photos.sqlite — latitude, longitude (blank if no GPS data)',
+    'Faces':         'Photos.sqlite — number of faces Apple detected in the image',
+    'Face Ages':     'Photos.sqlite — Apple\'s age estimate per detected face (e.g. Adult ×2, Child)',
+    'Status':        'Photos.sqlite — Favorite, Hidden and/or Recently Deleted (in trash, not yet purged) state',
 }
 
 
@@ -1471,14 +1528,26 @@ class FileTableModel(QAbstractTableModel):
 
     # ── filtering ────────────────────────────────────────────────────────────
 
-    def set_filter(self, text, col):
+    def set_filter(self, text, col=-1, text_cols=None,
+                   date_col=-1, date_from='', date_to='',
+                   type_col=-1, types=None):
         """Start an incremental filter. Clears visible rows immediately, then
-        adds matching rows in chunks so the UI count updates live."""
+        adds matching rows in chunks so the UI count updates live.
+
+        text/text_cols — substring match across the given columns (all if None
+                         and col < 0, the single column if col >= 0).
+        date_col/from/to — keep rows whose 'YYYY-MM-DD …' cell date is within
+                           [date_from, date_to] (inclusive, 'YYYY-MM-DD').
+        type_col/types — keep rows whose type cell is in the *types* set
+                         (None = no type filtering)."""
         self._filter_gen += 1
         my_gen = self._filter_gen
         needle = text.casefold()
         ncols  = self.columnCount()
-        check_cols = list(range(ncols)) if col < 0 else [col]
+        if text_cols is not None:
+            check_cols = [c for c in text_cols if c < ncols]
+        else:
+            check_cols = list(range(ncols)) if col < 0 else [col]
         total  = len(self._all_rows)
 
         # Clear visible rows immediately
@@ -1489,12 +1558,27 @@ class FileTableModel(QAbstractTableModel):
         show_files   = self._show_files
         show_folders = self._show_folders
 
-        def _type_ok(r):
+        def _row_ok(r):
             is_folder = r[2] >= 0  # fc == -1 for files, >= 0 for folders
-            return (show_folders if is_folder else show_files)
+            if not (show_folders if is_folder else show_files):
+                return False
+            cols = r[0]
+            if date_col >= 0:
+                v = cols[date_col] if date_col < len(cols) else ''
+                if not v or not (date_from <= v[:10] <= date_to):
+                    return False
+            if types is not None:
+                tv = cols[type_col] if 0 <= type_col < len(cols) else ''
+                if (tv or '') not in types:
+                    return False
+            if needle:
+                if not any(needle in cols[c].casefold()
+                           for c in check_cols if c < len(cols) and cols[c]):
+                    return False
+            return True
 
-        if not needle:
-            visible = [r for r in self._all_rows if _type_ok(r)]
+        if not needle and date_col < 0 and types is None:
+            visible = [r for r in self._all_rows if _row_ok(r)]
             self.beginInsertRows(QModelIndex(), 0, len(visible) - 1)
             self._rows = visible
             self.endInsertRows()
@@ -1508,11 +1592,7 @@ class FileTableModel(QAbstractTableModel):
             if self._filter_gen != my_gen:
                 return  # superseded
             end = min(idx[0] + _FILTER_CHUNK, total)
-            matched = [
-                r for r in source[idx[0]:end]
-                if _type_ok(r) and any(needle in r[0][c].casefold()
-                       for c in check_cols if c < len(r[0]))
-            ]
+            matched = [r for r in source[idx[0]:end] if _row_ok(r)]
             if matched:
                 first = len(self._rows)
                 last  = first + len(matched) - 1
@@ -1528,10 +1608,20 @@ class FileTableModel(QAbstractTableModel):
 
         QTimer.singleShot(0, _chunk)
 
-    def set_type_filter(self, show_files: bool, show_folders: bool, current_text: str, current_col: int):
+    def distinct_values(self, header: str) -> list[str]:
+        """Sorted distinct cell values for the given header across all rows."""
+        try:
+            col = self._headers.index(header)
+        except ValueError:
+            return []
+        seen = {r[0][col] for r in self._all_rows
+                if col < len(r[0]) and r[0][col]}
+        return sorted(seen)
+
+    def set_type_filter(self, show_files: bool, show_folders: bool, **filter_args):
         self._show_files   = show_files
         self._show_folders = show_folders
-        self.set_filter(current_text, current_col)
+        self.set_filter(**filter_args)
 
     # ── sorting ──────────────────────────────────────────────────────────────
 
@@ -1562,11 +1652,11 @@ class MultiColumnFilterProxy(QSortFilterProxyModel):
             src.sort(column, order)
             self.invalidate()
 
-    def set_filter(self, text, col):
+    def set_filter(self, *args, **kwargs):
         src = self.sourceModel()
         if src is not None:
             assert isinstance(src, FileTableModel)
-            src.set_filter(text, col)
+            src.set_filter(*args, **kwargs)
 
 
 class ExportProgressDialog(QDialog):
@@ -3446,6 +3536,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.recent_paths: list = [e['path'] for e in self._ffs_archives if 'path' in e]
         self._migrate_device_labels()
         self._case_dir: str | None = None   # case folder for the currently loaded zip
+        # {'DCIM/100APPLE/IMG_0001.HEIC': [values in _PHOTO_HEADERS order]}
+        self._photo_index: dict[str, list] = {}
+        self._photos_prompt_shown = False   # one Media-folder offer per archive
+        self._photo_flag_rules = _load_photo_flag_rules()
 
         # ── Menu bar ──────────────────────────────────────────────────────
         menu_bar = self.menuBar()
@@ -3610,6 +3704,22 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.file_view.setModel(self.proxy_model)
         self.file_view.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.file_view.setSortingEnabled(True)
+        # User-defined column order, persisted across views and sessions.
+        _s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        saved_order = _s.value('file_column_order', []) or []
+        self._column_order: list[str] = [str(h) for h in saved_order]
+        self._applying_column_order = False
+        # Per-folder saved layouts {folder_ui_path: {'order': [...], 'hidden': [...]}}
+        self._folder_column_configs: dict = {}
+        _raw_cfg = _s.value('folder_column_configs', '', type=str)
+        if _raw_cfg:
+            try:
+                self._folder_column_configs = json.loads(_raw_cfg)
+            except Exception:
+                self._folder_column_configs = {}
+        _hdr = self.file_view.horizontalHeader()
+        _hdr.setSectionsMovable(True)
+        _hdr.sectionMoved.connect(self._on_section_moved)
         self.file_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_view.customContextMenuRequested.connect(self.show_table_context_menu)
         self.file_view.doubleClicked.connect(self.handle_table_double_click)
@@ -3617,26 +3727,51 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         filter_bar = QHBoxLayout()
         filter_bar.setContentsMargins(0, 2, 0, 2)
-        self.show_files_cb = QCheckBox("Files")
-        self.show_files_cb.setChecked(True)
-        self.show_folders_cb = QCheckBox("Folders")
-        self.show_folders_cb.setChecked(True)
-        self.show_files_cb.stateChanged.connect(self._on_type_filter_changed)
-        self.show_folders_cb.stateChanged.connect(self._on_type_filter_changed)
         filter_bar.addWidget(QLabel("Filter:"))
-        filter_bar.addSpacing(4)
-        filter_bar.addWidget(self.show_files_cb)
-        filter_bar.addSpacing(8)
-        filter_bar.addWidget(self.show_folders_cb)
         filter_bar.addSpacing(6)
+
+        # Text — substring match in the chosen string column (or all of them)
         self.filter_col_combo = QComboBox()
-        self.filter_col_combo.setMaximumWidth(140)
-        self._update_filter_columns(self.file_headers)
+        self.filter_col_combo.setMaximumWidth(120)
         filter_bar.addWidget(self.filter_col_combo)
         self.filter_input = QLineEdit()
         self.filter_input.setPlaceholderText("Type to filter rows...")
+        self.filter_input.setMinimumWidth(150)
         self.filter_input.returnPressed.connect(self._apply_filter)
-        filter_bar.addWidget(self.filter_input)
+        filter_bar.addWidget(self.filter_input, 1)
+        filter_bar.addSpacing(10)
+
+        # Date range — applied to the timestamp column chosen in the combo
+        self.filter_date_enable = QCheckBox("Date")
+        self.filter_date_enable.toggled.connect(self._on_date_filter_toggled)
+        filter_bar.addWidget(self.filter_date_enable)
+        self.filter_date_combo = QComboBox()
+        self.filter_date_combo.currentIndexChanged.connect(
+            lambda _=None: self._apply_filter_if_date_enabled())
+        filter_bar.addWidget(self.filter_date_combo)
+        self.filter_date_from = QDateEdit(QDate(2000, 1, 1))
+        self.filter_date_to   = QDateEdit(QDate.currentDate())
+        for de in (self.filter_date_from, self.filter_date_to):
+            de.setDisplayFormat("yyyy-MM-dd")
+            de.setCalendarPopup(True)
+            de.dateChanged.connect(
+                lambda _=None: self._apply_filter_if_date_enabled())
+        filter_bar.addWidget(self.filter_date_from)
+        filter_bar.addWidget(QLabel("–"))
+        filter_bar.addWidget(self.filter_date_to)
+        self._set_date_filter_enabled(False)
+        filter_bar.addSpacing(10)
+
+        # Type — multi-select menu of the types present in the current view
+        self._type_filter_selected: set | None = None   # None = all types
+        self.filter_type_btn = QPushButton("Type: All")
+        self._type_menu = QMenu(self.filter_type_btn)
+        self._type_menu.aboutToShow.connect(self._populate_type_menu)
+        self.filter_type_btn.setMenu(self._type_menu)
+        filter_bar.addWidget(self.filter_type_btn)
+        filter_bar.addSpacing(6)
+
+        self._update_filter_columns(self.file_headers)
         self.filter_go_btn = QPushButton("Go")
         self.filter_go_btn.setMaximumWidth(40)
         self.filter_go_btn.clicked.connect(self._apply_filter)
@@ -3654,6 +3789,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.deselect_all_btn.setVisible(False)
         self.deselect_all_btn.clicked.connect(self._deselect_all_files)
 
+        # Hidden-column names for the selected-files (aggregate) view —
+        # remembered across rebuilds; plain folder views always reset.
+        self._agg_hidden_columns: set[str] = set()
+        self.columns_btn = QPushButton("Columns…")
+        self.columns_btn.setToolTip(
+            "Show or hide columns in the current view.\n"
+            "Resets when you change folder; the Show Selected Files view "
+            "remembers its setting.")
+        self.columns_btn.clicked.connect(self._show_columns_dialog)
+
         self.table_status_label = QLabel()
         self.table_status_label.setStyleSheet(_status_style)
 
@@ -3668,6 +3813,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         sel_bar.addStretch()
         sel_bar.addWidget(self.show_selected_btn)
         sel_bar.addWidget(self.deselect_all_btn)
+        sel_bar.addWidget(self.columns_btn)
         file_tab_layout.addLayout(sel_bar)
         file_tab_layout.addLayout(filter_bar)
         file_tab_layout.addWidget(self.file_view)
@@ -3730,6 +3876,238 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.file_model = model
         model.filter_progress.connect(self._on_filter_progress)
         model.filter_done.connect(self._on_filter_done)
+        self._apply_column_visibility()
+        self._apply_column_order()
+
+    def _apply_column_visibility(self):
+        """Apply per-view column hiding.  A single folder with a saved layout
+        uses its hidden set; the selected-files (aggregate) view re-applies the
+        session hidden set; a plain folder view shows every column."""
+        if not hasattr(self, 'file_view'):
+            return   # first _set_file_model call during __init__
+        headers = self.file_model._headers
+        cfg = self._current_folder_config()
+        if cfg is not None:
+            hidden = set(cfg.get('hidden', []))
+        elif getattr(self, '_view_is_recursive', False):
+            hidden = getattr(self, '_agg_hidden_columns', set())
+        else:
+            hidden = set()
+        for i, h in enumerate(headers):
+            self.file_view.setColumnHidden(i, h in hidden)
+        self._update_columns_indicator()
+
+    # ── Column ordering & per-folder layouts (persisted) ──────────────────────
+
+    def _current_folder_config(self):
+        """Return the saved layout dict for the current single-folder view, or
+        None (aggregate views and unsaved folders have no per-folder layout)."""
+        if (not getattr(self, '_view_is_recursive', False)
+                and getattr(self, '_view_path', '')):
+            return getattr(self, '_folder_column_configs', {}).get(self._view_path)
+        return None
+
+    def _save_column_order(self):
+        s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        s.setValue('file_column_order', self._column_order)
+
+    def _save_folder_configs(self):
+        s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        s.setValue('folder_column_configs', json.dumps(self._folder_column_configs))
+
+    def _record_column_order(self, visual_order: list):
+        """Merge the current view's visual order into the persisted global
+        order, keeping known-but-absent columns in their old relative spot."""
+        seen = set(visual_order)
+        self._column_order = list(visual_order) + [
+            h for h in self._column_order if h not in seen]
+        self._save_column_order()
+
+    def _commit_order(self, visual_order: list):
+        """Persist a new visual order — into the folder's saved layout if it
+        has one, otherwise into the global default order."""
+        cfg = self._current_folder_config()
+        if cfg is not None:
+            cfg['order'] = list(visual_order)
+            self._save_folder_configs()
+        else:
+            self._record_column_order(visual_order)
+
+    def _apply_column_order(self):
+        """Rearrange header sections to match the saved order (the folder's
+        layout if present, otherwise the global default)."""
+        if not hasattr(self, 'file_view'):
+            return
+        cfg = self._current_folder_config()
+        order_src = (cfg.get('order') if cfg and cfg.get('order')
+                     else self._column_order)
+        header  = self.file_view.horizontalHeader()
+        headers = self.file_model._headers
+        # An empty order_src falls through to identity order, which resets any
+        # custom arrangement left over from a previously-viewed folder layout.
+        order = [h for h in (order_src or []) if h in headers]
+        order += [h for h in headers if h not in order]
+        self._applying_column_order = True
+        try:
+            for visual_pos, name in enumerate(order):
+                logical = headers.index(name)
+                cur = header.visualIndex(logical)
+                if cur != visual_pos:
+                    header.moveSection(cur, visual_pos)
+        finally:
+            self._applying_column_order = False
+
+    def _on_section_moved(self, *_):
+        """User dragged a column header — record the new order."""
+        if self._applying_column_order:
+            return
+        header  = self.file_view.horizontalHeader()
+        headers = self.file_model._headers
+        self._commit_order(
+            [headers[header.logicalIndex(v)] for v in range(len(headers))])
+
+    def _update_columns_indicator(self):
+        """Reflect hidden-column count and any saved-folder layout on the
+        Columns button so the state is visible at a glance."""
+        if not hasattr(self, 'columns_btn') or not hasattr(self, 'file_view'):
+            return
+        headers = self.file_model._headers
+        hidden_names = [headers[i] for i in range(len(headers))
+                        if self.file_view.isColumnHidden(i)]
+        saved = self._current_folder_config() is not None
+        if hidden_names:
+            self.columns_btn.setText(f"Columns ⊘{len(hidden_names)}")
+            tip = "Hidden: " + ", ".join(hidden_names)
+        else:
+            self.columns_btn.setText("Columns…")
+            tip = "Show, hide or reorder columns in the current view."
+        if saved:
+            tip += "\nLayout saved for this folder."
+        self.columns_btn.setToolTip(tip)
+
+    def _show_columns_dialog(self):
+        headers = self.file_model._headers
+        header_view = self.file_view.horizontalHeader()
+        # A real single folder is selected (not the aggregate or no-selection state)
+        single_folder = not self._view_is_recursive and bool(self._view_path)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Columns")
+        dlg.setMinimumSize(300, 400)
+        lay = QVBoxLayout(dlg)
+        note = QLabel(
+            "Tick to show, untick to hide. Drag rows — or use the arrows — "
+            "to reorder. " +
+            ("Use “Save for this folder” to keep this layout for this folder."
+             if single_folder else
+             "Order is saved permanently; hiding lasts for this view."))
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lst = QListWidget()
+        lst.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        lst.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # List in the on-screen (visual) order
+        for v in range(len(headers)):
+            logical = header_view.logicalIndex(v)
+            item = QListWidgetItem(headers[logical])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Unchecked
+                if self.file_view.isColumnHidden(logical)
+                else Qt.CheckState.Checked)
+            lst.addItem(item)
+
+        def _on_item_changed(item):
+            name = item.text()
+            if name not in headers:
+                return
+            logical = headers.index(name)
+            hide = item.checkState() != Qt.CheckState.Checked
+            self.file_view.setColumnHidden(logical, hide)
+            cfg = self._current_folder_config()
+            if cfg is not None:
+                hidden = set(cfg.get('hidden', []))
+                hidden.add(name) if hide else hidden.discard(name)
+                cfg['hidden'] = sorted(hidden)
+                self._save_folder_configs()
+            elif self._view_is_recursive:
+                self._agg_hidden_columns.add(name) if hide \
+                    else self._agg_hidden_columns.discard(name)
+            self._update_columns_indicator()
+
+        def _on_reordered(*_):
+            self._commit_order([lst.item(i).text() for i in range(lst.count())])
+            self._apply_column_order()
+
+        def _move_current(delta: int):
+            row = lst.currentRow()
+            if row < 0 or not (0 <= row + delta < lst.count()):
+                return
+            item = lst.takeItem(row)
+            lst.insertItem(row + delta, item)
+            lst.setCurrentRow(row + delta)
+            _on_reordered()
+
+        lst.itemChanged.connect(_on_item_changed)
+        lst.model().rowsMoved.connect(_on_reordered)
+        lay.addWidget(lst)
+
+        # Per-folder save / remove (single-folder views only)
+        if single_folder:
+            has_cfg = self._current_folder_config() is not None
+
+            def _save_for_folder():
+                order  = [lst.item(i).text() for i in range(lst.count())]
+                hidden = [lst.item(i).text() for i in range(lst.count())
+                          if lst.item(i).checkState() != Qt.CheckState.Checked]
+                self._folder_column_configs[self._view_path] = {
+                    'order': order, 'hidden': hidden}
+                self._save_folder_configs()
+                self.status_bar.showMessage(
+                    "Column layout saved for this folder", 4000)
+                self._update_columns_indicator()
+                dlg.accept()
+
+            def _remove_for_folder():
+                self._folder_column_configs.pop(self._view_path, None)
+                self._save_folder_configs()
+                dlg.accept()
+                self._apply_column_order()
+                self._apply_column_visibility()
+
+            save_row = QHBoxLayout()
+            if has_cfg:
+                remove_btn = QPushButton("Remove saved layout")
+                remove_btn.clicked.connect(_remove_for_folder)
+                save_row.addWidget(remove_btn)
+            save_btn = QPushButton("Save for this folder")
+            save_btn.clicked.connect(_save_for_folder)
+            save_row.addWidget(save_btn)
+            save_row.addStretch()
+            lay.addLayout(save_row)
+
+        btn_row = QHBoxLayout()
+        up_btn = QPushButton("↑")
+        up_btn.setFixedWidth(36)
+        up_btn.clicked.connect(partial(_move_current, -1))
+        btn_row.addWidget(up_btn)
+        down_btn = QPushButton("↓")
+        down_btn.setFixedWidth(36)
+        down_btn.clicked.connect(partial(_move_current, 1))
+        btn_row.addWidget(down_btn)
+        show_all = QPushButton("Show All")
+
+        def _show_all():
+            for i in range(lst.count()):
+                lst.item(i).setCheckState(Qt.CheckState.Checked)
+
+        show_all.clicked.connect(_show_all)
+        btn_row.addWidget(show_all)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+        dlg.exec()
 
     def _on_filter_progress(self, visible, total):
         self.table_status_label.setText(f"{visible:,} of {total:,} items (filtering…)")
@@ -3739,29 +4117,29 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.table_status_label.setText(f"{total:,} items")
         else:
             self.table_status_label.setText(f"{visible:,} of {total:,} items (filtered)")
-        col_name = self.filter_col_combo.currentText()
-        text = self.filter_input.text()
-        if text:
-            self._log(f"Filter applied: \"{text}\" in {col_name} — {visible:,} of {total:,} rows visible")
-
-    def _on_type_filter_changed(self):
-        col = self.filter_col_combo.currentIndex() - 1
-        text = self.filter_input.text()
-        self.file_model.set_type_filter(
-            self.show_files_cb.isChecked(),
-            self.show_folders_cb.isChecked(),
-            text, col,
-        )
+        args = self._current_filter_args()
+        if self._filter_is_active(args):
+            parts = []
+            if args.get('text'):
+                parts.append(f"text \"{args['text']}\"")
+            if 'date_col' in args:
+                parts.append(f"{self.filter_date_combo.currentText()} "
+                             f"{args['date_from']}–{args['date_to']}")
+            if 'types' in args:
+                parts.append(f"types {sorted(args['types'])}")
+            self._log(f"Filter applied: {', '.join(parts)} — "
+                      f"{visible:,} of {total:,} rows visible")
 
     def _apply_filter(self):
-        col = self.filter_col_combo.currentIndex() - 1  # index 0 = "All Columns" → -1
-        text = self.filter_input.text()
         total = self.file_model.rowCount()
         self.table_status_label.setText(f"0 of {total:,} items (filtering…)")
-        self.proxy_model.set_filter(text, col)
+        self.proxy_model.set_filter(**self._current_filter_args())
 
     def _clear_filter(self):
         self.filter_input.clear()
+        self.filter_date_enable.setChecked(False)
+        self._type_filter_selected = None
+        self.filter_type_btn.setText("Type: All")
         self.proxy_model.set_filter("", -1)
         self._log(f"Filter cleared in: {self._view_path}")
 
@@ -3884,13 +4262,181 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if self._selected_media_path:
                 self._select_file_in_table(self._selected_media_path)
 
+    _TIME_HEADERS = ('Created', 'Changed', 'Modified')
+
     def _update_filter_columns(self, headers):
+        """Reconfigure the text/date column combos and type filter for new headers."""
+        string_headers = [h for h in headers
+                          if h not in self._TIME_HEADERS and h != 'Type']
+        prev_text_col = self.filter_col_combo.currentText()
         self.filter_col_combo.blockSignals(True)
         self.filter_col_combo.clear()
-        self.filter_col_combo.addItem("All Columns")
-        for h in headers:
+        self.filter_col_combo.addItem("All")
+        for h in string_headers:
             self.filter_col_combo.addItem(h)
+        if prev_text_col in string_headers or prev_text_col == "All":
+            self.filter_col_combo.setCurrentText(prev_text_col)
+        elif 'Name' in string_headers:
+            self.filter_col_combo.setCurrentText('Name')
         self.filter_col_combo.blockSignals(False)
+
+        prev = self.filter_date_combo.currentText()
+        self.filter_date_combo.blockSignals(True)
+        self.filter_date_combo.clear()
+        date_headers = [h for h in headers if h in self._TIME_HEADERS]
+        for h in date_headers:
+            self.filter_date_combo.addItem(h)
+        if prev in date_headers:
+            self.filter_date_combo.setCurrentText(prev)
+        elif 'Modified' in date_headers:
+            self.filter_date_combo.setCurrentText('Modified')
+        self.filter_date_combo.blockSignals(False)
+        has_dates = bool(date_headers)
+        self.filter_date_enable.setVisible(has_dates)
+        self.filter_date_combo.setVisible(has_dates)
+        self.filter_date_from.setVisible(has_dates)
+        self.filter_date_to.setVisible(has_dates)
+        if not has_dates:
+            self.filter_date_enable.setChecked(False)
+        self.filter_type_btn.setVisible('Type' in headers)
+        # Headers changed → previously selected types may not exist any more
+        self._type_filter_selected = None
+        self.filter_type_btn.setText("Type: All")
+
+    def _set_date_filter_enabled(self, on: bool):
+        self.filter_date_combo.setEnabled(on)
+        self.filter_date_from.setEnabled(on)
+        self.filter_date_to.setEnabled(on)
+
+    def _on_date_filter_toggled(self, on: bool):
+        self._set_date_filter_enabled(on)
+        if on:
+            self._autofill_date_range()
+        self._apply_filter()
+
+    def _apply_filter_if_date_enabled(self):
+        if self.filter_date_enable.isChecked():
+            self._apply_filter()
+
+    def _autofill_date_range(self):
+        """Initialise from/to with the oldest and newest dates of the rows
+        currently shown in the file window."""
+        if not self.file_model:
+            return
+        headers = self.file_model._headers
+        header = self.filter_date_combo.currentText()
+        if header not in headers:
+            return
+        col  = headers.index(header)
+        rows = self.file_model._rows or self.file_model._all_rows
+        dates = [r[0][col][:10] for r in rows
+                 if col < len(r[0]) and r[0][col]]
+        if not dates:
+            return
+        self._set_date_range(min(dates), max(dates))
+
+    def _set_date_range(self, lo: str, hi: str):
+        """Set both date editors ('YYYY-MM-DD' strings) without re-filtering."""
+        for de, val in ((self.filter_date_from, lo), (self.filter_date_to, hi)):
+            d = QDate.fromString(val, 'yyyy-MM-dd')
+            if d.isValid():
+                de.blockSignals(True)
+                de.setDate(d)
+                de.blockSignals(False)
+
+    def _filter_by_date(self, header: str, date_str: str, week: bool):
+        """Activate the date filter for *header*, same day or a week window
+        centred on *date_str* (right-click 'Filter by Date' actions)."""
+        d = QDate.fromString(date_str[:10], 'yyyy-MM-dd')
+        if not d.isValid():
+            return
+        self.filter_date_combo.blockSignals(True)
+        self.filter_date_combo.setCurrentText(header)
+        self.filter_date_combo.blockSignals(False)
+        if week:
+            lo, hi = d.addDays(-3), d.addDays(3)
+        else:
+            lo, hi = d, d
+        self._set_date_range(lo.toString('yyyy-MM-dd'), hi.toString('yyyy-MM-dd'))
+        self.filter_date_enable.blockSignals(True)
+        self.filter_date_enable.setChecked(True)
+        self.filter_date_enable.blockSignals(False)
+        self._set_date_filter_enabled(True)
+        self._apply_filter()
+
+    _FOLDER_TYPE_NAMES = {'Folder', 'Empty Folder', 'Folder - Metadata Only'}
+
+    def _populate_type_menu(self):
+        self._type_menu.clear()
+        all_act = self._type_menu.addAction("All Types")
+        all_act.triggered.connect(partial(self._set_type_filter, None))
+        self._type_menu.addSeparator()
+        values = self.file_model.distinct_values('Type') if self.file_model else []
+        folder_vals = [v for v in values if v in self._FOLDER_TYPE_NAMES]
+        file_vals   = [v for v in values if v not in self._FOLDER_TYPE_NAMES]
+        selected = self._type_filter_selected
+
+        def _checked(v):
+            return selected is None or v in selected
+
+        files_act = self._type_menu.addAction("Files")
+        files_act.setCheckable(True)
+        files_act.setChecked(all(map(_checked, file_vals)) if file_vals else True)
+        files_act.toggled.connect(partial(self._toggle_type_group, file_vals))
+        folders_act = self._type_menu.addAction("Folders")
+        folders_act.setCheckable(True)
+        folders_act.setChecked(all(map(_checked, folder_vals)) if folder_vals else True)
+        folders_act.toggled.connect(partial(self._toggle_type_group, folder_vals))
+        self._type_menu.addSeparator()
+        for v in file_vals:
+            act = self._type_menu.addAction(v)
+            act.setCheckable(True)
+            act.setChecked(_checked(v))
+            act.toggled.connect(partial(self._on_type_menu_toggled, v))
+
+    def _all_type_values(self) -> set:
+        return set(self.file_model.distinct_values('Type')
+                   if self.file_model else [])
+
+    def _toggle_type_group(self, values: list, checked: bool):
+        all_values = self._all_type_values()
+        cur = (set(all_values) if self._type_filter_selected is None
+               else set(self._type_filter_selected))
+        cur = cur | set(values) if checked else cur - set(values)
+        self._set_type_filter(None if cur >= all_values else cur)
+
+    def _on_type_menu_toggled(self, value: str, checked: bool):
+        self._toggle_type_group([value], checked)
+
+    def _set_type_filter(self, selected: set | None):
+        self._type_filter_selected = selected
+        self.filter_type_btn.setText(
+            "Type: All" if selected is None else "Type: Filtered")
+        self._apply_filter()
+
+    def _current_filter_args(self) -> dict:
+        """Collect the filter bar's state into kwargs for FileTableModel.set_filter."""
+        headers = self.file_model._headers if self.file_model else self.file_headers
+        args: dict = {'text': self.filter_input.text()}
+        sel = self.filter_col_combo.currentText()
+        if sel != "All" and sel in headers:
+            args['text_cols'] = [headers.index(sel)]
+        else:
+            args['text_cols'] = [i for i, h in enumerate(headers)
+                                 if h not in self._TIME_HEADERS and h != 'Type']
+        if (self.filter_date_enable.isChecked()
+                and self.filter_date_combo.currentText() in headers):
+            args['date_col']  = headers.index(self.filter_date_combo.currentText())
+            args['date_from'] = self.filter_date_from.date().toString('yyyy-MM-dd')
+            args['date_to']   = self.filter_date_to.date().toString('yyyy-MM-dd')
+        if self._type_filter_selected is not None and 'Type' in headers:
+            args['type_col'] = headers.index('Type')
+            args['types']    = set(self._type_filter_selected)
+        return args
+
+    @staticmethod
+    def _filter_is_active(args: dict) -> bool:
+        return bool(args.get('text')) or 'date_col' in args or 'types' in args
 
     def _zip_stem(self):
         """Return (parent_dir, stem) for the currently loaded archive."""
@@ -4174,12 +4720,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._view_is_recursive = False
         self._refresh_folder_view()
 
+        # Offer to process Photos.sqlite the first time a Media folder is opened
+        QTimer.singleShot(
+            0, partial(self._maybe_offer_photos_processing, folder_path))
+
         # Refresh media tab if it's currently visible
         if self.center_tabs.currentIndex() == 1:
             self._load_media_from_file_model()
 
     def _build_entry_row(self, path: str, has_bundles: bool = False,
-                         display_parent: str | None = None):
+                         display_parent: str | None = None,
+                         photo_cols: bool = False):
         """Return one file-model row tuple for *path*, or None if hidden.
 
         Single source of truth for building file-browser rows — used by the
@@ -4204,6 +4755,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                                       display_parent=display_parent, seg=seg)
         if has_bundles:
             cols.append(name if name in self.guid_to_bundle else "")
+        if photo_cols:
+            info = self._photo_index.get(self._photo_key(path) or '')
+            cols.extend(info if info else [''] * len(_PHOTO_HEADERS))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
                 path in self._nested_archive_map)
 
@@ -4478,18 +5032,29 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         # Capture filter state before swapping models (new model has no filter).
         if preserve_filter:
-            _filter_text = self.filter_input.text()
-            _filter_col  = self.filter_col_combo.currentIndex() - 1
+            _filter_args = self._current_filter_args()
         else:
-            _filter_text = ""
-            _filter_col  = -1
+            _filter_args = None
 
         # Bump generation — any in-flight batch will see the change and abort
         self._load_gen += 1
         my_gen = self._load_gen
 
         # Swap in an empty model immediately so the checkbox tick feels instant
-        self._set_file_model(FileTableModel(self.file_headers))
+        # Photo columns are included when any checked folder sits under the
+        # Media partition (DCIM, PhotoData, …) and photo metadata is loaded.
+        has_photos = bool(self._photo_index) and any(
+            self._photo_key(f) for f in checked)
+        headers = self.file_headers + (_PHOTO_HEADERS if has_photos else [])
+        self._set_file_model(FileTableModel(headers))
+        # _update_filter_columns resets the type selection — restore it when
+        # the filter should survive the rebuild.
+        _type_sel   = self._type_filter_selected
+        _type_label = self.filter_type_btn.text()
+        self._update_filter_columns(headers)
+        if preserve_filter:
+            self._type_filter_selected = _type_sel
+            self.filter_type_btn.setText(_type_label)
 
         if not checked:
             # Fall back to showing the currently highlighted folder, if any
@@ -4520,7 +5085,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 state['idx'] += 1
                 disp_parent = self._display_path(folder)
                 for child in self.folder_map.get(folder, []):
-                    row = self._build_entry_row(child, display_parent=disp_parent)
+                    row = self._build_entry_row(child, display_parent=disp_parent,
+                                                photo_cols=has_photos)
                     if row is None:
                         continue
                     batch_rows.append(row)
@@ -4538,14 +5104,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 QTimer.singleShot(0, _process_batch)
             else:
                 self.file_view.resizeColumnsToContents()
-                if _filter_text:
+                if _filter_args is not None and self._filter_is_active(_filter_args):
                     if select_path:
                         _model = self.file_model
                         def _on_filter_done_select(*_):
                             _model.filter_done.disconnect(_on_filter_done_select)
                             self._select_file_by_path(select_path)
                         _model.filter_done.connect(_on_filter_done_select)
-                    self.proxy_model.set_filter(_filter_text, _filter_col)
+                    self.proxy_model.set_filter(**_filter_args)
                 elif select_path:
                     self._select_file_by_path(select_path)
                 self._refresh_table_status()
@@ -4580,6 +5146,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             parent_act = QAction("📂 Open Parent Folder in Tree", self)
             parent_act.triggered.connect(partial(self.navigate_tree_to_path, parent_path))
             menu.addAction(parent_act)
+
+        # Filter by this row's dates — same day, or a week centred on it
+        row_cols = self.file_model._rows[source.row()][0]
+        headers  = self.file_model._headers
+        date_opts = [(h, row_cols[headers.index(h)])
+                     for h in self._TIME_HEADERS
+                     if h in headers and headers.index(h) < len(row_cols)
+                     and row_cols[headers.index(h)]]
+        if date_opts:
+            date_menu = menu.addMenu("📅 Filter by This Date")
+            for header, val in date_opts:
+                act = date_menu.addAction(f"{header} — same day ({val[:10]})")
+                act.triggered.connect(
+                    partial(self._filter_by_date, header, val, False))
+            date_menu.addSeparator()
+            for header, val in date_opts:
+                act = date_menu.addAction(f"{header} — same week (±3 days)")
+                act.triggered.connect(
+                    partial(self._filter_by_date, header, val, True))
 
         # Collect file paths from all selected rows for header scan
         _scan_paths = []
@@ -4868,6 +5453,76 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._skip_search_reminder_once = True
             self._start_keyword_search()
 
+    # ── Photos.sqlite metadata index ──────────────────────────────────────────
+
+    @staticmethod
+    def _photo_key(ui_path: str) -> str | None:
+        """Map a browser ui_path to the Photos.sqlite asset_path key.
+
+        Asset paths are relative to the Media folder (ZDIRECTORY/ZFILENAME,
+        e.g. 'DCIM/100APPLE/IMG_0001.HEIC'), so strip everything up to
+        '/Media/'.  Works for both Cellebrite ('mobile/Media/…') and GrayKey
+        ('private/var/mobile/Media/…') layouts."""
+        i = ui_path.find('/Media/')
+        return ui_path[i + 7:] if i >= 0 else None
+
+    def _load_photo_index(self):
+        """(Re)build the asset_path → photo column values index from the
+        Photos Metadata artifact results, if present in the case DB."""
+        self._photo_index = {}
+        if not self._case_dir:
+            return
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                columns, rows = load_artifact_results(db, 'photos_metadata')
+        except Exception:
+            return
+        if not rows or 'asset_path' not in columns:
+            return
+        idx = {c: i for i, c in enumerate(columns)}
+
+        def get(r, col):
+            i = idx.get(col)
+            return (r[i] or '') if i is not None else ''
+
+        for r in rows:
+            key = get(r, 'asset_path')
+            if not key:
+                continue
+            status = ', '.join(x for x in (get(r, 'Favorite'),
+                                           get(r, 'Hidden'),
+                                           get(r, 'Trashed')) if x)
+            flags = self._compute_photo_flags(get(r, 'Labels'),
+                                              get(r, 'Face Ages'))
+            self._photo_index[key] = [
+                flags, get(r, 'Taken'), get(r, 'Added'), get(r, 'Original Name'),
+                get(r, 'Album'), get(r, 'Labels'), get(r, 'Origin'),
+                get(r, 'Camera'), get(r, 'Place'), get(r, 'GPS'),
+                get(r, 'Faces'), get(r, 'Face Ages'), status,
+            ]
+
+    def _compute_photo_flags(self, labels_str: str, face_ages_str: str) -> str:
+        """Map a photo's raw labels to triage flag categories (Weapon,
+        Document, …).  A face estimated Baby/Child adds 'Minor (face)' as a
+        review prompt.  Returns a compact comma-joined string, '' if none."""
+        label_set = {l.strip().lower()
+                     for l in (labels_str or '').split(',') if l.strip()}
+        hits = [flag for flag, terms in self._photo_flag_rules.items()
+                if label_set & terms]
+        fa = (face_ages_str or '').lower()
+        if 'baby' in fa or 'child' in fa:
+            hits.append('Minor (face)')
+        return ', '.join(hits)
+
+    def _on_photo_index_changed(self):
+        """Rebuild the photo index after artifact parsers ran, then refresh
+        the current view so the columns appear immediately."""
+        self._load_photo_index()
+        if self._view_is_recursive:
+            self._rebuild_file_view_from_checked(preserve_filter=True)
+        else:
+            self._refresh_folder_view(preserve_filter=True)
+
     def _open_new_ffs(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open ZIP", "", "ZIP (*.zip)")
         if path:
@@ -4878,6 +5533,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if case_dir is None:
             return   # user cancelled the dialog
         self._case_dir = case_dir
+        self._photo_index = {}        # rebuilt in on_metadata_ready
+        self._photos_prompt_shown = False
         self._search_entries = None   # clear cached index for the new archive
         self.zip_path = zip_path
         # Clear search UI from the previous archive
@@ -4992,6 +5649,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # even when the label is already cached in ffs_archives.json.
         QTimer.singleShot(0, partial(self._fetch_and_store_label, self.zip_path))
         self._refresh_artifact_tab()
+        self._load_photo_index()
         self._artifact_act.setEnabled(True)
         # Start background precomputation of folder counts if not already cached.
         if len(self._file_count_cache) < len(self.folder_map):
@@ -5263,14 +5921,23 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         folder_path = self._view_path
         children = self.folder_map.get(folder_path, [])
         has_bundles = any(p.split('/')[-1] in self.guid_to_bundle for p in children)
-        headers = self.file_headers + (['UUID'] if has_bundles else [])
+        has_photos = bool(self._photo_index) and any(
+            (k := self._photo_key(p)) and k in self._photo_index
+            for p in children)
+        headers = (self.file_headers + (['UUID'] if has_bundles else [])
+                   + (_PHOTO_HEADERS if has_photos else []))
         new_model = FileTableModel(headers)
+        # _update_filter_columns resets the type selection — save the filter
+        # bar state around it when the filter must survive the refresh.
+        if preserve_filter:
+            _type_sel    = self._type_filter_selected
+            _type_label  = self.filter_type_btn.text()
+            _scroll_val  = self.file_view.verticalScrollBar().value()
         self._update_filter_columns(headers)
 
         if preserve_filter:
-            _filter_text = self.filter_input.text()
-            _filter_col  = self.filter_col_combo.currentIndex() - 1
-            _scroll_val  = self.file_view.verticalScrollBar().value()
+            self._type_filter_selected = _type_sel
+            self.filter_type_btn.setText(_type_label)
         else:
             self.filter_input.clear()
             self.proxy_model.set_filter("", -1)
@@ -5278,20 +5945,23 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         batch = []
         disp_parent = self._display_path(folder_path)
         for path in sorted(children):
-            row = self._build_entry_row(path, has_bundles, display_parent=disp_parent)
+            row = self._build_entry_row(path, has_bundles, display_parent=disp_parent,
+                                        photo_cols=has_photos)
             if row is not None:
                 batch.append(row)
         new_model.append_rows_batch(batch)
         self._set_file_model(new_model)
 
         if preserve_filter:
-            if _filter_text:
+            # Compute against the new model so column indexes line up.
+            _filter_args = self._current_filter_args()
+            if self._filter_is_active(_filter_args):
                 if select_path:
                     def _on_filter_done_select(*_):
                         new_model.filter_done.disconnect(_on_filter_done_select)
                         self._select_file_by_path(select_path)
                     new_model.filter_done.connect(_on_filter_done_select)
-                self.proxy_model.set_filter(_filter_text, _filter_col)
+                self.proxy_model.set_filter(**_filter_args)
             else:
                 self.file_view.verticalScrollBar().setValue(_scroll_val)
                 if select_path:

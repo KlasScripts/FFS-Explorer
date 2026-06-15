@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QComboBox, QHBoxLayout, QVBoxLayout,
     QTableView, QTreeView, QPlainTextEdit, QStackedWidget, QSplitter,
     QScrollArea, QCheckBox, QPushButton, QDialog, QMessageBox,
+    QProgressDialog,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
@@ -838,4 +839,74 @@ class ArtifactViewerMixin:
             parent=self,
         )
         dlg.parsers_completed.connect(self._refresh_artifact_tab)
+        dlg.parsers_completed.connect(self._on_photo_index_changed)
         dlg.exec()
+
+    # ── Photos.sqlite quick-process offer ─────────────────────────────────────
+
+    @staticmethod
+    def _is_ios_media_path(ui_path: str) -> bool:
+        """True for the iOS media root or any subfolder, for both Cellebrite
+        ('mobile/Media/…') and GrayKey ('private/var/mobile/Media/…')."""
+        return ui_path.endswith('mobile/Media') or 'mobile/Media/' in ui_path
+
+    def _photos_db_present(self) -> bool:
+        cands = self._adapter.user_candidates(
+            'mobile/Media/PhotoData/Photos.sqlite')
+        if self._streaming_index is not None:
+            return any(c in self._streaming_index for c in cands)
+        return any(c in getattr(self, 'zip_names', ()) for c in cands)
+
+    def _maybe_offer_photos_processing(self, folder_path: str):
+        """When the user first opens an iOS Media folder, offer to run the
+        Photos.sqlite parser so the photo columns become available."""
+        if getattr(self, '_photos_prompt_shown', False):
+            return
+        if not folder_path or self._is_android_archive():
+            return
+        if not self._is_ios_media_path(folder_path):
+            return
+        if self._photo_index or not self._case_dir:
+            return   # already processed, or nowhere to store results
+        if not self._photos_db_present():
+            return
+        self._photos_prompt_shown = True
+        ans = QMessageBox.question(
+            self, "Process Photo Data",
+            "This device's photo library (Photos.sqlite) has not been "
+            "processed yet.\n\n"
+            "Processing it links each photo to its album, original filename, "
+            "creating app, date taken, location and detected faces — shown as "
+            "extra columns in the file browser.\n\n"
+            "Process the photo metadata now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self._run_photos_parser()
+
+    def _run_photos_parser(self):
+        from artifact_runner import list_artifacts
+        selected = [(sn, m) for sn, m in list_artifacts('ios')
+                    if sn == 'photos_metadata']
+        if not selected:
+            return
+        prog = QProgressDialog("Processing Photos.sqlite…", None, 0, 0, self)
+        prog.setWindowTitle("Photo Metadata")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setCancelButton(None)
+        prog.show()
+        self._photos_worker = ArtifactRunnerWorker(
+            selected, self.zip_path, self._adapter,
+            self._streaming_index, self._case_dir)
+
+        def _done():
+            prog.close()
+            self._on_photo_index_changed()
+            self._refresh_artifact_tab()
+            n = len(self._photo_index)
+            self.status_bar.showMessage(
+                f"Photo metadata processed — {n:,} photos linked", 6000)
+
+        self._photos_worker.done.connect(_done)
+        self._photos_worker.start()

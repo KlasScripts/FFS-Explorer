@@ -1,0 +1,8 @@
+{
+  "_README": "Triage flags for the photo Labels column. Each key is a flag name; each value is a list of Apple scene/object labels that raise that flag. Matching is exact (case-insensitive) against the individual labels Apple's on-device classifier produced. Edit freely and reload the case to apply. NOTE: these are review-prioritisation aids only, NOT detection — Apple does not classify drugs or abuse material, so those cannot be found this way. The 'Minor (face)' flag is derived separately from the face-age estimate and means a face was estimated as Baby/Child; it is a prompt for human review, not a finding.",
+  "Weapon": ["firearm", "gun", "pistol", "revolver", "rifle", "shotgun", "ammunition", "bullet", "cartridge", "knife", "blade", "sword", "holster", "weapon"],
+  "Document": ["document", "receipt", "ticket", "passport", "license plate", "identity document", "credit card", "id card"],
+  "Vehicle": ["car", "truck", "motorcycle", "motor home", "sportscar", "vehicle", "license plate"],
+  "People": ["people", "crowd", "person"],
+  "Drug": ["pill", "tablet", "syringe", "needle", "cannabis", "marijuana", "bong", "pipe", "powder", "drug"]
+}

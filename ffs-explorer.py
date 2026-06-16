@@ -10,13 +10,12 @@ import zlib
 import json
 import hashlib
 import struct
-import msgpack
 import plistlib
 import xml.dom.minidom
 import pathlib
 import subprocess
 import configparser
-from collections import defaultdict
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from functools import lru_cache, partial
@@ -60,6 +59,13 @@ from zip_cd_cache import (CachedZipView, is_valid as _cd_cache_valid,
                           compute_data_offsets as _compute_data_offsets,
                           sidecar_hash as _cd_sidecar_hash,
                           extract_cd_hash as _cd_extract_hash)
+from ffs_metadata import (_build_folder_tree, _compute_folder_sizes,
+                          _find_metadata_only_folders, _find_missing_plists,
+                          _UUID_RE, parse_archive_metadata, persist_result,
+                          _parse_child as _ffs_parse_child,
+                          pack_snapshot, unpack_snapshot,
+                          SNAPSHOT_KEY as _SNAPSHOT_KEY,
+                          SNAPSHOT_VERSION as _SNAPSHOT_VERSION)
 from datetime import datetime, timedelta, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
                               QHBoxLayout, QGridLayout, QWidget, QHeaderView, QPushButton,
@@ -85,8 +91,8 @@ _BG_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ffs-bg')
 
 # Load-snapshot cache: the complete result of a first archive load, stored in
 # casecache.db so re-opens skip the CD parse, metadata read, and derivations.
-_SNAPSHOT_KEY     = 'load_snapshot'
-_SNAPSHOT_VERSION = '1'
+# _SNAPSHOT_KEY / _SNAPSHOT_VERSION are imported from ffs_metadata (single
+# source of truth, shared with the subprocess parser).
 
 _TREE_PLACEHOLDER  = "__placeholder__"
 _BM_ROOT           = "__bookmarks__"
@@ -176,17 +182,8 @@ def _format_archive_entry(entry: dict, prefs: dict) -> str:
 # shrinks below this so deeply-indented items can be reached via horizontal scroll.
 _TREE_COL_MIN = 1000
 
-# iOS container metadata files: a folder that contains only these (and nothing else)
-# is labelled "Folder - Metadata Only" rather than a regular folder.
-_SYSTEM_METADATA_NAMES: frozenset = frozenset({
-    ".com.apple.mobile_container_manager.metadata.plist",
-    ".com.apple.FairPlay.MachineIdentifier",
-    ".com.apple.springboard.shortcuts",
-})
-
-_UUID_RE = re.compile(
-    r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
-)
+# _SYSTEM_METADATA_NAMES and _UUID_RE now live in ffs_metadata.py (Qt-free,
+# shared with the subprocess parser).  _UUID_RE is imported back above.
 
 FORENSIC_SHORTCUTS = [
     ("App Data", "mobile/Containers/Data/Application"),
@@ -703,123 +700,6 @@ class ExtractorWorker(QThread):
         return children
 
 
-def _compute_folder_sizes(
-    folder_map: dict,
-    zip_names: frozenset,
-    zip_sizes: dict,
-    ffs_adapter,
-    zip_ui_paths: frozenset | None = None,
-    progress_cb=None,
-) -> dict:
-    """Compute total bytes per folder using a bottom-up (leaf-first) algorithm.
-
-    Returns {folder_path: total_bytes} for every folder except the root ('').
-
-    Step 1 accumulates direct file sizes into each immediate parent.
-    Step 2 propagates child totals upward sorted deepest-first so every
-    subtotal is resolved before its parent is visited.  The root ('') is
-    intentionally excluded — it would just be the sum of every file and
-    provides no actionable insight in the UI.
-    """
-    folder_bytes: dict[str, int] = {fp: 0 for fp in folder_map}
-    total = len(folder_map)
-    done = [0]
-    _REPORT_EVERY = 2000
-
-    # Step 1: direct file contributions into each immediate parent.
-    for fp, children in folder_map.items():
-        for child in children:
-            if child in folder_map:
-                continue  # subfolder — handled in step 2
-            if zip_ui_paths is not None:
-                in_zip = child in zip_ui_paths
-            else:
-                resolved = ffs_adapter.resolve(child)
-                in_zip = resolved in zip_names or resolved.lstrip('/') in zip_names
-            if not in_zip or not zip_sizes:
-                continue
-            raw = ffs_adapter.resolve(child)
-            # Bare directory entries are keyed with a trailing slash in zip_names.
-            if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
-                continue
-            size = zip_sizes.get(raw, zip_sizes.get(raw.lstrip('/'), 0))
-            folder_bytes[fp] += size
-
-        done[0] += 1
-        if progress_cb and done[0] % _REPORT_EVERY == 0:
-            progress_cb(done[0], total)
-            time.sleep(0)
-
-    # Step 2: propagate child totals up to parents, deepest folders first.
-    for fp in sorted(folder_bytes, key=lambda p: p.count('/'), reverse=True):
-        if not fp:
-            continue  # never propagate from root
-        parent = fp.rsplit('/', 1)[0] if '/' in fp else ''
-        if parent and parent in folder_bytes:
-            folder_bytes[parent] += folder_bytes[fp]
-
-    folder_bytes.pop('', None)  # remove root
-    if progress_cb:
-        progress_cb(total, total)
-    return folder_bytes
-
-
-def _find_metadata_only_folders(
-    folder_map: dict,
-    zip_names: frozenset,
-    zip_ui_paths: frozenset | None,
-    ffs_adapter,
-) -> set:
-    """Return the set of iOS folder paths whose only in-zip content is Apple container metadata.
-
-    A folder qualifies if every file it (recursively) contains is in
-    _SYSTEM_METADATA_NAMES and at least one such file is present.  Truly
-    empty subfolders are ignored — they do not disqualify the parent.
-    Only call this for iOS archives (Graykey / Cellebrite FFS), not Android.
-    """
-    cache: dict[str, str] = {}  # fp -> "metadata_only" | "empty" | "content"
-
-    def _check(fp: str) -> str:
-        if fp in cache:
-            return cache[fp]
-        cache[fp] = "empty"  # cycle guard
-        has_metadata = False
-        for child in folder_map.get(fp, []):
-            if child in folder_map:
-                cs = _check(child)
-                if cs == "content":
-                    cache[fp] = "content"
-                    return "content"
-                if cs == "metadata_only":
-                    has_metadata = True
-                # "empty" subfolder — does not disqualify
-            else:
-                if zip_ui_paths is not None:
-                    in_zip = child in zip_ui_paths
-                else:
-                    resolved = ffs_adapter.resolve(child)
-                    in_zip = resolved in zip_names or resolved.lstrip('/') in zip_names
-                if not in_zip:
-                    continue
-                raw = ffs_adapter.resolve(child)
-                if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
-                    continue  # bare directory entry — skip
-                if child.split('/')[-1] in _SYSTEM_METADATA_NAMES:
-                    has_metadata = True
-                else:
-                    cache[fp] = "content"
-                    return "content"
-        result = "metadata_only" if has_metadata else "empty"
-        cache[fp] = result
-        return result
-
-    for fp in folder_map:
-        if fp:  # skip root
-            _check(fp)
-
-    return {fp for fp, v in cache.items() if v == "metadata_only"}
-
-
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -846,50 +726,6 @@ def _format_ts_cached(ts) -> str:
         return f"{_date_prefix(days)} {h:02d}:{m:02d}:{s:02d} UTC"
     except (ValueError, OSError, OverflowError):
         return "---"
-
-
-def _find_missing_plists(folder_map: dict, ffs_adapter, guid_to_bundle: dict) -> list:
-    """Return UUID container folders whose MCM metadata plist is unresolved."""
-    parents = ffs_adapter.container_parents()
-    return [
-        p for p in folder_map
-        if p.rsplit('/', 1)[0] in parents
-        and _UUID_RE.match(p.split('/')[-1])
-        and p.split('/')[-1] not in guid_to_bundle
-    ]
-
-
-def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
-    """Build and return folder_map from ui_metadata paths."""
-    if status_cb:
-        status_cb(f"Building folder tree ({len(ui_metadata):,} entries)...")
-    # defaultdict avoids allocating a throwaway set() per iteration the way
-    # setdefault(parent, set()) would — this loop runs once per archive entry.
-    folder_map_sets: defaultdict[str, set] = defaultdict(set)
-    for i, ui_path in enumerate(ui_metadata):
-        if not ui_path:
-            continue  # skip empty-string keys from malformed archives
-        parent = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ""
-        folder_map_sets[parent].add(ui_path)
-        if i % 20_000 == 0:
-            time.sleep(0)   # yield GIL so the main thread can process events
-    if status_cb:
-        status_cb("Resolving folder hierarchy...")
-    for i, path in enumerate(list(folder_map_sets.keys())):
-        current = path
-        while current:
-            parent = current.rsplit('/', 1)[0] if '/' in current else ""
-            if parent not in folder_map_sets:
-                folder_map_sets[parent] = {current}
-            elif current not in folder_map_sets[parent]:
-                folder_map_sets[parent].add(current)
-            else:
-                break
-            current = parent
-        if i % 20_000 == 0:
-            time.sleep(0)
-    return {k: list(v) for k, v in folder_map_sets.items()}
-
 
 
 def _count_header_candidates(ui_metadata: dict, ffs_adapter) -> int:
@@ -942,11 +778,42 @@ _DEFAULT_PHOTO_FLAGS: dict = {
 }
 
 
+def _photo_flags_path() -> str:
+    """User-editable photo_flags.json location.
+
+    In a frozen build it sits next to the .exe so investigators can find and
+    edit it (and edits survive app restarts, unlike anything inside the
+    PyInstaller bundle).  In dev it stays in config/ beside the source."""
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), 'photo_flags.json')
+    return os.path.join(_CONFIG_DIR, 'photo_flags.json')
+
+
+def _seed_photo_flags(path: str) -> None:
+    """Create photo_flags.json on first run so the user has something to edit.
+
+    Copies the template bundled in the exe; if that's missing, writes the
+    built-in defaults.  Never overwrites an existing (possibly edited) file."""
+    if os.path.exists(path):
+        return
+    try:
+        template = resource_path(os.path.join('config', 'photo_flags.json'))
+        if os.path.exists(template) and os.path.abspath(template) != os.path.abspath(path):
+            shutil.copyfile(template, path)
+        else:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({k: sorted(v) for k, v in _DEFAULT_PHOTO_FLAGS.items()},
+                          f, indent=2)
+    except OSError:
+        pass
+
+
 def _load_photo_flag_rules() -> dict:
-    """Return {flag_name: frozenset(lowercased terms)} from
-    config/photo_flags.json, falling back to the built-in defaults."""
+    """Return {flag_name: frozenset(lowercased terms)} from the user-editable
+    photo_flags.json (next to the exe), falling back to the built-in defaults."""
     rules = {k: set(v) for k, v in _DEFAULT_PHOTO_FLAGS.items()}
-    path = os.path.join(_CONFIG_DIR, 'photo_flags.json')
+    path = _photo_flags_path()
+    _seed_photo_flags(path)
     try:
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
@@ -1171,7 +1038,10 @@ class ZipMetadataWorker(QThread):
             if not folder_sizes:
                 return False   # sizes are required downstream — do a full load
             self.status_update.emit("Loading archive metadata from local cache…")
-            snap = msgpack.unpackb(raw, raw=False, strict_map_key=False)
+            # Chunked deserialize, yielding the GIL between chunks so the GUI
+            # and progress bar keep animating instead of hanging on one big
+            # unpack (~1-2 s for a large Cellebrite archive).
+            snap = unpack_snapshot(raw, yield_cb=lambda: time.sleep(0))
             fmt, user_pfx, sys_pfx, old_layout = snap['adapter']
             ffs_adapter = FfsAdapter(fmt, user_pfx, sys_pfx, bool(old_layout))
             self._local_extra_delta = snap['delta']
@@ -1190,6 +1060,111 @@ class ZipMetadataWorker(QThread):
             ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
             metadata_only_folders)
         return True
+
+    def _run_parse_offloaded(self) -> bool:
+        """Parse the (non-streaming) archive and emit metadata_ready.
+
+        Tries a child process first — true parallelism, GUI stays responsive.
+        The child persists its result to casecache.db, so on success we simply
+        load it back through the tested snapshot fast-path.  If the subprocess
+        is unavailable for any reason, we compute in this thread instead
+        (correct, just less responsive).  Returns True if metadata was emitted,
+        False if parsing failed entirely (caller falls back to the legacy path).
+        """
+        if self._parse_in_subprocess():
+            if self._try_load_from_snapshot():
+                return True
+            # Child reported done but the snapshot is unusable — fall through
+            # to an in-thread parse rather than leaving the user with nothing.
+
+        self.status_update.emit("Parsing archive metadata…")
+        try:
+            result = parse_archive_metadata(
+                self.zip_path, self.case_dir,
+                status_cb=self.status_update.emit)
+        except Exception as exc:
+            self.status_update.emit(f"Metadata parse error: {exc}")
+            return False
+        try:
+            self._emit_and_persist_result(result)
+        except Exception as exc:
+            self.status_update.emit(f"Metadata parse error: {exc}")
+            return False
+        return True
+
+    def _parse_in_subprocess(self) -> bool:
+        """Run the parse in a child process which persists to casecache.db.
+        Returns True if it finished successfully, False on any failure (so the
+        caller can fall back to an in-process parse)."""
+        try:
+            import multiprocessing as mp
+            ctx = mp.get_context('spawn')
+            recv_conn, send_conn = ctx.Pipe(duplex=False)
+            proc = ctx.Process(
+                target=_ffs_parse_child,
+                args=(send_conn, self.zip_path, self.case_dir),
+                daemon=True,
+            )
+            proc.start()
+            send_conn.close()   # parent only receives
+        except Exception as exc:
+            self.status_update.emit(f"Could not start parser process: {exc}")
+            return False
+
+        done = False
+        try:
+            while True:
+                if not recv_conn.poll(0.2):
+                    if not proc.is_alive():
+                        break       # died without reporting
+                    continue
+                try:
+                    msg = recv_conn.recv()
+                except EOFError:
+                    break
+                tag = msg[0]
+                if tag == 'status':
+                    self.status_update.emit(msg[1])
+                elif tag == 'done':
+                    done = True
+                    break
+                elif tag == 'error':
+                    self.status_update.emit(
+                        "Parser process failed — retrying in-process.")
+                    print(f"[ffs parse subprocess]\n{msg[1]}")
+                    break
+        finally:
+            recv_conn.close()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.terminate()
+        return done
+
+    def _emit_and_persist_result(self, result: dict):
+        """Emit metadata_ready from an in-thread parse result, then persist the
+        snapshot / guid map / folder sizes to the case DB."""
+        fmt, user_pfx, sys_pfx, old_layout = result['adapter_args']
+        ffs_adapter = FfsAdapter(fmt, user_pfx, sys_pfx, bool(old_layout))
+        self._local_extra_delta = result['delta']
+        self._streaming_index   = None
+        zip_names    = frozenset(result['zip_names'])
+        zip_ui_paths = result['zip_ui_paths']
+        ui_metadata  = result['ui_metadata']
+        folder_map   = result['folder_map']
+        guid_to_bundle = result['guid_to_bundle']
+        folder_sizes   = result['folder_sizes']
+        missing_plist_paths = _find_missing_plists(
+            folder_map, ffs_adapter, guid_to_bundle)
+
+        # Emit first — the UI tree appears immediately; DB writes follow.
+        self.metadata_ready.emit(
+            ui_metadata, folder_map, guid_to_bundle, zip_names,
+            ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
+            set(result['metadata_only']))
+        try:
+            persist_result(self.case_dir, result)
+        except Exception:
+            pass
 
     def run(self):
         try:
@@ -1243,6 +1218,15 @@ class ZipMetadataWorker(QThread):
                         _elapsed = time.monotonic() - _t0
                         self.status_update.emit(
                             f"Central directory copied to case folder in {_elapsed:.1f}s.")
+
+                # Fast path: offload the heavy non-streaming parse to a child
+                # process.  It runs on its own interpreter/GIL so the CPU-bound
+                # work doesn't freeze the GUI (a QThread can't achieve this for
+                # pure-Python work — one shared GIL).  Header scans and streaming
+                # archives stay on the in-thread path below.
+                if self._streaming_index is None and not self.scan_headers:
+                    if self._run_parse_offloaded():
+                        return
 
                 if self._streaming_index is None:
                     self.status_update.emit("Loading central directory from local copy…")
@@ -1377,17 +1361,11 @@ class ZipMetadataWorker(QThread):
             if self.case_dir and self._streaming_index is None:
                 self.status_update.emit("Saving load cache…")
                 try:
-                    snapshot_blob = msgpack.packb({
-                        'adapter': [ffs_adapter.format, ffs_adapter.user_prefix,
-                                    ffs_adapter.sys_prefix, ffs_adapter.old_layout],
-                        'delta':         self._local_extra_delta,
-                        'zip_names':     list(zip_names),
-                        'zip_ui_paths':  (list(zip_ui_paths)
-                                          if zip_ui_paths is not None else None),
-                        'ui_metadata':   ui_metadata,
-                        'folder_map':    folder_map,
-                        'metadata_only': list(metadata_only_folders),
-                    }, use_bin_type=True)
+                    snapshot_blob = pack_snapshot(
+                        [ffs_adapter.format, ffs_adapter.user_prefix,
+                         ffs_adapter.sys_prefix, ffs_adapter.old_layout],
+                        self._local_extra_delta, zip_names, zip_ui_paths,
+                        ui_metadata, folder_map, metadata_only_folders)
                 except Exception:
                     snapshot_blob = None
 
@@ -1436,7 +1414,7 @@ _HEADER_TOOLTIPS: dict[str, str] = {
     'Added':         'Photos.sqlite — when the photo was added to this device\'s library (ZADDEDDATE); a large gap from Taken means it was received/imported, not captured here',
     'Original Name': 'Photos.sqlite — filename before any rename by the Photos library',
     'Album':         'Photos.sqlite — album(s) containing this asset',
-    'Flags':         'Triage categories derived from Labels (Weapon, Document, Vehicle…) plus Minor (face) from the face-age estimate. A review aid for prioritising images — NOT detection; Apple does not classify drugs or abuse material. Edit config/photo_flags.json to customise.',
+    'Flags':         'Triage categories derived from Labels (Weapon, Document, Vehicle…) plus Minor (face) from the face-age estimate. A review aid for prioritising images — NOT detection; Apple does not classify drugs or abuse material. Edit photo_flags.json (next to the app) to customise.',
     'Labels':        'psi.sqlite — Apple\'s scene/object classification (e.g. Dog, Beach, Receipt)',
     'Origin':        'Photos.sqlite ZIMPORTEDBY — how the photo entered this library, naming the source: Back/Front Camera = captured on this device; an app name (WhatsApp, Instagram…), AirDrop, Messages, Safari or Screenshot = arrived another way',
     'Camera':        'Photos.sqlite — EXIF camera make and model; a model differing from the device suggests an imported/received photo',
@@ -5595,6 +5573,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._selected_media_path = None
         self._pending_media_selection = None
         self._media_context = None
+        # Busy/indeterminate (range 0,0) so the bar keeps animating for the whole
+        # load — a static bar looked hung.  Hidden only once BOTH the tree has
+        # finished populating and the worker thread is done (covers any header
+        # scan that runs after metadata_ready); see _maybe_hide_load_progress.
+        self._tree_done   = False
+        self._worker_done = False
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
         self._load_start = time.monotonic()
@@ -5604,6 +5588,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.worker.metadata_ready.connect(self.on_metadata_ready)
         self.worker.header_scan_progress.connect(self._on_header_scan_progress)
         self.worker.header_scan_done.connect(self._on_header_scan_done)
+        self.worker.finished.connect(self._on_load_worker_finished)
         self.worker.start()
 
     def on_metadata_ready(self, data, folder_map, guid_map, zip_names, ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None, metadata_only_folders=None):
@@ -5638,7 +5623,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'Path'])
         self._update_filter_columns(self.file_headers)
-        self.progress_bar.setRange(0, 100)
+        # (Progress bar stays indeterminate/animated — hidden later once the
+        # tree and worker are both finished, not here.)
         self.save_recent_list(self.zip_path)
         fmt_label = "GrayKey" if ffs_adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
         self._inject_nested_archives()
@@ -6030,7 +6016,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             current.setCheckState(Qt.CheckState.Checked)
 
     def reload_tree_entirely(self):
-        if not self.folder_map: return
+        if not self.folder_map:
+            # Nothing to populate — don't leave the load bar spinning forever.
+            self._tree_done = True
+            self._maybe_hide_load_progress()
+            return
         if self._search_index_worker and self._search_index_worker.isRunning():
             self._search_index_worker.stop()
             self._search_index_worker.wait()
@@ -6047,6 +6037,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_model.invisibleRootItem().appendRow(root_item)
         self._populate_tree_children_batched(root_item, "", on_done=lambda: self._on_tree_loaded(root_item))
 
+    def _on_load_worker_finished(self):
+        """The metadata worker thread has fully exited (including any header
+        scan that ran after metadata_ready).  Hide the load bar only if the
+        tree has also finished — whichever completes last."""
+        self._worker_done = True
+        self._maybe_hide_load_progress()
+
+    def _maybe_hide_load_progress(self):
+        """Hide the indeterminate load bar once both the tree population and the
+        worker thread are done, so it keeps animating while either is still
+        working."""
+        if getattr(self, '_tree_done', False) and getattr(self, '_worker_done', False):
+            self.progress_bar.hide()
+
     def _on_tree_loaded(self, root_item):
         self.tree_view.expand(self.tree_model.indexFromItem(root_item))
         self.tree_view.horizontalScrollBar().setValue(0)
@@ -6054,7 +6058,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if hasattr(self, '_adapter'):
             fmt_label = "GrayKey" if self._adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
             self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
-        self.progress_bar.hide()
+        self._tree_done = True
+        self._maybe_hide_load_progress()
         elapsed = time.monotonic() - getattr(self, '_load_start', time.monotonic())
         self.status_bar.showMessage(
             f"Loaded: {os.path.basename(self.zip_path)}  —  {elapsed:.1f}s")
@@ -6901,6 +6906,11 @@ def _qt_message_handler(msg_type, context, message):
         print(f"Qt error: {message}", file=sys.stderr)
 
 if __name__ == "__main__":
+    # Must run before any process is spawned (and is essential under PyInstaller,
+    # where a spawned child re-launches the exe — freeze_support reroutes it to
+    # the worker target instead of opening another GUI window).
+    import multiprocessing
+    multiprocessing.freeze_support()
     qInstallMessageHandler(_qt_message_handler)
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))

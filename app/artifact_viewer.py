@@ -357,8 +357,8 @@ class ArtifactRunnerDialog(QDialog):
 
         platform = 'android' if is_android else 'ios'
 
-        from artifact_runner import list_artifacts
-        all_artifacts = list_artifacts(platform)
+        from artifact_runner import load_artifacts
+        all_artifacts, load_errors = load_artifacts(platform)
 
         def _exists(candidates):
             if streaming_index is not None:
@@ -385,8 +385,23 @@ class ArtifactRunnerDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
+        # Surface parser scripts that failed to import (e.g. a dependency that
+        # wasn't bundled into the frozen build).  Without this they'd silently
+        # disappear from the list, making it look like nothing matched.
+        if load_errors:
+            err_lines = "\n".join(f"  • {fn}: {msg}" for fn, msg in load_errors)
+            warn = QLabel(
+                "⚠ Some parser scripts could not be loaded and are unavailable:\n"
+                f"{err_lines}")
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #b00020; font-size: 11px;")
+            layout.addWidget(warn)
+
         if not available:
-            layout.addWidget(QLabel("No artifact parsers matched files in the loaded archive."))
+            layout.addWidget(QLabel(
+                "No parsers are available — see the errors above."
+                if load_errors else
+                "No artifact parsers matched files in the loaded archive."))
             close_btn = QPushButton("Close")
             close_btn.clicked.connect(self.reject)
             layout.addWidget(close_btn)
@@ -414,12 +429,15 @@ class ArtifactRunnerDialog(QDialog):
         inner_layout.setSpacing(5)
         self._checkboxes: list[tuple[QCheckBox, str, object]] = []
         for script_name, mod in available:
+            last = run_history.get(script_name)
             cb = QCheckBox(getattr(mod, 'name', script_name))
-            cb.setChecked(True)
+            # Default to unchecked for parsers already run to completion in this
+            # case — they don't need re-running.  Never-run and incomplete
+            # parsers stay ticked.
+            cb.setChecked(not (last and last['complete']))
             row = QHBoxLayout()
             row.setSpacing(10)
             row.addWidget(cb)
-            last = run_history.get(script_name)
             if last:
                 rows   = last['output_rows'] or 0
                 run_at = (last['run_at'] or '')[:10]

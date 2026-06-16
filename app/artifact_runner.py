@@ -52,12 +52,21 @@ else:
 
 # ── Loading ───────────────────────────────────────────────────────────────────
 
-def list_artifacts(platform: str) -> list[tuple[str, object]]:
-    """Return [(script_name, module), ...] for all valid scripts in artifacts/<platform>/."""
+def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[str, str]]]:
+    """Load all artifact scripts for a platform.
+
+    Returns (modules, errors):
+      modules — [(script_name, module), ...] for scripts that imported cleanly.
+      errors  — [(filename, message), ...] for scripts that failed to load,
+                e.g. a stdlib dependency that wasn't bundled into the frozen
+                build.  These are reported so the user knows a parser is
+                unavailable instead of it silently vanishing from the list.
+    """
     plat_dir = os.path.join(_ARTIFACTS_DIR, platform)
-    results = []
+    modules: list[tuple[str, object]] = []
+    errors:  list[tuple[str, str]]    = []
     if not os.path.isdir(plat_dir):
-        return results
+        return modules, errors
     for fname in sorted(os.listdir(plat_dir)):
         if not fname.endswith('.py') or fname.startswith('_'):
             continue
@@ -67,10 +76,18 @@ def list_artifacts(platform: str) -> list[tuple[str, object]]:
             spec = importlib.util.spec_from_file_location(script_name, path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            results.append((script_name, mod))
+            modules.append((script_name, mod))
         except Exception as exc:
+            errors.append((fname, f"{type(exc).__name__}: {exc}"))
             print(f"[artifact_runner] Could not load {fname}: {exc}")
-    return results
+    return modules, errors
+
+
+def list_artifacts(platform: str) -> list[tuple[str, object]]:
+    """Return [(script_name, module), ...] for all valid scripts in artifacts/<platform>/.
+
+    Thin wrapper over load_artifacts() for callers that don't need load errors."""
+    return load_artifacts(platform)[0]
 
 
 # ── File saving ───────────────────────────────────────────────────────────────

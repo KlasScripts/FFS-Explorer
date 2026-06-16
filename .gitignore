@@ -1,2 +1,5 @@
 venv/
-config/ffs_archives.json.claude/
+config/ffs_archives.json
+.claude/
+__pycache__/
+*.pyc

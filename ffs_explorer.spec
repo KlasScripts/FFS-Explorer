@@ -13,6 +13,7 @@ a = Analysis(
     datas=[
         # Bundle config JSON files under config/ next to the exe
         ('config/hardware_models.json', 'config'),
+        ('config/photo_flags.json', 'config'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),
         # Artifact parser scripts — loaded dynamically so PyInstaller can't
@@ -27,6 +28,15 @@ a = Analysis(
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',
+        # Artifact parser scripts (artifacts/) are loaded via importlib at
+        # runtime, so PyInstaller's import analysis never sees their imports.
+        # Any stdlib module used ONLY inside an artifact must be listed here or
+        # the script fails to load and the parser silently never appears.
+        # photos_metadata.py needs these:
+        'unicodedata',
+        'uuid',
+        'struct',
+        'plistlib',
     ],
     hookspath=[],
     hooksconfig={},

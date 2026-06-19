@@ -50,6 +50,7 @@ from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
 from keyword_search import KeywordSearchMixin
 from artifact_viewer import ArtifactViewerMixin
+from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from artifact_db import load_artifact_results
 from streaming_zip import StreamingZipIndex
 from zip_reader import read_nested_entry
@@ -3479,7 +3480,7 @@ def _do_path_change_check(
     return passed
 
 
-class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin):  # type: ignore[reportIncompatibleMethodOverride]
+class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, SqliteViewerMixin):  # type: ignore[reportIncompatibleMethodOverride]
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FFS Explorer")
@@ -3824,6 +3825,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.splitter.setStretchFactor(1, 1)
 
         hex_panel = self._setup_hex_panel(_section_style, _status_style)
+        # Add the generic SQLite browser as a third preview tab (Hex / Text / Database)
+        self._sql_tab_index = self.preview_tabs.addTab(
+            self._setup_sqlite_tab(), "Database")
 
         self.outer_splitter = QSplitter(Qt.Orientation.Vertical)
         self.outer_splitter.addWidget(self.splitter)
@@ -4568,6 +4572,19 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._load_text_preview(text, ui_path)
         else:
             self._clear_text_preview()
+        self._maybe_load_sqlite_preview(ui_path, data)
+
+    def _maybe_load_sqlite_preview(self, ui_path: str, data: bytes) -> None:
+        """Show the Database tab when *data* is a SQLite database (detected by
+        its header, not its extension); otherwise clear it so a stale database
+        isn't left on screen."""
+        if data[:16] == _SQLITE_MAGIC:
+            self._load_sqlite_preview(
+                ui_path, raw=data,
+                sidecar_reader=lambda suffix: self._read_zip_bytes(ui_path + suffix))
+            self.preview_tabs.setCurrentIndex(self._sql_tab_index)
+        else:
+            self._clear_sqlite_preview()
 
     def _load_nested_entry_preview(self, ui_path: str) -> None:
         """Read an entry from an extracted nested archive and display it."""
@@ -4588,6 +4605,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._load_text_preview(text, ui_path)
         else:
             self._clear_text_preview()
+        if data[:16] == _SQLITE_MAGIC:
+            stored = arch['stored_path']
+            self._load_sqlite_preview(
+                ui_path, raw=data,
+                sidecar_reader=lambda suffix: read_nested_entry(
+                    stored, entry_path + suffix))
+            self.preview_tabs.setCurrentIndex(self._sql_tab_index)
+        else:
+            self._clear_sqlite_preview()
 
     def _expand_to_private_var(self):
         """Expand the tree down to private/var on GrayKey load so its children
@@ -6894,6 +6920,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def closeEvent(self, event):
         self._stop_all_workers()
+        self._clear_sqlite_preview()
         super().closeEvent(event)
 
 

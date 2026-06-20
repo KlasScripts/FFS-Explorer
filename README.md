@@ -48,7 +48,8 @@ GrayKey uses a different approach, storing critical file metadata within **ZIP e
     *   **Hex** — lazily paginated, so even large files open instantly.
     *   **Text** — pretty-prints JSON, XML, and plist (binary plist included).
     *   **Database** — full SQLite browser (see below).
-*   **Media Browser:** Thumbnail grid for images and video, with frame extraction.
+    *   **SEGB** — record viewer for Apple's SEGB format (see below).
+*   **Media Browser:** Thumbnail grid for images. Video thumbnails via frame extraction (`ffmpeg`) are a **work in progress** — frames are not yet generated reliably and require a working `ffmpeg` setup, so videos may appear without a preview.
 *   **Keyword Search:** Search across the extraction, including inside nested archives.
 *   **Artefact Viewer:** Runs bundled parsers (e.g. `Photos.sqlite`, SMS, WhatsApp) and shows results in a sortable, filterable table.
 *   **Export & Audit:** Recursive directory export, data-integrity checks, and basic audit logging.
@@ -67,6 +68,21 @@ Databases are detected by **content** — the 16-byte `SQLite format 3` header �
 This makes it easy to *understand* how SQLite stores a table and its recent (WAL) activity, and to *validate* how a commercial tool presents the same database.
 
 > **Scope note:** the WAL view is a **net-change** comparison (last-checkpointed state vs. WAL-applied state). It is not a frame-by-frame WAL carve or a deleted-record recovery engine.
+
+---
+
+## 🧬 SEGB Record Viewer
+
+SEGB ("segmented buffer") is the record container Apple uses across many iOS data stores (Biome streams and others). Like the SQLite browser, SEGB files are detected by their **header** (`SEGB` magic), not by extension.
+
+*   **Record list:** each record's timestamp, state (Written / Deleted / Unknown), size, and CRC status; deleted records are highlighted.
+*   **Protobuf decoding with known schemas:** record payloads are protobuf. They are decoded with [`blackboxprotobuf`](https://pypi.org/project/blackboxprotobuf/) into an **expandable tree**. When the stream is recognised, a built-in **schema** gives fields the right types, human **names**, and timestamp/GUID rendering — these were ported from iLEAPP's `biome*` artifacts (21 streams). Unknown streams fall back to schema-less auto-decode.
+*   **Analysis aids** (when no schema applies): candidate **timestamp interpretations** for numeric fields (Unix / Mac-Cocoa), a **UTF-8 preview** and **nested-message decode** for byte fields (so a string mis-decoded as a sub-message is still readable), and **JSON export** of the records.
+*   **Editable, per-case schemas:** when the guess is wrong, **Edit schema…** lets you correct the typedef/labels/hints (seeded from the current guess) and **save it into the case database**, so it auto-applies to that stream next time. User schemas override the built-ins.
+
+Record parsing uses the MIT-licensed [`ccl_segb`](https://github.com/abrignoni/iLEAPP/tree/main/scripts/ccl_segb) library by Alex Caithness / CCL Forensics, vendored under `app/ccl_segb/` (see its `NOTICE`). The built-in stream schemas are ported from [iLEAPP](https://github.com/abrignoni/iLEAPP) (MIT) — credit to its authors for the field meanings.
+
+> **Scope note:** with no schema, field numbers are opaque and the type/timestamp inferences are heuristics for analyst review — they are not authoritative. Records marked *Deleted* may be partial and can fail to decode (shown as raw hex).
 
 ---
 

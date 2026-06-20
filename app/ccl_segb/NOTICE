@@ -1,0 +1,11 @@
+This directory vendors the `ccl_segb` library for reading Apple SEGB record
+files.
+
+Origin : https://github.com/abrignoni/iLEAPP/tree/main/scripts/ccl_segb
+Author : Alex Caithness, CCL Forensics
+License: MIT (Copyright 2023, CCL Forensics) — see the license headers in
+         ccl_segb.py, ccl_segb1.py, and ccl_segb2.py.
+
+The files are vendored unmodified so FFS Explorer can parse SEGB files without an
+external dependency. All credit for the SEGB parsing belongs to the original
+authors.

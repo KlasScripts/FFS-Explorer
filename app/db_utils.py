@@ -12,6 +12,7 @@ SQLite databases:
                      artifact_<name> tables (written by artifact_db.py)
 """
 
+import json
 import os
 import sqlite3
 
@@ -243,6 +244,18 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         ON search_scope_files (term_id)
     ''')
 
+    # User-defined / refined protobuf schemas for SEGB streams, keyed by the
+    # Biome stream name.  A user schema overrides the built-in one (segb_schemas).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS segb_schemas (
+            stream_key   TEXT NOT NULL PRIMARY KEY,
+            typedef_json TEXT NOT NULL DEFAULT '{}',
+            labels_json  TEXT NOT NULL DEFAULT '{}',
+            hints_json   TEXT NOT NULL DEFAULT '{}',
+            updated      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
+        )
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
     return conn
@@ -302,6 +315,43 @@ def save_guid_bundle_map(conn: 'sqlite3.Connection', mapping: dict) -> None:
 def load_guid_bundle_map(conn: 'sqlite3.Connection') -> dict:
     """Return {guid: bundle_id}, or {} if none saved."""
     return dict(conn.execute('SELECT guid, bundle_id FROM guid_bundle'))
+
+
+# ── SEGB protobuf schemas (user-defined, per case) ────────────────────────────
+
+def save_segb_schema(conn: 'sqlite3.Connection', stream_key: str, schema: dict) -> None:
+    """Persist a user schema {'typedef','labels','hints'} for *stream_key*."""
+    conn.execute(
+        'INSERT OR REPLACE INTO segb_schemas '
+        '(stream_key, typedef_json, labels_json, hints_json, updated) '
+        "VALUES (?,?,?,?, strftime('%Y-%m-%dT%H:%M:%S','now'))",
+        (stream_key,
+         json.dumps(schema.get('typedef', {})),
+         json.dumps(schema.get('labels', {})),
+         json.dumps(schema.get('hints', {}))),
+    )
+    conn.commit()
+
+
+def load_segb_schema(conn: 'sqlite3.Connection', stream_key: str) -> dict | None:
+    """Return the user schema for *stream_key* as {'typedef','labels','hints'},
+    or None if none saved."""
+    row = conn.execute(
+        'SELECT typedef_json, labels_json, hints_json FROM segb_schemas '
+        'WHERE stream_key = ?', (stream_key,)).fetchone()
+    if not row:
+        return None
+    try:
+        return {'typedef': json.loads(row[0]), 'labels': json.loads(row[1]),
+                'hints': json.loads(row[2])}
+    except Exception:
+        return None
+
+
+def delete_segb_schema(conn: 'sqlite3.Connection', stream_key: str) -> None:
+    """Remove the user schema for *stream_key* (revert to built-in)."""
+    conn.execute('DELETE FROM segb_schemas WHERE stream_key = ?', (stream_key,))
+    conn.commit()
 
 
 # ── Header types ──────────────────────────────────────────────────────────────

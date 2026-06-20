@@ -19,7 +19,7 @@ a = Analysis(
         # Artifact parser scripts — loaded dynamically so PyInstaller can't
         # detect them via import analysis; must be listed explicitly.
         ('artifacts', 'artifacts'),
-    ],
+    ] + collect_data_files('blackboxprotobuf'),
     hiddenimports=[
         # msgpack sometimes needs explicit nudging
         'msgpack',
@@ -37,7 +37,9 @@ a = Analysis(
         'uuid',
         'struct',
         'plistlib',
-    ],
+    ] + collect_submodules('blackboxprotobuf')
+      + collect_submodules('ccl_segb')
+      + ['google.protobuf', 'six'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

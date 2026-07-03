@@ -29,7 +29,7 @@ from contextlib import closing
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QSplitter, QTableView,
     QTreeView, QPushButton, QFileDialog, QHeaderView, QAbstractItemView,
-    QDialog, QPlainTextEdit, QDialogButtonBox, QMessageBox,
+    QDialog, QPlainTextEdit, QDialogButtonBox, QMessageBox, QCheckBox,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush
@@ -132,7 +132,9 @@ class SegbViewerMixin:
     # ── Setup ──────────────────────────────────────────────────────────────────
 
     def _setup_segb_tab(self) -> QWidget:
-        self._segb_records: list = []
+        self._segb_all: list = []            # every parsed record
+        self._segb_view: list = []           # [(orig_index, record)] currently shown
+        self._segb_show_deleted = False
         self._segb_name = ''
         self._segb_stream_key = None
         self._segb_schema = None
@@ -152,6 +154,12 @@ class SegbViewerMixin:
             lambda cur, _prev: self._on_segb_record_selected(cur.row()))
 
         self._segb_schema_label = QLabel("Schema: —")
+        self._segb_deleted_check = QCheckBox("Show deleted")
+        self._segb_deleted_check.setToolTip(
+            "Also list records the SEGB marked as deleted (off by default — "
+            "the view focuses on live records).")
+        self._segb_deleted_check.toggled.connect(self._on_segb_show_deleted_toggled)
+        self._segb_deleted_check.setVisible(False)
         self._segb_edit_btn = QPushButton("Edit schema…")
         self._segb_edit_btn.clicked.connect(self._edit_segb_schema)
         self._segb_edit_btn.setEnabled(False)
@@ -168,6 +176,7 @@ class SegbViewerMixin:
         bar.addWidget(QLabel("Records"))
         bar.addWidget(self._segb_schema_label)
         bar.addStretch(1)
+        bar.addWidget(self._segb_deleted_check)
         bar.addWidget(self._segb_edit_btn)
         bar.addWidget(self._segb_export_btn)
         top_l.addLayout(bar)
@@ -211,13 +220,40 @@ class SegbViewerMixin:
             self._segb_status_label.setText(f"{self._segb_name} is not a SEGB file.")
             return
 
-        self._segb_records = records
+        self._segb_all = records
+        self._segb_version = version
         self._segb_resolve_schema(ui_path)
+        self._segb_refresh_record_list()
 
-        for i, rec in enumerate(records):
+    @staticmethod
+    def _segb_is_empty(rec) -> bool:
+        """Empty records carry no usable payload — never shown."""
+        return rec.state == EntryState.Unknown or len(rec.data) == 0
+
+    def _segb_refresh_record_list(self) -> None:
+        """Rebuild the record list: live records always, deleted only when the
+        toggle is on, empty records never."""
+        live_n = sum(1 for r in self._segb_all
+                     if r.state == EntryState.Written and not self._segb_is_empty(r))
+        deleted_n = sum(1 for r in self._segb_all
+                        if r.state == EntryState.Deleted and not self._segb_is_empty(r))
+
+        view = []
+        for i, rec in enumerate(self._segb_all):
+            if self._segb_is_empty(rec):
+                continue
+            if rec.state == EntryState.Deleted and not self._segb_show_deleted:
+                continue
+            view.append((i, rec))
+        self._segb_view = view
+
+        sel = self._segb_table_view.selectionModel()
+        sel.blockSignals(True)
+        self._segb_record_model.removeRows(0, self._segb_record_model.rowCount())
+        for orig_i, rec in view:
             state = rec.state.name if isinstance(rec.state, EntryState) else str(rec.state)
             crc = ('OK' if rec.crc_passed else 'FAIL') if rec.state == EntryState.Written else '—'
-            cells = [str(i), str(getattr(rec, 'timestamp1', '')), state, str(len(rec.data)), crc]
+            cells = [str(orig_i), str(getattr(rec, 'timestamp1', '')), state, str(len(rec.data)), crc]
             items = []
             for text in cells:
                 it = QStandardItem(text)
@@ -226,15 +262,27 @@ class SegbViewerMixin:
                     it.setBackground(QBrush(_DELETED_BG))
                 items.append(it)
             self._segb_record_model.appendRow(items)
+        sel.blockSignals(False)
 
-        self._segb_export_btn.setEnabled(bool(records))
-        self._segb_edit_btn.setEnabled(bool(records) and _bbp() is not None)
+        self._segb_deleted_check.setVisible(deleted_n > 0)
+        self._segb_deleted_check.setText(f"Show deleted ({deleted_n})")
+        self._segb_export_btn.setEnabled(bool(view))
+        self._segb_edit_btn.setEnabled(bool(view) and _bbp() is not None)
+
         bbp_note = '' if _bbp() else '  ·  install blackboxprotobuf for record decoding'
+        extra = f' (+{deleted_n} deleted)' if (deleted_n and not self._segb_show_deleted) else ''
         self._segb_status_label.setText(
-            f"{self._segb_name} — SEGB {version} · {len(records)} "
-            f"record{'' if len(records) == 1 else 's'}{bbp_note}")
-        if records:
+            f"{self._segb_name} — SEGB {self._segb_version} · {live_n} live "
+            f"record{'' if live_n == 1 else 's'}{extra}{bbp_note}")
+
+        if view:
             self._segb_table_view.selectRow(0)
+        else:
+            self._segb_tree_model.removeRows(0, self._segb_tree_model.rowCount())
+
+    def _on_segb_show_deleted_toggled(self, checked: bool) -> None:
+        self._segb_show_deleted = checked
+        self._segb_refresh_record_list()
 
     # ── Schema resolution ─────────────────────────────────────────────────────────
 
@@ -271,9 +319,9 @@ class SegbViewerMixin:
 
     def _on_segb_record_selected(self, row: int) -> None:
         self._segb_tree_model.removeRows(0, self._segb_tree_model.rowCount())
-        if row < 0 or row >= len(self._segb_records):
+        if row < 0 or row >= len(self._segb_view):
             return
-        data = self._segb_records[row].data
+        data = self._segb_view[row][1].data
         root = self._segb_tree_model.invisibleRootItem()
 
         bbp = _bbp()
@@ -392,14 +440,15 @@ class SegbViewerMixin:
     # ── Schema editor ──────────────────────────────────────────────────────────────
 
     def _edit_segb_schema(self) -> None:
-        if not self._segb_records:
+        if not self._segb_view:
             return
         bbp = _bbp()
         seed = self._segb_schema or {'typedef': {}, 'labels': {}, 'hints': {}}
         if not self._segb_schema and bbp is not None:
-            row = max(self._segb_table_view.currentIndex().row(), 0)
+            row = min(max(self._segb_table_view.currentIndex().row(), 0),
+                      len(self._segb_view) - 1)
             try:
-                _, auto_td = bbp.decode_message(self._segb_records[row].data)
+                _, auto_td = bbp.decode_message(self._segb_view[row][1].data)
                 seed = {'typedef': auto_td, 'labels': {}, 'hints': {}}
             except Exception:
                 pass
@@ -444,9 +493,9 @@ class SegbViewerMixin:
             td = schema['typedef'] or None
             if td and bbp is not None:
                 try:
-                    bbp.decode_message(self._segb_records[0].data, td)
+                    bbp.decode_message(self._segb_view[0][1].data, td)
                 except Exception as exc:
-                    err.setText(f"typedef does not decode record 0: {exc}")
+                    err.setText(f"typedef does not decode the first record: {exc}")
                     return None
             err.setText("")
             self._segb_schema = schema
@@ -497,7 +546,7 @@ class SegbViewerMixin:
     # ── Export ───────────────────────────────────────────────────────────────────
 
     def _export_segb_json(self) -> None:
-        if not self._segb_records:
+        if not self._segb_view:
             return
         default = (self._segb_name or 'segb').rsplit('.', 1)[0] + '_records.json'
         path, _ = QFileDialog.getSaveFileName(
@@ -507,7 +556,7 @@ class SegbViewerMixin:
         bbp = _bbp()
         typedef = (self._segb_schema or {}).get('typedef') or None
         out = []
-        for i, rec in enumerate(self._segb_records):
+        for i, rec in self._segb_view:
             entry = {
                 'index': i,
                 'timestamp': getattr(rec, 'timestamp1', None),
@@ -543,7 +592,9 @@ class SegbViewerMixin:
     # ── Cleanup ────────────────────────────────────────────────────────────────
 
     def _clear_segb_preview(self) -> None:
-        self._segb_records = []
+        self._segb_all = []
+        self._segb_view = []
+        self._segb_show_deleted = False
         self._segb_stream_key = None
         self._segb_schema = None
         self._segb_schema_source = 'none'
@@ -551,6 +602,11 @@ class SegbViewerMixin:
             self._segb_record_model.removeRows(0, self._segb_record_model.rowCount())
         if hasattr(self, '_segb_tree_model'):
             self._segb_tree_model.removeRows(0, self._segb_tree_model.rowCount())
+        if hasattr(self, '_segb_deleted_check'):
+            self._segb_deleted_check.blockSignals(True)
+            self._segb_deleted_check.setChecked(False)
+            self._segb_deleted_check.setVisible(False)
+            self._segb_deleted_check.blockSignals(False)
         if hasattr(self, '_segb_export_btn'):
             self._segb_export_btn.setEnabled(False)
         if hasattr(self, '_segb_edit_btn'):

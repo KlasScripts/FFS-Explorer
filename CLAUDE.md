@@ -5,8 +5,8 @@ extractions (Cellebrite / GrayKey zips) without extracting them. Single-window
 app; one "case folder" per exhibit holds local caches and results.
 
 **Always run with the project venv:** `venv/bin/python ffs-explorer.py`
-(system Python lacks PySide6). Line counts ~16.5k total; `ffs-explorer.py`
-alone is ~7.3k — use the section map below instead of reading it whole.
+(system Python lacks PySide6). Line counts ~16.8k total; `ffs-explorer.py`
+alone is ~7.4k — use the section map below instead of reading it whole.
 
 ## Architecture in one paragraph
 
@@ -75,23 +75,27 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 
 ## ffs-explorer.py section map (approx. lines)
 
-- 100–580: prefs, archive-entry formatting, device-info readers (UFD/plist/build.prop)
-- 586–1002: `ExtractorWorker`; archive discovery/classification, photo-flag rules
-- 1003–1432: `ZipMetadataWorker` (first-open orchestration, cache load/save)
-- 1433–1740: `FileTableModel`, filter proxy, `ExportProgressDialog`
-- 1744–2384: settings/preferences dialogs, small scan workers, integrity check
-- 2385–3111: `ProcessDialog` (extraction/processing hub, artifact runs)
-- 3112–3496: `ArchiveSelectionDialog` (open/recent UI)
-- 3497–7283: `FastZipBrowser` — the main window:
-  - 3497–3999: `__init__` + column config; 4123–4460: filtering (text/date/type)
-  - 4527–4750: preview dispatch (`_load_file_preview` routes to mixin tabs)
-  - 4756–5320: tree/table selection, entry rows, context menus, export
-  - 5327–5460: time-column detection, Android detection, jump menu
-  - 5494–5880: processing entry, photo index, `start_loading` → `on_metadata_ready`, nested archives
-  - 5987–6540: folder view refresh, batched tree population, bookmarks
-  - 6542–6780: research-status styling/dialog (uses `research_store`)
-  - 6783–7280: lazy tree expansion, recents/`config/ffs_archives.json`, worker retirement, `closeEvent`
-- 7284+: Qt message handler, `__main__` (incl. stall-detector timer)
+- 100–680: prefs, archive-entry formatting, device-info readers
+  (UFD/plist/build.prop), photo-flag rules + `_build_photo_index`,
+  Windows-safe export path sanitizers (`_sanitize_export_rel`, `_fs_path`)
+- 681–1094: `ExtractorWorker`; archive discovery/classification
+- 1095–1539: `ZipMetadataWorker` (first-open orchestration, subprocess parse,
+  snapshot fast-path)
+- 1540–1953: `FileTableModel`, filter proxy, `ExportProgressDialog`
+- 1954–2491: settings/preferences dialogs, small scan workers, integrity check
+- 2492–3218: `ProcessDialog` (extraction/processing hub, artifact runs)
+- 3219–3603: `ArchiveSelectionDialog` (open/recent UI)
+- 3604–7420: `FastZipBrowser` — the main window:
+  - 3604–4100: `__init__` + column config; 4230–4570: filtering (text/date/type)
+  - 4690–4920: preview dispatch (`_load_file_preview` routes to mixin tabs)
+  - 4920–5430: tree/table selection, entry rows, context menus, export
+  - 5434–5570: time-column detection, Android detection, jump menu
+  - 5590–6000: processing entry, photo index, `start_loading` →
+    `on_metadata_ready` (+ `_start_case_meta_load` async DB extras), nested archives
+  - 6125–6670: folder view refresh, batched tree population, bookmarks
+  - 6680–6950: research-status styling/dialog (uses `research_store`)
+  - 6954–7420: lazy tree expansion, recents/`config/ffs_archives.json`, worker retirement, `closeEvent`
+- 7422+: Qt message handler, `__main__` (incl. stall-detector timer)
 
 ## Config & resources
 

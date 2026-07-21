@@ -36,6 +36,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       save_guid_bundle_map, load_guid_bundle_map,
                       save_folder_counts, save_folder_sizes, load_folder_data,
                       save_device_info, load_device_info,
+                      save_case_setting, load_case_setting,
                       upsert_device_info_field,
                       start_run_log, complete_run_log, load_last_run,
                       load_run_history,
@@ -126,6 +127,10 @@ def _load_prefs() -> dict:
         'case_data_root':  s.value('case_data_root', '', type=str),
         'case_name_slots': slots,
         'case_sort_order': s.value('case_sort_order', 'recent', type=str),
+        # AI access master switch (hides the feature entirely when off) and
+        # the default model backend offered when enabling on a case.
+        'ai_enabled':      s.value('ai_enabled', False, type=bool),
+        'ai_backend':      s.value('ai_backend', 'local', type=str),
     }
 
 
@@ -135,6 +140,8 @@ def _save_prefs(prefs: dict):
     for i, slot in enumerate(prefs.get('case_name_slots', _DEFAULT_CASE_NAME_SLOTS)):
         s.setValue(f'case_name_slot_{i}', slot)
     s.setValue('case_sort_order', prefs.get('case_sort_order', 'recent'))
+    s.setValue('ai_enabled', bool(prefs.get('ai_enabled', False)))
+    s.setValue('ai_backend', prefs.get('ai_backend', 'local'))
 
 
 # Formatted archive sizes, keyed by path.  Stat-ing every archive on each
@@ -2042,6 +2049,32 @@ class PreferencesDialog(QDialog):
         layout.addWidget(self._preview_label)
         self._update_preview()
 
+        # ── AI Access ─────────────────────────────────────────────────────────
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep2)
+        layout.addWidget(QLabel("<b>AI Access</b>"))
+        self._ai_check = QCheckBox(
+            "Allow AI access features (adds a Tools menu to share processed "
+            "case data with an AI client — always off per case until "
+            "explicitly enabled)")
+        self._ai_check.setChecked(bool(prefs.get('ai_enabled', False)))
+        layout.addWidget(self._ai_check)
+        ai_row = QHBoxLayout()
+        ai_row.addWidget(QLabel("Default model backend:"))
+        self._ai_backend_combo = QComboBox()
+        self._ai_backend_combo.addItem(
+            "Local model (LM Studio) — case data stays on this machine", "local")
+        self._ai_backend_combo.addItem(
+            "Claude (Anthropic cloud) — case data leaves this machine", "claude")
+        self._ai_backend_combo.setCurrentIndex(
+            1 if prefs.get('ai_backend', 'local') == 'claude' else 0)
+        self._ai_backend_combo.setEnabled(self._ai_check.isChecked())
+        self._ai_check.toggled.connect(self._ai_backend_combo.setEnabled)
+        ai_row.addWidget(self._ai_backend_combo, 1)
+        layout.addLayout(ai_row)
+
         # ── Buttons ───────────────────────────────────────────────────────────
         layout.addStretch()
         btn_row = QHBoxLayout()
@@ -2072,6 +2105,8 @@ class PreferencesDialog(QDialog):
             'case_data_root':  self._root_edit.text().strip(),
             'case_name_slots': slots,
             'case_sort_order': self._sort_combo.currentData(),
+            'ai_enabled':      self._ai_check.isChecked(),
+            'ai_backend':      self._ai_backend_combo.currentData(),
         })
         self.accept()
 
@@ -3663,19 +3698,24 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         prefs_act = QAction("Preferences…", self)
         prefs_act.triggered.connect(self._open_preferences)
         file_menu.addAction(prefs_act)
-        # AI access (embedded MCP server) — OFF by default, per-session,
-        # per-case; never persisted.  See _toggle_mcp_server.
-        tools_menu = menu_bar.addMenu("Tools")
+        # AI access (embedded MCP server).  Three consent layers:
+        #   1. global preference (ai_enabled) — feature hidden entirely when off
+        #   2. per-case enable via _toggle_mcp_server — never persisted as "on"
+        #   3. per-case model backend choice (local / claude), remembered in
+        #      the case's caseresults.db
+        self._tools_menu = menu_bar.addMenu("Tools")
         self._mcp_controller = None
+        self._mcp_backend = 'local'
         self._mcp_act = QAction("Enable AI Access (MCP Server)", self)
         self._mcp_act.setCheckable(True)
         self._mcp_act.setEnabled(False)          # needs an open case
         self._mcp_act.triggered.connect(self._toggle_mcp_server)
-        tools_menu.addAction(self._mcp_act)
+        self._tools_menu.addAction(self._mcp_act)
         self._mcp_copy_act = QAction("Copy MCP Config for This Case", self)
         self._mcp_copy_act.setEnabled(False)
         self._mcp_copy_act.triggered.connect(self._copy_mcp_config)
-        tools_menu.addAction(self._mcp_copy_act)
+        self._tools_menu.addAction(self._mcp_copy_act)
+        self._apply_ai_pref_visibility()
         self._view_path = ""
         self._view_is_recursive = False
         self._checked_folders: set = set()
@@ -5589,6 +5629,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._ffs_archives = self._load_ffs_archives()
             self.update_dropdown_ui()
             self._populate_recent_menu()
+            self._apply_ai_pref_visibility()
 
     def _unextracted_archive_count(self) -> int:
         """Number of discoverable archives not yet successfully extracted.
@@ -5894,11 +5935,68 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     # ── AI access (embedded MCP server) ───────────────────────────────────────
 
+    def _apply_ai_pref_visibility(self):
+        """Show/hide the whole AI feature per the global preference; turning
+        it off in Preferences also stops any running server."""
+        enabled = _load_prefs().get('ai_enabled', False)
+        self._tools_menu.menuAction().setVisible(enabled)
+        if not enabled:
+            self._shutdown_mcp_server("AI access turned off in Preferences")
+
+    def _mcp_consent_dialog(self, default_backend: str) -> str | None:
+        """Per-case consent + backend choice.  Returns 'local'/'claude', or
+        None if cancelled."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Enable AI Access for This Case?")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(520)
+        v = QVBoxLayout(dlg)
+        text = QLabel(
+            "This starts a local server (127.0.0.1 only, token-protected) "
+            "giving a connected AI client <b>read-only</b> access to this "
+            "case's processed data: parsed artifacts, search results, "
+            "bookmarks, device info, research notes, and file metadata "
+            "(paths and timestamps — never file contents).<br><br>"
+            "Every access is logged to the case's run_log. The server stops "
+            "when you disable it, load another archive, or close the app.")
+        text.setWordWrap(True)
+        v.addWidget(text)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Model backend for this case:"))
+        combo = QComboBox()
+        combo.addItem("Local model (LM Studio) — case data stays on this machine",
+                      "local")
+        combo.addItem("Claude (Anthropic cloud) — case data LEAVES this machine",
+                      "claude")
+        combo.setCurrentIndex(1 if default_backend == 'claude' else 0)
+        row.addWidget(combo, 1)
+        v.addLayout(row)
+        cloud_note = QLabel(
+            "⚠ Cloud backend: anything the AI reads is transmitted to "
+            "Anthropic's servers. Confirm this is permitted for this exhibit.")
+        cloud_note.setWordWrap(True)
+        cloud_note.setStyleSheet("color: #b8860b;")
+        cloud_note.setVisible(default_backend == 'claude')
+        combo.currentIndexChanged.connect(
+            lambda i: cloud_note.setVisible(combo.currentData() == 'claude'))
+        v.addWidget(cloud_note)
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dlg.reject)
+        ok = QPushButton("Enable")
+        ok.setDefault(True)
+        ok.clicked.connect(dlg.accept)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        v.addLayout(btns)
+        return combo.currentData() if dlg.exec() else None
+
     def _toggle_mcp_server(self, checked: bool):
         """Menu handler: per-case, per-session consent gate for AI access.
 
-        Off by default and never persisted; enabling shows an explicit
-        warning that a connected AI client transmits case data to its model.
+        Off by default and never persisted as 'on'; only the backend choice
+        (local vs claude) is remembered with the case.
         """
         if not checked:
             self._shutdown_mcp_server("disabled by user")
@@ -5908,23 +6006,24 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             QMessageBox.information(self, "AI Access",
                                     "Open and process a case first.")
             return
-        resp = QMessageBox.warning(
-            self, "Enable AI Access?",
-            "This starts a local server (127.0.0.1 only, token-protected) "
-            "giving a connected AI client READ-ONLY access to this case's "
-            "processed data: parsed artifacts, search results, bookmarks, "
-            "device info, research notes, and file metadata (paths and "
-            "timestamps — never file contents).\n\n"
-            "Anything the AI client reads is sent to its model. If that "
-            "model is cloud-hosted, case data leaves this machine — confirm "
-            "this is permitted for this exhibit.\n\n"
-            "Every access is logged to the case's run_log. The server stops "
-            "when you disable it, load another archive, or close the app.",
-            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        if resp != QMessageBox.StandardButton.Ok:
+        # Default backend: this case's remembered choice, else the global one.
+        default_backend = _load_prefs().get('ai_backend', 'local')
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                default_backend = load_case_setting(db, 'ai_backend',
+                                                    default_backend)
+        except Exception:
+            pass
+        backend = self._mcp_consent_dialog(default_backend)
+        if backend is None:
             self._mcp_act.setChecked(False)
             return
+        self._mcp_backend = backend
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                save_case_setting(db, 'ai_backend', backend)
+        except Exception:
+            pass
         try:
             from mcp_control import McpServerController
             from mcp_server import CaseContext
@@ -5953,17 +6052,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                                 f"Could not start MCP server: {exc}")
             return
         self._mcp_copy_act.setEnabled(True)
+        backend_label = ("local model" if self._mcp_backend == 'local'
+                         else "Claude (cloud)")
         self.status_bar.showMessage(
-            f"AI access ENABLED — MCP server on 127.0.0.1:{port} "
-            f"(read-only, all access logged)")
+            f"AI access ENABLED for {backend_label} — MCP server on "
+            f"127.0.0.1:{port} (read-only, all access logged)")
 
     def _copy_mcp_config(self):
-        if self._mcp_controller is None or not self._mcp_controller.running:
+        """Clipboard payload matches the case's chosen backend: mcp.json for
+        LM Studio, a `claude mcp add` command for Claude Code."""
+        ctl = self._mcp_controller
+        if ctl is None or not ctl.running:
             return
-        QApplication.clipboard().setText(self._mcp_controller.config_snippet())
-        self.status_bar.showMessage(
-            "MCP config copied — paste into the client's mcp.json "
-            "(LM Studio / Claude Code; Claude Desktop needs the mcp-remote shim).")
+        if self._mcp_backend == 'claude':
+            QApplication.clipboard().setText(
+                f'claude mcp add --transport http ffs-explorer {ctl.url()} '
+                f'--header "Authorization: Bearer {ctl.token}"')
+            self.status_bar.showMessage(
+                "Claude Code command copied — run it in a terminal, then "
+                "start `claude` and use the ffs-explorer tools.")
+        else:
+            QApplication.clipboard().setText(ctl.config_snippet())
+            self.status_bar.showMessage(
+                "MCP config copied — paste into LM Studio's mcp.json "
+                "(Program panel → Install → Edit mcp.json).")
 
     def _shutdown_mcp_server(self, reason: str = ""):
         """Stop the MCP server if running (user toggle, archive change,

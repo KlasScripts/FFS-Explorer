@@ -255,6 +255,13 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
     # User-defined / refined protobuf schemas for SEGB streams, keyed by the
     # Biome stream name.  A user schema overrides the built-in one (segb_schemas).
     conn.execute('''
+        CREATE TABLE IF NOT EXISTS case_settings (
+            key   TEXT NOT NULL PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    ''')
+
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS segb_schemas (
             stream_key   TEXT NOT NULL PRIMARY KEY,
             typedef_json TEXT NOT NULL DEFAULT '{}',
@@ -309,6 +316,20 @@ def check_results_schema(cache_dir: str) -> None:
 
 
 # ── GUID / bundle-ID map ──────────────────────────────────────────────────────
+
+def save_case_setting(conn: 'sqlite3.Connection', key: str, value: str) -> None:
+    """Persist one per-case setting (e.g. the AI backend chosen for this case)."""
+    conn.execute('INSERT OR REPLACE INTO case_settings (key, value) VALUES (?, ?)',
+                 (key, str(value)))
+    conn.commit()
+
+
+def load_case_setting(conn: 'sqlite3.Connection', key: str,
+                      default: str | None = None) -> str | None:
+    row = conn.execute('SELECT value FROM case_settings WHERE key=?',
+                       (key,)).fetchone()
+    return row[0] if row else default
+
 
 def save_guid_bundle_map(conn: 'sqlite3.Connection', mapping: dict) -> None:
     """Persist {guid: bundle_id} into the guid_bundle table."""

@@ -5,8 +5,8 @@ extractions (Cellebrite / GrayKey zips) without extracting them. Single-window
 app; one "case folder" per exhibit holds local caches and results.
 
 **Always run with the project venv:** `venv/bin/python ffs-explorer.py`
-(system Python lacks PySide6). Line counts ~17k total; `ffs-explorer.py`
-alone is ~7.6k — use the section map below instead of reading it whole.
+(system Python lacks PySide6). Line counts ~17.2k total; `ffs-explorer.py`
+alone is ~7.7k — use the section map below instead of reading it whole.
 
 ## Architecture in one paragraph
 
@@ -46,7 +46,8 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
   mismatch it is auto-deleted and rebuilt.
 - `caseresults.db` — precious results (never auto-deleted): search_index /
   search_results, bookmarks, device_info, run_log, user SEGB schemas
-  (`segb_schemas`), artifact parser output (`artifact_<name>` tables). On
+  (`segb_schemas`), per-case settings (`case_settings`, e.g. AI backend
+  choice), artifact parser output (`artifact_<name>` tables). On
   schema mismatch raises `OldSchemaError`.
 - (Heads-up: `zip_cd_cache.py`'s docstring still says "casedata.db" — stale
   name, the real file is `caseresults.db`.)
@@ -77,28 +78,30 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 
 ## ffs-explorer.py section map (approx. lines)
 
-- 100–680: prefs, archive-entry formatting, device-info readers
-  (UFD/plist/build.prop), photo-flag rules + `_build_photo_index`,
-  Windows-safe export path sanitizers (`_sanitize_export_rel`, `_fs_path`)
-- 681–1094: `ExtractorWorker`; archive discovery/classification
-- 1095–1539: `ZipMetadataWorker` (first-open orchestration, subprocess parse,
+- 100–687: prefs (incl. AI-access globals), archive-entry formatting,
+  device-info readers (UFD/plist/build.prop), photo-flag rules +
+  `_build_photo_index`, Windows-safe export path sanitizers
+  (`_sanitize_export_rel`, `_fs_path`)
+- 688–1101: `ExtractorWorker`; archive discovery/classification
+- 1102–1546: `ZipMetadataWorker` (first-open orchestration, subprocess parse,
   snapshot fast-path)
-- 1540–1953: `FileTableModel`, filter proxy, `ExportProgressDialog`
-- 1954–2491: settings/preferences dialogs, small scan workers, integrity check
-- 2492–3218: `ProcessDialog` (extraction/processing hub, artifact runs)
-- 3219–3603: `ArchiveSelectionDialog` (open/recent UI)
-- 3604–7420: `FastZipBrowser` — the main window:
-  - 3604–4100: `__init__` + column config; 4230–4570: filtering (text/date/type)
-  - 4690–4920: preview dispatch (`_load_file_preview` routes to mixin tabs)
-  - 4920–5430: tree/table selection, entry rows, context menus, export
-  - 5434–5570: time-column detection, Android detection, jump menu
-  - 5590–6100: processing entry, photo index, `start_loading` →
+- 1547–1960: `FileTableModel`, filter proxy, `ExportProgressDialog`
+- 1961–2526: settings/preferences dialogs, small scan workers, integrity check
+- 2527–3253: `ProcessDialog` (extraction/processing hub, artifact runs)
+- 3254–3638: `ArchiveSelectionDialog` (open/recent UI)
+- 3639–7640: `FastZipBrowser` — the main window:
+  - 3639–4140: `__init__` + column config (incl. Tools menu / AI access);
+    4270–4610: filtering (text/date/type)
+  - 4730–4960: preview dispatch (`_load_file_preview` routes to mixin tabs)
+  - 4960–5470: tree/table selection, entry rows, context menus, export
+  - 5475–5610: time-column detection, Android detection, jump menu
+  - 5630–6210: processing entry, photo index, `start_loading` →
     `on_metadata_ready` (+ `_start_case_meta_load` async DB extras),
-    AI-access toggle (`_toggle_mcp_server`), nested archives
-  - 6225–6770: folder view refresh, batched tree population, bookmarks
-  - 6780–7050: research-status styling/dialog (uses `research_store`)
-  - 7054–7530: lazy tree expansion, recents/`config/ffs_archives.json`, worker retirement, `closeEvent`
-- 7531+: Qt message handler, `__main__` (incl. stall-detector timer)
+    AI-access consent/toggle (`_toggle_mcp_server`), nested archives
+  - 6337–6880: folder view refresh, batched tree population, bookmarks
+  - 6892–7160: research-status styling/dialog (uses `research_store`)
+  - 7166–7640: lazy tree expansion, recents/`config/ffs_archives.json`, worker retirement, `closeEvent`
+- 7643+: Qt message handler, `__main__` (incl. stall-detector timer)
 
 ## Config & resources
 

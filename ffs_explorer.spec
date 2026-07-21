@@ -39,6 +39,10 @@ a = Analysis(
         'plistlib',
     ] + collect_submodules('blackboxprotobuf')
       + collect_submodules('ccl_segb')
+      # MCP server (Tools → Enable AI Access) is lazy-imported; uvicorn loads
+      # its event-loop/protocol modules dynamically, so both need collecting.
+      + collect_submodules('mcp')
+      + collect_submodules('uvicorn')
       + ['google.protobuf', 'six'],
     hookspath=[],
     hooksconfig={},

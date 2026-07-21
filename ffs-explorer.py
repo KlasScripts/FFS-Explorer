@@ -3663,6 +3663,19 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         prefs_act = QAction("Preferences…", self)
         prefs_act.triggered.connect(self._open_preferences)
         file_menu.addAction(prefs_act)
+        # AI access (embedded MCP server) — OFF by default, per-session,
+        # per-case; never persisted.  See _toggle_mcp_server.
+        tools_menu = menu_bar.addMenu("Tools")
+        self._mcp_controller = None
+        self._mcp_act = QAction("Enable AI Access (MCP Server)", self)
+        self._mcp_act.setCheckable(True)
+        self._mcp_act.setEnabled(False)          # needs an open case
+        self._mcp_act.triggered.connect(self._toggle_mcp_server)
+        tools_menu.addAction(self._mcp_act)
+        self._mcp_copy_act = QAction("Copy MCP Config for This Case", self)
+        self._mcp_copy_act.setEnabled(False)
+        self._mcp_copy_act.triggered.connect(self._copy_mcp_config)
+        tools_menu.addAction(self._mcp_copy_act)
         self._view_path = ""
         self._view_is_recursive = False
         self._checked_folders: set = set()
@@ -5686,6 +5699,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         case_dir, scan_headers = self._get_or_ask_case_dir(zip_path)
         if case_dir is None:
             return   # user cancelled the dialog
+        self._shutdown_mcp_server("archive changed")
         self._case_dir = case_dir
         self._photo_index = {}        # rebuilt in on_metadata_ready
         self._photos_prompt_shown = False
@@ -5817,6 +5831,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         QTimer.singleShot(0, partial(self._fetch_and_store_label, self.zip_path))
         self._refresh_artifact_tab()
         self._artifact_act.setEnabled(True)
+        self._mcp_act.setEnabled(True)
         # Header-type overrides and the photo index can take seconds of DB
         # reads on a big case; this whole slot runs between two frames, so
         # anything slow here is a beach ball.  Load them on the background
@@ -5876,6 +5891,91 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 self._refresh_folder_view(preserve_filter=True)
 
         QTimer.singleShot(10, _poll)
+
+    # ── AI access (embedded MCP server) ───────────────────────────────────────
+
+    def _toggle_mcp_server(self, checked: bool):
+        """Menu handler: per-case, per-session consent gate for AI access.
+
+        Off by default and never persisted; enabling shows an explicit
+        warning that a connected AI client transmits case data to its model.
+        """
+        if not checked:
+            self._shutdown_mcp_server("disabled by user")
+            return
+        if not getattr(self, '_case_dir', None) or not self.folder_map:
+            self._mcp_act.setChecked(False)
+            QMessageBox.information(self, "AI Access",
+                                    "Open and process a case first.")
+            return
+        resp = QMessageBox.warning(
+            self, "Enable AI Access?",
+            "This starts a local server (127.0.0.1 only, token-protected) "
+            "giving a connected AI client READ-ONLY access to this case's "
+            "processed data: parsed artifacts, search results, bookmarks, "
+            "device info, research notes, and file metadata (paths and "
+            "timestamps — never file contents).\n\n"
+            "Anything the AI client reads is sent to its model. If that "
+            "model is cloud-hosted, case data leaves this machine — confirm "
+            "this is permitted for this exhibit.\n\n"
+            "Every access is logged to the case's run_log. The server stops "
+            "when you disable it, load another archive, or close the app.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if resp != QMessageBox.StandardButton.Ok:
+            self._mcp_act.setChecked(False)
+            return
+        try:
+            from mcp_control import McpServerController
+            from mcp_server import CaseContext
+            if self._mcp_controller is None:
+                self._mcp_controller = McpServerController()
+            ctx = CaseContext(
+                case_dir=self._case_dir,
+                zip_path=self.zip_path or '',
+                get_ui_metadata=lambda: self.full_metadata,
+                get_folder_map=lambda: self.folder_map,
+                get_folder_sizes=lambda: self._folder_sizes,
+                get_guid_to_bundle=lambda: self.guid_to_bundle,
+                get_header_types=lambda: self._header_type_overrides,
+                adapter=getattr(self, '_adapter', None),
+            )
+            port, _token = self._mcp_controller.start(ctx)
+        except ImportError:
+            self._mcp_act.setChecked(False)
+            QMessageBox.warning(self, "AI Access",
+                                "The MCP server components (mcp/uvicorn) are "
+                                "not available in this build.")
+            return
+        except Exception as exc:
+            self._mcp_act.setChecked(False)
+            QMessageBox.warning(self, "AI Access",
+                                f"Could not start MCP server: {exc}")
+            return
+        self._mcp_copy_act.setEnabled(True)
+        self.status_bar.showMessage(
+            f"AI access ENABLED — MCP server on 127.0.0.1:{port} "
+            f"(read-only, all access logged)")
+
+    def _copy_mcp_config(self):
+        if self._mcp_controller is None or not self._mcp_controller.running:
+            return
+        QApplication.clipboard().setText(self._mcp_controller.config_snippet())
+        self.status_bar.showMessage(
+            "MCP config copied — paste into the client's mcp.json "
+            "(LM Studio / Claude Code; Claude Desktop needs the mcp-remote shim).")
+
+    def _shutdown_mcp_server(self, reason: str = ""):
+        """Stop the MCP server if running (user toggle, archive change,
+        app close).  Safe to call unconditionally."""
+        ctl = getattr(self, '_mcp_controller', None)
+        if ctl is not None and ctl.running:
+            ctl.stop()
+            if reason:
+                self.status_bar.showMessage(f"AI access disabled — {reason}")
+        if hasattr(self, '_mcp_act'):
+            self._mcp_act.setChecked(False)
+            self._mcp_copy_act.setEnabled(False)
 
     def _on_header_scan_progress(self, remaining: int):
         if remaining > 0:
@@ -7389,6 +7489,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if getattr(self, '_workers_stopped', False):
             return
         self._workers_stopped = True
+
+        # MCP server first — it's a daemon thread, but stopping it here means
+        # no AI client can read the case mid-teardown.
+        try:
+            ctl = getattr(self, '_mcp_controller', None)
+            if ctl is not None:
+                ctl.stop()
+        except Exception:
+            pass
 
         def _stop(worker, has_stop=False):
             try:

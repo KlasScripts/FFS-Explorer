@@ -5,8 +5,8 @@ extractions (Cellebrite / GrayKey zips) without extracting them. Single-window
 app; one "case folder" per exhibit holds local caches and results.
 
 **Always run with the project venv:** `venv/bin/python ffs-explorer.py`
-(system Python lacks PySide6). Line counts ~16.8k total; `ffs-explorer.py`
-alone is ~7.4k — use the section map below instead of reading it whole.
+(system Python lacks PySide6). Line counts ~17k total; `ffs-explorer.py`
+alone is ~7.6k — use the section map below instead of reading it whole.
 
 ## Architecture in one paragraph
 
@@ -71,6 +71,8 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `segb_schemas.py` | Built-in per-stream protobuf typedefs + field labels for known Biome streams; user-authored schemas persist to `caseresults.db` via `db_utils.save_segb_schema` and override the built-ins |
 | `artifact_runner.py` / `artifact_db.py` / `artifact_viewer.py` | Plugin system: parser scripts in `artifacts/ios|android/` (e.g. `photos_metadata.py`, `sms_messages.py`, `whatsapp.py`) run against the archive, results into `casedata.db`, browsed in Artifacts tab |
 | `research_store.py` | Global (cross-case) artifact research notes in `config/research_status.json`, keyed by stream/bundle identity, drives row colouring |
+| `mcp_server.py` | Read-only MCP server (tools + prompts) over processed case data; Qt-free; audit-logs every tool call to `run_log` (run_type `mcp`) |
+| `mcp_control.py` | Lifecycle for the embedded MCP server: uvicorn on a daemon thread, 127.0.0.1 + per-start bearer token; lazy-imports mcp/uvicorn (optional deps) |
 | `highlight_delegate.py` | Yellow highlight of active search term in views |
 
 ## ffs-explorer.py section map (approx. lines)
@@ -90,12 +92,13 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
   - 4690–4920: preview dispatch (`_load_file_preview` routes to mixin tabs)
   - 4920–5430: tree/table selection, entry rows, context menus, export
   - 5434–5570: time-column detection, Android detection, jump menu
-  - 5590–6000: processing entry, photo index, `start_loading` →
-    `on_metadata_ready` (+ `_start_case_meta_load` async DB extras), nested archives
-  - 6125–6670: folder view refresh, batched tree population, bookmarks
-  - 6680–6950: research-status styling/dialog (uses `research_store`)
-  - 6954–7420: lazy tree expansion, recents/`config/ffs_archives.json`, worker retirement, `closeEvent`
-- 7422+: Qt message handler, `__main__` (incl. stall-detector timer)
+  - 5590–6100: processing entry, photo index, `start_loading` →
+    `on_metadata_ready` (+ `_start_case_meta_load` async DB extras),
+    AI-access toggle (`_toggle_mcp_server`), nested archives
+  - 6225–6770: folder view refresh, batched tree population, bookmarks
+  - 6780–7050: research-status styling/dialog (uses `research_store`)
+  - 7054–7530: lazy tree expansion, recents/`config/ffs_archives.json`, worker retirement, `closeEvent`
+- 7531+: Qt message handler, `__main__` (incl. stall-detector timer)
 
 ## Config & resources
 
@@ -114,7 +117,9 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
   `pyinstaller ffs_explorer.spec` — that spec is the one that matters (past
   bugs came from applying bundling fixes to a spec CI didn't use).
 - The spec must bundle `app/ccl_segb` (vendored) and config seeds.
-- `requirements.txt`: msgpack, PySide6, blackboxprotobuf (+ pyobjc on macOS).
+- `requirements.txt`: msgpack, PySide6, blackboxprotobuf (+ pyobjc on macOS);
+  mcp + uvicorn are optional at runtime (lazy-imported by the AI-access
+  feature) but listed so frozen builds include them.
 
 ## Keeping this map current (instruction to Claude)
 

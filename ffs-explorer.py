@@ -583,6 +583,54 @@ def _read_device_info(zip_path: str) -> tuple[list[tuple[str,str,str]], str]:
         return [], ''
 
 
+def _compute_photo_flags(rules: dict, labels_str: str, face_ages_str: str) -> str:
+    """Map a photo's raw labels to triage flag categories (Weapon,
+    Document, …).  A face estimated Baby/Child adds 'Minor (face)' as a
+    review prompt.  Returns a compact comma-joined string, '' if none."""
+    label_set = {l.strip().lower()
+                 for l in (labels_str or '').split(',') if l.strip()}
+    hits = [flag for flag, terms in rules.items() if label_set & terms]
+    fa = (face_ages_str or '').lower()
+    if 'baby' in fa or 'child' in fa:
+        hits.append('Minor (face)')
+    return ', '.join(hits)
+
+
+def _build_photo_index(case_dir: str, rules: dict) -> dict:
+    """Build {asset_path: photo column values} from the photos_metadata
+    artifact table.  Module-level and Qt-free so it can run on the
+    background pool — on a large case this loads 100k+ rows."""
+    index: dict = {}
+    try:
+        with closing(_open_results_db(case_dir)) as db:
+            columns, rows = load_artifact_results(db, 'photos_metadata')
+    except Exception:
+        return index
+    if not rows or 'asset_path' not in columns:
+        return index
+    idx = {c: i for i, c in enumerate(columns)}
+
+    def get(r, col):
+        i = idx.get(col)
+        return (r[i] or '') if i is not None else ''
+
+    for r in rows:
+        key = get(r, 'asset_path')
+        if not key:
+            continue
+        status = ', '.join(x for x in (get(r, 'Favorite'),
+                                       get(r, 'Hidden'),
+                                       get(r, 'Trashed')) if x)
+        flags = _compute_photo_flags(rules, get(r, 'Labels'), get(r, 'Face Ages'))
+        index[key] = [
+            flags, get(r, 'Taken'), get(r, 'Added'), get(r, 'Original Name'),
+            get(r, 'Album'), get(r, 'Labels'), get(r, 'Origin'),
+            get(r, 'Camera'), get(r, 'Place'), get(r, 'GPS'),
+            get(r, 'Faces'), get(r, 'Face Ages'), status,
+        ]
+    return index
+
+
 # Characters NTFS rejects in a path segment (plus control bytes), and the
 # reserved DOS device names Windows refuses regardless of extension.
 _WIN_BAD_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
@@ -5589,62 +5637,45 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         i = ui_path.find('/Media/')
         return ui_path[i + 7:] if i >= 0 else None
 
-    def _load_photo_index(self):
+    def _load_photo_index(self, on_done=None):
         """(Re)build the asset_path → photo column values index from the
-        Photos Metadata artifact results, if present in the case DB."""
+        Photos Metadata artifact results, off the GUI thread.
+
+        Loading every photos_metadata row and computing flags takes seconds
+        on a large case, so the work runs on the background pool; the
+        finished dict is swapped in on the main thread, then on_done()."""
         self._photo_index = {}
         if not self._case_dir:
             return
-        try:
-            with closing(_open_results_db(self._case_dir)) as db:
-                columns, rows = load_artifact_results(db, 'photos_metadata')
-        except Exception:
-            return
-        if not rows or 'asset_path' not in columns:
-            return
-        idx = {c: i for i, c in enumerate(columns)}
+        self._photo_index_seq = getattr(self, '_photo_index_seq', 0) + 1
+        my_seq = self._photo_index_seq
+        fut = _BG_POOL.submit(_build_photo_index, self._case_dir,
+                              self._photo_flag_rules)
 
-        def get(r, col):
-            i = idx.get(col)
-            return (r[i] or '') if i is not None else ''
+        def _poll():
+            if my_seq != self._photo_index_seq:
+                return  # superseded by a newer rebuild or archive load
+            if not fut.done():
+                QTimer.singleShot(30, _poll)
+                return
+            try:
+                self._photo_index = fut.result()
+            except Exception:
+                return
+            if on_done:
+                on_done()
 
-        for r in rows:
-            key = get(r, 'asset_path')
-            if not key:
-                continue
-            status = ', '.join(x for x in (get(r, 'Favorite'),
-                                           get(r, 'Hidden'),
-                                           get(r, 'Trashed')) if x)
-            flags = self._compute_photo_flags(get(r, 'Labels'),
-                                              get(r, 'Face Ages'))
-            self._photo_index[key] = [
-                flags, get(r, 'Taken'), get(r, 'Added'), get(r, 'Original Name'),
-                get(r, 'Album'), get(r, 'Labels'), get(r, 'Origin'),
-                get(r, 'Camera'), get(r, 'Place'), get(r, 'GPS'),
-                get(r, 'Faces'), get(r, 'Face Ages'), status,
-            ]
-
-    def _compute_photo_flags(self, labels_str: str, face_ages_str: str) -> str:
-        """Map a photo's raw labels to triage flag categories (Weapon,
-        Document, …).  A face estimated Baby/Child adds 'Minor (face)' as a
-        review prompt.  Returns a compact comma-joined string, '' if none."""
-        label_set = {l.strip().lower()
-                     for l in (labels_str or '').split(',') if l.strip()}
-        hits = [flag for flag, terms in self._photo_flag_rules.items()
-                if label_set & terms]
-        fa = (face_ages_str or '').lower()
-        if 'baby' in fa or 'child' in fa:
-            hits.append('Minor (face)')
-        return ', '.join(hits)
+        QTimer.singleShot(10, _poll)
 
     def _on_photo_index_changed(self):
         """Rebuild the photo index after artifact parsers ran, then refresh
         the current view so the columns appear immediately."""
-        self._load_photo_index()
-        if self._view_is_recursive:
-            self._rebuild_file_view_from_checked(preserve_filter=True)
-        else:
-            self._refresh_folder_view(preserve_filter=True)
+        def _refresh():
+            if self._view_is_recursive:
+                self._rebuild_file_view_from_checked(preserve_filter=True)
+            else:
+                self._refresh_folder_view(preserve_filter=True)
+        self._load_photo_index(on_done=_refresh)
 
     def _open_new_ffs(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open ZIP", "", "ZIP (*.zip)")
@@ -5753,9 +5784,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._header_type_overrides = {}
         self._file_count_cache = {}
         if self._case_dir:
+            # Counts stay synchronous: one small blob unpack (~tens of ms),
+            # and row building falls back to a full recursive walk for any
+            # uncached folder — async here would reintroduce that stall.
             try:
                 with closing(_open_cache_db(self._case_dir)) as db:
-                    self._header_type_overrides = load_header_types(db)
                     self._file_count_cache, _ = load_folder_data(db)
             except Exception:
                 pass
@@ -5783,8 +5816,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # even when the label is already cached in ffs_archives.json.
         QTimer.singleShot(0, partial(self._fetch_and_store_label, self.zip_path))
         self._refresh_artifact_tab()
-        self._load_photo_index()
         self._artifact_act.setEnabled(True)
+        # Header-type overrides and the photo index can take seconds of DB
+        # reads on a big case; this whole slot runs between two frames, so
+        # anything slow here is a beach ball.  Load them on the background
+        # pool and repaint when they land.
+        self._start_case_meta_load()
         # Start background precomputation of folder counts if not already cached.
         if len(self._file_count_cache) < len(self.folder_map):
             QTimer.singleShot(300, self._start_precompute_folder_counts)
@@ -5797,6 +5834,48 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                           if self._folder_total_size(p) > 0]
             if actionable:
                 self._warn_and_select_missing(actionable)
+
+    def _start_case_meta_load(self):
+        """Load the heavy per-case DB extras after metadata_ready — header-
+        type overrides and the photo index — on the background pool, apply
+        on the main thread, and repaint the current view so the late-
+        arriving types/photo columns show up."""
+        case_dir = self._case_dir
+        if not case_dir:
+            return
+        rules = self._photo_flag_rules
+        self._case_meta_seq = getattr(self, '_case_meta_seq', 0) + 1
+        my_seq = self._case_meta_seq
+
+        def _load():
+            overrides = {}
+            try:
+                with closing(_open_cache_db(case_dir)) as db:
+                    overrides = load_header_types(db)
+            except Exception:
+                pass
+            return overrides, _build_photo_index(case_dir, rules)
+
+        fut = _BG_POOL.submit(_load)
+
+        def _poll():
+            if my_seq != self._case_meta_seq:
+                return  # a newer archive load superseded this one
+            if not fut.done():
+                QTimer.singleShot(30, _poll)
+                return
+            try:
+                overrides, photos = fut.result()
+            except Exception:
+                return
+            self._header_type_overrides = overrides
+            self._photo_index = photos
+            if self._view_is_recursive:
+                self._rebuild_file_view_from_checked(preserve_filter=True)
+            else:
+                self._refresh_folder_view(preserve_filter=True)
+
+        QTimer.singleShot(10, _poll)
 
     def _on_header_scan_progress(self, remaining: int):
         if remaining > 0:

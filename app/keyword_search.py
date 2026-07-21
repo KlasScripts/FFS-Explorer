@@ -644,8 +644,11 @@ class KeywordSearchMixin:
 
     # ── Scope combo ──────────────────────────────────────────────────────────
 
-    def _refresh_search_scope_combo(self):
-        """Rebuild the scope dropdown: fixed options + current bookmark groups."""
+    def _refresh_search_scope_combo(self, groups=None):
+        """Rebuild the scope dropdown: fixed options + current bookmark groups.
+
+        Pass *groups* when the caller already loaded them (the bookmark panel
+        does) — opening the results DB here would block the main thread."""
         prev = self.search_scope_combo.currentData()
         self.search_scope_combo.blockSignals(True)
         self.search_scope_combo.clear()
@@ -658,13 +661,14 @@ class KeywordSearchMixin:
             "Selected Files — search only currently selected files/folders\n"
             "BM: <group>    — search only files in that bookmark group"
         )
-        groups = []
-        if getattr(self, '_case_dir', None):
-            try:
-                with closing(_open_results_db(self._case_dir)) as db:
-                    groups = load_bookmark_groups(db)
-            except Exception:
-                pass
+        if groups is None:
+            groups = []
+            if getattr(self, '_case_dir', None):
+                try:
+                    with closing(_open_results_db(self._case_dir)) as db:
+                        groups = load_bookmark_groups(db)
+                except Exception:
+                    pass
         if groups:
             self.search_scope_combo.insertSeparator(self.search_scope_combo.count())
             for g in groups:

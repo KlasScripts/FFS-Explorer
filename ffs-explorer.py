@@ -52,6 +52,7 @@ from keyword_search import KeywordSearchMixin
 from artifact_viewer import ArtifactViewerMixin
 from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
+import research_store as _research
 from artifact_db import load_artifact_results
 from streaming_zip import StreamingZipIndex
 from zip_reader import read_nested_entry
@@ -77,7 +78,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QTabWidget, QSizePolicy,
                               QMessageBox, QCheckBox, QAbstractItemView,
                               QTreeWidget, QTreeWidgetItem, QTextEdit,
-                              QListWidget, QListWidgetItem, QDateEdit)
+                              QListWidget, QListWidgetItem, QDateEdit,
+                              QRadioButton)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QDate,
@@ -1442,6 +1444,11 @@ class FileTableModel(QAbstractTableModel):
     _BOLD_FONT         = QFont("Arial", weight=QFont.Weight.ExtraBold)
     _BOLD_ITALIC_FONT  = QFont("Arial", weight=QFont.Weight.ExtraBold, italic=True)
 
+    # Research-status styling callbacks (ui_path -> QColor|None / str|None),
+    # injected by _set_file_model so every model construction site gets them.
+    _research_fg  = None
+    _research_tip = None
+
     def __init__(self, headers, parent=None):
         super().__init__(parent)
         self._headers  = list(headers)
@@ -1476,7 +1483,13 @@ class FileTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.UserRole + 1:
             return row[2]
         if role == Qt.ItemDataRole.ForegroundRole:
+            if self._research_fg is not None:
+                c = self._research_fg(row[1])
+                if c is not None:
+                    return c
             return self._GREY_COLOR if row[4] else None
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return self._research_tip(row[1]) if self._research_tip else None
         if role == Qt.ItemDataRole.FontRole:
             if row[3]:
                 return self._BOLD_ITALIC_FONT if (len(row) > 5 and row[5]) else self._BOLD_FONT
@@ -3559,6 +3572,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._hide_empty_folders = True
         self._missing_plist_paths: set = set()
         self._tree_populating = False
+        # Guards for the batched tree populator: _tree_gen invalidates in-flight
+        # QTimer batches when the model is replaced; _tree_pending_jobs maps a
+        # parent ui_path to a drain function that synchronously finishes its
+        # in-flight population (needed by _ensure_children_loaded callers).
+        self._tree_gen = 0
+        self._tree_pending_jobs: dict = {}
         # (header_label, metadata_key) pairs for the time columns — set per archive
         self._time_cols: list[tuple[str, str]] = [('Changed', 'ctime'), ('Modified', 'mtime')]
 
@@ -3608,6 +3627,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._reset_tree_model()
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.tree_model)
+        # All tree rows are plain single-line text; telling Qt so replaces its
+        # O(n) per-item layout passes with O(1) math — without this, appending
+        # rows to a folder with tens of thousands of children triggers
+        # multi-hundred-ms relayouts on the main thread.
+        self.tree_view.setUniformRowHeights(True)
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.setAutoScroll(False)  # Prevent auto-scroll to selection
         self.tree_view.customContextMenuRequested.connect(self.show_tree_context_menu)
@@ -3859,6 +3883,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # detach, calling headerData on a freed Python wrapper → SIGSEGV.
         self.proxy_model.setSourceModel(model)
         self.file_model = model
+        model._research_fg  = self._research_fg_for_row
+        model._research_tip = self._research_tip_for_row
         model.filter_progress.connect(self._on_filter_progress)
         model.filter_done.connect(self._on_filter_done)
         self._apply_column_visibility()
@@ -4152,7 +4178,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _should_hide_folder(self, path: str) -> bool:
         """Return True when this folder should be suppressed from both tree and browser.
 
-        Single source of truth — used by _populate_tree_children and _classify_entry
+        Single source of truth — used by _populate_tree_children_batched and _classify_entry
         so the two views can never show different sets of folders.
 
         """
@@ -4499,6 +4525,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             pass
 
     def _reset_tree_model(self):
+        # Invalidate in-flight populate batches — their closures hold items of
+        # the model being replaced, and touching those after the swap would
+        # raise "Internal C++ object already deleted".
+        self._tree_gen += 1
+        self._tree_pending_jobs.clear()
         self.tree_model = QStandardItemModel()
         self.tree_model.setHorizontalHeaderLabels(['Folder Structure'])
         self.tree_model.itemChanged.connect(self.on_tree_item_changed)
@@ -4886,7 +4917,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _start_precompute_folder_counts(self):
         """Begin batch precomputation of all folder file counts on the main thread."""
         self._precompute_zip_path = self.zip_path
-        self._precompute_folders = list(self.folder_map.keys())
+        # Deepest-first: every recursive call finds its subfolders already
+        # cached, so each call only touches immediate children.  In arbitrary
+        # order the first near-root folder would walk the entire archive in
+        # one uninterruptible slot (hundreds of ms for 300k+ entries).
+        self._precompute_folders = sorted(
+            self.folder_map.keys(), key=lambda p: p.count('/'), reverse=True)
         self._precompute_batch_index = 0
         self._precompute_counts_batch()
 
@@ -4894,12 +4930,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if self.zip_path != self._precompute_zip_path:
             return  # archive changed; abort stale callbacks
         folders = self._precompute_folders
-        start = self._precompute_batch_index
-        end = min(start + 2000, len(folders))
-        for fp in folders[start:end]:
-            self._count_files_recursive(fp)
-        self._precompute_batch_index = end
-        if end < len(folders):
+        i = self._precompute_batch_index
+        deadline = time.monotonic() + FRAME_BUDGET_SECS
+        while i < len(folders):
+            self._count_files_recursive(folders[i])
+            i += 1
+            if time.monotonic() >= deadline:
+                break
+        self._precompute_batch_index = i
+        if i < len(folders):
             QTimer.singleShot(0, self._precompute_counts_batch)
         else:
             self._save_folder_counts_to_db()
@@ -4951,6 +4990,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # is actually clicked instead of paying it on every right-click.
             self._bookmark_submenu(
                 menu, partial(self._collect_bookmark_paths, folder_path))
+            self._research_menu_action(menu, folder_path)
             menu.addSeparator()
         export_act = QAction("📁 Export Folder (Recursive)", self)
         export_act.triggered.connect(partial(self.handle_export_request, is_tree=True))
@@ -5221,6 +5261,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if bm_paths:
             menu.addSeparator()
             self._bookmark_submenu(menu, bm_paths)
+
+        # Research status — single-target only (a mark applies to one artifact)
+        if count == 1 and ui_path:
+            self._research_menu_action(menu, ui_path)
 
         menu.exec(self.file_view.viewport().mapToGlobal(point))
 
@@ -5636,6 +5680,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def on_metadata_ready(self, data, folder_map, guid_map, zip_names, ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None, metadata_only_folders=None):
         self.full_metadata = data
         self.folder_map = folder_map
+        # New case: research colors depend on this device's iOS version
+        self._research_row_cache = {}
+        self._research_ios_cache = None
         self.guid_to_bundle = guid_map
         self.zip_names = zip_names
         self._adapter = ffs_adapter
@@ -6110,24 +6157,34 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         QTimer.singleShot(0, self._fit_splitter_to_tree)
         QTimer.singleShot(0, self._refresh_bookmark_panel)
 
-    def _populate_tree_children_batched(self, parent_item, parent_path, on_done=None):
-        """Add immediate folder children of parent_path in frame-sized batches
-        so the UI stays responsive for large archives or slow network paths."""
-        children = sorted(
-            p for p in self.folder_map.get(parent_path, [])
-            if p in self.folder_map or self._is_empty_folder_entry(p)
-        )
-        state = {'idx': 0}
+    def _populate_tree_children_batched(self, parent_item, parent_path,
+                                        on_done=None, synchronous=False):
+        """Add immediate folder children of parent_path to parent_item.
 
-        def _batch():
-            deadline = time.monotonic() + FRAME_BUDGET_SECS
+        The only up-front work is a plain string sort — all filtering happens
+        inside the frame-budgeted loop (the empty-folder check resolves each
+        entry, which is too slow to run for 50k children before the first
+        frame).  Batches abort if the tree model is replaced (_tree_gen), and
+        a synchronous drain is registered in _tree_pending_jobs so
+        _ensure_children_loaded callers can finish an in-flight population
+        on demand.  With synchronous=True the whole population runs before
+        returning."""
+        children = sorted(self.folder_map.get(parent_path, []))
+        state = {'idx': 0, 'done': False}
+        my_gen = self._tree_gen
+
+        def _step(deadline):
+            """Add children until done (returns True) or deadline hit."""
             while state['idx'] < len(children):
                 p = children[state['idx']]
                 state['idx'] += 1
                 in_fm = p in self.folder_map
+                is_empty_dir = not in_fm and self._is_empty_folder_entry(p)
+                if not in_fm and not is_empty_dir:
+                    continue  # genuine file — not a directory
                 if in_fm and self._should_hide_folder(p):
                     continue
-                if not in_fm and self._hide_empty_folders:
+                if is_empty_dir and self._hide_empty_folders:
                     continue
                 name = p.split('/')[-1]
                 item = QStandardItem(self._display_name(name))
@@ -6136,19 +6193,44 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 item.setCheckable(True)
                 item.setCheckState(Qt.CheckState.Checked if p in self._checked_folders
                                    else Qt.CheckState.Unchecked)
+                self._research_tree_style(item, p)
                 parent_item.appendRow(item)
                 if self.folder_map.get(p):
                     placeholder = QStandardItem()
                     placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
                     placeholder.setEditable(False)
                     item.appendRow(placeholder)
-                if time.monotonic() >= deadline:
-                    QTimer.singleShot(0, _batch)
-                    return
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+            return True
+
+        def _finish():
+            if state['done']:
+                return
+            state['done'] = True
+            self._tree_pending_jobs.pop(parent_path, None)
             if on_done:
                 on_done()
 
-        QTimer.singleShot(0, _batch)
+        def _drain():
+            if state['done'] or my_gen != self._tree_gen:
+                return
+            if _step(None):
+                _finish()
+
+        def _batch():
+            if state['done'] or my_gen != self._tree_gen:
+                return
+            if _step(time.monotonic() + FRAME_BUDGET_SECS):
+                _finish()
+            else:
+                QTimer.singleShot(0, _batch)
+
+        self._tree_pending_jobs[parent_path] = _drain
+        if synchronous:
+            _drain()
+        else:
+            QTimer.singleShot(0, _batch)
 
     def _fit_splitter_to_tree(self):
         """Resize the splitter so the tree panel is wide enough to show its
@@ -6168,18 +6250,44 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     # ── Bookmarks ─────────────────────────────────────────────────────────────
 
     def _refresh_bookmark_panel(self):
-        """Repopulate the bookmark list panel below the folder tree."""
+        """Repopulate the bookmark list panel below the folder tree.
+
+        The results DB is opened on the background pool — the first open of a
+        fresh case creates the schema, which took ~600 ms of main-thread hang
+        when done synchronously.  The UI update runs back on the main thread
+        via a polled future."""
         if not getattr(self, '_case_dir', None):
             return
-        try:
-            with closing(_open_results_db(self._case_dir)) as db:
+        case_dir = self._case_dir
+        self._bookmark_refresh_seq = getattr(self, '_bookmark_refresh_seq', 0) + 1
+        my_seq = self._bookmark_refresh_seq
+
+        def _load():
+            with closing(_open_results_db(case_dir)) as db:
                 groups = load_bookmark_groups(db)
                 if not groups:
                     save_bookmark_group(db, 'Evidence', 'Files directly relevant to the investigation')
                     save_bookmark_group(db, 'Interesting', 'Files worth reviewing further')
                     groups = load_bookmark_groups(db)
-        except Exception:
-            return
+            return groups
+
+        fut = _BG_POOL.submit(_load)
+
+        def _poll():
+            if my_seq != self._bookmark_refresh_seq:
+                return  # superseded by a newer refresh
+            if not fut.done():
+                QTimer.singleShot(30, _poll)
+                return
+            try:
+                groups = fut.result()
+            except Exception:
+                return
+            self._apply_bookmark_groups(groups)
+
+        QTimer.singleShot(10, _poll)
+
+    def _apply_bookmark_groups(self, groups):
         self._bookmark_list.clear()
         for g in groups:
             item = QListWidgetItem(f"{g['name']}  ({g['count']:,})")
@@ -6196,8 +6304,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._bookmark_list.setFixedHeight(list_h)
         QTimer.singleShot(0, self._fit_bookmark_panel_size)
         # Keep search scope combo in sync with current bookmark groups.
+        # Pass the already-loaded groups so it doesn't reopen the results DB.
         if hasattr(self, 'search_scope_combo'):
-            self._refresh_search_scope_combo()
+            self._refresh_search_scope_combo(groups)
 
     def _fit_bookmark_panel_size(self):
         """Shrink the left splitter's bookmark panel to exactly fit its content."""
@@ -6428,38 +6537,259 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     # ── End bookmarks ──────────────────────────────────────────────────────────
 
-    def _populate_tree_children(self, parent_item, parent_path):
-        """Add immediate folder children of parent_path to parent_item.
-        Each child that itself has children gets a placeholder so the tree
-        shows an expand arrow; actual grandchildren are loaded on demand."""
-        children = sorted(self.folder_map.get(parent_path, []))
-        for p in children:
-            in_fm = p in self.folder_map
-            is_empty_dir = not in_fm and self._is_empty_folder_entry(p)
-            if not in_fm and not is_empty_dir:
-                continue  # genuine file — not a directory
-            if in_fm and self._should_hide_folder(p):
-                continue
-            if is_empty_dir and self._hide_empty_folders:
-                continue
-            name = p.split('/')[-1]
-            item = QStandardItem(self._display_name(name))
-            item.setData(p, Qt.ItemDataRole.UserRole)
-            item.setEditable(False)
-            item.setCheckable(True)
-            item.setCheckState(Qt.CheckState.Checked if p in self._checked_folders
-                               else Qt.CheckState.Unchecked)
-            parent_item.appendRow(item)
-            # Add a placeholder so Qt shows the expand arrow without
-            # loading all grandchildren upfront.
-            if self.folder_map.get(p):
-                placeholder = QStandardItem()
-                placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
-                placeholder.setEditable(False)
-                item.appendRow(placeholder)
+    # ── Artifact research status (global knowledge base) ──────────────────────
+
+    def _research_key_for(self, ui_path):
+        """Research key for a path, or None if not markable."""
+        if not ui_path:
+            return None
+        return _research.key_for_path(ui_path, ui_path in self.folder_map)
+
+    def _research_row_style(self, ui_path):
+        """(QColor|None, tooltip|None) for a tree/table row, memoized.
+
+        Only the stream folder node carries a stream mark's color — the segb
+        files inside stay uncolored (their numeric names differ per
+        extraction, so the mark belongs to the stream, not the file).
+        """
+        cache = getattr(self, '_research_row_cache', None)
+        if cache is None:
+            cache = self._research_row_cache = {}
+        hit = cache.get(ui_path)
+        if hit is not None:
+            return hit
+        color = tip = None
+        is_folder = ui_path in self.folder_map
+        key = rec = None
+        if is_folder:
+            if _research.is_stream_dir(ui_path):
+                key = self._research_key_for(ui_path)
+        elif not _research.stream_key(ui_path):
+            key = self._research_key_for(ui_path)
+        if key:
+            rec = _research.get(key)
+        if rec:
+            dev_ios = self._research_device_ios()
+            c = _research.effective_color(rec, dev_ios)
+            if c:
+                color = QColor(c)
+            tip = _research.tooltip_for(key, rec, dev_ios)
+        cache[ui_path] = (color, tip)
+        return color, tip
+
+    def _research_device_ios(self):
+        """This case's iOS version ('' if unknown), cached per case folder.
+
+        Read from device_info in caseresults.db (written asynchronously after
+        archive load); the cache is invalidated when the case changes or the
+        device-info worker completes.
+        """
+        cd = self._case_dir
+        cached = getattr(self, '_research_ios_cache', None)
+        if cached is not None and cached[0] == cd:
+            return cached[1]
+        ver = ''
+        if cd:
+            try:
+                with closing(_open_results_db(cd)) as db:
+                    rows = load_device_info(db)
+                ver = next((data for f, data, _s in rows if f == 'iOS Version'), '')
+            except Exception:
+                ver = ''
+        self._research_ios_cache = (cd, ver)
+        return ver
+
+    def _research_fg_for_row(self, ui_path):
+        return self._research_row_style(ui_path)[0]
+
+    def _research_tip_for_row(self, ui_path):
+        return self._research_row_style(ui_path)[1]
+
+    def _research_tree_style(self, item, path):
+        """Apply (or clear) research color + tooltip on a tree item."""
+        color, tip = self._research_row_style(path)
+        item.setData(color, Qt.ItemDataRole.ForegroundRole)
+        item.setData(tip, Qt.ItemDataRole.ToolTipRole)
+
+    def _refresh_research_styling(self):
+        """Restyle everything after a mark is saved/cleared — no reload."""
+        self._research_row_cache = {}
+        self._research_ios_cache = None
+        if hasattr(self, 'file_view'):
+            self.file_view.viewport().update()
+        model = getattr(self, 'tree_model', None)
+        if model is None:
+            return
+        stack = [model.invisibleRootItem()]
+        while stack:
+            it = stack.pop()
+            for r in range(it.rowCount()):
+                child = it.child(r)
+                if child is None:
+                    continue
+                p = child.data(Qt.ItemDataRole.UserRole)
+                if p and p != _TREE_PLACEHOLDER:
+                    self._research_tree_style(child, p)
+                    stack.append(child)
+
+    def _research_menu_action(self, menu, ui_path):
+        """Append a 'Research Status…' action to *menu* if the path is markable."""
+        key = self._research_key_for(ui_path)
+        if not key:
+            return
+        rec = _research.get(key)
+        if not rec:
+            label = "🧪 Research Status…"
+        else:
+            outcome = _research.OUTCOME_LABELS.get(rec.get('outcome'), '?')
+            if _research.staleness(rec, self._research_device_ios()):
+                outcome += " — review needed"
+            label = f"🧪 Research Status ({outcome})…"
+        act = QAction(label, self)
+        act.triggered.connect(partial(self._research_status_dialog, ui_path))
+        menu.addSeparator()
+        menu.addAction(act)
+
+    def _research_status_dialog(self, ui_path):
+        """Record research about an artifact: outcome + dated required reason."""
+        key = self._research_key_for(ui_path)
+        if not key:
+            return
+        rec = _research.get(key)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Research Status")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(460)
+        layout = QVBoxLayout(dlg)
+        target = QLabel(f"<b>{_research.key_display(key)}</b>")
+        layout.addWidget(target)
+        scope = QLabel("Applies to every file of this Biome stream, in all cases."
+                       if key.startswith("stream:") else
+                       "Applies to every file with this name, in all cases.")
+        scope.setStyleSheet("color: #888;")
+        layout.addWidget(scope)
+        remind = QLabel("⚠ " + _research.GOSPEL_NOTE + " " + _research.AGEING_NOTE)
+        remind.setWordWrap(True)
+        remind.setStyleSheet("color: #b8860b;")
+        layout.addWidget(remind)
+        if rec:
+            assessed = _research.age_text(rec.get('assessed', ''))
+            age_col = '#b8860b' if _research.is_stale(rec.get('assessed', '')) else '#666'
+            extra = ""
+            if rec.get('published'):
+                extra += f" · published {rec['published']}"
+            if rec.get('ios_versions'):
+                extra += f" · tested iOS {rec['ios_versions']}"
+            cur = QLabel(
+                f"Currently: <b>{_research.OUTCOME_LABELS.get(rec.get('outcome'), '?')}</b>"
+                f" — assessed <span style='color:{age_col}'>{assessed}</span>{extra}")
+            cur.setWordWrap(True)
+            layout.addWidget(cur)
+            stale = _research.staleness(rec, self._research_device_ios())
+            if stale:
+                warn = QLabel("<b>⚠ REVIEW NEEDED for this case:</b><br>• "
+                              + "<br>• ".join(stale)
+                              + "<br>This mark may no longer apply — do your own "
+                                "review before dismissing or relying on this artifact.")
+                warn.setWordWrap(True)
+                warn.setStyleSheet(
+                    "color: #b8860b; border: 1px solid #b8860b; "
+                    "border-radius: 4px; padding: 6px;")
+                layout.addWidget(warn)
+        layout.addWidget(QLabel("Outcome:"))
+        radios = {}
+        radio_row = QHBoxLayout()
+        for oc in _research.OUTCOMES:
+            rb = QRadioButton(_research.OUTCOME_LABELS[oc])
+            radios[oc] = rb
+            radio_row.addWidget(rb)
+        radio_row.addStretch()
+        layout.addLayout(radio_row)
+        initial = rec.get('outcome') if rec else None
+        radios.get(initial, radios['unknown']).setChecked(True)
+        layout.addWidget(QLabel("Why (required — cite the research or source):"))
+        reason_edit = QTextEdit()
+        reason_edit.setFixedHeight(80)
+        reason_edit.setPlaceholderText(
+            "e.g. Covered by <paper/blog>: values only mirror data already in X…")
+        if rec:
+            reason_edit.setPlainText(rec.get('reason', ''))
+        layout.addWidget(reason_edit)
+        detail_row = QHBoxLayout()
+        ios_col = QVBoxLayout()
+        ios_col.addWidget(QLabel("iOS versions the research covered:"))
+        ios_edit = QLineEdit()
+        ios_edit.setPlaceholderText("e.g. 15, 16–17.2")
+        if rec:
+            ios_edit.setText(rec.get('ios_versions', ''))
+        ios_col.addWidget(ios_edit)
+        detail_row.addLayout(ios_col)
+        pub_col = QVBoxLayout()
+        pub_col.addWidget(QLabel("Research published (date):"))
+        pub_edit = QLineEdit()
+        pub_edit.setPlaceholderText("e.g. 2024-11")
+        if rec:
+            pub_edit.setText(rec.get('published', ''))
+        pub_col.addWidget(pub_edit)
+        detail_row.addLayout(pub_col)
+        layout.addLayout(detail_row)
+        err_label = QLabel()
+        err_label.setStyleSheet("color: red;")
+        layout.addWidget(err_label)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        btn_row.addWidget(save_btn)
+        if rec:
+            clear_btn = QPushButton("Clear Mark")
+
+            def _clear():
+                _research.remove(key)
+                dlg.accept()
+                self.status_bar.showMessage(
+                    f"Research mark cleared — {_research.key_display(key)}", 4000)
+                self._refresh_research_styling()
+            clear_btn.clicked.connect(_clear)
+            btn_row.addWidget(clear_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        def _try_save():
+            reason = reason_edit.toPlainText().strip()
+            if not reason:
+                err_label.setText("Reason cannot be blank — record why for future you.")
+                return
+            outcome = next(oc for oc, rb in radios.items() if rb.isChecked())
+            try:
+                _research.upsert(key, outcome, reason,
+                                 ios_versions=ios_edit.text(),
+                                 published=pub_edit.text())
+            except Exception as e:
+                err_label.setText(str(e))
+                return
+            dlg.accept()
+            self.status_bar.showMessage(
+                f"Research saved: {_research.OUTCOME_LABELS[outcome]} — "
+                f"{_research.key_display(key)}", 4000)
+            self._refresh_research_styling()
+        save_btn.clicked.connect(_try_save)
+        dlg.exec()
+
+    # ── End research status ────────────────────────────────────────────────────
 
     def _on_tree_item_expanded(self, index):
         """Lazy-load children when a tree node is expanded for the first time.
+
+        Population runs in frame-sized batches so folders with tens of
+        thousands of immediate children don't freeze the UI.  The placeholder
+        guard doubles as re-entry protection: once the placeholder is removed
+        a re-fired expanded signal returns early.  _tree_populating is NOT
+        held across the async span — it would silently drop user checkbox
+        ticks between batches, and new items can't emit spurious itemChanged
+        because setCheckState happens before appendRow.
 
         The scroll position is saved before children are added and restored
         after Qt's internal scrollTo settles, so expanding a node keeps the
@@ -6476,25 +6806,32 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         path = item.data(Qt.ItemDataRole.UserRole)
         if path is None:
             return
-        self._tree_populating = True
         item.removeRow(0)
-        self._populate_tree_children(item, path)
-        self._tree_populating = False
+        self._populate_tree_children_batched(item, path)
         QTimer.singleShot(0, lambda hpos=hpos, vpos=vpos: (
             self.tree_view.horizontalScrollBar().setValue(hpos),
             self.tree_view.verticalScrollBar().setValue(vpos)
         ))
 
     def _ensure_children_loaded(self, item):
-        """If item still holds only a placeholder, replace it with real children."""
+        """If item still holds only a placeholder, replace it with real children.
+
+        Synchronous by contract: callers (navigate_tree_to_path,
+        _expand_to_private_var, _tick_single_path) walk paths level by level
+        and need the complete child list before continuing.  If a batched
+        expansion for this folder is mid-flight, drain it to completion
+        instead of repopulating."""
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path is not None and path in self._tree_pending_jobs:
+            self._tree_pending_jobs[path]()
+            return
         if item.rowCount() == 1:
             placeholder = item.child(0)
             if placeholder and placeholder.data(Qt.ItemDataRole.UserRole) == _TREE_PLACEHOLDER:
-                path = item.data(Qt.ItemDataRole.UserRole)
                 if path is not None:
                     self._tree_populating = True
                     item.removeRow(0)
-                    self._populate_tree_children(item, path)
+                    self._populate_tree_children_batched(item, path, synchronous=True)
                     self._tree_populating = False
 
     def _find_tree_item(self, path: str):
@@ -6536,6 +6873,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         item.setEditable(False)
         item.setCheckable(True)
         item.setCheckState(check_state)
+        self._research_tree_style(item, ui_path)
         if self.folder_map.get(ui_path):
             placeholder = QStandardItem()
             placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
@@ -6807,6 +7145,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             entry['label'] = label
             self._save_ffs_archives()
             self.update_dropdown_ui()
+        # iOS version may only now be known — recheck research staleness colors
+        self._refresh_research_styling()
 
     def _entry_display(self, entry: dict, prefs: dict) -> str:
         """Build the display string for one archive entry using slot preferences."""
@@ -6955,9 +7295,37 @@ if __name__ == "__main__":
     # the worker target instead of opening another GUI window).
     import multiprocessing
     multiprocessing.freeze_support()
+    if sys.platform == "darwin":
+        # Dev runs from the bare interpreter inherit Python.app's bundle, so the
+        # Dock and menu bar say "Python". Patch the in-memory bundle info before
+        # Qt registers with the system. Bundled .app builds don't need this.
+        try:
+            from Foundation import NSBundle
+            _info = (NSBundle.mainBundle().localizedInfoDictionary()
+                     or NSBundle.mainBundle().infoDictionary())
+            if _info is not None:
+                _info["CFBundleName"] = "FFS Explorer"
+                _info["CFBundleDisplayName"] = "FFS Explorer"
+        except Exception:
+            pass
     qInstallMessageHandler(_qt_message_handler)
     app = QApplication(sys.argv)
+    app.setApplicationName("FFS Explorer")
+    app.setApplicationDisplayName("FFS Explorer")
     app.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
+    if os.environ.get('FFS_STALL_DEBUG'):
+        # Main-thread stall detector: a 50 ms heartbeat that reports whenever
+        # the event loop couldn't tick for >150 ms.
+        _hb = {'last': time.monotonic()}
+        def _stall_tick():
+            now = time.monotonic()
+            gap_ms = (now - _hb['last']) * 1000
+            if gap_ms > 150:
+                print(f"[stall] {gap_ms:.0f} ms", file=sys.stderr)
+            _hb['last'] = now
+        _stall_timer = QTimer()
+        _stall_timer.timeout.connect(_stall_tick)
+        _stall_timer.start(50)
     window = FastZipBrowser()
     app.aboutToQuit.connect(window._stop_all_workers)
     atexit.register(window._stop_all_workers)  # runs before Qt's atexit on exception exit

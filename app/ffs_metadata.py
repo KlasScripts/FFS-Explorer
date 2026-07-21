@@ -43,6 +43,13 @@ SNAPSHOT_VERSION = '2'
 # frame, so yielding the GIL between chunks keeps the UI animating.
 _SNAP_CHUNK = 40_000
 
+# When these passes run in the in-process QThread fallback (streaming archives,
+# header-scan runs, subprocess unavailable), pure-Python loops starve the GUI
+# thread of the GIL.  time.sleep(0) forces a GIL handoff; every ~4k iterations
+# keeps stalls well under a frame while adding negligible overhead — and it is
+# a no-op cost in the subprocess path.
+_YIELD_EVERY = 4096
+
 
 def _chunked(d: dict, n: int):
     """Yield successive dicts of at most n items from d."""
@@ -137,31 +144,38 @@ def _compute_folder_sizes(
     folder_bytes: dict[str, int] = {fp: 0 for fp in folder_map}
     total = len(folder_map)
     done = [0]
+    seen = 0
     _REPORT_EVERY = 2000
 
     # Step 1: direct file contributions into each immediate parent.
-    for fp, children in folder_map.items():
-        for child in children:
-            if child in folder_map:
-                continue  # subfolder — handled in step 2
-            if zip_ui_paths is not None:
-                in_zip = child in zip_ui_paths
-            else:
-                resolved = ffs_adapter.resolve(child)
-                in_zip = resolved in zip_names or resolved.lstrip('/') in zip_names
-            if not in_zip or not zip_sizes:
-                continue
-            raw = ffs_adapter.resolve(child)
-            # Bare directory entries are keyed with a trailing slash in zip_names.
-            if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
-                continue
-            size = zip_sizes.get(raw, zip_sizes.get(raw.lstrip('/'), 0))
-            folder_bytes[fp] += size
+    # With no size data (streaming archives) every child would be skipped
+    # anyway — don't pay n resolve() calls to find that out.
+    if zip_sizes:
+        for fp, children in folder_map.items():
+            for child in children:
+                if child in folder_map:
+                    continue  # subfolder — handled in step 2
+                if zip_ui_paths is not None:
+                    if child not in zip_ui_paths:
+                        continue
+                    raw = ffs_adapter.resolve(child)
+                else:
+                    raw = ffs_adapter.resolve(child)
+                    if raw not in zip_names and raw.lstrip('/') not in zip_names:
+                        continue
+                # Bare directory entries are keyed with a trailing slash in zip_names.
+                if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
+                    continue
+                size = zip_sizes.get(raw, zip_sizes.get(raw.lstrip('/'), 0))
+                folder_bytes[fp] += size
+                seen += 1
+                if seen % _YIELD_EVERY == 0:
+                    time.sleep(0)  # a single folder can hold 10k+ children
 
-        done[0] += 1
-        if progress_cb and done[0] % _REPORT_EVERY == 0:
-            progress_cb(done[0], total)
-            time.sleep(0)
+            done[0] += 1
+            if progress_cb and done[0] % _REPORT_EVERY == 0:
+                progress_cb(done[0], total)
+                time.sleep(0)
 
     # Step 2: propagate child totals up to parents, deepest folders first.
     for fp in sorted(folder_bytes, key=lambda p: p.count('/'), reverse=True):
@@ -191,6 +205,7 @@ def _find_metadata_only_folders(
     Only call this for iOS archives (Graykey / Cellebrite FFS), not Android.
     """
     cache: dict[str, str] = {}  # fp -> "metadata_only" | "empty" | "content"
+    seen = [0]  # children examined — drives periodic GIL yields
 
     def _check(fp: str) -> str:
         if fp in cache:
@@ -198,6 +213,9 @@ def _find_metadata_only_folders(
         cache[fp] = "empty"  # cycle guard
         has_metadata = False
         for child in folder_map.get(fp, []):
+            seen[0] += 1
+            if seen[0] % _YIELD_EVERY == 0:
+                time.sleep(0)  # yield GIL — this walk previously never did
             if child in folder_map:
                 cs = _check(child)
                 if cs == "content":
@@ -208,13 +226,13 @@ def _find_metadata_only_folders(
                 # "empty" subfolder — does not disqualify
             else:
                 if zip_ui_paths is not None:
-                    in_zip = child in zip_ui_paths
+                    if child not in zip_ui_paths:
+                        continue
+                    raw = ffs_adapter.resolve(child)
                 else:
-                    resolved = ffs_adapter.resolve(child)
-                    in_zip = resolved in zip_names or resolved.lstrip('/') in zip_names
-                if not in_zip:
-                    continue
-                raw = ffs_adapter.resolve(child)
+                    raw = ffs_adapter.resolve(child)
+                    if raw not in zip_names and raw.lstrip('/') not in zip_names:
+                        continue
                 if (raw + '/') in zip_names or (raw.lstrip('/') + '/') in zip_names:
                     continue  # bare directory entry — skip
                 if child.split('/')[-1] in _SYSTEM_METADATA_NAMES:
@@ -256,7 +274,7 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
             continue  # skip empty-string keys from malformed archives
         parent = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ""
         folder_map_sets[parent].add(ui_path)
-        if i % 20_000 == 0:
+        if i % _YIELD_EVERY == 0:
             time.sleep(0)   # yield GIL so the main thread can process events
     if status_cb:
         status_cb("Resolving folder hierarchy...")
@@ -271,7 +289,7 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
             else:
                 break
             current = parent
-        if i % 20_000 == 0:
+        if i % _YIELD_EVERY == 0:
             time.sleep(0)
     return {k: list(v) for k, v in folder_map_sets.items()}
 

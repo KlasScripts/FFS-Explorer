@@ -1,0 +1,13 @@
+{
+  "_note": "Research findings age \u2014 artifact behaviour changes between iOS versions. Re-verify old assessments.",
+  "marks": {
+    "stream:CarPlay.Connected": {
+      "assessed": "2026-07-19T06:42:32",
+      "ios_versions": "17.5,18.2,18.3",
+      "outcome": "no_value",
+      "published": "2025-02",
+      "reason": "Why CarPlay.Connected seems less useful: it's one of two biome streams that record CarPlay connection state (the other being _DKEvent.Carplay.IsConnected, which logs clean session start/end times). CarPlay.Connected instead logs raw boolean flips (key 1 = 0/1 for disconnected/connected) and often includes a redundant \"coming from disconnected\" record right before the real connection event \u2014 so it duplicates what _DKEvent.Carplay.IsConnected already gives you more cleanly, without adding new session-boundary info. It's there for corroboration, but the DKEvent stream is the more directly usable timeline of when a session started and ended.\nDevices/iOS versions tested: iPhone 14 (iOS 17.5), iPhone 14 Pro (iOS 18.2), iPhone 16 Pro (iOS 18.3.1), all connected to the author's Nissan Rogue.\nLink: Ridin' With Apple CarPlay 2"
+    }
+  },
+  "version": 1
+}

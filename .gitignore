@@ -3,3 +3,4 @@ config/ffs_archives.json
 .claude/
 __pycache__/
 *.pyc
+.DS_Store

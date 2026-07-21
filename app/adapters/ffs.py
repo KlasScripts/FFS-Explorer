@@ -25,6 +25,7 @@ Usage
 import plistlib
 import re
 import struct
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from itertools import batched
@@ -32,6 +33,11 @@ from itertools import batched
 import msgpack
 
 from . import graykey as _gk
+
+# GIL-handoff cadence for O(n)-over-all-entries loops.  These may run inside
+# the GUI process's worker QThread (in-process fallback paths), where a long
+# pure-Python loop starves the main thread; time.sleep(0) yields the GIL.
+_YIELD_EVERY = 4096
 
 _FS_RE = re.compile(r'^(filesystem\d+)/')
 
@@ -400,7 +406,9 @@ class FfsAdapter:
             _find_block = _gk._find_block
             _TAG_UT    = _gk._TAG_UT
             result = {}
-            for f in z.infolist():
+            for i, f in enumerate(z.infolist()):
+                if i % _YIELD_EVERY == 0:
+                    time.sleep(0)
                 if f.filename.endswith('/'):
                     continue
                 name = f.filename.rstrip('/')
@@ -433,6 +441,10 @@ class FfsAdapter:
             for candidate in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
                 try:
                     with z.open(candidate) as f:
+                        # Single GIL hold for the whole unpack (~1-2 s for a large
+                        # archive): a top-level msgpack map cannot be chunk-decoded
+                        # without changing the metadata format.  The dominant path
+                        # avoids this via subprocess parse + chunked snapshot.
                         raw = msgpack.unpack(f)
                 except KeyError:
                     continue
@@ -457,7 +469,9 @@ class FfsAdapter:
         old_strip = (prefix + 'private/var/') if self.old_layout else None
 
         result: dict[str, str] = {}
-        for entry in zip_names:
+        for i, entry in enumerate(zip_names):
+            if i % _YIELD_EVERY == 0:
+                time.sleep(0)  # runs in the worker QThread — yield the GIL
             phys = entry.rstrip('/')
             if not phys.startswith(prefix):
                 continue
@@ -493,6 +507,7 @@ class FfsAdapter:
             _emit("Reading metadata.msgpack...")
             for mp_path in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
                 if mp_path in streaming_index:
+                    # Single GIL hold — see the load_metadata unpack comment.
                     raw: dict = msgpack.unpackb(
                         streaming_index.get_entry(mp_path).read(), raw=False)
                     break
@@ -545,7 +560,9 @@ class FfsAdapter:
         # raw_data can be queried directly, eliminating ~490k resolve() calls
         # and one full in-memory copy of the metadata dict.
         guid_meta: dict = {}
-        for k, v in raw_data.items():
+        for i, (k, v) in enumerate(raw_data.items()):
+            if i % _YIELD_EVERY == 0:
+                time.sleep(0)
             if '-' in k:
                 guid_meta[self.resolve(k)] = v
 
@@ -564,13 +581,14 @@ class FfsAdapter:
         # Pass 2 — enrich: msgpack is a read-only lookup; it never introduces new
         # keys.  Anything in the msgpack but absent from the zip simply doesn't
         # exist as far as the browser is concerned — no "Not in Zip" entries.
-        ui_metadata: dict = {
-            ui_path: (
+        ui_metadata: dict = {}
+        for i, (ui_path, phys) in enumerate(_zip_entries.items()):
+            if i % _YIELD_EVERY == 0:
+                time.sleep(0)
+            ui_metadata[ui_path] = (
                 raw_data.get(ui_path)
                 or (guid_meta.get(phys) if '-' in ui_path else None)
                 or {}
             )
-            for ui_path, phys in _zip_entries.items()
-        }
 
         return ui_metadata, guid_to_bundle, zip_ui_paths

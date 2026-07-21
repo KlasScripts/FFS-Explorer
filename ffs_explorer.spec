@@ -59,6 +59,18 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+_UPX_EXCLUDE = [
+    # UPX-packing Qt, Python, and MSVC runtime DLLs is the classic source of
+    # antivirus false positives and occasional broken Qt plugin loads, and
+    # Defender re-scans the unpacked images on every launch.
+    'Qt6*.dll',
+    'PySide6*',
+    'python*.dll',
+    'vcruntime*.dll',
+    'msvcp*.dll',
+    'ucrtbase.dll',
+]
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -69,6 +81,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,                       # compress binaries — set False if UPX causes AV flags
+    upx_exclude=_UPX_EXCLUDE,
     console=False,                  # no console window (GUI app)
     disable_windowed_traceback=False,
     target_arch=None,
@@ -84,6 +97,6 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=_UPX_EXCLUDE,
     name='ffs-explorer',         # output folder name inside dist/
 )

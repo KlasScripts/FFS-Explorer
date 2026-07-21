@@ -583,6 +583,53 @@ def _read_device_info(zip_path: str) -> tuple[list[tuple[str,str,str]], str]:
         return [], ''
 
 
+# Characters NTFS rejects in a path segment (plus control bytes), and the
+# reserved DOS device names Windows refuses regardless of extension.
+_WIN_BAD_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+_WIN_RESERVED  = frozenset(
+    ['CON', 'PRN', 'AUX', 'NUL']
+    + [f'COM{i}' for i in range(1, 10)]
+    + [f'LPT{i}' for i in range(1, 10)])
+
+
+def _sanitize_export_rel(rel_path: str) -> str:
+    """Make an archive-relative path safe to create on the local filesystem.
+
+    The filename keeps the leading-dot rename (exports must not produce
+    hidden files).  On Windows, every segment also gets illegal characters
+    replaced with '_', trailing dots/spaces trimmed (Windows strips them
+    silently, causing collisions), and reserved device names prefixed —
+    iOS paths regularly contain segments NTFS would otherwise reject.
+    """
+    segments = [s for s in re.split(r'[\\/]+', rel_path) if s not in ('', '.', '..')]
+    if not segments:
+        return '_'
+    if segments[-1].startswith('.'):
+        segments[-1] = '_' + segments[-1][1:]
+    if sys.platform == 'win32':
+        segments = [
+            ('_' + s if s.split('.', 1)[0].upper() in _WIN_RESERVED else s) or '_'
+            for s in (_WIN_BAD_CHARS.sub('_', seg).rstrip(' .') for seg in segments)
+        ]
+    return os.path.join(*segments)
+
+
+def _fs_path(path: str) -> str:
+    r"""Long-path-safe form of *path* for open()/makedirs() on Windows.
+
+    Deep iOS container paths + a destination folder easily exceed MAX_PATH
+    (260); the \\?\ prefix lifts the limit without requiring the registry
+    long-path opt-in.  Returns *path* unchanged elsewhere."""
+    if sys.platform != 'win32':
+        return path
+    path = os.path.abspath(path)
+    if path.startswith('\\\\?\\'):
+        return path
+    if path.startswith('\\\\'):          # UNC share → \\?\UNC\server\share\…
+        return '\\\\?\\UNC' + path[1:]
+    return '\\\\?\\' + path
+
+
 class ExtractorWorker(QThread):
     file_count = Signal(int)          # total files, emitted once before loop
     progress   = Signal(int, int)     # (current, total)
@@ -645,11 +692,8 @@ class ExtractorWorker(QThread):
                         return
 
                     physical_path = self.path_resolver(ui_path)
-                    path_segments = list(os.path.split(rel_path))
-                    if path_segments[1].startswith('.'):
-                        path_segments[1] = '_' + path_segments[1][1:]
-                    sanitized_rel = os.path.join(*path_segments)
-                    dest_path = os.path.join(self.dest_dir, sanitized_rel)
+                    sanitized_rel = _sanitize_export_rel(rel_path)
+                    dest_path = _fs_path(os.path.join(self.dest_dir, sanitized_rel))
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
                     if i % 50 == 0 or i == total - 1:

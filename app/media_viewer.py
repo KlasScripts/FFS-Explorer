@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sqlite3
+import sys
 import zipfile
 from itertools import batched
 
@@ -26,20 +27,38 @@ _THUMB_BATCH_COMMIT = 20   # inserts to accumulate before a single db.commit()
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
+# Keep ffmpeg from flashing a console window on every call — in the frozen
+# windowed exe each bare subprocess.run pops (and steals focus to) a black
+# console.  No-op everywhere but Windows.
+_SUBPROC_FLAGS = (
+    {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {})
+
+
 def _find_ffmpeg() -> str | None:
-    """Return the absolute path to ffmpeg, or None if not found."""
+    """Return the absolute path to ffmpeg, or None if not found.
+
+    Checked in order: PATH, then next to the frozen exe (drop ffmpeg.exe into
+    the dist folder — no PATH editing needed), then Homebrew locations."""
     if not hasattr(_find_ffmpeg, '_result'):
         import shutil
         candidate = shutil.which('ffmpeg')
         if candidate is None:
-            for p in ('/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'):
+            if sys.platform == 'win32':
+                base = (os.path.dirname(sys.executable)
+                        if getattr(sys, 'frozen', False)
+                        else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                fallbacks = (os.path.join(base, 'ffmpeg.exe'),)
+            else:
+                fallbacks = ('/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg')
+            for p in fallbacks:
                 if os.path.isfile(p):
                     candidate = p
                     break
         if candidate:
             try:
                 subprocess.run([candidate, '-version'],
-                               capture_output=True, timeout=3, check=True)
+                               capture_output=True, timeout=3, check=True,
+                               **_SUBPROC_FLAGS)
             except Exception:
                 candidate = None
         _find_ffmpeg._result = candidate
@@ -66,6 +85,7 @@ def _video_frame_bytes(video_data: bytes) -> bytes | None:
                 input=video_data,
                 capture_output=True,
                 timeout=30,
+                **_SUBPROC_FLAGS,
             )
             if result.returncode == 0 and result.stdout:
                 return result.stdout

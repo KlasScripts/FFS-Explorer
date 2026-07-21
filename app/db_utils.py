@@ -49,6 +49,9 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
 
     conn = sqlite3.connect(db_path, timeout=5)
     conn.execute('PRAGMA journal_mode=WAL')
+    # WAL's default synchronous=FULL fsyncs every commit — costly on Windows.
+    # NORMAL is the standard WAL pairing and this DB is rebuildable anyway.
+    conn.execute('PRAGMA synchronous=NORMAL')
 
     ver = conn.execute('PRAGMA user_version').fetchone()[0]
     if ver != 0 and ver != _CACHE_SCHEMA_VERSION:
@@ -59,6 +62,7 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
             pass
         conn = sqlite3.connect(db_path, timeout=5)
         conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS thumbnails (
@@ -144,6 +148,9 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
 
     conn = sqlite3.connect(db_path, timeout=5)
     conn.execute('PRAGMA journal_mode=WAL')
+    # NORMAL keeps WAL durability across app crashes (a whole-OS crash can
+    # lose the last commit, which is acceptable even for the results DB).
+    conn.execute('PRAGMA synchronous=NORMAL')
     conn.execute('PRAGMA foreign_keys=ON')
 
     ver = conn.execute('PRAGMA user_version').fetchone()[0]

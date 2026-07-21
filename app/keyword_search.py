@@ -2,6 +2,7 @@
 
 import sqlite3
 import threading
+import time
 import zipfile
 from contextlib import closing
 from itertools import batched
@@ -289,10 +290,17 @@ class KeywordSearchWorker(QThread):
                 pass
             return results
 
+        # Throttle progress: one queued signal per file means hundreds of
+        # thousands of GUI label repaints on a full-archive search — the main
+        # thread ends up busier than the search itself.
+        _last_prog = 0.0
         for entry, entry_results in reader.run_parallel(
                 entries, search_entry, cancel_check=self._stop.is_set):
             done += 1
-            self.progress.emit(done, total)
+            now = time.monotonic()
+            if now - _last_prog >= 0.1 or done == total:
+                _last_prog = now
+                self.progress.emit(done, total)
             try:
                 name = entry[0]
                 for file_offset, context in entry_results:
@@ -341,6 +349,14 @@ class NestedArchiveSearchWorker(QThread):
         total = len(all_entries)
         self.progress.emit(0, total)
         hits = done = 0
+        _last_prog = 0.0
+
+        def _report():
+            nonlocal _last_prog
+            now = time.monotonic()
+            if now - _last_prog >= 0.1 or done == total:
+                _last_prog = now
+                self.progress.emit(done, total)
 
         for archive_ui_path, stored_path, entry_path in all_entries:
             if self._stop.is_set():
@@ -348,7 +364,7 @@ class NestedArchiveSearchWorker(QThread):
             data = read_nested_entry(stored_path, entry_path)
             if data is None:
                 done += 1
-                self.progress.emit(done, total)
+                _report()
                 continue
 
             data_lower = data.lower()
@@ -371,7 +387,7 @@ class NestedArchiveSearchWorker(QThread):
                 hits += 1
                 self.result_found.emit(vpath, idx, context, stored_path, entry_path)
             done += 1
-            self.progress.emit(done, total)
+            _report()
 
         self.finished.emit(hits, done, total)
 

@@ -338,10 +338,12 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
             pass
 
         # Only Cellebrite iOS uses the Pass-1 zip-entry precompute.
-        precomputed = (
-            ffs_adapter.build_zip_entries(zip_names)
-            if ffs_adapter.format == FfsAdapter.FORMAT_CELLEBRITE else None
-        )
+        precomputed = None
+        if ffs_adapter.format == FfsAdapter.FORMAT_CELLEBRITE:
+            # ~500k-entry pass — without its own status it sits under a stale
+            # "Reading zip directory..." message.
+            status(f"Scanning user partition ({ffs_adapter.user_prefix})…")
+            precomputed = ffs_adapter.build_zip_entries(zip_names)
         ui_metadata, guid_to_bundle, zip_ui_paths = ffs_adapter.build_ui_metadata(
             zip_path, zip_names,
             z=z_ctx,
@@ -387,7 +389,7 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
     else:
         metadata_only = set()
 
-    status("Saving load cache…")
+    status("Packing snapshot…")
     adapter_args = [ffs_adapter.format, ffs_adapter.user_prefix,
                     ffs_adapter.sys_prefix, ffs_adapter.old_layout]
     snapshot_blob = pack_snapshot(
@@ -442,7 +444,7 @@ def _parse_child(conn, zip_path: str, case_dir: str) -> None:
             except Exception:
                 pass
         result = parse_archive_metadata(zip_path, case_dir, status_cb=status)
-        status("Saving load cache…")
+        status("Writing case cache…")
         persist_result(case_dir, result)
         conn.send(('done',))
     except Exception:

@@ -1069,12 +1069,16 @@ class ZipMetadataWorker(QThread):
         self.scan_headers = scan_headers
         self.case_dir = case_dir
 
-    def _try_load_from_snapshot(self) -> bool:
+    def _try_load_from_snapshot(self, first_load: bool = False) -> bool:
         """Fast re-open: restore the previous load's full result from casecache.db.
 
         Skips the .zcd parse, format detection, metadata read (msgpack /
         extra fields), folder-tree build, and metadata-only scan.  Returns
         True if the snapshot was emitted, False to fall back to a full load.
+
+        first_load only changes the status wording: right after the child
+        process parsed the archive, "from local cache" reads as if the parse
+        was thrown away.
         """
         try:
             with closing(_open_cache_db(self.case_dir)) as db:
@@ -1085,7 +1089,9 @@ class ZipMetadataWorker(QThread):
                 guid_to_bundle  = load_guid_bundle_map(db)
             if not folder_sizes:
                 return False   # sizes are required downstream — do a full load
-            self.status_update.emit("Loading archive metadata from local cache…")
+            self.status_update.emit(
+                "Loading parsed metadata…" if first_load
+                else "Loading archive metadata from local cache…")
             # Chunked deserialize, yielding the GIL between chunks so the GUI
             # and progress bar keep animating instead of hanging on one big
             # unpack (~1-2 s for a large Cellebrite archive).
@@ -1120,7 +1126,7 @@ class ZipMetadataWorker(QThread):
         False if parsing failed entirely (caller falls back to the legacy path).
         """
         if self._parse_in_subprocess():
-            if self._try_load_from_snapshot():
+            if self._try_load_from_snapshot(first_load=True):
                 return True
             # Child reported done but the snapshot is unusable — fall through
             # to an in-thread parse rather than leaving the user with nothing.
@@ -1145,6 +1151,10 @@ class ZipMetadataWorker(QThread):
         Returns True if it finished successfully, False on any failure (so the
         caller can fall back to an in-process parse)."""
         try:
+            # Cover the spawn gap: in a frozen exe, starting the child means
+            # relaunching the executable (bootloader + interpreter + imports),
+            # which can take seconds with no message of its own.
+            self.status_update.emit("Starting parser process…")
             import multiprocessing as mp
             ctx = mp.get_context('spawn')
             recv_conn, send_conn = ctx.Pipe(duplex=False)

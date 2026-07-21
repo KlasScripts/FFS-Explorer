@@ -581,6 +581,7 @@ class FfsAdapter:
         # Pass 2 — enrich: msgpack is a read-only lookup; it never introduces new
         # keys.  Anything in the msgpack but absent from the zip simply doesn't
         # exist as far as the browser is concerned — no "Not in Zip" entries.
+        _emit("Merging zip and msgpack metadata…")
         ui_metadata: dict = {}
         for i, (ui_path, phys) in enumerate(_zip_entries.items()):
             if i % _YIELD_EVERY == 0:

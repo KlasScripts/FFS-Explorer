@@ -82,11 +82,19 @@ def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
     return b''.join([header] + ui_parts + fm_parts)
 
 
-def unpack_snapshot(raw: bytes, yield_cb=None) -> dict:
+def unpack_snapshot(raw, yield_cb=None) -> dict:
     """Inverse of pack_snapshot.  Calls yield_cb() (if given) after each chunk
-    so a caller on a worker thread can release the GIL and keep the GUI alive."""
-    unp = msgpack.Unpacker(raw=False, strict_map_key=False, max_buffer_size=0)
-    unp.feed(raw)
+    so a caller on a worker thread can release the GIL and keep the GUI alive.
+
+    *raw* is either the packed bytes or a readable file-like (e.g. a sqlite3
+    Blob from db_utils.open_blob) — the file-like form streams the snapshot
+    into the unpacker instead of holding a second full copy in memory."""
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        unp = msgpack.Unpacker(raw=False, strict_map_key=False, max_buffer_size=0)
+        unp.feed(raw)
+    else:
+        unp = msgpack.Unpacker(raw, raw=False, strict_map_key=False,
+                               max_buffer_size=0)
     header = next(unp)
     ui_metadata: dict = {}
     for _ in range(header['n_ui']):

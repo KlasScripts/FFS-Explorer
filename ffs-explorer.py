@@ -31,7 +31,7 @@ sys.path.insert(0, _APP_DIR)
 from adapters import FfsAdapter
 from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       check_cache_schema, check_results_schema,
-                      save_blob, load_blob,
+                      save_blob, load_blob, open_blob,
                       save_header_types, load_header_types, clear_header_types,
                       save_guid_bundle_map, load_guid_bundle_map,
                       save_folder_counts, save_folder_sizes, load_folder_data,
@@ -1082,20 +1082,25 @@ class ZipMetadataWorker(QThread):
         """
         try:
             with closing(_open_cache_db(self.case_dir)) as db:
-                raw = load_blob(db, _SNAPSHOT_KEY, _SNAPSHOT_VERSION)
-                if raw is None:
+                # Cheap existence/version probe first, so the status message
+                # only appears once we know the snapshot will actually be used
+                # (and before the heavy reads it describes, not after).
+                blob = open_blob(db, _SNAPSHOT_KEY, _SNAPSHOT_VERSION)
+                if blob is None:
                     return False
-                _, folder_sizes = load_folder_data(db)
-                guid_to_bundle  = load_guid_bundle_map(db)
-            if not folder_sizes:
-                return False   # sizes are required downstream — do a full load
-            self.status_update.emit(
-                "Loading parsed metadata…" if first_load
-                else "Loading archive metadata from local cache…")
-            # Chunked deserialize, yielding the GIL between chunks so the GUI
-            # and progress bar keep animating instead of hanging on one big
-            # unpack (~1-2 s for a large Cellebrite archive).
-            snap = unpack_snapshot(raw, yield_cb=lambda: time.sleep(0))
+                with closing(blob):
+                    _, folder_sizes = load_folder_data(db)
+                    guid_to_bundle  = load_guid_bundle_map(db)
+                    if not folder_sizes:
+                        return False   # sizes are required downstream — full load
+                    self.status_update.emit(
+                        "Loading parsed metadata…" if first_load
+                        else "Loading archive metadata from local cache…")
+                    # Streamed, chunked deserialize: the blob feeds the
+                    # unpacker directly (no second in-memory copy of a
+                    # hundreds-of-MB snapshot), and the GIL is yielded
+                    # between chunks so the GUI keeps animating.
+                    snap = unpack_snapshot(blob, yield_cb=lambda: time.sleep(0))
             fmt, user_pfx, sys_pfx, old_layout = snap['adapter']
             ffs_adapter = FfsAdapter(fmt, user_pfx, sys_pfx, bool(old_layout))
             self._local_extra_delta = snap['delta']

@@ -12,6 +12,7 @@ SQLite databases:
                      artifact_<name> tables (written by artifact_db.py)
 """
 
+import io
 import json
 import os
 import sqlite3
@@ -468,6 +469,30 @@ def load_blob(conn: 'sqlite3.Connection', key: str, version: str) -> bytes | Non
     if row is None or row[0] != version:
         return None
     return row[1]
+
+
+def open_blob(conn: 'sqlite3.Connection', key: str, version: str):
+    """Return a read-only file-like over the stored blob for *key* (version
+    checked), or None.
+
+    Uses Connection.blobopen so a large blob (the load snapshot can be
+    hundreds of MB) streams straight into the deserialiser instead of being
+    materialised in memory first.  The caller must finish reading — and close
+    the returned object — before closing *conn*.  Falls back to an in-memory
+    BytesIO where blobopen is unavailable (Python < 3.11).
+    """
+    row = conn.execute(
+        'SELECT rowid, version FROM blobs WHERE key=?', (key,)
+    ).fetchone()
+    if row is None or row[1] != version:
+        return None
+    if hasattr(conn, 'blobopen'):
+        try:
+            return conn.blobopen('blobs', 'data', row[0], readonly=True)
+        except sqlite3.Error:
+            pass
+    data = load_blob(conn, key, version)
+    return io.BytesIO(data) if data is not None else None
 
 
 # ── Folder sizes and counts ───────────────────────────────────────────────────

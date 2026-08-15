@@ -1,0 +1,18 @@
+#!/bin/sh
+# Verifies/auto-fixes CLAUDE.md's anchors against the code before every
+# commit. Installed via scripts/install-hooks.sh (not tracked directly in
+# .git/hooks, since git doesn't version that directory).
+set -e
+
+if ! git diff --cached --name-only | grep -qE '^(ffs-explorer\.py|app/|CLAUDE\.md)'; then
+    exit 0
+fi
+
+python3 scripts/check_claude_md.py
+status=$?
+
+if git diff --name-only | grep -q '^CLAUDE\.md$'; then
+    git add CLAUDE.md
+fi
+
+exit $status

@@ -26,7 +26,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 ## Data flow (opening an archive)
 
 1. `FastZipBrowser.start_loading()` → case dir chosen (`_get_or_ask_case_dir`).
-2. `ZipMetadataWorker` (ffs-explorer.py:1003) → `app/ffs_metadata.py
+2. `ZipMetadataWorker` (ffs-explorer.py:1102) → `app/ffs_metadata.py
    parse_archive_metadata()` in a child process: central-directory parse,
    `ui_metadata` build, folder tree/sizes; snapshot persisted to case dir
    (msgpack) so re-opens are instant.
@@ -137,6 +137,14 @@ file, and if so update the relevant line(s) in the same session. Triggers:
 
 Routine bugfixes inside an existing method need **no** map update — do not
 add method-level detail here; that belongs in docstrings.
+
+**Automated backstop:** `scripts/check_claude_md.py` runs as a pre-commit
+hook (install via `scripts/install-hooks.sh` after cloning) and auto-corrects
+plain line-number drift in single-symbol anchors like `` `Foo` (file.py:NNN) ``
+and flags (blocks the commit on) anything needing judgment — a symbol that
+moved files, the module table going out of sync, or the section map drifting
+past tolerance. It only catches mechanical drift; still update the map
+yourself for the semantic triggers above.
 
 ## Conventions
 

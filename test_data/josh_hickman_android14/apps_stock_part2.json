@@ -1,0 +1,128 @@
+{
+  "Google (Search Bar / Nearby Share)": {
+    "version": "15.2.36.29.arm64",
+    "note": "Google Search Bar (GSB) activity from home screen, plus Nearby Share activity. Other device for Nearby Share: 'Thomas's S23', Wi-Fi MAC 24:11:53:64:51:4F, BT MAC 24:11:53:64:51:4E.",
+    "actions": [
+      {"date": "2024-01-31", "time": "15:45", "action": "Invoked Google Assistant (accidental)"},
+      {"date": "2024-02-03", "time": "10:03", "action": "Invoke Google Assistant", "message": "\"Hey Google can you turn on the couch lamp?\""},
+      {"date": "2024-07-27", "time": "14:21", "action": "Sent four (4) pictures via Quick Share"},
+      {"date": "2024-07-27", "time": "16:09", "action": "Searched for \"2024 Olympic schedule\" in GSB"},
+      {"date": "2024-07-27", "time": "16:10", "action": "Clicked on link 2024 Olympics Full Schedule on NBC website"}
+    ]
+  },
+  "Google Play Store": {
+    "version": "42.2.28-31 [0] [PR] 660641439",
+    "note": "Search queries for every app subsequently installed are logged here (full list mirrors the app-install list above, ~50 entries from 2024-01-26 through 2024-07-27). Not fully re-transcribed — see PDF pages 65-66.",
+    "actions": [
+      {"date": "2024-01-26", "time": "20:55", "action": "Searched for \"Google Fi\""},
+      {"date": "2024-01-26", "time": "20:59", "action": "Searched for \"fitbit\""},
+      {"date": "2024-01-27", "time": "09:23", "action": "Searched for \"spotify\""},
+      {"date": "2024-01-27", "time": "09:35", "action": "Searched for \"signal\""},
+      {"date": "2024-04-27", "time": "17:39", "action": "Searhced for \"reddit\""},
+      {"date": "2024-05-30", "time": "14:07", "action": "Searched for \"zoom\""},
+      {"date": "2024-07-13", "time": "21:39", "action": "Searched for \"wickr\""},
+      {"date": "2024-07-24", "time": "06:40", "action": "Searched for \"waze\""},
+      {"date": "2024-07-26", "time": "08:50", "action": "Searched for \"alltrails\""},
+      {"date": "2024-07-27", "time": "13:28", "action": "Searched for \"tiktok\""}
+    ]
+  },
+  "Keep Notes": {
+    "version": "5.24.012.03.90",
+    "actions": [
+      {"date": "2024-07-27", "time": "15:43", "action": "Created note", "message": "Title: My Android 14 Keep Note"},
+      {"date": "2024-07-27", "time": "15:44", "action": "Added text to note", "message": "The first note."},
+      {"date": "2024-07-27", "time": "15:47", "action": "Created second note", "message": "Title: My Second Note"},
+      {"date": "2024-07-27", "time": "15:48", "action": "Added text to second note", "message": "The second note."}
+    ]
+  },
+  "Maps": {
+    "version": "11.113.0101", "updated_version": "11.138.0201", "updated_date": "2024-07-27", "updated_time": "18:34",
+    "note": "Android Auto activity denoted with double asterisks (**) in source.",
+    "actions": [
+      {"date": "2024-01-29", "time": "08:59", "action": "Searched for \"Starbucks\" nearby"},
+      {"date": "2024-01-29", "time": "09:00", "action": "Selected location / got directions"},
+      {"date": "2024-01-29", "time": "09:01", "action": "Started navigation to 100 Grand Hill Pl, Holly Springs, NC 27540"},
+      {"date": "2024-01-29", "time": "09:11", "action": "Arrived at destination"},
+      {"date": "2024-01-30", "time": "08:12", "action": "Dropped pin at 35.591383, -78.775345"},
+      {"date": "2024-01-30", "time": "08:13", "action": "Got directions to dropped pin"},
+      {"date": "2024-01-30", "time": "08:14", "action": "Started navigation to dropped pin"},
+      {"date": "2024-01-30", "time": "08:19", "action": "Arrived at destination"},
+      {"date": "2024-05-07", "time": "14:54", "action": "Searched for 800 US Highway 130, Hamilton, NJ 08690"},
+      {"date": "2024-05-07", "time": "14:55", "action": "Got directions to 800 US Highway 130, Hamilton, NJ 08690"},
+      {"date": "2024-05-07", "time": "14:56", "action": "Started navigation to 800 US Highway 130, Hamilton, NJ 08690"},
+      {"date": "2024-05-07", "time": "15:55", "action": "Stopped navigation at destination"},
+      {"date": "2024-06-03", "time": "14:01", "action": "Searched for \"best western Wilmington nc\""},
+      {"date": "2024-06-03", "time": "14:02", "action": "Got directions to 503 Nutt Street, Wilmington NC 28401"},
+      {"date": "2024-06-03", "time": "14:03", "action": "Started navigation to 503 Nutt Street, Wilmington NC 28401"},
+      {"date": "2024-06-03", "time": "16:29", "action": "Arrived at destination"},
+      {"date": "2024-06-15", "time": "13:17", "action": "Searched for 913 Ocean Drive, Emerald Isle, NC 28594 / got directions"},
+      {"date": "2024-06-15", "time": "13:18", "action": "Started navigation to 913 Ocean Drive, Emerald Isle, NC 28594"},
+      {"date": "2024-06-15", "time": "16:47", "action": "Arrived at destination"},
+      {"date": "2024-07-15", "time": "14:39", "action": "Searched for \"Capitol Hilton\""},
+      {"date": "2024-07-15", "time": "14:40", "action": "Got directions to 1001 16th St NW, Washington, DC 20036"},
+      {"date": "2024-07-15", "time": "14:41", "action": "Started navigation to 1001 16th St NW, Washington, DC 20036"},
+      {"date": "2024-07-15", "time": "16:28", "action": "Stopped navigation"},
+      {"date": "2024-07-27", "time": "12:40", "action": "Searched for \"Shashein Store\""},
+      {"date": "2024-07-27", "time": "12:41", "action": "Got directions to 8702 Center Road, Springfield, VA 22152"},
+      {"date": "2024-07-27", "time": "12:42", "action": "Started navigation to 8702 Center Road, Springfield, VA 22152"},
+      {"date": "2024-07-27", "time": "12:55", "action": "Arrived at destination"}
+    ]
+  },
+  "Messages": {
+    "version": "messages.android_20240116_01_RC03.phone_dynamic",
+    "updated_version": "messages.android_20240702_01_RC02.phone_dynamic", "updated_date": "2024-07-27", "updated_time": "18:32",
+    "note": "Spam and login code/token messages received during data-gen are not documented.",
+    "actions": [
+      {"date": "2024-07-26", "time": "15:03", "action": "Received message", "message": "Are you here yet?"},
+      {"date": "2024-07-26", "time": "15:11", "action": "Sent message", "message": "Yes I am. I had a small hiccup with your contact but I'm good now."},
+      {"date": "2024-07-26", "time": "15:12", "action": "Received message", "message": "Good. And we are on RCS, which is good."},
+      {"date": "2024-07-26", "time": "15:14", "action": "Replied to message", "message": "(Message received at 15:12) Yep, this is great. I wish more people used it."},
+      {"date": "2024-07-26", "time": "15:16", "action": "Received message", "message": "Well, that depends on how long Google keeps it around. They like killing off messenging [sic] apps. (ROFL emoji)"},
+      {"date": "2024-07-26", "time": "15:18", "action": "Reacted to message", "message": "(Message received at 15:16) (ROFL emoji)"},
+      {"date": "2024-07-26", "time": "15:23", "action": "Received message", "message": "True, they are good for that."},
+      {"date": "2024-07-26", "time": "15:24", "action": "Sent message", "message": "Um, I think that was my line."},
+      {"date": "2024-07-26", "time": "15:32", "action": "Received message", "message": "You're right. That was my fault."},
+      {"date": "2024-07-26", "time": "15:33", "action": "Sent message", "message": "It happens. Lol"},
+      {"date": "2024-07-26", "time": "15:36", "action": "Received message", "message": "It does. Want to send me a picture?"},
+      {"date": "2024-07-26", "time": "15:37", "action": "Sent message", "message": "Sure. Let me find one. Standby."},
+      {"date": "2024-07-26", "time": "15:38", "action": "Sent picture", "message": "Predator"},
+      {"date": "2024-07-26", "time": "15:40", "action": "Received message", "message": "Lol. I guess I'm neither because I see Predator, too. Hang on and I'll send one to you."},
+      {"date": "2024-07-26", "time": "15:41", "action": "Received picture", "message": "Keyboard and mouse"},
+      {"date": "2024-07-26", "time": "15:42", "action": "Saved picture", "message": "Keyboard and mouse"},
+      {"date": "2024-07-26", "time": "15:45", "action": "Sent message", "message": "Got it."},
+      {"date": "2024-07-26", "time": "15:47", "action": "Received 3 pictures (received as MMS)", "message": "Building, Street with cars, New York/Newark"},
+      {"date": "2024-07-26", "time": "15:48", "action": "Saved 3 pictures", "message": "Building, Street with cars, New York/Newark"},
+      {"date": "2024-07-26", "time": "15:52", "action": "Received message", "message": "Here is your super bad message. Please delete it."},
+      {"date": "2024-07-26", "time": "16:11", "action": "Deleted message", "message": "Message received at 15:52"},
+      {"date": "2024-07-26", "time": "16:26", "action": "Received static location"},
+      {"date": "2024-07-26", "time": "16:45", "action": "Sent static location"},
+      {"date": "2024-07-27", "time": "16:04", "action": "Received message", "message": "(Message contained no text) (Attachment name: iOS_Bug_Reporting_for_Forensic_Purposes_1.2.pdf)"},
+      {"date": "2024-07-27", "time": "16:06", "action": "Opened attachment in Google Drive Viewer"}
+    ]
+  },
+  "Phone": {
+    "version": "121.0.596421684",
+    "note": "Spam calls received throughout the data-gen period are not documented; only user-initiated/intentionally-received calls.",
+    "actions": [
+      {"date": "2024-02-01", "time": "15:07", "action": "Outgoing call to 828-705-8820", "length_of_call": "0:13"},
+      {"date": "2024-06-04", "time": "15:28", "action": "Incoming call from 980-220-8799", "length_of_call": "3:47:24"},
+      {"date": "2024-07-27", "time": "17:39", "action": "Outgoing call to 919579", "length_of_call": "Call terminated"},
+      {"date": "2024-07-27", "time": "17:40", "action": "Outgoing call to 919-579-4674", "length_of_call": "2:01"},
+      {"date": "2024-07-27", "time": "17:45", "action": "Incoming call from 919-579-4674", "length_of_call": "1:45"}
+    ]
+  },
+  "Photos": {
+    "version": "6.67.0.599937979", "update_date": "2024-04-22", "update_time": "11:39", "update_version": "6.79.0.624777117",
+    "note": "Camera/other-app pictures land here; if saved via another app the entry is documented in that app.",
+    "actions": [
+      {"date": "2024-07-22", "time": "16:29", "action": "Turned on backups for folder \"Download\""},
+      {"date": "2024-07-22", "time": "16:30", "action": "Turned on backups for folder \"Pictures\""},
+      {"date": "2024-07-22", "time": "16:31", "action": "Turned on backups for folder \"Imgur\""},
+      {"date": "2024-07-22", "time": "16:12", "action": "Setup Locked Folder"},
+      {"date": "2024-07-22", "time": "16:13", "action": "Moved picture to Locked Folder", "message": "File name: PXL_20240605_000025158.jpg"},
+      {"date": "2024-07-22", "time": "16:21", "action": "Created one album / added three pictures", "message": "Album Name: Android 14 Album; pictures: LOVE, Freedom Plaza, Livin Salty"},
+      {"date": "2024-07-22", "time": "16:22", "action": "Shared album", "message": "Android 14 Album"},
+      {"date": "2024-07-22", "time": "16:26", "action": "Other party added three pictures to shared album", "message": "Guy from IT, Italian, Android"}
+    ]
+  }
+}

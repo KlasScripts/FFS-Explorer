@@ -1,0 +1,91 @@
+{
+  "Android Auto": {
+    "version": "12.2.642624-release",
+    "note": "Default app in Android 14. Each connect-to-car event is also a power (charge) event and a Bluetooth connection. Messages read/dictated appear under Messages. Music played appears under the respective music app.",
+    "actions": [
+      {"date": "2024-01-29", "time": "14:38", "action": "Connect to car"},
+      {"date": "2024-01-29", "time": "15:08", "action": "Disconnect from car"},
+      {"date": "2024-07-27", "time": "12:38", "action": "Connect to car"},
+      {"date": "2024-07-27", "time": "12:57", "action": "Disconnect from car"}
+    ]
+  },
+  "Camera": {
+    "version": "9.2.113.585804376.14",
+    "note": "For picture disposition see the Photos app entry. Full log is ~60 timestamped 'Took picture (landscape/portrait/front camera)' / 'Took video' entries from 2024-01-27 through 2024-07-27.",
+    "actions": [
+      {"date": "2024-01-27", "time": "13:56", "action": "Took picture (landscape)"},
+      {"date": "2024-01-27", "time": "14:17", "action": "Took picture (landscape)"},
+      {"date": "2024-01-27", "time": "14:50", "action": "Took picture (portrait)"},
+      {"date": "2024-01-27", "time": "15:07", "action": "Took picture (portrait)"},
+      {"date": "2024-05-11", "time": "13:35", "action": "Took video"},
+      {"date": "2024-07-27", "time": "10:53", "action": "Took picture (front camera - portrait)"},
+      {"date": "2024-07-27", "time": "11:02", "action": "Took picture (front camera - portrait)"},
+      {"date": "2024-07-27", "time": "11:07", "action": "Took picture (landscape)"}
+    ],
+    "note2": "Full ~90-entry list intentionally truncated here (first/last few shown) — see PDF pages 60-62 for every picture/video timestamp if needed."
+  },
+  "Chrome": {
+    "version": "121.0.6167.101",
+    "note": "One tab was previously open. Some 3rd party apps may contribute to Chrome history and are not documented here.",
+    "actions": [
+      {"date": "2024-07-13", "time": "21:14", "action": "Typed \"mlb.com\" into address bar / visited mlb.com"},
+      {"date": "2024-07-13", "time": "21:15", "action": "Clicked link for \"Ohtani reaches 200-homer milestone\""},
+      {"date": "2024-07-13", "time": "21:16", "action": "Went back to mlb.com main page"},
+      {"date": "2024-07-13", "time": "21:17", "action": "Clicked link for \"Everything to kno about the 2024 MLB Draft\""},
+      {"date": "2024-07-13", "time": "21:18", "action": "Opened second tab; Clicked link for \"'Absolutely incredible' Man rowing solo across Atlantic is surrounded by whales.\""},
+      {"date": "2024-07-13", "time": "21:20", "action": "Typed \"mobile phone forensics\" in address bar / ran search in second tab"},
+      {"date": "2024-07-13", "time": "21:21", "action": "Clicked on result \"Mobile Device Forensics\" / visited site on cellebrite.com in second tab"},
+      {"date": "2024-07-13", "time": "21:22", "action": "Opened third tab"},
+      {"date": "2024-07-13", "time": "21:23", "action": "Typed \"shelley duvall\" in address bar / ran search in third tab"},
+      {"date": "2024-07-13", "time": "21:24", "action": "Opened Incognito tab"},
+      {"date": "2024-07-13", "time": "21:25", "action": "Typed \"nfl.com\" in address bar / visited site in first Incognito tab"},
+      {"date": "2024-07-13", "time": "21:26", "action": "Clicked on link for \"5 biggest camp storylines for each AFC South team\" in first Incognito tab"},
+      {"date": "2024-07-13", "time": "21:27", "action": "Opened second Incognito tab"},
+      {"date": "2024-07-13", "time": "21:28", "action": "Typed \"SANS\" in the address bar / ran search in second Incognito tab"},
+      {"date": "2024-07-13", "time": "21:29", "action": "Clicked on link for \"sans.org\" / visited site in second Incognito tab"},
+      {"date": "2024-07-13", "time": "21:30", "action": "Clicked on link \"Find Training\" in second Incognito tab"},
+      {"date": "2024-07-13", "time": "21:31", "action": "Opened third Incognito tab"},
+      {"date": "2024-07-13", "time": "21:32", "action": "Typed \"when does Android 15 come out?\" in address bar / ran search in third Incognito tab"},
+      {"date": "2024-07-13", "time": "21:34", "action": "Closed second tab"},
+      {"date": "2024-07-13", "time": "21:36", "action": "Closed second Incognito tab"}
+    ]
+  },
+  "Docs": {
+    "version": "1.24.002.01.90",
+    "actions": [
+      {"date": "2024-07-27", "time": "14:06", "action": "Created document"},
+      {"date": "2024-07-27", "time": "14:07", "action": "Changed title to document created at 14:06", "message": "Title: My First Android 14 Document"},
+      {"date": "2024-07-27", "time": "14:08", "action": "Saved document"},
+      {"date": "2024-07-27", "time": "14:10", "action": "Shared document created at 14:06"},
+      {"date": "2024-07-27", "time": "15:52", "action": "Created second document"},
+      {"date": "2024-07-27", "time": "15:53", "action": "Changed title to second document created at 15:53", "message": "Title: Second Android 14 Doc"},
+      {"date": "2024-07-27", "time": "15:54", "action": "Saved document"}
+    ]
+  },
+  "Drive": {
+    "version": "2.24.017.1.all.alldpi",
+    "note": "File actions taken in other apps are documented in the respective apps.",
+    "actions": [
+      {"date": "2024-07-27", "time": "16:03", "action": "Set to upload data via Wi-Fi and Cellular"},
+      {"date": "2024-07-27", "time": "16:06", "action": "Opened attachment from Messages", "message": "Attachment name: iOS_Bug_Reporting_for_Forensic_Purposes_1.2.pdf"},
+      {"date": "2024-07-27", "time": "16:08", "action": "Started uploading attachment"}
+    ]
+  },
+  "Files": {
+    "version": "14-11814667",
+    "note": "Safe Folder PIN: 1234",
+    "actions": [
+      {"date": "2024-07-27", "time": "16:14", "action": "Set PIN"},
+      {"date": "2024-07-27", "time": "16:19", "action": "Moved one file to Safe Folder", "message": "File Name: 20240727_142305.jpg"}
+    ]
+  },
+  "Gmail": {
+    "version": "2023.12.31.599526178",
+    "note": "Google Workspace integrated into Gmail — Messages/Spaces/Meetings documented under Google Chat. Only emails sent/received by user documented here.",
+    "actions": [
+      {"date": "2024-07-27", "time": "14:34", "action": "Received message", "subject": "Android 14 Message", "message": "Here is your message with attachments (Attachments: 20240727_142338.jpg, 20240727_142305.jpg, 20240520_084456.jpg)"},
+      {"date": "2024-07-27", "time": "14:38", "action": "Downloaded three attachments"},
+      {"date": "2024-07-27", "time": "14:42", "action": "Sent message", "subject": "Re: Android 14 Message", "message": "Received. Here is your response with an attachment. (Attachment: PXL_20240724_195734810.jpg)"}
+    ]
+  }
+}

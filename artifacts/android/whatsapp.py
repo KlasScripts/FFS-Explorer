@@ -27,10 +27,15 @@ def run(paths):
             chat_mapped_jid._id                                                 AS chat_mapped_jid_id,
             sender_mapped_jid.raw_string                                        AS sender_mapped_jid_raw,
             sender_mapped_jid._id                                               AS sender_mapped_jid_id,
-            chat_contact.display_name                                           AS chat_contact_name,
-            chat_jidmap_contact.display_name                                    AS chat_mapped_contact_name,
-            sender_contact.display_name                                         AS sender_contact_name,
-            sender_jidmap_contact.display_name                                  AS sender_mapped_contact_name,
+            COALESCE(chat_contact.display_name, chat_contact.wa_name,
+                     chat_contact.given_name)                                   AS chat_contact_name,
+            COALESCE(chat_jidmap_contact.display_name, chat_jidmap_contact.wa_name,
+                     chat_jidmap_contact.given_name)                            AS chat_mapped_contact_name,
+            COALESCE(sender_contact.display_name, sender_contact.wa_name,
+                     sender_contact.given_name)                                 AS sender_contact_name,
+            COALESCE(sender_jidmap_contact.display_name, sender_jidmap_contact.wa_name,
+                     sender_jidmap_contact.given_name)                          AS sender_mapped_contact_name,
+            m.chat_row_id                                                       AS raw_chat_row_id,
             datetime(m.timestamp / 1000, 'unixepoch', 'localtime')             AS sent_time,
             m.text_data                                                         AS text,
             message_media.file_path                                             AS media_path,
@@ -86,10 +91,16 @@ def run(paths):
         else:
             remote_name = r["chat_mapped_contact_name"] or r["chat_contact_name"]
 
+        chat_subject = r["chat_subject"]
+        if r["chat_id"] is None:
+            # message.chat_row_id points at no row in chat (dangling FK) — surface
+            # it instead of silently dropping the row or leaving a blank subject.
+            chat_subject = f"[no chat record — raw chat_row_id={r['raw_chat_row_id']}]"
+
         records.append({
             "message_id":       r["message_id"],
             "chat_id":          r["chat_id"],
-            "chat_subject":     r["chat_subject"],
+            "chat_subject":     chat_subject,
             "chat_jid":         _fmt(r["chat_jid_raw"], r["chat_jid_id"]),
             "direction":        "Sent" if is_sent else "Received",
             "group_sender":     group_sender,

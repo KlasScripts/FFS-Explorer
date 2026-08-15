@@ -1,0 +1,142 @@
+{
+  "AllTrails": {
+    "version": "19.4.1", "install_date": "2024-07-26", "install_time": "08:51",
+    "username": "ldehner505@gmail.com",
+    "actions": [
+      {"date": "2024-07-26", "time": "08:54", "action": "Login"},
+      {"date": "2024-07-26", "time": "08:55", "action": "Set profile picture"},
+      {"date": "2024-07-27", "time": "10:01", "action": "Started hike"},
+      {"date": "2024-07-27", "time": "10:38", "action": "Ended hike"},
+      {"date": "2024-07-27", "time": "13:23", "action": "Added picture to hike from 10:01"}
+    ]
+  },
+  "BeReal": {
+    "version": "2.17.0", "install_date": "2024-07-26", "install_time": "09:46",
+    "actions": [
+      {"date": "2024-07-26", "time": "09:47", "action": "Login"},
+      {"date": "2024-07-26", "time": "09:48", "action": "Added This Is DFIR as a friend"},
+      {"date": "2024-07-26", "time": "09:50", "action": "Set profile picture"},
+      {"date": "2024-07-26", "time": "11:11", "action": "Took/Posted BeReal"},
+      {"date": "2024-07-26", "time": "11:12", "action": "Added caption to BeReal", "message": "BeReal taken at 11:11"},
+      {"date": "2024-07-26", "time": "12:13", "action": "Took BeReal w/ caption"}
+    ]
+  },
+  "Brave": {
+    "version": "1.67.123", "install_date": "2024-07-13", "install_time": "09:54",
+    "note": "Brave was the default search engine",
+    "actions": [
+      {"date": "2024-07-13", "time": "14:08", "action": "Typed \"mlb.com\" into address bar / visited mlb.com / clicked link for \"Futures Game, 4 p.m. ET: Lineups, how to watch, Skills Showcase, more\""},
+      {"date": "2024-07-13", "time": "14:11", "action": "Went back to mlb.com main page"},
+      {"date": "2024-07-13", "time": "14:12", "action": "Clicked link for \"104.5 mph! The fastest pitch of the year\""},
+      {"date": "2024-07-13", "time": "14:13", "action": "Opened second tab"},
+      {"date": "2024-07-13", "time": "14:15", "action": "Typed \"mobile phone forensics\" in address bar / ran search in second tab"},
+      {"date": "2024-07-13", "time": "14:16", "action": "Clicked on result \"Mobile Device Forensics – Cellebrite\" / visited site on Cellebrite.com in second tab"},
+      {"date": "2024-07-13", "time": "14:17", "action": "Opened third tab"},
+      {"date": "2024-07-13", "time": "14:19", "action": "Typed \"shelley duvall\" in address bar / ran search in third tab"},
+      {"date": "2024-07-13", "time": "14:20", "action": "Opened private tab"},
+      {"date": "2024-07-13", "time": "14:22", "action": "Typed \"nfl.com\" in address bar / visited site in first private tab"},
+      {"date": "2024-07-13", "time": "14:23", "action": "Clicked on link for \"5 biggest camp storylines for each AFC South team\" in first private tab"},
+      {"date": "2024-07-13", "time": "14:25", "action": "Opened second private tab"},
+      {"date": "2024-07-13", "time": "14:26", "action": "Typed \"SANS\" in the address bar / ran search in second private tab"},
+      {"date": "2024-07-13", "time": "14:27", "action": "Clicked on link for \"sans.org\" / visited site in second private tab"},
+      {"date": "2024-07-13", "time": "14:29", "action": "Clicked on link \"Find Training\" in second private tab"},
+      {"date": "2024-07-13", "time": "14:30", "action": "Opened third private tab"},
+      {"date": "2024-07-13", "time": "14:32", "action": "Typed \"when does Android 15 come out?\" in address bar / ran search in third private tab"},
+      {"date": "2024-07-13", "time": "14:34", "action": "Closed second tab"},
+      {"date": "2024-07-13", "time": "14:36", "action": "Closed second private tab"}
+    ]
+  },
+  "Burner": {
+    "version": "5.10.5", "install_date": "2024-07-07", "install_time": "14:35",
+    "phone_number": "919-205-9852",
+    "note": "Name of number is \"My Burner.\" Calls made/received through the native phone app.",
+    "actions": [
+      {"date": "2024-07-07", "time": "14:37", "action": "Login"},
+      {"date": "2024-07-07", "time": "14:38", "action": "Obtain number"},
+      {"date": "2024-07-07", "time": "14:40", "action": "Set number name"},
+      {"date": "2024-07-07", "time": "14:51", "action": "Created new contact", "message": "ThisIs DFIR"},
+      {"date": "2024-07-07", "time": "14:52", "action": "Sent message", "message": "What is up on the Burner??"},
+      {"date": "2024-07-07", "time": "14:54", "action": "Received message", "message": "Not too much. Finished lunch and waiting to go the gym. You?"},
+      {"date": "2024-07-07", "time": "14:56", "action": "Sent message", "message": "About the same. Not looking forward to the gym, though. Rainy afternoons make me sleepy."},
+      {"date": "2024-07-07", "time": "14:59", "action": "Received message", "message": "I totally get that. It's raining by you? Still super dry here."},
+      {"date": "2024-07-07", "time": "15:01", "action": "Sent message", "message": "Yeah. We needed it, too. Hopefully it continues for the rest of the day."},
+      {"date": "2024-07-07", "time": "15:05", "action": "Received message", "message": "We need it as well. Hopefully soon."},
+      {"date": "2024-07-07", "time": "15:06", "action": "Sent message", "message": "I'll send a picture."},
+      {"date": "2024-07-07", "time": "15:15", "action": "Sent picture", "message": "Wisdom"},
+      {"date": "2024-07-07", "time": "15:18", "action": "Received message", "message": "Got it. I'll send one over."},
+      {"date": "2024-07-07", "time": "15:24", "action": "Received picture", "message": "Peter Cushing"},
+      {"date": "2024-07-07", "time": "15:25", "action": "Saved picture", "message": "Peter Cushing"},
+      {"date": "2024-07-07", "time": "15:27", "action": "Sent message", "message": "(ROFL emoji) I'll give you a call."},
+      {"date": "2024-07-07", "time": "15:29", "action": "Outgoing call", "message": "Call was missed"},
+      {"date": "2024-07-07", "time": "15:32", "action": "Outgoing call", "message": "1:47"},
+      {"date": "2024-07-07", "time": "15:35", "action": "Received message", "message": "My turn."},
+      {"date": "2024-07-07", "time": "15:36", "action": "Incoming call", "message": "2:21"},
+      {"date": "2024-07-07", "time": "15:40", "action": "Sent message", "message": "Super duper bad message here. Delete it."},
+      {"date": "2024-07-07", "time": "15:43", "action": "Received message", "message": "Done. Bad message back at you."},
+      {"date": "2024-07-07", "time": "15:45", "action": "Deleted message", "message": "Message received at 15:43"}
+    ]
+  },
+  "Calculator (Sgallery)": {
+    "version": "1.94", "install_date": "2024-02-04", "install_time": "12:37",
+    "note": "Passcode was set to 1234",
+    "actions": [
+      {"date": "2024-02-04", "time": "12:38", "action": "Set passcode"},
+      {"date": "2024-02-04", "time": "12:40", "action": "Imported one picture", "message": "Following these two"},
+      {"date": "2024-02-04", "time": "12:41", "action": "Created note", "message": "Title: My Secret Note; This is my super secret note. Don't look at it. (Smiley face emoji)"},
+      {"date": "2024-07-26", "time": "14:51", "action": "Removed picture", "message": "Following these two"},
+      {"date": "2024-07-26", "time": "14:54", "action": "Imported one picture", "message": "Sheet music"}
+    ]
+  },
+  "Discord": {
+    "version": "214.16 - Stable", "install_date": "2024-02-04", "install_time": "12:48",
+    "updated_version": "239.15 - Stable", "updated_date": "2024-07-27", "updated_time": "18:03 (finished at 18:04)",
+    "username": "ldehner505",
+    "note": "Server Name: Android Test Images. Asterisks (*) denote action in direct message. All server messages occur in #general.",
+    "actions": [
+      {"date": "2024-02-04", "time": "12:50", "action": "Login"},
+      {"date": "2024-02-04", "time": "12:51", "action": "Uploaded profile picture"},
+      {"date": "2024-02-04", "time": "12:53", "action": "Received friend request"},
+      {"date": "2024-02-04", "time": "12:54", "action": "Accepted friend request"},
+      {"date": "2024-02-04", "time": "12:55", "action": "Received Server invitation*"},
+      {"date": "2024-02-04", "time": "12:56", "action": "Accepted Server invitation*"},
+      {"date": "2024-02-04", "time": "13:18", "action": "Sent message*", "message": "Hi there. Thanks for the invitation (Smiley face emoji)"},
+      {"date": "2024-02-04", "time": "13:19", "action": "Received message*", "message": "No problem, my pleasure. Welcome to the club."},
+      {"date": "2024-02-04", "time": "13:20", "action": "Sent message*", "message": "Thanks for having me. What do we do here?"},
+      {"date": "2024-02-04", "time": "13:22", "action": "Received reply to message*", "message": "(Message sent at 13:20) Nothing exciting. We just generate data for the test images."},
+      {"date": "2024-02-04", "time": "13:24", "action": "Sent message*", "message": "Wow, that does not sound exciting. At all."},
+      {"date": "2024-02-04", "time": "13:27", "action": "Other party reacted to message*", "message": "(Message sent at 13:24) (ROFL emoji)"},
+      {"date": "2024-02-04", "time": "13:28", "action": "Received message*", "message": "Told ya. Want to send me a picture?"},
+      {"date": "2024-02-04", "time": "13:29", "action": "Sent message*", "message": "Sure."},
+      {"date": "2024-02-04", "time": "13:31", "action": "Sent picture*", "message": "Yoda in 4K"},
+      {"date": "2024-02-04", "time": "13:33", "action": "Received message*", "message": "Nice. I'll send one. Hang on."},
+      {"date": "2024-02-04", "time": "13:35", "action": "Received picture*", "message": "It's a date"},
+      {"date": "2024-02-04", "time": "13:36", "action": "Saved picture*", "message": "It's a date"},
+      {"date": "2024-02-07", "time": "10:23", "action": "Sent message*", "message": "Hi there. Sorry for the long delay here."},
+      {"date": "2024-02-07", "time": "10:24", "action": "Received message*", "message": "No worries. Let's do the delete message thing and hop over to the server."},
+      {"date": "2024-02-07", "time": "10:27", "action": "Sent message*", "message": "Here is my bad message. I'll delete it in a minute."},
+      {"date": "2024-02-07", "time": "10:29", "action": "Deleted message*", "message": "Message sent at 10:27"},
+      {"date": "2024-02-07", "time": "10:31", "action": "Sent message*", "message": "I deleted it."},
+      {"date": "2024-02-07", "time": "10:37", "action": "Sent message", "message": "Hi gents. Thanks for having me."},
+      {"date": "2024-02-07", "time": "10:40", "action": "Received message", "message": "No problem. Thanks for joining. We can make this quick (Smiley face emoji)"},
+      {"date": "2024-02-07", "time": "10:43", "action": "Replied to message", "message": "(Message received at 10:40) Happy to be here."},
+      {"date": "2024-02-07", "time": "10:49", "action": "Received message", "message": "I'm late to the party."},
+      {"date": "2024-02-07", "time": "10:51", "action": "Sent message", "message": "I wouldn't worry about it."},
+      {"date": "2024-02-07", "time": "10:53", "action": "Received message", "message": "Here comes a picture."},
+      {"date": "2024-02-07", "time": "10:55", "action": "Received picture", "message": "Software Developer"},
+      {"date": "2024-02-07", "time": "11:08", "action": "Sent message", "message": "Got it. I'll send one"},
+      {"date": "2024-02-07", "time": "11:11", "action": "Sent picture", "message": "Arguing"},
+      {"date": "2024-02-07", "time": "11:15", "action": "Other party reacted to picture", "message": "Picture sent at 11:11"},
+      {"date": "2024-02-07", "time": "11:18", "action": "Sent message", "message": "Here is my bad message to the group. I'll delete it."},
+      {"date": "2024-02-07", "time": "11:21", "action": "Deleted message", "message": "Message sent at 11:18"},
+      {"date": "2024-02-07", "time": "11:23", "action": "Sent message", "message": "I deleted it."},
+      {"date": "2024-02-07", "time": "11:25", "action": "Sent message*", "message": "Here comes an audio call."},
+      {"date": "2024-02-07", "time": "11:32", "action": "Outgoing audio call*", "message": "~1:45"},
+      {"date": "2024-02-07", "time": "11:35", "action": "Received message*", "message": "I'll call you. Standby."},
+      {"date": "2024-02-07", "time": "11:36", "action": "Incoming audio call*", "message": "~1:45"},
+      {"date": "2024-02-07", "time": "11:39", "action": "Sent message*", "message": "Time for a video call."},
+      {"date": "2024-02-07", "time": "11:40", "action": "Outgoing video call*", "message": "~1:30"},
+      {"date": "2024-02-07", "time": "11:42", "action": "Received message*", "message": "My turn for a video call."},
+      {"date": "2024-02-07", "time": "11:43", "action": "Incoming video call*", "message": "~1:31"}
+    ]
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "Microsoft Edge": {
+    "version": "126.0.2592.100", "install_date": "2024-07-13", "install_time": "10:00",
+    "note": "Bing was the default search engine.",
+    "actions": [
+      {"date": "2024-07-13", "time": "15:39", "action": "Typed \"mlb.com\" into address bar / visited mlb.com"},
+      {"date": "2024-07-13", "time": "15:40", "action": "Clicked link for \"Futures Game, 4 p.m. ET: Lineups, how to watch Skills Showcase, more\""},
+      {"date": "2024-07-13", "time": "15:41", "action": "Went back to mlb.com main page"},
+      {"date": "2024-07-13", "time": "15:42", "action": "Clicked link for \"104.5 mph! The fastest pitch of the year\""},
+      {"date": "2024-07-13", "time": "15:43", "action": "Opened second tab"},
+      {"date": "2024-07-13", "time": "15:44", "action": "Typed \"mobile phone forensics\" in address bar / ran search in second tab"},
+      {"date": "2024-07-13", "time": "15:46", "action": "Clicked on result \"Mobile Phone Forensics\" / visited site on magnetforensics.com in second tab"},
+      {"date": "2024-07-13", "time": "15:47", "action": "Opened third tab"},
+      {"date": "2024-07-13", "time": "15:48", "action": "Typed \"shelley duvall\" in address bar / ran search in third tab"},
+      {"date": "2024-07-13", "time": "15:49", "action": "Opened two InPrivate tabs"},
+      {"date": "2024-07-13", "time": "15:50", "action": "Typed \"nfl.com\" in address bar / visited site in second InPrivate tab"},
+      {"date": "2024-07-13", "time": "15:51", "action": "Clicked on link for \"5 biggest camp storylines for each AFC South team\" in second InPrivate tab"},
+      {"date": "2024-07-13", "time": "15:52", "action": "Typed \"SANS\" in the address bar / ran search in first InPrivate tab"},
+      {"date": "2024-07-13", "time": "15:53", "action": "Clicked on link for \"sans.org\" / visited site in first InPrivate tab"},
+      {"date": "2024-07-13", "time": "15:54", "action": "Clicked on link \"Find Training\" in first InPrivate tab"},
+      {"date": "2024-07-13", "time": "15:55", "action": "Opened third InPrivate tab"},
+      {"date": "2024-07-13", "time": "15:56", "action": "Typed \"when does Android 15 come out?\" in address bar / ran search in third InPrivate tab"},
+      {"date": "2024-07-13", "time": "15:57", "action": "Closed second tab"},
+      {"date": "2024-07-13", "time": "15:58", "action": "Closed second InPrivate tab"}
+    ]
+  },
+  "Microsoft Teams": {
+    "version": "1416/1.0.0.2024073501", "install_date": "2024-04-29", "install_time": "11:47",
+    "updated_version": "1416/1.0.0.2024132702", "updated_date": "2024-07-27", "updated_time": "18:10",
+    "username": "Liz Dehner",
+    "note": "Location sharing from this device was not available in the app, but device was capable of receiving location information.",
+    "actions": [
+      {"date": "2024-04-29", "time": "11:50", "action": "Login"},
+      {"date": "2024-04-29", "time": "11:51", "action": "Set profile picture"},
+      {"date": "2024-04-29", "time": "11:53", "action": "Sent message", "message": "Hey there!"},
+      {"date": "2024-04-29", "time": "11:55", "action": "Received message", "message": "Hi! Did the credentials work?"},
+      {"date": "2024-04-29", "time": "11:58", "action": "Replied to message", "message": "(Message received at 11:55) They totally did. Just like you said. I should listen to you more often. (ROFL emoji)"},
+      {"date": "2024-04-29", "time": "12:01", "action": "Received message", "message": "Good. I thought they would. Just need to add a little protection to it, that's all."},
+      {"date": "2024-04-29", "time": "12:02", "action": "Reacted to message", "message": "(Message received at 12:01) (Thumbs up emoji)"},
+      {"date": "2024-04-29", "time": "12:05", "action": "Sent message", "message": "Thanks for the reminder. I need to get on that."},
+      {"date": "2024-04-29", "time": "12:07", "action": "Received message", "message": "You should be able to login and add it to the existing items. Not difficult."},
+      {"date": "2024-04-29", "time": "12:10", "action": "Sent message", "message": "Ok. I'll have a look shortly. I didn't think it would be too difficult."},
+      {"date": "2024-04-29", "time": "12:16", "action": "Received message", "message": "Totally doable. How's the doggie?"},
+      {"date": "2024-04-29", "time": "12:18", "action": "Sent message", "message": "He seems to be doing ok for the moment. He's mobile, which is always good."},
+      {"date": "2024-04-29", "time": "12:20", "action": "Received message", "message": "For a dog that is basically blind, he sure does move around a lot."},
+      {"date": "2024-04-29", "time": "12:22", "action": "Sent message", "message": "He's brave. But that's why it's good that he's moving around."},
+      {"date": "2024-04-29", "time": "12:24", "action": "Received message", "message": "Here comes a picture of [sic]"},
+      {"date": "2024-04-29", "time": "12:27", "action": "Received picture", "message": "Change in my wallet"},
+      {"date": "2024-04-29", "time": "12:28", "action": "Saved picture", "message": "Change in my wallet"},
+      {"date": "2024-04-29", "time": "12:30", "action": "Sent message", "message": "That's accurate. I'll send one."},
+      {"date": "2024-04-29", "time": "12:33", "action": "Sent picture", "message": "Sarlacc"},
+      {"date": "2024-04-29", "time": "12:35", "action": "Received message", "message": "Nice!"},
+      {"date": "2024-04-29", "time": "12:53", "action": "Sent message", "message": "Here comes an audio call."},
+      {"date": "2024-04-29", "time": "12:54", "action": "Outgoing audio call", "message": "1:36"},
+      {"date": "2024-04-29", "time": "12:56", "action": "Received message", "message": "I'll call you after the meeting."},
+      {"date": "2024-05-01", "time": "13:04", "action": "Incoming audio call", "message": "1:41"},
+      {"date": "2024-05-01", "time": "13:06", "action": "Sent message", "message": "That must've been some meeting. I'll video call you in a moment."},
+      {"date": "2024-05-01", "time": "13:08", "action": "Outgoing video call", "message": "1:50"},
+      {"date": "2024-05-01", "time": "13:10", "action": "Received message", "message": "Now it's my go."},
+      {"date": "2024-05-01", "time": "13:13", "action": "Outgoing video call", "message": "2:01"},
+      {"date": "2024-05-01", "time": "13:17", "action": "Sent message", "message": "Here is the message I don't want anyone to see. I'll delete it."},
+      {"date": "2024-05-01", "time": "13:19", "action": "Deleted message", "message": "Message sent at 13:17"},
+      {"date": "2024-05-01", "time": "13:23", "action": "Received message", "message": "I saw that. I will delete this message in a minute."},
+      {"date": "2024-05-01", "time": "13:26", "action": "Other party deleted message", "message": "Message received at 13:23"},
+      {"date": "2024-05-01", "time": "13:29", "action": "Received message", "message": "All set here."},
+      {"date": "2024-05-01", "time": "13:30", "action": "Sent message", "message": "Same."},
+      {"date": "2024-07-26", "time": "12:11", "action": "Received static location"}
+    ]
+  },
+  "Opera": {
+    "version": "83.3.4388.80648", "install_date": "2024-07-13", "install_time": "10:01",
+    "note": "Google was the default search engine",
+    "actions": [
+      {"date": "2024-07-13", "time": "16:12", "action": "Typed \"mlb.com\" into address bar / visited mlb.com"},
+      {"date": "2024-07-13", "time": "16:13", "action": "Clicked link for \"Ohtani reaches 200-homer milestone\""},
+      {"date": "2024-07-13", "time": "16:14", "action": "Went back to mlb.com main page"},
+      {"date": "2024-07-13", "time": "16:15", "action": "Clicked link for \"104.5 mph! The fastest pitch of the year\""},
+      {"date": "2024-07-13", "time": "16:16", "action": "Opened second tab"},
+      {"date": "2024-07-13", "time": "16:17", "action": "Typed \"mobile phone forensics\" in address bar / ran search in second tab"},
+      {"date": "2024-07-13", "time": "16:18", "action": "Clicked on result \"Mobile Device Forensics\" / visited site on cellebrite.com in second tab"},
+      {"date": "2024-07-13", "time": "16:19", "action": "Opened third tab"},
+      {"date": "2024-07-13", "time": "16:20", "action": "Typed \"shelley duvall\" in address bar / ran search in third tab"},
+      {"date": "2024-07-13", "time": "16:21", "action": "Opened private tab"},
+      {"date": "2024-07-13", "time": "16:22", "action": "Typed \"nfl.com\" in address bar / visited site in first private tab"},
+      {"date": "2024-07-13", "time": "16:23", "action": "Clicked on link for \"5 biggest camp storylines for each AFC South team\" in first private tab"},
+      {"date": "2024-07-13", "time": "16:24", "action": "Opened second private tab"},
+      {"date": "2024-07-13", "time": "16:25", "action": "Typed \"SANS\" in the address bar / ran search in second private tab"},
+      {"date": "2024-07-13", "time": "16:26", "action": "Clicked on link for \"sans.org\" / visited site in second private tab"},
+      {"date": "2024-07-13", "time": "16:27", "action": "Clicked on link \"Find Training\" in second private tab"},
+      {"date": "2024-07-13", "time": "16:28", "action": "Opened third private tab"},
+      {"date": "2024-07-13", "time": "16:29", "action": "Typed \"when does Android 15 come out?\" in address bar / ran search in third private tab"},
+      {"date": "2024-07-13", "time": "16:30", "action": "Closed second tab"},
+      {"date": "2024-07-13", "time": "16:31", "action": "Closed second private tab"}
+    ]
+  },
+  "Private Photo Vault": {
+    "version": "4.3.0", "install_date": "2024-04-27", "install_time": "17:33",
+    "note": "Key used to encrypt some of the app data is not available in the extraction.",
+    "actions": [
+      {"date": "2024-04-27", "time": "17:34", "action": "Set PIN", "message": "1234"},
+      {"date": "2024-04-27", "time": "17:35", "action": "Imported three pictures"}
+    ]
+  },
+  "Proton Mail": {
+    "version": "4.0.15", "install_date": "2024-07-06", "install_time": "15:41",
+    "username": "ldehner505@proton[.]me",
+    "note": "Key used to encrypt some of the app data is not available in the extraction.",
+    "actions": [
+      {"date": "2024-07-06", "time": "15:55", "action": "Login"},
+      {"date": "2024-07-09", "time": "08:47", "action": "Sent message", "subject": "Test Message 14 & 17", "message": "Here is your test message for Android 14 and iOS 17."},
+      {"date": "2024-07-09", "time": "08:53", "action": "Sent message", "subject": "Test Message Take 2", "message": "Take 2. Test message for Android 14 and iOS 17."},
+      {"date": "2024-07-13", "time": "09:27", "action": "Received message", "subject": "Re: Test Message Take 2", "message": "Message received. Here is your reply. (Smiley face emoji)"},
+      {"date": "2024-07-13", "time": "09:34", "action": "Sent message", "subject": "Re: Test Message Take 2", "message": "I am attaching a picture to this message. (Attachment name: PXL_20240605_000025158.jpg)"},
+      {"date": "2024-07-13", "time": "09:47", "action": "Received message", "subject": "Re: Test Message Take 2", "message": "I remember that place! I am attaching a picture here. (Attachment name: IMG_0041.jpeg)"}
+    ]
+  }
+}

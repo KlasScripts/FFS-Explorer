@@ -1,0 +1,54 @@
+{
+  "phone": {
+    "make": "Google", "model": "Pixel 7a", "storage": "128 GB", "ram": "8 GB",
+    "carrier_1": "Google Fi", "phone_number_1": "919-928-2177", "carrier_2": "Visible",
+    "serial": "1B031JEG500741", "wifi_mac": "94:45:60:1b:6c:e0", "bt_mac": "94:45:60:1b:98:cc"
+  },
+  "android_version": {
+    "version": "14", "build": "UQ1A.240105.004", "patch_level": "2024-01-05",
+    "kernel": "5.10.177-android13-4-00003-ga7208022a7ea-ab10815828 #1 Fri Sep 15 16:40:54 UTC 2023",
+    "baseband": "g5300q-230927-231102-B-11040898", "passcode_user1": "1149"
+  },
+  "procedure": [
+    "Phone reset to factory defaults by flashing a stock Android image",
+    "Google Fi account added (eSIM) for cellular service",
+    "53 non-stock apps installed from Google Play store, populated with user data",
+    "Stock Android apps populated with user data"
+  ],
+  "google_account": {
+    "email": "ldehner505@gmail.com",
+    "added_to_device": "2024-01-26 20:47"
+  },
+  "timezone_note": "yyyy-mm-dd / hh:mm, UTC-0500 before 2024-03-10 12:00 UTC; UTC-0400 (EDT) after",
+  "image_creation": {
+    "application": "Cellebrite Inseyets UFED", "version": "10.2.0.359",
+    "date": "2024-07-28", "time": "08:38",
+    "hashes": {
+      "EXTRACTION_FFS.zip": {
+        "md5": "090B14B3AFA95A2A4CEA8AD4FE87DA62",
+        "sha1": "48FBD803DBBC2D2CF0144FEA2999B2616833A543",
+        "sha256": "A9A2D881A81AB0CBB6AC8CAA76457C2EB3EF00EEDDEC6892956CF21FA0A8464A"
+      },
+      "Summary Report.pdf": {
+        "md5": "8CB71962503302EB7B839B50FEDB9904",
+        "sha1": "82AC54E252A5343C748DD90C6ED69788CE4C0945",
+        "sha256": "69EB3B7957222852D64626D7BDEE714D97BE48E2607B42385606AF50EA82960C"
+      },
+      "EXTRACTION_FFS.ufd": {
+        "md5": "0A65CB91A69F90CA64E0FF63B5359832",
+        "sha1": "B53A216B8F567C7E4728C37FFCA593108747D21D",
+        "sha256": "78EEFAF1F9128EA65ABA40AB3F61E447B04D12E34ACBC16B40C392D3B8299B35"
+      },
+      "EvidenceCollection.ufdx": {
+        "md5": "218160E3B6B62A3E0913D63A53C1C315",
+        "sha1": "FD0AD5EE4E4549D6F749738ADB0C8B973F3133E3",
+        "sha256": "1ED4D24068CE55A04BD0D2C43D41EA6C777B5FD1C4FEB7D81E4042860C90C238"
+      },
+      "Android_14_Public_Image.tar.gz": {
+        "md5": "2F9578715A315C0897E51EF9C1007F2D",
+        "sha1": "B4E8E9F33B7687A89E91F01D3C3FF887B465D00D",
+        "sha256": "4E1698460550E20F3B334AE9DF96EE1CD78314BDC0FE5DE5183FD5D7E1C8967E"
+      }
+    }
+  }
+}

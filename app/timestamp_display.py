@@ -198,7 +198,8 @@ class TimestampDisplayMixin:
                 if zone_setting is None:
                     # Never detected for this case — run the cheap part once now.
                     is_first_load = True
-                    handset_zone = _device_timezone.detect_handset_zone(zip_path, adapter) or ''
+                    handset_zone = _device_timezone.detect_handset_zone(
+                        zip_path, adapter, case_dir) or ''
                     acquisition = _device_timezone.detect_acquisition_offset(zip_path)
                     save_case_setting(db, 'handset_timezone_name', handset_zone)
                     save_case_setting(db, 'acquisition_offset_hours',

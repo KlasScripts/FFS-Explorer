@@ -21,6 +21,8 @@ import zipfile
 from datetime import datetime
 from zoneinfo import available_timezones, ZoneInfo
 
+from zip_cd_cache import CachedZipView, load as _zcd_load
+
 # Windows identifies timezones by its own names ("GMT Standard Time",
 # "Pacific Standard Time", ...) — NOT IANA names, despite some looking
 # similar. Most DF work on this project happens on Windows, so
@@ -175,7 +177,7 @@ _WINDOWS_TO_IANA = {
 }
 
 
-def detect_handset_zone(zip_path: str, adapter) -> str | None:
+def detect_handset_zone(zip_path: str, adapter, case_dir: str | None = None) -> str | None:
     """Return the device's own configured IANA timezone name (e.g.
     'America/New_York'), or None if not found.
 
@@ -191,14 +193,26 @@ def detect_handset_zone(zip_path: str, adapter) -> str | None:
     under the same prefix as `/private/var/mobile/...` (the same partition
     every other artifact parser already reads from), not the OS/system
     partition.
+
+    When *case_dir* is given, reads via the local .zcd central-directory
+    cache (zip_cd_cache) instead of opening a fresh zipfile.ZipFile — avoids
+    a second full central-directory read over the network, and never touches
+    the app's shared, non-thread-safe zip handle (this runs off the GUI
+    thread). Falls back to opening the zip directly when no case_dir is
+    given or the cache isn't available yet.
     """
     try:
-        with zipfile.ZipFile(zip_path) as z:
+        view = None
+        if case_dir:
+            infos = _zcd_load(zip_path, case_dir)
+            if infos is not None:
+                view = CachedZipView(zip_path, infos)
+        with (view if view is not None else zipfile.ZipFile(zip_path)) as z:
             names = frozenset(z.namelist())
             for candidate in adapter.user_candidates('db/timezone/localtime'):
                 if candidate not in names:
                     continue
-                content = z.read(candidate).decode('utf-8', errors='replace').strip()
+                content = z.open(candidate).read().decode('utf-8', errors='replace').strip()
                 if 'zoneinfo/' not in content:
                     continue
                 zone = content.split('zoneinfo/', 1)[1].strip()

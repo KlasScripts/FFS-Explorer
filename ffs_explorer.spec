@@ -19,7 +19,11 @@ a = Analysis(
         # Artifact parser scripts — loaded dynamically so PyInstaller can't
         # detect them via import analysis; must be listed explicitly.
         ('artifacts', 'artifacts'),
-    ] + collect_data_files('blackboxprotobuf'),
+    ] + collect_data_files('blackboxprotobuf')
+      # zoneinfo has no system tz database to fall back to on Windows;
+      # tzdata ships it as package data, never imported by name so PyInstaller's
+      # static analysis can't discover it on its own (see device_timezone.py).
+      + collect_data_files('tzdata'),
     hiddenimports=[
         # msgpack sometimes needs explicit nudging
         'msgpack',
@@ -39,9 +43,17 @@ a = Analysis(
         'plistlib',
     ] + collect_submodules('blackboxprotobuf')
       + collect_submodules('ccl_segb')
+      # sms_messages.py imports this lazily (attributedBody typedstream
+      # fallback decode) — same "artifact scripts are invisible to static
+      # analysis" reason as the stdlib modules above.
+      + collect_submodules('typedstream')
       # MCP server (Tools → Enable AI Access) is lazy-imported; uvicorn loads
       # its event-loop/protocol modules dynamically, so both need collecting.
-      + collect_submodules('mcp')
+      # mcp.cli is excluded: it's the standalone `mcp` CLI tool (never used —
+      # this app only imports mcp.server.fastmcp.FastMCP directly) and its
+      # import requires the optional `typer` extra (`pip install mcp[cli]`),
+      # which we don't install; collecting it crashes the PyInstaller build.
+      + collect_submodules('mcp', filter=lambda name: not name.startswith('mcp.cli'))
       + collect_submodules('uvicorn')
       + ['google.protobuf', 'six'],
     hookspath=[],

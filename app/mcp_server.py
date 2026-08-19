@@ -8,7 +8,16 @@ Phase-1 surface (see also mcp_control.py for the GUI-side lifecycle):
   Tier 2 — file tree as *queryable metadata*: list_folder / find_paths /
            get_file_metadata return paths, sizes, timestamps and detected
            types — never file contents.
-  There is deliberately NO raw-file-read tool in phase 1.
+  Tier 3 — raw content, opt-in per case on top of Tier 1/2 (see the
+           "Enable AI Access" dialog's second checkbox; ctx.raw_content_enabled
+           gates every tool below). Deliberately narrow: SQLite schema/sample
+           rows only (get_sqlite_schema / sample_sqlite_rows) — never
+           arbitrary raw SQL and never a generic "read any file's bytes"
+           tool. Exists so an AI client can draft a new artifact-parser
+           script (artifacts/ios|android/ format) for an app with no parser
+           yet, without an examiner shelling out to inspect the archive by
+           hand. Drafted scripts are prose/code in the chat — never
+           auto-installed or auto-run against the case.
 
 Design constraints:
   * Read-only towards the case: every SQLite open uses mode=ro; the in-memory
@@ -27,7 +36,9 @@ never pays the import cost unless AI access is enabled.
 import json
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -36,6 +47,9 @@ import research_store as _research
 
 MAX_ROWS = 500          # hard cap for any row-returning tool
 DEFAULT_ROWS = 100
+MAX_SAMPLE_ROWS = 50    # Tier 3 sample_sqlite_rows cap — exploratory, not a dump
+
+_SQLITE_MAGIC = b'SQLite format 3\x00'
 
 
 # ── Case context ──────────────────────────────────────────────────────────────
@@ -56,6 +70,10 @@ class CaseContext:
     get_guid_to_bundle: Callable[[], dict] = field(default=lambda: {})
     get_header_types: Callable[[], dict] = field(default=lambda: {})
     adapter: object = None          # FfsAdapter (Qt-free) or None
+    raw_content_enabled: bool = False
+    read_bytes: Callable[[str], object] = field(default=lambda path: None)
+    # ^ (ui_path) -> bytes | None — the host's own zip reader; Tier 3 tools
+    # only. Never mutate the returned bytes.
 
 
 # ── Read-only DB access ───────────────────────────────────────────────────────
@@ -86,6 +104,74 @@ _IDENT_RE = re.compile(r'^[A-Za-z0-9_]+$')
 
 def _clamp(limit: int) -> int:
     return max(1, min(int(limit or DEFAULT_ROWS), MAX_ROWS))
+
+
+def _blob_safe(v, _max=64):
+    """BLOB columns come back from sqlite3 as raw bytes, which the MCP
+    transport cannot JSON-serialize (breaks the whole response, not just
+    that cell) — surface size + a hex preview instead of dropping the value."""
+    if isinstance(v, (bytes, bytearray)):
+        return f'<blob {len(v)} bytes, hex: {v[:_max].hex()}{"…" if len(v) > _max else ""}>'
+    return v
+
+
+# ── Tier 3: raw SQLite access (opt-in) ──────────────────────────────────────
+
+def _extract_sqlite_ro(ctx: CaseContext, path: str) -> tuple[sqlite3.Connection, str]:
+    """Extract *path* (a ui_path) plus any -wal/-shm sidecars to a locked-down
+    temp copy and open it strictly read-only.
+
+    Sidecars are pulled in unmodified and the copy is chmod'd read-only
+    *before* sqlite3 ever touches it, then opened via a `mode=ro` URI — never
+    a bare connect() — so nothing here can trigger an auto-checkpoint that
+    would alter the extracted WAL (see the project's WAL-handling note: a
+    live connection only ever shows current state, never what checkpointing
+    might discard). Caller must close the connection and rmtree the tmpdir.
+    """
+    path = (path or '').strip('/')
+    raw = ctx.read_bytes(path)
+    if raw is None:
+        raise FileNotFoundError(f'{path!r} not found or unreadable in archive')
+    if raw[:16] != _SQLITE_MAGIC:
+        raise ValueError(f'{path!r} is not a SQLite database (bad header)')
+
+    tmpdir = tempfile.mkdtemp(prefix='ffs_mcp_sqlite_')
+    db_path = os.path.join(tmpdir, os.path.basename(path) or 'db')
+    try:
+        with open(db_path, 'wb') as f:
+            f.write(raw)
+        for suffix in ('-wal', '-shm'):
+            sidecar = ctx.read_bytes(path + suffix)
+            if sidecar and sidecar[:16] != _SQLITE_MAGIC:
+                with open(db_path + suffix, 'wb') as f:
+                    f.write(sidecar)
+        for suffix in ('', '-wal'):
+            p = db_path + suffix
+            if os.path.isfile(p):
+                os.chmod(p, 0o444)
+        # -shm deliberately left writable: it is SQLite's shared-memory
+        # WAL-index (pure in-process bookkeeping, never evidence — the WAL
+        # frames themselves live in -wal, which stays read-only above).
+        # SQLite's own docs say a reader needs -shm write access to safely
+        # use the WAL; chmod'ing it 444 here was tested and made no
+        # difference on the one case exercised so far, but the risk of it
+        # mattering on a different SQLite build/version is not worth taking
+        # for a file that is pure bookkeeping, not evidence.
+        #
+        # Separately — and this is the one actually confirmed against real
+        # data — reading a WAL-mode db file WITHOUT its -wal sidecar is not
+        # simply "missing the newest rows": it can show MORE rows than
+        # currently exist. A table here showed 8 rows read main-file-only,
+        # vs. 1 row with the WAL correctly applied (matching the system
+        # sqlite3 CLI + `PRAGMA integrity_check` = ok) — the extra 8 were
+        # stale/superseded page content the WAL had since overwritten, not
+        # real data. Always pull -wal alongside the main file; never treat
+        # a WAL-less read as a safe "no worse than incomplete" fallback.
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5)
+        return conn, tmpdir
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
 
 
 # ── Server factory ────────────────────────────────────────────────────────────
@@ -294,11 +380,10 @@ def build_server(ctx: CaseContext):
         if path not in ui_metadata and path not in folder_map:
             return {'error': f'path not in archive: {path!r} — try find_paths'}
         d = _entry_meta(path, ui_metadata, folder_map)
-        for part in path.split('/'):
-            bundle = ctx.get_guid_to_bundle().get(part)
-            if bundle:
-                d['app_bundle'] = bundle
-                break
+        bundle = (ctx.adapter.bundle_id_for_path(path, ctx.get_guid_to_bundle())
+                 if ctx.adapter else None)
+        if bundle:
+            d['app_bundle'] = bundle
         return d
 
     @tool
@@ -314,13 +399,87 @@ def build_server(ctx: CaseContext):
         out = []
         for parent in parents:
             for child in folder_map.get(parent, []):
-                guid = child.rsplit('/', 1)[-1]
-                bundle = guid_map.get(guid)
+                bundle = (ctx.adapter.container_bundle_id(child, guid_map)
+                         if ctx.adapter else None)
                 if bundle:
                     out.append({'bundle_id': bundle, 'path': child,
                                 'total_bytes': sizes.get(child, 0)})
         out.sort(key=lambda d: d['total_bytes'], reverse=True)
         return {'total': len(out), 'containers': out[:_clamp(limit)]}
+
+    # ── Tier 3: raw SQLite access (opt-in — see CaseContext.raw_content_enabled) ──
+
+    @tool
+    def get_sqlite_schema(path: str) -> dict:
+        """[Raw content — opt-in] Schema of a SQLite database anywhere in the
+        archive: every table's columns (name/type/notnull/pk), foreign keys,
+        and row count. Extracted to a locked-down read-only temp copy (WAL/SHM
+        sidecars included when present, never checkpointed/altered). Use this
+        to explore a database behind an app container that has no artifact
+        parser yet — find it first with find_paths, e.g.
+        find_paths('databases') under a bundle's container path."""
+        if not ctx.raw_content_enabled:
+            return {'error': 'raw content access is not enabled for this case — '
+                              'the examiner must opt in via the AI Access dialog'}
+        try:
+            conn, tmpdir = _extract_sqlite_ro(ctx, path)
+        except Exception as exc:
+            return {'error': str(exc)}
+        try:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+            out = {}
+            for t in tables:
+                cols = [{'name': c[1], 'type': c[2], 'notnull': bool(c[3]),
+                         'pk': bool(c[5])}
+                        for c in conn.execute(f'PRAGMA table_info("{t}")')]
+                fks = [{'from': f[3], 'to_table': f[2], 'to_column': f[4]}
+                       for f in conn.execute(f'PRAGMA foreign_key_list("{t}")')]
+                count = conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
+                out[t] = {'columns': cols, 'foreign_keys': fks, 'row_count': count}
+            return {'path': path, 'tables': out}
+        finally:
+            conn.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @tool
+    def sample_sqlite_rows(path: str, table: str, limit: int = 20,
+                           offset: int = 0) -> dict:
+        """[Raw content — opt-in] Up to 50 sample rows at a time from one
+        table of a SQLite database anywhere in the archive — enough to read
+        real column values (enum codes, timestamp units/epoch, NULL
+        patterns, indirection tables) when drafting a parser. Call
+        get_sqlite_schema first to get table/column names, and page with
+        `offset` for tables with more real content than the 50-row cap
+        (rows come back in storage order, not any particular sort). Not a
+        full dump — once a parser exists, use query_artifact instead."""
+        if not ctx.raw_content_enabled:
+            return {'error': 'raw content access is not enabled for this case — '
+                              'the examiner must opt in via the AI Access dialog'}
+        if not _IDENT_RE.match(table or ''):
+            return {'error': f'invalid table name: {table!r}'}
+        limit = max(1, min(int(limit or 20), MAX_SAMPLE_ROWS))
+        try:
+            conn, tmpdir = _extract_sqlite_ro(ctx, path)
+        except Exception as exc:
+            return {'error': str(exc)}
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone()
+            if not exists:
+                return {'error': f'no table {table!r} in {path!r} — check get_sqlite_schema'}
+            cols = [d[1] for d in conn.execute(f'PRAGMA table_info("{table}")')]
+            total = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            rows = conn.execute(f'SELECT * FROM "{table}" LIMIT ? OFFSET ?',
+                                (limit, max(0, int(offset)))).fetchall()
+            return {'path': path, 'table': table, 'columns': cols,
+                    'total_rows': total,
+                    'rows': [[_blob_safe(v) for v in row] for row in rows]}
+        finally:
+            conn.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     # ── Prompts (pre-curated, with user slots) ───────────────────────────────
 
@@ -372,6 +531,77 @@ def build_server(ctx: CaseContext):
             "For the top gaps, use find_paths to identify their main "
             "databases (.sqlite/.db files) an examiner should review "
             f"manually.\n{_VERIFY}")
+
+    @mcp.prompt()
+    def build_artifact_parser(bundle_id: str) -> str:
+        """Draft a new artifact-parser script for an app with no coverage
+        yet. Requires raw content access to be enabled for this case."""
+        return (
+            f"Draft a parser script for the app '{bundle_id}', which has no "
+            "artifact parser yet. This requires raw content access "
+            "(get_sqlite_schema / sample_sqlite_rows) — if those tools "
+            "return 'not enabled', tell the examiner to opt in via the AI "
+            "Access dialog and stop.\n\n"
+            "1. Call list_app_containers to get the container path for "
+            f"'{bundle_id}', then find_paths on that path filtered to "
+            "'.db'/'.sqlite' to locate its database file(s) — check both "
+            "the main container and any shared/external storage path.\n"
+            "2. For each candidate database, call get_sqlite_schema. "
+            "Identify the table(s) holding user content and look for "
+            "identity-mapping/indirection tables (e.g. a contact-alias or "
+            "id-remap table) that only matter for some rows — missing one "
+            "produces silent under-resolution, not a visible error.\n"
+            "3. Call sample_sqlite_rows on the relevant tables to see real "
+            "values: timestamp units/epoch, enum/flag codes, NULL patterns, "
+            "and whether a foreign key ever points at nothing (orphaned "
+            "row — must be surfaced with its raw id, e.g. '[no chat record "
+            "— raw chat_row_id=-1]', never silently dropped or blanked).\n"
+            "4. Preserve raw identifiers alongside any resolved display "
+            "value (e.g. both a raw row id and a resolved name) — an "
+            "examiner needs to independently verify/cite, so resolving away "
+            "the raw id is a regression even when the resolved value is "
+            "correct.\n"
+            "5. For any INNER-vs-LEFT JOIN or include/exclude call "
+            "(e.g. rows with zero attachments/parts), don't default to "
+            "'keep everything is safer' — inspect what the excluded rows "
+            "actually contain via sample_sqlite_rows before deciding; state "
+            "the reasoning as a code comment either way.\n"
+            "6. Check whether this app has photos/videos/voice notes/other "
+            "attachments, and whether the column pointing at one is a real "
+            "local path rather than a remote URL (http/https — the file "
+            "isn't in the archive at all, e.g. GroupMe/Burner media) or a "
+            "runtime-only reference (content://, e.g. some Viber/Google "
+            "Messages fields — meaningless outside a live device). If it's "
+            "a real local path, declare a module-level `media_fields: "
+            "list[str]` naming the output field(s) that hold it, and build "
+            "each one as a full archive ui_path in `run()` — using this "
+            "case's actual container base (from list_app_containers, or "
+            "the `_app_base_ui_path` key already present in the `paths` "
+            "dict passed to run() for the multi-file API) plus whatever "
+            "the database's own path column contributes, which sometimes "
+            "needs an extra fixed segment the column alone doesn't show "
+            "(e.g. WhatsApp iOS's ZMEDIALOCALPATH needing a 'Message/' "
+            "prefix — verify with find_paths against a real filename from "
+            "sample_sqlite_rows, don't assume the column is already a "
+            "complete path). This makes the app's thumbnail/full-view "
+            "media viewer (see CLAUDE.md's Conventions section) work for "
+            "the app being drafted, the same as it already does for "
+            "WhatsApp/SMS/Photos/Google Messages. A column with no locally "
+            "resolvable file is a real, reportable finding — say so in the "
+            "script's `description`, don't silently omit media_fields "
+            "without explaining why.\n"
+            "7. Write the script matching this project's artifact-parser "
+            "plugin format (multi-file API): module-level `name` (human "
+            "label), `app_path` (container base path), `files` "
+            "dict[key -> subpath] for required databases, optional "
+            "`optional_files` for sidecars like -wal/-shm, optional "
+            "`media_fields` (step 6), and `run(paths) -> list[dict]` "
+            "receiving extracted on-disk paths. Output the full script as "
+            "a single code block for the examiner to review and save "
+            "under artifacts/ios/ or artifacts/android/ themselves — "
+            "never claim it has been installed or run against the case; "
+            "nothing here writes to the artifacts/ directory.\n"
+            f"{_VERIFY}")
 
     return mcp
 

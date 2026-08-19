@@ -2,7 +2,11 @@
 
 Each parser produces a list of dicts.  write_artifact_results() creates (or
 replaces) a table named  artifact_<script_name>  in the case database and
-inserts all rows.  Column names come from the dict keys of the first row.
+inserts all rows.  Column names are the union of every row's keys, in
+first-seen order — not just row[0]'s (a parser's own rows and, since
+artifact_runner.py's recoverable_tables pass, sqlite_carve.py's recovered
+rows can carry different key sets; row[0]-only column selection would
+silently drop whichever keys the other rows have that row[0] doesn't).
 
 All values are stored as TEXT.  The table is always rebuilt from scratch so
 re-running a parser updates the results cleanly.
@@ -25,7 +29,13 @@ def write_artifact_results(
         return 0
 
     table = f"artifact_{script_name}"
-    columns = list(rows[0].keys())
+    columns = []
+    seen = set()
+    for row in rows:
+        for c in row.keys():
+            if c not in seen:
+                seen.add(c)
+                columns.append(c)
 
     col_defs = ', '.join(f'"{c}" TEXT' for c in columns)
     case_conn.execute(f'DROP TABLE IF EXISTS "{table}"')

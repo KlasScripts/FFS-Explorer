@@ -1,0 +1,428 @@
+{
+  "Music": {
+    "note": "Music playback in CarPlay is denoted in italics. Some previous playback history/AppleMusic activity may be present. See documentation from prior iOS images for previous history/activity.",
+    "actions": [
+      {
+        "date": "2024-01-17",
+        "time": "14:44",
+        "action": "Started playback"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Eric Prydz – Call On Me"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Steve Aoki – Livin’ My Love"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Naughty By Nature – Hip Hop Hooray"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "DMX – What’s My Name"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Plump DJs – Intermission"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Oakenfold – Faster Kill Pussycat"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Robbie Williams – Millennium"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Kanye West – All Of The Lights"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Game – Red Nation"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Talib Kweli – Get By"
+      },
+      {
+        "date": "2024-01-17",
+        "action": "Talib Kweli – Hostile Gospel, Pt. 1"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "15:33",
+        "action": "Stopped playback"
+      },
+      {
+        "date": "2024-01-21",
+        "time": "14:23",
+        "action": "Started Playback (Playlist Name: Sampled)"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "Common – The Light"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "Bobby Caldwell – Open Your Eyes"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "2Pac – Do for Love"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "Bobby Caldwell – What You Won’t Do for Love"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "The Pharcyde – Runnin’"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "Stan Getz & Luiz Bonfá – Saudade Vem Correndo"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "Positive K – I Got a Man"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "A Taste of Honey – Rescue Me"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "Queen Pen – Party Ain’t a Party"
+      },
+      {
+        "date": "2024-01-21",
+        "action": "Earth, Wind, & Fire – On Your Face"
+      },
+      {
+        "date": "2024-01-21",
+        "time": "15:04",
+        "action": "Stopped playback"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "13:28",
+        "action": "Started playback"
+      },
+      {
+        "date": "2024-07-28",
+        "action": "A Tribe Called Quest – Electric Relaxation"
+      },
+      {
+        "date": "2024-07-28",
+        "action": "Ronnie Foster – Mystic Brew"
+      },
+      {
+        "date": "2024-07-28",
+        "action": "Geto Boys – My Mind Playin’ Tricks On Me"
+      },
+      {
+        "date": "2024-07-28",
+        "action": "Isaac Hayes – Hung up on My Baby"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "13:47",
+        "action": "Stopped playback"
+      }
+    ]
+  },
+  "Notes": {
+    "note": "Passcode for locked notes: MyPassword (Hint: Who’s Password). Notes were also locked with the phone passcode.",
+    "actions": [
+      {
+        "date": "2024-01-17",
+        "time": "16:52",
+        "action": "Created note “iOS 16 Note”",
+        "message": "Here is my first iOS 16 note."
+      },
+      {
+        "date": "2024-01-17",
+        "time": "16:56",
+        "action": "Created note “iOS 16 Secure Note”",
+        "message": "This is my locked note for iOS 16."
+      },
+      {
+        "date": "2024-01-17",
+        "time": "16:58",
+        "action": "Locked iOS 16 Secure Note with phone passcode / locked all notes"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "16:59",
+        "action": "Shared “iOS 16 Note” via Messages"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "17:00",
+        "action": "DFIR Two added a sentence to iOS 16 Note",
+        "message": "Added sentence: This is DFIR Two. I wrote this sentence."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:20",
+        "action": "Created note “My iOS 17 Note”",
+        "message": "Test note 1"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:22",
+        "action": "Created note “Shared iOS 17 Note”",
+        "message": "My shared iOS 17 note"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:23",
+        "action": "Shared “Shared iOS 17 Note” with DFIR Four"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:24",
+        "action": "Created note / closed note before saving"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:25",
+        "action": "Created note “iOS 17 Locked Note”",
+        "message": "I am locking this iOS 17 note"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:26",
+        "action": "Locked note “iOS 17 Locked Note”"
+      }
+    ]
+  },
+  "Phone": {
+    "note": "Audio/video calls from 3rd party apps occurred which may appear in the call log but are not documented here; see the respective apps for details. Unsolicited and missed phone calls are also not documented. | Duration is mm:ss",
+    "actions": [
+      {
+        "date": "2023-08-11",
+        "time": "16:53",
+        "action": "Outgoing audio call",
+        "message": "919-303-5700 (~1:30)"
+      },
+      {
+        "date": "2024-01-12",
+        "time": "10:12",
+        "action": "Outgoing audio call",
+        "message": "919-567-1775 (~3:54)"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:46",
+        "action": "Incoming audio call (via CarPlay)",
+        "message": "919-888-7386 (~1:35)"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:48",
+        "action": "Outgoing audio call (via CarPlay)",
+        "message": "919-888-7386 (~1:45)"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "17:40",
+        "action": "Incoming audio call",
+        "message": "919-579-4674 (~2:02)"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "17:45",
+        "action": "Outgoing audio call",
+        "message": "919-579-4674 (~1:46)"
+      }
+    ]
+  },
+  "Photos": {
+    "note": "Images that were saved in apps are documented in the respective apps. Only actions taken within the Photos app will be documented here.",
+    "actions": [
+      {
+        "date": "2024-01-16",
+        "time": "14:09",
+        "action": "Created album: iOS 16 album"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:10",
+        "action": "Added ten (10) pictures to iOS 16 album"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:13",
+        "action": "Created shared album: iOS 16 Shared Album / shared with This Is DFIR Two"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:14",
+        "action": "This Is DFIR Two accepted invite to shared album"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:17",
+        "action": "Posted ten (10) pictures to iOS 16 Shared Album with comment: My first batch of picture [sic]."
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:27",
+        "action": "This Is DFIR Two liked ten (10) pictures posted to iOS 16 Shared Album"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:31",
+        "action": "This Is DFIR Two posted five (5) pictures to iOS 16 Shared Album"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:34",
+        "action": "Liked five (5) pictures posted by This Is DFIR Two"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "17:05",
+        "action": "Placed picture in Hidden album (Fart squirrels)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:03",
+        "action": "Created shared album (Name: iOS 17 Shared Album) / shared with DFIR Four"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:05",
+        "action": "Added three photos to iOS 17 Shared Album (Wisdom, Pepsi, Livin Salty)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:12",
+        "action": "Removed DFIR Four from iOS 17 Shared Album"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:13",
+        "action": "Shared iOS 17 Shared Album with DFIR Four"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:15",
+        "action": "DFIR Four accepted invitation"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:16",
+        "action": "DFIR Four posted one picture to iOS 17 Shared Album (iOS 17 Image) (Note: notification received at 10:17)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:19",
+        "action": "Hide picture (Smoke)"
+      }
+    ]
+  },
+  "Safari": {
+    "note": "Bookmarks and previous browsing history may be resident as a result of data generation from previous iOS images. Information about the previous data can be found in the documentation for those images. | Asterisks (*) denote action taken within a Private tab.",
+    "actions": [
+      {
+        "date": "2024-01-11",
+        "time": "18:13",
+        "action": "Typed “nhl.com” in address bar. Visited NHL website. (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "18:15",
+        "action": "Clicked on link “Buzz: Ovechkin, Wilson game-time calls for Capitals” (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "18:16",
+        "action": "Opened second tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:37",
+        "action": "Typed “digitalcorpora” in address bar (search) (2nd tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:38",
+        "action": "Clicked result for “digitalcorpora.org” / visited site (2nd tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:40",
+        "action": "Opened Private tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:41*",
+        "action": "Typed “sans.org” in the address bar. Visited SANS website (1st Private tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:42*",
+        "action": "Clicked on the “Find Training” link (1st Private tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:43*",
+        "action": "Opened 2nd Private tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:44*",
+        "action": "Typed “ESPN” in address bar (search) (2nd Private tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:45*",
+        "action": "Clicked on result for “espn.com” / visited site (2nd Private Browsing tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:46*",
+        "action": "Clicked on link for “NFL coaches, ranked by wins” (2nd Private tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:47*",
+        "action": "Refreshed 2nd Private tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:49*",
+        "action": "Closed 1st Private tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:53",
+        "action": "Went backward to nhl.com on 1st tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:57",
+        "action": "Added nhl.com as a bookmark (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "19:59",
+        "action": "Closed 2nd tab"
+      }
+    ]
+  },
+  "Weather": {
+    "actions": [
+      {
+        "date": "2024-01-17",
+        "time": "17:07",
+        "action": "Added Athens, Greece to location list"
+      }
+    ]
+  }
+}

@@ -1,6 +1,8 @@
 msgpack
 PySide6
 blackboxprotobuf
+pytypedstream
+tzdata; sys_platform == "win32"
 pyobjc-framework-Cocoa; sys_platform == "darwin"
 # Optional at runtime (AI access / MCP server — lazy-imported), required for
 # full builds so the frozen exe includes the feature.

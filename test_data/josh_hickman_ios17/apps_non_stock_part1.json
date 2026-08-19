@@ -1,0 +1,451 @@
+{
+  "AllTrails": {
+    "version": "18.8.0",
+    "install_date": "2024-01-12",
+    "install_time": "12:17",
+    "username": "thisisdfir@gmail.com",
+    "note": "Install completed at 12:19.",
+    "actions": [
+      {
+        "date": "2024-01-12",
+        "time": "12:21",
+        "action": "Login"
+      },
+      {
+        "date": "2024-01-12",
+        "time": "12:23",
+        "action": "Started hiking navigation"
+      },
+      {
+        "date": "2024-01-12",
+        "time": "13:38",
+        "action": "Stopped hiking navigation"
+      },
+      {
+        "date": "2024-01-12",
+        "time": "13:39",
+        "action": "Added picture to hike"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "10:01",
+        "action": "Started hike"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "10:38",
+        "action": "Ended hike"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "13:22",
+        "action": "Added picture to hike from 10:01"
+      }
+    ]
+  },
+  "BeReal": {
+    "version": "1.21.4",
+    "install_date": "2024-01-09",
+    "install_time": "18:30",
+    "updated_version": "2.24.0",
+    "update_date": "2024-07-26",
+    "update_time": "11:15",
+    "actions": [
+      {
+        "date": "2024-01-09",
+        "time": "18:31",
+        "action": "Login"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "15:40",
+        "action": "Took a BeReal",
+        "message": "My first BeReal!"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "13:22",
+        "action": "Took a BeReal",
+        "message": "My second BeReal for iOS 16!"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "13:39",
+        "action": "Other party commented on BeReal",
+        "message": "Nice BeReal. Sugg Farm?"
+      },
+      {
+        "date": "2024-07-26",
+        "time": "11:17",
+        "action": "Added LizD as friend"
+      },
+      {
+        "date": "2024-07-26",
+        "time": "11:17",
+        "action": "Took BeReal"
+      },
+      {
+        "date": "2024-07-26",
+        "time": "11:19",
+        "action": "Added caption to BeReal",
+        "message": "(BeReal taken at 11:17)"
+      },
+      {
+        "date": "2024-07-26",
+        "time": "12:14",
+        "action": "Took BeReal"
+      },
+      {
+        "date": "2024-07-26",
+        "time": "12:15",
+        "action": "Added caption to BeReal",
+        "message": "(BeReal taken at 12:14)"
+      }
+    ]
+  },
+  "Brave": {
+    "version": "1.61.1",
+    "install_date": "2024-01-11",
+    "install_time": "12:06",
+    "note": "Brave was the default search engine. Actions with an asterisk (*) were taken in private tabs.",
+    "actions": [
+      {
+        "date": "2024-01-11",
+        "time": "13:32",
+        "action": "Typed “nhl.com” in address bar. Visited NHL website. (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:35",
+        "action": "Clicked on link “Buzz: Ovechkin, Wilson game-time calls for Capitals” (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:36",
+        "action": "Opened second tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:39",
+        "action": "Typed “digitalcorpora” in address bar (search) (2nd tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:40",
+        "action": "Clicked result for “digitalcorpora.org” / visited site (2nd tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:42",
+        "action": "Opened Private Tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:44*",
+        "action": "Typed “sans.org” in the address bar. Visited SANS website"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:46*",
+        "action": "Clicked on the “Find Training” link"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:47*",
+        "action": "Opened second Private Tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:49*",
+        "action": "Typed “ESPN” in address bar (search) (2nd Private tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:51*",
+        "action": "Clicked on result for “espn.com” / visited site (2nd Private tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:52*",
+        "action": "Clicked on link for “Tracking NFL coach openings: Latest intel” (2nd Private tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:55*",
+        "action": "Refreshed 2nd Private Tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "13:57*",
+        "action": "Closed 1st Private Tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "15:58",
+        "action": "Added digitalcorpora.org as a bookmark (2nd tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "15:59",
+        "action": "Closed 1st tab"
+      }
+    ]
+  },
+  "Burner": {
+    "version": "5.4.11",
+    "install_date": "2024-01-11",
+    "install_time": "11:11",
+    "note": "First number: 828-566-6788 | Second number: 919-321-9828 | Calls made/received via the native phone app.",
+    "actions": [
+      {
+        "date": "2024-01-11",
+        "time": "11:13",
+        "action": "Login"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:14",
+        "action": "Obtained new number"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:18",
+        "action": "Sent message",
+        "message": "Here is my Burner number."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:20",
+        "action": "Received message",
+        "message": "Sheesh. Another number? I’m also getting those weird strings at the end of the messages again."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:22",
+        "action": "Sent message",
+        "message": "Really?"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:24",
+        "action": "Received message",
+        "message": "Yep. Just like Google Voice."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:26",
+        "action": "Sent message",
+        "message": "It must be a carrier thing. I don’t see them."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:31",
+        "action": "Received message",
+        "message": "Has to be. I don’t think it makes much of a difference, though."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:33",
+        "action": "Sent message",
+        "message": "I agree. I’ll send you a picture in a second."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:34",
+        "action": "Sent picture",
+        "message": "(Bob Barker)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:37",
+        "action": "Received message",
+        "message": "It tossed an error. I’ll try to send you one now."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:45",
+        "action": "Received picture",
+        "message": "(Rage intensifies)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:47",
+        "action": "Saved picture",
+        "message": "(Rage intensifies)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:49",
+        "action": "Sent message",
+        "message": "I’ll call you."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:50",
+        "action": "Outgoing audio call",
+        "message": "(~1:40)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:54",
+        "action": "Received message",
+        "message": "My turn. I’ll call you."
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:56",
+        "action": "Incoming audio call",
+        "message": "(~1:55)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "11:59",
+        "action": "Received message",
+        "message": "This is the bad message for this app. Delete it. (Smiley face emoji)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "12:00",
+        "action": "Deleted message",
+        "message": "(Message received at 12:00)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "12:02",
+        "action": "Sent message",
+        "message": "Deleted. (Smiley face emoji)"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "14:42",
+        "action": "Obtained second number"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "14:44",
+        "action": "Set name of second number",
+        "message": "“My Burner”"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "14:49",
+        "action": "Created new contact",
+        "message": "“Liz Dehner”"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "14:52",
+        "action": "Received message",
+        "message": "What is up on the Burner??"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "14:54",
+        "action": "Sent message",
+        "message": "Not too much. Finished lunch and waiting to go to the gym. You?"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "14:56",
+        "action": "Received message",
+        "message": "About the same. Not looking forward to the gym, though. Rainy afternoons make me sleepy."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "14:59",
+        "action": "Sent message",
+        "message": "I totally get that. It’s raining by you? Still super dry here."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:01",
+        "action": "Received message",
+        "message": "Yeah, we needed it, too. Hopefully it continues for the rest of the day."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:05",
+        "action": "Sent message",
+        "message": "We need it as well. Hopefully soon."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:06",
+        "action": "Received message",
+        "message": "I’ll send a picture."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:15",
+        "action": "Received picture",
+        "message": "(Wisdom)"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:17",
+        "action": "Saved picture",
+        "message": "(Wisdom)"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:18",
+        "action": "Sent message",
+        "message": "Got it. I’ll send one over."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:24",
+        "action": "Sent picture",
+        "message": "(Peter Cushing)"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:27",
+        "action": "Received message",
+        "message": "(ROFL emoji) I’ll give you a call."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:29",
+        "action": "Incoming call",
+        "message": "(Call was missed)"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:32",
+        "action": "Incoming call",
+        "message": "(1:40)"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:35",
+        "action": "Sent message",
+        "message": "My turn."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:36",
+        "action": "Outgoing call",
+        "message": "(2:24)"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:40",
+        "action": "Received message",
+        "message": "Super duper bad message here. Delete it."
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:42",
+        "action": "Deleted message",
+        "message": "(Message received at 15:40)"
+      },
+      {
+        "date": "2024-07-07",
+        "time": "15:43",
+        "action": "Sent message",
+        "message": "Done. Bad message back at you."
+      }
+    ]
+  }
+}

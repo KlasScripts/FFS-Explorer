@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QComboBox, QHBoxLayout, QVBoxLayout,
     QTableView, QPushButton, QFileDialog, QCheckBox,
 )
-from PySide6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QBrush
 
 from artifact_viewer import ArtifactTableModel, ArtifactFilterWorker
@@ -123,6 +123,94 @@ class SqliteDiffModel(QAbstractTableModel):
         return section + 1
 
 
+class SqlitePreviewWorker(QThread):
+    """Extracts a SQLite db (+ WAL/SHM sidecars) to a temp copy and counts
+    every table's rows — off the GUI thread.  Both the extraction write and
+    the per-table SELECT COUNT(*) loop can take seconds on a large database
+    (e.g. a case on a network share), and this previously ran synchronously
+    in _load_sqlite_preview on every file click."""
+    done = Signal(dict)
+
+    def __init__(self, raw: bytes, name: str, wal: bytes | None, shm: bytes | None):
+        super().__init__()
+        self._raw  = raw
+        self._name = name
+        self._wal  = wal
+        self._shm  = shm
+
+    def run(self):
+        tmpdir = tempfile.mkdtemp(prefix="ffs_sqlite_")
+        db_path = os.path.join(tmpdir, self._name)
+        try:
+            with open(db_path, 'wb') as f:
+                f.write(self._raw)
+        except Exception as exc:
+            self.done.emit({'error': f"Could not extract {self._name}: {exc}", 'tmpdir': tmpdir})
+            return
+
+        # Pull WAL/SHM sidecars alongside so the latest committed pages show.
+        # A real -wal/-shm never starts with the SQLite main-db magic; guards
+        # against readers that fall back to the whole db blob when the
+        # sidecar entry doesn't exist (e.g. gzip-sourced nested archives).
+        wrote_wal = False
+        for suffix, sidecar in (('-wal', self._wal), ('-shm', self._shm)):
+            if sidecar is None or sidecar[:16] == _SQLITE_MAGIC:
+                continue
+            try:
+                with open(db_path + suffix, 'wb') as f:
+                    f.write(sidecar)
+                if suffix == '-wal':
+                    wrote_wal = True
+            except Exception:
+                pass
+
+        # When a WAL is present, keep a pristine copy of the main file alone
+        # so the GUI thread can compute the pre-WAL (last-checkpointed) state.
+        has_wal = wrote_wal
+        before_path = None
+        if wrote_wal:
+            before_dir = os.path.join(tmpdir, 'before')
+            os.makedirs(before_dir, exist_ok=True)
+            before_path = os.path.join(before_dir, self._name)
+            try:
+                with open(before_path, 'wb') as f:
+                    f.write(self._raw)
+            except Exception:
+                has_wal = False
+                before_path = None
+
+        if self.isInterruptionRequested():
+            self.done.emit({'cancelled': True, 'tmpdir': tmpdir})
+            return
+
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                tables = [r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+                counts = {}
+                for t in tables:
+                    if self.isInterruptionRequested():
+                        self.done.emit({'cancelled': True, 'tmpdir': tmpdir})
+                        return
+                    try:
+                        counts[t] = conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
+                    except Exception:
+                        counts[t] = 0
+            finally:
+                conn.close()   # never hand a cross-thread sqlite3 connection to the GUI thread
+        except Exception:
+            self.done.emit({'error': f"{self._name} is not a valid SQLite database.",
+                             'tmpdir': tmpdir})
+            return
+
+        self.done.emit({
+            'tmpdir': tmpdir, 'db_path': db_path, 'before_path': before_path,
+            'has_wal': has_wal, 'name': self._name, 'tables': tables, 'counts': counts,
+        })
+
+
 class SqliteViewerMixin:
 
     # ── Setup ──────────────────────────────────────────────────────────────────
@@ -135,6 +223,7 @@ class SqliteViewerMixin:
         self._sql_before_path:  str | None = None   # main file alone (pre-WAL)
         self._sql_meta_conn:    sqlite3.Connection | None = None
         self._sql_filter_worker = None
+        self._sql_preview_worker = None
         self._sql_list_mode     = False          # True for WITHOUT ROWID tables
         self._sql_has_wal       = False
         self._sql_diff_mode     = False
@@ -230,76 +319,72 @@ class SqliteViewerMixin:
             self._sql_status_label.setText(f"Could not read {name} from the archive.")
             return
 
-        self._sql_tmpdir  = tempfile.mkdtemp(prefix="ffs_sqlite_")
-        self._sql_db_path = os.path.join(self._sql_tmpdir, name)
-        try:
-            with open(self._sql_db_path, 'wb') as f:
-                f.write(raw)
-        except Exception as exc:
-            self._sql_status_label.setText(f"Could not extract {name}: {exc}")
-            self._clear_sqlite_preview()
-            return
-
-        # Pull WAL/SHM sidecars alongside so the latest committed pages show.
-        # SQLite finds them automatically by matching basename + suffix.
-        wrote_wal = False
+        # Fetch sidecar bytes here (touches the shared zip handle — stays on
+        # the GUI thread); the worker decides whether each is a real sidecar
+        # and does the actual (slow) extraction + per-table counting.
+        wal = shm = None
         if sidecar_reader is not None:
-            for suffix in ('-wal', '-shm'):
+            for suffix, var in (('-wal', 'wal'), ('-shm', 'shm')):
                 try:
                     sidecar = sidecar_reader(suffix)
                 except Exception:
                     sidecar = None
-                # Guard against readers that fall back to returning the whole
-                # db blob when a sidecar entry doesn't exist (e.g. gzip-sourced
-                # nested archives): a real -wal/-shm never starts with the
-                # SQLite main-db magic.
-                if sidecar is None or sidecar[:16] == b'SQLite format 3\x00':
-                    continue
-                try:
-                    with open(os.path.join(self._sql_tmpdir, name + suffix), 'wb') as f:
-                        f.write(sidecar)
-                    if suffix == '-wal':
-                        wrote_wal = True
-                except Exception:
-                    pass
+                if suffix == '-wal':
+                    wal = sidecar
+                else:
+                    shm = sidecar
 
-        # When a WAL is present, keep a pristine copy of the main file alone so
-        # we can compute the pre-WAL (last-checkpointed) state for the diff.
-        self._sql_has_wal = wrote_wal
-        if wrote_wal:
-            before_dir = os.path.join(self._sql_tmpdir, 'before')
-            os.makedirs(before_dir, exist_ok=True)
-            self._sql_before_path = os.path.join(before_dir, name)
-            try:
-                with open(self._sql_before_path, 'wb') as f:
-                    f.write(raw)
-            except Exception:
-                self._sql_has_wal = False
-                self._sql_before_path = None
+        self._set_sql_controls_enabled(False)
+        self._sql_status_label.setText(f"Loading {name}…")
+        self._stop_sqlite_preview_worker()
+        self._sql_preview_worker = SqlitePreviewWorker(raw, name, wal, shm)
+        self._sql_preview_worker.done.connect(self._on_sqlite_preview_ready)
+        self._sql_preview_worker.start()
 
-        try:
-            self._sql_meta_conn = sqlite3.connect(self._sql_db_path)
-            tables = [r[0] for r in self._sql_meta_conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-        except Exception:
-            self._sql_status_label.setText(f"{name} is not a valid SQLite database.")
-            self._clear_sqlite_preview()
+    def _stop_sqlite_preview_worker(self) -> None:
+        worker = self._sql_preview_worker
+        if worker is None:
             return
+        if worker.isRunning():
+            try:
+                worker.done.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            worker.requestInterruption()
+            worker.wait()
+        self._sql_preview_worker = None
+
+    def _on_sqlite_preview_ready(self, result: dict) -> None:
+        self._sql_preview_worker = None
+
+        if result.get('cancelled') or result.get('error'):
+            tmpdir = result.get('tmpdir')
+            if tmpdir and os.path.isdir(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            if result.get('error'):
+                self._sql_status_label.setText(result['error'])
+            return
+
+        self._sql_tmpdir      = result['tmpdir']
+        self._sql_db_path     = result['db_path']
+        self._sql_before_path = result['before_path']
+        self._sql_has_wal     = result['has_wal']
+        name   = result['name']
+        tables = result['tables']
+        counts = result['counts']
 
         if not tables:
             self._sql_status_label.setText(f"{name} contains no tables.")
             return
 
-        counts = {}
-        for t in tables:
-            try:
-                counts[t] = self._sql_meta_conn.execute(
-                    f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
-            except Exception:
-                counts[t] = 0
-        self._sql_table_counts = counts
+        try:
+            self._sql_meta_conn = sqlite3.connect(self._sql_db_path)
+        except Exception:
+            self._sql_status_label.setText(f"{name} is not a valid SQLite database.")
+            self._clear_sqlite_preview()
+            return
 
+        self._sql_table_counts = counts
         self._sql_tables = list(tables)
         self._sql_table_combo.blockSignals(True)
         self._sql_table_combo.clear()
@@ -658,6 +743,7 @@ class SqliteViewerMixin:
     # ── Cleanup ────────────────────────────────────────────────────────────────
 
     def _clear_sqlite_preview(self) -> None:
+        self._stop_sqlite_preview_worker()
         self._cancel_sql_filter_worker()
         for model in (getattr(self, '_sql_model', None),
                       getattr(self, '_sql_diff_model', None)):

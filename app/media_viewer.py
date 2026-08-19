@@ -24,6 +24,31 @@ VIDEO_THUMB_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.avi'})
 THUMB_SIZE         = 160   # thumbnail box size in pixels
 _THUMB_BATCH_COMMIT = 20   # inserts to accumulate before a single db.commit()
 
+_IMAGE_MAGIC = (b'\xff\xd8\xff', b'\x89PNG\r\n\x1a\n', b'GIF87a', b'GIF89a')
+
+
+def sniff_media_kind(ext: str, data: bytes) -> str | None:
+    """'image' | 'video' | None, extension first (cheap, no decode needed),
+    falling back to magic-byte sniffing when the extension doesn't say —
+    confirmed necessary on real data: Google Messages' MMS cache files are
+    always named 'conversation_..._part_..._.bin' regardless of the actual
+    content (mp4/jpeg/png all seen under that same generic name), so an
+    extension-only check silently drops every one of them. Video is
+    detected via the ISO-BMFF box header (4-byte size + 'ftyp' at offset
+    4) that mp4/mov/m4v/3gp all share; image via the four magic prefixes
+    the app already treats as pictures elsewhere (see header_scan.py)."""
+    if ext in VIDEO_THUMB_EXTENSIONS:
+        return 'video'
+    if ext in MEDIA_EXTENSIONS:
+        return 'image'
+    if not data:
+        return None
+    if any(data.startswith(magic) for magic in _IMAGE_MAGIC):
+        return 'image'
+    if len(data) > 8 and data[4:8] == b'ftyp':
+        return 'video'
+    return None
+
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
@@ -132,14 +157,13 @@ class ThumbnailWorker(QThread):
     finished_all    = Signal()
 
     def __init__(self, zip_path, items, path_resolver, thumb_size, zip_info_map,
-                 streaming_index=None, cache_dir=None):
+                 cache_dir=None):
         super().__init__()
         self.zip_path        = zip_path
         self.items           = items
         self.path_resolver   = path_resolver
         self.thumb_size      = thumb_size
         self.zip_info_map    = zip_info_map
-        self.streaming_index = streaming_index
         self.cache_dir       = cache_dir
         self._stop           = False
 
@@ -164,7 +188,7 @@ class ThumbnailWorker(QThread):
             pending = []
             items_list = list(self.items)
 
-            _zf = None if self.streaming_index is not None else zipfile.ZipFile(self.zip_path, 'r')
+            _zf = zipfile.ZipFile(self.zip_path, 'r')
             try:
                 for batch in batched(items_list, _DB_BATCH):
                     # Query DB for just this batch
@@ -208,17 +232,17 @@ class ThumbnailWorker(QThread):
                                     pass
 
                         try:
-                            if self.streaming_index is not None:
-                                data = self.streaming_index.get_entry(physical).read()
-                            else:
-                                data = _zf.read(physical)
+                            data = _zf.read(physical)
                         except Exception:
                             continue
 
-                        if ext in VIDEO_THUMB_EXTENSIONS:
+                        kind = sniff_media_kind(ext, data)
+                        if kind == 'video':
                             data = _video_frame_bytes(data)
                             if not data:
                                 continue
+                        elif kind != 'image':
+                            continue
 
                         img = QImage()
                         if not img.loadFromData(data):
@@ -376,7 +400,7 @@ class MediaViewerMixin:
 
         self._thumb_worker = ThumbnailWorker(
             self.zip_path, media_paths, self._adapter.resolve, THUMB_SIZE, zip_info_map,
-            streaming_index=self._streaming_index, cache_dir=self._case_dir)
+            cache_dir=self._case_dir)
         self._thumb_worker.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._thumb_worker.finished_all.connect(self._on_thumbnails_done)
         self._thumb_worker.start()

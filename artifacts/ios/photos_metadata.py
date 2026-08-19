@@ -35,8 +35,6 @@ optional_files = {"photos_wal": "Photos.sqlite-wal",
 # (1501 synonyms are intentionally excluded — they duplicate 1500 noisily.)
 _PSI_LABEL_CATEGORIES = (1500, 1005, 1006)
 
-_APPLE_EPOCH_OFFSET = 978307200          # 2001-01-01 → unix epoch
-
 _AGE_LABELS = {1: 'Baby', 2: 'Child', 3: 'Young Adult',
                4: 'Adult', 5: 'Senior'}
 
@@ -78,6 +76,26 @@ _ROW_KEYS = ["asset_path", "Original Name", "Album", "Origin", "Camera",
              "Labels", "Taken", "Added", "Favorite",
              "Place", "GPS", "Faces", "Face Ages",
              "Hidden", "Trashed"]
+
+# Raw values (never a formatted string) so both this report table and the
+# main file browser's merged Taken/Added columns (see _build_photo_index /
+# _build_entry_row in ffs-explorer.py) can display them per the case's
+# timestamp-display setting. ZDATECREATED/ZADDEDDATE are Cocoa/Mac epoch
+# SECONDS (not the nanosecond variant iOS SMS uses).
+timestamp_fields = {"Taken": "cocoa_s", "Added": "cocoa_s"}
+
+# "attachment_path" is a full archive ui_path for the thumbnail/full-view
+# feature (see app/artifact_media.py) — deliberately a SEPARATE field from
+# "asset_path" above, not a rename of it: ffs-explorer.py's
+# _build_photo_index / _photo_key() already use "asset_path" as a join key
+# in its existing short form (relative to the Media folder, e.g.
+# 'DCIM/100APPLE/IMG_0001.HEIC') to merge Taken/Added into the main file
+# browser table, matched by stripping everything up to '/Media/' from a
+# browser ui_path — changing that value's shape would silently break that
+# join. Actual asset files live in mobile/Media/DCIM/… , a sibling of
+# app_path (mobile/Media/PhotoData, where Photos.sqlite itself lives) —
+# confirmed against a real extraction, both for a live HEIC and a live MOV.
+media_fields = ["attachment_path"]
 
 
 # ── Schema discovery helpers ──────────────────────────────────────────────────
@@ -273,9 +291,11 @@ def run(paths):
             return f'{alias}."{col}"' if col in available else 'NULL'
 
         def date_expr(col):
-            return ('NULL' if col not in a_cols else
-                    f"CASE WHEN a.{col} IS NULL THEN NULL ELSE "
-                    f"datetime(a.{col} + {_APPLE_EPOCH_OFFSET}, 'unixepoch') END")
+            # Raw Cocoa-seconds value, not a formatted string — see
+            # timestamp_fields above. Both this report table and the file
+            # browser's merged Taken/Added columns format it at display
+            # time, per the case's UTC/handset/acquisition setting.
+            return f'a."{col}"' if col in a_cols else 'NULL'
 
         taken_expr = date_expr('ZDATECREATED')
         added_expr = date_expr('ZADDEDDATE')
@@ -351,7 +371,8 @@ def run(paths):
             else:
                 camera = md or mk
             out.append({
-                "asset_path":    f"{directory}/{filename}",
+                "asset_path":       f"{directory}/{filename}",
+                "attachment_path":  f"mobile/Media/{directory}/{filename}",
                 "Original Name": orig_name or '',
                 "Album":         albums.get(pk, ''),
                 "Origin":        _origin(importedby, imported_by, imp_bundle),

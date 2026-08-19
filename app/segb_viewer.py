@@ -37,6 +37,7 @@ from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush
 from ccl_segb import ccl_segb1, ccl_segb2
 from ccl_segb.ccl_segb_common import EntryState
 from segb_schemas import stream_key_for_path, get_schema
+from dialog_helpers import error_label
 
 _DELETED_BG = QColor(198, 40, 40, 70)   # red-ish, matches the SQLite diff view
 
@@ -71,12 +72,16 @@ def _bbp():
 
 
 def _render_epoch(hint: str, value) -> str:
+    # _COCOA_EPOCH/_UNIX_EPOCH are naive but UTC-valued (epoch + seconds is
+    # timezone-independent arithmetic) — labeled explicitly here so the
+    # result can't be mistaken for local time, matching every other
+    # timestamp in this codebase.
     epoch = _COCOA_EPOCH if hint == 'cocoa' else _UNIX_EPOCH
     try:
         dt = epoch + datetime.timedelta(seconds=float(value))
     except (TypeError, ValueError, OverflowError, OSError):
         return ''
-    return f'{dt:%Y-%m-%d %H:%M:%S}'
+    return f'{dt:%Y-%m-%d %H:%M:%S} UTC'
 
 
 def _timestamp_hints(value) -> str:
@@ -95,7 +100,9 @@ def _timestamp_hints(value) -> str:
             continue
         if _TS_MIN <= dt <= _TS_MAX:
             hints.append(f'{label}: {dt:%Y-%m-%d %H:%M:%S}')
-    return f'   ⏱ {"  |  ".join(hints)}' if hints else ''
+    # One trailing "(UTC)" for the whole group rather than repeating it per
+    # hint — all four candidate interpretations are equally UTC-valued.
+    return f'   ⏱ {"  |  ".join(hints)} (UTC)' if hints else ''
 
 
 def _printable(b: bytes, limit: int = 80) -> str:
@@ -119,10 +126,26 @@ def _hex_preview(b: bytes, limit: int = 96) -> str:
     return b[:limit].hex(' ') + ('  …' if len(b) > limit else '')
 
 
+def _fmt_record_ts(dt) -> str:
+    # rec.timestamp1 (from the vendored ccl_segb decoder) is a naive
+    # datetime, but UTC-valued (Cocoa-epoch + seconds is timezone-
+    # independent arithmetic) — labeled explicitly, not left as a bare
+    # unlabeled string an examiner could mistake for local time.
+    if not isinstance(dt, datetime.datetime):
+        return str(dt) if dt else ''
+    return f'{dt:%Y-%m-%d %H:%M:%S} UTC'
+
+
 def _json_default(o):
     if isinstance(o, (bytes, bytearray)):
         return o.hex()
     if isinstance(o, datetime.datetime):
+        # rec.timestamp1 is naive but UTC-valued (see _fmt_record_ts) —
+        # attach the tzinfo before isoformat() so the exported string
+        # carries an explicit +00:00 offset instead of reading as
+        # timezone-unspecified (which most readers assume means local).
+        if o.tzinfo is None:
+            o = o.replace(tzinfo=datetime.timezone.utc)
         return o.isoformat()
     return str(o)
 
@@ -253,7 +276,7 @@ class SegbViewerMixin:
         for orig_i, rec in view:
             state = rec.state.name if isinstance(rec.state, EntryState) else str(rec.state)
             crc = ('OK' if rec.crc_passed else 'FAIL') if rec.state == EntryState.Written else '—'
-            cells = [str(orig_i), str(getattr(rec, 'timestamp1', '')), state, str(len(rec.data)), crc]
+            cells = [str(orig_i), _fmt_record_ts(getattr(rec, 'timestamp1', None)), state, str(len(rec.data)), crc]
             items = []
             for text in cells:
                 it = QStandardItem(text)
@@ -463,8 +486,7 @@ class SegbViewerMixin:
         editor = QPlainTextEdit()
         editor.setPlainText(json.dumps(seed, indent=2))
         v.addWidget(editor, stretch=1)
-        err = QLabel("")
-        err.setStyleSheet("color: #c62828;")
+        err = error_label()
         v.addWidget(err)
 
         buttons = QDialogButtonBox()

@@ -1,0 +1,635 @@
+{
+  "Firefox": {
+    "version": "121.2",
+    "install_date": "2024-01-11",
+    "install_time": "16:40",
+    "note": "Google was the default search engine. Actions with an asterisk (*) were taken in Incognito tabs.",
+    "actions": [
+      {
+        "date": "2024-01-11",
+        "time": "16:41",
+        "action": "Typed “nhl.com” in address bar. Visited NHL website. (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:42",
+        "action": "Clicked on link “Buzz: Ovechkin, Wilson game-time calls for Capitals” (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:43",
+        "action": "Opened second tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:44",
+        "action": "Typed “digitalcorpora” in address bar (search) (2nd tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:45",
+        "action": "Clicked result for “digitalcorpora.org” / visited site (2nd tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:54",
+        "action": "Open Private Browsing tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:55",
+        "action": "Typed “sans.org” in the address bar. Visited SANS website (1st Private Browsing tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:56",
+        "action": "Clicked on the “Find Training” link (1st Private Browsing tab) / Opened second Private Browsing tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:58",
+        "action": "Typed “ESPN” in address bar (search) (2nd Private Browsing tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "16:59",
+        "action": "Clicked on result for “espn.com” / visited site (2nd Private Browsing tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:00",
+        "action": "Clicked on link for “NFL coaches, ranked by wins” (2nd Private Browsing tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:01",
+        "action": "Refreshed 2nd Private Browsing tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:02",
+        "action": "Closed 1st Private Browsing tab"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:03",
+        "action": "Added digitalcorpora.org as a bookmark (2nd tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:04",
+        "action": "Closed 1st tab"
+      }
+    ]
+  },
+  "Firefox Focus": {
+    "version": "121.0",
+    "install_date": "2024-01-11",
+    "install_time": "17:05",
+    "note": "All tabs are considered “private.” One tab was allowed at a time.",
+    "actions": [
+      {
+        "date": "2024-01-11",
+        "time": "17:07",
+        "action": "Typed “nhl.com” in address bar. Visited NHL website. (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:08",
+        "action": "Clicked on link “Buzz: Ovechkin, Wilson game-time calls for Capitals” (1st tab)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:10",
+        "action": "Typed “digitalcorpora” in address bar (search)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:11",
+        "action": "Clicked result for “digitalcorpora.org” / visited site"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:40",
+        "action": "Typed “sans.org” in the address bar. Visited SANS website"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:41",
+        "action": "Clicked on the “Find Training” link"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:42",
+        "action": "Typed “ESPN” in address bar (search)"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:43",
+        "action": "Clicked on result for “espn.com” / visited site"
+      },
+      {
+        "date": "2024-01-11",
+        "time": "17:43",
+        "action": "Clicked on link for “NFL coaches, ranked by wins”"
+      }
+    ]
+  },
+  "FitBit": {
+    "version": "4.06 (40623035)",
+    "install_date": "2023-12-18",
+    "install_time": "11:42",
+    "username": "thisisdfir@gmail.com",
+    "note": "Sync’d actions are manual, a result of opening the app. Some data was populated from previous images. See data from the Android See data from the Android 10, 11, 12, 13, iOS 13, 14 and 15 images. Only actions taken during the data generation period of this image are documented here. Fitbit data does not populate Apple Health or Apple Fitness. * indicates location data is associated with the event",
+    "actions": [
+      {
+        "date": "2023-12-18",
+        "time": "11:44",
+        "action": "Login"
+      },
+      {
+        "date": "2023-12-18",
+        "time": "11:45",
+        "action": "Removed existing Versa 3 wearable"
+      },
+      {
+        "date": "2023-12-18",
+        "time": "11:47",
+        "action": "Paired Versa 3 to phone"
+      },
+      {
+        "date": "2023-12-18",
+        "time": "11:49",
+        "action": "Connect Versa 3 to Wi-Fi"
+      },
+      {
+        "date": "2023-12-18",
+        "time": "11:59",
+        "action": "Put Versa 3 on"
+      },
+      {
+        "date": "2023-12-19",
+        "time": "07:13",
+        "action": "Take off Versa 3"
+      },
+      {
+        "date": "2023-12-19",
+        "time": "07:30",
+        "action": "Put on Versa 3"
+      },
+      {
+        "date": "2023-12-21",
+        "time": "16:42",
+        "action": "Take off Versa 3"
+      },
+      {
+        "date": "2023-12-21",
+        "time": "17:05",
+        "action": "Put on Versa 3"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "11:11",
+        "action": "Turned off Versa 3"
+      }
+    ],
+    "workouts": [
+      {
+        "date": "2023-12-18",
+        "time": "12:31",
+        "type": "Run*",
+        "distance": "3.54",
+        "pace": "7:39",
+        "calories": "414",
+        "total_time": "27:00",
+        "avg_heart_rate": "169"
+      },
+      {
+        "date": "2023-12-20",
+        "time": "13:06",
+        "type": "Run*",
+        "distance": "3.52",
+        "pace": "7:30",
+        "calories": "393",
+        "total_time": "26:00",
+        "avg_heart_rate": "167"
+      },
+      {
+        "date": "2023-12-22",
+        "time": "09:58",
+        "type": "Run*",
+        "distance": "3.55",
+        "pace": "7:36",
+        "calories": "390",
+        "total_time": "27:00",
+        "avg_heart_rate": "161"
+      },
+      {
+        "date": "2023-12-23",
+        "time": "12:11",
+        "type": "Walk*",
+        "distance": "4.53",
+        "pace": "16:53",
+        "calories": "604",
+        "total_time": "1:16:00",
+        "avg_heart_rate": "98"
+      }
+    ],
+    "daily_activity_metrics": [
+      {
+        "date": "2023-12-18",
+        "steps": "14,286",
+        "floors_climbed": "28",
+        "distance_mi": "7.85",
+        "cals": "2,927",
+        "sleep": "N/A"
+      },
+      {
+        "date": "2023-12-19",
+        "steps": "7,466",
+        "floors_climbed": "13",
+        "distance_mi": "3.41",
+        "cals": "2,465",
+        "sleep": "7 hrs 9 mins"
+      },
+      {
+        "date": "2023-12-20",
+        "steps": "16,557",
+        "floors_climbed": "39",
+        "distance_mi": "8.84",
+        "cals": "3,383",
+        "sleep": "6 hrs 43 mins"
+      },
+      {
+        "date": "2023-12-21",
+        "steps": "6,116",
+        "floors_climbed": "14",
+        "distance_mi": "2.79",
+        "cals": "2,358",
+        "sleep": "7 hrs 2 mins"
+      },
+      {
+        "date": "2023-12-22",
+        "steps": "14,774",
+        "floors_climbed": "34",
+        "distance_mi": "8.07",
+        "cals": "3,054",
+        "sleep": "7 hrs 25 mins"
+      },
+      {
+        "date": "2023-12-23",
+        "steps": "18,093",
+        "floors_climbed": "40",
+        "distance_mi": "8.83",
+        "cals": "3,051",
+        "sleep": "7 hrs 4 mins"
+      },
+      {
+        "date": "2023-12-24",
+        "steps": "2,367",
+        "floors_climbed": "7",
+        "distance_mi": "1.08",
+        "cals": "1,920",
+        "sleep": "7 hrs 15 mins"
+      }
+    ]
+  },
+  "Garmin Connect": {
+    "version": "4.69.1.5",
+    "install_date": "2023-07-27",
+    "install_time": "20:10",
+    "updated_version": "4.74.3",
+    "update_date": "2024-01-23",
+    "update_time": "10:00",
+    "username": "thisisdfir@gmail.com",
+    "note": "Sync’d actions are manual, a result of opening the app. Some data was loaded from previous images. See data from the Android 10, 11, 12, 13, iOS 13, 14, and 15 images. Actions taken during the data generation period of this image are documented here. Daily activity metrics may populate in the Apple Health app, but are not documented here. * indicates location data is associated with the event",
+    "actions": [
+      {
+        "date": "2023-07-27",
+        "time": "20:11",
+        "action": "Login"
+      },
+      {
+        "date": "2023-07-27",
+        "time": "20:13",
+        "action": "Paired vivoactive 4 to phone"
+      },
+      {
+        "date": "2023-07-27",
+        "time": "20:16",
+        "action": "Put watch on"
+      },
+      {
+        "date": "2023-07-27",
+        "time": "20:38",
+        "action": "Connected watch to Wi-Fi"
+      },
+      {
+        "date": "2023-07-27",
+        "time": "20:39",
+        "action": "Started watch update / update complete"
+      },
+      {
+        "date": "2023-07-29",
+        "time": "15:04",
+        "action": "Take watch off"
+      },
+      {
+        "date": "2023-07-29",
+        "time": "15:17",
+        "action": "Put watch on"
+      },
+      {
+        "date": "2023-07-30",
+        "time": "11:29",
+        "action": "Take watch off"
+      },
+      {
+        "date": "2023-07-30",
+        "time": "11:44",
+        "action": "Put watch on"
+      },
+      {
+        "date": "2023-08-01",
+        "time": "16:08",
+        "action": "Take watch off / watch on charger"
+      },
+      {
+        "date": "2023-08-02",
+        "time": "20:20",
+        "action": "Watch off charger / put watch on"
+      },
+      {
+        "date": "2023-08-04",
+        "time": "09:22",
+        "action": "Take watch off"
+      },
+      {
+        "date": "2023-08-04",
+        "time": "13:38",
+        "action": "Put watch on"
+      },
+      {
+        "date": "2023-08-05",
+        "time": "13:16",
+        "action": "Take watch off"
+      },
+      {
+        "date": "2023-08-05",
+        "time": "13:38",
+        "action": "Put watch on"
+      },
+      {
+        "date": "2023-08-07",
+        "time": "07:21",
+        "action": "Take watch off"
+      },
+      {
+        "date": "2023-08-07",
+        "time": "07:33",
+        "action": "Put watch on"
+      },
+      {
+        "date": "2023-08-07",
+        "time": "19:30",
+        "action": "Take watch off / watch on charger"
+      },
+      {
+        "date": "2023-08-11",
+        "time": "07:07",
+        "action": "Watch off charger / put watch on"
+      },
+      {
+        "date": "2023-08-11",
+        "time": "16:05",
+        "action": "Take watch off"
+      },
+      {
+        "date": "2023-08-11",
+        "time": "16:31",
+        "action": "Put watch on"
+      },
+      {
+        "date": "2023-08-14",
+        "time": "07:20",
+        "action": "Take watch off"
+      },
+      {
+        "date": "2023-08-14",
+        "time": "07:39",
+        "action": "Put watch on"
+      },
+      {
+        "date": "2023-08-14",
+        "time": "20:08",
+        "action": "Power off watch"
+      }
+    ],
+    "workouts": [
+      {
+        "date": "2023-08-01",
+        "time": "11:11",
+        "type": "Run*",
+        "distance": "3.11",
+        "pace": "8:07",
+        "calories": "403",
+        "total_time": "25:14",
+        "avg_heart_rate": "169"
+      },
+      {
+        "date": "2023-08-03",
+        "time": "07:43",
+        "type": "Run*",
+        "distance": "3.34",
+        "pace": "8:03",
+        "calories": "417",
+        "total_time": "26:53",
+        "avg_heart_rate": "166"
+      },
+      {
+        "date": "2023-08-06",
+        "time": "08:32",
+        "type": "Run*",
+        "distance": "3.08",
+        "pace": "8:08",
+        "calories": "387",
+        "total_time": "25:03",
+        "avg_heart_rate": "166"
+      },
+      {
+        "date": "2023-08-12",
+        "time": "08:34",
+        "type": "Run*",
+        "distance": "3.11",
+        "pace": "8:11",
+        "calories": "397",
+        "total_time": "25:26",
+        "avg_heart_rate": "168"
+      },
+      {
+        "date": "2023-08-13",
+        "time": "10:13",
+        "type": "Walk*",
+        "distance": "4.01",
+        "pace": "18:07",
+        "calories": "420",
+        "total_time": "1:12:39",
+        "avg_heart_rate": "102"
+      }
+    ],
+    "daily_activity_metrics": [
+      {
+        "date": "2023-07-27",
+        "steps": "1,185",
+        "stress_level": "12",
+        "distance_mi": "0.6",
+        "cals": "2,055",
+        "sleep": "-"
+      },
+      {
+        "date": "2023-07-28",
+        "steps": "9,300",
+        "stress_level": "14",
+        "distance_mi": "4.7",
+        "cals": "2,282",
+        "sleep": "7 hrs 51 mins"
+      },
+      {
+        "date": "2023-07-29",
+        "steps": "10,654",
+        "stress_level": "22",
+        "distance_mi": "5.4",
+        "cals": "2,444",
+        "sleep": "9 hrs 1 min"
+      },
+      {
+        "date": "2023-07-30",
+        "steps": "7,047",
+        "stress_level": "16",
+        "distance_mi": "3.6",
+        "cals": "2,112",
+        "sleep": "8 hrs 14 mins"
+      },
+      {
+        "date": "2023-07-31",
+        "steps": "8,673",
+        "stress_level": "17",
+        "distance_mi": "4.4",
+        "cals": "2,192",
+        "sleep": "8 hrs 34"
+      },
+      {
+        "date": "2023-08-01",
+        "steps": "10,702",
+        "stress_level": "24",
+        "distance_mi": "6.3",
+        "cals": "2,677",
+        "sleep": "8 hrs 30 mins"
+      },
+      {
+        "date": "2023-08-02",
+        "steps": "925",
+        "stress_level": "22",
+        "distance_mi": "0.5",
+        "cals": "2,045",
+        "sleep": "-"
+      },
+      {
+        "date": "2023-08-03",
+        "steps": "12,813",
+        "stress_level": "24",
+        "distance_mi": "7.4",
+        "cals": "2,695",
+        "sleep": "7 hrs 25 mins"
+      },
+      {
+        "date": "2023-08-04",
+        "steps": "9,149",
+        "stress_level": "24",
+        "distance_mi": "4.6",
+        "cals": "2,252",
+        "sleep": "9 hrs 13 mins"
+      },
+      {
+        "date": "2023-08-05",
+        "steps": "4,958",
+        "stress_level": "23",
+        "distance_mi": "2.5",
+        "cals": "2,111",
+        "sleep": "7 hrs 17mins"
+      },
+      {
+        "date": "2023-08-06",
+        "steps": "13,038",
+        "stress_level": "23",
+        "distance_mi": "7.4",
+        "cals": "2,661",
+        "sleep": "8 hrs 50 mins"
+      },
+      {
+        "date": "2023-08-07",
+        "steps": "2,578",
+        "stress_level": "22",
+        "distance_mi": "1.8",
+        "cals": "2,088",
+        "sleep": "8 hrs 16 mins"
+      },
+      {
+        "date": "2023-08-08",
+        "steps": "-",
+        "stress_level": "-",
+        "distance_mi": "-",
+        "cals": "-",
+        "sleep": "-"
+      },
+      {
+        "date": "2023-08-09",
+        "steps": "-",
+        "stress_level": "-",
+        "distance_mi": "-",
+        "cals": "-",
+        "sleep": "-"
+      },
+      {
+        "date": "2023-08-10",
+        "steps": "-",
+        "stress_level": "-",
+        "distance_mi": "-",
+        "cals": "-",
+        "sleep": "-"
+      },
+      {
+        "date": "2023-08-11",
+        "steps": "4,372",
+        "stress_level": "20",
+        "distance_mi": "2.2",
+        "cals": "2,107",
+        "sleep": "-"
+      },
+      {
+        "date": "2023-08-12",
+        "steps": "15,215",
+        "stress_level": "25",
+        "distance_mi": "8.6",
+        "cals": "2,830",
+        "sleep": "9 hrs 31 mins"
+      },
+      {
+        "date": "2023-08-13",
+        "steps": "16,504",
+        "stress_level": "23",
+        "distance_mi": "8.2",
+        "cals": "2,609",
+        "sleep": "8 hrs 25 mins"
+      },
+      {
+        "date": "2023-08-14",
+        "steps": "4,093",
+        "stress_level": "20",
+        "distance_mi": "2.1",
+        "cals": "1,769",
+        "sleep": "9 hrs 27 mins"
+      }
+    ]
+  }
+}

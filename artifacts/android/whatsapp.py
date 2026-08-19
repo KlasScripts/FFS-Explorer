@@ -1,14 +1,82 @@
 import sqlite3
 
 name     = "WhatsApp Messages"
+description = ("Messages from WhatsApp's local database (msgstore.db, "
+              "table message), live rows plus anything freeblocks/freed "
+              "pages/WAL history/header-signature scanning recovers from "
+              "the same table, merged into this same report. Checked, not "
+              "skipped: on the extraction this was built against, "
+              "msgstore.db has PRAGMA secure_delete = FAST set, which "
+              "actively zeroes freed page bytes at delete time — confirmed "
+              "by inspecting the freed ranges directly (all zero, aside "
+              "from a single leftover 2-byte freeblock-link fragment "
+              "followed by zeros, not record content) on a database with "
+              "one confirmed-deleted message (a message._id gap). Checked "
+              "the same way against message_ftsv2_content (WhatsApp's own "
+              "full-text-search shadow table, the same kind of table that "
+              "recovered a deleted message on LINE via WAL history) and "
+              "against the live WAL for both tables — no stale/uncommitted "
+              "copy of the deleted row's page was present either. A real "
+              "negative for carving specifically, not evidence nothing was "
+              "deleted. message_revoked (WhatsApp's own \"delete for "
+              "everyone\" tombstone table) was empty on this extraction — "
+              "the one documented deletion here was a local-only delete, "
+              "which WhatsApp does not appear to route through that table.")
 app_path = "data/data/com.whatsapp"
 files    = {
     "msgstore": "databases/msgstore.db",
     "wa":       "databases/wa.db",
 }
+optional_files = {
+    # Same basenames as on-device, same directory, so sqlite3 picks them up
+    # automatically on connect() — WAL can hold the most recent,
+    # not-yet-checkpointed messages, and the recovery pass below can't
+    # search a WAL that was never extracted from the archive.
+    "msgstore_wal": "databases/msgstore.db-wal",
+    "msgstore_shm": "databases/msgstore.db-shm",
+    "wa_wal": "databases/wa.db-wal",
+    "wa_shm": "databases/wa.db-shm",
+}
+
+# Declarative only — no recovery code belongs here; see description above
+# for what was actually found.
+recoverable_tables = ["message"]
+
+# Raw values (never a formatted string) so the Report table can display
+# them per the case's timestamp-display setting. "sent_time" is this
+# module's own run() output for the message table's "timestamp" column;
+# "timestamp" is that same column's own SQL name as it appears on a
+# carved/recovered row instead (carving dumps the table's own column names
+# verbatim, and WhatsApp's column really is called "timestamp"). Both are
+# Unix epoch milliseconds.
+timestamp_fields = {"sent_time": "ms", "timestamp": "ms"}
+
+# "attachment_path" is a full archive ui_path for the thumbnail/full-view
+# feature (see app/artifact_media.py) — built from message_media.file_path
+# (already selected as "media_path" below, kept unchanged) plus a FIXED
+# base path, not app_path/data/data/com.whatsapp: WhatsApp writes media to
+# shared/external storage, a completely different location from its own
+# app-private database directory. Confirmed against a real extraction —
+# message_media.file_path 'Media/WhatsApp Images/Sent/IMG-....jpg' only
+# resolves under data/media/0/Android/media/com.whatsapp/WhatsApp/, not
+# under app_path. This is a fixed OS/app convention (unlike iOS's
+# per-install GUID containers), so it's hardcoded rather than resolved via
+# guid_to_bundle.
+_MEDIA_BASE = "data/media/0/Android/media/com.whatsapp/WhatsApp"
+media_fields = ["attachment_path"]
 
 
 def run(paths):
+    # sent_time is the raw m.timestamp value (ms), not converted in SQL at
+    # all — deliberately not `datetime(m.timestamp/1000, 'unixepoch')`
+    # (still correct, but a needless SQL-side format now that the Report
+    # table itself formats per the case's timestamp-display setting; see
+    # timestamp_fields above). This also sidesteps the historical trap
+    # documented at length in this project's git history: SQLite's
+    # 'localtime' modifier converts using the ANALYSIS MACHINE's timezone,
+    # not the device's — a bug once shipped here, verified wrong on this
+    # project's own UK-based dev machine, silently 5 hours off a January
+    # EST timestamp by pure winter-GMT coincidence.
     conn = sqlite3.connect(paths["msgstore"])
     conn.execute("ATTACH DATABASE ? AS contacts_db", (paths["wa"],))
     cur = conn.cursor()
@@ -36,7 +104,7 @@ def run(paths):
             COALESCE(sender_jidmap_contact.display_name, sender_jidmap_contact.wa_name,
                      sender_jidmap_contact.given_name)                          AS sender_mapped_contact_name,
             m.chat_row_id                                                       AS raw_chat_row_id,
-            datetime(m.timestamp / 1000, 'unixepoch', 'localtime')             AS sent_time,
+            m.timestamp                                                         AS sent_time,
             m.text_data                                                         AS text,
             message_media.file_path                                             AS media_path,
             message_location.latitude,
@@ -79,12 +147,21 @@ def run(paths):
         else:
             group_sender = None
 
+        # jid_map only has a row for a LID-privacy-identity contact (memory:
+        # present but sparse — see checklist point 1); an ordinary contact's
+        # *_mapped_jid is simply absent, not an error, so fall back to the
+        # plain jid the same way remote_name below falls back to the plain
+        # contact name. Without this fallback, remote_party_jid came back
+        # None for 229 of 230 rows on the extraction this was built against
+        # — verified wrong, not a hypothetical edge case.
         if is_sent and is_group:
             remote_jid = None
         elif is_group:
-            remote_jid = _fmt(r["sender_mapped_jid_raw"], r["sender_mapped_jid_id"])
+            remote_jid = (_fmt(r["sender_mapped_jid_raw"], r["sender_mapped_jid_id"])
+                          or _fmt(r["sender_jid_raw"], r["sender_jid_id"]))
         else:
-            remote_jid = _fmt(r["chat_mapped_jid_raw"], r["chat_mapped_jid_id"])
+            remote_jid = (_fmt(r["chat_mapped_jid_raw"], r["chat_mapped_jid_id"])
+                          or _fmt(r["chat_jid_raw"], r["chat_jid_id"]))
 
         if is_group:
             remote_name = r["sender_mapped_contact_name"] or r["sender_contact_name"]
@@ -109,8 +186,12 @@ def run(paths):
             "sent_time":        r["sent_time"],
             "text":             r["text"],
             "media_path":       r["media_path"],
+            "attachment_path":  (f"{_MEDIA_BASE}/{r['media_path']}"
+                                 if r["media_path"] else ''),
             "latitude":         r["latitude"],
             "longitude":        r["longitude"],
+            "recovered":        False,
+            "source_table":     "message",
         })
 
     return records

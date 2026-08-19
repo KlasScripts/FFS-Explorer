@@ -1,5 +1,6 @@
 """hex_viewer.py — hex-viewer constants, worker, and FastZipBrowser mixin."""
 
+import warnings
 import zipfile
 
 from zip_entry import ZipEntry
@@ -77,6 +78,8 @@ class HexLoadWorker(QThread):
             with zipfile.ZipFile(self.entry.zip_path, 'r') as z:
                 with z.open(self.entry.physical_path) as f:
                     while len(data) < self.LIMIT:
+                        if self.isInterruptionRequested():
+                            return
                         chunk = f.read(self.CHUNK)
                         if not chunk:
                             break
@@ -200,12 +203,32 @@ class HexViewerMixin:
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
+    def _stop_hex_worker(self):
+        """Stop any in-flight hex-load worker before starting a new one.
+
+        Uses cooperative interruption instead of QThread.terminate() (an
+        unsafe forced-kill that can leave the worker mid-syscall in an
+        undefined state), and disconnects its signals first so an
+        already-queued load_complete/progress from the old worker can never
+        land against the file that replaces it.
+        """
+        worker = self._hex_worker
+        if worker is None or not worker.isRunning():
+            return
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for name in ("progress", "load_complete", "error"):
+                try:
+                    getattr(worker, name).disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+        worker.requestInterruption()
+        worker.wait()
+
     def _load_hex_preview(self, ui_path):
         self.preview_tabs.setCurrentIndex(0)
 
-        if self._hex_worker is not None and self._hex_worker.isRunning():
-            self._hex_worker.terminate()
-            self._hex_worker.wait()
+        self._stop_hex_worker()
 
         self._hex_entry        = None
         self._hex_file_size    = 0
@@ -218,11 +241,8 @@ class HexViewerMixin:
         self.hex_progress_bar.hide()
 
         try:
-            if self._streaming_index is not None:
-                entry = self._streaming_index.get_entry(physical_path)
-            else:
-                zinfo = self._get_zip_handle().getinfo(physical_path)
-                entry = ZipEntry(self.zip_path, physical_path, zinfo)
+            zinfo = self._get_zip_handle().getinfo(physical_path)
+            entry = ZipEntry(self.zip_path, physical_path, zinfo)
         except Exception as e:
             self._on_hex_error(str(e))
             return
@@ -254,9 +274,7 @@ class HexViewerMixin:
     def _load_hex_preview_from_bytes(self, data: bytes, label: str) -> None:
         """Populate the Hex tab from raw bytes without reading the FFS zip."""
         self.preview_tabs.setCurrentIndex(0)
-        if self._hex_worker is not None and self._hex_worker.isRunning():
-            self._hex_worker.terminate()
-            self._hex_worker.wait()
+        self._stop_hex_worker()
         self._hex_entry        = None
         self._hex_file_size    = len(data)
         self._hex_bytes_loaded = len(data)
@@ -272,9 +290,7 @@ class HexViewerMixin:
     def _open_hex_from_search(self, physical_path: str, display_label: str,
                                jump_to: int | None, keyword: str):
         """Load *physical_path* into the hex viewer positioned at *jump_to* offset."""
-        if self._hex_worker is not None and self._hex_worker.isRunning():
-            self._hex_worker.terminate()
-            self._hex_worker.wait()
+        self._stop_hex_worker()
 
         self._hex_entry        = None
         self._hex_file_size    = 0
@@ -287,11 +303,8 @@ class HexViewerMixin:
         self.hex_progress_bar.hide()
 
         try:
-            if self._streaming_index is not None:
-                entry = self._streaming_index.get_entry(physical_path)
-            else:
-                zinfo = self._get_zip_handle().getinfo(physical_path)
-                entry = ZipEntry(self.zip_path, physical_path, zinfo)
+            zinfo = self._get_zip_handle().getinfo(physical_path)
+            entry = ZipEntry(self.zip_path, physical_path, zinfo)
         except Exception as e:
             self._on_hex_error(str(e))
             return
@@ -344,9 +357,7 @@ class HexViewerMixin:
         Positions the view around *jump_to* and highlights the keyword,
         mirroring the behaviour of _open_hex_from_search for FFS zip entries.
         """
-        if self._hex_worker is not None and self._hex_worker.isRunning():
-            self._hex_worker.terminate()
-            self._hex_worker.wait()
+        self._stop_hex_worker()
 
         self._hex_entry        = None
         self._hex_ui_path      = display_label
@@ -679,11 +690,8 @@ class HexViewerMixin:
         """
         physical = self._adapter.resolve(ui_path)
         try:
-            if self._streaming_index is not None:
-                entry = self._streaming_index.get_entry(physical)
-            else:
-                zinfo = self._get_zip_handle().getinfo(physical)
-                entry = ZipEntry(self.zip_path, physical, zinfo)
+            zinfo = self._get_zip_handle().getinfo(physical)
+            entry = ZipEntry(self.zip_path, physical, zinfo)
             n = entry.file_size if max_bytes < 0 else min(max_bytes, entry.file_size)
             return entry.read(n)
         except Exception:

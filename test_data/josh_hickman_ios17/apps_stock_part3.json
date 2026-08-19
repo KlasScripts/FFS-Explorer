@@ -1,0 +1,627 @@
+{
+  "Journal": {
+    "actions": [
+      {
+        "date": "2024-07-28",
+        "time": "13:55",
+        "action": "Title: Afternoon run and walk",
+        "message": "It was so hot! I thought I was going to pass out, but I made it. (Smiley face emoji)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "13:57",
+        "action": "Title: N/A",
+        "message": "This is my test entry. Hopefully you can see it."
+      }
+    ]
+  },
+  "Mail": {
+    "note": "Only user actions are documented here; additional mail messages were received. User actions via Gmail will also appear within the app.",
+    "actions": [
+      {
+        "date": "2024-01-17",
+        "time": "17:15",
+        "action": "Login"
+      }
+    ]
+  },
+  "Maps": {
+    "note": "Navigation started in CarPlay is denoted here with (CarPlay).",
+    "actions": [
+      {
+        "date": "2023-07-08",
+        "time": "12:36",
+        "action": "Searched for “107 Edinburgh” / Chose destination"
+      },
+      {
+        "date": "2023-07-08",
+        "time": "12:37",
+        "action": "Started navigation to 107 Edinburgh South Drive, Cary, NC 27511"
+      },
+      {
+        "date": "2023-07-08",
+        "time": "12:54",
+        "action": "Navigation ended (arrived at destination)"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "12:49",
+        "action": "Searched for “1223 Timber Dr E”"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "12:50",
+        "action": "Started navigation to 1223 Timber Drive E, Garner, NC 27529"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "13:34",
+        "action": "Stopped navigation (user stopped)"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "14:06",
+        "action": "Searched for “Limited Run Games”"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "14:07",
+        "action": "Started navigation to 107 Edinburgh South Drive, Cary, NC 27511"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "14:31",
+        "action": "Stopped navigation (user stopped)"
+      },
+      {
+        "date": "2023-07-21",
+        "time": "08:34",
+        "action": "Searched for “7629 Purfoy Rd”"
+      },
+      {
+        "date": "2023-07-21",
+        "time": "08:35",
+        "action": "Started navigation to 7629 Purfoy Road, Fuquay-Varina, NC 27526"
+      },
+      {
+        "date": "2023-07-21",
+        "time": "08:53",
+        "action": "Navigation ended (arrived at destination)"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "13:40",
+        "action": "Searched for “Limited Run Games”"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "13:41",
+        "action": "Started navigation to 107 Edinburgh South Drive, Cary, NC 27511"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "13:58",
+        "action": "Stopped navigation (user stopped)"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "14:44",
+        "action": "Searched for nearby Dick’s Sporting Goods"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "14:45",
+        "action": "Selected location (168 Grand Hill Pl, Holly Springs, NC 27540)"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "14:46",
+        "action": "Started navigation to 168 Grand Hill Pl, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "14:59",
+        "action": "Navigation ended (arrived at destination)"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "08:06",
+        "action": "Searched for nearby coffee shops"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "08:07",
+        "action": "Searched for “Starbucks”"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "08:08",
+        "action": "Selected Starbucks at 185 Grand Hill Pl, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "08:09",
+        "action": "Got directions to 185 Grand Hill Pl, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "08:10",
+        "action": "Started navigation to 185 Grand Hill Pl, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "08:25",
+        "action": "Navigation ended (arrived at destination)"
+      },
+      {
+        "date": "2024-05-07",
+        "time": "14:51",
+        "action": "Searched for “Hilton Garden Inn”"
+      },
+      {
+        "date": "2024-05-07",
+        "time": "14:52",
+        "action": "Got directions 800 US-130 Hamilton, NJ 08690"
+      },
+      {
+        "date": "2024-05-07",
+        "time": "14:53",
+        "action": "Started navigation to 800 US-130 Hamilton, NJ 08690"
+      },
+      {
+        "date": "2024-05-07",
+        "time": "15:54",
+        "action": "Arrived at destination"
+      },
+      {
+        "date": "2024-06-03",
+        "time": "13:58",
+        "action": "Searched for “best western Wilmington bc” [sic]"
+      },
+      {
+        "date": "2024-06-03",
+        "time": "13:59",
+        "action": "Got directions to 503 Nutt Street, Wilmington NC 28401"
+      },
+      {
+        "date": "2024-06-03",
+        "time": "14:00",
+        "action": "Started navigation to 503 Nutt Street, Wilmington NC 28401"
+      },
+      {
+        "date": "2024-06-03",
+        "time": "16:28",
+        "action": "Arrived at destination"
+      },
+      {
+        "date": "2024-06-15",
+        "time": "13:13",
+        "action": "Searched for “913 Ocean Drive Emerald Isle NC”"
+      },
+      {
+        "date": "2024-06-15",
+        "time": "13:14",
+        "action": "Searched for “913 Ocean Drive Emerald Isle NC”"
+      },
+      {
+        "date": "2024-06-15",
+        "time": "13:15",
+        "action": "Got directions to 913 Ocean Drive Emerald Isle N.C. 28594"
+      },
+      {
+        "date": "2024-06-15",
+        "time": "13:16",
+        "action": "Started navigation to 913 Ocean Drive Emerald Isle N.C. 28594"
+      },
+      {
+        "date": "2024-06-15",
+        "time": "16:50",
+        "action": "Ended navigation"
+      },
+      {
+        "date": "2024-07-15",
+        "time": "14:41",
+        "action": "Searched for “Capitol Hilton”"
+      },
+      {
+        "date": "2024-07-15",
+        "time": "14:42",
+        "action": "Got directions to 1001 16th St NW, Washington, DC 20036"
+      },
+      {
+        "date": "2024-07-15",
+        "time": "14:43",
+        "action": "Started navigation to 1001 16th St NW, Washington, DC 20036"
+      },
+      {
+        "date": "2024-07-15",
+        "time": "16:28",
+        "action": "Stopped navigation"
+      }
+    ]
+  },
+  "Messages": {
+    "note": "Location sharing may also appear in FindMy. iMessages were sync’d with iCloud. Message retention time is not changed from the default",
+    "actions": [
+      {
+        "date": "2023-08-11",
+        "time": "16:49",
+        "action": "Received Spotify Playlist",
+        "message": "(Playlist: Sampled)"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:27",
+        "action": "Received message",
+        "message": "(Attached file: SANS_FOR585_Poster)"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:29",
+        "action": "Saved shared file",
+        "message": "(Attached file: SANS_FOR585_Poster)"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:32",
+        "action": "Sent file (from Files app)",
+        "message": "(Attached file: IMG_0190)"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:35",
+        "action": "Sent Collaborate link from Files"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:37",
+        "action": "Received Collaborate link from Files"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:41",
+        "action": "Received message",
+        "message": "Did you get the link I sent?"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:13",
+        "action": "Sent message",
+        "message": "I did! Thank you."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:14",
+        "action": "Received message",
+        "message": "Awesome. Are you working today?"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:17",
+        "action": "Sent message",
+        "message": "I am, unfortunately. It’s fine, though. I got a few things off my plate."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:19",
+        "action": "Received message",
+        "message": "Good. Hopefully, that continues."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:20",
+        "action": "Replied to message",
+        "message": "(Message received at 14:19) It dpends on if my kid cooperates. Lol"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:21",
+        "action": "Other party reacted to message",
+        "message": "(Message received at 14:20) (Reaction: HaHa)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:22",
+        "action": "Received message",
+        "message": "(Smiley face emoji)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:23",
+        "action": "Sent message",
+        "message": "Here comes a picture"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:24",
+        "action": "Sent picture",
+        "message": "(Brooklyn)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:25",
+        "action": "Received message",
+        "message": "That’s great! I’ll send one now."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:27",
+        "action": "Received picture",
+        "message": "(Yippee Ki Yay)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:28",
+        "action": "Saved picture",
+        "message": "(Yippee Ki Yay)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:30",
+        "action": "Sent message",
+        "message": "Here is my message. I will edit it in a minute."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:31",
+        "action": "Edited message",
+        "message": "(Message sent at 14:30) New message: I edited this message."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:32",
+        "action": "Received message",
+        "message": "Got it."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:33",
+        "action": "Received message",
+        "message": "I am going to edit this message momentarily."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:34",
+        "action": "Reacted to message",
+        "message": "(Thumb’s up reaction)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:35",
+        "action": "Other party edited message",
+        "message": "(Message received at 14:33) New message: This is the edited version of this message."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:36",
+        "action": "Sent message",
+        "message": "Nice. I am going to unsend this message in a minute or two."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:37",
+        "action": "Unsent message",
+        "message": "(Message sent at 14:36)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:39",
+        "action": "Received message",
+        "message": "Here it’s [sic] your super bad message. Please delete it and let me know."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:40",
+        "action": "Other party edited message",
+        "message": "(Message received at 14:39) New message: Here is your super bad message. Please delete it and let me know."
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:41",
+        "action": "Deleted message",
+        "message": "(Edited message from 14:40)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:42",
+        "action": "Deleted message",
+        "message": "(Message received on 2024-01-14 at 10:41)"
+      },
+      {
+        "date": "2024-01-15",
+        "time": "14:43",
+        "action": "Sent message",
+        "message": "I moved it to Recently deleted."
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:52",
+        "action": "Sent message (with Siri via CarPlay)",
+        "message": "I am sending this message to you using Siri."
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:53",
+        "action": "Received message (other party used Siri to send)",
+        "message": "Hi. This is your reply. I am using Siri to send it."
+      },
+      {
+        "date": "2024-01-17",
+        "time": "16:59",
+        "action": "Shared “iOS 16 Note”"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "11:38",
+        "action": "Sent static location"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "11:41",
+        "action": "Received static location"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "11:43",
+        "action": "Sent static location"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "11:51",
+        "action": "Started sending dynamic location"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "11:54",
+        "action": "Stopped sending dynamic location"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "11:55",
+        "action": "Started receiving dynamic location"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "11:58",
+        "action": "Stopped receiving dynamic location"
+      },
+      {
+        "date": "2024-07-26",
+        "time": "16:29",
+        "action": "Received static location"
+      },
+      {
+        "date": "2024-07-26",
+        "time": "16:45",
+        "action": "Sent static location"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:23",
+        "action": "Shared “Shared iOS 17 Note” with DFIR Four"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:47",
+        "action": "Received message",
+        "message": "Last one, hopefully. (Smiley face emoji)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:48",
+        "action": "Replied to message",
+        "message": "(Message received at 10:47) Yes, hopefully. I’m worn out."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:50",
+        "action": "Received message",
+        "message": "Totally. I can’t any more. I need a small break before iOS 18 and Android 15."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:51",
+        "action": "Reacted to message",
+        "message": "(Message received at 10:50) (Heart emoji)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:52",
+        "action": "Sent message",
+        "message": "Absolutely. I’m ready to be done for a bit."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:54",
+        "action": "Received message",
+        "message": "You and me both. I’ll send a picture."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:59",
+        "action": "Received picture",
+        "message": "(Silverware & candles)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:00",
+        "action": "Saved picture",
+        "message": "(Silverware & candles)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:01",
+        "action": "Sent message",
+        "message": "Got it. I’ll send one."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:02",
+        "action": "Sent picture",
+        "message": "(LOVE)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:03",
+        "action": "Received message",
+        "message": "I am going to edit this message in one minute."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:04",
+        "action": "Other party edited message",
+        "message": "(Message received at 11:03) I edited this message."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:05",
+        "action": "Sent message",
+        "message": "Cool. I’ll edit this message momentarily."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:06",
+        "action": "Edited message",
+        "message": "(Message sent at 11:05) This is my edited message."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:07",
+        "action": "Received message",
+        "message": "Here is your bad message. Please delete it."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:08",
+        "action": "Deleted message",
+        "message": "(Message received at 11:07)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:09",
+        "action": "Sent message",
+        "message": "Returning the favor it. Delete this."
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:54",
+        "action": "Started receiving dynamic location"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:55",
+        "action": "Started sending dynamic location"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:58",
+        "action": "Stopped receiving dynamic location"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "11:59",
+        "action": "Stopped sending dynamic location"
+      }
+    ]
+  }
+}

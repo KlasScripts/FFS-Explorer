@@ -13,9 +13,28 @@ Single-file (legacy, iOS-style):
 Multi-file (new, for scripts that need several databases):
     name      str            — human-readable label
     app_path  str            — base path of the app within the user partition
-                               (e.g. "data/data/com.whatsapp")
+                               (e.g. "data/data/com.whatsapp"). Android
+                               package dirs and fixed iOS OS-level paths
+                               (e.g. "mobile/Library/SMS") only — a
+                               THIRD-PARTY iOS app's own container is
+                               GUID-named per install, not usable here;
+                               such a module declares app_group instead
+                               (see below), never both.
+    app_group str            — alternative to app_path, third-party iOS
+                               apps only: the app's stable App Group
+                               identifier (e.g.
+                               "group.net.whatsapp.WhatsApp.shared"),
+                               resolved to this device's actual GUID-named
+                               container via the case's own guid_to_bundle
+                               map (see _resolve_app_group_base). Confirm
+                               the exact string against a real
+                               extraction's guid_to_bundle first — it is
+                               NOT the app's bundle id, and not guessable
+                               (e.g. WhatsApp's own bundle id is
+                               net.whatsapp.WhatsApp, a different string
+                               from its App Group above).
     files     dict[str,str]  — {key: subpath} where subpath is relative to
-                               app_path (e.g. {"msgstore": "databases/msgstore.db"})
+                               app_path/app_group (e.g. {"msgstore": "databases/msgstore.db"})
     optional_files dict[str,str]
                              — like files, but extracted only when present in the
                                archive; a missing optional file is not an error
@@ -23,6 +42,30 @@ Multi-file (new, for scripts that need several databases):
                                (e.g. {"wal": "Photos.sqlite-wal"})
     run(paths)               — receives dict[str, str] mapping each key to the
                                extracted file's path on disk; returns list[dict]
+
+Optional module-level attributes, read by app/artifact_viewer.py:
+    description str — where this data comes from and any known reliability
+                       caveats; shown on the report's "Report Notes/Warning"
+                       tree entry (not inline on the report itself — a long
+                       description there used to push the table down/off-
+                       screen).
+    warning     str — separate from description; something the examiner
+                       must read before trusting the report (e.g. a
+                       carving/recovery limitation, not a routine note).
+                       Styled in bold red on the same Notes/Warning page,
+                       above description. Most scripts don't need one —
+                       reserve it for a genuine "read this or you'll
+                       misinterpret the data" caveat, not general notes.
+    timestamp_fields dict[str, str] — {field_name: unit_code} for every
+                       timestamp-shaped output field (unit_code one of
+                       "s"/"ms"/"cocoa_s"/"cocoa_ns"); the field must hold
+                       the raw numeric value, never a pre-formatted string
+                       — the Report table formats it per the case's
+                       UTC/handset/acquisition setting at display time (see
+                       CLAUDE.md's timestamp conventions).
+    recoverable_tables list[str] — declarative only, names tables this
+                       script's recovery pass (sqlite_carve) can carve from;
+                       no recovery code belongs on the module itself.
 
 Source files are saved to:
     case_dir/artifact_parser_files/<Parser Name>/original_filename
@@ -118,20 +161,12 @@ def _extract_candidate(
     zip_path: str,
     dest_path: str,
     zip_obj: zipfile.ZipFile | None,
-    streaming_index,
 ) -> bool:
     """Try each candidate path and extract the first match to dest_path.
 
     Returns True if a file was found and saved (or already existed), False if
     none of the candidates exist in the archive.
     """
-    if streaming_index is not None:
-        for candidate in candidates:
-            if candidate not in streaming_index:
-                continue
-            _save_entry(streaming_index.get_entry(candidate), dest_path)
-            return True
-
     if zip_obj is not None:
         zip_names = set(zip_obj.namelist())
         for candidate in candidates:
@@ -144,7 +179,45 @@ def _extract_candidate(
     return False
 
 
+def _recover_deleted_rows(paths: dict, table: str, field_notes: dict) -> list[dict]:
+    """One entry of a parser's `recoverable_tables` -> extra rows from
+    app/sqlite_carve.py's freeblock/freed-page/WAL-history scan, or [] if
+    nothing survived, the module can't be imported, or anything about the
+    attempt failed. A parser declares only the table name (see viber.py /
+    burner.py for the one-line convention) — no recovery code belongs in
+    an artifact script; this is the only call site. *field_notes* is the
+    matching entry (if any) of a parser's optional `recovery_field_notes`
+    — also declarative, a caveat string per column the parser's own
+    cross-checking found unreliable, attached to the recovered row rather
+    than silently dropped or (worse) "corrected" to a guess."""
+    try:
+        import sqlite_carve
+    except ImportError:
+        return []
+    return sqlite_carve.recover_deleted_rows(paths, table, field_notes)
+
+
 # ── Running ───────────────────────────────────────────────────────────────────
+
+def _resolve_app_group_base(app_group: str, guid_to_bundle: dict) -> str | None:
+    """iOS third-party app data lives under a GUID-named container
+    (Containers/Data/Application/<GUID>/… for the app's own sandbox, or
+    Containers/Shared/AppGroup/<GUID>/… for data an app explicitly shares
+    via an App Group entitlement — the GUID is random per install, never
+    the same across extractions, so a module can't hardcode it the way
+    Android's package-name-based app_path works. A module declares the
+    App Group's own stable bundle-style identifier instead (e.g.
+    "group.net.whatsapp.WhatsApp.shared", confirmed against a real
+    extraction's guid_to_bundle map — see artifacts/ios/whatsapp.py) and
+    this reverse-looks-up which GUID that resolved to on THIS device.
+    guid_to_bundle is {guid: bundle_id}, already built once at case-load
+    (FastZipBrowser.guid_to_bundle) from Cellebrite's own MCM metadata —
+    no new resolution mechanism, just reusing it here."""
+    for guid, bundle_id in (guid_to_bundle or {}).items():
+        if bundle_id == app_group:
+            return f"mobile/Containers/Shared/AppGroup/{guid}"
+    return None
+
 
 def run_artifact(
     script_name: str,
@@ -153,40 +226,68 @@ def run_artifact(
     adapter,
     case_dir: str,
     zip_obj: zipfile.ZipFile | None = None,
-    streaming_index=None,
+    guid_to_bundle: dict | None = None,
 ) -> tuple[list[dict], str]:
     """Run one artifact parser against the open archive.
 
     Source files are saved to case_dir/artifact_parser_files/<name>/ and
     kept for direct inspection.  Extraction is skipped if the file exists.
 
-    Returns (rows, error).  On success rows is a list[dict] and error is ''.
-    On failure rows is [] and error describes what went wrong.
+    Returns (rows, error). On success rows is a list[dict] — the parser's
+    own query result plus whatever its `recoverable_tables` declaration
+    turned up, appended after. A script wanting recovered/carved content
+    kept as its own separate, independently-trusted report (rather than
+    blended into a normal query's output) should be its own separate
+    script whose `run()` returns [] and whose entire contribution is its
+    `recoverable_tables` declaration — see e.g.
+    artifacts/android/burner_messageentity.py. On failure rows is [] and
+    error describes what went wrong.
     """
     parser_name = getattr(module, 'name', script_name)
     dest_dir    = _parser_files_dir(case_dir, parser_name)
 
     # ── Multi-file API ────────────────────────────────────────────────────────
-    if hasattr(module, 'app_path') and hasattr(module, 'files'):
-        app_base = module.app_path.strip('/')
+    has_app_path  = hasattr(module, 'app_path')  and hasattr(module, 'files')
+    has_app_group = hasattr(module, 'app_group') and hasattr(module, 'files')
+    if has_app_path or has_app_group:
+        if has_app_path:
+            app_base = module.app_path.strip('/')
+        else:
+            app_base = _resolve_app_group_base(module.app_group, guid_to_bundle)
+            if app_base is None:
+                return [], f"{script_name}: app group '{module.app_group}' not present on this device"
         paths: dict[str, str] = {}
+        # Reserved key (leading underscore — never a real `files`/
+        # `optional_files` entry, whose keys are chosen by the module
+        # author): the container's own ui_path, for a parser that needs to
+        # build a *reference* to some other file inside the container
+        # rather than extract it directly — e.g. an attachment path stored
+        # in a database column, which artifact_media.py resolves later at
+        # display time via the app's normal zip-reading path, never copied
+        # to disk by the parser itself. See media_fields on the module and
+        # artifacts/ios/whatsapp.py's `attachment_path` for the convention.
+        paths['_app_base_ui_path'] = app_base
         for key, subpath in module.files.items():
             ui_path    = f"{app_base}/{subpath.lstrip('/')}"
             candidates = adapter.user_candidates(ui_path)
             dest_path  = os.path.join(dest_dir, os.path.basename(subpath))
-            if not _extract_candidate(candidates, zip_path, dest_path, zip_obj, streaming_index):
+            if not _extract_candidate(candidates, zip_path, dest_path, zip_obj):
                 return [], f"{script_name}: file not found: {ui_path}"
             paths[key] = dest_path
         for key, subpath in getattr(module, 'optional_files', {}).items():
             ui_path    = f"{app_base}/{subpath.lstrip('/')}"
             candidates = adapter.user_candidates(ui_path)
             dest_path  = os.path.join(dest_dir, os.path.basename(subpath))
-            if _extract_candidate(candidates, zip_path, dest_path, zip_obj, streaming_index):
+            if _extract_candidate(candidates, zip_path, dest_path, zip_obj):
                 paths[key] = dest_path
         try:
-            return module.run(paths) or [], ''
+            rows = module.run(paths) or []
         except Exception as exc:
             return [], f"{script_name}: {exc}"
+        all_notes = getattr(module, 'recovery_field_notes', {})
+        for table in getattr(module, 'recoverable_tables', ()):
+            rows = rows + _recover_deleted_rows(paths, table, all_notes.get(table, {}))
+        return rows, ''
 
     # ── Single-file API (legacy) ──────────────────────────────────────────────
     target_paths = getattr(module, 'target_paths', [])
@@ -196,7 +297,7 @@ def run_artifact(
     for ui_path in target_paths:
         candidates = adapter.user_candidates(ui_path)
         dest_path  = os.path.join(dest_dir, os.path.basename(ui_path))
-        if not _extract_candidate(candidates, zip_path, dest_path, zip_obj, streaming_index):
+        if not _extract_candidate(candidates, zip_path, dest_path, zip_obj):
             continue
         try:
             db   = sqlite3.connect(dest_path)

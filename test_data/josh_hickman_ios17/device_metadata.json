@@ -1,0 +1,71 @@
+{
+  "phone": {
+    "make": "iPhone 11", "model": "A2111 (Purple)", "order_number": "MWLC2LL/A",
+    "ram": "4 GB", "storage": "64 GB",
+    "carrier": "Google Fi", "phone_number": "919-579-4674",
+    "serial": "F4GZ987AN72N", "wifi_mac": "88:64:40:75:2A:A7", "bt_mac": "88:64:40:72:54:5A"
+  },
+  "ios_version": {
+    "version": "17.3", "build": "21D50", "passcode_final": "3349",
+    "note": "Prior to 2024-01-23 at 11:16 the device was running iOS 16.1.2 (that period's data is included in this documentation). Passcode was changed from an earlier value to 3349 as part of the 'Other Events' log (0731 -> 3349), which is otherwise out of scope here — see the PDF directly for the full Other Events timeline."
+  },
+  "procedure": [
+    "The phone had been previously reset to factory defaults, including a wipe of the device. iOS 16.1.2 was installed.",
+    "A Google Fi account was added in order to apply cellular service to the device.",
+    "Fifty-five (55) third-party apps were installed from the AppStore and populated with user data based on each app's respective capabilities.",
+    "Stock iOS apps were populated with user data based on each app's respective capabilities.",
+    "Some third-party apps were updated.",
+    "An extraction was performed using Cellebrite UFED.",
+    "The phone was updated to iOS 17.3.",
+    "Additional data was generated in both 3rd party and native applications.",
+    "A second extraction was performed using Cellebrite UFED."
+  ],
+  "apple_account": {
+    "email": "thisisdfir@gmail.com",
+    "added_to_device": "2023-07-01 16:22"
+  },
+  "timezone_note": "yyyy-mm-dd / hh:mm. UTC-0400 (EDT) 2023-07-01 through 2023-11-04; UTC-0500 (EST) 2023-11-05 through 2023-11-21; UTC+0100 (CET) 2023-11-22 through 2023-11-28 12:00 UTC; UTC-0500 (EST) 2023-11-28 12:00 UTC through 2024-03-10 12:00 UTC; UTC-0400 (EDT) after 2024-03-10 12:00 UTC.",
+  "transcription_note": "Per the source PDF: transferred media (pictures/videos) and emojis are described in the Message column in (italics/parentheses) — this convention is preserved as parenthetical text inside each action's \"message\" field throughout apps_*.json, exactly as printed, not converted to any other format.",
+  "image_creation": {
+    "application": "Cellebrite Inseyets UFED", "version": "10.2.0.359",
+    "date": "2024-07-28", "time": "17:09",
+    "hashes": {
+      "iOS_17_Public_Image.tar.gz": {
+        "md5": "E115F051D15178FA1334489E24C9F0FD",
+        "sha1": "78528267FAE742391E29C0C6ED30ABA024B6A1AD",
+        "sha256": "A8192126FCB495AEBA32885A8BE576A306CD2C5D7EA740375D5EF2B8E9399502"
+      },
+      "00008030-001259123E50802E.zip": {
+        "note": "Encrypted backup (Password: MyPassword123)",
+        "md5": "65CA4C7685C5881F807C5E0DB8182364",
+        "sha1": "0075E3A903AB7168990BC184B25BADBAA733759C",
+        "sha256": "ACEA6302F7B447DCDF1E845549917030BB0763A9897A2A3AA930C53754499E0B"
+      },
+      "sysdiagnose_2024.01.23_10-31-02-0500_iPhone-OS_iPhone_20B110.tar.gz": {
+        "md5": "D15A0621B3D9A00959A33A0862D6D334",
+        "sha1": "0EC25FEDB7321B7526C259AAB2C003009BA6B901",
+        "sha256": "592F1066FEE06BF08787160F3BF6E599FF8E30318CF9089459A98B2A62CEDCBF"
+      },
+      "EvidenceCollection.ufdx": {
+        "md5": "7C5712A40534DDFACA1E17FD5703A56B",
+        "sha1": "67C0C22618719CB0B3BCC2A95147B1DBE5CBDE2F",
+        "sha256": "C856098A57413925CA60EE98CF2DC3E29B9145259B71AF9190B9E718AB2B58F3"
+      },
+      "EXTRACTION_FFS.ufd": {
+        "md5": "1533779DD0281D24B3DA62362DF35D53",
+        "sha1": "8230D29DF8E583572AFAFF8C8CCB4A430E04F150",
+        "sha256": "84EC28D111EF38849BB1B505EEDE28905309DCB98B30249FFCFD17A23310F87A"
+      },
+      "SummaryReport.pdf": {
+        "md5": "D3F1489BE5099645C510FABE8F72D866",
+        "sha1": "7B65A44D1AEB80AF0F0F26A76F05954E3B3548E2",
+        "sha256": "92D4B5095D8A53D4FCAF27376EFAAC1945A881F7D12DFEACC673461845BB694A"
+      },
+      "EXTRACTION_FFS.zip": {
+        "md5": "5FD16BB305B021727A537CF0C73C9A1D",
+        "sha1": "8165B815523121C7905752FB91D4FAE4CA6F0A16",
+        "sha256": "7E603D016416A097FBE79704250130603AF2599990AB2E395E428DBF3B9014FA"
+      }
+    }
+  }
+}

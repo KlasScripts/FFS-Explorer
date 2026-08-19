@@ -1,11 +1,13 @@
 """artifact_viewer.py — ArtifactRunnerWorker, ArtifactRunnerDialog, and ArtifactViewerMixin."""
 
+import html
 import os
 import pathlib
+import re
 import sqlite3
 import zipfile
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QComboBox, QHBoxLayout, QVBoxLayout,
@@ -18,6 +20,59 @@ from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
 
 from db_utils import _open_results_db, start_run_log, complete_run_log, load_last_run
 from highlight_delegate import HighlightDelegate
+from artifact_media import MediaThumbnailDelegate, MediaFullViewDialog, THUMB_CELL_SIZE
+from dialog_helpers import note_label, ERROR_STYLE
+import validation_store
+import parser_validation
+
+
+def _local_date(iso_str: str) -> str:
+    """'YYYY-MM-DD' local-date for a stored UTC run_log ISO timestamp.
+
+    Tool-provenance only (when the examiner ran this parser), never
+    evidence — see ffs-explorer.py's _format_tool_ts_local for the fuller
+    version (with UTC offset) used elsewhere; this one only needs the date.
+    """
+    if not iso_str:
+        return ''
+    try:
+        dt_utc = datetime.strptime(iso_str, '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+    except ValueError:
+        return iso_str[:10]
+    return dt_utc.astimezone().strftime('%Y-%m-%d')
+
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.?!])\s+(?=[A-Z0-9(])')
+_BACKTICK_SPLIT_RE = re.compile(r'`([^`]+)`')
+
+
+def _notes_html_paragraphs(text: str, sentences_per_para: int = 2) -> str:
+    """Turn one of this project's hand-written `description`/`warning`
+    strings — always a single sentence-dense paragraph in the source, easy
+    to read there but a hard-to-scan wall of text in the UI — into
+    readable HTML: paragraph breaks every couple of sentences, and
+    `backtick`-quoted identifiers (already used throughout these strings
+    for table/column names) rendered as monospace spans."""
+    if not text:
+        return ''
+    sentences = _SENTENCE_SPLIT_RE.split(text.strip())
+    paras = [' '.join(sentences[i:i + sentences_per_para])
+             for i in range(0, len(sentences), sentences_per_para)]
+    out = []
+    for para in paras:
+        # Alternating [plain, code, plain, code, ..., plain] — escape each
+        # piece on its own so a literal '<'/'&' inside a `backtick span`
+        # (e.g. a SQL comparison) can't break the surrounding markup.
+        pieces = _BACKTICK_SPLIT_RE.split(para)
+        rendered = []
+        for i, piece in enumerate(pieces):
+            escaped = html.escape(piece)
+            if i % 2 == 1:  # odd indices are the backtick-captured groups
+                escaped = (f'<code style="background:rgba(127,127,127,0.15); '
+                          f'padding:1px 4px; border-radius:3px;">{escaped}</code>')
+            rendered.append(escaped)
+        out.append(f'<p style="margin:0 0 10px 0; line-height:145%;">{"".join(rendered)}</p>')
+    return ''.join(out)
 
 
 # ── DB-backed virtual table model ─────────────────────────────────────────────
@@ -51,6 +106,17 @@ class ArtifactTableModel(QAbstractTableModel):
         # Retained filter clause so sort() can re-apply it
         self._where: str  = ''
         self._wargs: list = []
+        # Timestamp display: {column_name: unit_code} from the parser
+        # module's own timestamp_fields declaration, plus a formatter
+        # callback — see set_timestamp_formatting(). Empty/None means no
+        # timestamp columns in this report, or nothing to reformat (the
+        # ordinary case for most tables).
+        self._ts_units:     dict = {}
+        self._ts_formatter        = None
+        # Column indices holding an archive ui_path to an attachment/media
+        # file — from the parser module's own media_fields declaration
+        # (names), resolved to indices here. See set_media_columns().
+        self._media_cols:   set  = set()
 
     # ── Connection ────────────────────────────────────────────────────────
 
@@ -79,6 +145,8 @@ class ArtifactTableModel(QAbstractTableModel):
         self._lru.clear()
         self._where = ''
         self._wargs = []
+        self._ts_units, self._ts_formatter = {}, None
+        self._media_cols = set()
         self.endResetModel()
 
     def load_rows(self, columns: list, rows: list) -> None:
@@ -94,6 +162,8 @@ class ArtifactTableModel(QAbstractTableModel):
         self._lru.clear()
         self._where = ''
         self._wargs = []
+        self._ts_units, self._ts_formatter = {}, None
+        self._media_cols = set()
         self.endResetModel()
 
     def clear(self) -> None:
@@ -108,7 +178,41 @@ class ArtifactTableModel(QAbstractTableModel):
         self._lru.clear()
         self._where = ''
         self._wargs = []
+        self._ts_units, self._ts_formatter = {}, None
+        self._media_cols = set()
         self.endResetModel()
+
+    def set_timestamp_formatting(self, units: dict, formatter) -> None:
+        """units: {column_name: unit_code}, from the parser module's own
+        timestamp_fields declaration. formatter(raw_value, unit_code) -> str,
+        or None to disable (no timestamp columns in this report). The
+        active mode itself is shown once, in the shared banner above every
+        tab (see FastZipBrowser._refresh_timestamp_mode_indicator) — not
+        repeated per column header here. Call once, right after
+        load_from_db()/load_rows() — resets on every fresh load, so a
+        report with no declaration never inherits a previous report's
+        formatting."""
+        self._ts_units     = dict(units) if units else {}
+        self._ts_formatter = formatter if units else None
+        # layoutChanged rather than hand-built dataChanged/headerDataChanged
+        # ranges — simpler, and safe on an empty table (no row/column-bound
+        # index construction to get right).
+        self.layoutChanged.emit()
+
+    def set_media_columns(self, col_names) -> None:
+        """col_names: iterable of column-name strings from the parser
+        module's own media_fields declaration — cells there hold an archive
+        ui_path to an attachment/media file, and are painted as thumbnails
+        by MediaThumbnailDelegate (see ArtifactViewerMixin._art_show_report)
+        rather than as plain path text. Call once, right after
+        load_from_db()/load_rows() — resets on every fresh load, same
+        reasoning as set_timestamp_formatting() above."""
+        names = set(col_names) if col_names else set()
+        self._media_cols = {i for i, name in enumerate(self._columns) if name in names}
+        self.layoutChanged.emit()
+
+    def media_columns(self) -> set:
+        return set(self._media_cols)
 
     # ── Filter / sort ─────────────────────────────────────────────────────
 
@@ -195,8 +299,15 @@ class ArtifactTableModel(QAbstractTableModel):
         row = self._get_row(index.row())
         if row is None:
             return ''
-        val = row[index.column()] if index.column() < len(row) else None
-        return str(val) if val is not None else ''
+        col = index.column()
+        val = row[col] if col < len(row) else None
+        if val is None or val == '':
+            return ''
+        col_name = self._columns[col] if col < len(self._columns) else None
+        unit_code = self._ts_units.get(col_name) if col_name else None
+        if unit_code and self._ts_formatter:
+            return self._ts_formatter(val, unit_code)
+        return str(val)
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role != Qt.ItemDataRole.DisplayRole:
@@ -269,22 +380,25 @@ class ArtifactFilterWorker(QThread):
 # ── Tree node role sentinels ──────────────────────────────────────────────────
 _ART_GROUP  = "__art_group__:"
 _ART_REPORT = "__art_report__:"
+_ART_NOTES  = "__art_notes__:"
 _ART_SCRIPT = "__art_script__:"
 _ART_SOURCE = "__art_source__:"
 _ART_FILES  = "__art_files__:"
+_ART_VALIDATION = "__art_validation__:"
 
 
 class ArtifactRunnerWorker(QThread):
     log  = Signal(str)
     done = Signal()
 
-    def __init__(self, selected, zip_path, adapter, streaming_index, case_dir):
+    def __init__(self, selected, zip_path, adapter, case_dir,
+                guid_to_bundle: dict | None = None):
         super().__init__()
         self._selected        = selected
         self._zip_path        = zip_path
         self._adapter         = adapter
-        self._streaming_index = streaming_index
         self._case_dir        = case_dir
+        self._guid_to_bundle  = guid_to_bundle or {}
 
     def run(self):
         from artifact_runner import run_artifact
@@ -297,15 +411,13 @@ class ArtifactRunnerWorker(QThread):
             self.done.emit()
             return
 
-        zip_obj = None
-        if self._streaming_index is None:
-            try:
-                zip_obj = zipfile.ZipFile(self._zip_path, 'r')
-            except Exception as exc:
-                self.log.emit(f"Could not open archive: {exc}")
-                case_conn.close()
-                self.done.emit()
-                return
+        try:
+            zip_obj = zipfile.ZipFile(self._zip_path, 'r')
+        except Exception as exc:
+            self.log.emit(f"Could not open archive: {exc}")
+            case_conn.close()
+            self.done.emit()
+            return
 
         try:
             for script_name, module in self._selected:
@@ -321,7 +433,7 @@ class ArtifactRunnerWorker(QThread):
                     self._zip_path, self._adapter,
                     case_dir=self._case_dir,
                     zip_obj=zip_obj,
-                    streaming_index=self._streaming_index,
+                    guid_to_bundle=self._guid_to_bundle,
                 )
                 if error:
                     self.log.emit(f"  Error: {error}")
@@ -348,26 +460,33 @@ class ArtifactRunnerWorker(QThread):
 class ArtifactRunnerDialog(QDialog):
     parsers_completed = Signal()
 
-    def __init__(self, zip_path, zip_names, adapter, streaming_index, case_dir,
-                 is_android, parent=None):
+    def __init__(self, zip_path, zip_names, adapter, case_dir,
+                 is_android, parent=None, guid_to_bundle: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Run Artifact Parsers")
         self.setMinimumSize(480, 540)
         self._worker = None
+        self._guid_to_bundle = guid_to_bundle or {}
 
         platform = 'android' if is_android else 'ios'
 
-        from artifact_runner import load_artifacts
+        from artifact_runner import load_artifacts, _resolve_app_group_base
         all_artifacts, load_errors = load_artifacts(platform)
 
         def _exists(candidates):
-            if streaming_index is not None:
-                return any(c in streaming_index for c in candidates)
             return any(c in zip_names for c in candidates)
 
         def _mod_matches(mod):
             if hasattr(mod, 'app_path') and hasattr(mod, 'files'):
                 app_base = mod.app_path.strip('/')
+                return any(
+                    _exists(adapter.user_candidates(f"{app_base}/{sub.lstrip('/')}"))
+                    for sub in mod.files.values()
+                )
+            if hasattr(mod, 'app_group') and hasattr(mod, 'files'):
+                app_base = _resolve_app_group_base(mod.app_group, self._guid_to_bundle)
+                if app_base is None:
+                    return False
                 return any(
                     _exists(adapter.user_candidates(f"{app_base}/{sub.lstrip('/')}"))
                     for sub in mod.files.values()
@@ -390,11 +509,9 @@ class ArtifactRunnerDialog(QDialog):
         # disappear from the list, making it look like nothing matched.
         if load_errors:
             err_lines = "\n".join(f"  • {fn}: {msg}" for fn, msg in load_errors)
-            warn = QLabel(
+            warn = note_label(
                 "⚠ Some parser scripts could not be loaded and are unavailable:\n"
-                f"{err_lines}")
-            warn.setWordWrap(True)
-            warn.setStyleSheet("color: #b00020; font-size: 11px;")
+                f"{err_lines}", style=ERROR_STYLE)
             layout.addWidget(warn)
 
         if not available:
@@ -440,7 +557,7 @@ class ArtifactRunnerDialog(QDialog):
             row.addWidget(cb)
             if last:
                 rows   = last['output_rows'] or 0
-                run_at = (last['run_at'] or '')[:10]
+                run_at = _local_date(last['run_at'])
                 if last['complete']:
                     info_text  = f"last run {run_at} · {rows:,} rows"
                     info_color = 'grey'
@@ -477,7 +594,6 @@ class ArtifactRunnerDialog(QDialog):
 
         self._zip_path        = zip_path
         self._adapter         = adapter
-        self._streaming_index = streaming_index
         self._case_dir        = case_dir
 
     def _run(self):
@@ -495,7 +611,8 @@ class ArtifactRunnerDialog(QDialog):
 
         self._worker = ArtifactRunnerWorker(
             selected, self._zip_path, self._adapter,
-            self._streaming_index, self._case_dir,
+            self._case_dir,
+            guid_to_bundle=self._guid_to_bundle,
         )
         self._worker.log.connect(self._log.appendPlainText)
         self._worker.done.connect(self._on_done)
@@ -576,6 +693,9 @@ class ArtifactViewerMixin:
         self._art_highlight_delegate = HighlightDelegate(
             lambda: self._art_active_filter)
         self._art_report_view.setItemDelegate(self._art_highlight_delegate)
+        self._art_media_delegate = MediaThumbnailDelegate(self._art_report_view)
+        self._art_media_thumb_worker = None
+        self._art_report_view.doubleClicked.connect(self._on_art_report_double_clicked)
         report_layout.addWidget(self._art_report_view)
 
         # Script page — read-only monospace text editor
@@ -583,10 +703,48 @@ class ArtifactViewerMixin:
         self._art_script_view.setReadOnly(True)
         self._art_script_view.setFont(QFont("Courier", 11))
 
+        # Notes/Warning page — a script's own `description` (where this data
+        # comes from, and any known reliability caveats), moved out of the
+        # report view (it was pushing the table down, sometimes off-screen,
+        # for scripts with long descriptions) into its own tree entry.
+        # `warning` (optional, module-level, separate from `description`) is
+        # styled red when a module sets one — reserved for something the
+        # examiner must read before trusting the report, not routine notes.
+        self._art_notes_label = QLabel()
+        self._art_notes_label.setWordWrap(True)
+        self._art_notes_label.setTextFormat(Qt.TextFormat.RichText)
+        self._art_notes_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._art_notes_label.setStyleSheet(
+            "background: palette(base); border: 1px solid palette(mid); "
+            "border-radius: 4px; padding: 10px 12px;")
+        _notes_scroll = QScrollArea()
+        _notes_scroll.setWidgetResizable(True)
+        _notes_scroll.setWidget(self._art_notes_label)
+        _notes_scroll.setStyleSheet("QScrollArea { border: none; }")
+
+        # Validation page — diffs this parser's current schema/folder
+        # structure against a recorded GTD baseline (see
+        # validation_store.py / parser_validation.py), or offers to record
+        # one. Plain monospace text (like the Script page) rather than rich
+        # text: this is a structured diff report, not prose.
+        validation_page = QWidget()
+        validation_layout = QVBoxLayout(validation_page)
+        validation_layout.setContentsMargins(4, 4, 4, 4)
+        self._art_validation_record_btn = QPushButton("Record This Case as Validation Baseline")
+        self._art_validation_record_btn.clicked.connect(self._on_art_record_validation_baseline)
+        validation_layout.addWidget(self._art_validation_record_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self._art_validation_view = QPlainTextEdit()
+        self._art_validation_view.setReadOnly(True)
+        self._art_validation_view.setFont(QFont("Courier", 11))
+        validation_layout.addWidget(self._art_validation_view)
+        self._art_validation_script_name = None
+
         self._art_stack = QStackedWidget()
         self._art_stack.addWidget(self._art_placeholder)  # 0
         self._art_stack.addWidget(report_page)             # 1
         self._art_stack.addWidget(self._art_script_view)  # 2
+        self._art_stack.addWidget(_notes_scroll)           # 3
+        self._art_stack.addWidget(validation_page)          # 4
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._art_tree_view)
@@ -607,6 +765,7 @@ class ArtifactViewerMixin:
         from artifact_runner import list_artifacts
 
         self._cancel_art_filter_worker()
+        self._retire_art_media_worker()
         self._art_tree_model.clear()
         self._art_tree_model.setHorizontalHeaderLabels(["Device Artifacts"])
         self._art_table_model.clear()   # closes any open SQLite connection
@@ -644,9 +803,11 @@ class ArtifactViewerMixin:
             group = _item(label, _ART_GROUP + script_name)
             group.setFont(QFont("Arial", weight=QFont.Weight.Bold))
             group.appendRow(_item("Report",         _ART_REPORT + script_name))
+            group.appendRow(_item("Report Notes/Warning", _ART_NOTES + script_name))
             group.appendRow(_item("Script",         _ART_SCRIPT + script_name))
             group.appendRow(_item("Source in ZIP",  _ART_SOURCE + script_name))
             group.appendRow(_item("Exported Files", _ART_FILES  + script_name))
+            group.appendRow(_item("Validation",     _ART_VALIDATION + script_name))
             self._art_tree_model.invisibleRootItem().appendRow(group)
 
         self._art_tree_view.expandAll()
@@ -657,12 +818,16 @@ class ArtifactViewerMixin:
             return
         if role_val.startswith(_ART_REPORT):
             self._art_show_report(role_val[len(_ART_REPORT):])
+        elif role_val.startswith(_ART_NOTES):
+            self._art_show_notes(role_val[len(_ART_NOTES):])
         elif role_val.startswith(_ART_SCRIPT):
             self._art_show_script(role_val[len(_ART_SCRIPT):])
         elif role_val.startswith(_ART_SOURCE):
             self._art_goto_source(role_val[len(_ART_SOURCE):])
         elif role_val.startswith(_ART_FILES):
             self._art_show_files(role_val[len(_ART_FILES):])
+        elif role_val.startswith(_ART_VALIDATION):
+            self._art_show_validation(role_val[len(_ART_VALIDATION):])
 
     # ── Report display ────────────────────────────────────────────────────────
 
@@ -681,10 +846,16 @@ class ArtifactViewerMixin:
 
     def _art_resize_columns(self, max_width: int = 320):
         """Estimate column widths by sampling the first 200 visible rows."""
-        fm     = self._art_report_view.fontMetrics()
-        n_cols = self._art_table_model.columnCount()
-        n_rows = min(200, self._art_table_model.rowCount())
+        fm          = self._art_report_view.fontMetrics()
+        n_cols      = self._art_table_model.columnCount()
+        n_rows      = min(200, self._art_table_model.rowCount())
+        media_cols  = self._art_table_model.media_columns()
         for col in range(n_cols):
+            if col in media_cols:
+                # Cell shows a fixed-size thumbnail, not the raw ui_path
+                # text — size from that, not from sampling path lengths.
+                self._art_report_view.setColumnWidth(col, max_width)
+                continue
             header = self._art_table_model.headerData(col, Qt.Orientation.Horizontal) or ''
             w = fm.horizontalAdvance(str(header)) + 24
             for row in range(n_rows):
@@ -710,12 +881,282 @@ class ArtifactViewerMixin:
                 pass
             return
 
+        from artifact_runner import list_artifacts
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+
+        # Media columns (see media_fields on the parser module): pull every
+        # distinct non-empty value now, while conn is still ours and unused
+        # by anything else — load_from_db() below transfers ownership to
+        # the model, and nothing may safely query it out from under that
+        # afterwards.
+        media_fields = list(getattr(mod, 'media_fields', ())) if mod else []
+        media_paths  = set()
+        for col_name in media_fields:
+            if col_name not in cols:
+                continue
+            try:
+                for (v,) in conn.execute(
+                        f'SELECT DISTINCT "{col_name}" FROM "{table}" '
+                        f'WHERE "{col_name}" IS NOT NULL AND "{col_name}" != \'\''):
+                    media_paths.add(v)
+            except Exception:
+                pass
+
         # Transfer connection ownership to the model
         self._art_table_model.load_from_db(conn, table, cols, ids)
+
+        # Raw-value timestamp columns (see timestamp_fields on the parser
+        # module) get formatted per the case's UTC/handset/acquisition
+        # setting at display time — set_timestamp_formatting must be called
+        # AFTER load_from_db, which resets it to empty/None on every load.
+        units = getattr(mod, 'timestamp_fields', {}) if mod else {}
+        if units:
+            def _fmt(raw_value, unit_code):
+                try:
+                    secs = float(raw_value)
+                except (TypeError, ValueError):
+                    return str(raw_value)
+                if unit_code == 'ms':
+                    secs /= 1000
+                elif unit_code == 'cocoa_s':
+                    secs += 978307200
+                elif unit_code == 'cocoa_ns':
+                    secs = secs / 1e9 + 978307200
+                return self.format_ts(secs)
+            self._art_table_model.set_timestamp_formatting(units, _fmt)
+        else:
+            self._art_table_model.set_timestamp_formatting({}, None)
+
+        # Media columns: thumbnail delegate per-column (never touches the
+        # other columns' normal HighlightDelegate), row height tall enough
+        # for a thumbnail, and an async decode pass over every distinct
+        # path collected above — see MediaThumbnailDelegate in
+        # artifact_media.py and _start_art_media_thumbnails below.
+        self._art_table_model.set_media_columns(media_fields)
+        media_col_idx = self._art_table_model.media_columns()
+        for col in range(len(cols)):
+            self._art_report_view.setItemDelegateForColumn(
+                col, self._art_media_delegate if col in media_col_idx
+                     else self._art_highlight_delegate)
+        self._art_report_view.verticalHeader().setDefaultSectionSize(
+            THUMB_CELL_SIZE + 16 if media_col_idx else 80)
+        self._start_art_media_thumbnails(list(media_paths))
+
         self._setup_report_filter_ui(cols)
         self._art_resize_columns()
         self._art_row_label.setText(f"{len(ids):,} rows")
         self._art_stack.setCurrentIndex(1)
+
+    # ── Media columns (thumbnails + full view) ──────────────────────────────
+
+    def _retire_art_media_worker(self):
+        worker = getattr(self, '_art_media_thumb_worker', None)
+        if worker is not None:
+            self._retire_worker(worker)
+            self._art_media_thumb_worker = None
+
+    def _start_art_media_thumbnails(self, media_paths: list):
+        """Decode a thumbnail for every distinct media-column path in the
+        just-loaded report, off the UI thread. Reuses media_viewer's own
+        ThumbnailWorker — same zip-reading logic and the
+        same on-disk thumbnail cache the Media tab uses (keyed separately
+        by thumb size, so this never collides with the Media tab's own
+        160px thumbnails)."""
+        self._retire_art_media_worker()
+        self._art_media_delegate.set_cache({})
+        if not media_paths or not self.zip_path:
+            return
+        from media_viewer import ThumbnailWorker
+        zip_info_map = {
+            self._adapter.resolve(p): self.full_metadata.get(p, {}).get('size', 0)
+            for p in media_paths}
+        worker = ThumbnailWorker(
+            self.zip_path, media_paths, self._adapter.resolve, THUMB_CELL_SIZE,
+            zip_info_map, cache_dir=self._case_dir)
+        worker.thumbnail_ready.connect(self._on_art_media_thumbnail_ready)
+        self._art_media_thumb_worker = worker
+        worker.start()
+
+    def _on_art_media_thumbnail_ready(self, ui_path, img):
+        from PySide6.QtGui import QPixmap
+        self._art_media_delegate.set_pixmap(ui_path, QPixmap.fromImage(img))
+        self._art_report_view.viewport().update()
+
+    def _on_art_report_double_clicked(self, index):
+        """Open the full-size image / video-player dialog for a
+        media-column cell. No-op for any other column."""
+        if index.column() not in self._art_table_model.media_columns():
+            return
+        ui_path = self._art_table_model.data(index) or ''
+        if not ui_path:
+            return
+        data = self._read_zip_bytes(ui_path)
+        if data is None:
+            self.status_bar.showMessage(
+                f"Attachment not found in archive: {ui_path}", 5000)
+            return
+        MediaFullViewDialog(ui_path, data, parent=self).exec()
+
+    def _art_show_notes(self, script_name: str):
+        """Report Notes/Warning page — a script's own `description` (where
+        this data comes from, and known reliability caveats), and an
+        optional `warning` for something the examiner must read before
+        trusting the report. Off the report page itself (see
+        _art_show_report) so a long description no longer pushes the table
+        down or off-screen. Rendered as rich text (paragraph breaks at
+        sentence boundaries, `backtick` spans as monospace) — these
+        descriptions are written as one long sentence-dense paragraph in
+        the source, which reads fine there but is hard to scan as a wall
+        of text in the UI."""
+        from artifact_runner import list_artifacts
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+        description = getattr(mod, 'description', '') if mod else ''
+        warning     = getattr(mod, 'warning', '') if mod else ''
+
+        if warning:
+            parts = [
+                '<div style="font-size:14px; font-weight:600; color:#8a1c1c; '
+                'margin-bottom:8px;">⚠️&nbsp; Warning</div>',
+                _notes_html_paragraphs(warning),
+            ]
+            if description:
+                parts.append(
+                    '<hr style="border:none; border-top:1px solid #e3b3b3; margin:14px 0;">'
+                    '<div style="font-weight:600; margin-bottom:6px;">Notes</div>')
+                parts.append(_notes_html_paragraphs(description))
+            html_body = ''.join(parts)
+            self._art_notes_label.setStyleSheet(
+                "background:#fdecea; border:1px solid #d64545; border-radius:4px; "
+                "padding:10px 12px; color:#3a1414;")
+        else:
+            html_body = (_notes_html_paragraphs(description)
+                        if description else
+                        '<span style="color:#888888;">No notes declared for this report.</span>')
+            self._art_notes_label.setStyleSheet(
+                "background: palette(base); border: 1px solid palette(mid); "
+                "border-radius: 4px; padding: 10px 12px;")
+        self._art_notes_label.setText(html_body)
+        self._art_stack.setCurrentIndex(3)
+
+    # ── Validation baseline ─────────────────────────────────────────────────
+
+    def _device_os_string(self) -> str:
+        """Best-effort 'Model OS-version' string from this case's own
+        device_info table — same source get_case_overview's MCP tool reads.
+        Used only as context on a validation diff (see render_diff_text's
+        device_os_mismatch note), never as a lookup key."""
+        if not self._case_dir:
+            return ''
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                rows = dict(db.execute('SELECT field_name, data FROM device_info'))
+        except Exception:
+            return ''
+        model = rows.get('Model', '')
+        for key in ('iOS Version', 'Android Version', 'OS Version'):
+            if rows.get(key):
+                return f"{model} {rows[key]}".strip()
+        return model
+
+    def _compute_validation_snapshot(self, script_name: str) -> dict:
+        """Schema + folder-structure snapshot for script_name against the
+        CURRENTLY OPEN case, reusing that parser's already-extracted files
+        under case_dir/artifact_parser_files/<name>/ (no re-extraction —
+        this only runs after a parser has already completed once) and this
+        case's own self.folder_map (no new zip scan)."""
+        from artifact_runner import list_artifacts, _resolve_app_group_base, _parser_files_dir
+
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+        if mod is None:
+            raise ValueError(f"parser module {script_name!r} not found")
+        if not hasattr(mod, 'files'):
+            raise ValueError("validation baselines only support the multi-file "
+                             "(app_path/app_group + files) parser API")
+
+        if hasattr(mod, 'app_path'):
+            app_base = mod.app_path.strip('/')
+        else:
+            app_base = _resolve_app_group_base(mod.app_group, self.guid_to_bundle)
+            if app_base is None:
+                raise ValueError(f"app group {mod.app_group!r} not present on this device")
+
+        parser_name = getattr(mod, 'name', script_name)
+        dest_dir = _parser_files_dir(self._case_dir, parser_name)
+        paths = {'_app_base_ui_path': app_base}
+        for key, subpath in {**mod.files, **getattr(mod, 'optional_files', {})}.items():
+            dest_path = os.path.join(dest_dir, os.path.basename(subpath))
+            if os.path.isfile(dest_path):
+                paths[key] = dest_path
+
+        schema    = parser_validation.snapshot_schema(paths)
+        structure = parser_validation.snapshot_structure(self.folder_map, app_base)
+        return {'schema': schema, 'structure': structure}
+
+    def _art_show_validation(self, script_name: str):
+        self._art_validation_script_name = script_name
+        platform = 'android' if self._is_android_archive() else 'ios'
+        key = f'{platform}:{script_name}'
+        baseline = validation_store.get(key)
+
+        if baseline is None:
+            self._art_validation_view.setPlainText(
+                "No validation baseline recorded for this parser yet.\n\n"
+                "Use the button above to record THIS case's schema and "
+                "folder structure as the reference — only do this against "
+                "a case you know is GTD-validated (a known device/app "
+                "version the parser's output was actually checked "
+                "against), never against real casework.")
+            self._art_validation_record_btn.setText(
+                "Record This Case as Validation Baseline")
+        else:
+            try:
+                current = self._compute_validation_snapshot(script_name)
+            except Exception as exc:
+                self._art_validation_view.setPlainText(
+                    f"Could not compute this case's current snapshot: {exc}")
+                self._art_validation_record_btn.setText("Update Validation Baseline")
+                self._art_stack.setCurrentIndex(4)
+                return
+            diff = parser_validation.diff_snapshot(baseline, current)
+            text = parser_validation.render_diff_text(
+                diff, baseline, self._device_os_string())
+            self._art_validation_view.setPlainText(text)
+            self._art_validation_record_btn.setText(
+                "Update Validation Baseline (overwrites the recorded one)")
+        self._art_stack.setCurrentIndex(4)
+
+    def _on_art_record_validation_baseline(self):
+        script_name = self._art_validation_script_name
+        if not script_name:
+            return
+        reply = QMessageBox.question(
+            self, "Record Validation Baseline",
+            "This overwrites any existing validation baseline for this "
+            "parser with a snapshot of THIS case's database schema and "
+            "folder structure.\n\n"
+            "Only do this against a case you know is GTD-validated — a "
+            "known device/app version you trust this parser's output "
+            "against — never against real casework.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            snapshot = self._compute_validation_snapshot(script_name)
+        except Exception as exc:
+            self.status_bar.showMessage(f"Could not compute snapshot: {exc}", 5000)
+            return
+        platform = 'android' if self._is_android_archive() else 'ios'
+        key = f'{platform}:{script_name}'
+        case_label = os.path.basename((self._case_dir or '').rstrip('/')) or '?'
+        validation_store.save_baseline(
+            key, snapshot, case_label, self._device_os_string())
+        self.status_bar.showMessage(
+            f"Validation baseline recorded for {script_name}.", 5000)
+        self._art_show_validation(script_name)
 
     # ── Filtering ─────────────────────────────────────────────────────────────
 
@@ -829,7 +1270,16 @@ class ArtifactViewerMixin:
                 if not entry.is_file():
                     continue
                 st    = entry.stat()
-                mtime = datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                # Local time, explicit offset: this is when the tool
+                # extracted the file to local disk — tool provenance, not
+                # evidence content, so local (what the examiner expects
+                # for "things I did") rather than UTC (reserved for
+                # evidence — see CLAUDE.md's Conventions section).
+                local  = datetime.fromtimestamp(st.st_mtime).astimezone()
+                offset = local.utcoffset() or timedelta(0)
+                sign   = '+' if offset >= timedelta(0) else '-'
+                hh, mm = divmod(abs(offset).seconds // 60, 60)
+                mtime  = f"{local:%Y-%m-%d %H:%M:%S} (UTC{sign}{hh:02d}:{mm:02d})"
                 rows.append((entry.name, f"{st.st_size:,}", mtime, entry.path))
 
         self._art_table_model.load_rows(columns, rows)
@@ -851,10 +1301,10 @@ class ArtifactViewerMixin:
             zip_path=self.zip_path,
             zip_names=self.zip_names,
             adapter=self._adapter,
-            streaming_index=self._streaming_index,
             case_dir=self._case_dir,
             is_android=self._is_android_archive(),
             parent=self,
+            guid_to_bundle=self.guid_to_bundle,
         )
         dlg.parsers_completed.connect(self._refresh_artifact_tab)
         dlg.parsers_completed.connect(self._on_photo_index_changed)
@@ -871,8 +1321,6 @@ class ArtifactViewerMixin:
     def _photos_db_present(self) -> bool:
         cands = self._adapter.user_candidates(
             'mobile/Media/PhotoData/Photos.sqlite')
-        if self._streaming_index is not None:
-            return any(c in self._streaming_index for c in cands)
         return any(c in getattr(self, 'zip_names', ()) for c in cands)
 
     def _maybe_offer_photos_processing(self, folder_path: str):
@@ -916,7 +1364,7 @@ class ArtifactViewerMixin:
         prog.show()
         self._photos_worker = ArtifactRunnerWorker(
             selected, self.zip_path, self._adapter,
-            self._streaming_index, self._case_dir)
+            self._case_dir)
 
         def _done():
             prog.close()

@@ -76,7 +76,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 
 # ── Shared zip-entry scanner ─────────────────────────────────────────────────
 
-def _build_zip_entries(zip_path: str, streaming_index, stop,
+def _build_zip_entries(zip_path: str, stop,
                        case_dir: str | None = None,
                        delta: int | None = None) -> list:
     """Return list of (name, data_offset, file_size) for all STORED entries.
@@ -84,15 +84,6 @@ def _build_zip_entries(zip_path: str, streaming_index, stop,
     *case_dir*, when set, allows using the local .zcd sidecar to avoid
     reading the central directory from the network."""
     entries = []
-    if streaming_index is not None:
-        for name in streaming_index.namelist():
-            try:
-                entry = streaming_index.get_entry(name)
-                if entry.is_stored and entry.file_size > 0:
-                    entries.append((name, entry.data_offset, entry.file_size))
-            except Exception:
-                pass
-        return entries
 
     # Use the local .zcd sidecar when available — avoids a full network CD read.
     infolist = None
@@ -136,12 +127,11 @@ class SearchIndexWorker(QThread):
     """
     entries_ready = Signal(list)   # list of (name, data_offset, file_size)
 
-    def __init__(self, zip_path: str, streaming_index=None,
+    def __init__(self, zip_path: str,
                  case_dir: str | None = None, delta: int | None = None,
                  parent=None):
         super().__init__(parent)
         self.zip_path        = zip_path
-        self.streaming_index = streaming_index
         self.case_dir        = case_dir
         self.delta           = delta
         self._stop           = threading.Event()
@@ -157,7 +147,7 @@ class SearchIndexWorker(QThread):
                 self.entries_ready.emit(cached)
                 return
 
-        entries = _build_zip_entries(self.zip_path, self.streaming_index, self._stop,
+        entries = _build_zip_entries(self.zip_path, self._stop,
                                      case_dir=self.case_dir, delta=self.delta)
         if self._stop.is_set():
             return
@@ -207,12 +197,11 @@ class KeywordSearchWorker(QThread):
     _CTX_BYTES = 40                # bytes either side of hit for context
 
     def __init__(self, zip_path: str, keyword: str,
-                 streaming_index=None, entries=None, scope="all",
+                 entries=None, scope="all",
                  exclude_prefixes: tuple = (), parent=None):
         super().__init__(parent)
         self.zip_path          = zip_path
         self.keyword           = keyword.encode('utf-8', errors='replace')
-        self.streaming_index   = streaming_index
         self._stop             = threading.Event()
         self._prebuilt_entries = entries
         self._scope            = scope
@@ -224,7 +213,7 @@ class KeywordSearchWorker(QThread):
         self._stop.set()
 
     def _build_entries(self) -> list:
-        return _build_zip_entries(self.zip_path, self.streaming_index, self._stop)
+        return _build_zip_entries(self.zip_path, self._stop)
 
     def run(self):
         if self._prebuilt_entries is not None:
@@ -1313,7 +1302,6 @@ class KeywordSearchMixin:
         self._search_scope_files_btn.setVisible(False)
         worker = SearchIndexWorker(
             self.zip_path,
-            streaming_index=self._streaming_index,
             case_dir=self._case_dir,
             delta=self._local_extra_delta,
         )
@@ -1420,7 +1408,6 @@ class KeywordSearchMixin:
 
         self._search_worker = KeywordSearchWorker(
             self.zip_path, term,
-            streaming_index=self._streaming_index,
             entries=scoped_entries,
             scope=worker_scope,
             exclude_prefixes=worker_exclude)

@@ -2,8 +2,15 @@
 """Pre-commit check: verify CLAUDE.md's file:line anchors and module table
 against the actual code. Auto-fixes precise single-symbol anchors in place;
 blocks the commit (prints a report) for anything that needs human/LLM
-judgment: a symbol that moved files, one that vanished, a module-table
-mismatch, or the section map's total line count drifting past tolerance.
+judgment: a symbol that moved files, one that vanished, or a module-table
+mismatch.
+
+The old line-number-range "section map" check was removed along with the
+line numbers it checked (2026-08-19) — that map is symbol-name-only now
+(see CLAUDE.md), specifically because a *stored* number can drift silently
+between the rare commits this project makes, while a name only goes stale
+on a rename (rare, deliberate, and this script's single-anchor check still
+catches that).
 
 Deliberately conservative: only touches things it can verify unambiguously,
 so it never blocks on noise. Exit 0 = clean (or auto-fixed and safe to
@@ -27,9 +34,6 @@ MAIN_FILE = "ffs-explorer.py"
 VENDORED = {"ccl_segb", "__pycache__"}
 
 SINGLE_ANCHOR_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`\s*\((?:`)?([\w./-]+\.py):(\d+)(?:`)?\)")
-SECTION_RANGE_RE = re.compile(r"^(\s*)-\s*(\d+)[–-](\d+):\s*(.*)$")
-FIRST_BACKTICK_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
-FINAL_MARKER_RE = re.compile(r"^-\s*(\d+)\+:")
 TABLE_ROW_PY_RE = re.compile(r"`([\w./-]+\.py)`")
 
 
@@ -77,61 +81,6 @@ def check_single_anchors(text: str, blocking: list, fixed: list):
     return SINGLE_ANCHOR_RE.sub(repl, text)
 
 
-def check_section_map(text: str, blocking: list):
-    lines = text.splitlines()
-    in_section = False
-    tolerance = 150
-    for line in lines:
-        if line.strip().startswith("## ffs-explorer.py section map"):
-            in_section = True
-            continue
-        if in_section and line.startswith("## "):
-            break
-        if not in_section:
-            continue
-
-        fm = FINAL_MARKER_RE.match(line.strip())
-        if fm:
-            claimed_total = int(fm.group(1))
-            actual_total = sum(1 for _ in (ROOT / MAIN_FILE).open())
-            if abs(actual_total - claimed_total) > tolerance:
-                blocking.append(
-                    f"Section map's final marker says {claimed_total}+ lines, but "
-                    f"{MAIN_FILE} is now {actual_total} lines (drift > {tolerance}). "
-                    f"Section map likely needs a re-check, at least near the tail."
-                )
-            continue
-
-        m = SECTION_RANGE_RE.match(line)
-        if not m:
-            continue
-        _, start, end, rest = m.groups()
-        start, end = int(start), int(end)
-        bt = FIRST_BACKTICK_RE.search(rest)
-        if not bt:
-            continue  # no unambiguous symbol to check; skip rather than guess
-        symbol = bt.group(1)
-        hits = find_symbol(ROOT, symbol)
-        if not hits:
-            continue  # not every backticked token is a class/def (e.g. config keys); skip
-        same_file = [h for h in hits if h[0] == MAIN_FILE]
-        window = 150
-        if same_file:
-            if any(start - window <= ln <= end + window for _, ln in same_file):
-                continue
-            blocking.append(
-                f"Section map range {start}-{end} (`{symbol}`) — actual definition is at "
-                f"line {same_file[0][1]}, outside the expected window. Range likely needs "
-                f"updating."
-            )
-        else:
-            other = ", ".join(f"{f}:{ln}" for f, ln in hits)
-            blocking.append(
-                f"Section map range {start}-{end} (`{symbol}`) — no longer in {MAIN_FILE}, "
-                f"now found in: {other}. Likely moved out of the main file; update the map."
-            )
-
-
 def check_module_table(text: str, blocking: list):
     in_table = False
     documented = set()
@@ -174,7 +123,6 @@ def main():
     fixed = []
 
     new_text = check_single_anchors(text, blocking, fixed)
-    check_section_map(new_text, blocking)
     check_module_table(new_text, blocking)
 
     if new_text != text:

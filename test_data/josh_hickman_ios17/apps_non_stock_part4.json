@@ -1,0 +1,907 @@
+{
+  "Gettr": {
+    "version": "1.33.0",
+    "install_date": "2024-02-09",
+    "install_time": "09:22",
+    "username": "thisisdfir",
+    "actions": [
+      {
+        "date": "2024-02-09",
+        "time": "09:24",
+        "action": "Login"
+      },
+      {
+        "date": "2024-02-09",
+        "time": "09:32",
+        "action": "Started following ldehner505"
+      },
+      {
+        "date": "2024-02-09",
+        "time": "09:33",
+        "action": "Sent message",
+        "message": "Hi there. Welcome!"
+      },
+      {
+        "date": "2024-02-09",
+        "time": "09:55",
+        "action": "Reacted to message",
+        "message": "(Message received at 09:34) (Thumbs up emoji)"
+      },
+      {
+        "date": "2024-02-09",
+        "time": "09:58",
+        "action": "Sent message",
+        "message": "No problem. This app seems pretty basic with regards to messaging."
+      },
+      {
+        "date": "2024-02-09",
+        "time": "09:59",
+        "action": "Received reply to message",
+        "message": "(Message sent at 09:58) Agreed. We can totally make this a quick one and move on."
+      },
+      {
+        "date": "2024-02-09",
+        "time": "10:02",
+        "action": "Sent message",
+        "message": "Yep. How’s the phone screen holding up?"
+      },
+      {
+        "date": "2024-02-09",
+        "time": "10:03",
+        "action": "Received message",
+        "message": "It’s doing ok. I have tk [sic] be super careful with it."
+      },
+      {
+        "date": "2024-02-09",
+        "time": "10:13",
+        "action": "Sent message",
+        "message": "Awesome. We can send it in for repair after we are done."
+      },
+      {
+        "date": "2024-02-09",
+        "time": "10:17",
+        "action": "Sent message",
+        "message": "That was my thought as well. I’ll send over a picture."
+      },
+      {
+        "date": "2024-02-09",
+        "time": "10:20",
+        "action": "Received picture",
+        "message": "(R2 knows)"
+      },
+      {
+        "date": "2024-02-09",
+        "time": "10:21",
+        "action": "Saved picture",
+        "message": "(R2 knows)"
+      },
+      {
+        "date": "2024-02-09",
+        "time": "10:22",
+        "action": "Sent message",
+        "message": "Love it! I’ll find one to send you."
+      },
+      {
+        "date": "2024-02-09",
+        "time": "10:24",
+        "action": "Sent picture",
+        "message": "(Ignoring you)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "08:58",
+        "action": "Received message",
+        "message": "Nice."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:00",
+        "action": "Sent message",
+        "message": "Looks like we can only delete our own messages here."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:02",
+        "action": "Received message",
+        "message": "Yeah. I will delete this message in a minute."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:03",
+        "action": "Other party deleted message",
+        "message": "(Message received at 09:02)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:05",
+        "action": "Sent message",
+        "message": "It deletes it for both of us. Interesting."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:07",
+        "action": "Sent message",
+        "message": "I will delete this message in a moment."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:08",
+        "action": "Deleted message",
+        "message": "(Message sent at 09:07)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:09",
+        "action": "Received message",
+        "message": "Yeah, that is interesting. Each message is gone for both parties."
+      }
+    ]
+  },
+  "Gmail": {
+    "version": "6.0.231127.1784698",
+    "install_date": "2023-12-19",
+    "install_time": "11:37",
+    "username": "thisisdfir@gmail.com",
+    "note": "Only user actions are documented here; additional mail messages were received. Messages in this app will also be present in the Apple Mail app.",
+    "actions": [
+      {
+        "date": "2023-12-19",
+        "time": "11:38",
+        "action": "Login"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "09:36",
+        "action": "Sent email",
+        "subject": "iOS 16 Test Message",
+        "message": "Here is the first email in the chain."
+      },
+      {
+        "date": "2024-01-23",
+        "time": "09:41",
+        "action": "Received email",
+        "subject": "Re: iOS 16 Test Message",
+        "message": "Message received. Here is your reply."
+      },
+      {
+        "date": "2024-01-23",
+        "time": "09:43",
+        "action": "Sent email",
+        "subject": "Re: iOS 16 Test Message",
+        "message": "Got it. I am attaching a picture. (Attachment name: IMG_0032)"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "09:47",
+        "action": "Received email",
+        "message": "Received. I am attaching a picture, too. (Attachment name: IMG_0127)"
+      },
+      {
+        "date": "2024-01-23",
+        "time": "09:48",
+        "action": "Saved picture",
+        "message": "(IMG_0127)"
+      }
+    ]
+  },
+  "Google Chat": {
+    "version": "0.356.549732398",
+    "install_date": "2023-07-27",
+    "install_time": "09:31",
+    "updated_version": "1.0.240",
+    "update_date": "2024-01-23",
+    "update_time": "10:04",
+    "note": "Some data was sync’d from previous data generation periods. Only data that was generated during this period is documented here. Asterisks (*) denote direct messages. Calls were routed through the Gmail app.",
+    "actions": [
+      {
+        "date": "2023-07-27",
+        "time": "09:37",
+        "action": "Login"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "12:45",
+        "action": "Received message*",
+        "message": "Are you here by any chance?"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "12:54",
+        "action": "Reacted to message",
+        "message": "(Message received at 12:45) (Thumbs up emoji)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "12:56",
+        "action": "Sent message*",
+        "message": "I am!"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "12:57",
+        "action": "Received message*",
+        "message": "Good. This is like MEGA. We have double the work here."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "13:00",
+        "action": "Replied to message*",
+        "message": "(Message received at 12:57)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "13:02",
+        "action": "Received message*",
+        "message": "Here’s to hoping. (ROFL emoji)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "13:04",
+        "action": "Sent message*",
+        "message": "How’s the weather where you are?"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "13:09",
+        "action": "Received message*",
+        "message": "Getting worse. It’s raining in sheets."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "13:10",
+        "action": "Sent message*",
+        "message": "About the same. If I don’t lose a tree I will be surprised."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "13:16",
+        "action": "Received message*",
+        "message": "Hopefully not. I think those trees are about 400 a piece."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "13:18",
+        "action": "Sent message*",
+        "message": "Fantastic."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "15:49",
+        "action": "Sent message*",
+        "message": "Here comes a picture."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "15:50",
+        "action": "Sent picture*",
+        "message": "(Boeing)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "15:51",
+        "action": "Received message*",
+        "message": "Oof. Lol."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "15:52",
+        "action": "Sent message*",
+        "message": "Too soon?"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "15:53",
+        "action": "Received message*",
+        "message": "Maybe. I’ll send a picture."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "15:58",
+        "action": "Received picture*",
+        "message": "(Blow your food)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "15:59",
+        "action": "Saved picture*",
+        "message": "(Blow your food)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:00",
+        "action": "Received message*",
+        "message": "I’ll call you."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:01",
+        "action": "Received message*",
+        "message": "Audio"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:02",
+        "action": "Incoming audio call*",
+        "message": "(~1:30)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:05",
+        "action": "Sent message*",
+        "message": "Here comes an audio call."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:06",
+        "action": "Outgoing audio call*",
+        "message": "(~1:30)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:08",
+        "action": "Received message*",
+        "message": "Video call incoming."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:10",
+        "action": "Incoming video call*",
+        "message": "(~1:30)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:13",
+        "action": "Sent message*",
+        "message": "I’ll video call you."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:16",
+        "action": "Outgoing video call*",
+        "message": "(~1:30)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:18",
+        "action": "Sent message*",
+        "message": "We can only delete messages we send. I’ll delete this one in a minute."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:21",
+        "action": "Deleted message*",
+        "message": "(Message sent at 16:18)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:22",
+        "action": "Sent message*",
+        "message": "It’s been deleted"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:23",
+        "action": "Created new space",
+        "message": "(Space Name: iOS 16 Test Space)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:25",
+        "action": "Received message",
+        "message": "I’m here!"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:26",
+        "action": "Replied to message",
+        "message": "(Message received at 16:25) Good. Send me a picture please."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:27",
+        "action": "Other party reacted to message",
+        "message": "(Message sent at 16:26) (Thumbs up emoji)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:29",
+        "action": "Received picture",
+        "message": "(9-8)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:31",
+        "action": "Saved picture",
+        "message": "(9-8)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:32",
+        "action": "Sent message",
+        "message": "(Smiley face emoji) I’ll send one now."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:34",
+        "action": "Sent picture",
+        "message": "(A chemist)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:36",
+        "action": "Sent message",
+        "message": "Here is my super duper bad message. I’ll delete it in a second."
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:38",
+        "action": "Deleted message",
+        "message": "(Message sent at 16:36)"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:39",
+        "action": "Received message",
+        "message": "Did you delete it?"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:40",
+        "action": "Sent message",
+        "message": "Yes."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:19",
+        "action": "Received message*",
+        "message": "Hi! Are you here yet?"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:21",
+        "action": "Added profile picture",
+        "message": "(HAL)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:22",
+        "action": "Sent message*",
+        "message": "Of course I am. I’m having coffee at the moment."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:24",
+        "action": "Received reply to message*",
+        "message": "(Message sent at 09:22) Of course you are! I am, too. I was up late watching TV."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:27",
+        "action": "Sent message*",
+        "message": "Nice. Anything good?"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:29",
+        "action": "Received message*",
+        "message": "Griselda. It’s got Sophia Vergara in it. It’s surprisingly good."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:31",
+        "action": "Sent message*",
+        "message": "But is it accurate?"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:33",
+        "action": "Received message*",
+        "message": "They have taken some liberties (Smiley face emoji)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:34",
+        "action": "Sent message*",
+        "message": "Of course they have. I’ll check it out anyway."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:35",
+        "action": "Received message*",
+        "message": "It’s on Netflix."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:37",
+        "action": "Sent message*",
+        "message": "I will find a picture to send"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:38",
+        "action": "Other party reacted to message*",
+        "message": "(Message received at 09:37) (Thumbs up emoji)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:42",
+        "action": "Sent picture*",
+        "message": "(One ticket)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:44",
+        "action": "Received message*",
+        "message": "Got it. I’ll send one now."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:45",
+        "action": "Received picture*",
+        "message": "(Back hurt)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:47",
+        "action": "Saved picture*",
+        "message": "(Back hurt)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:50",
+        "action": "Received message*",
+        "message": "I’ll audio call you."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:51",
+        "action": "Incoming audio call*",
+        "message": "~1:30"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:55",
+        "action": "Sent message*",
+        "message": "It doesn’t look like I have the ability to start just an audio call. Here comes…a call."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "09:56",
+        "action": "Outgoing audio call*",
+        "message": "~1:30"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "10:20",
+        "action": "Received message*",
+        "message": "Here comes a video call."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "10:21",
+        "action": "Incoming video call*",
+        "message": "~1:30"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "10:24",
+        "action": "Sent message*",
+        "message": "My turn."
+      },
+      {
+        "date": "2024-02-11",
+        "time": "10:25",
+        "action": "Outgoing video call*",
+        "message": "~1:40"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "10:35",
+        "action": "Added to new space",
+        "message": "(Space Name: Android 14 Test Space)"
+      },
+      {
+        "date": "2024-02-11",
+        "time": "10:37",
+        "action": "Sent message",
+        "message": "Hi there. I’m here."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:08",
+        "action": "Received message",
+        "message": "I’m here! Been a long time. (ROFL emoji)"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:09",
+        "action": "Replied to message",
+        "message": "(Reply to message received at 10:08) No kidding. What happened??"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:11",
+        "action": "Received message",
+        "message": "We went to the beach last weekend and I just didn’t feel like doing much."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:13",
+        "action": "Sent message",
+        "message": "I totally understand. I didn’t do much myself."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:15",
+        "action": "Received message",
+        "message": "Weather was garbage so we ended up just lounging around the house."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:17",
+        "action": "Sent message",
+        "message": "Aquarium, though, right?"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:18",
+        "action": "Received message",
+        "message": "Oh yeah. But that was the only thing."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:22",
+        "action": "Sent message",
+        "message": "Nice. Send me a picture?"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:23",
+        "action": "Received message",
+        "message": "Sure!"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:25",
+        "action": "Received message & picture",
+        "message": "Q [sic] (Death)"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:26",
+        "action": "Saved picture",
+        "message": "(Death)"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:27",
+        "action": "Sent message",
+        "message": "Nice. I’ll send one."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:29",
+        "action": "Sent picture",
+        "message": "(Pop music)"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:41",
+        "action": "Received message",
+        "message": "Here is the message I am going to delete in a minute."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:43",
+        "action": "Other party deleted message",
+        "message": "(Message received at 10:41)"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:44",
+        "action": "Sent message",
+        "message": "Got it."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:46",
+        "action": "Sent message",
+        "message": "This is my “delete” message."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:47",
+        "action": "Deleted message",
+        "message": "(Message sent at 10:46)"
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:49",
+        "action": "Sent message",
+        "message": "Nice. Let’s move to Google Voice."
+      },
+      {
+        "date": "2024-02-26",
+        "time": "10:50",
+        "action": "Reacted to message",
+        "message": "(Message received at 10:49) (Thumbs up emoji)"
+      }
+    ]
+  },
+  "Google Maps": {
+    "version": "6.97.0",
+    "install_date": "2024-01-13",
+    "install_time": "12:21",
+    "updated_version": "6.125.1",
+    "update_date": "2024-07-28",
+    "update_time": "14:34",
+    "note": "Activity done via CarPlay is documented here and denoted in italics. Update completed at 14:36.",
+    "actions": [
+      {
+        "date": "2024-01-13",
+        "time": "12:22",
+        "action": "Login"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "08:26",
+        "action": "Dropped pin (35.5927267, -78.8087893"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "08:27",
+        "action": "Saved dropped pin in the Favorite list / got directions to “Work”"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "08:28",
+        "action": "Changed “Work” address to 1885 Broad Street, Fuquay-Varina, NC 27526"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "10:13",
+        "action": "Searched for “Starbucks” / selected location at 185 Grand Hill Pl, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "10:14",
+        "action": "Started navigation to 185 Grand Hill Pl, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "10:24",
+        "action": "Arrived at destination"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "10:30",
+        "action": "Added 185 Grand Hill Pl, Holly Springs, NC 27540 as Starred places"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:23",
+        "action": "Set “Home” address to 516 Ancient Oaks Drive, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:11",
+        "action": "Searched for CVS"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:12",
+        "action": "Selected 151 Village Walk, Holly Springs, NC 27540 / got directions"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:13",
+        "action": "Started navigation to 151 Village Walk, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:21",
+        "action": "Arrived at destination"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:27",
+        "action": "Searched for “Work” / got directions to 1885 Broad Street, Fuquay- Varina, NC 27526"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:28",
+        "action": "Started navigation"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:32",
+        "action": "Stopped navigation (prior to reaching destination) (Note: app did not progress through directions – likely encountered an error)"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:36",
+        "action": "Got directions to Favorite location (dropped pin)"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:47",
+        "action": "Started navigation to dropped pin"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:40",
+        "action": "Arrived at destination"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "15:13",
+        "action": "Searched for “Home” / got directions to 516 Ancient Oaks Drive, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "15:14",
+        "action": "Started navigation"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "15:15",
+        "action": "Stopped navigation (prior to reaching destination) (Note: app did not progress through directions – likely encountered an error)"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "15:17",
+        "action": "Searched for “Home” / got directions to 516 Ancient Oaks Drive, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "15:18",
+        "action": "Started navigation"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "15:32",
+        "action": "Ended navigation (prior to reaching destination)"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "13:49",
+        "action": "Searched for “W.E. Hunt Recreation Center”"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "13:50",
+        "action": "Got directions to W. E. Hunt Recreatopm Center (301 Stinson Avenue, Holly Springs, NC 27540)"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "13:51",
+        "action": "Started navigation to 301 Stinson Avenue, Holly Springs, NC 27540"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "13:55",
+        "action": "Arrived at destination"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "14:19",
+        "action": "Searched for “Work” (1885 Broad Street, Fuquay-Varina, NC 27526)"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "14:20",
+        "action": "Got directions to “Work” (1885 Broad Street, Fuquay-Varina, NC 27526)"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "14:21",
+        "action": "Started navigation to 1885 Broad Street, Fuquay-Varina, NC 27526"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "14:23",
+        "action": "Stopped navigation (prior to reaching destination)"
+      }
+    ]
+  }
+}

@@ -1,0 +1,958 @@
+{
+  "imo (or imo HD)": {
+    "version": "7.2.22",
+    "install_date": "2023-12-23",
+    "install_time": "16:27",
+    "updated_version": "7.2.23",
+    "update_date": "2024-07-28",
+    "update_time": "15:22",
+    "note": "Phone number 919-579-4674.",
+    "actions": [
+      {
+        "date": "2023-12-28",
+        "time": "08:55",
+        "action": "Login"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "08:57",
+        "action": "Sent message",
+        "message": "I finally got imo to log in!"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "08:58",
+        "action": "Received message",
+        "message": "Woot!"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "09:08",
+        "action": "Sent message",
+        "message": "I know, right?! So exciting. (Smiley face emoji)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "09:14",
+        "action": "Received reply to message",
+        "message": "(Message sent at 09:08) Yes. Sooooo exciting."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:10",
+        "action": "Sent message",
+        "message": "I know, I know. ONE more app. It shouldn’t add that much more work to it."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:11",
+        "action": "Received message",
+        "message": "Yeah, what’s one more app? Lol."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:15",
+        "action": "Sent message",
+        "message": "True. Want to send me a picture?"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:18",
+        "action": "Received message",
+        "message": "Sure. Give me a minute to find one."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:19",
+        "action": "Received picture",
+        "message": "(Chipolte)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:20",
+        "action": "Saved picture",
+        "message": "(Chipolte)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:21",
+        "action": "Sent message",
+        "message": "Lol. True! I’ll send you a picture as soon as I find one."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:22",
+        "action": "Sent picture",
+        "message": "(Christmas idea)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:25",
+        "action": "Received message",
+        "message": "That’s actually a great idea. It would make the holidays more enjoyable."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:26",
+        "action": "Sent message",
+        "message": "Especially if you don’t like the people."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:28",
+        "action": "Received message",
+        "message": "I will audio call you. Standby."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:29",
+        "action": "Incoming audio call",
+        "message": "(~1:35)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:32",
+        "action": "Sent message",
+        "message": "My turn."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:33",
+        "action": "Outgoing audio call",
+        "message": "(~1:55)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:37",
+        "action": "Received message",
+        "message": "Here comes a video call."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:40",
+        "action": "Incoming video call",
+        "message": "(~1:35)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:42",
+        "action": "Sent message",
+        "message": "My turn (again)."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:43",
+        "action": "Outgoing video call",
+        "message": "(~1:35)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:46",
+        "action": "Received message",
+        "message": "Here is your super bad message. Let me know when you delete it."
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:48",
+        "action": "Deleted message",
+        "message": "(Message received at 10:46)"
+      },
+      {
+        "date": "2023-12-28",
+        "time": "10:49",
+        "action": "Sent message",
+        "message": "Deleted."
+      },
+      {
+        "date": "2024-04-21",
+        "time": "13:37",
+        "action": "Sent message",
+        "message": "Are you there?"
+      },
+      {
+        "date": "2024-04-21",
+        "time": "13:38",
+        "action": "Received message",
+        "message": "Yes. My number apparently was used by someone else. There are a lot of contacts in here that are not mine."
+      },
+      {
+        "date": "2024-04-21",
+        "time": "13:41",
+        "action": "Sent message",
+        "message": "Interesting. Your profile picture started out as someone else and now it is correct."
+      },
+      {
+        "date": "2024-04-21",
+        "time": "13:42",
+        "action": "Received message",
+        "message": "I did have to change my profile picture, so that checks out."
+      },
+      {
+        "date": "2024-04-21",
+        "time": "13:45",
+        "action": "Sent message",
+        "message": "Ah, ok. Things look ok now. Hopefully you don’t get any stray messages. lol."
+      },
+      {
+        "date": "2024-04-21",
+        "time": "13:46",
+        "action": "Received reply to message",
+        "message": "(Message sent at 13:45) (ROFL emoji)"
+      },
+      {
+        "date": "2024-04-21",
+        "time": "13:48",
+        "action": "Received message",
+        "message": "Let’s hope not. Please send me a picture."
+      },
+      {
+        "date": "2024-04-21",
+        "time": "14:23",
+        "action": "Sent message",
+        "message": "Sure. Just a moment."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:33",
+        "action": "Sent picture",
+        "message": "(Paramore)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:34",
+        "action": "Other party liked message",
+        "message": "(Message sent at 11:33)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:43",
+        "action": "Received message",
+        "message": "Nice. I’ll send one now."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:44",
+        "action": "Received picture",
+        "message": "(Fatherhood)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:46",
+        "action": "Saved picture",
+        "message": "(Fatherhood)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:47",
+        "action": "Received message",
+        "message": "Here comes an audio call."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:48",
+        "action": "Incoming audio call",
+        "message": "(~1:38)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:51",
+        "action": "Sent message",
+        "message": "My turn."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:52",
+        "action": "Outgoing audio call",
+        "message": "(~1:51)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:57",
+        "action": "Received message",
+        "message": "I’ll video call you."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "11:58",
+        "action": "Incoming video call",
+        "message": "(~2:00)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:02",
+        "action": "Sent message",
+        "message": "I’ll video call you."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:04",
+        "action": "Outgoing video call",
+        "message": "(~1:45)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:08",
+        "action": "Received message",
+        "message": "Here is your bad message. Please delete it."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:10",
+        "action": "Deleted message",
+        "message": "(Message received at 12:08)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:11",
+        "action": "Sent message",
+        "message": "Ok I’m sending you a bad message now. Delete it."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:15",
+        "action": "Received message",
+        "message": "It’s gone."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:16",
+        "action": "Sent message (x2)",
+        "message": "So is mine."
+      }
+    ]
+  },
+  "Instagram": {
+    "version": "293.1.0.21.50",
+    "install_date": "2023-07-27",
+    "install_time": "09:35",
+    "updated_version": "341.0.0",
+    "update_date": "2024-07-28",
+    "update_time": "14:31",
+    "username": "thisisdfir",
+    "note": "Email: thisisdfir@gmail.com | Earlier update: Updated Version 315.0.0, Update Date 2024-01-23, Update Time 10:06. Five following, two followers. Previous data resides in this app due to account sync’ing; see documentation from previous Android and iOS images for documentation. Asterisks (*) denote message sent in Vanish Mode. Update completed at 14:34.",
+    "actions": [
+      {
+        "date": "2023-07-27",
+        "time": "09:53",
+        "action": "Login"
+      },
+      {
+        "date": "2023-12-23",
+        "time": "16:40",
+        "action": "Sent message",
+        "message": "What’s up?!"
+      },
+      {
+        "date": "2023-12-23",
+        "time": "16:42",
+        "action": "Received message",
+        "message": "Not much. What are you up to?"
+      },
+      {
+        "date": "2023-12-23",
+        "time": "16:44",
+        "action": "Sent message",
+        "message": "I am about to have an adult beverage. The holiday and whatnot. (ROFL emoji)"
+      },
+      {
+        "date": "2023-12-23",
+        "time": "16:45",
+        "action": "Received message",
+        "message": "That bad already?"
+      },
+      {
+        "date": "2023-12-23",
+        "time": "16:47",
+        "action": "Sent message",
+        "message": "Meh. I just need to unwind a bit a bit. Typical holiday."
+      },
+      {
+        "date": "2023-12-23",
+        "time": "16:48",
+        "action": "Other party reacted to message",
+        "message": "(Message sent at 16:47) (Heart emoji)"
+      },
+      {
+        "date": "2023-12-23",
+        "time": "16:49",
+        "action": "Sent message",
+        "message": "I’ll send a picture. Hang on."
+      },
+      {
+        "date": "2023-12-23",
+        "time": "16:51",
+        "action": "Sent picture",
+        "message": "Calling in sick"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:29",
+        "action": "Received message",
+        "message": "That is…true. I’ll send one. Hang on."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:31",
+        "action": "Received picture",
+        "message": "us-east-1"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:32",
+        "action": "Saved picture",
+        "message": "us-east-1"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:33",
+        "action": "Sent message",
+        "message": "I’ll audio call you. Standby."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:34",
+        "action": "Outgoing audio call",
+        "message": "(~1:38)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:37",
+        "action": "Received message",
+        "message": "My turn."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:38",
+        "action": "Incoming audio call",
+        "message": "(~1:33)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:42",
+        "action": "Sent message",
+        "message": "Ok. Video call time."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:45",
+        "action": "Outgoing video call",
+        "message": "(~2:06)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:48",
+        "action": "Received message",
+        "message": "Alright, my turn."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:50",
+        "action": "Incoming video call",
+        "message": "(~2:03)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:58",
+        "action": "Other party turned on Vanish Mode"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "13:59",
+        "action": "Received message*",
+        "message": "Here is the first message in vanish mode."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:08",
+        "action": "Sent message*",
+        "message": "Got it. What is this supposed to do?"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:10",
+        "action": "Received message*",
+        "message": "No clue. Just thought we should turn it on."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:12",
+        "action": "Sent message*",
+        "message": "Maybe it wipes things out when we turn it off…?"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:14",
+        "action": "Received message*",
+        "message": "We are going to find out. (ROFL emoji)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:15",
+        "action": "Other party turned off Vanish Mode"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:16",
+        "action": "Received message",
+        "message": "So all of the messages I had in Vanish Mode disappeared after I turned it off."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:17",
+        "action": "Sent message",
+        "message": "I’ll keep mine thn so people can see them."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:18",
+        "action": "Sent message",
+        "message": "I am going to unsend this message in just a moment."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:20",
+        "action": "Unsent message",
+        "message": "(Message sent at 14:18)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:21",
+        "action": "Sent message",
+        "message": "Unsent."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "15:01",
+        "action": "Received reply to message",
+        "message": "(Message received at 14:16)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:35",
+        "action": "Added one follower"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:38",
+        "action": "Received message",
+        "message": "What’s up?!"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:40",
+        "action": "Sent message",
+        "message": "Welcome to Meta! (ROFL emoji)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:42",
+        "action": "Other party reacted to message",
+        "message": "(Message received at 12:40)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:44",
+        "action": "Received message",
+        "message": "I liked this account to my FB account."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:45",
+        "action": "Replied to message",
+        "message": "(Message received at 12:44) That should be ok. At least, I think it should."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:48",
+        "action": "Received message",
+        "message": "Ok, good. I wasn’t sure."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:50",
+        "action": "Sent message",
+        "message": "Worst case scenario is you have to merge the account info in the utility. It shouldn’t make a difference, though."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:51",
+        "action": "Received message",
+        "message": "Awesome. I will send you ba [sic] picture."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:54",
+        "action": "Sent picture",
+        "message": "(Duck Wearing Bow-Tie)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:55",
+        "action": "Saved picture",
+        "message": "(Duck Wearing Bow-Tie)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:56",
+        "action": "Sent message",
+        "message": "Wow. I have no words. lol."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:58",
+        "action": "Sent message",
+        "message": "I will send a picture now."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "12:59",
+        "action": "Sent picture",
+        "message": "(Peppa pig)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:02",
+        "action": "Received message",
+        "message": "Lol. I will audio call you in a minute."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:03",
+        "action": "Incoming audio call",
+        "message": "(1:23)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:05",
+        "action": "Sent message",
+        "message": "My turn for an audio call."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:06",
+        "action": "Outgoing audio call",
+        "message": "(1:33)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:10",
+        "action": "Sent message",
+        "message": "Video call time."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:11",
+        "action": "Incoming video call",
+        "message": "(1:39)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:15",
+        "action": "Sent message",
+        "message": "I’ll give it a go."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:17",
+        "action": "Outgoing video call",
+        "message": "(1:31)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:20",
+        "action": "Sent message",
+        "message": "Here is your bad message. Trash it."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:21",
+        "action": "Received message",
+        "message": "I can’t. You’ll need to unsend it."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:25",
+        "action": "Unsent message",
+        "message": "(Message sent at 13:20)"
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:26",
+        "action": "Received message",
+        "message": "I will unsend this message in a minute."
+      },
+      {
+        "date": "2024-04-22",
+        "time": "13:28",
+        "action": "Other party unsent message",
+        "message": "(Message received at 13:26)"
+      }
+    ]
+  },
+  "KeepSafe": {
+    "version": "11.10.1",
+    "install_date": "2024-01-12",
+    "install_time": "11:30",
+    "note": "Passcode is 1234. Passcode for “My Private Album” is 4567. Some data is synced with KeepSafe cloud and was populated during data generation in previous images.",
+    "actions": [
+      {
+        "date": "2024-01-12",
+        "time": "11:32",
+        "action": "Login"
+      },
+      {
+        "date": "2024-01-12",
+        "time": "11:36",
+        "action": "Imported picture into Main Album (Choose violence)"
+      },
+      {
+        "date": "2024-01-12",
+        "time": "11:40",
+        "action": "Imported picture into My Private Album (Fart squirrels)"
+      }
+    ]
+  },
+  "kik": {
+    "version": "16.13.1",
+    "install_date": "2023-12-24",
+    "install_time": "14:23",
+    "updated_version": "16.16.1",
+    "update_date": "2024-07-28",
+    "update_time": "14:56",
+    "username": "ThisIsDFIR",
+    "note": "Email: thisisdfir@gmail.com | Update completed at 14:59.",
+    "actions": [
+      {
+        "date": "2023-12-24",
+        "time": "14:26",
+        "action": "Login"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:28",
+        "action": "Sent message",
+        "message": "Are you here?"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:30",
+        "action": "Received message",
+        "message": "I am! This one looks basic. Just messages and pictures."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:31",
+        "action": "Sent message",
+        "message": "It appears that way. We can finish it quickly."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:34",
+        "action": "Received message",
+        "message": "Awesome. I just noticed I can delete your messages."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:36",
+        "action": "Sent message",
+        "message": "Nice. Any plans for tonight?"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:37",
+        "action": "Received message",
+        "message": "Not really. Just a quiet dinner and then more of this. (Smiley face emoji)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:39",
+        "action": "Sent message",
+        "message": "Don’t do too much. Enjoy some down time, too."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:40",
+        "action": "Received message",
+        "message": "I will. Here comes a picture."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:41",
+        "action": "Received picture",
+        "message": "(Ports)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:42",
+        "action": "Saved picture",
+        "message": "(Ports)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:43",
+        "action": "Sent message",
+        "message": "Got it. I’ll send you one now."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:45",
+        "action": "Sent picture",
+        "message": "(Festivus)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:46",
+        "action": "Sent message",
+        "message": "A little late, busy [sic] still relevant"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:47",
+        "action": "Received message",
+        "message": "True."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:48",
+        "action": "Received message",
+        "message": "Here is your bad message. Please delete it."
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:49",
+        "action": "Deleted message",
+        "message": "(Message received at 14:48)"
+      },
+      {
+        "date": "2023-12-24",
+        "time": "14:50",
+        "action": "Sent message",
+        "message": "Deleted."
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:17",
+        "action": "Received message",
+        "message": "Good morning. Are you awake?"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:19",
+        "action": "Set to accept new chat requests"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:20",
+        "action": "Sent message",
+        "message": "I am. Good morning. I had to adjust a setting to see your message."
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:22",
+        "action": "Set to never accept new chat requests"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:23",
+        "action": "Received message",
+        "message": "I set mine to “Never.”"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:24",
+        "action": "Sent message",
+        "message": "That is what I was set to originally, but I couldn’t see your message. I switched to “Always” and then back to “Never.”"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:25",
+        "action": "Received message",
+        "message": "There are no replies here. (Smiley face emoji)"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:27",
+        "action": "Sent message",
+        "message": "I noticed. I honestly can’t believe this app is still around."
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:28",
+        "action": "Received message",
+        "message": "Same same. Want to send me a picture?"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:29",
+        "action": "Sent message",
+        "message": "Sure. Give me a minute."
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:30",
+        "action": "Sent picture",
+        "message": "(CyberBus)"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:34",
+        "action": "Received message",
+        "message": "Got it. I’ll send you one."
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:36",
+        "action": "Received picture",
+        "message": "(The cheese)"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:37",
+        "action": "Saved picture",
+        "message": "(The cheese)"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:38",
+        "action": "Sent message",
+        "message": "Whoah. That is creepy!"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:39",
+        "action": "Received message",
+        "message": "It totally is."
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:40",
+        "action": "Sent message",
+        "message": "Here is your bad message. Please delete it."
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:44",
+        "action": "Received message",
+        "message": "Delete this message when you get it."
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:46",
+        "action": "Deleted message",
+        "message": "(Message received at 08:44)"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:47",
+        "action": "Sent message",
+        "message": "Mine is gone. Yours?"
+      },
+      {
+        "date": "2024-04-23",
+        "time": "08:48",
+        "action": "Received message",
+        "message": "It’s toast."
+      }
+    ]
+  }
+}

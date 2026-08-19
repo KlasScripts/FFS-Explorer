@@ -43,8 +43,8 @@ SNAPSHOT_VERSION = '2'
 # frame, so yielding the GIL between chunks keeps the UI animating.
 _SNAP_CHUNK = 40_000
 
-# When these passes run in the in-process QThread fallback (streaming archives,
-# header-scan runs, subprocess unavailable), pure-Python loops starve the GUI
+# When these passes run in the in-process QThread fallback (header-scan
+# runs, subprocess unavailable), pure-Python loops starve the GUI
 # thread of the GIL.  time.sleep(0) forces a GIL handoff; every ~4k iterations
 # keeps stalls well under a frame while adding negligible overhead — and it is
 # a no-op cost in the subprocess path.
@@ -156,8 +156,8 @@ def _compute_folder_sizes(
     _REPORT_EVERY = 2000
 
     # Step 1: direct file contributions into each immediate parent.
-    # With no size data (streaming archives) every child would be skipped
-    # anyway — don't pay n resolve() calls to find that out.
+    # With no size data every child would be skipped anyway — don't pay
+    # n resolve() calls to find that out.
     if zip_sizes:
         for fp, children in folder_map.items():
             for child in children:
@@ -302,10 +302,10 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
     return {k: list(v) for k, v in folder_map_sets.items()}
 
 
-# ── Full non-streaming parse (used by subprocess and in-process fallback) ────────
+# ── Full archive parse (used by subprocess and in-process fallback) ──────────────
 
 def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict:
-    """Parse a non-streaming FFS archive from its local .zcd cache.
+    """Parse an FFS archive from its local .zcd cache.
 
     Returns a result dict with the live objects plus the packed snapshot:
       adapter_args, delta, zip_names, zip_ui_paths, ui_metadata, folder_map,
@@ -314,8 +314,8 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
 
     This is the heavy, CPU-bound work; run it in a child process to keep the
     GUI responsive.  Requires a valid local central-directory cache (.zcd) —
-    raises if absent.  Streaming archives and header scans are NOT handled here
-    (the GUI keeps those on its in-thread path).
+    raises if absent.  Header scans are NOT handled here (the GUI keeps
+    those on its in-thread path).
     """
     def status(msg):
         if status_cb:
@@ -355,7 +355,6 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
         ui_metadata, guid_to_bundle, zip_ui_paths = ffs_adapter.build_ui_metadata(
             zip_path, zip_names,
             z=z_ctx,
-            streaming_index=None,
             status_cb=status,
             guid_to_bundle=cached_guid_bundle,
             zip_entries=precomputed,

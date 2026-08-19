@@ -16,9 +16,10 @@ import pathlib
 import subprocess
 import configparser
 import shutil
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from functools import lru_cache, partial
+from functools import partial
 from itertools import islice
 from operator import itemgetter
 
@@ -53,9 +54,10 @@ from keyword_search import KeywordSearchMixin
 from artifact_viewer import ArtifactViewerMixin
 from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
+from timestamp_display import TimestampDisplayMixin
+from dialog_helpers import button_row, error_label, note_label, WARNING_STYLE
 import research_store as _research
 from artifact_db import load_artifact_results
-from streaming_zip import StreamingZipIndex
 from zip_reader import read_nested_entry
 from zip_cd_cache import (CachedZipView, is_valid as _cd_cache_valid,
                           save as _cd_cache_save, load as _cd_cache_load,
@@ -80,7 +82,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QMessageBox, QCheckBox, QAbstractItemView,
                               QTreeWidget, QTreeWidgetItem, QTextEdit,
                               QListWidget, QListWidgetItem, QDateEdit,
-                              QRadioButton)
+                              QRadioButton, QButtonGroup)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QColor, QIcon)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QDate,
@@ -699,9 +701,33 @@ class ExtractorWorker(QThread):
         self.folder_map = folder_map
         self.path_resolver = path_resolver
         self._cancelled = False
+        self._used_dest_paths: set[str] = set()
+        self._collision_count = 0
 
     def cancel(self):
         self._cancelled = True
+
+    def _dedupe_dest(self, dest_path: str) -> str:
+        """Guarantee dest_path is unique within this export run.
+
+        _sanitize_export_rel can map distinct source names to the same
+        sanitized name (hidden-file rename, illegal-char substitution, case
+        folding on case-insensitive filesystems) — without this, the second
+        file silently overwrites the first with no warning. On collision,
+        append ' (2)', ' (3)', … before the extension instead.
+        """
+        if dest_path not in self._used_dest_paths:
+            self._used_dest_paths.add(dest_path)
+            return dest_path
+        self._collision_count += 1
+        base, ext = os.path.splitext(dest_path)
+        n = 2
+        while True:
+            candidate = f"{base} ({n}){ext}"
+            if candidate not in self._used_dest_paths:
+                self._used_dest_paths.add(candidate)
+                return candidate
+            n += 1
 
     def run(self):
         _CHUNK = 1024 * 1024  # 1 MB copy buffer
@@ -749,6 +775,7 @@ class ExtractorWorker(QThread):
                     physical_path = self.path_resolver(ui_path)
                     sanitized_rel = _sanitize_export_rel(rel_path)
                     dest_path = _fs_path(os.path.join(self.dest_dir, sanitized_rel))
+                    dest_path = self._dedupe_dest(dest_path)
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
                     if i % 50 == 0 or i == total - 1:
@@ -781,7 +808,13 @@ class ExtractorWorker(QThread):
 
                     self.progress.emit(i + 1, total)
 
-            self.finished.emit(True, f"Successfully exported {total} items.", self.dest_dir)
+            msg = f"Successfully exported {total} items."
+            if self._collision_count:
+                msg += (f" {self._collision_count} filename collision"
+                        f"{'s' if self._collision_count != 1 else ''} resolved "
+                        "by appending '(2)', '(3)', … — check the export folder "
+                        "if two source files were expected to share a name.")
+            self.finished.emit(True, msg, self.dest_dir)
         except Exception as e:
             self.finished.emit(False, f"Export Failed: {str(e)}", "")
 
@@ -803,32 +836,31 @@ class ExtractorWorker(QThread):
         return children
 
 
-_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+def _format_tool_ts_local(iso_str: str) -> str:
+    """Format a stored UTC ISO timestamp ('%Y-%m-%dT%H:%M:%S', no offset)
+    as local time for display, with the UTC offset shown explicitly.
 
-
-@lru_cache(maxsize=4096)
-def _date_prefix(days: int) -> str:
-    """'YYYY-MM-DD' for a day number since the epoch (cached — few unique days)."""
-    return (_EPOCH_UTC + timedelta(days=days)).strftime('%Y-%m-%d')
-
-
-@lru_cache(maxsize=1 << 16)
-def _format_ts_cached(ts) -> str:
-    """Format an epoch timestamp (s or APFS ns) as a UTC display string.
-
-    strftime per row dominated recursive-view row building, so the date part
-    is cached per day and the time of day is computed arithmetically —
-    ~5x faster on archives with diverse timestamps, identical output.
+    For TOOL-PROVENANCE timestamps only (run_log, integrity checks,
+    bookmarks — when the examiner did something with this app on this
+    machine), never for evidence. Storage stays UTC (sortable,
+    unambiguous, no migration needed for existing rows); only the display
+    layer converts. Evidence timestamps must stay UTC end-to-end — see
+    app/timestamp_display.py's _format_ts_cached and CLAUDE.md's
+    Conventions section. (A different concern from that module — tool
+    provenance, never evidence — so it stays here rather than moving with
+    it; see that module's own docstring.)
     """
+    if not iso_str:
+        return ''
     try:
-        if ts > 1e10:
-            ts = ts / 1e9   # APFS stores timestamps as nanoseconds since epoch
-        days, rem = divmod(int(ts // 1), 86400)
-        h, rem = divmod(rem, 3600)
-        m, s = divmod(rem, 60)
-        return f"{_date_prefix(days)} {h:02d}:{m:02d}:{s:02d} UTC"
-    except (ValueError, OSError, OverflowError):
-        return "---"
+        dt_utc = datetime.strptime(iso_str, '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+    except ValueError:
+        return iso_str.replace('T', ' ')  # unparsable — show as-is rather than hide it
+    local  = dt_utc.astimezone()
+    offset = local.utcoffset() or timedelta(0)
+    sign   = '+' if offset >= timedelta(0) else '-'
+    hh, mm = divmod(abs(offset).seconds // 60, 60)
+    return f"{local:%Y-%m-%d %H:%M:%S} (UTC{sign}{hh:02d}:{mm:02d})"
 
 
 def _count_header_candidates(ui_metadata: dict, ffs_adapter) -> int:
@@ -862,6 +894,11 @@ def _is_extractable(name: str, ft: str) -> bool:
 _PHOTO_HEADERS = ['Flags', 'Taken', 'Added', 'Original Name', 'Album', 'Labels',
                   'Origin', 'Camera', 'Place', 'GPS', 'Faces',
                   'Face Ages', 'Status']
+
+# Cocoa/Mac epoch (2001-01-01) -> Unix epoch, seconds. photos_metadata.py's
+# Taken/Added (timestamp_fields unit "cocoa_s") store the raw value in this
+# unit; _build_entry_row converts to Unix seconds before calling format_ts.
+_APPLE_COCOA_EPOCH_OFFSET = 978307200
 
 # Triage flags derived from the photo Labels (Apple's scene/object classes).
 # A clean overlay over the messy raw label list — sortable/filterable.  These
@@ -907,8 +944,12 @@ def _seed_photo_flags(path: str) -> None:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump({k: sorted(v) for k, v in _DEFAULT_PHOTO_FLAGS.items()},
                           f, indent=2)
-    except OSError:
-        pass
+    except OSError as e:
+        # Was silently swallowed — falls back to built-in defaults with zero
+        # indication that photo-flag customizations will never persist (e.g.
+        # exe installed to a protected directory like Program Files).
+        print(f"[photo_flags] Could not seed {path!r}: {e}. "
+              f"Photo-flag customizations will not be saved this run.")
 
 
 def _load_photo_flag_rules() -> dict:
@@ -1034,25 +1075,16 @@ def _resolve_file_candidates(
     ui_paths: list,
     ffs_adapter,
     z=None,
-    streaming_index=None,
     delta: int | None = None,
 ) -> list[tuple[str, int, int]]:
     """Return [(ui_path, data_offset, file_size)] for the given ui_paths.
 
-    Opens its own ZipFile when neither *z* nor *streaming_index* is supplied.
+    Opens its own ZipFile when *z* isn't supplied.
     """
     if not ui_paths:
         return []
     candidates: list[tuple[str, int, int]] = []
     resolve = ffs_adapter.resolve
-
-    if streaming_index is not None:
-        entries = streaming_index._entries
-        for ui_path in ui_paths:
-            row = entries.get(resolve(ui_path))
-            if row:
-                candidates.append((ui_path, row[0], row[2]))
-        return candidates
 
     close_z = z is None
     if close_z:
@@ -1085,7 +1117,6 @@ def _collect_header_candidates(
     ui_metadata: dict,
     ffs_adapter,
     z=None,
-    streaming_index=None,
     delta: int | None = None,
 ) -> list[tuple[str, int, int]]:
     """Return [(ui_path, data_offset, file_size)] for 'Other'-typed files in scan_folders."""
@@ -1095,13 +1126,12 @@ def _collect_header_candidates(
         if ui_path.startswith(scan_folders)
         and _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
     ]
-    return _resolve_file_candidates(zip_path, targets, ffs_adapter,
-                                    z=z, streaming_index=streaming_index, delta=delta)
+    return _resolve_file_candidates(zip_path, targets, ffs_adapter, z=z, delta=delta)
 
 
 class ZipMetadataWorker(QThread):
     """Background thread that loads and processes an FFS archive. Steps:
-      1. Open the zip (falls back to StreamingZipIndex if no central directory)
+      1. Open the zip
       2. Detect the archive format (Graykey / Cellebrite iOS / Cellebrite Android)
       3. Load the GUID→bundle-ID map from cache or build it from the archive
       4. Build ui_metadata (path → timestamps/size dict) via the format adapter
@@ -1176,7 +1206,7 @@ class ZipMetadataWorker(QThread):
         return True
 
     def _run_parse_offloaded(self) -> bool:
-        """Parse the (non-streaming) archive and emit metadata_ready.
+        """Parse the archive and emit metadata_ready.
 
         Tries a child process first — true parallelism, GUI stays responsive.
         The child persists its result to casecache.db, so on success we simply
@@ -1264,7 +1294,6 @@ class ZipMetadataWorker(QThread):
         fmt, user_pfx, sys_pfx, old_layout = result['adapter_args']
         ffs_adapter = FfsAdapter(fmt, user_pfx, sys_pfx, bool(old_layout))
         self._local_extra_delta = result['delta']
-        self._streaming_index   = None
         zip_names    = frozenset(result['zip_names'])
         zip_ui_paths = result['zip_ui_paths']
         ui_metadata  = result['ui_metadata']
@@ -1287,7 +1316,6 @@ class ZipMetadataWorker(QThread):
     def run(self):
         try:
             self.status_update.emit("Opening Archive...")
-            self._streaming_index    = None
             self._local_extra_delta: int | None = None
 
             if self.case_dir:
@@ -1325,65 +1353,42 @@ class ZipMetadataWorker(QThread):
                             f"Copying central directory… {done / max(total, 1):.0%}"),
                     )
                     if not _saved:
-                        # No seekable CD — fall back to streaming index
-                        self.status_update.emit("Streaming zip detected — building index...")
-                        self._streaming_index = StreamingZipIndex.open(
-                            self.zip_path,
-                            progress_cb=lambda done, total: self.status_update.emit(
-                                f"Indexing archive: {done / max(total, 1):.0%}"),
-                        )
-                    else:
-                        _elapsed = time.monotonic() - _t0
-                        self.status_update.emit(
-                            f"Central directory copied to case folder in {_elapsed:.1f}s.")
+                        raise RuntimeError(
+                            "Failed to read the archive's central directory — "
+                            "the zip file may be corrupted or truncated.")
+                    _elapsed = time.monotonic() - _t0
+                    self.status_update.emit(
+                        f"Central directory copied to case folder in {_elapsed:.1f}s.")
 
-                # Fast path: offload the heavy non-streaming parse to a child
-                # process.  It runs on its own interpreter/GIL so the CPU-bound
-                # work doesn't freeze the GUI (a QThread can't achieve this for
-                # pure-Python work — one shared GIL).  Header scans and streaming
-                # archives stay on the in-thread path below.
-                if self._streaming_index is None and not self.scan_headers:
+                # Fast path: offload the heavy parse to a child process.  It
+                # runs on its own interpreter/GIL so the CPU-bound work doesn't
+                # freeze the GUI (a QThread can't achieve this for pure-Python
+                # work — one shared GIL).  Header scans stay on the in-thread
+                # path below.
+                if not self.scan_headers:
                     if self._run_parse_offloaded():
                         return
 
-                if self._streaming_index is None:
-                    self.status_update.emit("Loading central directory from local copy…")
-                    _cached_infos = _cd_cache_load(self.zip_path, self.case_dir)
-                    z_ctx = CachedZipView(self.zip_path, _cached_infos) if _cached_infos else None
-                    if z_ctx is None:
-                        raise RuntimeError("Failed to load central directory from local copy")
-                else:
-                    z_ctx = None
+                self.status_update.emit("Loading central directory from local copy…")
+                _cached_infos = _cd_cache_load(self.zip_path, self.case_dir)
+                z_ctx = CachedZipView(self.zip_path, _cached_infos) if _cached_infos else None
+                if z_ctx is None:
+                    raise RuntimeError("Failed to load central directory from local copy")
             else:
                 # No case dir — open the network file directly
-                try:
-                    z_ctx = zipfile.ZipFile(self.zip_path, 'r')
-                    z_ctx.__enter__()
-                except zipfile.BadZipFile:
-                    self.status_update.emit("Streaming zip detected — building index...")
-                    self._streaming_index = StreamingZipIndex.open(
-                        self.zip_path,
-                        progress_cb=lambda done, total: self.status_update.emit(
-                            f"Indexing archive: {done / max(total, 1):.0%}"),
-                    )
-                    z_ctx = None
+                z_ctx = zipfile.ZipFile(self.zip_path, 'r')
+                z_ctx.__enter__()
 
             try:
                 self.status_update.emit("Reading zip directory...")
-                if self._streaming_index is not None:
-                    zip_names = frozenset(self._streaming_index.namelist())
-                    zip_sizes: dict[str, int] = {}
-                    ffs_adapter = FfsAdapter.detect_from_names(zip_names)
-                else:
-                    assert z_ctx is not None
-                    _infolist = z_ctx.infolist()
-                    # One pass: the size dict's keys double as the name set.
-                    zip_sizes = {info.filename: info.file_size for info in _infolist}
-                    zip_names = frozenset(zip_sizes)
-                    ffs_adapter = FfsAdapter.detect(z_ctx, zip_names)
-                    _stored = [i for i in _infolist
-                               if i.compress_type == zipfile.ZIP_STORED and i.file_size > 0]
-                    self._local_extra_delta = _probe_delta(self.zip_path, _stored)
+                _infolist = z_ctx.infolist()
+                # One pass: the size dict's keys double as the name set.
+                zip_sizes = {info.filename: info.file_size for info in _infolist}
+                zip_names = frozenset(zip_sizes)
+                ffs_adapter = FfsAdapter.detect(z_ctx, zip_names)
+                _stored = [i for i in _infolist
+                           if i.compress_type == zipfile.ZIP_STORED and i.file_size > 0]
+                self._local_extra_delta = _probe_delta(self.zip_path, _stored)
                 time.sleep(0)   # yield GIL after C-level frozenset build
 
                 cached_guid_bundle: dict | None = None
@@ -1409,7 +1414,6 @@ class ZipMetadataWorker(QThread):
                 ui_metadata, guid_to_bundle, zip_ui_paths = ffs_adapter.build_ui_metadata(
                     self.zip_path, zip_names,
                     z=z_ctx,
-                    streaming_index=self._streaming_index,
                     status_cb=self.status_update.emit,
                     guid_to_bundle=cached_guid_bundle,
                     zip_entries=_precomputed_zip_entries,
@@ -1423,7 +1427,7 @@ class ZipMetadataWorker(QThread):
                         "Collecting header scan candidates from archive (may be slow on network)…")
                     header_candidates = _collect_header_candidates(
                         self.zip_path, ui_metadata, ffs_adapter,
-                        z=z_ctx, streaming_index=self._streaming_index,
+                        z=z_ctx,
                         delta=self._local_extra_delta,
                     )
             finally:
@@ -1476,7 +1480,7 @@ class ZipMetadataWorker(QThread):
             # processes metadata_ready it mutates these dicts (nested-archive
             # injection), which would race with serialisation.
             snapshot_blob = None
-            if self.case_dir and self._streaming_index is None:
+            if self.case_dir:
                 self.status_update.emit("Saving load cache…")
                 try:
                     snapshot_blob = pack_snapshot(
@@ -1615,7 +1619,11 @@ class FileTableModel(QAbstractTableModel):
             if role == Qt.ItemDataRole.DisplayRole:
                 return self._headers[section]
             if role == Qt.ItemDataRole.ToolTipRole:
-                return _HEADER_TOOLTIPS.get(self._headers[section])
+                # Modified/Changed can carry a " (handset: ...)"-style
+                # suffix when a non-UTC timestamp-display mode is active —
+                # strip it so the lookup still matches the bare key.
+                header = self._headers[section].split(' (', 1)[0]
+                return _HEADER_TOOLTIPS.get(header)
         return None
 
     # ── bulk mutation ────────────────────────────────────────────────────────
@@ -1686,9 +1694,14 @@ class FileTableModel(QAbstractTableModel):
 
         if not needle and date_col < 0 and types is None:
             visible = [r for r in self._all_rows if _row_ok(r)]
-            self.beginInsertRows(QModelIndex(), 0, len(visible) - 1)
-            self._rows = visible
-            self.endInsertRows()
+            if visible:
+                # beginInsertRows(0, -1) is an invalid range per Qt docs —
+                # only call it when there's at least one row to insert.
+                self.beginInsertRows(QModelIndex(), 0, len(visible) - 1)
+                self._rows = visible
+                self.endInsertRows()
+            else:
+                self._rows = visible
             self.filter_done.emit(len(visible), total)
             return
 
@@ -1798,16 +1811,8 @@ class ExportProgressDialog(QDialog):
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
 
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.clicked.connect(self._on_cancel)
-        btn_row.addWidget(self._cancel_btn)
-        self._ok_btn = QPushButton("OK")
-        self._ok_btn.setVisible(False)
-        self._ok_btn.setDefault(True)
-        self._ok_btn.clicked.connect(self.accept)
-        btn_row.addWidget(self._ok_btn)
+        btn_row, self._cancel_btn, self._ok_btn = button_row(self, on_cancel=self._on_cancel)
+        self._ok_btn.setVisible(False)   # shown only once the export finishes
         layout.addLayout(btn_row)
 
     # --- slots wired to ExtractorWorker signals ---
@@ -1872,6 +1877,7 @@ class CaseSettingsDialog(QDialog):
 
         self._accepted_dir: str | None = None
         self._base_folder = base_folder
+        self._zip_path = zip_path
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -1905,15 +1911,8 @@ class CaseSettingsDialog(QDialog):
         layout.addStretch()
 
         # Buttons
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self._save_btn = QPushButton("Save Settings")
-        self._save_btn.setDefault(True)
-        self._save_btn.clicked.connect(self._on_save)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(self._save_btn)
+        btn_row, _cancel_btn, self._save_btn = button_row(
+            self, ok_text="Save Settings", on_ok=self._on_save)
         layout.addLayout(btn_row)
 
         self._on_name_changed()
@@ -1945,6 +1944,8 @@ class CaseSettingsDialog(QDialog):
                 QMessageBox.StandardButton.Yes,
             )
             if ans != QMessageBox.StandardButton.Yes:
+                return
+            if not _do_path_change_check(self, self._zip_path, case_dir):
                 return
         self._accepted_dir = case_dir
         self.accept()
@@ -2077,15 +2078,7 @@ class PreferencesDialog(QDialog):
 
         # ── Buttons ───────────────────────────────────────────────────────────
         layout.addStretch()
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        save_btn = QPushButton("Save")
-        save_btn.setDefault(True)
-        save_btn.clicked.connect(self._on_save)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
+        btn_row, _cancel_btn, _save_btn = button_row(self, ok_text="Save", on_ok=self._on_save)
         layout.addLayout(btn_row)
 
     def _browse(self):
@@ -2116,24 +2109,20 @@ class HeaderScanWorker(QThread):
     progress = Signal(int)   # remaining count
     done     = Signal(dict)  # {ui_path: detected_type}
 
-    def __init__(self, zip_path, ui_metadata, ffs_adapter, streaming_index=None,
-                 delta=None):
+    def __init__(self, zip_path, ui_metadata, ffs_adapter, delta=None):
         super().__init__()
         self._zip_path        = zip_path
         self._ui_metadata     = ui_metadata
         self._adapter         = ffs_adapter
-        self._streaming_index = streaming_index
         self._delta           = delta
 
     def run(self):
         z = None
         try:
-            if self._streaming_index is None:
-                z = zipfile.ZipFile(self._zip_path, 'r')
+            z = zipfile.ZipFile(self._zip_path, 'r')
             candidates = _collect_header_candidates(
                 self._zip_path, self._ui_metadata, self._adapter,
-                z=z, streaming_index=self._streaming_index,
-                delta=self._delta,
+                z=z, delta=self._delta,
             )
         finally:
             if z:
@@ -2156,19 +2145,17 @@ class SingleFileScanWorker(QThread):
     """Scan file headers for a specific list of ui_paths (not just 'Other' files)."""
     done = Signal(dict)   # {ui_path: detected_type}
 
-    def __init__(self, zip_path, ui_paths, ffs_adapter,
-                 streaming_index=None, delta=None):
+    def __init__(self, zip_path, ui_paths, ffs_adapter, delta=None):
         super().__init__()
         self._zip_path        = zip_path
         self._ui_paths        = ui_paths
         self._ffs_adapter     = ffs_adapter
-        self._streaming_index = streaming_index
         self._delta           = delta
 
     def run(self):
         candidates = _resolve_file_candidates(
             self._zip_path, self._ui_paths, self._ffs_adapter,
-            streaming_index=self._streaming_index, delta=self._delta,
+            delta=self._delta,
         )
         if not candidates:
             self.done.emit({})
@@ -2207,14 +2194,13 @@ class NestedArchiveWorker(QThread):
     _MEM_LIMIT = 100 * 1024 * 1024   # 100 MB — larger files written to temp first
 
     def __init__(self, zip_path, case_dir, candidates, ui_metadata,
-                 ffs_adapter, streaming_index=None, delta=None, parent=None):
+                 ffs_adapter, delta=None, parent=None):
         super().__init__(parent)
         self._zip_path        = zip_path
         self._case_dir        = case_dir
         self._candidates      = candidates      # list of ui_path strings
         self._ui_metadata     = ui_metadata
         self._adapter         = ffs_adapter
-        self._streaming_index = streaming_index
         self._delta           = delta
 
     def _load_completed(self, out_dir: str) -> set[str]:
@@ -2282,11 +2268,8 @@ class NestedArchiveWorker(QThread):
             file_size = meta.get('size', 0)
 
             # ── Read raw bytes from FFS zip ───────────────────────────────────
-            if self._streaming_index is not None:
-                raw = self._streaming_index.get_entry(physical).read()
-            else:
-                with zipfile.ZipFile(self._zip_path, 'r') as zf:
-                    raw = zf.read(physical)
+            with zipfile.ZipFile(self._zip_path, 'r') as zf:
+                raw = zf.read(physical)
 
             key             = hashlib.sha1(ui_path.encode()).hexdigest()[:12]
             basename        = os.path.basename(ui_path) or 'content'
@@ -2534,7 +2517,7 @@ class ProcessDialog(QDialog):
     _RUN_TYPE_INTEGRITY = 'integrity_check'
 
     def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
-                 streaming_index=None, delta=None, preselect_nested=False,
+                 delta=None, preselect_nested=False,
                  auto_archive_selection=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Process Case")
@@ -2544,7 +2527,6 @@ class ProcessDialog(QDialog):
         self._case_dir        = case_dir
         self._adapter         = ffs_adapter
         self._ui_metadata     = ui_metadata
-        self._streaming_index = streaming_index
         self._delta           = delta
         self._candidate_count  = _count_header_candidates(ui_metadata, ffs_adapter)
         self._scan_worker:      HeaderScanWorker     | None = None
@@ -2683,7 +2665,7 @@ class ProcessDialog(QDialog):
                 "<i>No data integrity check recorded.</i>")
             self._integrity_hist_btn.setVisible(False)
             return
-        run_at  = last['run_at'].replace('T', ' ')
+        run_at  = _format_tool_ts_local(last['run_at'])
         passed  = (last['output_rows'] or 0) > 0
         verdict = ("<span style='color:#2e7d32'>Passed</span>" if passed else
                    "<span style='color:#c62828'>⚠ FAILED — data may be "
@@ -2722,7 +2704,7 @@ class ProcessDialog(QDialog):
         dlg.setMinimumSize(620, 280)
         lay = QVBoxLayout(dlg)
         tree = QTreeWidget()
-        tree.setHeaderLabels(["Checked At (UTC)", "Result", "Computed SHA256"])
+        tree.setHeaderLabels(["Checked At", "Result", "Computed SHA256"])
         tree.setRootIsDecorated(False)
         tree.setAlternatingRowColors(True)
         for run in history:
@@ -2733,7 +2715,7 @@ class ProcessDialog(QDialog):
             if m:
                 sha = m.group(1)
             item = QTreeWidgetItem([
-                run['run_at'].replace('T', ' '),
+                _format_tool_ts_local(run['run_at']),
                 "Passed" if passed else "FAILED",
                 sha,
             ])
@@ -2769,7 +2751,7 @@ class ProcessDialog(QDialog):
         if last is None:
             lines.append("No previous header scan recorded.")
         else:
-            run_at   = last['run_at'].replace('T', ' ')
+            run_at   = _format_tool_ts_local(last['run_at'])
             scanned  = last['processed'] or 0
             changed  = last['output_rows'] or 0
             lines.append(
@@ -3006,7 +2988,7 @@ class ProcessDialog(QDialog):
         self._status_label.setText("Starting header scan…")
         self._scan_worker = HeaderScanWorker(
             self._zip_path, self._ui_metadata,
-            self._adapter, self._streaming_index,
+            self._adapter,
             delta=self._delta,
         )
         self._scan_worker.progress.connect(self._on_header_progress)
@@ -3135,7 +3117,7 @@ class ProcessDialog(QDialog):
         self._nested_worker = NestedArchiveWorker(
             self._zip_path, self._case_dir, candidates,
             self._ui_metadata, self._adapter,
-            self._streaming_index, self._delta,
+            self._delta,
         )
         self._nested_errors: list[str] = []
         self._nested_worker.progress.connect(self._on_nested_progress)
@@ -3614,7 +3596,7 @@ def _do_path_change_check(
 
     new_hash = _cd_extract_hash(zip_path)
     if new_hash is None:
-        return True   # archive unreadable or streaming — allow
+        return True   # archive unreadable — allow
 
     passed = trusted == new_hash
     try:
@@ -3636,7 +3618,7 @@ def _do_path_change_check(
     return passed
 
 
-class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, SqliteViewerMixin, SegbViewerMixin):  # type: ignore[reportIncompatibleMethodOverride]
+class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, SqliteViewerMixin, SegbViewerMixin, TimestampDisplayMixin):  # type: ignore[reportIncompatibleMethodOverride]
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FFS Explorer")
@@ -3655,7 +3637,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._precompute_zip_path: str = ""
         self._zip_handle: zipfile.ZipFile | None = None
         self._zip_open_future = None
-        self._streaming_index: StreamingZipIndex | None = None
         self._local_extra_delta: int | None = None
         self._header_type_overrides: dict = {}   # {ui_path: detected_type}
         self._nested_archive_map:   dict        = {}   # archive_ui_path → {stored_path, entries}
@@ -3716,6 +3697,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._mcp_copy_act.triggered.connect(self._copy_mcp_config)
         self._tools_menu.addAction(self._mcp_copy_act)
         self._apply_ai_pref_visibility()
+        self._timestamp_display_act = QAction("Timestamp Display...", self)
+        self._timestamp_display_act.setEnabled(False)   # needs an open case
+        self._timestamp_display_act.triggered.connect(self._timestamp_display_dialog)
+        self._tools_menu.addAction(self._timestamp_display_act)
         self._view_path = ""
         self._view_is_recursive = False
         self._checked_folders: set = set()
@@ -3776,6 +3761,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         archive_bar.addWidget(self.folder_view_btn)
         layout.addLayout(archive_bar)
 
+        self._setup_timestamp_banner(layout)  # see app/timestamp_display.py
 
         _section_style = (
             "font-weight: bold; padding: 3px 6px;"
@@ -4315,10 +4301,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._log(f"Filter cleared in: {self._view_path}")
 
     def _get_zip_handle(self) -> zipfile.ZipFile | None:
-        """Return the shared ZipFile handle, opening it lazily on first use.
-        Returns None for streaming zips — use _streaming_index instead."""
-        if self._streaming_index is not None:
-            return None
+        """Return the shared ZipFile handle, opening it lazily on first use."""
         if self._zip_handle is None:
             if self._zip_open_future is not None:
                 try:
@@ -4968,7 +4951,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             cols.append(name if name in self.guid_to_bundle else "")
         if photo_cols:
             info = self._photo_index.get(self._photo_key(path) or '')
-            cols.extend(info if info else [''] * len(_PHOTO_HEADERS))
+            if info:
+                # info[1]/info[2] = Taken/Added, raw Cocoa-epoch seconds
+                # from photos_metadata.py's own timestamp_fields (never a
+                # pre-formatted string) — converted to Unix seconds and
+                # formatted per the case's UTC/handset/acquisition setting,
+                # same as every other timestamp in this view. Only touched
+                # when there's an actual photo record: format_ts('') would
+                # otherwise turn a genuinely-blank (non-photo) cell into "---".
+                info = list(info)
+                info[1] = self.format_ts(float(info[1]) + _APPLE_COCOA_EPOCH_OFFSET) if info[1] else ''
+                info[2] = self.format_ts(float(info[2]) + _APPLE_COCOA_EPOCH_OFFSET) if info[2] else ''
+                cols.extend(info)
+            else:
+                cols.extend([''] * len(_PHOTO_HEADERS))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
                 path in self._nested_archive_map)
 
@@ -5116,9 +5112,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 pass
         _BG_POOL.submit(_save)
 
-    def format_ts(self, ts):
-        if not ts: return "---"
-        return _format_ts_cached(ts)
 
     def ensure_and_open_export_dir(self):
         if not self.zip_path: return
@@ -5662,7 +5655,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             case_dir=self._case_dir,
             ffs_adapter=self._adapter,
             ui_metadata=self.full_metadata,
-            streaming_index=self._streaming_index,
             delta=self._local_extra_delta,
             preselect_nested=preselect_nested,
             auto_archive_selection=auto_archive_selection,
@@ -5810,9 +5802,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # scan that runs after metadata_ready); see _maybe_hide_load_progress.
         self._tree_done   = False
         self._worker_done = False
+        self._metadata_ready_fired = False
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
         self._load_start = time.monotonic()
+        # Retire any still-running worker from a previous archive first — same
+        # non-blocking pattern as _thumb_worker above, so a stale worker can
+        # never clobber this load's state or crash on GC while running.
+        self._retire_worker(getattr(self, 'worker', None))
         self.worker = ZipMetadataWorker(zip_path, scan_headers=scan_headers,
                                         case_dir=self._case_dir)
         self.worker.status_update.connect(self.status_bar.showMessage)
@@ -5823,6 +5820,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.worker.start()
 
     def on_metadata_ready(self, data, folder_map, guid_map, zip_names, ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None, metadata_only_folders=None):
+        self._metadata_ready_fired = True
         self.full_metadata = data
         self.folder_map = folder_map
         # New case: research colors depend on this device's iOS version
@@ -5851,10 +5849,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._zip_handle.close()
             self._zip_handle = None
         self._zip_open_future = None
-        self._streaming_index    = getattr(self.worker, '_streaming_index', None)
         self._local_extra_delta  = getattr(self.worker, '_local_extra_delta', None)
-        if self._streaming_index is None:
-            self._zip_open_future = _BG_POOL.submit(zipfile.ZipFile, self.zip_path, 'r')
+        self._zip_open_future = _BG_POOL.submit(zipfile.ZipFile, self.zip_path, 'r')
         self._time_cols = self._detect_time_columns(data)
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'Path'])
@@ -5873,6 +5869,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._refresh_artifact_tab()
         self._artifact_act.setEnabled(True)
         self._mcp_act.setEnabled(True)
+        self._timestamp_display_act.setEnabled(True)
         # Header-type overrides and the photo index can take seconds of DB
         # reads on a big case; this whole slot runs between two frames, so
         # anything slow here is a beach ball.  Load them on the background
@@ -5899,7 +5896,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         case_dir = self._case_dir
         if not case_dir:
             return
-        rules = self._photo_flag_rules
+        rules    = self._photo_flag_rules
+        zip_path = self.zip_path
+        adapter  = self._adapter
         self._case_meta_seq = getattr(self, '_case_meta_seq', 0) + 1
         my_seq = self._case_meta_seq
 
@@ -5910,7 +5909,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     overrides = load_header_types(db)
             except Exception:
                 pass
-            return overrides, _build_photo_index(case_dir, rules)
+            tz = self._load_or_detect_timezone_settings(zip_path, adapter, case_dir)
+            return overrides, _build_photo_index(case_dir, rules), tz
 
         fut = _BG_POOL.submit(_load)
 
@@ -5921,15 +5921,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 QTimer.singleShot(30, _poll)
                 return
             try:
-                overrides, photos = fut.result()
+                overrides, photos, tz = fut.result()
             except Exception:
                 return
             self._header_type_overrides = overrides
             self._photo_index = photos
+            (self._handset_zone_name, self._acquisition_zone_name,
+             self._manual_zone_name,
+             self._timestamp_display_mode, is_first_load) = tz
+            self._refresh_timestamp_mode_indicator()
             if self._view_is_recursive:
                 self._rebuild_file_view_from_checked(preserve_filter=True)
             else:
                 self._refresh_folder_view(preserve_filter=True)
+            if is_first_load:
+                # Surface the choice proactively on a brand-new case rather
+                # than leaving it undiscovered behind the Tools menu — the
+                # menu item (_timestamp_display_dialog) stays available to
+                # revisit this at any later time too.
+                QTimer.singleShot(200, self._timestamp_display_dialog)
 
         QTimer.singleShot(10, _poll)
 
@@ -5943,9 +5953,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not enabled:
             self._shutdown_mcp_server("AI access turned off in Preferences")
 
-    def _mcp_consent_dialog(self, default_backend: str) -> str | None:
-        """Per-case consent + backend choice.  Returns 'local'/'claude', or
-        None if cancelled."""
+    def _mcp_consent_dialog(self, default_backend: str,
+                            default_raw_content: bool) -> tuple[str, bool] | None:
+        """Per-case consent + backend choice + raw-content opt-in.  Returns
+        (backend, raw_content_enabled), or None if cancelled."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Enable AI Access for This Case?")
         dlg.setModal(True)
@@ -5971,26 +5982,38 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         combo.setCurrentIndex(1 if default_backend == 'claude' else 0)
         row.addWidget(combo, 1)
         v.addLayout(row)
-        cloud_note = QLabel(
+        cloud_note = note_label(
             "⚠ Cloud backend: anything the AI reads is transmitted to "
-            "Anthropic's servers. Confirm this is permitted for this exhibit.")
-        cloud_note.setWordWrap(True)
-        cloud_note.setStyleSheet("color: #b8860b;")
+            "Anthropic's servers. Confirm this is permitted for this exhibit.",
+            style=WARNING_STYLE)
         cloud_note.setVisible(default_backend == 'claude')
         combo.currentIndexChanged.connect(
             lambda i: cloud_note.setVisible(combo.currentData() == 'claude'))
         v.addWidget(cloud_note)
-        btns = QHBoxLayout()
-        btns.addStretch()
-        cancel = QPushButton("Cancel")
-        cancel.clicked.connect(dlg.reject)
-        ok = QPushButton("Enable")
-        ok.setDefault(True)
-        ok.clicked.connect(dlg.accept)
-        btns.addWidget(cancel)
-        btns.addWidget(ok)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        v.addWidget(sep)
+        raw_check = QCheckBox(
+            "Also allow raw database content (schema + sample rows) — beyond "
+            "the summary above")
+        raw_check.setChecked(bool(default_raw_content))
+        v.addWidget(raw_check)
+        v.addWidget(note_label(
+            "⚠ This is a bigger step than the read-only summary above: it "
+            "lets the AI open any SQLite database anywhere in the archive "
+            "(schema + up to 50 sample rows per query, read-only, never "
+            "arbitrary SQL) — including undocumented app data with no "
+            "parser yet. Only needed to have the AI draft a new "
+            "artifact-parser script for review; leave off otherwise.",
+            style=WARNING_STYLE))
+
+        btns, _cancel_btn, _ok_btn = button_row(dlg, ok_text="Enable")
         v.addLayout(btns)
-        return combo.currentData() if dlg.exec() else None
+        if not dlg.exec():
+            return None
+        return combo.currentData(), raw_check.isChecked()
 
     def _toggle_mcp_server(self, checked: bool):
         """Menu handler: per-case, per-session consent gate for AI access.
@@ -6006,22 +6029,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             QMessageBox.information(self, "AI Access",
                                     "Open and process a case first.")
             return
-        # Default backend: this case's remembered choice, else the global one.
+        # Defaults: this case's remembered choices, else the global one.
         default_backend = _load_prefs().get('ai_backend', 'local')
+        default_raw_content = False
         try:
             with closing(_open_results_db(self._case_dir)) as db:
                 default_backend = load_case_setting(db, 'ai_backend',
                                                     default_backend)
+                default_raw_content = load_case_setting(
+                    db, 'raw_content_enabled', '0') == '1'
         except Exception:
             pass
-        backend = self._mcp_consent_dialog(default_backend)
-        if backend is None:
+        choice = self._mcp_consent_dialog(default_backend, default_raw_content)
+        if choice is None:
             self._mcp_act.setChecked(False)
             return
+        backend, raw_content_enabled = choice
         self._mcp_backend = backend
         try:
             with closing(_open_results_db(self._case_dir)) as db:
                 save_case_setting(db, 'ai_backend', backend)
+                save_case_setting(db, 'raw_content_enabled',
+                                  '1' if raw_content_enabled else '0')
         except Exception:
             pass
         try:
@@ -6038,6 +6067,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 get_guid_to_bundle=lambda: self.guid_to_bundle,
                 get_header_types=lambda: self._header_type_overrides,
                 adapter=getattr(self, '_adapter', None),
+                raw_content_enabled=raw_content_enabled,
+                read_bytes=lambda p: self._read_zip_bytes(p),
             )
             port, _token = self._mcp_controller.start(ctx)
         except ImportError:
@@ -6054,9 +6085,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._mcp_copy_act.setEnabled(True)
         backend_label = ("local model" if self._mcp_backend == 'local'
                          else "Claude (cloud)")
+        raw_label = " + raw DB content" if raw_content_enabled else ""
         self.status_bar.showMessage(
-            f"AI access ENABLED for {backend_label} — MCP server on "
-            f"127.0.0.1:{port} (read-only, all access logged)")
+            f"AI access ENABLED for {backend_label}{raw_label} — MCP server "
+            f"on 127.0.0.1:{port} (read-only, all access logged)")
 
     def _copy_mcp_config(self):
         """Clipboard payload matches the case's chosen backend: mcp.json for
@@ -6234,7 +6266,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             [ui_path],
             self.full_metadata,
             self._adapter,
-            self._streaming_index,
             self._local_extra_delta,
         )
         # partial binds ui_path; the signal appends (ok, err).
@@ -6302,7 +6333,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 pass
         self._single_scan_worker = SingleFileScanWorker(
             self.zip_path, ui_paths, self._adapter,
-            self._streaming_index, self._local_extra_delta,
+            self._local_extra_delta,
         )
         self._single_scan_worker.done.connect(self._on_single_scan_done)
         self._single_scan_worker.start()
@@ -6481,6 +6512,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         scan that ran after metadata_ready).  Hide the load bar only if the
         tree has also finished — whichever completes last."""
         self._worker_done = True
+        if not getattr(self, '_metadata_ready_fired', False):
+            # metadata_ready never fired for this load (the worker hit an
+            # exception before emitting it — see ZipMetadataWorker.run's
+            # except clause) — there is no tree population to wait for, so
+            # don't leave the bar spinning on a load that already failed.
+            self._tree_done = True
         self._maybe_hide_load_progress()
 
     def _maybe_hide_load_progress(self):
@@ -6726,11 +6763,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 continue
             fc = self._count_files_recursive(ui_path) if is_folder else -1
             cols = self._build_entry_cols(ui_path, name, meta, is_folder, file_type, fc)
-            # Append bookmarked timestamp as plain readable string.
-            bm_ts = entry.get('bookmarked_at', '')
-            if bm_ts:
-                bm_ts = bm_ts.replace('T', ' ')
-            cols.append(bm_ts)
+            # Bookmarked timestamp — tool provenance (when the examiner
+            # bookmarked this), shown local per _format_tool_ts_local.
+            cols.append(_format_tool_ts_local(entry.get('bookmarked_at', '')))
             batch.append((cols, ui_path, fc, is_folder and not grey_row,
                           grey_row, ui_path in self._nested_archive_map))
 
@@ -6850,8 +6885,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         desc_edit.setFixedHeight(60)
         desc_edit.setPlaceholderText("Purpose or notes about this group…")
         layout.addWidget(desc_edit)
-        err_label = QLabel()
-        err_label.setStyleSheet("color: red;")
+        err_label = error_label()
         layout.addWidget(err_label)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -7018,9 +7052,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                        "Applies to every file with this name, in all cases.")
         scope.setStyleSheet("color: #888;")
         layout.addWidget(scope)
-        remind = QLabel("⚠ " + _research.GOSPEL_NOTE + " " + _research.AGEING_NOTE)
-        remind.setWordWrap(True)
-        remind.setStyleSheet("color: #b8860b;")
+        remind = note_label("⚠ " + _research.GOSPEL_NOTE + " " + _research.AGEING_NOTE,
+                            style=WARNING_STYLE)
         layout.addWidget(remind)
         if rec:
             assessed = _research.age_text(rec.get('assessed', ''))
@@ -7083,8 +7116,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         pub_col.addWidget(pub_edit)
         detail_row.addLayout(pub_col)
         layout.addLayout(detail_row)
-        err_label = QLabel()
-        err_label.setStyleSheet("color: red;")
+        err_label = error_label()
         layout.addWidget(err_label)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -7573,10 +7605,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """
         if worker is None or not worker.isRunning():
             return
-        try:
-            worker.disconnect()
-        except (RuntimeError, TypeError):
-            pass
+        # worker.disconnect() with no arguments raises TypeError in PySide6 —
+        # it does not disconnect anything (silently swallowed here before,
+        # meaning stale signals were never actually being ignored). Disconnect
+        # each declared Signal explicitly instead.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for name in dir(type(worker)):
+                if isinstance(getattr(type(worker), name, None), Signal):
+                    try:
+                        getattr(worker, name).disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
         if hasattr(worker, 'stop'):
             worker.stop()
         else:
@@ -7611,14 +7651,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         except Exception:
             pass
 
-        def _stop(worker, has_stop=False):
+        def _stop(worker, method='quit'):
             try:
                 if worker is None or not worker.isRunning():
                     return
-                if has_stop:
-                    worker.stop()
-                else:
-                    worker.quit()
+                getattr(worker, method)()
                 worker.wait(2000)
             except Exception:
                 pass
@@ -7628,8 +7665,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _stop(getattr(self, '_single_scan_worker', None))
         _stop(getattr(self, '_hex_worker', None))
         _stop(getattr(self, '_device_info_worker', None))
-        _stop(getattr(self, '_thumb_worker', None), has_stop=True)
-        _stop(getattr(self, '_search_index_worker', None), has_stop=True)
+        _stop(getattr(self, '_thumb_worker', None), method='stop')
+        _stop(getattr(self, '_art_media_thumb_worker', None), method='stop')
+        _stop(getattr(self, '_search_index_worker', None), method='stop')
+        _stop(getattr(self, 'ex_worker', None), method='cancel')
+        _stop(getattr(self, '_sql_preview_worker', None), method='requestInterruption')
         for w in list(getattr(self, '_retired_workers', [])):
             _stop(w, has_stop=hasattr(w, 'stop'))
 

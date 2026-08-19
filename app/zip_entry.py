@@ -6,10 +6,6 @@ read strategies so callers never have to know which one applies:
 * ZIP_STORED   → seek directly into the raw zip file (zero decompression).
 * ZIP_DEFLATED → fall back to zipfile.ZipFile.open() (standard decompress).
 
-Two construction paths are supported:
-* ZipEntry(zip_path, physical_path, zinfo)  — from a zipfile.ZipInfo
-* ZipEntry.from_parts(...)                  — from a StreamingZipIndex entry
-
 The sqlite_uri() helper exposes the SQLite "file:?offset=&immutable=1" URI
 so a SQLite viewer can open a database that lives inside a zip with no
 extraction at all, provided it is stored uncompressed (which is almost
@@ -36,20 +32,6 @@ class ZipEntry:
         self._header_offset = zinfo.header_offset
         self._data_offset: int | None = None
 
-    @classmethod
-    def from_parts(cls, zip_path: str, physical_path: str,
-                   data_offset: int, file_size: int,
-                   compress_type: int) -> "ZipEntry":
-        """Construct a ZipEntry from raw values (e.g. from StreamingZipIndex)."""
-        obj = object.__new__(cls)
-        obj.zip_path       = zip_path
-        obj.physical_path  = physical_path
-        obj._file_size     = file_size
-        obj._compress_type = compress_type
-        obj._header_offset = None   # not available from streaming index
-        obj._data_offset   = data_offset   # already known — no header re-read needed
-        return obj
-
     # ── Properties ────────────────────────────────────────────────────────────
 
     @property
@@ -66,9 +48,8 @@ class ZipEntry:
     def data_offset(self) -> int:
         """Byte offset of the raw entry data within the zip file.
 
-        For ZipInfo-based entries: computed once from the local file header
-        (header_offset + 30 + filename_len + extra_len).
-        For streaming-index entries: already known at construction time."""
+        Computed once from the local file header
+        (header_offset + 30 + filename_len + extra_len)."""
         if self._data_offset is None:
             with open(self.zip_path, 'rb') as f:
                 f.seek(self._header_offset + 26)

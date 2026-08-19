@@ -1,0 +1,242 @@
+{
+  "FaceTime": {
+    "actions": [
+      {
+        "date": "2024-01-16",
+        "time": "16:55",
+        "action": "Outgoing call 919-888-7386 (~1:35)"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "16:59",
+        "action": "Incoming call 919-888-7386 (~2:00)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:27",
+        "action": "Incoming call from 919-923-3798 (~1:30)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:30",
+        "action": "Outgoing call to 919-923-3798 (~1:40)"
+      }
+    ]
+  },
+  "Files": {
+    "actions": [
+      {
+        "date": "2024-01-14",
+        "time": "10:29",
+        "action": "Saved shared file (File Name: SANS_FOR585_Poster) Location: Desktop folder in iCloud"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:32",
+        "action": "Sent file via Messages (File Name: IMG_0190)"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:35",
+        "action": "Shared file (File Name: iOS Mobile Installation Logs) (Collaborate)"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:37",
+        "action": "Received shared file (File Name: IMG_0163) (Collaborate)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "13:52",
+        "action": "Shared file via Messages (File Name: SANS_FOR585_Poster)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "14:20",
+        "action": "Received shared file via Messages (File Name: 330)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "14:21",
+        "action": "Opened 330 in Files"
+      }
+    ]
+  },
+  "Find My": {
+    "actions": [
+      {
+        "date": "2024-01-22",
+        "time": "10:22",
+        "action": "Opened “AirTag is following…” alert"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "10:23",
+        "action": "Triggered AirTag alert"
+      },
+      {
+        "date": "2024-01-22",
+        "time": "10:24",
+        "action": "Clicked on “Learn About This AirTag” / attempted to scan AirTag / scan failed"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:42",
+        "action": "Opened “AirTag is following…” alert (AirTag no longer available)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "13:41",
+        "action": "Scanned AirTag (opened Safari window)"
+      }
+    ]
+  },
+  "Fitness": {
+    "note": "Some fitness was completed on the AppleWatch. It is documented here due to syncing and is denoted in italics. Fitbit and Garmin data does populate the Fitness app. Some data was previously generated; only data generated during the data generation period is documented here. | Time is (mm:ss) | * indicates location data is associated with the event",
+    "actions": [
+      {
+        "date": "2023-07-08",
+        "time": "07:47",
+        "action": "Outdoor Run* (Total Time: 25:29, Distance: 3.03 mi, Avg Heart Rate: 168, Active Calories: 348)"
+      },
+      {
+        "date": "2023-07-10",
+        "time": "07:46",
+        "action": "Outdoor Run* (Total Time: 25:17, Distance: 3.06 mi, Avg Heart Rate: 166, Active Calories: 340)"
+      },
+      {
+        "date": "2023-07-13",
+        "time": "07:47",
+        "action": "Outdoor Run* (Total Time: 25:28, Distance: 3.04 mi, Avg Heart Rate: 169, Active Calories: 346)"
+      },
+      {
+        "date": "2023-07-19",
+        "time": "07:16",
+        "action": "Outdoor Run* (Total Time: 25:51, Distance: 3.03 mi, Avg Heart Rate: 162, Active Calories: 349)"
+      },
+      {
+        "date": "2023-07-24",
+        "time": "07:58",
+        "action": "Outdoor Run* (Total Time: 25:24, Distance: 3.02 mi, Avg Heart Rate: 163, Active Calories: 385)"
+      },
+      {
+        "date": "2023-07-24",
+        "time": "08:24",
+        "action": "Outdoor Walk* (Total Time: 13:57, Distance: 0.74 mi, Avg Heart Rate: 128, Active Calories: 89)"
+      },
+      {
+        "date": "2024-07-23",
+        "time": "15:55",
+        "action": "Outdoor Run* (Total Time: 26:25, Distance: 3.13 mi, Avg Heart Rate: 169, Active Calories: 374)"
+      },
+      {
+        "date": "2024-07-23",
+        "time": "16:37",
+        "action": "Outdoor Walk* (Total Time: 15:53, Distance: 0.89 mi, Avg Heart Rate: 140, Active Calories: 111)"
+      },
+      {
+        "date": "2024-07-25",
+        "time": "16:33",
+        "action": "Outdoor Run* (Total Time: 25:31, Distance: 3.14 mi, Avg Heart Rate: 169, Active Calories: 374)"
+      },
+      {
+        "date": "2024-07-25",
+        "time": "16:59",
+        "action": "Outdoor Walk* (Total Time: 20:36, Distance: 1.19 mi, Avg Heart Rate: 135, Active Calories: 159)"
+      }
+    ]
+  },
+  "Health": {
+    "note": "Fitbit data is not populated in the Health app. Note that some residual data remained prior to data generation period. Some Garmin data is populated in Health. | Only data populated while wearing the AppleWatch is documented here. | Sleep schedule set to 22:45 – 06:30 (set on 2023-07-07 at 21:13)",
+    "actions": [
+      {
+        "date": "2023-07-08",
+        "action": "Move: 897 cal, Exercise: 70 min, Stand: 14 hrs, Steps: 12,224, Distance: 6.87 mi, Sleep: 7 hrs 7 mins"
+      },
+      {
+        "date": "2023-07-09",
+        "action": "Move: 649 cal, Exercise: 27 min, Stand: 14 hrs, Steps: 11,004, Distance: 5.41 mi, Sleep: 7 hrs 55 mins"
+      },
+      {
+        "date": "2023-07-10",
+        "action": "Move: 930 cal, Exercise: 66 min, Stand: 13 hrs, Steps: 12,236, Distance: 6.91 mi, Sleep: 7 hrs 34 mins"
+      },
+      {
+        "date": "2023-07-11",
+        "action": "Move: 448 cal, Exercise: 14 min, Stand: 15 hrs, Steps: 4,789, Distance: 2.36 mi, Sleep: 7 hrs 7 mins"
+      },
+      {
+        "date": "2023-07-12",
+        "action": "Move: 389 cal, Exercise: 9 min, Stand: 14 hrs, Steps: 4,265, Distance: 2.11 mi, Sleep: 7 hrs 42 mins"
+      },
+      {
+        "date": "2023-07-13",
+        "action": "Move: 921 cal, Exercise: 76 min, Stand: 14 hrs, Steps: 11,850, Distance: 6.70 mi, Sleep: 7 hrs 21 mins"
+      },
+      {
+        "date": "2023-07-14",
+        "action": "Move: 391 cal, Exercise: 12 min, Stand: 14 hrs, Steps: 4,048, Distance: 2.02 mi, Sleep: 6 hrs 39 mins"
+      },
+      {
+        "date": "2023-07-15",
+        "action": "Move: 463 cal, Exercise: 27 min, Stand: 12 hrs, Steps: 6,573, Distance: 3.24 mi, Sleep: 6 hrs 8 mins"
+      },
+      {
+        "date": "2023-07-16",
+        "action": "Move: 309 cal, Exercise: 17 min, Stand: 9 hrs, Steps: 3,731, Distance: 1.82 mi, Sleep: 6 hrs 29 mins"
+      },
+      {
+        "date": "2023-07-17",
+        "action": "Move: 402 cal, Exercise: 11 min, Stand: 14 hrs, Steps: 3,944, Distance: 1.92 mi, Sleep: 8 hrs 19 mins"
+      },
+      {
+        "date": "2023-07-18",
+        "action": "Move: 380 cal, Exercise: 6 min, Stand: 14 hrs, Steps: 3,471, Distance: 1.72 mi, Sleep: 6 hrs 55 mins"
+      },
+      {
+        "date": "2023-07-19",
+        "action": "Move: 871 cal, Exercise: 66 min, Stand: 13 hrs, Steps: 11,182, Distance: 6.38 mi, Sleep: 6 hrs 50 mins"
+      },
+      {
+        "date": "2023-07-20",
+        "action": "Move: 447 cal, Exercise: 29 min, Stand: 14 hrs, Steps: 4,253, Distance: 2.10 mi, Sleep: 6 hrs 28 mins"
+      },
+      {
+        "date": "2023-07-21",
+        "action": "Move: 448 cal, Exercise: 19 min, Stand: 14 hrs, Steps: 4,326, Distance: 2.13 mi, Sleep: 7 hrs 34 mins"
+      },
+      {
+        "date": "2023-07-22",
+        "action": "Move: 412 cal, Exercise: 12 min, Stand: 14 hrs, Steps: 4,241, Distance: 2.09 mi, Sleep: 7 hrs 3 mins"
+      },
+      {
+        "date": "2023-07-23",
+        "action": "Move: 348 cal, Exercise: 6 min, Stand: 11 hrs, Steps: 3,946, Distance: 1.94 mi, Sleep: 9 hrs 2 mins"
+      },
+      {
+        "date": "2023-07-24",
+        "action": "Move: 937 cal, Exercise: 67 min, Stand: 13 hrs, Steps: 12,457, Distance: 6.96 mi, Sleep: 7 hrs 40 mins"
+      },
+      {
+        "date": "2024-07-22",
+        "action": "Move: 215 cal, Exercise: 5 min, Stand: 7 hrs, Steps: 2,543, Distance: 1.22 mi, Sleep: N/A"
+      },
+      {
+        "date": "2024-07-23",
+        "action": "Move: 914 cal, Exercise: 55 min, Stand: 11 hrs, Steps: 11,413, Distance: 6.52 mi, Sleep: 6 hrs 50 mins"
+      },
+      {
+        "date": "2024-07-24",
+        "action": "Move: 527 cal, Exercise: 7 min, Stand: 14 hrs, Steps: 6,134, Distance: 2.96 mi, Sleep: 6 hrs 38 mins"
+      },
+      {
+        "date": "2024-07-25",
+        "action": "Move: 983 cal, Exercise: 67 min, Stand: 13 hrs, Steps: 12,828, Distance: 7.31 mi, Sleep: 7 hrs 44 mins"
+      },
+      {
+        "date": "2024-07-26",
+        "action": "Move: 84 cal, Exercise: 4 min, Stand: 3 hrs, Steps: 1,142, Distance: 0.53 mi, Sleep: N/A"
+      }
+    ]
+  }
+}

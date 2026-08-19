@@ -210,9 +210,8 @@ class FfsAdapter:
     def detect_from_names(cls, zip_names: frozenset) -> "FfsAdapter":
         """Detect format from a set of zip entry names (no ZipFile required).
 
-        Always returns a Cellebrite adapter — use this when the zip cannot
-        be opened by zipfile (e.g. streaming zips with no central directory),
-        where GrayKey can be ruled out."""
+        Always returns a Cellebrite adapter — used by detect() once GrayKey
+        and zip-extras have been ruled out."""
         user_prefix, old_layout = _detect_user_prefix(zip_names)
         return cls(
             cls.FORMAT_CELLEBRITE,
@@ -314,12 +313,36 @@ class FfsAdapter:
 
     def container_parents(self) -> tuple[str, ...]:
         """Return ui_path prefixes for app container parent folders."""
+        if self.format == self.FORMAT_ZIP_EXTRAS:
+            return ("data/data",)
         pv = "private/var/" if self.format == self.FORMAT_GRAYKEY else ""
         return (
             pv + "mobile/Containers/Data/Application",
             pv + "mobile/Containers/Data/PluginKitPlugin",
             pv + "mobile/Containers/Shared/AppGroup",
         )
+
+    def container_bundle_id(self, child_path: str, guid_map: dict) -> str | None:
+        """Resolve one container_parents() child to its bundle/package id.
+
+        Android's data/data/<package> layout needs no indirection — the
+        folder name already *is* the package id. iOS containers are
+        GUID-named; resolve through the guid->bundle map built at
+        metadata-parse time."""
+        name = child_path.rsplit('/', 1)[-1]
+        if self.format == self.FORMAT_ZIP_EXTRAS:
+            return name
+        return guid_map.get(name)
+
+    def bundle_id_for_path(self, path: str, guid_map: dict) -> str | None:
+        """Resolve the owning app's bundle/package id for an arbitrary path
+        that falls under one of container_parents(), or None if it doesn't."""
+        for parent in self.container_parents():
+            prefix = parent + '/'
+            if path.startswith(prefix):
+                child_name = path[len(prefix):].split('/', 1)[0]
+                return self.container_bundle_id(f'{parent}/{child_name}', guid_map)
+        return None
 
     def scan_folders(self) -> list[str]:
         """Return default header-scan folder prefixes for this format."""
@@ -486,7 +509,6 @@ class FfsAdapter:
         zip_path: str,
         zip_names: frozenset,
         z: zipfile.ZipFile | None = None,
-        streaming_index=None,
         status_cb=None,
         guid_to_bundle: dict | None = None,
         zip_entries: dict | None = None,
@@ -501,21 +523,6 @@ class FfsAdapter:
         def _emit(msg):
             if status_cb:
                 status_cb(msg)
-
-        # ── Streaming Cellebrite ──────────────────────────────────────────────
-        if streaming_index is not None:
-            _emit("Reading metadata.msgpack...")
-            for mp_path in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
-                if mp_path in streaming_index:
-                    # Single GIL hold — see the load_metadata unpack comment.
-                    raw: dict = msgpack.unpackb(
-                        streaming_index.get_entry(mp_path).read(), raw=False)
-                    break
-            else:
-                raise KeyError("metadata.msgpack not found in metadata1/ or metadata2/")
-            if self.old_layout:
-                raw = {k.removeprefix("private/var/"): v for k, v in raw.items()}
-            return raw, {}, None
 
         assert z is not None
 
@@ -540,7 +547,7 @@ class FfsAdapter:
             ui_metadata = self.load_metadata(zip_path, z)
             return ui_metadata, guid_to_bundle, frozenset(ui_metadata.keys())
 
-        # ── Cellebrite iOS non-streaming ──────────────────────────────────────
+        # ── Cellebrite iOS ────────────────────────────────────────────────────
         if guid_to_bundle is None:
             _emit("Mapping Bundle IDs to GUIDs...")
             _pv = "private/var/" if self.old_layout else ""

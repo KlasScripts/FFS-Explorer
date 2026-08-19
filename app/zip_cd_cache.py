@@ -371,8 +371,8 @@ def sidecar_hash(zip_path: str, case_dir: str) -> str | None:
 def extract_cd_hash(zip_path: str) -> str | None:
     """Return SHA-256 of the CD extracted directly from zip_path (no sidecar).
 
-    Returns None if the archive has no seekable central directory (e.g. streaming)
-    or if the file cannot be read.
+    Returns None if the archive has no seekable central directory (e.g. it is
+    corrupted or truncated) or if the file cannot be read.
     """
     try:
         return hashlib.sha256(_extract_cd_payload(zip_path)).hexdigest()

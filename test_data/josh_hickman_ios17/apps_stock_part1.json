@@ -1,0 +1,355 @@
+{
+  "AppStore": {
+    "actions": [
+      {
+        "date": "2024-01-06",
+        "time": "15:08",
+        "action": "Searched for “life360”"
+      },
+      {
+        "date": "2024-01-09",
+        "time": "16:45",
+        "action": "Searched for “teleguard”"
+      },
+      {
+        "date": "2024-02-09",
+        "time": "09:19",
+        "action": "Searched for “gettr”"
+      }
+    ]
+  },
+  "Calendar": {
+    "actions": [
+      {
+        "date": "2024-01-06",
+        "time": "15:03",
+        "action": "Created event: Event: Coffee Date: 2024-01-06 09:00 – 10:00 (UTC -0500) Location: Starbucks, 100 Grand Hill Pl, Holly Springs, NC 27540 Reminders: 30 minutes before, 15 minutes before"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "09:56",
+        "action": "Received Invitation: Event: Corporate Retreat Date: 2024-01-19 (All-Day) Location: The Umstead Hotel and Spa (100 Woodland Pond Dr, Cary, NC 27513) Reminder: 1 day before"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:00",
+        "action": "Accepted invitation (received at 09:56)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:33",
+        "action": "Received Invitation: Event: iOS 17 Received Invite Date: 2024-07-28 at 10:35 – 10:40 Location: Starbucks (8408 Old Keene Mill Rd, Springfield, VA 22152) Reminder: Time to Leave"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:36",
+        "action": "Created event: Event: iOS 17 Shared Invite Date: 2024-07-28 at 10:40 – 10:45 Location: Best Buy (6555 Frontier Drive, Springfield, VA 22150) Reminder: N/A"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:37",
+        "action": "Other party accepted invitation to iOS 17 Shared Invite"
+      }
+    ]
+  },
+  "Camera": {
+    "note": "For information about any disposition of the pictures listed below, see the entry for the Photos app.",
+    "actions": [
+      {
+        "date": "2023-07-01",
+        "time": "19:36",
+        "action": "Took a live picture (x2) (portrait)"
+      },
+      {
+        "date": "2023-07-01",
+        "time": "20:04",
+        "action": "Took a video (x2) (portrait)"
+      },
+      {
+        "date": "2023-07-01",
+        "time": "21:07",
+        "action": "Took video (portrait)"
+      },
+      {
+        "date": "2023-07-01",
+        "time": "21:10",
+        "action": "Took a video (landscape)"
+      },
+      {
+        "date": "2023-07-01",
+        "time": "21:46",
+        "action": "Took a video (landscape)"
+      },
+      {
+        "date": "2023-07-01",
+        "time": "22:15",
+        "action": "Took a video (landscape)"
+      },
+      {
+        "date": "2023-07-01",
+        "time": "22:53",
+        "action": "Took a video (landscape)"
+      },
+      {
+        "date": "2023-07-09",
+        "time": "13:36",
+        "action": "Took a picture (portrait)"
+      },
+      {
+        "date": "2023-07-09",
+        "time": "16:30",
+        "action": "Took a picture (portrait)"
+      },
+      {
+        "date": "2023-07-21",
+        "time": "09:51",
+        "action": "Took a selfie (portrait)"
+      },
+      {
+        "date": "2024-07-16",
+        "time": "22:36",
+        "action": "Took a selfie (portrait)"
+      },
+      {
+        "date": "2024-07-17",
+        "time": "13:50",
+        "action": "Took a selfie (portrait)"
+      },
+      {
+        "date": "2024-07-17",
+        "time": "16:20",
+        "action": "Took a selfie (landscape)"
+      },
+      {
+        "date": "2024-07-19",
+        "time": "11:21",
+        "action": "Took a selfie (portrait)"
+      },
+      {
+        "date": "2024-07-24",
+        "time": "12:05",
+        "action": "Took a picture (portrait)"
+      },
+      {
+        "date": "2024-07-24",
+        "time": "12:32",
+        "action": "Took a picture (landscape)"
+      },
+      {
+        "date": "2024-07-24",
+        "time": "15:57",
+        "action": "Took a picture (landscape)"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "10:53",
+        "action": "Took a selfie (portrait)"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "11:02",
+        "action": "Took a picture (landscape)"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "11:07",
+        "action": "Took a picture (landscape)"
+      }
+    ],
+    "note2": "table truncated, 129 total rows, see PDF pages 88-90 for full list"
+  },
+  "CarPlay": {
+    "note": "This is not a standalone app; the functionality is part of iOS. Each time the device is connected to the vehicle also indicates a power event (on charge) which is not documented in the Power Events section. Power event stops when device is disconnected. | Vehicle Name: Nissan Rogue (“Rouge”) | Bluetooth MAC: b4:ec:02:73:ff:93 | Phone was not paired to car via Bluetooth, however previous research has shown the Bluetooth MAC address may be present. For further description of navigation events, see the Maps app.",
+    "actions": [
+      {
+        "date": "2023-07-08",
+        "time": "12:34",
+        "action": "Connect to car / enable Siri"
+      },
+      {
+        "date": "2023-07-08",
+        "time": "12:56",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "12:48",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "13:35",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "14:05",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2023-07-15",
+        "time": "14:32",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2023-07-21",
+        "time": "08:33",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2023-07-21",
+        "time": "08:57",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "13:39",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "13:59",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "14:44",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2023-11-18",
+        "time": "15:00",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "12:35",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "12:59",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "13:34",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "13:40",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "13:47",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "14:52",
+        "action": "Invoked Siri (“Send a message to DFIR Two”) / dictated and sent message"
+      },
+      {
+        "date": "2024-01-16",
+        "time": "15:00",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "10:11",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "10:29",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:11",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:21",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "14:26",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2024-01-17",
+        "time": "15:34",
+        "action": "Disconnect from car"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "12:14",
+        "action": "Connect to car"
+      },
+      {
+        "date": "2024-07-27",
+        "time": "12:21",
+        "action": "Disconnect from car"
+      }
+    ]
+  },
+  "Clock": {
+    "actions": [
+      {
+        "date": "2023-07-07",
+        "time": "20:57",
+        "action": "Added Tel Aviv, Israel to World Clock"
+      },
+      {
+        "date": "2023-07-07",
+        "time": "20:58",
+        "action": "Added UTC to World Clock"
+      },
+      {
+        "date": "2024-01-06",
+        "time": "15:04",
+        "action": "Added Athens, Greece to World Clock"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:01",
+        "action": "Started a timer for five (5) minutes"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:06",
+        "action": "Timer expired"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:07",
+        "action": "Set alarm for 2024-01-14 at 10:09"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:09",
+        "action": "Alarm fired"
+      },
+      {
+        "date": "2024-01-14",
+        "time": "10:10",
+        "action": "Turned alarm off (alarm set at 10:07)"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:39",
+        "action": "Created alarm for 2024-07-28 at 10:41"
+      },
+      {
+        "date": "2024-07-28",
+        "time": "10:41",
+        "action": "Alarm fired / Turned alarm off"
+      }
+    ]
+  }
+}

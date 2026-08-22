@@ -30,6 +30,7 @@ below/around what that API can see.
 import os
 import sqlite3
 import struct
+import tempfile
 
 _LEAF_TABLE_PAGE = 0x0D
 _INTERIOR_TABLE_PAGE = 0x05
@@ -187,7 +188,8 @@ def decode_leaf_page_cells(page: bytes, page_no: int, header_offset: int = 0) ->
         except ValueError:
             continue
         out.append({'page': page_no, 'offset': cell_off, 'rowid': rowid,
-                    'values': values, 'types': types})
+                    'values': values, 'types': types,
+                    'cell_len': c1 + c2 + payload_len})
     return out
 
 
@@ -223,6 +225,77 @@ def walk_table_leaf_pages(raw: bytes, page_size: int, root_page: int) -> list[in
                     child = struct.unpack('>I', page[cell_off:cell_off + 4])[0]
                     stack.append(child)
     return leaves
+
+
+def locate_live_row(raw: bytes, table: str, rowid: int) -> dict | None:
+    """Find the on-disk (page, cell-offset, cell-length) of a currently
+    LIVE row by its rowid — for the Artifact Viewer's "jump the hex view
+    to where this record lives" feature, the opposite case from
+    recover_deleted_rows (which only ever looks at freed/unlinked space).
+
+    The rootpage lookup is the one place this function opens an actual
+    sqlite3 connection, and only against a throwaway temp copy of *raw*
+    (never the archive or a persistent extracted file) opened `mode=ro` —
+    same reasoning as record_column_names/rowid_alias_column elsewhere in
+    this module: a real SQLite reader correctly follows overflow pages for
+    a long `sqlite_master.sql` CREATE TABLE text, which the raw cell
+    decoder below deliberately does not attempt (decode_leaf_page_cells
+    skips a cell it can't decode fully on-page). The connection is
+    read-only, touches nothing but sqlite_master, and the temp file is
+    removed immediately after.
+
+    Returns None (never raises) if the table doesn't exist, the rowid
+    isn't found in the table's CURRENT live b-tree (it may only exist in
+    an unmerged WAL frame — not checked here — or may genuinely be
+    deleted, which is recover_deleted_rows' job, not this one's), or
+    anything else about the lookup fails."""
+    try:
+        header = parse_db_header(raw)
+    except Exception:
+        return None
+
+    fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+    root_page = None
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
+        try:
+            row = conn.execute(
+                "SELECT rootpage FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone()
+            root_page = row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    if root_page is None:
+        return None
+
+    try:
+        for page_no in walk_table_leaf_pages(raw, header['page_size'], root_page):
+            header_offset = 100 if page_no == 1 else 0
+            page = _page_bytes(raw, header['page_size'], page_no)
+            if len(page) < header_offset + 12 or page[header_offset] != _LEAF_TABLE_PAGE:
+                continue
+            for cell in decode_leaf_page_cells(page, page_no, header_offset):
+                if cell['rowid'] == rowid:
+                    return {
+                        'page':        page_no,
+                        'offset':      cell['offset'],
+                        'length':      cell['cell_len'],
+                        'abs_offset':  (page_no - 1) * header['page_size'] + cell['offset'],
+                        'page_size':   header['page_size'],
+                    }
+    except Exception:
+        return None
+    return None
 
 
 def iter_freelist_pages(raw: bytes, page_size: int, header: dict):

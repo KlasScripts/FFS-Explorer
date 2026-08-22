@@ -47,6 +47,56 @@ optional_files = {
     "chatstorage_shm": "ChatStorage.sqlite-shm",
 }
 
+# Lets the Artifact Viewer's Hex-panel "Record" mode jump straight to the
+# on-disk cell(s) a row was actually built from — a joined report like
+# this one has more than one, so record_source is a LIST: this row's own
+# ZWAMESSAGE cell, PLUS the three tables it LEFT JOINed in (chat session,
+# group member, media item), each independently resolvable since a
+# LEFT JOIN with no match just leaves that entry's rowid None/unresolvable
+# (locate_live_row already handles a not-found rowid gracefully). All four
+# share one file ("chatstorage" — everything here lives in the single
+# ChatStorage.sqlite, unlike e.g. Android WhatsApp's separate msgstore.db/
+# wa.db). "table_field" reads the source table's name from an OUTPUT field
+# on the row (used for the main entry, matching both live and
+# recoverable_tables-carved rows via "source_table"/"raw_rowid" — see
+# below); a joined entry's table never varies per row, so it's given as a
+# literal "table" string instead, needing no row lookup. "rowid_fields"
+# are tried in order.
+record_source = [
+    {
+        "label":        "Message",
+        "file_key":     "chatstorage",
+        "table_field":  "source_table",
+        "rowid_fields": ["raw_message_id", "raw_rowid"],
+    },
+    {
+        "label":        "Chat Session",
+        "file_key":     "chatstorage",
+        "table":        "ZWACHATSESSION",
+        "rowid_fields": ["raw_chat_id"],
+    },
+    {
+        "label":        "Group Member",
+        "file_key":     "chatstorage",
+        "table":        "ZWAGROUPMEMBER",
+        "rowid_fields": ["raw_group_member_id"],
+    },
+    {
+        "label":        "Media Item",
+        "file_key":     "chatstorage",
+        "table":        "ZWAMEDIAITEM",
+        "rowid_fields": ["raw_media_item_id"],
+    },
+]
+
+# raw_chat_id/raw_group_member_id/raw_media_item_id exist ONLY to feed
+# record_source above — pure plumbing, never useful as report content (an
+# examiner already sees the resolved conversation/sender/attachment
+# columns) — so they're kept out of the Report table. raw_message_id and
+# source_table stay visible: raw_message_id is the row's OWN id, not a
+# joined table's, and source_table is a citation label, not a raw key.
+hidden_fields = ["raw_chat_id", "raw_group_member_id", "raw_media_item_id"]
+
 # Declarative only — no recovery code belongs here; see description above
 # for what was actually found.
 recoverable_tables = ["ZWAMESSAGE"]
@@ -116,7 +166,9 @@ def run(paths):
             c.ZCONTACTJID   AS contact_jid,
             gm.ZCONTACTNAME AS group_member_name,
             gm.ZMEMBERJID   AS group_member_jid,
-            med.ZMEDIALOCALPATH AS media_local_path
+            m.ZGROUPMEMBER  AS group_member_row_id,
+            med.ZMEDIALOCALPATH AS media_local_path,
+            med.Z_PK        AS media_item_id
         FROM ZWAMESSAGE m
         LEFT JOIN ZWACHATSESSION c ON c.Z_PK = m.ZCHATSESSION
         LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER
@@ -152,6 +204,8 @@ def run(paths):
             "attachment_path": attachment_path,
             "raw_message_id": r["message_id"],
             "raw_chat_id": r["chat_id"],
+            "raw_group_member_id": r["group_member_row_id"],
+            "raw_media_item_id": r["media_item_id"],
             "recovered": False,
             "source_table": "ZWAMESSAGE",
         }

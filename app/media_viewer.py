@@ -8,11 +8,12 @@ import zipfile
 from itertools import batched
 
 from db_utils import _open_cache_db
+from header_scan import classify_magic, is_text, TEXT_SIZE_LIMIT
 from PySide6.QtWidgets import (
     QWidget, QLabel, QScrollArea, QGridLayout, QVBoxLayout,
 )
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtCore import Qt, QThread, Signal, QBuffer, QIODevice
+from PySide6.QtCore import Qt, QThread, Signal, QBuffer, QIODevice, QTimer
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -21,32 +22,46 @@ MEDIA_EXTENSIONS = frozenset({
     '.mov', '.mp4', '.m4v', '.3gp', '.avi',
 })
 VIDEO_THUMB_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.avi'})
+TEXT_ATTACHMENT_EXTENSIONS = frozenset({'.txt', '.vcf'})
 THUMB_SIZE         = 160   # thumbnail box size in pixels
 _THUMB_BATCH_COMMIT = 20   # inserts to accumulate before a single db.commit()
 
-_IMAGE_MAGIC = (b'\xff\xd8\xff', b'\x89PNG\r\n\x1a\n', b'GIF87a', b'GIF89a')
+# header_scan.classify_magic() categories this function knows how to fold
+# into its own 'image'/'video'/'pdf' vocabulary. 'Document' today only ever
+# comes from the %PDF signature (see header_scan._SIGNATURES) — revisit
+# this mapping if that table ever grows a second Document-category entry.
+_MAGIC_KIND = {'Picture': 'image', 'Video': 'video', 'Document': 'pdf'}
 
 
 def sniff_media_kind(ext: str, data: bytes) -> str | None:
-    """'image' | 'video' | None, extension first (cheap, no decode needed),
-    falling back to magic-byte sniffing when the extension doesn't say —
-    confirmed necessary on real data: Google Messages' MMS cache files are
-    always named 'conversation_..._part_..._.bin' regardless of the actual
-    content (mp4/jpeg/png all seen under that same generic name), so an
-    extension-only check silently drops every one of them. Video is
-    detected via the ISO-BMFF box header (4-byte size + 'ftyp' at offset
-    4) that mp4/mov/m4v/3gp all share; image via the four magic prefixes
-    the app already treats as pictures elsewhere (see header_scan.py)."""
+    """'image' | 'video' | 'pdf' | 'text' | None, extension first (cheap,
+    no decode needed), falling back to the same magic-byte/printable-text
+    classification used app-wide to type an unrecognized file
+    (header_scan.classify_magic / header_scan.is_text) when the extension
+    doesn't say — confirmed necessary on real data: Google Messages' MMS
+    cache files are always named 'conversation_..._part_..._.bin'
+    regardless of the actual content (mp4/jpeg/png/pdf/vcf all seen under
+    that same generic name), so an extension-only check silently drops
+    every one of them. 'pdf'/'text' exist so a Report-table attachment
+    viewer (artifact_media.MediaFullViewDialog) can show a real text
+    preview, or an honest 'no in-app preview' panel for a PDF, instead of
+    a false 'could not decode as image' error for a non-image
+    attachment."""
     if ext in VIDEO_THUMB_EXTENSIONS:
         return 'video'
     if ext in MEDIA_EXTENSIONS:
         return 'image'
+    if ext == '.pdf':
+        return 'pdf'
+    if ext in TEXT_ATTACHMENT_EXTENSIONS:
+        return 'text'
     if not data:
         return None
-    if any(data.startswith(magic) for magic in _IMAGE_MAGIC):
-        return 'image'
-    if len(data) > 8 and data[4:8] == b'ftyp':
-        return 'video'
+    kind = _MAGIC_KIND.get(classify_magic(data[:16]))
+    if kind:
+        return kind
+    if len(data) <= TEXT_SIZE_LIMIT and is_text(data):
+        return 'text'
     return None
 
 
@@ -304,6 +319,12 @@ class MediaViewerMixin:
         self._thumb_widgets:   dict = {}
         self._thumb_img_labels: dict = {}
         self._thumb_positions:  dict = {}
+        # Bumped on every _start_thumbnail_load call; a batched placeholder
+        # pass (_place_thumb_placeholders_batched) checks this before each
+        # chunk and quietly stops if it's gone stale (a new folder loaded
+        # while it was still running) — same guard pattern as the folder
+        # tree's own _tree_gen (see _reset_tree_model).
+        self._thumb_gen = 0
         self._selected_media_path: str | None = None
         self._pending_media_selection: str | None = None
         self._media_context    = None
@@ -360,8 +381,15 @@ class MediaViewerMixin:
 
     def _start_thumbnail_load(self, media_paths, total_files=None, sort_desc=""):
         """Stop any running thumb worker, clear the grid, then start the worker.
-        Containers are created lazily in _on_thumbnail_ready so the main thread
-        is never blocked pre-building hundreds of widgets up front."""
+        Every file gets its blank-square-plus-filename placeholder container
+        up front (via _place_thumb_placeholders_batched, in small batches
+        so the main thread is never blocked building hundreds/thousands of
+        widgets in one shot) — already clickable, selectable, and hex-
+        previewable before its thumbnail decodes, and permanently so if it
+        never does (an unsupported format, or a video frame extraction that
+        fails — previously such a file got no widget at all, ever).
+        _on_thumbnail_ready fills in the actual pixmap for whichever
+        placeholders succeed; unfilled ones just stay blank squares."""
         # Retire (don't wait) — the worker may be stuck inside a long ffmpeg
         # call and wait() would freeze the GUI until it returns.
         self._retire_worker(self._thumb_worker)
@@ -376,10 +404,12 @@ class MediaViewerMixin:
         self._thumb_img_labels   = {}
         self._thumb_positions    = {}
         self._selected_media_path = None
+        self._thumb_gen += 1
 
         if not media_paths or not self.zip_path:
             self._media_status.setText(
                 "No media files" if self.zip_path else "Select a folder to view media")
+            self._clear_hex_preview()
             return
 
         self._media_total_files = total_files
@@ -392,6 +422,8 @@ class MediaViewerMixin:
         # Pre-compute grid positions (pure integer arithmetic — no widget creation)
         for i, ui_path in enumerate(media_paths):
             self._thumb_positions[ui_path] = divmod(i, n_cols)
+
+        self._place_thumb_placeholders_batched(media_paths, 0, self._thumb_gen)
 
         zip_info_map = {
             self._adapter.resolve(p): self.full_metadata.get(p, {}).get('size', 0)
@@ -440,6 +472,29 @@ class MediaViewerMixin:
         self._thumb_img_labels[ui_path] = img_label
         self._media_grid.addWidget(container, row, col)
 
+    _THUMB_PLACEHOLDER_BATCH = 60
+
+    def _place_thumb_placeholders_batched(self, media_paths: list, start: int, gen: int) -> None:
+        """Create every file's blank-square-plus-filename container a
+        chunk at a time via QTimer.singleShot(0, …) instead of all in one
+        pass — same reasoning as the folder tree's own
+        _populate_tree_children_batched: hundreds/thousands of widgets
+        built synchronously would freeze the GUI for the duration. *gen*
+        is this call's _thumb_gen snapshot; if a newer _start_thumbnail_load
+        has since bumped it (a different folder loaded while this batch
+        was still running), stop quietly rather than placing widgets into
+        a grid that's already been cleared and repurposed for different
+        paths/positions."""
+        if gen != self._thumb_gen:
+            return
+        end = min(start + self._THUMB_PLACEHOLDER_BATCH, len(media_paths))
+        for ui_path in media_paths[start:end]:
+            if ui_path not in self._thumb_widgets:
+                self._place_thumb_container(ui_path)
+        if end < len(media_paths):
+            QTimer.singleShot(
+                0, lambda: self._place_thumb_placeholders_batched(media_paths, end, gen))
+
     def _on_thumbnail_ready(self, ui_path, img):
         if ui_path not in self._thumb_img_labels:
             if ui_path not in self._thumb_positions:
@@ -455,6 +510,25 @@ class MediaViewerMixin:
             self._thumb_widgets[ui_path].set_selected(True)
         self.status_bar.showMessage(ui_path)
         self._select_file_in_table(ui_path)
+        self._load_hex_preview(ui_path)
+
+    def _resync_media_hex_preview(self) -> None:
+        """Restore Media Browser's own last-selected file's hex into the
+        shared bottom panel on switching back to this tab, or clear it if
+        nothing has been selected here yet — same reasoning as the other
+        three tabs' resyncs (see "Per-tab state on switching" in
+        CLAUDE.md). Needed as its own call, separate from _on_thumb_clicked
+        above: the existing thumbnail-grid reload logic in
+        _on_center_tab_changed only re-fires _on_thumb_clicked when a
+        FILE BROWSER selection is pending sync into Media Browser — a
+        plain "switch back to Media Browser, nothing changed, no pending
+        File Browser selection" pass touches neither, which would
+        otherwise leave whatever another tab last put in the shared panel
+        showing here instead."""
+        if self._selected_media_path and self._selected_media_path in self._thumb_widgets:
+            self._load_hex_preview(self._selected_media_path)
+        else:
+            self._clear_hex_preview()
 
     def _on_thumbnails_done(self):
         count    = self._media_grid.count()

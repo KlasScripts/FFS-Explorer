@@ -79,8 +79,12 @@ def classify_magic(header: bytes) -> str | None:
     return None
 
 
-def _is_text(data: bytes) -> bool:
-    """Return True if every byte in data is printable ASCII or whitespace."""
+def is_text(data: bytes) -> bool:
+    """Return True if every byte in data is printable ASCII or whitespace.
+
+    Public (not `_is_text`) — also used by media_viewer.sniff_media_kind's
+    magic-byte fallback to classify a generic-named attachment (e.g. a
+    vCard) that carries no recognizable binary signature."""
     if not data:
         return False
     # translate(None, delete) removes all valid-text bytes; non-empty result
@@ -116,7 +120,7 @@ def scan_entries(
         buf = reader.read_at(data_offset, file_size, max_bytes=max_b)
         detected = classify_magic(buf)
         if detected is None and 0 < file_size <= TEXT_SIZE_LIMIT:
-            if _is_text(buf):
+            if is_text(buf):
                 detected = 'Text'
         return detected
 

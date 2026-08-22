@@ -94,7 +94,17 @@ FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface r
 
 # Shared pool for small fire-and-forget background jobs (cache DB writes,
 # zip pre-opening) — replaces creating a throwaway ThreadPoolExecutor per call.
-_BG_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ffs-bg')
+# All I/O-bound (zip/network reads, sqlite — each task opens its own
+# connection, nothing shared across threads), so sized well above core
+# count rather than for CPU parallelism. 4, not 2 (raised 2026-08-22): at
+# case-load, _zip_open_future (zip reopen) and _start_case_meta_load's
+# background load (header overrides + photo index + timezone detection,
+# which also gates the proactive Timestamp Display dialog) can both be in
+# flight within moments of each other, with folder-count precompute
+# following shortly after — 2 workers meant the others queued behind
+# whichever was already running, worst on a slow/network-hosted archive
+# where the zip-reopen alone could occupy a slot for a long time.
+_BG_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='ffs-bg')
 
 # Load-snapshot cache: the complete result of a first archive load, stored in
 # casecache.db so re-opens skip the CD parse, metadata read, and derivations.
@@ -3706,6 +3716,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._checked_folders: set = set()
         self._rebuild_pending = False
         self._selected_file_path: str | None = None
+        # The file actually LOADED into the bottom preview panel (hex/text/
+        # database/SEGB) via a double-click — distinct from
+        # _selected_file_path, which updates on a plain single-click
+        # selection change and can point at a row that was never actually
+        # previewed. Used to restore File Browser's own preview when
+        # switching back to this tab after the shared panel showed
+        # something else (a Keyword Search hit, or an Artifact record) —
+        # see "Per-tab state on switching" in CLAUDE.md.
+        self._fb_last_preview_path: str | None = None
         self._selected_media_path: str | None = None
         self._thumb_widgets: dict = {}
         self._pending_media_selection: str | None = None
@@ -3996,6 +4015,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.splitter.setStretchFactor(1, 1)
 
         hex_panel = self._setup_hex_panel(_section_style, _status_style)
+        self._finish_artifact_hex_wiring()
         # Add the generic SQLite browser as a third preview tab (Hex / Text / Database)
         self._sql_tab_index = self.preview_tabs.addTab(
             self._setup_sqlite_tab(), "Database")
@@ -4369,6 +4389,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     # ── Media browser ────────────────────────────────────────────────────────
 
     def _on_center_tab_changed(self, index):
+        self._hex_source_toggle.setVisible(index == 3)
         if index in (2, 3):
             # Save current tree width and collapse it for full-width tabs
             sizes = self.splitter.sizes()
@@ -4377,8 +4398,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.splitter.setSizes([0, sum(sizes)])
             if index == 2:
                 self._update_search_status_bar()
+                # Restore Keyword Search's own last-viewed hit into the
+                # shared bottom panel — same reasoning as the File Browser/
+                # Artifact Viewer resyncs below/above. A no-op if nothing
+                # is currently selected in the results tree.
+                self._on_search_row_selected()
             else:
-                self._refresh_artifact_tab()
+                # Artifact Viewer: deliberately no tree/report refresh here
+                # — see Conventions: "Per-tab state on switching" — but DO
+                # resync the shared bottom Hex panel to the currently
+                # selected report row. The panel is shared across every
+                # center tab, so if the examiner used the File Browser's
+                # own hex preview while away, it's now showing THAT file,
+                # not this tab's row — re-deriving it from the still-intact
+                # row selection (never cleared on tab-away, see below)
+                # restores "where I left off" for the Artifact Viewer
+                # specifically, the same way switching Record/Attachment
+                # already does for a row that's already selected. A no-op
+                # if nothing was ever selected in this report yet.
+                self._on_art_hex_source_toggled()
             return
         # Switching away — restore tree if it was hidden
         if self.splitter.sizes()[0] == 0 and self._tree_splitter_sizes:
@@ -4407,6 +4445,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     self._on_thumb_clicked(self._pending_media_selection)
                     self._media_scroll.ensureWidgetVisible(
                         self._thumb_widgets[self._pending_media_selection])
+                else:
+                    # No File Browser selection pending sync — _on_thumb_clicked
+                    # above (which also resyncs hex) won't fire, so the shared
+                    # hex panel needs its own explicit resync here instead;
+                    # see _resync_media_hex_preview's own docstring.
+                    self._resync_media_hex_preview()
                 self._pending_media_selection = None
                 return
 
@@ -4415,6 +4459,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # Switching back to File Browser — select the media file that was selected
             if self._selected_media_path:
                 self._select_file_in_table(self._selected_media_path)
+            # Restore File Browser's OWN last-previewed file into the
+            # shared bottom panel — it may currently be showing a Keyword
+            # Search hit or an Artifact record instead, from whatever tab
+            # was active in between. See "Per-tab state on switching".
+            self._resync_file_browser_preview()
 
     _TIME_HEADERS = ('Created', 'Changed', 'Modified')
 
@@ -4728,6 +4777,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _load_file_preview(self, ui_path: str) -> None:
         """Load a file for preview — text/JSON/XML in text tab + hex tab; others hex only."""
+        self._fb_last_preview_path = ui_path
         raw = self._read_zip_bytes(ui_path)
         if raw is None:
             self._clear_text_preview()
@@ -4772,6 +4822,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _load_nested_entry_preview(self, ui_path: str) -> None:
         """Read an entry from an extracted nested archive and display it."""
+        self._fb_last_preview_path = ui_path
         meta      = self.full_metadata.get(ui_path, {})
         arch_path = meta.get('_archive_path')
         arch      = self._nested_archive_map.get(arch_path) if arch_path else None
@@ -4804,6 +4855,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         else:
             self._clear_sqlite_preview()
             self._clear_segb_preview()
+
+    def _resync_file_browser_preview(self) -> None:
+        """Reload File Browser's own last-previewed file (_fb_last_preview_path)
+        into the shared bottom panel. Called on switching back to this tab
+        — see "Per-tab state on switching" in CLAUDE.md — since another
+        tab (Keyword Search, Artifact Viewer) may have written its own
+        content into that same panel while this tab was inactive. If
+        nothing has ever been previewed here yet, clears the panel instead
+        of leaving the other tab's content showing under this one — an
+        unused tab should look unused, not borrow whatever was last shown
+        elsewhere."""
+        path = self._fb_last_preview_path
+        if not path:
+            self._clear_hex_preview()
+            return
+        if path in self._nested_virtual_paths:
+            self._load_nested_entry_preview(path)
+        elif self._in_zip(path):
+            self._load_file_preview(path)
 
     def _expand_to_private_var(self):
         """Expand the tree down to private/var on GrayKey load so its children
@@ -5939,9 +6009,47 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 # than leaving it undiscovered behind the Tools menu — the
                 # menu item (_timestamp_display_dialog) stays available to
                 # revisit this at any later time too.
-                QTimer.singleShot(200, self._timestamp_display_dialog)
+                self._show_timestamp_dialog_when_ready(my_seq)
 
         QTimer.singleShot(10, _poll)
+
+    def _show_timestamp_dialog_when_ready(self, seq: int):
+        """Show the proactive first-load Timestamp Display dialog now that
+        background detection has actually finished, deferring only if
+        another modal is currently blocking (e.g. the missing-plist
+        integrity warning, _warn_and_select_missing) so the two can never
+        stack unexpectedly on top of each other. *seq* is the
+        _case_meta_seq snapshot from the load that triggered this — same
+        staleness guard _poll() itself uses, checked again on every deferred
+        retry (not just the initial call) since a retry can span an
+        arbitrarily long wait for another modal to clear, during which a
+        DIFFERENT case could in principle have been opened; bails quietly
+        rather than showing a case-A-triggered dialog against whatever
+        case is current by the time a modal finally clears.
+
+        Previously fired after an unconditional QTimer.singleShot(200, ...)
+        — a guess that OTHER unrelated pre-render (tree population via
+        _populate_tree_children_batched, _refresh_artifact_tab, the
+        device-label fetch, folder-count precompute) would have settled by
+        then. None of those have any actual bearing on this dialog — it
+        never reads tree/artifact state — so the 200ms was never a real
+        dependency, only a coincidence that happened to hold on a fast dev
+        machine. On a slower cold start (a frozen Windows build especially
+        — exe unpacking, antivirus scanning, slower disk I/O for the
+        tree's zip reads) those unrelated stages routinely took far longer
+        than 200ms, so the dialog would pop up modally while they were
+        still visibly running underneath it (a nested Qt event loop from
+        .exec() still processes their queued QTimer callbacks) — looking
+        like the app had hung right as everything else appeared to
+        finish. See the "Proactive first-load trigger race" note under
+        Timestamp Display in CLAUDE.md's Conventions section for the full
+        incident writeup."""
+        if seq != self._case_meta_seq:
+            return  # a newer archive load superseded the one that queued this
+        if QApplication.activeModalWidget() is not None:
+            QTimer.singleShot(50, lambda: self._show_timestamp_dialog_when_ready(seq))
+            return
+        self._timestamp_display_dialog()
 
     # ── AI access (embedded MCP server) ───────────────────────────────────────
 

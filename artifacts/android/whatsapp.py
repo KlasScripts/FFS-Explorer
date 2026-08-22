@@ -38,6 +38,55 @@ optional_files = {
     "wa_shm": "databases/wa.db-shm",
 }
 
+# Lets the Artifact Viewer's Hex-panel "Record" mode jump straight to the
+# on-disk cell(s) a row was actually built from — a joined report like
+# this one has more than one, so record_source is a LIST: this row's own
+# message cell, plus the chat table it's LEFT JOINed to. Both live in the
+# SAME db file (msgstore — "msgstore" key), unlike iOS WhatsApp's
+# single-file case; Android WhatsApp's actual second file, wa.db
+# ("wa" key, ATTACHed as contacts_db for the wa_contacts identity-lookup
+# joins), is NOT wired here — this parser's SELECT never selects
+# wa_contacts' own rowid, and its schema (specifically whether the
+# declared TEXT `jid` primary key is the table's real rowid or a separate
+# WITHOUT-ROWID-style key) hasn't been confirmed against a real
+# extraction. Declaring a record_source entry for it without that
+# verification would risk citing the WRONG cell — worse than the current
+# "not available" gap, per this project's standing rule of never guessing
+# at schema. Revisit once a real wa.db schema dump is available to check
+# against, same rigor as every other record_source/media_fields entry in
+# this project. "rowid_fields" tried in order: "message_id"/"chat_id" are
+# this module's own run() output for message._id/chat._id (Android's
+# standard rowid-alias primary key convention), "raw_rowid" is what a
+# recoverable_tables-carved row carries instead
+# (sqlite_carve.recover_deleted_rows) — carved rows resolve to nothing
+# here today since locate_live_row only walks the CURRENT live b-tree, not
+# freed space, which is the expected outcome for a genuinely deleted row,
+# not a bug (and only applies to the Message entry — recovery is only
+# declared for the "message" table below, never "chat").
+record_source = [
+    {
+        "label":        "Message",
+        "file_key":     "msgstore",
+        "table_field":  "source_table",
+        "rowid_fields": ["message_id", "raw_rowid"],
+    },
+    {
+        "label":        "Chat",
+        "file_key":     "msgstore",
+        "table":        "chat",
+        "rowid_fields": ["chat_id"],
+    },
+]
+
+# chat_id exists ONLY to feed the "Chat" record_source entry above — pure
+# plumbing, never useful as report content (an examiner already sees the
+# resolved chat_subject/chat_jid columns, and the no-chat-record fallback
+# case already cites the raw FK inline via raw_chat_row_id, a separate
+# field that stays visible). message_id and source_table stay visible:
+# message_id is the row's OWN id, not a joined table's, and source_table
+# is a citation label, not a raw key.
+hidden_fields = ["chat_id"]
+
 # Declarative only — no recovery code belongs here; see description above
 # for what was actually found.
 recoverable_tables = ["message"]

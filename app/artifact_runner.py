@@ -219,6 +219,37 @@ def _resolve_app_group_base(app_group: str, guid_to_bundle: dict) -> str | None:
     return None
 
 
+def resolve_module_file_ui_path(module, file_key: str, guid_to_bundle: dict | None) -> str | None:
+    """Rebuild the archive ui_path for one of a module's declared
+    `files`/`optional_files` entries, without extracting or touching disk —
+    used by the Artifact Viewer's "jump to record in hex" feature
+    (`record_source` on a module) to re-read a source database's CURRENT
+    archive bytes at click time, long after the parser run that populated
+    the report table. Deliberately never returns a path to the cached
+    extracted copy in artifact_parser_files/ — that copy was opened by the
+    parser's own (non-read-only) sqlite3.connect() and could have been
+    checkpointed since, where the archive entry itself never changes.
+    Mirrors run_artifact's own app_base/ui_path join; returns None if the
+    module uses the single-file `target_paths` API instead (nothing to key
+    by there) or the key isn't declared."""
+    has_app_path  = hasattr(module, 'app_path')  and hasattr(module, 'files')
+    has_app_group = hasattr(module, 'app_group') and hasattr(module, 'files')
+    if not (has_app_path or has_app_group):
+        return None
+    if has_app_path:
+        app_base = module.app_path.strip('/')
+    else:
+        app_base = _resolve_app_group_base(module.app_group, guid_to_bundle or {})
+        if app_base is None:
+            return None
+    subpath = module.files.get(file_key)
+    if subpath is None:
+        subpath = getattr(module, 'optional_files', {}).get(file_key)
+    if subpath is None:
+        return None
+    return f"{app_base}/{subpath.lstrip('/')}"
+
+
 def run_artifact(
     script_name: str,
     module,

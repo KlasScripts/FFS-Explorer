@@ -20,12 +20,13 @@ import shutil
 import tempfile
 
 from PySide6.QtCore import Qt, QSize, QUrl
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QFontDatabase, QImage, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSlider,
-    QStyle, QStyledItemDelegate, QVBoxLayout,
+    QStyle, QStyledItemDelegate, QTextEdit, QVBoxLayout,
 )
 
+from dialog_helpers import note_label
 from media_viewer import sniff_media_kind
 
 THUMB_CELL_SIZE = 64
@@ -107,8 +108,17 @@ class MediaFullViewDialog(QDialog):
         kind = sniff_media_kind(ext, data)
         if kind == 'video':
             self._build_video(layout, ui_path, data)
-        else:
+        elif kind == 'text':
+            self._build_text(layout, data)
+        elif kind == 'image':
             self._build_image(layout, data)
+        else:
+            # 'pdf', or a byte-for-byte unrecognized attachment — no
+            # in-app renderer for either (see 2026-08-21 decision: adding
+            # PDF rendering means a new dependency in a forensic tool's
+            # chain of custody, not taken lightly). Honest "not supported"
+            # panel instead of pretending an image decode was attempted.
+            self._build_unsupported(layout, ui_path, data, kind)
 
         self.resize(760, 680)
 
@@ -126,6 +136,25 @@ class MediaFullViewDialog(QDialog):
         scroll.setWidget(label)
         scroll.setWidgetResizable(img.width() < 760 and img.height() < 680)
         layout.addWidget(scroll)
+
+    def _build_text(self, layout, data: bytes) -> None:
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        view.setPlainText(data.decode('utf-8', errors='replace'))
+        layout.addWidget(view)
+
+    def _build_unsupported(self, layout, ui_path: str, data: bytes,
+                           kind: str | None) -> None:
+        """PDF, or anything sniff_media_kind couldn't classify at all —
+        no in-app renderer for either, so say so plainly rather than
+        showing a false 'could not decode as image' error."""
+        label = 'PDF document' if kind == 'pdf' else 'Unrecognized file type'
+        layout.addWidget(note_label(
+            f"{label} — {len(data):,} bytes\n\n"
+            "No in-app preview for this attachment yet. Use File ▸ Export, "
+            "or the Hex tab, to inspect it."))
+        layout.addStretch(1)
 
     def _build_video(self, layout, ui_path: str, data: bytes) -> None:
         from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer

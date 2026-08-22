@@ -925,9 +925,15 @@ class KeywordSearchMixin:
     def _on_search_row_selected(self):
         indexes = self.search_results_view.selectionModel().selectedRows(0)
         if not indexes:
+            # Nothing selected — including a fresh switch into this tab
+            # when Search has never been used yet (see "Per-tab state on
+            # switching" in CLAUDE.md). Clear the shared hex panel rather
+            # than leaving another tab's content showing under this one.
+            self._clear_hex_preview()
             return
         item = self.search_results_model.itemFromIndex(indexes[0])
         if not item:
+            self._clear_hex_preview()
             return
         _PATH_ROLE        = Qt.ItemDataRole.UserRole
         _OFFSET_ROLE      = Qt.ItemDataRole.UserRole + 1

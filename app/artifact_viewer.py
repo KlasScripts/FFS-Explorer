@@ -117,6 +117,16 @@ class ArtifactTableModel(QAbstractTableModel):
         # file — from the parser module's own media_fields declaration
         # (names), resolved to indices here. See set_media_columns().
         self._media_cols:   set  = set()
+        # Real (self._columns-space) indices of columns actually shown in
+        # the Report table — everything by default. A parser's own
+        # hidden_fields declaration (see set_hidden_columns()) narrows
+        # this, e.g. a joined table's raw rowid kept only for the Hex
+        # panel's Record mode to look up, never meant for display. Every
+        # QAbstractTableModel method below works in VISIBLE-index space
+        # (what the QTableView actually sees); row_dict() is the one
+        # exception, deliberately returning ALL columns since callers like
+        # ArtifactViewerMixin._art_load_record_hex need the hidden fields.
+        self._visible_idx:  list = []
 
     # ── Connection ────────────────────────────────────────────────────────
 
@@ -147,6 +157,7 @@ class ArtifactTableModel(QAbstractTableModel):
         self._wargs = []
         self._ts_units, self._ts_formatter = {}, None
         self._media_cols = set()
+        self._visible_idx = list(range(len(self._columns)))
         self.endResetModel()
 
     def load_rows(self, columns: list, rows: list) -> None:
@@ -164,6 +175,7 @@ class ArtifactTableModel(QAbstractTableModel):
         self._wargs = []
         self._ts_units, self._ts_formatter = {}, None
         self._media_cols = set()
+        self._visible_idx = list(range(len(self._columns)))
         self.endResetModel()
 
     def clear(self) -> None:
@@ -180,6 +192,7 @@ class ArtifactTableModel(QAbstractTableModel):
         self._wargs = []
         self._ts_units, self._ts_formatter = {}, None
         self._media_cols = set()
+        self._visible_idx = []
         self.endResetModel()
 
     def set_timestamp_formatting(self, units: dict, formatter) -> None:
@@ -204,15 +217,33 @@ class ArtifactTableModel(QAbstractTableModel):
         module's own media_fields declaration — cells there hold an archive
         ui_path to an attachment/media file, and are painted as thumbnails
         by MediaThumbnailDelegate (see ArtifactViewerMixin._art_show_report)
-        rather than as plain path text. Call once, right after
-        load_from_db()/load_rows() — resets on every fresh load, same
-        reasoning as set_timestamp_formatting() above."""
+        rather than as plain path text. Indices are in VISIBLE-column space
+        (what setItemDelegateForColumn etc. actually address) — call after
+        set_hidden_columns() so self._visible_idx already reflects any
+        hidden fields. Call once, right after load_from_db()/load_rows() —
+        resets on every fresh load, same reasoning as
+        set_timestamp_formatting() above."""
         names = set(col_names) if col_names else set()
-        self._media_cols = {i for i, name in enumerate(self._columns) if name in names}
+        self._media_cols = {vis_i for vis_i, real_i in enumerate(self._visible_idx)
+                            if self._columns[real_i] in names}
         self.layoutChanged.emit()
 
     def media_columns(self) -> set:
         return set(self._media_cols)
+
+    def set_hidden_columns(self, names) -> None:
+        """names: iterable of column-name strings from the parser module's
+        own hidden_fields declaration — internal plumbing (e.g. a joined
+        table's raw rowid, kept only for the Hex panel's Record mode to
+        look up — see record_source) that should never appear as a Report
+        table column. Changes columnCount(), so it's a structural reset,
+        not just layoutChanged. Call once, right after load_from_db()/
+        load_rows(), and BEFORE set_media_columns() (which indexes in the
+        resulting visible-column space this method establishes)."""
+        self.beginResetModel()
+        hidden = set(names) if names else set()
+        self._visible_idx = [i for i, c in enumerate(self._columns) if c not in hidden]
+        self.endResetModel()
 
     # ── Filter / sort ─────────────────────────────────────────────────────
 
@@ -291,7 +322,14 @@ class ArtifactTableModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self._rowids)
 
     def columnCount(self, parent=QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self._columns)
+        return 0 if parent.isValid() else len(self._visible_idx)
+
+    def _real_col(self, visible_col: int) -> int | None:
+        """Translate a QTableView column index (visible-space, the only
+        space the view/header/sort ever deal in) to its real index into
+        self._columns/a row tuple. None if out of range."""
+        return (self._visible_idx[visible_col]
+                if 0 <= visible_col < len(self._visible_idx) else None)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
@@ -299,12 +337,14 @@ class ArtifactTableModel(QAbstractTableModel):
         row = self._get_row(index.row())
         if row is None:
             return ''
-        col = index.column()
-        val = row[col] if col < len(row) else None
+        real_col = self._real_col(index.column())
+        if real_col is None:
+            return ''
+        val = row[real_col] if real_col < len(row) else None
         if val is None or val == '':
             return ''
-        col_name = self._columns[col] if col < len(self._columns) else None
-        unit_code = self._ts_units.get(col_name) if col_name else None
+        col_name = self._columns[real_col]
+        unit_code = self._ts_units.get(col_name)
         if unit_code and self._ts_formatter:
             return self._ts_formatter(val, unit_code)
         return str(val)
@@ -313,15 +353,31 @@ class ArtifactTableModel(QAbstractTableModel):
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:
-            return self._columns[section] if section < len(self._columns) else None
+            real_col = self._real_col(section)
+            return self._columns[real_col] if real_col is not None else None
         return str(section + 1)
 
+    def row_dict(self, model_row: int) -> dict:
+        """Raw (unformatted) column-name -> value mapping for one row —
+        used by the "jump to record in hex" feature, which needs the
+        actual rowid/source-table values a parser wrote (ints, not
+        display text), unlike data() which stringifies everything and
+        reformats timestamp columns for on-screen display."""
+        row = self._get_row(model_row)
+        if row is None:
+            return {}
+        return {col: (row[i] if i < len(row) else None)
+                for i, col in enumerate(self._columns)}
+
     def sort(self, col: int, order: Qt.SortOrder) -> None:
-        """Re-query rowids from SQLite using ORDER BY — fast C-level sort."""
-        if not self._conn or not self._columns or col >= len(self._columns):
+        """Re-query rowids from SQLite using ORDER BY — fast C-level sort.
+        *col* arrives from the QTableView header in visible-space, same as
+        every other QAbstractTableModel method here — see _real_col()."""
+        real_col = self._real_col(col)
+        if not self._conn or real_col is None:
             return
         direction = 'DESC' if order == Qt.SortOrder.DescendingOrder else 'ASC'
-        col_name  = self._columns[col]
+        col_name  = self._columns[real_col]
         try:
             if self._where:
                 sql  = (f'SELECT rowid FROM "{self._table}" WHERE {self._where}'
@@ -446,6 +502,7 @@ class ArtifactRunnerWorker(QThread):
                                              processed=count, output_rows=count)
                         except Exception:
                             pass
+                    self._precache_media_thumbnails(module, rows, zip_obj)
         except Exception as exc:
             self.log.emit(f"\nUnexpected error: {exc}")
         finally:
@@ -455,6 +512,45 @@ class ArtifactRunnerWorker(QThread):
 
         self.log.emit("\nAll selected parsers finished.")
         self.done.emit()
+
+    def _precache_media_thumbnails(self, module, rows: list[dict], zip_obj) -> None:
+        """Warm the on-disk thumbnail cache for a `media_fields` parser right
+        after its rows are written, so the Report tab's thumbnails are
+        already cached by the time anyone opens it — the on-open decode in
+        artifact_viewer's _start_art_media_thumbnails was fine for a
+        handful of attachments, but visibly slow to fill in the first time
+        a report with hundreds/thousands of media rows (e.g. WhatsApp) was
+        opened. Reuses media_viewer.ThumbnailWorker's own QThread class as
+        a plain synchronous call (.run(), not .start()) — safe because
+        we're already running on this worker's own background QThread, not
+        the GUI thread, and ThumbnailWorker touches no GUI/widget state,
+        only QImage decode + its own zip handle + its own cache DB
+        connection. Same cache (keyed ui_path+file_size+thumb_size) the
+        Report tab reads from, so a hit there is instant regardless of
+        whether it was filled here or on an earlier report open. Best
+        effort: never allowed to fail the parser run itself."""
+        media_fields = getattr(module, 'media_fields', None)
+        if not media_fields or not rows:
+            return
+        paths = {row[f] for f in media_fields for row in rows if row.get(f)}
+        if not paths:
+            return
+        try:
+            zip_info_map = {}
+            for p in paths:
+                physical = self._adapter.resolve(p)
+                try:
+                    zip_info_map[physical] = zip_obj.getinfo(physical).file_size
+                except KeyError:
+                    pass
+            self.log.emit(f"  Pre-caching thumbnails for {len(paths)} attachment(s)…")
+            from media_viewer import ThumbnailWorker
+            thumb_worker = ThumbnailWorker(
+                self._zip_path, list(paths), self._adapter.resolve,
+                THUMB_CELL_SIZE, zip_info_map, cache_dir=self._case_dir)
+            thumb_worker.run()
+        except Exception as exc:
+            self.log.emit(f"  Thumbnail pre-cache skipped: {exc}")
 
 
 class ArtifactRunnerDialog(QDialog):
@@ -695,7 +791,12 @@ class ArtifactViewerMixin:
         self._art_report_view.setItemDelegate(self._art_highlight_delegate)
         self._art_media_delegate = MediaThumbnailDelegate(self._art_report_view)
         self._art_media_thumb_worker = None
+        self._art_hex_active = False
+        self._art_current_mod = None
+        self._art_current_record_sources: list = []
         self._art_report_view.doubleClicked.connect(self._on_art_report_double_clicked)
+        self._art_report_view.selectionModel().currentRowChanged.connect(
+            self._on_art_report_row_selected)
         report_layout.addWidget(self._art_report_view)
 
         # Script page — read-only monospace text editor
@@ -757,6 +858,37 @@ class ArtifactViewerMixin:
         tab.layout().setContentsMargins(4, 4, 4, 4)
         return tab
 
+    def _finish_artifact_hex_wiring(self) -> None:
+        """Connect the shared hex panel's Record/Attachment toggle and the
+        joined-record source selector (HexViewerMixin._setup_hex_panel) to
+        the Artifact Viewer. Must run AFTER _setup_hex_panel exists —
+        ffs-explorer.py builds the Artifact Viewer tab before the hex
+        panel, so this can't be done inline in _setup_artifact_tab."""
+        self._hex_source_btn_group.buttonClicked.connect(self._on_art_hex_source_toggled)
+        self._hex_record_source_combo.currentIndexChanged.connect(self._on_art_hex_source_toggled)
+
+    def _on_art_hex_source_toggled(self, *_args) -> None:
+        """Re-load hex for whatever row is currently selected under the
+        newly-chosen mode/source — so flipping Record/Attachment, or
+        picking a different joined-record source, updates the panel
+        immediately instead of waiting for the next row click. Takes
+        *_args so it can be connected to either buttonClicked (passes the
+        button) or currentIndexChanged (passes an int) without a wrapper
+        per signal."""
+        idx = self._art_report_view.currentIndex()
+        if idx.isValid():
+            self._on_art_report_row_selected(idx, idx)
+        else:
+            # No row selected — including a fresh switch into this tab
+            # when no report has ever been opened here yet (see "Per-tab
+            # state on switching" in CLAUDE.md). Clear directly (not via
+            # _clear_art_hex, whose _art_hex_active guard would wrongly
+            # no-op here if the panel is currently showing some OTHER
+            # tab's content) rather than leaving that content showing
+            # under this one.
+            self._clear_hex_preview()
+            self._art_hex_active = False
+
     def _refresh_artifact_tab(self):
         """Rebuild the artifact tree from completed parsers in the case DB."""
         if not hasattr(self, '_art_tree_model'):
@@ -766,6 +898,10 @@ class ArtifactViewerMixin:
 
         self._cancel_art_filter_worker()
         self._retire_art_media_worker()
+        self._clear_art_hex()
+        self._art_current_mod = None
+        self._art_current_record_sources = []
+        self._hex_record_source_combo.setVisible(False)
         self._art_tree_model.clear()
         self._art_tree_model.setHorizontalHeaderLabels(["Device Artifacts"])
         self._art_table_model.clear()   # closes any open SQLite connection
@@ -812,7 +948,122 @@ class ArtifactViewerMixin:
 
         self._art_tree_view.expandAll()
 
+    def _clear_art_hex(self) -> None:
+        """Wipe the shared bottom Hex panel and mark it as no longer showing
+        Artifact-viewer content — called on any navigation away from the
+        row/report that populated it (a different report, a different tree
+        node, or leaving the Artifact Viewer tab entirely) so stale
+        attachment bytes never linger past the selection that loaded them."""
+        if not self._art_hex_active:
+            return
+        self._clear_hex_preview()
+        self._art_hex_active = False
+
+    def _show_art_hex_message(self, message: str) -> None:
+        """Explanatory placeholder in the Hex panel (e.g. "Record location
+        not available for this parser yet") instead of stale bytes or the
+        generic default text — still counts as Artifact-viewer-owned
+        content for _clear_art_hex's purposes, so leaving the tab/report
+        resets it the same as real hex content would."""
+        self._clear_hex_preview(message)
+        self._art_hex_active = True
+
+    def _on_art_report_row_selected(self, current, previous):
+        """Single-click / keyboard row selection: loads hex for the row
+        per the panel's Record/Attachment toggle (HexViewerMixin), and
+        keeps doing so as the user moves between rows — the toggle is the
+        sticky state, not the row, so scrolling through rows in either
+        mode keeps showing that same mode for each new row."""
+        if not current.isValid():
+            self._clear_art_hex()
+            return
+        row = self._art_table_model.row_dict(current.row())
+        if self._hex_source_is_record():
+            self._art_load_record_hex(row)
+        else:
+            self._art_load_attachment_hex(row)
+
+    def _art_load_attachment_hex(self, row: dict) -> None:
+        """Attachment hex mode: the row's first non-empty media_fields
+        value, same resolution _on_art_report_double_clicked uses for the
+        specific cell clicked."""
+        media_fields = getattr(self._art_current_mod, 'media_fields', ()) \
+            if self._art_current_mod else ()
+        ui_path = ''
+        for field in media_fields:
+            val = row.get(field)
+            if val:
+                ui_path = val
+                break
+        if not ui_path:
+            self._show_art_hex_message("No attachment on this row")
+            return
+        data = self._read_zip_bytes(ui_path)
+        if data is None:
+            self._show_art_hex_message(f"Attachment not found in archive: {ui_path}")
+            return
+        self._load_hex_preview_from_bytes(data, ui_path)
+        self._art_hex_active = True
+        self.status_bar.showMessage(ui_path)
+
+    def _art_load_record_hex(self, row: dict) -> None:
+        """Record hex mode: jump to this row's own on-disk database cell
+        in its source db file — see the parser module's `record_source`
+        declaration (a list of entries, one per DB row a joined report's
+        own rows are actually built from — see the combo populated in
+        _art_show_report) and sqlite_carve.locate_live_row. Never guesses:
+        a missing declaration, a row with no rowid/table data, an
+        unresolvable source file, or a rowid not found in the CURRENT live
+        b-tree (may be WAL-only and not yet checkpointed, or genuinely
+        deleted — recover_deleted_rows' job, not this one's) shows a
+        specific explanatory message rather than silently doing nothing or
+        showing the wrong bytes."""
+        mod     = self._art_current_mod
+        entries = self._art_current_record_sources
+        if not entries:
+            self._show_art_hex_message("Record location not available for this parser yet")
+            return
+        if len(entries) == 1:
+            rs = entries[0]
+        else:
+            rs = self._hex_record_source_combo.currentData() or entries[0]
+        table = rs['table'] if 'table' in rs else row.get(rs.get('table_field', 'source_table'))
+        rowid = None
+        for field in rs.get('rowid_fields', ()):
+            val = row.get(field)
+            if val is not None:
+                rowid = val
+                break
+        if not table or rowid is None:
+            self._show_art_hex_message("No record-location data on this row")
+            return
+        try:
+            rowid_int = int(rowid)
+        except (TypeError, ValueError):
+            self._show_art_hex_message("No record-location data on this row")
+            return
+        from artifact_runner import resolve_module_file_ui_path
+        ui_path = resolve_module_file_ui_path(mod, rs['file_key'], self.guid_to_bundle)
+        if not ui_path:
+            self._show_art_hex_message("Could not resolve the source database path for this parser")
+            return
+        data = self._read_zip_bytes(ui_path)
+        if data is None:
+            self._show_art_hex_message(f"Source database not found in archive: {ui_path}")
+            return
+        import sqlite_carve
+        loc = sqlite_carve.locate_live_row(data, str(table), rowid_int)
+        if loc is None:
+            self._show_art_hex_message(
+                f"Record not found at its expected location in "
+                f"{os.path.basename(ui_path)} (may be WAL-only, or deleted)")
+            return
+        self._load_hex_preview_from_bytes_at(data, ui_path, loc['abs_offset'], loc['length'])
+        self._art_hex_active = True
+        self.status_bar.showMessage(f"{ui_path}  —  offset: {loc['abs_offset']:,}")
+
     def _on_art_tree_clicked(self, index):
+        self._clear_art_hex()
         role_val = index.data(Qt.ItemDataRole.UserRole)
         if not role_val:
             return
@@ -831,16 +1082,24 @@ class ArtifactViewerMixin:
 
     # ── Report display ────────────────────────────────────────────────────────
 
-    def _setup_report_filter_ui(self, columns: list):
-        """Reset filter controls for a newly loaded report."""
+    def _setup_report_filter_ui(self, columns: list, hidden: set = frozenset()) -> None:
+        """Reset filter controls for a newly loaded report. *hidden* (a
+        parser's own hidden_fields declaration) is skipped in the dropdown
+        — an internal plumbing field isn't something an examiner can
+        usefully filter by — but each surviving item still carries its
+        REAL index into *columns* as Qt item data, since that's the index
+        space ArtifactFilterWorker/filter_rows_inmem actually key off
+        (unaffected by which columns are merely hidden from display)."""
         self._cancel_art_filter_worker()
         self._art_active_filter = ''
         self._art_filter_input.clear()
         self._art_filter_col.blockSignals(True)
         self._art_filter_col.clear()
-        self._art_filter_col.addItem("All Columns")
-        for col in columns:
-            self._art_filter_col.addItem(col)
+        self._art_filter_col.addItem("All Columns", -1)
+        for i, col in enumerate(columns):
+            if col in hidden:
+                continue
+            self._art_filter_col.addItem(col, i)
         self._art_filter_col.blockSignals(False)
         self._art_filter_btn.setEnabled(True)
 
@@ -884,6 +1143,29 @@ class ArtifactViewerMixin:
         from artifact_runner import list_artifacts
         platform = 'android' if self._is_android_archive() else 'ios'
         mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+        self._art_current_mod = mod
+
+        # record_source (see Conventions): a list of {label, file_key,
+        # table_field/table, rowid_fields} entries, one per DB row this
+        # report's own rows are actually built from — a joined report has
+        # more than one (its own table plus whatever it LEFT JOINed in).
+        # The combo is only shown/meaningful with >1 entry; a single entry
+        # needs no picker, and the record_source declaration itself may
+        # just be one dict rather than a list-of-one in that case.
+        raw_rs = getattr(mod, 'record_source', None) if mod else None
+        if isinstance(raw_rs, dict):
+            record_sources = [raw_rs]
+        elif raw_rs:
+            record_sources = list(raw_rs)
+        else:
+            record_sources = []
+        self._art_current_record_sources = record_sources
+        self._hex_record_source_combo.blockSignals(True)
+        self._hex_record_source_combo.clear()
+        for entry in record_sources:
+            self._hex_record_source_combo.addItem(entry.get('label', '?'), entry)
+        self._hex_record_source_combo.blockSignals(False)
+        self._hex_record_source_combo.setVisible(len(record_sources) > 1)
 
         # Media columns (see media_fields on the parser module): pull every
         # distinct non-empty value now, while conn is still ours and unused
@@ -905,6 +1187,14 @@ class ArtifactViewerMixin:
 
         # Transfer connection ownership to the model
         self._art_table_model.load_from_db(conn, table, cols, ids)
+
+        # Internal plumbing fields (see hidden_fields in Conventions) — a
+        # joined table's raw rowid kept only for the Hex panel's Record
+        # mode to look up (record_source), never meant as report content.
+        # Must run before set_media_columns(), which indexes in the
+        # visible-column space this establishes.
+        hidden_fields = set(getattr(mod, 'hidden_fields', ())) if mod else set()
+        self._art_table_model.set_hidden_columns(hidden_fields)
 
         # Raw-value timestamp columns (see timestamp_fields on the parser
         # module) get formatted per the case's UTC/handset/acquisition
@@ -935,7 +1225,7 @@ class ArtifactViewerMixin:
         # artifact_media.py and _start_art_media_thumbnails below.
         self._art_table_model.set_media_columns(media_fields)
         media_col_idx = self._art_table_model.media_columns()
-        for col in range(len(cols)):
+        for col in range(self._art_table_model.columnCount()):
             self._art_report_view.setItemDelegateForColumn(
                 col, self._art_media_delegate if col in media_col_idx
                      else self._art_highlight_delegate)
@@ -943,7 +1233,7 @@ class ArtifactViewerMixin:
             THUMB_CELL_SIZE + 16 if media_col_idx else 80)
         self._start_art_media_thumbnails(list(media_paths))
 
-        self._setup_report_filter_ui(cols)
+        self._setup_report_filter_ui(cols, hidden_fields)
         self._art_resize_columns()
         self._art_row_label.setText(f"{len(ids):,} rows")
         self._art_stack.setCurrentIndex(1)
@@ -985,7 +1275,12 @@ class ArtifactViewerMixin:
 
     def _on_art_report_double_clicked(self, index):
         """Open the full-size image / video-player dialog for a
-        media-column cell. No-op for any other column."""
+        media-column cell, and switch the Hex panel's toggle to
+        "Attachment" (staying there for subsequent row clicks, same as any
+        other toggle change — see _on_art_hex_source_toggled) so what's
+        shown matches what the dialog just opened, rather than leaving a
+        stale "Record" hex view underneath it. No-op for any non-media
+        column."""
         if index.column() not in self._art_table_model.media_columns():
             return
         ui_path = self._art_table_model.data(index) or ''
@@ -996,6 +1291,10 @@ class ArtifactViewerMixin:
             self.status_bar.showMessage(
                 f"Attachment not found in archive: {ui_path}", 5000)
             return
+        self._hex_source_attach_btn.setChecked(True)
+        self._load_hex_preview_from_bytes(data, ui_path)
+        self._art_hex_active = True
+        self.status_bar.showMessage(ui_path)
         MediaFullViewDialog(ui_path, data, parent=self).exec()
 
     def _art_show_notes(self, script_name: str):
@@ -1162,7 +1461,9 @@ class ArtifactViewerMixin:
 
     def _apply_art_filter(self):
         term    = self._art_filter_input.text()
-        col_idx = self._art_filter_col.currentIndex() - 1   # -1 = all columns
+        col_idx = self._art_filter_col.currentData()   # -1 = all columns; see _setup_report_filter_ui
+        if col_idx is None:
+            col_idx = -1
         total   = self._art_table_model.total_rows
 
         self._art_active_filter = term

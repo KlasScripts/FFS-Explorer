@@ -6,8 +6,9 @@ import zipfile
 from zip_entry import ZipEntry
 from zip_reader import read_nested_entry
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QProgressBar, QVBoxLayout, QFrame,
-    QPlainTextEdit, QTextEdit, QTabWidget,
+    QWidget, QLabel, QProgressBar, QVBoxLayout, QHBoxLayout, QFrame,
+    QPlainTextEdit, QTextEdit, QTabWidget, QToolButton, QButtonGroup,
+    QComboBox,
 )
 from PySide6.QtGui import (
     QFont, QFontMetricsF, QTextCursor, QTextCharFormat, QColor,
@@ -185,14 +186,67 @@ class HexViewerMixin:
         section_label = QLabel("File Preview")
         section_label.setStyleSheet(section_style)
 
+        # Record/Attachment source toggle — only meaningful in the
+        # Artifact Viewer (a report row can have both a source-database
+        # record and a separate attachment file), so it starts hidden and
+        # is shown/hidden purely by FastZipBrowser._on_center_tab_changed
+        # switching center tabs. This mixin has no artifact-report
+        # knowledge itself: it just exposes the two checkable buttons and
+        # a getter (_hex_source_is_record) — ArtifactViewerMixin owns what
+        # each mode actually loads.
+        self._hex_source_record_btn = QToolButton()
+        self._hex_source_record_btn.setText("Record")
+        self._hex_source_record_btn.setCheckable(True)
+        self._hex_source_record_btn.setChecked(True)
+        self._hex_source_attach_btn = QToolButton()
+        self._hex_source_attach_btn.setText("Attachment")
+        self._hex_source_attach_btn.setCheckable(True)
+        self._hex_source_btn_group = QButtonGroup(self)
+        self._hex_source_btn_group.setExclusive(True)
+        self._hex_source_btn_group.addButton(self._hex_source_record_btn)
+        self._hex_source_btn_group.addButton(self._hex_source_attach_btn)
+
+        # A report can declare MORE than one Record-mode source (e.g. a
+        # joined table's own row, not just the main one) — this combo
+        # picks which; ArtifactViewerMixin populates it per-report and
+        # hides it entirely when there's zero or one entry to choose from
+        # (nothing to pick, so nothing to show). Lives inside the same
+        # toggle container so it shares that container's tab-visibility.
+        self._hex_record_source_combo = QComboBox()
+        self._hex_record_source_combo.setVisible(False)
+
+        self._hex_source_toggle = QWidget()
+        toggle_layout = QHBoxLayout(self._hex_source_toggle)
+        toggle_layout.setContentsMargins(0, 0, 0, 0)
+        toggle_layout.setSpacing(2)
+        toggle_layout.addWidget(self._hex_source_attach_btn)
+        toggle_layout.addWidget(self._hex_source_record_btn)
+        toggle_layout.addWidget(self._hex_record_source_combo)
+        self._hex_source_toggle.setVisible(False)
+
+        header_row = QWidget()
+        header_row_layout = QHBoxLayout(header_row)
+        header_row_layout.setContentsMargins(0, 0, 0, 0)
+        header_row_layout.addWidget(section_label)
+        header_row_layout.addStretch(1)
+        header_row_layout.addWidget(self._hex_source_toggle)
+
         outer = QWidget()
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
         outer_layout.addWidget(sep)
-        outer_layout.addWidget(section_label)
+        outer_layout.addWidget(header_row)
         outer_layout.addWidget(self.preview_tabs, stretch=1)
         return outer
+
+    def _hex_source_is_record(self) -> bool:
+        """True if the Artifact Viewer's hex-source toggle is set to
+        "Record" (jump to the row's own database cell) rather than
+        "Attachment" (the row's linked media/file). Meaningless — but
+        harmless to call — outside the Artifact Viewer, where the toggle
+        stays hidden and defaulted to Record."""
+        return self._hex_source_record_btn.isChecked()
 
     # ── Event filter ─────────────────────────────────────────────────────────
 
@@ -286,6 +340,34 @@ class HexViewerMixin:
         self.hex_view.setPlainText(self._render_hex(chunk))
         self._fit_hex_font()
         self._update_hex_label()
+
+    def _load_hex_preview_from_bytes_at(self, data: bytes, label: str,
+                                         offset: int, length: int = 0) -> None:
+        """Like _load_hex_preview_from_bytes, but positions the view at
+        *offset* and highlights *length* bytes there — the Artifact
+        Viewer's "Record" hex mode uses this to jump straight to a
+        selected row's own on-disk cell instead of showing the file from
+        byte 0. Windowing mirrors _open_nested_hex_from_search (a fixed
+        byte window is loaded, not the read-at-scroll-time paging used for
+        an in-archive entry, since *data* is already a plain in-memory
+        buffer with no incremental read path of its own)."""
+        self.preview_tabs.setCurrentIndex(0)
+        self._stop_hex_worker()
+        self._hex_entry   = None
+        self._hex_file_size = len(data)
+        self._hex_ui_path = label
+        self.hex_view.clear()
+        self.hex_progress_bar.hide()
+
+        win_start = max(0, ((offset - 10) // 32) * 32)
+        win_end   = min(len(data), ((offset + max(length, 0) + HIT_WINDOW_AFTER + 31) // 32) * 32)
+        chunk = data[win_start:win_end]
+        self._hex_view_start   = win_start
+        self._hex_bytes_loaded = len(chunk)
+        self.hex_view.setPlainText(self._render_hex(chunk, win_start))
+        self._fit_hex_font()
+        self._update_hex_label()
+        QTimer.singleShot(0, lambda o=offset, l=length: self._jump_to_hex_range(o, l))
 
     def _open_hex_from_search(self, physical_path: str, display_label: str,
                                jump_to: int | None, keyword: str):
@@ -616,8 +698,13 @@ class HexViewerMixin:
 
         self.hex_view.setExtraSelections(extra_sels)
 
-    def _jump_to_hex_offset(self, offset: int, keyword: str):
-        """Scroll the hex view so *offset* is visible, then highlight the keyword."""
+    def _jump_to_hex_range(self, offset: int, length: int) -> None:
+        """Scroll the hex view so *offset* is visible, then highlight
+        *length* bytes there. Shared by _jump_to_hex_offset (a keyword
+        search hit, where the highlight length comes from the keyword's
+        own encoded byte length) and the Artifact Viewer's record-offset
+        jump (which already knows an exact cell byte length, with no
+        keyword to re-derive one from)."""
         self._pending_hex_jump = None
         line  = (offset - self._hex_view_start) // _HEX_BYTES_PER_ROW
         doc   = self.hex_view.document()
@@ -630,9 +717,13 @@ class HexViewerMixin:
             visible = self.hex_view.viewport().height() // max(
                 1, self.hex_view.fontMetrics().lineSpacing())
             sb.setValue(max(0, sb.value() - visible // 3))
-        if keyword:
-            kw_bytes = keyword.encode('utf-8', errors='replace')
-            self._highlight_hex_range(offset, len(kw_bytes))
+        if length > 0:
+            self._highlight_hex_range(offset, length)
+
+    def _jump_to_hex_offset(self, offset: int, keyword: str):
+        """Scroll the hex view so *offset* is visible, then highlight the keyword."""
+        kw_bytes = keyword.encode('utf-8', errors='replace') if keyword else b''
+        self._jump_to_hex_range(offset, len(kw_bytes))
 
     def _highlight_hex_range(self, start_offset: int, length: int):
         """Highlight *length* bytes at *start_offset* in both the hex and ASCII columns."""
@@ -674,6 +765,23 @@ class HexViewerMixin:
         """Wipe the Text tab without switching to it."""
         self.text_label.setText('')
         self.text_view.clear()
+
+    def _clear_hex_preview(self, message: str = "No file selected") -> None:
+        """Wipe the Hex tab without switching to it — used when the thing
+        that populated it (e.g. an Artifact report row) is no longer the
+        active selection, so stale evidence bytes don't linger once the
+        examiner has moved on to something unrelated. *message* lets a
+        caller explain WHY nothing is shown (e.g. "Record location not
+        available for this parser yet") rather than the generic default."""
+        self._stop_hex_worker()
+        self._hex_entry        = None
+        self._hex_file_size    = 0
+        self._hex_bytes_loaded = 0
+        self._hex_view_start   = 0
+        self._hex_ui_path      = ""
+        self.hex_progress_bar.hide()
+        self.hex_view.clear()
+        self.hex_label.setText(message)
 
     def _load_text_preview(self, text: str, label: str) -> None:
         """Display *text* in the Text tab with *label* shown above it."""

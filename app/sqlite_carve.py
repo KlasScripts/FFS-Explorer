@@ -362,6 +362,7 @@ def _brute_force_records(chunk: bytes, base_offset: int, page_no: int,
             if not values:
                 continue
             out.append({'page': page_no, 'offset': base_offset + start,
+                       'length': c1 + c2 + payload_len,
                        'rowid': rowid, 'values': values, 'source': source})
         except ValueError:
             continue
@@ -556,9 +557,21 @@ def carve_by_header_signature(raw: bytes, page_size: int, leaf_pages: list,
                 values, truncated = decode_body(bounded, types, body_start)
                 if not values:
                     continue
+                # No payload-length varint precedes a header-signature match
+                # (that's the whole point — see the section docstring), so
+                # there's no single number to read the record's length from
+                # the way the other carving paths have; reconstructed instead
+                # from the header + each field's own serial-type size. A
+                # truncated match ran past the free-space range's own end
+                # (bounded == page[:end]), so the reconstructed length is
+                # capped there rather than claiming bytes past what was
+                # actually available to decode.
+                length = header_len + sum(_serial_type_size(t) for t in types)
+                if truncated:
+                    length = min(length, end - offset)
                 out.append({'page': page_no, 'header_offset': offset, 'rowid': None,
                            'values': values, 'types': types, 'truncated': truncated,
-                           'source': 'header_signature'})
+                           'length': length, 'source': 'header_signature'})
     return out
 
 
@@ -585,7 +598,12 @@ def iter_wal_frames(wal: bytes, page_size: int):
         page_image = wal[off + 24:off + 24 + page_size]
         yield {'frame_index': i, 'page': page_no,
               'is_commit': db_size_after_commit != 0,
-              'image': page_image}
+              'image': page_image,
+              # Absolute byte offset of this frame's own 24-byte header in
+              # the WAL FILE (not the main db) — needed so a recovered row
+              # sourced from WAL history can be hex-jumped to in the -wal
+              # sidecar directly. See carve_wal_history_for_table.
+              'frame_offset': off}
 
 
 def blob_safe(v, _max=64):
@@ -679,6 +697,10 @@ def carve_wal_history_for_table(wal: bytes, page_size: int, leaf_pages: set[int]
             if cell['rowid'] not in current_rowids:
                 cell['source'] = 'wal_frame'
                 cell['frame_index'] = frame['frame_index']
+                # Absolute offset of this cell's own bytes within the WAL
+                # FILE itself: past the frame's 24-byte header, then the
+                # cell's already-known offset within the page image.
+                cell['wal_offset'] = frame['frame_offset'] + 24 + cell['offset']
                 out.append(cell)
     return out
 
@@ -825,12 +847,24 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
                 if content_key in content_seen:
                     continue
                 content_seen.add(content_key)
+                is_wal = c['source'] == 'wal_frame'
                 row = {
                     'recovered': True,
                     'recovery_method': c['source'],
                     'source_table': table,
                     'raw_page': c['page'],
                     'raw_rowid': c['rowid'],
+                    # Exact on-disk location of THIS candidate's own bytes,
+                    # for the Artifact Viewer's Hex-panel Record mode to
+                    # jump straight to — no live-b-tree search needed (that
+                    # would never find a carved row anyway); the carving
+                    # pass already knows precisely where it found this one.
+                    # 'main' = the primary db file record_source's file_key
+                    # already resolves; 'wal' = that same key's "_wal"
+                    # sidecar (see resolve_module_file_ui_path's caller).
+                    'raw_file':   'wal' if is_wal else 'main',
+                    'raw_offset': c['wal_offset'] if is_wal else c['offset'],
+                    'raw_length': c.get('length') or c.get('cell_len'),
                 }
                 row.update(fields)
                 row.update(_try_link_foreign_keys(conn, table, fields))
@@ -863,6 +897,13 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
                     'source_table': table,
                     'raw_page': c['page'],
                     'raw_rowid': None,
+                    # header-signature matches only ever come from the main
+                    # db file's free space (see carve_by_header_signature —
+                    # it's never run against WAL frames), so this is always
+                    # 'main'.
+                    'raw_file':   'main',
+                    'raw_offset': c['header_offset'],
+                    'raw_length': c.get('length'),
                     'truncated': c['truncated'],
                 }
                 row.update(fields)

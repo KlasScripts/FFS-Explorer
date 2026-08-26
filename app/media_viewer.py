@@ -8,7 +8,16 @@ import zipfile
 from itertools import batched
 
 from db_utils import _open_cache_db
-from header_scan import classify_magic, is_text, TEXT_SIZE_LIMIT
+# MEDIA_EXTENSIONS/VIDEO_THUMB_EXTENSIONS/TEXT_ATTACHMENT_EXTENSIONS/
+# sniff_media_kind moved to header_scan.py 2026-08-25 (re-exported here
+# unchanged, so existing `from media_viewer import ...` call sites keep
+# working) so app_intelligence.py can reuse the same classification
+# logic for an accurate media-file count without pulling in this
+# module's own PySide6 imports — app_intelligence.py must stay Qt-free
+# (used by the MCP server too). See header_scan.py's own comment.
+from header_scan import (classify_magic, is_text, TEXT_SIZE_LIMIT,
+                         MEDIA_EXTENSIONS, VIDEO_THUMB_EXTENSIONS,
+                         TEXT_ATTACHMENT_EXTENSIONS, sniff_media_kind)
 from PySide6.QtWidgets import (
     QWidget, QLabel, QScrollArea, QGridLayout, QVBoxLayout,
 )
@@ -17,52 +26,8 @@ from PySide6.QtCore import Qt, QThread, Signal, QBuffer, QIODevice, QTimer
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MEDIA_EXTENSIONS = frozenset({
-    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif',
-    '.mov', '.mp4', '.m4v', '.3gp', '.avi',
-})
-VIDEO_THUMB_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.avi'})
-TEXT_ATTACHMENT_EXTENSIONS = frozenset({'.txt', '.vcf'})
 THUMB_SIZE         = 160   # thumbnail box size in pixels
 _THUMB_BATCH_COMMIT = 20   # inserts to accumulate before a single db.commit()
-
-# header_scan.classify_magic() categories this function knows how to fold
-# into its own 'image'/'video'/'pdf' vocabulary. 'Document' today only ever
-# comes from the %PDF signature (see header_scan._SIGNATURES) — revisit
-# this mapping if that table ever grows a second Document-category entry.
-_MAGIC_KIND = {'Picture': 'image', 'Video': 'video', 'Document': 'pdf'}
-
-
-def sniff_media_kind(ext: str, data: bytes) -> str | None:
-    """'image' | 'video' | 'pdf' | 'text' | None, extension first (cheap,
-    no decode needed), falling back to the same magic-byte/printable-text
-    classification used app-wide to type an unrecognized file
-    (header_scan.classify_magic / header_scan.is_text) when the extension
-    doesn't say — confirmed necessary on real data: Google Messages' MMS
-    cache files are always named 'conversation_..._part_..._.bin'
-    regardless of the actual content (mp4/jpeg/png/pdf/vcf all seen under
-    that same generic name), so an extension-only check silently drops
-    every one of them. 'pdf'/'text' exist so a Report-table attachment
-    viewer (artifact_media.MediaFullViewDialog) can show a real text
-    preview, or an honest 'no in-app preview' panel for a PDF, instead of
-    a false 'could not decode as image' error for a non-image
-    attachment."""
-    if ext in VIDEO_THUMB_EXTENSIONS:
-        return 'video'
-    if ext in MEDIA_EXTENSIONS:
-        return 'image'
-    if ext == '.pdf':
-        return 'pdf'
-    if ext in TEXT_ATTACHMENT_EXTENSIONS:
-        return 'text'
-    if not data:
-        return None
-    kind = _MAGIC_KIND.get(classify_magic(data[:16]))
-    if kind:
-        return kind
-    if len(data) <= TEXT_SIZE_LIMIT and is_text(data):
-        return 'text'
-    return None
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────

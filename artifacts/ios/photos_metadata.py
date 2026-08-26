@@ -97,6 +97,68 @@ timestamp_fields = {"Taken": "cocoa_s", "Added": "cocoa_s"}
 # confirmed against a real extraction, both for a live HEIC and a live MOV.
 media_fields = ["attachment_path"]
 
+# Lets the Artifact Viewer's Hex-panel "Record" mode jump straight to the
+# on-disk cell(s) a row was actually built from — one entry per joined
+# table, same pattern as the WhatsApp parsers. All four share one file
+# ("photos_db" — everything here lives in the single Photos.sqlite).
+# "table_field" (not a fixed "table" string) for the main entry because
+# the asset table's own NAME varies by iOS version (ZASSET vs
+# ZGENERICASSET — see run()'s runtime discovery above); the three joined
+# attribute tables' NAMES are fixed regardless of iOS version (only which
+# FK COLUMN each joins on varies, e.g. ZMEDIAANALYSISASSETATTRIBUTES via
+# ZASSET or ZASSETFORANALYSIS — irrelevant here since the table name
+# itself doesn't change), so those use a literal "table" string instead.
+# Every rowid field (raw_asset_id / raw_additional_attrs_id /
+# raw_media_analysis_id / raw_extended_attrs_id) is that table's own
+# Z_PK — Core Data's own primary-key column, and — like every other Z_PK
+# used elsewhere in this project (WhatsApp's ZWAMESSAGE etc.) — a genuine
+# SQLite rowid alias by construction, not a synthetic id; this is a
+# structural property of how Core Data generates its SQLite schema, not
+# something checked per-table. A LEFT JOIN that didn't match for a given
+# asset (or a whole join skipped because this device's Photos.sqlite
+# version lacks the expected FK column — see run()'s conditional joins)
+# leaves that entry's rowid NULL, same as the attribute columns
+# themselves already go blank in that case — the Record picker then
+# correctly says "no record-location data" for that entry, consistent
+# with the report already showing nothing for that joined table on that
+# row, never a false claim. No recoverable_tables declared for this
+# parser, so no carved-row fallback rowid field is needed for any entry.
+record_source = [
+    {
+        "label":        "Asset",
+        "file_key":     "photos_db",
+        "table_field":  "source_table",
+        "rowid_fields": ["raw_asset_id"],
+    },
+    {
+        "label":        "Additional Attributes",
+        "file_key":     "photos_db",
+        "table":        "ZADDITIONALASSETATTRIBUTES",
+        "rowid_fields": ["raw_additional_attrs_id"],
+    },
+    {
+        "label":        "Media Analysis",
+        "file_key":     "photos_db",
+        "table":        "ZMEDIAANALYSISASSETATTRIBUTES",
+        "rowid_fields": ["raw_media_analysis_id"],
+    },
+    {
+        "label":        "Extended Attributes",
+        "file_key":     "photos_db",
+        "table":        "ZEXTENDEDATTRIBUTES",
+        "rowid_fields": ["raw_extended_attrs_id"],
+    },
+]
+
+# The three joined-table rowids exist ONLY to feed record_source above —
+# pure plumbing, never useful as report content (an examiner already sees
+# the resolved Original Name/Origin/Camera/Faces columns they enabled).
+# raw_asset_id and source_table stay visible: raw_asset_id is the row's
+# OWN id, not a joined table's, and source_table is a citation label, not
+# a raw key.
+hidden_fields = ["raw_additional_attrs_id", "raw_media_analysis_id",
+                 "raw_extended_attrs_id"]
+
 
 # ── Schema discovery helpers ──────────────────────────────────────────────────
 
@@ -338,7 +400,10 @@ def run(paths):
                    {sel('aa', 'ZREVERSELOCATIONDATA', aa_cols)},
                    {sel('ma', 'ZFACECOUNT', ma_cols)},
                    {sel('ext', 'ZCAMERAMAKE', ext_cols)},
-                   {sel('ext', 'ZCAMERAMODEL', ext_cols)}
+                   {sel('ext', 'ZCAMERAMODEL', ext_cols)},
+                   {sel('aa', 'Z_PK', aa_cols)},
+                   {sel('ma', 'Z_PK', ma_cols)},
+                   {sel('ext', 'Z_PK', ext_cols)}
             FROM "{asset_t}" a{joins}
         """
         albums    = _load_albums(db, tables)
@@ -350,7 +415,7 @@ def run(paths):
         for (pk, asset_uuid, directory, filename, taken, added, lat, lon,
                 hidden, trashed, favorite, orig_name, imported_by,
                 importedby, imp_bundle, revloc, face_count,
-                cam_make, cam_model) in db.execute(query):
+                cam_make, cam_model, aa_pk, ma_pk, ext_pk) in db.execute(query):
             if not directory or not filename:
                 continue
             gps = ''
@@ -388,6 +453,11 @@ def run(paths):
                 "Favorite":      'Favorite' if favorite == 1 else '',
                 "Hidden":        'Hidden' if hidden == 1 else '',
                 "Trashed":       'Recently Deleted' if trashed == 1 else '',
+                "raw_asset_id":  pk,
+                "source_table":  asset_t,
+                "raw_additional_attrs_id": aa_pk,
+                "raw_media_analysis_id":   ma_pk,
+                "raw_extended_attrs_id":   ext_pk,
             })
         return out
     finally:

@@ -12,11 +12,15 @@ folder, and a `run()` function that turns those files into rows. FFS
 Explorer extracts the files, calls `run()`, and shows the result as a
 Report in the Artifacts tab — nothing more.
 
-A parser never touches the archive itself (read-only evidence, always),
-never imports anything from this project's `app/` code, and never talks to
-the network. It only reads the file paths it's handed and returns
-`list[dict]`. That's what "self-contained" means here: you could copy the
-one `.py` file to someone else's copy of this app and it would work.
+A parser never touches the archive itself (read-only evidence, always) and
+never talks to the network. It only reads the file paths it's handed and
+returns `list[dict]`. It also doesn't depend on any of this project's
+`app/`-code UI/viewer machinery — the one deliberate exception is a small,
+stable set of generic utilities in `app/artifact_runner.py` meant to be
+imported directly (see "Reusable helpers" below), since that file always
+ships with FFS Explorer itself. That's what "self-contained" means here:
+you could copy the one `.py` file to someone else's copy of this app and
+it would work.
 
 ## The fast way: ask the app to draft one
 
@@ -156,6 +160,69 @@ added by hand. **Verify the constructed path actually resolves to a real
 file in the archive before trusting it** — use `find_paths` (via the MCP
 tools, or the file browser's search) on a real example filename first.
 
+### `hidden_fields` (if you added a field only for `record_source` below)
+
+```python
+hidden_fields = ["raw_group_member_id"]
+```
+
+Names output field(s) to keep out of the Report table entirely — for a
+value you need internally (see `record_source` next) but that has no
+value as something an examiner would want to see as a column. Don't hide
+a field just because it's raw/technical — `raw_message_id` and
+`source_table` stay visible even where `record_source` is declared,
+because the row's own id and which table it came from are still useful
+citation info on their own. Only hide a field that exists *purely* to
+make `record_source` work and means nothing on its own (a joined table's
+internal rowid, say).
+
+### `record_source` (if you want the Hex panel's "Record" jump to work)
+
+```python
+record_source = {
+    "file_key":     "main_db",          # a files/optional_files key
+    "table_field":  "source_table",     # output field naming the source table
+    "rowid_fields": ["raw_message_id"], # output field holding that table's rowid
+}
+```
+
+Lets an examiner select a report row and jump the Hex panel straight to
+that row's own on-disk database cell — real evidence citation, not just
+"trust the report." `rowid_fields` must be a genuine SQLite rowid alias
+(an `INTEGER PRIMARY KEY` column) for the named table, not a synthetic id
+— check the table's own `CREATE TABLE` statement (via `get_sqlite_schema`
+or the Database tab) before declaring this, the same rigor as `media_fields`
+above. **A joined report** (most non-trivial ones) usually wants **one
+entry per joined table**, as a list:
+
+```python
+record_source = [
+    {"label": "Message", "file_key": "main_db",
+     "table_field": "source_table", "rowid_fields": ["raw_message_id"]},
+    {"label": "Chat", "file_key": "main_db",
+     "table": "chats", "rowid_fields": ["raw_chat_id"]},   # fixed table name — never varies per row
+]
+```
+
+With more than one entry, a small picker appears next to the Hex panel's
+Record/Attachment toggle so the examiner can choose which joined table's
+cell to view. The output field the entry points at usually already needs
+to exist for something else (a raw id you're already keeping per the rule
+above) — but sometimes doesn't, and you'll need to add one more `SELECT`
+column purely to make this work (see `artifacts/ios/whatsapp.py`'s group-
+member/media-item entries for a real example of exactly that). **Don't
+guess this one** — declaring it wrong doesn't fail loudly, it silently
+points the examiner at the wrong bytes, which is worse than not having
+the feature at all. If you can't confirm a table's rowid is real, leave
+that entry out; the report still works, that row's Record mode just says
+"not available."
+
+A row your `recoverable_tables` recovery pass carved (below) still has a
+real, exact citation too — the carving pass already knows precisely which
+bytes it found, in either the main db file or a `-wal` sidecar — so
+`record_source` covers both live and recovered rows for free once
+declared; nothing extra to write for the recovered case.
+
 ### `recoverable_tables` (if you've checked for deleted content)
 
 ```python
@@ -170,6 +237,25 @@ you've actually checked (a real negative — "no WAL, checked, found
 nothing" — is still worth declaring, so a future re-check on different
 data finds it automatically instead of needing another one-off
 investigation).
+
+### Reusable helpers
+
+A parser is meant to stay self-contained (see "What a parser actually is"
+above) — but a couple of tiny, generic utilities in `app/artifact_runner.py`
+are the one deliberate exception, importable directly from `run()`:
+
+```python
+from artifact_runner import first_nonempty
+attachment_path = first_nonempty(row["full_media_path"], row["thumbnail_path"])
+```
+
+`first_nonempty(*values)` returns the first truthy value, or `""` if
+they're all empty — for an app that sometimes only has a smaller cached
+preview locally instead of the full media file (WhatsApp iOS's
+`ZMEDIALOCALPATH`/`ZXMPPTHUMBPATH` is the real example this was built
+for). If you find yourself needing the same small building block a second
+time, add it to that file's "Parser helpers" section rather than
+re-writing it inline — that's what it's there for.
 
 ## Validating what you wrote
 

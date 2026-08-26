@@ -48,12 +48,10 @@ _CALL_LABELS = {
 }
 
 
-def _display_name(contact_name, viber_name, number, member_id):
-    return contact_name or viber_name or number or member_id or None
-
-
 def run(paths):
     import sqlite3
+
+    from artifact_runner import first_nonempty, missing_ref_label
 
     conn = sqlite3.connect(paths["viber_messages"])
     conn.row_factory = sqlite3.Row
@@ -70,8 +68,8 @@ def run(paths):
     members_by_convo = {}
     name_by_participant_row = {}
     for r in member_rows:
-        name = (_display_name(r["contact_name"], r["viber_name"], r["number"],
-                              r["member_id"]) or "[unresolved participant]")
+        name = first_nonempty(r["contact_name"], r["viber_name"], r["number"],
+                              r["member_id"], default="[unresolved participant]")
         members_by_convo.setdefault(r["conversation_id"], []).append(name)
         name_by_participant_row[r["participant_row_id"]] = name
 
@@ -117,10 +115,10 @@ def run(paths):
     out = []
     for r in rows:
         sender = name_by_participant_row.get(
-            r["participant_id"], f"[no participant record — raw participant_id={r['participant_id']}]")
+            r["participant_id"], missing_ref_label("participant record", "participant_id", r["participant_id"]))
         convo_members = members_by_convo.get(r["conversation_id"], [])
         conversation = (", ".join(convo_members) if convo_members
-                       else f"[no participant records — raw conversation_id={r['conversation_id']}]")
+                       else missing_ref_label("participant records", "conversation_id", r["conversation_id"]))
 
         if r["extra_mime"] == _MIME_CALL:
             label = _CALL_LABELS.get(r["body"], r["body"] or "[call event]")

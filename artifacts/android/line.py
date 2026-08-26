@@ -59,6 +59,8 @@ def _parse_call_params(parameter):
 def run(paths):
     import sqlite3
 
+    from artifact_runner import missing_ref_label
+
     conn = sqlite3.connect(paths["naver_line"])
     conn.row_factory = sqlite3.Row
 
@@ -87,7 +89,7 @@ def run(paths):
 
     out = []
     for r in rows:
-        conversation = chat_names.get(r["chat_id"]) or f"[no chat name — raw chat_id={r['chat_id']}]"
+        conversation = chat_names.get(r["chat_id"]) or missing_ref_label("chat name", "chat_id", r["chat_id"])
         # from_mid is populated with the peer's mid on a message the peer
         # sent, and left NULL/blank for anything the local user sent —
         # confirmed against ground truth on every call/message/location row
@@ -102,7 +104,7 @@ def run(paths):
         # extraction that actually varies with direction.
         incoming = bool(r["from_mid"])
         direction = "Incoming" if incoming else "Outgoing"
-        sender = (contact_names.get(r["from_mid"], f"[no contact record — raw mid={r['from_mid']}]")
+        sender = (contact_names.get(r["from_mid"], missing_ref_label("contact record", "mid", r["from_mid"]))
                  if incoming else "[local user]")
 
         if r["type"] == _TYPE_CALL:

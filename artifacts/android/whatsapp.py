@@ -116,6 +116,8 @@ media_fields = ["attachment_path"]
 
 
 def run(paths):
+    from artifact_runner import missing_ref_label
+
     # sent_time is the raw m.timestamp value (ms), not converted in SQL at
     # all — deliberately not `datetime(m.timestamp/1000, 'unixepoch')`
     # (still correct, but a needless SQL-side format now that the Report
@@ -221,7 +223,7 @@ def run(paths):
         if r["chat_id"] is None:
             # message.chat_row_id points at no row in chat (dangling FK) — surface
             # it instead of silently dropping the row or leaving a blank subject.
-            chat_subject = f"[no chat record — raw chat_row_id={r['raw_chat_row_id']}]"
+            chat_subject = missing_ref_label("chat record", "chat_row_id", r["raw_chat_row_id"])
 
         records.append({
             "message_id":       r["message_id"],

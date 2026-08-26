@@ -1,5 +1,6 @@
 venv/
 config/ffs_archives.json
+config/dev_mcp_credentials.json
 .claude/
 __pycache__/
 *.pyc

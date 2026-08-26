@@ -58,27 +58,10 @@ timestamp_fields = {"date": "ms", "received_timestamp": "ms", "timestamp": "ms"}
 media_fields = ["attachment_path"]
 
 
-def _display_name(row_full_name, row_display_dest):
-    return row_full_name or row_display_dest or None
-
-
-def _resolve_cache_path(app_base, local_cache_path):
-    """local_cache_path is an absolute on-device path (either
-    '/data/user/0/<pkg>/...' or '/data/data/<pkg>/...' depending on Android
-    version) into this same app's data directory — find the package-name
-    marker and rejoin everything after it onto app_base, rather than
-    assuming which of the two forms is present."""
-    marker = 'com.google.android.apps.messaging/'
-    if not local_cache_path or not app_base:
-        return ''
-    i = local_cache_path.find(marker)
-    if i < 0:
-        return ''
-    return f"{app_base}/{local_cache_path[i + len(marker):]}"
-
-
 def run(paths):
     import sqlite3
+
+    from artifact_runner import first_nonempty, resolve_path_after_marker
 
     app_base = paths.get("_app_base_ui_path")
 
@@ -152,7 +135,8 @@ def run(paths):
         # whether any of them has a surviving cache entry.
         attachment_path = ''
         for m in media:
-            resolved = _resolve_cache_path(app_base, m["part_cache_path"])
+            resolved = resolve_path_after_marker(
+                app_base, m["part_cache_path"], 'com.google.android.apps.messaging/')
             if resolved:
                 attachment_path = resolved
                 break
@@ -173,11 +157,11 @@ def run(paths):
         # false — matches Josh Hickman's ALEAPP googleMessages.py reference.
         sub_id = r["sender_sub_id"]
         if sub_id is None:
-            direction, sender_name = None, _display_name(r["sender_full_name"], r["sender_dest"])
+            direction, sender_name = None, first_nonempty(r["sender_full_name"], r["sender_dest"], default=None)
         elif sub_id != -2:
             direction, sender_name = "Sent", "Me"
         else:
-            direction, sender_name = "Received", _display_name(r["sender_full_name"], r["sender_dest"])
+            direction, sender_name = "Received", first_nonempty(r["sender_full_name"], r["sender_dest"], default=None)
 
         out.append({
             "date": date_str,

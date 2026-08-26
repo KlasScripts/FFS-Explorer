@@ -2,6 +2,7 @@ msgpack
 PySide6
 blackboxprotobuf
 pytypedstream
+nska_deserialize
 tzdata; sys_platform == "win32"
 pyobjc-framework-Cocoa; sys_platform == "darwin"
 # Optional at runtime (AI access / MCP server — lazy-imported), required for

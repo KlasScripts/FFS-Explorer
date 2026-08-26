@@ -32,6 +32,7 @@ from itertools import batched
 
 import msgpack
 
+import csstore as _cs
 from . import graykey as _gk
 
 # GIL-handoff cadence for O(n)-over-all-entries loops.  These may run inside
@@ -171,6 +172,231 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
     with ThreadPoolExecutor(max_workers=n) as pool:
         for batch_result in pool.map(_read_batch, batched(entries, batch_size)):
             out.update(batch_result)
+    return out
+
+
+# ── LaunchServices csstore: richer, independent GUID/App-Group source ────────
+#
+# Apple's proprietary, undocumented LaunchServices cache
+# (com.apple.LaunchServices-<version>-v2.csstore, `bdsl` magic — see vendored
+# app/csstore.py) turned out, on real casework 2026-08-23/24, to be a single
+# central registry covering bundle id, both container GUIDs, and code-signing
+# App Group entitlements for the large majority of installed apps — all from
+# one file, independent of the per-container metadata plists
+# _build_guid_bundle_map() above reads (confirmed on real GrayKey extractions
+# to sometimes be missing per-container). See CLAUDE.md for the full
+# verification evidence (exact GUIDs/paths cross-checked against three real
+# apps). Field offsets below are reverse-engineered against real data, not
+# from any format documentation — Apple's own layout, undocumented.
+
+_LS_CSSTORE_RE = re.compile(r'com\.apple\.LaunchServices-(\d+)-v2\.csstore$')
+_GUID_RE = re.compile(
+    r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}')
+
+
+def _find_launchservices_csstore(zip_names: frozenset, container_prefix: str = "") -> str | None:
+    """Locate the LaunchServices cache file. The version number in the
+    filename varies per iOS build (5019, 6012 confirmed on two real
+    images) so this matches by pattern, not a fixed name. A
+    'SystemDataOnly-' prefixed sibling (a smaller subset) can also exist —
+    the plain, unprefixed file is preferred when both do.
+
+    A device that's been through multiple OS updates can leave several
+    superseded generations of this file behind (confirmed on the iOS 16.5
+    CTF23 Cellebrite image: versions 4031/4033/4035 of both the plain and
+    SystemDataOnly- variant all still present under the same
+    InternalDaemon container) — picking an arbitrary one (the previous
+    `non_system[0]` over an unordered frozenset) could silently return a
+    stale snapshot, confirmed on that same image to report a WhatsApp
+    data-container GUID that no longer exists anywhere in the archive.
+    The highest version number is the most recent build's registry, so
+    candidates are ranked by that first, then by the plain/SystemDataOnly-
+    preference within the winning version."""
+    candidates = [n for n in zip_names
+                 if (not container_prefix or n.startswith(container_prefix))
+                 and 'Library/Caches/' in n and _LS_CSSTORE_RE.search(n)]
+    if not candidates:
+        return None
+
+    def _rank(n: str) -> tuple[int, int]:
+        version = int(_LS_CSSTORE_RE.search(n).group(1))
+        return (version, 0 if 'SystemDataOnly-' not in n else -1)
+
+    return max(candidates, key=_rank)
+
+
+def _load_launchservices_store(zip_path: str, zip_names: frozenset,
+                               z: zipfile.ZipFile | None = None,
+                               container_prefix: str = "") -> "_cs.CSStore | None":
+    """Locate and parse the LaunchServices csstore file once; callers share
+    this single parse. Returns None if the file isn't present or fails to
+    parse (e.g. a corrupted/partial extraction) — never raises, matching
+    this module's existing resilience convention for optional metadata
+    sources."""
+    entry = _find_launchservices_csstore(zip_names, container_prefix)
+    if entry is None:
+        return None
+    _close = z is None
+    _z = zipfile.ZipFile(zip_path, 'r') if _close else z
+    try:
+        raw = _z.read(entry)
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return None
+    finally:
+        if _close:
+            _z.close()
+    try:
+        return _cs.CSStore.from_bytes(raw)
+    except Exception:
+        return None
+
+
+def _ls_string(store: "_cs.CSStore", key: int) -> str | None:
+    try:
+        return store.strings.get_string(key)
+    except Exception:
+        return None
+
+
+def _guid_from_path(path: str | None) -> str | None:
+    m = _GUID_RE.search(path or '')
+    return m.group(0) if m else None
+
+
+def _resolve_app_group_paths(store: "_cs.CSStore") -> dict:
+    """{app_group_id: guid} from PropertyList records whose keys are ALL
+    'group.'-prefixed — confirmed present as plain (non-NSKeyedArchiver)
+    bplist blobs for both a single-group app (Threema) and a five-group
+    app (WhatsApp — every declared group correctly paired with its own
+    container path). See CLAUDE.md for the verification evidence."""
+    out: dict = {}
+    try:
+        pl = store.get_table('PropertyList')
+    except KeyError:
+        return out
+    for unit in pl.hashmap.values():
+        d = unit.data
+        if d[:8] != b'bplist00':
+            continue
+        try:
+            result = plistlib.loads(d)
+        except Exception:
+            continue
+        if not isinstance(result, dict) or not result:
+            continue
+        if not all(isinstance(k, str) and k.startswith('group.') for k in result):
+            continue
+        for gid, path in result.items():
+            guid = _guid_from_path(path)
+            if guid:
+                out[gid] = guid
+    return out
+
+
+def _resolve_app_group_entitlements(store: "_cs.CSStore", bundle_record_data: bytes) -> list:
+    """Every 'group.'-prefixed App Group id this bundle's own code-signing
+    entitlements declare — read via the Bundle record's own cached
+    entitlements PropertyList (offset 35*4 — see
+    _extract_app_registry_from_launchservices), not by reading the app's
+    compiled binary (a Mach-O tail-read approach was investigated and
+    verified working, then found unnecessary once this was confirmed).
+    This record type has a literal 4-byte 'lnch' prefix before its real
+    bplist00 magic that the App-Group-PATH record type
+    (_resolve_app_group_paths) does not — confirmed on real data. Some key
+    names in the decoded dict come out as bplist string-sharing artifacts
+    (e.g. 'Yb' instead of the real entitlement key name) — the *values*
+    are unaffected, so this scans values for the 'group.' prefix rather
+    than trusting any specific key name."""
+    if len(bundle_record_data) < 36 * 4:
+        return []
+    key = struct.unpack_from('<I', bundle_record_data, 35 * 4)[0]
+    try:
+        pl = store.get_table('PropertyList')
+        raw = pl.hashmap[key].data
+    except (KeyError, struct.error):
+        return []
+    if raw[:4] == b'lnch':
+        raw = raw[4:]
+    try:
+        result = plistlib.loads(raw)
+    except Exception:
+        return []
+    groups = set()
+    if isinstance(result, dict):
+        for v in result.values():
+            if isinstance(v, list):
+                groups.update(x for x in v if isinstance(x, str) and x.startswith('group.'))
+    return sorted(groups)
+
+
+def _extract_app_registry_from_launchservices(store: "_cs.CSStore") -> list:
+    """Walk the Bundle table, returning one dict per resolvable app:
+    {bundle_id, display_name, team_id, bundle_container_path,
+    data_container_path, app_group_ids}. Field offsets confirmed stable
+    across three different real apps (WhatsApp, Signal, Discord) — see
+    CLAUDE.md. A record that doesn't resolve a plausible bundle id
+    (roughly 5% on real data — likely malformed/incomplete registrations)
+    is skipped, not guessed. PluginKit extensions (e.g. a Share/Notification
+    extension) show up as their OWN rows here, with their own bundle id
+    (a dotted suffix of the host app's, e.g.
+    'ch.threema.iapp.ThreemaShareExtension') — no separate handling
+    needed; a caller wanting "every container for app X" matches on
+    bundle_id == X OR bundle_id LIKE 'X.%'."""
+    by_id: dict = {}
+    try:
+        bundle_table = store.get_table('Bundle')
+        alias_table = store.get_table('Alias')
+    except KeyError:
+        return []
+    for unit in bundle_table.hashmap.values():
+        d = unit.data
+        if len(d) < 100:
+            continue
+        try:
+            bundle_alias_key = struct.unpack_from('<I', d, 0)[0]
+            name_key        = struct.unpack_from('<I', d, 8)[0]
+            bundle_id_key   = struct.unpack_from('<I', d, 12)[0]
+            team_key        = struct.unpack_from('<I', d, 16)[0]
+            data_alias_key  = struct.unpack_from('<I', d, 96)[0]
+        except struct.error:
+            continue
+        bundle_id = _ls_string(store, bundle_id_key)
+        if not bundle_id or '.' not in bundle_id or bundle_id[0].isdigit():
+            continue  # not a plausible reverse-DNS bundle id
+        bundle_path = (alias_table.hashmap[bundle_alias_key].data.decode('utf-8', 'replace')
+                      if bundle_alias_key in alias_table.hashmap else None)
+        data_path = (alias_table.hashmap[data_alias_key].data.decode('utf-8', 'replace')
+                    if data_alias_key in alias_table.hashmap else None)
+        row = {
+            'bundle_id': bundle_id,
+            'display_name': _ls_string(store, name_key),
+            'team_id': _ls_string(store, team_key),
+            'bundle_container_path': bundle_path,
+            'data_container_path': data_path,
+            'app_group_ids': _resolve_app_group_entitlements(store, d),
+        }
+        # Apple's own built-in apps are confirmed registered TWICE: once as
+        # the real installed app (real Data container), once as an
+        # always-present '/System/Library/AppPlaceholders/<Name>.app/' stub
+        # (no data container) — this dedup keeps whichever entry actually
+        # has a data_container_path, confirmed correct for all 33 real
+        # duplicate pairs found on the iOS 17 test image, not guessed.
+        existing = by_id.get(bundle_id)
+        if existing is None or (not existing.get('data_container_path') and data_path):
+            by_id[bundle_id] = row
+    return list(by_id.values())
+
+
+def _guid_map_from_app_registry_rows(rows: list) -> dict:
+    """{guid: bundle_id} derived from _extract_app_registry_from_launchservices()'s
+    output — lets the LaunchServices pass contribute to guid_to_bundle
+    without a second file read/parse."""
+    out = {}
+    for r in rows:
+        for path in (r.get('bundle_container_path'), r.get('data_container_path')):
+            guid = _guid_from_path(path)
+            if guid:
+                out[guid] = r['bundle_id']
     return out
 
 
@@ -321,6 +547,40 @@ class FfsAdapter:
             pv + "mobile/Containers/Data/PluginKitPlugin",
             pv + "mobile/Containers/Shared/AppGroup",
         )
+
+    def build_app_registry(self, zip_path: str, zip_names: frozenset,
+                           z: zipfile.ZipFile | None = None) -> tuple[list, dict]:
+        """Build app_registry rows AND a {guid: bundle_id} map from the
+        LaunchServices csstore (see the module-level _extract_app_registry_from_launchservices
+        etc. above) — a single central file, independent of the
+        per-container metadata plists _build_guid_bundle_map() reads,
+        confirmed on real casework to sometimes be missing on GrayKey
+        extractions. Android (FORMAT_ZIP_EXTRAS) has no LaunchServices
+        csstore and no GUID indirection to resolve at all — returns
+        ([], {}) immediately. Also returns ([], {}) if the csstore file
+        isn't present in this archive or fails to parse — never raises;
+        this is a bonus source, not a required one. Call this AFTER
+        build_ui_metadata(), not instead of it — this method computes its
+        own container-path prefix independently rather than requiring
+        build_ui_metadata's internal call sequence to change."""
+        if self.format == self.FORMAT_ZIP_EXTRAS:
+            return [], {}
+        if self.format == self.FORMAT_GRAYKEY:
+            container_prefix = "/private/var/mobile/Containers/"
+        else:
+            pv = "private/var/" if self.old_layout else ""
+            container_prefix = f"{self.user_prefix}/{pv}mobile/Containers/"
+        store = _load_launchservices_store(zip_path, zip_names, z=z,
+                                           container_prefix=container_prefix)
+        if store is None:
+            return [], {}
+        rows = _extract_app_registry_from_launchservices(store)
+        guid_map = _guid_map_from_app_registry_rows(rows)
+        group_paths = _resolve_app_group_paths(store)
+        for r in rows:
+            r['app_group_paths'] = {gid: group_paths[gid] for gid in r['app_group_ids']
+                                    if gid in group_paths}
+        return rows, guid_map
 
     def container_bundle_id(self, child_path: str, guid_map: dict) -> str | None:
         """Resolve one container_parents() child to its bundle/package id.

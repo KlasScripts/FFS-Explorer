@@ -41,6 +41,14 @@ a = Analysis(
         'uuid',
         'struct',
         'plistlib',
+        # nska_deserialize (NSKeyedArchiver plist decoding, artifact_runner.py's
+        # decode_plist_blob helper) and its own biplist dependency — imported
+        # at artifact_runner.py's module level, not inside a dynamically-loaded
+        # artifact script, so static analysis should already catch these; listed
+        # explicitly anyway to match this project's existing defensive pattern
+        # for every other pip dependency here.
+        'nska_deserialize',
+        'biplist',
     ] + collect_submodules('blackboxprotobuf')
       + collect_submodules('ccl_segb')
       # sms_messages.py imports this lazily (attributedBody typedstream

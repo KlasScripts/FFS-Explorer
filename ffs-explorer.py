@@ -34,7 +34,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       check_cache_schema, check_results_schema,
                       save_blob, load_blob, open_blob,
                       save_header_types, load_header_types, clear_header_types,
-                      save_guid_bundle_map, load_guid_bundle_map,
+                      save_guid_bundle_map, load_guid_bundle_map, save_app_registry,
                       save_folder_counts, save_folder_sizes, load_folder_data,
                       save_device_info, load_device_info,
                       save_case_setting, load_case_setting,
@@ -143,6 +143,8 @@ def _load_prefs() -> dict:
         # the default model backend offered when enabling on a case.
         'ai_enabled':      s.value('ai_enabled', False, type=bool),
         'ai_backend':      s.value('ai_backend', 'local', type=str),
+        'ai_dev_persist_credentials':
+            s.value('ai_dev_persist_credentials', False, type=bool),
     }
 
 
@@ -154,6 +156,8 @@ def _save_prefs(prefs: dict):
     s.setValue('case_sort_order', prefs.get('case_sort_order', 'recent'))
     s.setValue('ai_enabled', bool(prefs.get('ai_enabled', False)))
     s.setValue('ai_backend', prefs.get('ai_backend', 'local'))
+    s.setValue('ai_dev_persist_credentials',
+              bool(prefs.get('ai_dev_persist_credentials', False)))
 
 
 # Formatted archive sizes, keyed by path.  Stat-ing every archive on each
@@ -1430,7 +1434,7 @@ class ZipMetadataWorker(QThread):
                 )
                 time.sleep(0)   # yield GIL after msgpack/metadata build
 
-                _need_save_guid = cached_guid_bundle is None and bool(guid_to_bundle)
+                _need_save_guid_initial = cached_guid_bundle is None and bool(guid_to_bundle)
                 header_candidates: list = []
                 if self.scan_headers:
                     self.status_update.emit(
@@ -1443,6 +1447,16 @@ class ZipMetadataWorker(QThread):
             finally:
                 if z_ctx is not None:
                     z_ctx.__exit__(None, None, None)
+
+            # LaunchServices csstore: same enrichment as the subprocess path
+            # in ffs_metadata.parse_archive_metadata — see that function's
+            # comment for the full rationale. Opens its own zip handle
+            # rather than reusing z_ctx (already closed above).
+            self.status_update.emit("Building app registry from LaunchServices…")
+            _app_registry_rows, _ls_guid_map = ffs_adapter.build_app_registry(
+                self.zip_path, zip_names)
+            if _ls_guid_map:
+                guid_to_bundle = {**guid_to_bundle, **_ls_guid_map}
 
             folder_map = _build_folder_tree(ui_metadata, status_cb=self.status_update.emit)
             time.sleep(0)   # yield GIL after folder tree build
@@ -1510,10 +1524,18 @@ class ZipMetadataWorker(QThread):
             if self.case_dir:
                 try:
                     with closing(_open_cache_db(self.case_dir)) as _db:
-                        if _need_save_guid:
+                        # Also true whenever the LaunchServices merge resolved
+                        # anything — otherwise an already-cached guid_bundle
+                        # would silently swallow that enrichment, since
+                        # _need_save_guid_initial alone only fires on a cold
+                        # cache (see ffs_metadata.parse_archive_metadata's
+                        # matching comment).
+                        if _need_save_guid_initial or _ls_guid_map:
                             save_guid_bundle_map(_db, guid_to_bundle)
                         if _cached_sizes is None:
                             save_folder_sizes(_db, folder_sizes)
+                        if _app_registry_rows:
+                            save_app_registry(_db, _app_registry_rows)
                         if snapshot_blob is not None:
                             save_blob(_db, _SNAPSHOT_KEY, _SNAPSHOT_VERSION,
                                       snapshot_blob)
@@ -2086,6 +2108,24 @@ class PreferencesDialog(QDialog):
         ai_row.addWidget(self._ai_backend_combo, 1)
         layout.addLayout(ai_row)
 
+        self._ai_dev_check = QCheckBox(
+            "Developer mode: reuse a fixed port + token across restarts")
+        self._ai_dev_check.setChecked(bool(prefs.get('ai_dev_persist_credentials', False)))
+        self._ai_dev_check.setEnabled(self._ai_check.isChecked())
+        self._ai_check.toggled.connect(self._ai_dev_check.setEnabled)
+        layout.addWidget(self._ai_dev_check)
+        layout.addWidget(note_label(
+            "⚠ Normally the port and bearer token are regenerated every "
+            "time AI access starts, so an external client's saved "
+            "credential goes stale the moment the server restarts. This "
+            "instead writes them in PLAINTEXT to dev_mcp_credentials.json "
+            "and reuses them every time, so a tool like Claude Code only "
+            "needs `claude mcp add` run once. Anyone who can read that "
+            "file (or the process's memory) on this machine can reach the "
+            "server for as long as it stays valid. Leave off outside your "
+            "own dev machine.",
+            style=WARNING_STYLE))
+
         # ── Buttons ───────────────────────────────────────────────────────────
         layout.addStretch()
         btn_row, _cancel_btn, _save_btn = button_row(self, ok_text="Save", on_ok=self._on_save)
@@ -2110,6 +2150,7 @@ class PreferencesDialog(QDialog):
             'case_sort_order': self._sort_combo.currentData(),
             'ai_enabled':      self._ai_check.isChecked(),
             'ai_backend':      self._ai_backend_combo.currentData(),
+            'ai_dev_persist_credentials': self._ai_dev_check.isChecked(),
         })
         self.accept()
 
@@ -5937,6 +5978,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # even when the label is already cached in ffs_archives.json.
         QTimer.singleShot(0, partial(self._fetch_and_store_label, self.zip_path))
         self._refresh_artifact_tab()
+        # Nothing has been selected in the Artifact Viewer tree yet for this
+        # (freshly loaded) case — default to the Apps report rather than
+        # leaving it on the blank "Select a Report..." placeholder. Only
+        # done here, not inside _refresh_artifact_tab itself, since that
+        # method also reruns after a parser finishes (parsers_completed)
+        # and forcing a switch there would discard whatever report the
+        # examiner had open mid-session — see _art_select_and_show_apps'
+        # own docstring.
+        self._art_select_and_show_apps()
         self._artifact_act.setEnabled(True)
         self._mcp_act.setEnabled(True)
         self._timestamp_display_act.setEnabled(True)
@@ -6178,7 +6228,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 raw_content_enabled=raw_content_enabled,
                 read_bytes=lambda p: self._read_zip_bytes(p),
             )
-            port, _token = self._mcp_controller.start(ctx)
+            persist_dev = _load_prefs().get('ai_dev_persist_credentials', False)
+            port, _token = self._mcp_controller.start(ctx, persist_dev=persist_dev)
         except ImportError:
             self._mcp_act.setChecked(False)
             QMessageBox.warning(self, "AI Access",
@@ -6194,9 +6245,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         backend_label = ("local model" if self._mcp_backend == 'local'
                          else "Claude (cloud)")
         raw_label = " + raw DB content" if raw_content_enabled else ""
+        dev_label = " [dev: persisted credentials]" if persist_dev else ""
         self.status_bar.showMessage(
             f"AI access ENABLED for {backend_label}{raw_label} — MCP server "
-            f"on 127.0.0.1:{port} (read-only, all access logged)")
+            f"on 127.0.0.1:{port} (read-only, all access logged){dev_label}")
 
     def _copy_mcp_config(self):
         """Clipboard payload matches the case's chosen backend: mcp.json for

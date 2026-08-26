@@ -25,7 +25,7 @@ _SEARCH_ENTRIES_VERSION = '1'
 
 # Bump whenever the schema changes incompatibly.
 # Cache DB is auto-deleted on mismatch; results DB raises OldSchemaError.
-_CACHE_SCHEMA_VERSION   = 2
+_CACHE_SCHEMA_VERSION   = 14
 _RESULTS_SCHEMA_VERSION = 1
 
 
@@ -97,6 +97,26 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
+    # The "master registry" (app/adapters/ffs.py's LaunchServices csstore
+    # extraction) — one row per resolvable app, built once at first-open
+    # metadata parsing time, not re-derived per query. app_group_paths_json
+    # is {group_id: guid} for THIS bundle's own declared App Groups only
+    # (from its code-signing entitlements) — a PluginKit extension gets its
+    # own row here too (its own bundle_id, a dotted suffix of its host
+    # app's), not a nested field on the host's row; find "every container
+    # for app X" via bundle_id = X OR bundle_id LIKE 'X.%'.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS app_registry (
+            bundle_id             TEXT NOT NULL PRIMARY KEY,
+            display_name          TEXT,
+            team_id               TEXT,
+            bundle_container_path TEXT,
+            data_container_path   TEXT,
+            app_group_paths_json  TEXT NOT NULL DEFAULT '{}',
+            has_parser            INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+
     conn.execute('''
         CREATE TABLE IF NOT EXISTS nested_archives (
             ui_path         TEXT    NOT NULL PRIMARY KEY,
@@ -122,6 +142,51 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
     conn.execute('''
         CREATE INDEX IF NOT EXISTS idx_nae_archive
         ON nested_archive_entries (archive_ui_path)
+    ''')
+
+    # Per-app coverage/category/permission intelligence + interest score
+    # (app/app_intelligence.py) — fully re-derivable from the archive +
+    # existing parser coverage, so it belongs here, not in caseresults.db.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS app_intelligence (
+            platform             TEXT    NOT NULL,
+            app_id               TEXT    NOT NULL,
+            display_name         TEXT,
+            containers_json      TEXT    NOT NULL DEFAULT '[]',
+            total_bytes          INTEGER NOT NULL DEFAULT 0,
+            file_count           INTEGER NOT NULL DEFAULT 0,
+            media_file_count     INTEGER NOT NULL DEFAULT 0,
+            last_activity        INTEGER,
+            last_activity_utc    TEXT,
+            data_created          INTEGER,
+            data_created_utc     TEXT,
+            shared_created        INTEGER,
+            shared_created_utc   TEXT,
+            preferences_modified  INTEGER,
+            preferences_modified_utc TEXT,
+            splash_snapshot_modified INTEGER,
+            splash_snapshot_modified_utc TEXT,
+            has_parser           INTEGER NOT NULL DEFAULT 0,
+            artifact_tables_json TEXT    NOT NULL DEFAULT '[]',
+            row_count            INTEGER,
+            category             TEXT,
+            permissions_json     TEXT    NOT NULL DEFAULT '[]',
+            score                INTEGER NOT NULL DEFAULT 0,
+            score_breakdown_json TEXT    NOT NULL DEFAULT '{}',
+            recently_used        INTEGER NOT NULL DEFAULT 0,
+            evidence_databases_json TEXT NOT NULL DEFAULT '[]',
+            evidence_databases_total INTEGER NOT NULL DEFAULT 0,
+            known_location_json  TEXT,
+            webview_storage_path TEXT,
+            webview_storage_bytes INTEGER,
+            webview_storage_other INTEGER,
+            hidden_vault_storage_path TEXT,
+            hidden_vault_storage_bytes INTEGER,
+            hidden_vault_storage_other INTEGER,
+            encryption_caveat    TEXT,
+            scanned_at           INTEGER NOT NULL,
+            PRIMARY KEY (platform, app_id)
+        )
     ''')
 
     conn.execute(f'PRAGMA user_version = {_CACHE_SCHEMA_VERSION}')
@@ -215,6 +280,15 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
     # Migration: add completed_at to existing run_log tables created before this column existed.
     try:
         conn.execute('ALTER TABLE run_log ADD COLUMN completed_at TEXT')
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # Migration: add parser_version — the artifact parser's own version
+    # number (parser_versions.py, hash-derived) at the time an
+    # 'artifact_<script_name>' run happened, so a report opened later can
+    # tell whether the parser has since changed. NULL for non-artifact
+    # run_types (header_scan, mcp, etc.), which have no parser version.
+    try:
+        conn.execute('ALTER TABLE run_log ADD COLUMN parser_version INTEGER')
     except sqlite3.OperationalError:
         pass  # column already exists
 
@@ -346,6 +420,60 @@ def load_guid_bundle_map(conn: 'sqlite3.Connection') -> dict:
     return dict(conn.execute('SELECT guid, bundle_id FROM guid_bundle'))
 
 
+# ── App registry (app/adapters/ffs.py's LaunchServices csstore extraction) ────
+
+def save_app_registry(conn: 'sqlite3.Connection', rows: list) -> None:
+    """Replace all app_registry rows. Each row is one
+    adapters.ffs._extract_app_registry_from_launchservices() dict, plus a
+    'has_parser' bool and 'app_group_paths' ({group_id: guid}, cross-
+    referenced against adapters.ffs._resolve_app_group_paths()'s global
+    map) added by the caller. Full replace, not upsert, matching
+    save_guid_bundle_map's convention — a stale app's row should disappear
+    on the next case load, not linger."""
+    conn.execute('DELETE FROM app_registry')
+    conn.executemany(
+        'INSERT INTO app_registry (bundle_id, display_name, team_id, '
+        'bundle_container_path, data_container_path, app_group_paths_json, '
+        'has_parser) VALUES (?,?,?,?,?,?,?)',
+        [(r['bundle_id'], r.get('display_name'), r.get('team_id'),
+          r.get('bundle_container_path'), r.get('data_container_path'),
+          json.dumps(r.get('app_group_paths') or {}), int(r.get('has_parser', False)))
+         for r in rows],
+    )
+    conn.commit()
+
+
+def load_app_registry(conn: 'sqlite3.Connection') -> list:
+    """Return all app_registry rows as dicts, or [] if never built."""
+    rows = conn.execute(
+        'SELECT bundle_id, display_name, team_id, bundle_container_path, '
+        'data_container_path, app_group_paths_json, has_parser '
+        'FROM app_registry'
+    ).fetchall()
+    return [
+        {'bundle_id': r[0], 'display_name': r[1], 'team_id': r[2],
+         'bundle_container_path': r[3], 'data_container_path': r[4],
+         'app_group_paths': json.loads(r[5]), 'has_parser': bool(r[6])}
+        for r in rows
+    ]
+
+
+def load_app_registry_entry(conn: 'sqlite3.Connection', bundle_id: str) -> dict | None:
+    """Return one app_registry row (exact bundle_id match only — callers
+    wanting an app's own PluginKit extensions too should also query with
+    bundle_id LIKE '<id>.%' via load_app_registry() and filter), or None."""
+    row = conn.execute(
+        'SELECT bundle_id, display_name, team_id, bundle_container_path, '
+        'data_container_path, app_group_paths_json, has_parser '
+        'FROM app_registry WHERE bundle_id = ?', (bundle_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {'bundle_id': row[0], 'display_name': row[1], 'team_id': row[2],
+            'bundle_container_path': row[3], 'data_container_path': row[4],
+            'app_group_paths': json.loads(row[5]), 'has_parser': bool(row[6])}
+
+
 # ── SEGB protobuf schemas (user-defined, per case) ────────────────────────────
 
 def save_segb_schema(conn: 'sqlite3.Connection', stream_key: str, schema: dict) -> None:
@@ -409,15 +537,21 @@ def clear_header_types(conn: 'sqlite3.Connection') -> None:
 
 def start_run_log(conn: 'sqlite3.Connection', run_type: str,
                   total: int | None = None,
-                  notes: str | None = None) -> int:
+                  notes: str | None = None,
+                  parser_version: int | None = None) -> int:
     """Insert an in-progress run record and return its id.
 
     Call this when a scan/artifact run begins, then call complete_run_log()
     when it finishes.  run_type should be 'header_scan' or 'artifact_<script_name>'.
+    parser_version is the artifact parser's own version at run time (see
+    app/parser_versions.py) — only meaningful for an 'artifact_*' run_type;
+    leave None for anything else. Recorded so a report opened later can
+    tell whether the parser producing it has since changed.
     """
     cur = conn.execute(
-        'INSERT INTO run_log (run_type, total, complete, notes) VALUES (?, ?, 0, ?)',
-        (run_type, total, notes),
+        'INSERT INTO run_log (run_type, total, complete, notes, parser_version) '
+        'VALUES (?, ?, 0, ?, ?)',
+        (run_type, total, notes, parser_version),
     )
     conn.commit()
     return cur.lastrowid
@@ -437,7 +571,7 @@ def complete_run_log(conn: 'sqlite3.Connection', run_id: int,
 def load_last_run(conn: 'sqlite3.Connection', run_type: str) -> dict | None:
     """Return the most recent run_log entry for *run_type*, or None."""
     row = conn.execute(
-        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes '
+        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes, parser_version '
         'FROM run_log WHERE run_type=? ORDER BY id DESC LIMIT 1',
         (run_type,),
     ).fetchone()
@@ -446,21 +580,21 @@ def load_last_run(conn: 'sqlite3.Connection', run_type: str) -> dict | None:
     return {
         'run_at': row[0], 'completed_at': row[1], 'total': row[2],
         'processed': row[3], 'output_rows': row[4],
-        'complete': bool(row[5]), 'notes': row[6],
+        'complete': bool(row[5]), 'notes': row[6], 'parser_version': row[7],
     }
 
 
 def load_run_history(conn: 'sqlite3.Connection', run_type: str) -> list:
     """Return all run_log entries for *run_type*, newest first."""
     rows = conn.execute(
-        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes '
+        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes, parser_version '
         'FROM run_log WHERE run_type=? ORDER BY id DESC',
         (run_type,),
     ).fetchall()
     return [
         {'run_at': r[0], 'completed_at': r[1], 'total': r[2],
          'processed': r[3], 'output_rows': r[4],
-         'complete': bool(r[5]), 'notes': r[6]}
+         'complete': bool(r[5]), 'notes': r[6], 'parser_version': r[7]}
         for r in rows
     ]
 
@@ -514,6 +648,109 @@ def open_blob(conn: 'sqlite3.Connection', key: str, version: str):
             pass
     data = load_blob(conn, key, version)
     return io.BytesIO(data) if data is not None else None
+
+
+# ── App intelligence (app/app_intelligence.py) ─────────────────────────────────
+
+def save_app_intelligence(conn: 'sqlite3.Connection', rows: list) -> None:
+    """Replace all app_intelligence rows with a fresh scan_apps() result.
+
+    Each row is the dict scan_apps() returns — this re-serialises the
+    list/dict fields to JSON for storage. Full replace (not upsert) since a
+    stale app that's since been uninstalled/renamed should disappear too.
+    *rows* must already be in the desired display order — inserted in that
+    order and read back the same way (see load_app_intelligence) since
+    scan_apps()'s sort is richer than a plain score ORDER BY (it tie-breaks
+    on evidence/caveat/recency too)."""
+    conn.execute('DELETE FROM app_intelligence')
+    conn.executemany(
+        'INSERT INTO app_intelligence (platform, app_id, display_name, '
+        'containers_json, '
+        'total_bytes, file_count, media_file_count, last_activity, last_activity_utc, '
+        'data_created, data_created_utc, '
+        'shared_created, shared_created_utc, has_parser, '
+        'artifact_tables_json, row_count, category, permissions_json, '
+        'score, score_breakdown_json, recently_used, evidence_databases_json, '
+        'evidence_databases_total, known_location_json, '
+        'webview_storage_path, webview_storage_bytes, webview_storage_other, '
+        'hidden_vault_storage_path, hidden_vault_storage_bytes, '
+        'hidden_vault_storage_other, encryption_caveat, scanned_at, '
+        'preferences_modified, preferences_modified_utc, '
+        'splash_snapshot_modified, splash_snapshot_modified_utc) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [(r['platform'], r['app_id'], r['display_name'], json.dumps(r['containers']),
+          r['total_bytes'], r['file_count'], r['media_file_count'], r['last_activity'],
+          r['last_activity_utc'], r['data_created'],
+          r['data_created_utc'], r['shared_created'],
+          r['shared_created_utc'], int(r['has_parser']),
+          json.dumps(r['artifact_tables']), r['row_count'], r['category'],
+          json.dumps(r['permissions_declared']), r['score'],
+          json.dumps(r['score_breakdown']), int(r['recently_used']),
+          json.dumps(r['evidence_databases']), r['evidence_databases_total'],
+          json.dumps(r['known_location']) if r['known_location'] else None,
+          (r['webview_storage'] or {}).get('path'),
+          (r['webview_storage'] or {}).get('bytes'),
+          (r['webview_storage'] or {}).get('other_stores'),
+          (r['hidden_vault_storage'] or {}).get('path'),
+          (r['hidden_vault_storage'] or {}).get('bytes'),
+          (r['hidden_vault_storage'] or {}).get('other_stores'),
+          r['encryption_caveat'], r['scanned_at'],
+          r['preferences_modified'], r['preferences_modified_utc'],
+          r['splash_snapshot_modified'], r['splash_snapshot_modified_utc'])
+         for r in rows],
+    )
+    conn.commit()
+
+
+def load_app_intelligence(conn: 'sqlite3.Connection') -> list:
+    """Return the cached scan_apps()-shaped rows in their original (already
+    fully sorted) order — ORDER BY rowid, not score, since save_app_intelligence
+    inserts in scan_apps()'s own richer sort order and a plain score-only
+    re-sort here would silently lose the evidence/caveat/recency tie-break
+    on every cache-hit read."""
+    rows = conn.execute(
+        'SELECT platform, app_id, display_name, containers_json, total_bytes, '
+        'file_count, media_file_count, last_activity, last_activity_utc, '
+        'data_created, data_created_utc, '
+        'shared_created, shared_created_utc, has_parser, '
+        'artifact_tables_json, row_count, '
+        'category, permissions_json, score, score_breakdown_json, '
+        'recently_used, evidence_databases_json, evidence_databases_total, '
+        'known_location_json, '
+        'webview_storage_path, '
+        'webview_storage_bytes, webview_storage_other, '
+        'hidden_vault_storage_path, hidden_vault_storage_bytes, '
+        'hidden_vault_storage_other, encryption_caveat, scanned_at, '
+        'preferences_modified, preferences_modified_utc, '
+        'splash_snapshot_modified, splash_snapshot_modified_utc '
+        'FROM app_intelligence ORDER BY rowid'
+    ).fetchall()
+    out = []
+    for r in rows:
+        webview_storage = ({'path': r[24], 'bytes': r[25], 'other_stores': r[26]} if r[24] else None)
+        hidden_vault_storage = ({'path': r[27], 'bytes': r[28], 'other_stores': r[29]} if r[27] else None)
+        out.append({
+            'platform': r[0], 'app_id': r[1], 'display_name': r[2],
+            'containers': json.loads(r[3]),
+            'total_bytes': r[4], 'file_count': r[5], 'media_file_count': r[6],
+            'last_activity': r[7],
+            'last_activity_utc': r[8],
+            'data_created': r[9], 'data_created_utc': r[10],
+            'shared_created': r[11], 'shared_created_utc': r[12],
+            'has_parser': bool(r[13]), 'artifact_tables': json.loads(r[14]),
+            'row_count': r[15], 'category': r[16],
+            'permissions_declared': json.loads(r[17]), 'score': r[18],
+            'score_breakdown': json.loads(r[19]), 'recently_used': bool(r[20]),
+            'evidence_databases_total': r[22],
+            'known_location': json.loads(r[23]) if r[23] else None,
+            'webview_storage': webview_storage,
+            'hidden_vault_storage': hidden_vault_storage,
+            'evidence_databases': json.loads(r[21]), 'encryption_caveat': r[30],
+            'scanned_at': r[31],
+            'preferences_modified': r[32], 'preferences_modified_utc': r[33],
+            'splash_snapshot_modified': r[34], 'splash_snapshot_modified_utc': r[35],
+        })
+    return out
 
 
 # ── Folder sizes and counts ───────────────────────────────────────────────────

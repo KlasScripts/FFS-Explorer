@@ -144,6 +144,7 @@ _MESSAGE_TYPE_LABELS = {
 
 def run(paths):
     import sqlite3
+    from artifact_runner import first_nonempty, missing_ref_label
 
     app_base = paths.get("_app_base_ui_path")
 
@@ -168,6 +169,7 @@ def run(paths):
             gm.ZMEMBERJID   AS group_member_jid,
             m.ZGROUPMEMBER  AS group_member_row_id,
             med.ZMEDIALOCALPATH AS media_local_path,
+            med.ZXMPPTHUMBPATH  AS media_thumb_path,
             med.Z_PK        AS media_item_id
         FROM ZWAMESSAGE m
         LEFT JOIN ZWACHATSESSION c ON c.Z_PK = m.ZCHATSESSION
@@ -178,7 +180,7 @@ def run(paths):
 
     out = []
     for r in rows:
-        conversation = r["partner_name"] or f"[no chat record — raw chat_id={r['chat_id']}]"
+        conversation = r["partner_name"] or missing_ref_label("chat record", "chat_id", r["chat_id"])
 
         if r["is_from_me"]:
             sender = "Me"
@@ -191,9 +193,14 @@ def run(paths):
         body = r["text"] or _MESSAGE_TYPE_LABELS.get(
             r["message_type"], f"[No text — message type {r['message_type']}]")
 
+        # ZXMPPTHUMBPATH fallback: confirmed on a real extraction as a
+        # genuine, complete JPEG under the same "Message/" base as the
+        # full-size case (not a different location/format) — see
+        # first_nonempty's own docstring for why this pattern exists.
         attachment_path = ''
-        if r["media_local_path"] and app_base:
-            attachment_path = f"{app_base}/Message/{r['media_local_path']}"
+        local_path = first_nonempty(r["media_local_path"], r["media_thumb_path"])
+        if local_path and app_base:
+            attachment_path = f"{app_base}/Message/{local_path}"
 
         entry = {
             "conversation": conversation,

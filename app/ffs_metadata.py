@@ -27,7 +27,8 @@ import msgpack
 
 from adapters import FfsAdapter
 from db_utils import (_open_cache_db, load_guid_bundle_map, load_folder_data,
-                      save_blob, save_guid_bundle_map, save_folder_sizes)
+                      save_blob, save_guid_bundle_map, save_folder_sizes,
+                      save_app_registry)
 from zip_cd_cache import (CachedZipView, load as _cd_cache_load,
                           probe_delta as _probe_delta)
 
@@ -362,6 +363,21 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
     finally:
         z_ctx.__exit__(None, None, None)
 
+    # LaunchServices csstore: a single central registry (bundle id, both
+    # container GUIDs, App Group entitlements) independent of the
+    # per-container metadata plists build_ui_metadata's guid_to_bundle
+    # came from — confirmed on real casework to sometimes be missing on
+    # GrayKey extractions. Opens its own zip handle (z=None) rather than
+    # reusing z_ctx (a CachedZipView, already closed above) — cheap,
+    # one-time. Its guid_map takes priority on overlap (the richer,
+    # independently-verified source — see CLAUDE.md); it never REMOVES an
+    # entry the per-container plist method already resolved, only adds to
+    # or confirms it.
+    status("Building app registry from LaunchServices…")
+    app_registry_rows, ls_guid_map = ffs_adapter.build_app_registry(zip_path, zip_names)
+    if ls_guid_map:
+        guid_to_bundle = {**guid_to_bundle, **ls_guid_map}
+
     folder_map = _build_folder_tree(ui_metadata, status_cb=status)
 
     cached_sizes = None
@@ -415,14 +431,22 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
         'guid_to_bundle': guid_to_bundle,
         'folder_sizes':   folder_sizes,
         'snapshot_blob':  snapshot_blob,
-        'need_save_guid': cached_guid_bundle is None and bool(guid_to_bundle),
+        'app_registry':   app_registry_rows,
+        # Also true (not just "no cache existed") whenever the LaunchServices
+        # merge resolved anything — otherwise an already-cached guid_bundle
+        # would silently swallow the enrichment, since the ORIGINAL condition
+        # alone only fires on a cold cache.
+        'need_save_guid': (cached_guid_bundle is None and bool(guid_to_bundle))
+                          or bool(ls_guid_map),
         'need_save_sizes': cached_sizes is None,
+        'need_save_app_registry': bool(app_registry_rows),
     }
 
 
 def persist_result(case_dir: str, result: dict) -> None:
-    """Write a parse result's snapshot, guid map and folder sizes into
-    casecache.db, so the GUI can pick it up via the normal snapshot fast-path."""
+    """Write a parse result's snapshot, guid map, folder sizes, and app
+    registry into casecache.db, so the GUI can pick it up via the normal
+    snapshot fast-path."""
     if not case_dir:
         return
     with closing(_open_cache_db(case_dir)) as db:
@@ -430,6 +454,8 @@ def persist_result(case_dir: str, result: dict) -> None:
             save_guid_bundle_map(db, result['guid_to_bundle'])
         if result.get('need_save_sizes'):
             save_folder_sizes(db, result['folder_sizes'])
+        if result.get('need_save_app_registry'):
+            save_app_registry(db, result['app_registry'])
         if result.get('snapshot_blob') is not None:
             save_blob(db, SNAPSHOT_KEY, SNAPSHOT_VERSION, result['snapshot_blob'])
 

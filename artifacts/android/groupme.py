@@ -39,6 +39,8 @@ def run(paths):
     import json as _json
     import sqlite3
 
+    from artifact_runner import missing_ref_label
+
     conn = sqlite3.connect(paths["groupme"])
     conn.row_factory = sqlite3.Row
 
@@ -104,7 +106,7 @@ def run(paths):
     out = []
     for r in rows:
         conversation = convo_label.get(
-            r["conversation_id"], f"[no chat/group record — raw conversation_id={r['conversation_id']}]")
+            r["conversation_id"], missing_ref_label("chat/group record", "conversation_id", r["conversation_id"]))
 
         if r["sender_id"] == "system":
             direction = "System"
@@ -142,7 +144,7 @@ def run(paths):
         entry = {
             "conversation": conversation,
             "timestamp": r["created_at"],
-            "sender": r["name"] or f"[no name — raw sender_id={r['sender_id']}]",
+            "sender": r["name"] or missing_ref_label("name", "sender_id", r["sender_id"]),
             "direction": direction,
             "message": body,
             "raw_message_id": r["_id"],

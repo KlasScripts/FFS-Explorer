@@ -82,14 +82,85 @@ def classify_magic(header: bytes) -> str | None:
 def is_text(data: bytes) -> bool:
     """Return True if every byte in data is printable ASCII or whitespace.
 
-    Public (not `_is_text`) — also used by media_viewer.sniff_media_kind's
-    magic-byte fallback to classify a generic-named attachment (e.g. a
-    vCard) that carries no recognizable binary signature."""
+    Public (not `_is_text`) — also used by sniff_media_kind's magic-byte
+    fallback to classify a generic-named attachment (e.g. a vCard) that
+    carries no recognizable binary signature."""
     if not data:
         return False
     # translate(None, delete) removes all valid-text bytes; non-empty result
     # means at least one binary byte is present.
     return len(data.translate(None, _TEXT_DELETE)) == 0
+
+
+# ── Media-kind classification ───────────────────────────────────────────────
+#
+# Moved here from media_viewer.py 2026-08-25 (re-exported there unchanged,
+# so existing `from media_viewer import sniff_media_kind` call sites keep
+# working) so app_intelligence.py can reuse it for an accurate media-file
+# count without pulling in media_viewer's own PySide6 imports — this
+# module (and its own zip_reader dependency) is Qt-free, which
+# app_intelligence.py must stay (it's used by the MCP server too, which
+# needs to run on a plain background thread with no Qt requirement).
+
+MEDIA_EXTENSIONS = frozenset({
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif',
+    '.mov', '.mp4', '.m4v', '.3gp', '.avi',
+    # WhatsApp iOS caches a separate pre-generated preview image per media
+    # item under this literal extension (no second extension underneath —
+    # confirmed against a real extraction: the file IS a complete JPEG,
+    # magic bytes ff d8 ff e0 ... "JFIF"/"Exif", not a container or a
+    # renamed full-size original) alongside (or sometimes instead of) the
+    # full media file. Without this, the Media Browser's own folder-listing
+    # filter (_load_media_from_file_model, extension-gated for performance
+    # — it never falls back to sniffing magic bytes the way the Artifact
+    # Report thumbnail pipeline already does) skips it entirely.
+    '.thumb',
+})
+VIDEO_THUMB_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.avi'})
+TEXT_ATTACHMENT_EXTENSIONS = frozenset({'.txt', '.vcf'})
+
+# classify_magic() categories this function knows how to fold into its own
+# 'image'/'video'/'pdf' vocabulary. 'Document' today only ever comes from
+# the %PDF signature (see _SIGNATURES above) — revisit this mapping if
+# that table ever grows a second Document-category entry.
+_MAGIC_KIND = {'Picture': 'image', 'Video': 'video', 'Document': 'pdf'}
+
+
+def sniff_media_kind(ext: str, data: bytes) -> str | None:
+    """'image' | 'video' | 'pdf' | 'text' | None, extension first (cheap,
+    no decode needed), falling back to the same magic-byte/printable-text
+    classification used app-wide to type an unrecognized file
+    (classify_magic / is_text, above) when the extension doesn't say —
+    confirmed necessary on real data: Google Messages' MMS cache files
+    are always named 'conversation_..._part_..._.bin' regardless of the
+    actual content (mp4/jpeg/png/pdf/vcf all seen under that same generic
+    name), so an extension-only check silently drops every one of them.
+    'pdf'/'text' exist so a Report-table attachment viewer
+    (artifact_media.MediaFullViewDialog) can show a real text preview, or
+    an honest 'no in-app preview' panel for a PDF, instead of a false
+    'could not decode as image' error for a non-image attachment.
+
+    The extension-only branches never touch *data* — pass b'' when only
+    checking a recognized extension (the common case; see
+    app_intelligence._walk_container's media-count fast path, which never
+    reads a file's bytes at all unless the extension alone doesn't
+    resolve)."""
+    if ext in VIDEO_THUMB_EXTENSIONS:
+        return 'video'
+    if ext in MEDIA_EXTENSIONS:
+        return 'image'
+    if ext == '.pdf':
+        return 'pdf'
+    if ext in TEXT_ATTACHMENT_EXTENSIONS:
+        return 'text'
+    if not data:
+        return None
+    kind = _MAGIC_KIND.get(classify_magic(data[:16]))
+    if kind:
+        return kind
+    if len(data) <= TEXT_SIZE_LIMIT and is_text(data):
+        return 'text'
+    return None
 
 
 def scan_entries(

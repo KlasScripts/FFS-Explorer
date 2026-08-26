@@ -122,6 +122,8 @@ def _parse_attributed_body(blob):
 def run(paths):
     import sqlite3
 
+    from artifact_runner import missing_ref_label, resolve_path_after_marker
+
     conn = sqlite3.connect(paths["sms"])
     conn.row_factory = sqlite3.Row
 
@@ -171,10 +173,10 @@ def run(paths):
         chat_id = chat_by_message.get(r["ROWID"]) or (recovered_entry[0] if recovered_entry else None)
         chat = chats.get(chat_id)
         conversation = ((chat["display_name"] or chat["room_name"] or chat["chat_identifier"])
-                        if chat else f"[no chat record — raw message ROWID={r['ROWID']}]")
+                        if chat else missing_ref_label("chat record", "message ROWID", r["ROWID"]))
 
         sender = "Me" if r["is_from_me"] else handles.get(
-            r["handle_id"], f"[no handle record — raw handle_id={r['handle_id']}]")
+            r["handle_id"], missing_ref_label("handle record", "handle_id", r["handle_id"]))
 
         body = r["text"] or _parse_attributed_body(r["attributedBody"])
 
@@ -186,10 +188,13 @@ def run(paths):
             body = f"{body}  [Attachment: {att_desc}]" if body else f"[Attachment: {att_desc}]"
             # Only the first attachment gets a thumbnail column (one
             # media_fields column per row) — att_desc above still names
-            # every attachment on the row regardless of count.
-            first_filename = atts[0]["filename"]
-            if first_filename and first_filename.startswith('~/'):
-                attachment_path = 'mobile/' + first_filename[2:]
+            # every attachment on the row regardless of count. 'mobile' is
+            # the device root (attachment.filename's leading '~/' is the
+            # mobile user's HOME directory, not this module's own app_path
+            # — 'mobile/Library/SMS' — so the literal device root is
+            # passed here, not _app_base_ui_path).
+            attachment_path = resolve_path_after_marker(
+                'mobile', atts[0]["filename"], '~/')
 
         entry = {
             "conversation": conversation,

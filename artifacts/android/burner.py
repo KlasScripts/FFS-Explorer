@@ -38,6 +38,27 @@ optional_files = {
 # of requiring another one-off investigation.
 recoverable_tables = ["DbMessage"]
 
+# Lets the Artifact Viewer's Hex-panel "Record" mode jump straight to this
+# row's own on-disk cell in com.adhoclabs.burner.messages.db (see
+# ArtifactViewerMixin._art_load_record_hex / sqlite_carve.locate_live_row).
+# "rowid_fields" tried in order: "raw_message_id" is this module's own
+# run() output for a live row's DbMessage.id (already confirmed a genuine
+# SQLite rowid alias, not a synthetic id, by the existing recoverable_tables
+# carving pass above — carving backfills exactly this column from the
+# cell's own rowid, which only works if it already IS one), "raw_rowid" is
+# what a recoverable_tables-carved row carries instead
+# (sqlite_carve.recover_deleted_rows) — carved rows resolve to nothing
+# here today since locate_live_row only walks the CURRENT live b-tree, not
+# freed space, which is the expected outcome for a genuinely deleted row,
+# not a bug. Only the "messages" file/table is wired — burnerDatabase.db's
+# BurnerEntity/ContactEntity (attached as main_db, looked up by phone
+# number rather than by rowid above) aren't; a follow-up, not done here.
+record_source = {
+    "file_key":     "messages",
+    "table_field":  "source_table",
+    "rowid_fields": ["raw_message_id", "raw_rowid"],
+}
+
 # Raw values (never a formatted string) so the Report table can display
 # them per the case's timestamp-display setting. "timestamp" is this
 # module's own run() output; "dateCreated" is the same column's raw SQL
@@ -49,6 +70,8 @@ timestamp_fields = {"timestamp": "ms", "dateCreated": "ms"}
 
 def run(paths):
     import sqlite3
+
+    from artifact_runner import missing_ref_label
 
     conn = sqlite3.connect(paths["messages"])
     conn.row_factory = sqlite3.Row
@@ -78,7 +101,7 @@ def run(paths):
         direction = "Outgoing" if outgoing else ("Incoming" if r["direction"] == "Inbound"
                                                   else f"[unrecognized direction: {r['direction']!r}]")
         if outgoing:
-            party = own_numbers.get(r["burnerId"], f"[no burner record — raw burnerId={r['burnerId']}]")
+            party = own_numbers.get(r["burnerId"], missing_ref_label("burner record", "burnerId", r["burnerId"]))
         else:
             party = contact_names.get(r["contactId"], r["contactId"] or "[unknown contact]")
 

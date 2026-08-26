@@ -1,0 +1,88 @@
+{
+  "_note": "Auto-generated: 'version'/'hash' are derived purely from each parser script's own content and should not be hand-edited. 'changelog' entries are the only part meant for manual editing \u2014 see parser_versions.py.",
+  "format_version": 1,
+  "parsers": {
+    "android:burner": {
+      "changelog": {
+        "2": "Added record_source: single-table Record-mode hex jump into DbMessage (the parser's live-query table) \u2014 the first non-WhatsApp parser wired for this feature.",
+        "3": "Use shared missing_ref_label() instead of inline f-string for the no-burner-record fallback (no output change)."
+      },
+      "hash": "127142fa6541ed8f",
+      "version": 3
+    },
+    "android:burner_messageentity": {
+      "changelog": {},
+      "hash": "9113ecb42194269c",
+      "version": 1
+    },
+    "android:google_messages": {
+      "changelog": {
+        "2": "Removed local _display_name()/_resolve_cache_path() in favor of shared first_nonempty(default=...)/resolve_path_after_marker() (no output change)."
+      },
+      "hash": "fcb31a4e3fa83365",
+      "version": 2
+    },
+    "android:google_messages_deleted_conversations": {
+      "changelog": {},
+      "hash": "116808dca4e56785",
+      "version": 1
+    },
+    "android:groupme": {
+      "changelog": {
+        "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat/group-record and no-name fallbacks (no output change)."
+      },
+      "hash": "c12e85e9be3beba4",
+      "version": 2
+    },
+    "android:line": {
+      "changelog": {
+        "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat-name and no-contact-record fallbacks (no output change)."
+      },
+      "hash": "4a3ab6b292c7ba9d",
+      "version": 2
+    },
+    "android:line_fts": {
+      "changelog": {},
+      "hash": "468b9ff1e9196aed",
+      "version": 1
+    },
+    "android:viber": {
+      "changelog": {
+        "2": "Removed local _display_name() in favor of shared first_nonempty(default=...); use shared missing_ref_label() for the no-participant-record fallbacks (no output change)."
+      },
+      "hash": "06c84ca56bfc1fdc",
+      "version": 2
+    },
+    "android:whatsapp": {
+      "changelog": {
+        "2": "Use shared missing_ref_label() instead of inline f-string for the dangling-chat-FK fallback (no output change)."
+      },
+      "hash": "c5ee381054d923a8",
+      "version": 2
+    },
+    "ios:instagram": {
+      "changelog": {},
+      "hash": "4af945423c8785e4",
+      "version": 1
+    },
+    "ios:photos_metadata": {
+      "changelog": {},
+      "hash": "f56ed50cf1a409e6",
+      "version": 3
+    },
+    "ios:sms_messages": {
+      "changelog": {
+        "2": "Use shared missing_ref_label()/resolve_path_after_marker() instead of inline f-strings/startswith logic for the no-chat/no-handle-record fallbacks and attachment path resolution (no output change)."
+      },
+      "hash": "c0922e86025c30f9",
+      "version": 2
+    },
+    "ios:whatsapp": {
+      "changelog": {
+        "3": "Use shared missing_ref_label() instead of inline f-string for the no-chat-record fallback (no output change)."
+      },
+      "hash": "a9723c0e7ff5b0e0",
+      "version": 3
+    }
+  }
+}

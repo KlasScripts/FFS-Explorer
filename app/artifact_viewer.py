@@ -1573,6 +1573,13 @@ class ArtifactViewerMixin:
                     secs += 978307200
                 elif unit_code == 'cocoa_ns':
                     secs = secs / 1e9 + 978307200
+                elif unit_code == 'webkit_us':
+                    # Chromium/WebKit timestamp: microseconds since
+                    # 1601-01-01 UTC (base::Time's internal representation)
+                    # — used throughout Chrome's own SQLite stores
+                    # (History, Web Data, segmentation_platform's ukm_db,
+                    # ...). Offset is 1601-01-01 -> 1970-01-01 in seconds.
+                    secs = secs / 1e6 - 11644473600
                 return self.format_ts(secs)
             self._art_table_model.set_timestamp_formatting(units, _fmt)
         else:

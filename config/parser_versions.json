@@ -15,6 +15,46 @@
       "hash": "9113ecb42194269c",
       "version": 1
     },
+    "android:chrome_downloads": {
+      "changelog": {},
+      "hash": "7d7d7bc95dbb1312",
+      "version": 3
+    },
+    "android:chrome_history": {
+      "changelog": {},
+      "hash": "38cef13d0eb408ad",
+      "version": 3
+    },
+    "android:chrome_history_full": {
+      "changelog": {},
+      "hash": "a36577d8f4efd9d4",
+      "version": 2
+    },
+    "android:chrome_keyword_search_terms": {
+      "changelog": {},
+      "hash": "309f13d14764c367",
+      "version": 2
+    },
+    "android:chrome_offline_pages": {
+      "changelog": {},
+      "hash": "5f5401399386b8b4",
+      "version": 1
+    },
+    "android:chrome_search_terms": {
+      "changelog": {},
+      "hash": "de9df44bb40f9191",
+      "version": 2
+    },
+    "android:chrome_segmentation_platform": {
+      "changelog": {},
+      "hash": "b706092670c5703d",
+      "version": 1
+    },
+    "android:chrome_web_visits": {
+      "changelog": {},
+      "hash": "162d4f17507e3e73",
+      "version": 1
+    },
     "android:google_messages": {
       "changelog": {
         "2": "Removed local _display_name()/_resolve_cache_path() in favor of shared first_nonempty(default=...)/resolve_path_after_marker() (no output change)."

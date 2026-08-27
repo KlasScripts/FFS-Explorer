@@ -117,7 +117,17 @@ MEDIA_EXTENSIONS = frozenset({
     '.thumb',
 })
 VIDEO_THUMB_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.avi'})
-TEXT_ATTACHMENT_EXTENSIONS = frozenset({'.txt', '.vcf'})
+TEXT_ATTACHMENT_EXTENSIONS = frozenset({'.txt', '.vcf', '.mhtml'})
+# .mhtml (Chrome's Offline Pages archive format) added 2026-08-27: real
+# archives confirmed to fail the generic magic-byte/is_text fallback below
+# for two different reasons on real data -- most exceed TEXT_SIZE_LIMIT
+# (one real example was 3.6MB), and even a small one (151KB) failed the
+# is_text() pure-ASCII check over a single embedded UTF-8 euro sign in
+# inline CSS -- an all-but-unavoidable trait of real rendered web content,
+# not an edge case. Unconditional classification here shows the raw MIME
+# source (headers, boundary markers, literal HTML markup), not a rendered
+# page -- still real, readable evidence, same tradeoff already accepted
+# for .txt/.vcf.
 
 # classify_magic() categories this function knows how to fold into its own
 # 'image'/'video'/'pdf' vocabulary. 'Document' today only ever comes from

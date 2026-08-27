@@ -193,11 +193,30 @@ def decode_leaf_page_cells(page: bytes, page_no: int, header_offset: int = 0) ->
     return out
 
 
-def walk_table_leaf_pages(raw: bytes, page_size: int, root_page: int) -> list[int]:
+def walk_table_leaf_pages(raw: bytes, page_size: int, root_page: int,
+                         wal_images: dict[int, bytes] | None = None) -> list[int]:
     """Follow a table b-tree from *root_page* down to every leaf page
     currently belonging to it (root itself may be a leaf for a small
     table). Needed because carving freeblocks/WAL history only makes
-    sense scoped to the pages a table actually owns right now."""
+    sense scoped to the pages a table actually owns right now.
+
+    *wal_images*, if given (see _wal_latest_page_images), maps
+    page_no -> that page's most recent image still present in a WAL file —
+    consulted ONLY as a fallback when a page this walk needs doesn't
+    physically exist in *raw* at all. That is a real, unremarkable state:
+    a table created after the database's last checkpoint has a root (and
+    any interior) page that was NEVER written to the main file, so a
+    plain walk of *raw* finds zero leaves for it — and every one of that
+    table's real pages then gets silently skipped by
+    carve_wal_history_for_table too, since it only ever searches the page
+    numbers this function already found. Confirmed on a real Chrome
+    segmentation_platform/ukm_db: the schema named page 8 as the `urls`
+    table's root, but the checkpointed main file was only 1 page long —
+    see chrome_segmentation_platform.py's description for the full case.
+    Never used to override a page that DOES exist in *raw* — the WAL may
+    hold a newer version of an already-checkpointed page, but this
+    function's job is topology discovery, not content, and existing
+    behavior for a table that was already checkpointed must not change."""
     leaves = []
     stack = [root_page]
     seen = set()
@@ -208,6 +227,8 @@ def walk_table_leaf_pages(raw: bytes, page_size: int, root_page: int) -> list[in
         seen.add(page_no)
         header_offset = 100 if page_no == 1 else 0
         page = _page_bytes(raw, page_size, page_no)
+        if len(page) < page_size and wal_images and page_no in wal_images:
+            page = wal_images[page_no]
         if len(page) < header_offset + 12:
             continue
         page_type = page[header_offset]
@@ -606,6 +627,22 @@ def iter_wal_frames(wal: bytes, page_size: int):
               'frame_offset': off}
 
 
+def _wal_latest_page_images(wal: bytes, page_size: int) -> dict[int, bytes]:
+    """Every page number's most-recent image still physically present in
+    *wal*, keyed by page number — walk_table_leaf_pages' wal_images
+    fallback is the only consumer. This is topology discovery for a table
+    whose pages were never checkpointed into the main db file, not a
+    general "read the current db from its WAL" API. iter_wal_frames yields
+    frames in file order, so letting a later dict-set win here always
+    keeps the newest image — an outdated intermediate version of a page
+    could misreport a leaf as still being an interior page, or vice
+    versa, and either would corrupt the topology walk that consumes this."""
+    images = {}
+    for frame in iter_wal_frames(wal, page_size):
+        images[frame['page']] = frame['image']
+    return images
+
+
 def blob_safe(v, _max=64):
     """BLOB-typed record values decode as raw bytes, same as a live BLOB
     column read through sqlite3 — callers writing carved output to JSON,
@@ -817,8 +854,18 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
             if os.path.isfile(wal_path):
                 with open(wal_path, 'rb') as f:
                     wal = f.read()
+                # `leaves` alone (from the main file) misses a table whose
+                # root/interior pages were never checkpointed at all — see
+                # walk_table_leaf_pages' own docstring for the real case
+                # this was found against. Re-walking with a WAL-image
+                # fallback recovers the correct leaf set for exactly that
+                # case, and is a no-op for a table that WAS already
+                # checkpointed (the fallback only ever fires for a page
+                # missing from the main file).
+                wal_images = _wal_latest_page_images(wal, header['page_size'])
+                wal_leaves = walk_table_leaf_pages(raw, header['page_size'], root_row[0], wal_images)
                 rowid_candidates += carve_wal_history_for_table(
-                    wal, header['page_size'], set(leaves), live_rowids)
+                    wal, header['page_size'], set(leaves) | set(wal_leaves), live_rowids)
 
             out, seen, content_seen = [], set(), set()
             for c in rowid_candidates:

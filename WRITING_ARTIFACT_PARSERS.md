@@ -125,8 +125,22 @@ timestamp_fields = {"timestamp": "s"}
 
 `{field_name: unit_code}` — unit codes are `"s"` (Unix seconds), `"ms"`
 (Unix milliseconds), `"cocoa_s"` (Cocoa/Mac epoch seconds — iOS databases),
-or `"cocoa_ns"` (Cocoa epoch nanoseconds — used by iOS's `message` table
-specifically). The Report formats the raw value per the case's UTC /
+`"cocoa_ns"` (Cocoa epoch nanoseconds — used by iOS's `message` table
+specifically), or `"webkit_us"` (Chromium/WebKit epoch microseconds —
+`base::Time`'s internal representation, used throughout Chrome's own
+SQLite stores: History, Web Data, segmentation_platform's `ukm_db`, ...).
+**Always pass the raw stored value through unconverted and let the unit
+code do the conversion** — do not hand-convert to a different epoch in
+`run()` before returning it (e.g. converting webkit-microseconds to
+Unix-ms yourself and then declaring `"ms"`). A `recoverable_tables`-carved
+row carries the *raw* column value straight from the table, in its
+original epoch, under the same field name a hand-converted live row would
+use — if `run()` converts but the carved path can't, the same field name
+ends up holding two different units depending on whether the row is live
+or recovered, and the declared unit code is only ever correct for one of
+them. This was a real, shipped bug in this project's own Chrome parsers,
+found via a real recovered row landing off by centuries once formatted.
+The Report formats the raw value per the case's UTC /
 handset / acquisition / manual timestamp-display setting — never bake a
 formatted string into `run()`'s output. **Never use SQLite's `'localtime'`
 modifier or a bare `datetime.fromtimestamp(x)`** — both silently convert

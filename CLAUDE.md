@@ -538,7 +538,9 @@ underneath that verification.
     active mode isn't repeated per column, just the shared banner). Each
     parser module declares which of its output fields are timestamps via
     a module-level `timestamp_fields: dict[str, str]` (field name → unit
-    code: `"s"`, `"ms"`, `"cocoa_s"`, `"cocoa_ns"`), matching this
+    code: `"s"`, `"ms"`, `"cocoa_s"`, `"cocoa_ns"`, `"webkit_us"` — the
+    last added 2026-08-27 for Chrome's own SQLite stores, see the Chrome
+    artifacts entry below), matching this
     project's existing declarative conventions
     (`recoverable_tables`/`recovery_field_notes`/`description`). Must
     cover both the module's own live-row field names AND the *raw*

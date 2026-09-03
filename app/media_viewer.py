@@ -189,8 +189,22 @@ class ThumbnailWorker(QThread):
                         if self._stop:
                             return
 
-                        physical  = self.path_resolver(ui_path)
-                        file_size = self.zip_info_map.get(physical, 0)
+                        # A parser-generated local file (e.g. chrome_favicons.py's
+                        # own extracted .png, chrome_cache.py's .mhtml) is never
+                        # an archive entry -- path_resolver()/the zip's own
+                        # namelist have nothing to resolve it against. Same
+                        # os.path.isabs() convention hex_viewer._read_zip_bytes
+                        # already uses for the identical reason.
+                        is_local = os.path.isabs(ui_path)
+                        if is_local:
+                            try:
+                                file_size = os.path.getsize(ui_path)
+                            except OSError:
+                                continue
+                            physical = ui_path
+                        else:
+                            physical  = self.path_resolver(ui_path)
+                            file_size = self.zip_info_map.get(physical, 0)
                         ext       = os.path.splitext(physical)[1].lower()
                         blob      = cached.get((ui_path, file_size))
 
@@ -212,7 +226,11 @@ class ThumbnailWorker(QThread):
                                     pass
 
                         try:
-                            data = _zf.read(physical)
+                            if is_local:
+                                with open(ui_path, 'rb') as lf:
+                                    data = lf.read()
+                            else:
+                                data = _zf.read(physical)
                         except Exception:
                             continue
 

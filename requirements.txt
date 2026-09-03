@@ -5,6 +5,14 @@ pytypedstream
 nska_deserialize
 tzdata; sys_platform == "win32"
 pyobjc-framework-Cocoa; sys_platform == "darwin"
+# chrome_cache.py (app/chrome_cache.py) decompresses real cached HTTP
+# response bodies -- brotli ('br') and zstd are common real-world
+# Content-Encoding values (confirmed: 16%/2% of entries respectively on
+# real Android 14 JoshHickman casework), not exotic. Lazy-imported only
+# inside chrome_cache._decompress_body, same optional-but-listed
+# convention as mcp/uvicorn below, so a frozen build still includes them.
+brotli
+zstandard
 # Optional at runtime (AI access / MCP server — lazy-imported), required for
 # full builds so the frozen exe includes the feature.
 mcp

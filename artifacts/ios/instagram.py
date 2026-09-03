@@ -53,6 +53,7 @@ optional_files = {
 timestamp_fields = {"timestamp": "s"}
 hidden_fields = ["raw_row_id"]
 record_source = {
+    "label": "Direct Message",
     "file_key": "direct_db",
     "table": "messages",
     "rowid_fields": ["raw_row_id"],

@@ -1,0 +1,102 @@
+{
+  "reports": {
+    "chrome_web_history": {
+      "column_order": [
+        "title",
+        "url",
+        "timestamp",
+        "transition_type",
+        "qualifiers",
+        "from_url",
+        "source",
+        "raw_visit_id",
+        "raw_url_id"
+      ]
+    },
+    "chrome_autofill": {
+      "column_order": [
+        "field_name",
+        "value",
+        "count",
+        "date_created",
+        "date_last_used",
+        "source",
+        "raw_rowid",
+        "inferred_site_title",
+        "inferred_site_url",
+        "inferred_site_seconds_before"
+      ]
+    },
+    "chrome_offline_pages": {
+      "column_order": [
+        "title",
+        "online_url",
+        "original_url",
+        "archive_ui_path",
+        "file_path",
+        "file_size",
+        "creation_time",
+        "last_access_time",
+        "access_count",
+        "client_namespace",
+        "client_id",
+        "request_origin",
+        "file_missing_time",
+        "offline_id"
+      ]
+    },
+    "chrome_cache": {
+      "column_order": [
+        "url",
+        "title",
+        "top_level_site",
+        "status_line",
+        "content_type",
+        "content_encoding",
+        "raw_body_length",
+        "body_decoded_length",
+        "body_error",
+        "header_parse_error",
+        "response_date",
+        "response_date_epoch",
+        "references_found",
+        "references_resolved",
+        "reconstructed_mhtml_path",
+        "raw_ui_path"
+      ]
+    },
+    "chrome_cache_media": {
+      "column_order": [
+        "url",
+        "content_type",
+        "content_encoding",
+        "raw_body_length",
+        "body_decoded_length",
+        "body_error",
+        "response_date",
+        "response_date_epoch",
+        "referenced_by_pages",
+        "decoded_media_path",
+        "raw_ui_path",
+        "referenced_by_page_titles"
+      ]
+    },
+    "chrome_cache_pages": {
+      "column_order": [
+        "url",
+        "title",
+        "content_type",
+        "status_line",
+        "raw_body_length",
+        "body_decoded_length",
+        "response_date",
+        "response_date_epoch",
+        "references_found",
+        "references_resolved",
+        "reconstructed_mhtml_path",
+        "raw_ui_path",
+        "render_note"
+      ]
+    }
+  }
+}

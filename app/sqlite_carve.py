@@ -31,6 +31,7 @@ import os
 import sqlite3
 import struct
 import tempfile
+import time
 
 _LEAF_TABLE_PAGE = 0x0D
 _INTERIOR_TABLE_PAGE = 0x05
@@ -52,6 +53,28 @@ def read_varint(data: bytes, offset: int) -> tuple[int, int]:
         if not (b & 0x80):
             return result, i + 1
     raise ValueError('unreachable')
+
+
+def _to_signed_rowid(value: int) -> int:
+    """A ROWID varint is the one place this format's otherwise-always-
+    unsigned varint encoding (payload length, header length, every serial
+    type — none of which read_varint's own accumulator needs to treat as
+    anything but a plain non-negative number) actually holds a SIGNED
+    64-bit value: an INTEGER PRIMARY KEY column can legitimately be
+    negative, and SQLite still writes its varint using the same bit
+    pattern a signed int64 would have. Left un-converted, a negative
+    rowid round-trips as a huge POSITIVE number instead — confirmed a
+    real, not theoretical, gap: Chrome's own UKM `url_id` is a signed
+    64-bit hash that lands well into negative range on real data, and
+    locate_live_row's rowid comparison against the actual (correctly
+    signed, straight from a live SQL query) value silently never matched
+    because of exactly this — a live row that was genuinely present read
+    back as "not found" instead. Applied only at the two places this
+    module decodes a rowid specifically (decode_leaf_page_cells,
+    _brute_force_records) — never inside read_varint itself, which every
+    other caller in this file still needs to keep its current, correct
+    unsigned semantics."""
+    return value - (1 << 64) if value >= (1 << 63) else value
 
 
 def _serial_type_size(t: int) -> int:
@@ -174,6 +197,7 @@ def decode_leaf_page_cells(page: bytes, page_no: int, header_offset: int = 0) ->
             continue
         payload_len, c1 = read_varint(page, cell_off)
         rowid, c2 = read_varint(page, cell_off + c1)
+        rowid = _to_signed_rowid(rowid)
         payload_start = cell_off + c1 + c2
         # No overflow-page handling: only the on-page-local portion is
         # read, which for a 4096-byte page comfortably covers ordinary
@@ -375,6 +399,7 @@ def _brute_force_records(chunk: bytes, base_offset: int, page_no: int,
             if payload_len <= 0 or payload_len > len(chunk) - start:
                 continue
             rowid, c2 = read_varint(chunk, start + c1)
+            rowid = _to_signed_rowid(rowid)
             payload_start = start + c1 + c2
             payload = chunk[payload_start:payload_start + payload_len]
             if len(payload) < payload_len:
@@ -713,6 +738,103 @@ def rowid_alias_column(conn, table: str) -> str | None:
     return None
 
 
+def notnull_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Column names declared NOT NULL in the live schema (PRAGMA
+    table_info's own notnull flag, index 3). Used to flag a header_signature
+    carve (the one path with no rowid/exact-column-count check — see
+    carve_by_header_signature's own docstring) that decoded one of these as
+    NULL: SQLite enforces NOT NULL on write, so the only way a genuine row
+    of this table could read back with one of these columns empty is if
+    this candidate isn't really a row of this table at all — a direct
+    schema violation, not a stylistic sparseness. Not applied to the other
+    three carving paths: those already require an exact column-count match
+    against the live schema before a candidate ever reaches recover_deleted_
+    rows' output loop, which is already a stronger structural check than
+    this one substitutes for."""
+    info = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+    return {row[1] for row in info if row[3]}
+
+
+# Generous floor -- no real device evidence in this project's casework
+# predates 2000-01-01 UTC (smartphones didn't exist yet); a decoded
+# timestamp below this is far more consistent with a header-signature match
+# landing on non-timestamp garbage bytes than with a genuine old record.
+_TIMESTAMP_FLOOR_EPOCH = 946684800  # 2000-01-01T00:00:00Z
+# A day of slack past "now" absorbs ordinary device/analysis-machine clock
+# skew without over-trusting a value that's substantially in the future,
+# which a decoded value genuinely never should be.
+_TIMESTAMP_FUTURE_SLACK_SECONDS = 86400
+
+
+def _epoch_seconds(raw_value, unit_code: str):
+    """Raw timestamp field value + its declared unit_code (the same
+    convention parser modules use in their own timestamp_fields — see
+    artifact_runner.py's docstring) -> UTC epoch seconds, or None if it
+    can't be evaluated (non-numeric value, or an unrecognized unit_code).
+    Deliberately re-implemented here rather than imported from
+    artifact_viewer.py/ai_summary.py (both already have their own copy of
+    this exact conversion) — this module has zero dependency on either, the
+    same reasoning blob_safe's own docstring gives for its own duplicated
+    copy of mcp_server._blob_safe."""
+    try:
+        secs = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    if unit_code == 's':
+        return secs
+    if unit_code == 'ms':
+        return secs / 1000
+    if unit_code == 'cocoa_s':
+        return secs + 978307200
+    if unit_code == 'cocoa_ns':
+        return secs / 1e9 + 978307200
+    if unit_code == 'webkit_us':
+        return secs / 1e6 - 11644473600
+    return None
+
+
+def _timestamp_plausible(raw_value, unit_code: str) -> bool | None:
+    """None = couldn't evaluate (missing/non-numeric value, or no declared
+    unit_code) -- not a violation, just no verdict either way. False = the
+    decoded epoch falls outside [_TIMESTAMP_FLOOR_EPOCH, now + slack] -- see
+    those constants' own comments for why each bound is where it is."""
+    secs = _epoch_seconds(raw_value, unit_code)
+    if secs is None:
+        return None
+    return _TIMESTAMP_FLOOR_EPOCH <= secs <= time.time() + _TIMESTAMP_FUTURE_SLACK_SECONDS
+
+
+# A genuine TEXT value (URL, name, JSON, whatever a real column holds) is
+# printable text -- it does not contain a long run of literal NUL bytes.
+# header_signature's own body decode (decode_body) has no length check
+# against real content: it reads exactly as many bytes as the matched
+# header's own serial-type size claims, so a match landing in a stretch of
+# zeroed/reused free space decodes "successfully" as TEXT of whatever
+# length the header happened to claim, with the actual bytes being mostly
+# zero. Unlike notnull_columns/_timestamp_plausible (which flag a
+# candidate for a stronger caution label but still surface it -- this
+# project's standing escalate-don't-discard rule), this one is treated as
+# an outright rejection in recover_deleted_rows: NUL-byte-dominated
+# "text" is not a plausibility judgment about content MEANING (the kind
+# of guess this project deliberately avoids elsewhere, e.g. app_intelligence.py's
+# removed known_real_store), it is a mechanical fact about whether the
+# bytes are text at all.
+_TEXT_PLAUSIBLE_MIN_LEN = 8
+_TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION = 0.15
+
+
+def _text_plausible(value: str) -> bool:
+    """False if *value* is long enough to judge and more than
+    _TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION of its characters are control
+    characters (NUL and friends; a lone \\t/\\n/\\r doesn't count -- real
+    text can contain those) -- True for anything shorter (nothing
+    meaningful to judge) or genuinely printable."""
+    if len(value) < _TEXT_PLAUSIBLE_MIN_LEN:
+        return True
+    control = sum(1 for ch in value if ord(ch) < 32 and ch not in '\t\n\r')
+    return control / len(value) <= _TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION
+
+
 def carve_wal_history_for_table(wal: bytes, page_size: int, leaf_pages: set[int],
                                 current_rowids: set[int]) -> list[dict]:
     """Decode every historical WAL frame image for any page number in
@@ -802,7 +924,8 @@ def _try_link_foreign_keys(conn: sqlite3.Connection, table: str, fields: dict) -
     return linked
 
 
-def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> list[dict]:
+def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None,
+                         file_key: str = None, timestamp_fields: dict = None) -> list[dict]:
     """The one function artifact_runner.py calls. *paths* is the same
     dict `module.run(paths)` received (extracted-file paths, WAL/SHM
     sidecars included when the parser declared them as optional_files).
@@ -814,6 +937,27 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
     than dropping the field or silently correcting it to a guess — the raw
     recovered value is never altered, just labeled.
 
+    *timestamp_fields* is the parser's own module-level dict (see
+    artifact_runner.py's docstring) — {field_name: unit_code} — passed
+    straight through so a header_signature candidate's own declared
+    timestamp column(s) can be checked for plausibility (see
+    _timestamp_plausible). Field names here are expected in their RAW
+    (source-table) form, same as timestamp_fields already has to cover for
+    ordinary display formatting of a carved row — no extra parser-side
+    work needed for a parser that already declares this correctly.
+
+    *file_key*, if given, pins the search to exactly `paths[file_key]`
+    instead of the default `_find_table_file` scan of every file the
+    parser extracted. Needed when a parser reads more than one database
+    and two of them happen to define a same-named table — a real,
+    confirmed case: Chrome's History database and its separate
+    segmentation_platform/ukm_db both have a table literally named
+    `urls`. Without pinning, `_find_table_file` returns whichever file
+    happens to come first in `paths`' iteration order and the OTHER
+    file's own same-named table is never even looked at — silent data
+    loss, not an error. A parser with only one file per recoverable table
+    name (the common case) never needs this.
+
     Never raises: this is a bonus pass layered on top of a parser's own
     (already-succeeded) SQL query, and a carving bug must never take down
     a real parse. Returns [] on any failure, same as "nothing recoverable
@@ -823,9 +967,14 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
     gets surfaced instead)."""
     field_notes = field_notes or {}
     try:
-        db_path = _find_table_file(paths, table)
-        if db_path is None:
-            return []
+        if file_key is not None:
+            db_path = paths.get(file_key)
+            if db_path is None or not os.path.isfile(db_path):
+                return []
+        else:
+            db_path = _find_table_file(paths, table)
+            if db_path is None:
+                return []
         with open(db_path, 'rb') as f:
             raw = f.read()
         header = parse_db_header(raw)
@@ -840,6 +989,15 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
             live_rowids = {r[0] for r in conn.execute(f'SELECT rowid FROM "{table}"')}
             cols = record_column_names(conn, table)
             id_col = rowid_alias_column(conn, table)
+            # id_col excluded: a header_signature row structurally can
+            # never carry it (the rowid-alias column's record-body value is
+            # always a placeholder NULL — see record_column_names — and
+            # only the rowid-based paths below ever backfill it from the
+            # cell's own rowid, which a header_signature match doesn't
+            # have). Checking it here would flag every genuine header_
+            # signature carve of this table as a violation, not just a real
+            # false positive.
+            notnull_cols = notnull_columns(conn, table) - ({id_col} if id_col else set())
 
             leaves = walk_table_leaf_pages(raw, header['page_size'], root_row[0])
 
@@ -899,6 +1057,18 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
                     'recovered': True,
                     'recovery_method': c['source'],
                     'source_table': table,
+                    # Which of a parser's own files this table was actually
+                    # carved from — None for the common case (bare-string
+                    # recoverable_tables entry, table name unique across
+                    # every file this parser reads) but a real value (e.g.
+                    # "ukm_db") for the pinned tuple form, which only
+                    # exists because two of a parser's files can define a
+                    # same-named table (see this function's own docstring).
+                    # A record_source lookup needs this same disambiguator
+                    # when it declares two entries sharing that table name
+                    # too — matching by table name alone would be exactly
+                    # the collision this field exists to resolve.
+                    'source_file_key': file_key,
                     'raw_page': c['page'],
                     'raw_rowid': c['rowid'],
                     # Exact on-disk location of THIS candidate's own bytes,
@@ -909,8 +1079,18 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
                     # 'main' = the primary db file record_source's file_key
                     # already resolves; 'wal' = that same key's "_wal"
                     # sidecar (see resolve_module_file_ui_path's caller).
+                    # c['offset'] (main-file case) is PAGE-relative (0..
+                    # page_size-1, same as every other page-scoped offset
+                    # this module works with internally) — converted to a
+                    # true file-absolute offset here, the one place a
+                    # consumer (the Hex panel) actually needs one, the same
+                    # way locate_live_row already does for a live row's own
+                    # abs_offset. c['wal_offset'] needs no such conversion —
+                    # it's already file-absolute (built from the WAL frame's
+                    # own absolute header offset, not a page number).
                     'raw_file':   'wal' if is_wal else 'main',
-                    'raw_offset': c['wal_offset'] if is_wal else c['offset'],
+                    'raw_offset': (c['wal_offset'] if is_wal
+                                   else (c['page'] - 1) * header['page_size'] + c['offset']),
                     'raw_length': c.get('length') or c.get('cell_len'),
                 }
                 row.update(fields)
@@ -938,20 +1118,57 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None) -> l
                 if content_key in content_seen:
                     continue
                 content_seen.add(content_key)
+                # Confidence gate, header_signature only (see notnull_cols'
+                # own comment above and _timestamp_plausible): a NOT NULL
+                # column decoding as blank, or a declared timestamp column
+                # decoding outside a sane range, is a structural sign this
+                # candidate isn't really a row of *table* at all — never
+                # used to drop the row (this project's standing rule is
+                # escalate, don't silently discard), only to label it more
+                # specifically than the bare "(unverified match)" every
+                # header_signature row already gets.
+                notnull_violations = sorted(col for col in notnull_cols if fields.get(col) is None)
+                timestamp_issues = sorted(
+                    name for name, unit_code in (timestamp_fields or {}).items()
+                    if name in fields and _timestamp_plausible(fields[name], unit_code) is False)
+                # Outright rejection, not a label — see _text_plausible's
+                # own docstring for why NUL-dominated "text" is a
+                # mechanical fact about the bytes, not a content-meaning
+                # guess (the kind of judgment call this project otherwise
+                # avoids making on a candidate's behalf). This is the one
+                # place in this whole function that actually drops a
+                # candidate rather than surfacing it with an escalating
+                # caution label — logged, not silent, so a real anomaly
+                # here still leaves SOME trace even though the Report
+                # table itself intentionally never sees it.
+                implausible_text_fields = sorted(
+                    name for name, value in fields.items()
+                    if isinstance(value, str) and not _text_plausible(value))
+                if implausible_text_fields:
+                    print(f"[sqlite_carve] rejected header_signature candidate in "
+                         f"'{table}' (page {c['page']}, offset {c['header_offset']}): "
+                         f"implausible text in {', '.join(implausible_text_fields)}")
+                    continue
                 row = {
                     'recovered': True,
                     'recovery_method': c['source'],
                     'source_table': table,
+                    'source_file_key': file_key,
                     'raw_page': c['page'],
                     'raw_rowid': None,
                     # header-signature matches only ever come from the main
                     # db file's free space (see carve_by_header_signature —
                     # it's never run against WAL frames), so this is always
-                    # 'main'.
+                    # 'main'. c['header_offset'] is PAGE-relative (same
+                    # convention as c['offset'] in the rowid-based loop
+                    # above) — converted to file-absolute here, same reason
+                    # and same formula as that loop's own comment.
                     'raw_file':   'main',
-                    'raw_offset': c['header_offset'],
+                    'raw_offset': (c['page'] - 1) * header['page_size'] + c['header_offset'],
                     'raw_length': c.get('length'),
                     'truncated': c['truncated'],
+                    'notnull_violations': notnull_violations,
+                    'timestamp_issues': timestamp_issues,
                 }
                 row.update(fields)
                 row.update(_try_link_foreign_keys(conn, table, fields))

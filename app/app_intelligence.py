@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 import artifact_runner
 import ccl_abx
 from db_utils import _open_cache_db, _open_results_db, load_app_registry, load_case_setting
-from header_scan import sniff_media_kind
+from header_scan import sniff_media_kind, classify_magic
 
 
 def scan_logic_version() -> str:
@@ -276,10 +276,48 @@ _DB_DEPRIORITIZED_PATH_SUBSTRINGS = ('/webkit/',)
 
 
 def find_evidence_databases(container_path: str, folder_map: dict, ui_metadata: dict,
-                            limit: int = 5, read_bytes=None) -> tuple[list[dict], int]:
-    """Returns (candidates, total_found) — up to *limit* candidate database
-    files anywhere under *container_path*, plus the TRUE total that survived
-    filtering before the *limit* cutoff was applied. Reporting the total
+                            limit: int = 5, read_bytes=None) -> tuple[list[dict], int, list[dict]]:
+    """Returns (candidates, total_found, embedded_archives) — up to *limit*
+    candidate database files anywhere under *container_path*, the TRUE
+    total that survived filtering before the *limit* cutoff was applied,
+    and (added 2026-08-30, un-limited — see below) every extensionless
+    file found to actually be a ZIP/archive by its real magic bytes
+    rather than a database.
+
+    *embedded_archives* exists because this project's own nested-archive
+    extraction (the File Browser's "Extract as Nested Archive" / the
+    batch extraction in ProcessDialog) is a separate, MANUAL, examiner-
+    triggered step — never run automatically at case-open or anywhere in
+    this scan — so real evidence packed inside a compressed blob is
+    otherwise completely invisible here: not returned as a candidate
+    (it isn't a database), and previously not flagged as anything else
+    either, just silently skipped. Each entry is
+    `{path, bytes, note}` — note always explains what to do next ("this
+    is a compressed archive; its contents were not read — extract it to
+    see what's inside").
+
+    NOT rare on real casework, contrary to an earlier draft of this
+    comment — checked directly against three real archives (Android 14
+    JoshHickman, Android 15 CTF25 Cellebrite, Android 14 CTF26 Magnet):
+    27-90 extensionless embedded archives per archive, confirmed by
+    reading each one's own real magic bytes, not guessed. Every one
+    actually found so far, though, looks like app-internal SDK/ML-model
+    cache (WhatsApp's own wa_bwe_pl_classifier_mobile bandwidth-estimation
+    models, Instagram's igsignals/rtc_automos/bwe_mobile_congestion
+    telemetry, Google Play services' datadownloadfile_* delivery cache,
+    LINE's sticker packs) — never confirmed as a genuine miss of real
+    user-facing evidence in any case checked so far. Surfaced anyway,
+    unfiltered by name: this function already deliberately declines to
+    judge "real content vs. bundled SDK noise" by filename for database
+    candidates above (see the no-known_real_store design note), for the
+    same reason — telling them apart needs a content check or outside
+    context this function doesn't have, not a guess. Not capped by
+    *limit* either: the volume actually observed (dozens, not thousands)
+    stays far under the 1000 every current caller already passes, so
+    nothing is silently truncated in practice — revisit only if a real
+    case ever approaches that ceiling.
+
+    Reporting the total
     separately (added 2026-08-25) matters: confirmed on real casework
     (TikTok, iOS 16.5 CTF23 Cellebrite) that a small fixed limit can
     silently cut off the real evidence entirely — 34 candidates existed in
@@ -301,8 +339,20 @@ def find_evidence_databases(container_path: str, folder_map: dict, ui_metadata: 
     reader CaseContext already exposes for get_sqlite_schema/
     sample_sqlite_rows. When given (i.e. ctx.raw_content_enabled), a file
     with NO EXTENSION AT ALL that survived exclusion but didn't match
-    _DB_EXTENSIONS gets its header magic-byte checked (header_scan.
-    classify_magic) rather than being silently dropped. This SUPERSEDES an
+    _DB_EXTENSIONS gets its header magic-byte checked via the SAME general
+    header_scan.classify_magic() this project already uses elsewhere
+    (media_file_count, the File Browser's own type detection) — NOT a
+    hand-rolled SQLite-only check, which is what this function actually
+    did until 2026-08-30 despite this docstring already claiming
+    classify_magic (a real doc/code mismatch, found and fixed the same
+    day a design question surfaced it: an extensionless file that's
+    ACTUALLY a ZIP has real magic bytes classify_magic already recognizes
+    as 'Archive', but the narrower SQLite-only check silently dropped it
+    with zero signal either way — confirmed, not theoretical, since
+    classify_magic's own _SIGNATURES table already lists the ZIP
+    signature). 'Database' still means "recognized, keep as a candidate"
+    same as before; 'Archive' is NEW — see *embedded_archives* below.
+    This SUPERSEDES an
     earlier, narrower fix (an exact-name allowlist for Chrome's bare
     'History'/'Cookies'/etc. files, added and then removed the same day) —
     a hardcoded list of known bare filenames is the same kind of whack-a-
@@ -389,6 +439,7 @@ def find_evidence_databases(container_path: str, folder_map: dict, ui_metadata: 
     for the full instruction and the confirmed Instagram example."""
     candidates: list[dict] = []
     fallback: list[dict] = []
+    embedded_archives: list[dict] = []
     stack = [container_path]
     while stack:
         cur = stack.pop()
@@ -404,8 +455,31 @@ def find_evidence_databases(container_path: str, folder_map: dict, ui_metadata: 
                 size_hint = (ui_metadata.get(cur) or {}).get('size', 0)
                 if 0 < size_hint <= _MAGIC_CHECK_MAX_BYTES:
                     header = read_bytes(cur)
-                    if header and header[:16] == b'SQLite format 3\x00':
-                        recognized = True
+                    if header:
+                        category = classify_magic(header)
+                        if category == 'Database':
+                            recognized = True
+                        elif category == 'Archive':
+                            # A real, confirmed blind spot otherwise: this
+                            # file is genuinely a ZIP by its own magic
+                            # bytes, but nested-archive extraction is a
+                            # separate, manual, examiner-triggered step
+                            # never run automatically here — surface it
+                            # rather than silently drop it the way an
+                            # earlier version of this check did (it only
+                            # ever tested for the SQLite signature, never
+                            # called classify_magic at all despite this
+                            # function's own docstring already claiming
+                            # otherwise).
+                            embedded_archives.append({
+                                'path': cur, 'bytes': size_hint,
+                                'note': ("This is a compressed archive (ZIP) "
+                                        "— its contents were not read. "
+                                        "Extract it (nested-archive "
+                                        "extraction) to see what's inside; "
+                                        "it may hold this app's real "
+                                        "evidence."),
+                            })
             if not recognized:
                 continue
             if (name in _DB_NOISE_EXACT
@@ -435,7 +509,7 @@ def find_evidence_databases(container_path: str, folder_map: dict, ui_metadata: 
     candidates.sort(key=_rank, reverse=True)
     fallback.sort(key=_rank, reverse=True)
     chosen = candidates or fallback
-    return chosen[:limit], len(chosen)
+    return chosen[:limit], len(chosen), embedded_archives
 
 
 # Chromium-style WebView storage folder names — a COMPLETELY DIFFERENT
@@ -1330,6 +1404,7 @@ def scan_apps(ctx) -> list:
         # shadowed by noise in the Data container or vice versa.
         evidence_dbs = []
         evidence_dbs_total = 0
+        embedded_archives = []
         webview_matches = []
         vault_matches = []
         caveat = None
@@ -1341,10 +1416,11 @@ def scan_apps(ctx) -> list:
                 # see find_evidence_databases' docstring for why that
                 # matters (TikTok: 34 real candidates, 2 real files ranked
                 # #7/#12, both invisible if truncated per-container first).
-                cands, total = find_evidence_databases(
+                cands, total, archives = find_evidence_databases(
                     child, folder_map, ui_metadata, limit=1000, read_bytes=_rb)
                 evidence_dbs.extend(cands)
                 evidence_dbs_total += total
+                embedded_archives.extend(archives)
                 wv = find_webview_storage(child, folder_map, ui_metadata)
                 if wv:
                     webview_matches.append(wv)
@@ -1403,6 +1479,7 @@ def scan_apps(ctx) -> list:
             'recently_used': recently_used,
             'evidence_databases': evidence_dbs,
             'evidence_databases_total': evidence_dbs_total,
+            'embedded_archives': embedded_archives,
             'known_location': known_location,
             'webview_storage': webview_storage,
             'hidden_vault_storage': hidden_vault_storage,

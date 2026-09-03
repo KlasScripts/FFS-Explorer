@@ -125,7 +125,7 @@ def main() -> int:
         # actually do internally (2026-08-25).
         candidates = []
         for cp in container_paths:
-            cands, _total = app_intelligence.find_evidence_databases(
+            cands, _total, _archives = app_intelligence.find_evidence_databases(
                 cp, folder_map, ui_metadata, limit=1000, read_bytes=read_bytes)
             candidates.extend(cands)
         candidates.sort(key=lambda e: e['bytes'] + e['wal_bytes'], reverse=True)

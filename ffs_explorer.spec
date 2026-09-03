@@ -32,6 +32,24 @@ a = Analysis(
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',
+        # QtWebEngineWidgets (artifact_media.py's MediaFullViewDialog,
+        # added 2026-09-01 to render Chrome Offline Pages .mhtml archives)
+        # is only ever imported lazily inside a method, same pattern
+        # QtMultimedia/QtMultimediaWidgets already use for video playback
+        # a few lines down in that same file — those two work in this
+        # frozen build today WITHOUT being listed here at all (PyInstaller's
+        # own PySide6 hook auto-detects a function-body import the same as
+        # a module-level one), so this entry is likely redundant in
+        # practice, not required. Listed anyway out of caution: unlike
+        # QtMultimedia, QtWebEngine bundles a genuinely separate helper
+        # process (QtWebEngineProcess.exe) plus its own resource/locale
+        # .pak files, a real, previously-reported class of PyInstaller
+        # packaging gap for this specific Qt module — NOT verified against
+        # an actual frozen Windows build as of this comment (dev-mode/venv
+        # only). Check the next Windows CI run actually renders an .mhtml
+        # archive, not just that the exe launches, before trusting this.
+        'PySide6.QtWebEngineWidgets',
+        'PySide6.QtWebEngineCore',
         # Artifact parser scripts (artifacts/) are loaded via importlib at
         # runtime, so PyInstaller's import analysis never sees their imports.
         # Any stdlib module used ONLY inside an artifact must be listed here or
@@ -41,6 +59,12 @@ a = Analysis(
         'uuid',
         'struct',
         'plistlib',
+        # chrome_cache.py (app/chrome_cache.py, imported dynamically by
+        # artifacts/android/chrome_cache.py) lazy-imports these two only
+        # inside _decompress_body, for real 'br'/'zstd' Content-Encoding
+        # values (confirmed common on real casework — see requirements.txt).
+        'brotli',
+        'zstandard',
         # nska_deserialize (NSKeyedArchiver plist decoding, artifact_runner.py's
         # decode_plist_blob helper) and its own biplist dependency — imported
         # at artifact_runner.py's module level, not inside a dynamically-loaded

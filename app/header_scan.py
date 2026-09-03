@@ -117,17 +117,24 @@ MEDIA_EXTENSIONS = frozenset({
     '.thumb',
 })
 VIDEO_THUMB_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.avi'})
-TEXT_ATTACHMENT_EXTENSIONS = frozenset({'.txt', '.vcf', '.mhtml'})
-# .mhtml (Chrome's Offline Pages archive format) added 2026-08-27: real
-# archives confirmed to fail the generic magic-byte/is_text fallback below
-# for two different reasons on real data -- most exceed TEXT_SIZE_LIMIT
-# (one real example was 3.6MB), and even a small one (151KB) failed the
-# is_text() pure-ASCII check over a single embedded UTF-8 euro sign in
-# inline CSS -- an all-but-unavoidable trait of real rendered web content,
-# not an edge case. Unconditional classification here shows the raw MIME
-# source (headers, boundary markers, literal HTML markup), not a rendered
-# page -- still real, readable evidence, same tradeoff already accepted
-# for .txt/.vcf.
+TEXT_ATTACHMENT_EXTENSIONS = frozenset({'.txt', '.vcf'})
+# .mhtml/.mht (Chrome's Offline Pages archive format, and the older MS
+# spelling of the same MIME-multipart-HTML format) split into their OWN
+# 'webpage' kind 2026-09-01 -- originally folded into TEXT_ATTACHMENT_
+# EXTENSIONS on 2026-08-27 (see git history) because the generic magic-
+# byte/is_text fallback below failed on real archives for two different
+# reasons (most exceed TEXT_SIZE_LIMIT -- one real example was 3.6MB; a
+# small 151KB one still failed is_text()'s pure-ASCII check over a single
+# embedded UTF-8 euro sign in inline CSS, an all-but-unavoidable trait of
+# real rendered web content). That fixed classification, but the actual
+# VIEWER (artifact_media.MediaFullViewDialog) still only offered the raw
+# MIME source either way; 'webpage' now renders the archive as an actual
+# page instead (see MediaFullViewDialog._build_webpage) — QWebEngineView
+# handles MHTML's multipart/related structure (inline images/CSS as
+# separate MIME parts) directly, which is the whole reason the format
+# exists, so this is a strictly better view of the exact same bytes, not
+# a different/lossy one.
+WEBPAGE_ARCHIVE_EXTENSIONS = frozenset({'.mhtml', '.mht'})
 
 # classify_magic() categories this function knows how to fold into its own
 # 'image'/'video'/'pdf' vocabulary. 'Document' today only ever comes from
@@ -137,11 +144,11 @@ _MAGIC_KIND = {'Picture': 'image', 'Video': 'video', 'Document': 'pdf'}
 
 
 def sniff_media_kind(ext: str, data: bytes) -> str | None:
-    """'image' | 'video' | 'pdf' | 'text' | None, extension first (cheap,
-    no decode needed), falling back to the same magic-byte/printable-text
-    classification used app-wide to type an unrecognized file
-    (classify_magic / is_text, above) when the extension doesn't say —
-    confirmed necessary on real data: Google Messages' MMS cache files
+    """'image' | 'video' | 'pdf' | 'text' | 'webpage' | None, extension
+    first (cheap, no decode needed), falling back to the same magic-byte/
+    printable-text classification used app-wide to type an unrecognized
+    file (classify_magic / is_text, above) when the extension doesn't say
+    — confirmed necessary on real data: Google Messages' MMS cache files
     are always named 'conversation_..._part_..._.bin' regardless of the
     actual content (mp4/jpeg/png/pdf/vcf all seen under that same generic
     name), so an extension-only check silently drops every one of them.
@@ -149,6 +156,9 @@ def sniff_media_kind(ext: str, data: bytes) -> str | None:
     (artifact_media.MediaFullViewDialog) can show a real text preview, or
     an honest 'no in-app preview' panel for a PDF, instead of a false
     'could not decode as image' error for a non-image attachment.
+    'webpage' (Chrome Offline Pages' .mhtml/.mht archives — see
+    WEBPAGE_ARCHIVE_EXTENSIONS' own comment) gets an actual rendered page
+    in that same dialog rather than raw MIME source.
 
     The extension-only branches never touch *data* — pass b'' when only
     checking a recognized extension (the common case; see
@@ -161,6 +171,8 @@ def sniff_media_kind(ext: str, data: bytes) -> str | None:
         return 'image'
     if ext == '.pdf':
         return 'pdf'
+    if ext in WEBPAGE_ARCHIVE_EXTENSIONS:
+        return 'webpage'
     if ext in TEXT_ATTACHMENT_EXTENSIONS:
         return 'text'
     if not data:

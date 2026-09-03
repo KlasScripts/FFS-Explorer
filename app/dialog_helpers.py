@@ -17,10 +17,24 @@ from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton
 
 WARNING_COLOR = "#b8860b"   # amber — matches research_store.py's REVIEW_COLOR
 ERROR_COLOR   = "#c62828"   # red — matches research_store.py's OUTCOME_COLORS["no_value"]
+ACTIVE_COLOR  = "#1a73e8"   # blue — "this preset/mode is the one currently active"
 
 NOTE_STYLE    = "color: grey; font-size: 11px;"
 WARNING_STYLE = f"color: {WARNING_COLOR};"
 ERROR_STYLE   = f"color: {ERROR_COLOR};"
+# QPushButton stylesheet for "this is the currently-active preset" — e.g.
+# the Artifact Viewer's Columns row highlighting whichever of All/Core
+# exactly matches what's shown right now (see
+# ArtifactViewerMixin._update_art_columns_indicator). Not a QLabel style
+# like the three above — a button needs an explicit hover/pressed variant
+# too or Qt's own style would otherwise repaint over the background on
+# mouse-over.
+ACTIVE_BUTTON_STYLE = (
+    f"QPushButton {{ background-color: {ACTIVE_COLOR}; color: white; "
+    f"font-weight: bold; }} "
+    f"QPushButton:hover {{ background-color: {ACTIVE_COLOR}; color: white; }} "
+    f"QPushButton:pressed {{ background-color: {ACTIVE_COLOR}; color: white; }}"
+)
 
 
 def error_label() -> QLabel:

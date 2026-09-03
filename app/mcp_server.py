@@ -268,6 +268,88 @@ def build_server(ctx: CaseContext):
         return {'columns': cols, 'rows': rows, 'total_matching': total}
 
     @tool
+    def get_ai_summary_settings(name: str) -> dict:
+        """[AI Summary config] Current column selection / chunk_size /
+        prompt template for one artifact report's AI Summary feature
+        (name = a query_artifact name, e.g. 'chrome_search'), plus
+        `all_columns` (every real column that report has) and the current
+        local-LLM connection (endpoint/model — api_key is never returned).
+        Configuration only — this reads a global app-settings file, never
+        the case or evidence. Requires the report to have been run on
+        this case at least once (see query_artifact)."""
+        import ai_summary
+        import ai_summary_store
+        if not _IDENT_RE.match(name or ''):
+            return {'error': f'invalid artifact name: {name!r}'}
+        settings = ai_summary.get_settings(ctx.case_dir, name)
+        if not settings['all_columns']:
+            return {'error': f'artifact {name!r} has not been run on this case'}
+        conn = ai_summary_store.get_connection()
+        settings['connection'] = {'endpoint': conn['endpoint'], 'model': conn['model']}
+        return settings
+
+    @tool
+    def set_ai_summary_settings(name: str, columns: list[str] | None = None,
+                                chunk_size: int | None = None,
+                                max_gap_minutes: float | None = None,
+                                prompt: str | None = None) -> dict:
+        """[AI Summary config] Update one report's AI Summary settings —
+        only the fields given are changed; omit the rest to leave them
+        as-is. `chunk_size` is a max-rows-per-chunk safety ceiling;
+        `max_gap_minutes` is the real driver of where data gets split for
+        map-reduce (see run_ai_summary) — a new chunk starts when the gap
+        since the previous row's timestamp exceeds this many minutes,
+        so a multi-step flow (a sign-in sequence, a redirect chain)
+        never gets cut in half the way a fixed row-count split risked.
+        `prompt` must contain a literal '{data}' placeholder, where the
+        formatted rows get inserted — this is the per-chunk mini-summary
+        prompt; the final reduce-step prompt (combining chunks into one
+        narrative) is fixed and not independently configurable. writes to
+        a global app-settings file shared across cases, same as every
+        other examiner-facing setting in this app (research notes, parser
+        versions, ...). Call get_ai_summary_settings first to see the
+        current values and the full list of selectable columns."""
+        import ai_summary_store
+        if not _IDENT_RE.match(name or ''):
+            return {'error': f'invalid artifact name: {name!r}'}
+        if prompt is not None and '{data}' not in prompt:
+            return {'error': "prompt must contain a literal '{data}' placeholder"}
+        ai_summary_store.set_report_settings(
+            name, columns=columns, chunk_size=chunk_size,
+            max_gap_minutes=max_gap_minutes, prompt=prompt)
+        return {'ok': True}
+
+    @tool
+    def run_ai_summary(name: str) -> dict:
+        """[AI Summary] Run the CURRENTLY CONFIGURED AI Summary for one
+        report against this case's real, already-computed data, right
+        now — for tuning prompt/columns/chunk_size against real local-LLM
+        output before relying on it (see get_ai_summary_settings /
+        set_ai_summary_settings). Returns {text, rows_sent, total_rows,
+        columns_sent, prompt_used} on success, or {error} if the report
+        hasn't been run yet, no model is configured, or the local LLM
+        call itself failed (e.g. LM Studio isn't running) — this tool
+        never raises for a local-LLM failure, since that server being
+        down is an ordinary, expected condition, not a bug. Sends data
+        to whatever local server is configured (see
+        get_ai_summary_settings' connection field) — never to a remote/
+        cloud endpoint unless the examiner explicitly configured one. On
+        success, the result is also persisted (ai_summary.save_summary) —
+        the same store the GUI's app-group root view (e.g. "Chrome") reads
+        from, so a summary generated here is immediately visible there
+        too, not just returned to this call."""
+        import ai_summary
+        if not _IDENT_RE.match(name or ''):
+            return {'error': f'invalid artifact name: {name!r}'}
+        result = ai_summary.run_summary(ctx.case_dir, name)
+        if 'error' not in result:
+            # Same persistence the GUI's AISummaryDialog uses on success —
+            # an app-group root view (e.g. Chrome) reads whatever was last
+            # generated regardless of which surface generated it.
+            ai_summary.save_summary(ctx.case_dir, name, result)
+        return result
+
+    @tool
     def get_search_results(term: str, limit: int = DEFAULT_ROWS,
                            offset: int = 0) -> dict:
         """Hits for a keyword search previously run in FFS Explorer (see
@@ -611,6 +693,32 @@ def build_server(ctx: CaseContext):
           app_id to page deeper (it reuses this row's own container list)
           and keep schema-checking new entries — don't stop at the first
           5 and report nothing found while the total says otherwise.
+        - embedded_archives — (added 2026-08-30) every extensionless file
+          in this app's own containers whose REAL magic bytes are a ZIP,
+          not a database — each `{path, bytes, note}`. This project never
+          decompresses or header-scans anything automatically or in bulk
+          (the examiner's own "process everything" / per-file dialog /
+          do-nothing choices are all deliberately manual — see
+          ProcessDialog), so a genuinely-compressed file's contents are
+          otherwise completely unread here. Confirmed NOT rare on real
+          casework (27-90 per archive across three real cases checked
+          directly) — but every instance found so far looked like app-
+          internal SDK/ML-model cache (bandwidth-estimation models,
+          telemetry blobs, delivery caches), never confirmed as real
+          user-facing evidence being hidden this way; still surfaced
+          unfiltered by name, for the same reason evidence_databases above
+          doesn't try to guess "real vs. SDK noise" from a filename
+          either. If evidence_databases for this app looks thin, empty,
+          or telemetry-only (same schema-check as the standing triage step
+          above) WHILE embedded_archives is non-empty, that combination
+          means the real data may be sitting unextracted inside one of
+          these, not that this app has no evidence — say so explicitly,
+          and if you're drafting a NEW parser for this app (see
+          build_artifact_parser), declare `requires_nested_extraction`
+          (WRITING_ARTIFACT_PARSERS.md) rather than writing a `files`/
+          `optional_files` path that will never resolve on its own; if
+          you're just investigating, tell the examiner a manual "Extract
+          as Nested Archive" on that path may be worth doing.
         - webview_storage — {path, bytes, other_stores} if the container
           has Chromium-style WebView local storage (IndexedDB/LevelDB —
           common for a hybrid/WebView-based app, e.g. seen for real on
@@ -709,7 +817,18 @@ def build_server(ctx: CaseContext):
         Requires list_apps to have been called first in this session for
         this case — reuses its cached container list for *app_id* (the
         same 'containers' its list_apps row showed). Returns an error
-        naming that if the app_id isn't in the cache yet."""
+        naming that if the app_id isn't in the cache yet.
+
+        embedded_archives (added 2026-08-30) is reused straight from that
+        cached list_apps row rather than re-scanned — an extensionless
+        file under this app whose real magic bytes are a ZIP, not a
+        database. Its contents were never read here: nested-archive
+        extraction (the File Browser's own "Extract as Nested Archive" /
+        the batch extraction in the processing dialog) is a separate,
+        manual step this tool never triggers. If this list is non-empty
+        and evidence_databases above looks thin or noise-only, the real
+        evidence for this app may be sitting unextracted inside one of
+        these — tell the examiner rather than concluding "no evidence."""
         with closing(_open_cache_db(ctx.case_dir)) as cache_db:
             rows = load_app_intelligence(cache_db)
         row = next((r for r in rows if r['app_id'] == app_id), None)
@@ -723,13 +842,14 @@ def build_server(ctx: CaseContext):
         read_bytes = ctx.read_bytes if ctx.raw_content_enabled else None
         all_candidates: list = []
         for c in row['containers']:
-            cands, _total = app_intelligence.find_evidence_databases(
+            cands, _total, _archives = app_intelligence.find_evidence_databases(
                 c['path'], folder_map, ui_metadata, limit=1000, read_bytes=read_bytes)
             all_candidates.extend(cands)
         all_candidates.sort(key=lambda e: e['bytes'] + e['wal_bytes'], reverse=True)
         clamped = _clamp(limit)
         return {'app_id': app_id, 'total_candidates': len(all_candidates),
-                'candidates': all_candidates[:clamped]}
+                'candidates': all_candidates[:clamped],
+                'embedded_archives': row.get('embedded_archives', [])}
 
     # ── Tier 3: raw SQLite access (opt-in — see CaseContext.raw_content_enabled) ──
 
@@ -894,10 +1014,31 @@ def build_server(ctx: CaseContext):
             "(get_sqlite_schema / sample_sqlite_rows) — if those tools "
             "return 'not enabled', tell the examiner to opt in via the AI "
             "Access dialog and stop.\n\n"
-            "1. Call list_app_containers to get the container path for "
-            f"'{bundle_id}', then find_paths on that path filtered to "
-            "'.db'/'.sqlite' to locate its database file(s) — check both "
-            "the main container and any shared/external storage path.\n"
+            f"1. Call list_apps and find the row for '{bundle_id}' — check "
+            "its evidence_databases/evidence_databases_total/"
+            "embedded_archives fields BEFORE falling back to a plain "
+            "extension search. evidence_databases already covers "
+            "extensionless real database files via magic-byte detection, "
+            "not just '.db'/'.sqlite' names (Chrome's own bare 'History' "
+            "file is a real, confirmed example that a naive extension "
+            "filter would miss entirely) — but a NAME-based find_paths "
+            "call would still miss it. embedded_archives flags any "
+            "extensionless file that's actually a compressed archive "
+            "(confirmed common on real casework, not theoretical) — "
+            "invisible to any extension filter, and its contents were "
+            "never read. If evidence_databases looks thin or empty while "
+            "embedded_archives is non-empty, the real database may well "
+            "be sitting unextracted inside one of those archives — say so "
+            "to the examiner, and plan to declare "
+            "requires_nested_extraction (see WRITING_ARTIFACT_PARSERS.md) "
+            "rather than concluding this app has no real data. If "
+            "evidence_databases_total exceeds the candidates shown, call "
+            "list_evidence_candidates to page deeper before concluding "
+            "nothing relevant exists. Only use list_app_containers + "
+            "find_paths (filtered to '.db'/'.sqlite') as a quick manual "
+            "cross-check afterward, never as the primary discovery step — "
+            "check both the main container and any shared/external "
+            "storage path either way.\n"
             "2. For each candidate database, call get_sqlite_schema. "
             "Identify the table(s) holding user content and look for "
             "identity-mapping/indirection tables (e.g. a contact-alias or "
@@ -937,7 +1078,8 @@ def build_server(ctx: CaseContext):
             "plugin format — see WRITING_ARTIFACT_PARSERS.md at the repo "
             "root for the exact format and every optional declaration "
             "(`media_fields`, `timestamp_fields`, `recoverable_tables`, "
-            "`hidden_fields`, `record_source`) with real examples; read it "
+            "`hidden_fields`, `record_source`, `core_fields`, "
+            "`requires_nested_extraction`) with real examples; read it "
             "rather than re-deriving the format from memory, since it's "
             "kept current and this prompt isn't. Declare whichever optional "
             "attributes actually apply to this app based on what steps 1-6 "
@@ -949,7 +1091,13 @@ def build_server(ctx: CaseContext):
             "where a value came from — but per that doc's own warning, only "
             "declare `record_source` for a table whose rowid column is "
             "confirmed via get_sqlite_schema to be a genuine `INTEGER "
-            "PRIMARY KEY`, never guessed. Output the full script as a "
+            "PRIMARY KEY`, never guessed. If step 1 found the real data "
+            "sitting inside an embedded_archives entry, declare "
+            "`requires_nested_extraction` rather than writing a `files`/"
+            "`optional_files` path that will never resolve on its own. "
+            "Name your report's 2-4 most essential output columns in "
+            "`core_fields` so the examiner isn't shown every field by "
+            "default. Output the full script as a "
             "single code block for the examiner to review and save under "
             "artifacts/ios/ or artifacts/android/ themselves — never claim "
             "it has been installed or run against the case; nothing here "

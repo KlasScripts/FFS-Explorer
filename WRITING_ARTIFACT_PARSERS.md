@@ -190,6 +190,61 @@ citation info on their own. Only hide a field that exists *purely* to
 make `record_source` work and means nothing on its own (a joined table's
 internal rowid, say).
 
+### `core_fields` (recommended — which columns matter most)
+
+```python
+core_fields = ["timestamp", "url", "title"]
+```
+
+Names the subset of your report's own output fields an examiner most
+needs on a first pass — not every field your parser happens to produce,
+just the ones that actually answer "what happened." Drives the Report
+table's own "Columns" dialog (its own row above the report, above
+Filter): it always offers "All" / "None", and — only when this list is
+declared — a third "Core" preset that jumps straight to it. Every
+individual column is still there as its own checkable, reorderable row
+in the dialog's list regardless of whether you declare this;
+`core_fields` only adds the one-click shortcut, it never hides anything
+by itself the way
+`hidden_fields` does. Skip it if every column your parser produces is
+about equally important — there's no requirement to declare one.
+
+### `requires_nested_extraction` (if your target file lives inside an embedded archive)
+
+```python
+requires_nested_extraction = ["some/backup.zip"]
+```
+
+This project deliberately never decompresses or header-scans anything
+automatically — the examiner can process everything, do it selectively
+via a dialog, or do nothing at all, and each is a valid, supported
+choice (see ProcessDialog). That means **you, the parser author, are the
+only one who knows** whether the app you're targeting packs its real
+data inside a compressed blob rather than as a plain file in the
+archive — work that out while exploring the app's real container
+(cross-referencing iLEAPP/ALEAPP, checking `list_apps`' new
+`embedded_archives` field for that app) and declare it here if so.
+
+Each entry is a subpath relative to the resolved app base (same
+glob-capable convention as `files`/`optional_files` — not a `files` key
+itself). Before your `files`/`optional_files` are resolved, each
+declared archive is extracted (via this project's existing nested-
+archive mechanism — the exact same code path the examiner's own manual
+"Extract as Nested Archive" uses, so a prior manual extraction is
+reused instead of redone, and one triggered here is visible to the
+examiner afterward too). The result lands in a reserved
+`paths['_nested_archives']` dict — `{ui_path: on-disk extracted zip
+path}` — for your own `run()` to open with plain `zipfile` calls and
+read whatever it needs; this project doesn't try to make `files`/
+`optional_files` transparently reach inside it for you, since the
+internal layout of an arbitrary embedded archive isn't something a
+generic path-resolution step can guess at. A declared archive that
+can't be found or fails to extract does NOT abort your parser — it's
+recorded in `paths['_nested_archive_errors']` (`{ui_path: message}`)
+instead, so `run()` can decide for itself whether that's fatal or just
+means less data this time, the same "missing is fine, you decide"
+shape `optional_files` already has.
+
 ### `record_source` (if you want the Hex panel's "Record" jump to work)
 
 ```python
@@ -220,7 +275,48 @@ record_source = [
 
 With more than one entry, a small picker appears next to the Hex panel's
 Record/Attachment toggle so the examiner can choose which joined table's
-cell to view. The output field the entry points at usually already needs
+cell to view. The picker is rebuilt fresh each time a DIFFERENT row is
+selected, always defaulting back to that row's own first matching entry —
+selecting a join from the dropdown is a deliberate per-row choice, never
+sticky onto whatever the next row happens to be.
+
+**If your `run()` merges more than one live SQL query into one report**
+(e.g. `chrome_web_history.py`, which reads Chrome's own History AND its
+separate segmentation_platform/ukm_db as one table, tagged via a `source`
+output field) — each query can have a genuinely different main table plus
+joins, so give every entry a `source_match` list naming which `source`
+value(s) it applies to:
+
+```python
+record_source = [
+    {"label": "Query A Main", "file_key": "db_a", "table": "main_table",
+     "rowid_fields": ["raw_id"], "source_match": ["Query A"]},
+    {"label": "Query A Joined URL", "file_key": "db_a", "table": "urls",
+     "rowid_fields": ["raw_url_id"], "source_match": ["Query A"]},
+    {"label": "Query B Main", "file_key": "db_b", "table": "urls",
+     "rowid_fields": ["raw_url_id"], "source_match": ["Query B"]},
+]
+```
+
+A row from Query A only ever offers the two Query-A entries (defaulting to
+its own main table); a row from Query B only ever offers its own single
+entry — never a join that structurally can't apply to it. Omit
+`source_match` entirely for the common single-query case (every existing
+parser but `chrome_web_history.py`) and every entry applies to every row,
+unchanged from before this existed. Real, worked example:
+`artifacts/android/chrome_web_history.py`.
+
+Two entries sharing a bare table name across different files (real case
+above: Chrome History's own `urls` vs. `ukm_db`'s `urls`) is fine for a
+LIVE row (`source_match` already disambiguates it) but needs one more
+thing for a CARVED row of that table: declare the SAME `file_key`-pinned
+tuple in `recoverable_tables` you'd need anyway for the collision (see
+below) — the carving pass already tags a recovered row with which file it
+came from, which the Hex panel uses to pick the right entry even though
+`source_match` itself never runs for a carved row (it already knows its
+real source table directly).
+
+The output field the entry points at usually already needs
 to exist for something else (a raw id you're already keeping per the rule
 above) — but sometimes doesn't, and you'll need to add one more `SELECT`
 column purely to make this work (see `artifacts/ios/whatsapp.py`'s group-
@@ -251,6 +347,30 @@ you've actually checked (a real negative — "no WAL, checked, found
 nothing" — is still worth declaring, so a future re-check on different
 data finds it automatically instead of needing another one-off
 investigation).
+
+Every recovered row automatically gets a `source` field — `"Carved —
+{table}"`, or `"Carved — {table} (unverified match)"` for a header_signature
+match (no rowid, the weakest of the four carving paths) — so a report whose
+`core_fields` includes `"source"` never shows a carved row's most important
+column blank. A `header_signature` match is additionally cross-checked
+against the live schema and, if you declare `timestamp_fields` (using the
+RAW source-table column name, not just your own output field name — see
+above), against a plausible timestamp range; a real hit upgrades the suffix
+to `"Carved — {table} (likely false positive — implausible timestamp:
+last_timestamp)"` naming the exact reason, never silently dropping the row
+— see `sqlite_carve.notnull_columns`/`_timestamp_plausible`. Nothing to
+declare for this beyond `timestamp_fields` you'd want anyway. If your
+`recoverable_tables` spans more than one underlying table/database, give
+each one a real name instead of a bare SQL table name:
+
+```python
+recovery_source_labels = {"visits": "Chrome History (visits table)"}
+```
+
+See `artifacts/android/chrome_web_history.py` for a two-source example, and
+CLAUDE.md's Conventions for the confidence-tiering reasoning (why only
+`header_signature` gets the caution suffix, not the other three carving
+paths).
 
 ### Reusable helpers
 

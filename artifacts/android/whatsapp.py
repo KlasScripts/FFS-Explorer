@@ -39,30 +39,37 @@ optional_files = {
 }
 
 # Lets the Artifact Viewer's Hex-panel "Record" mode jump straight to the
-# on-disk cell(s) a row was actually built from — a joined report like
-# this one has more than one, so record_source is a LIST: this row's own
-# message cell, plus the chat table it's LEFT JOINed to. Both live in the
-# SAME db file (msgstore — "msgstore" key), unlike iOS WhatsApp's
-# single-file case; Android WhatsApp's actual second file, wa.db
-# ("wa" key, ATTACHed as contacts_db for the wa_contacts identity-lookup
-# joins), is NOT wired here — this parser's SELECT never selects
-# wa_contacts' own rowid, and its schema (specifically whether the
-# declared TEXT `jid` primary key is the table's real rowid or a separate
-# WITHOUT-ROWID-style key) hasn't been confirmed against a real
-# extraction. Declaring a record_source entry for it without that
-# verification would risk citing the WRONG cell — worse than the current
-# "not available" gap, per this project's standing rule of never guessing
-# at schema. Revisit once a real wa.db schema dump is available to check
-# against, same rigor as every other record_source/media_fields entry in
-# this project. "rowid_fields" tried in order: "message_id"/"chat_id" are
-# this module's own run() output for message._id/chat._id (Android's
-# standard rowid-alias primary key convention), "raw_rowid" is what a
-# recoverable_tables-carved row carries instead
-# (sqlite_carve.recover_deleted_rows) — carved rows resolve to nothing
-# here today since locate_live_row only walks the CURRENT live b-tree, not
-# freed space, which is the expected outcome for a genuinely deleted row,
-# not a bug (and only applies to the Message entry — recovery is only
-# declared for the "message" table below, never "chat").
+# on-disk cell(s) a row was actually built from. The real query below
+# joins EIGHT tables across TWO database files (msgstore.db: message,
+# chat, jid ×4, message_media, message_location; wa.db, ATTACHed as
+# contacts_db: wa_contacts ×4) — expanded 2026-08-31 from an original
+# Message+Chat-only declaration once every OTHER joined table's rowid
+# status was actually checked against this project's own real WhatsApp
+# casework (PRAGMA table_info on both real db files), not left as an
+# unconfirmed gap:
+#   - jid._id, message_media.message_row_id, message_location.message_row_id,
+#     and wa_contacts._id are ALL genuine single-column INTEGER PRIMARY KEY
+#     rowid aliases — confirmed, not assumed. The old comment here
+#     specifically flagged wa_contacts' rowid status as unconfirmed; it
+#     turned out to just need checking; there's a real one.
+#   - message_media/message_location have no rowid of their own in the
+#     query's SELECT list, but need none: their PK (message_row_id) is BY
+#     DEFINITION identical to m._id (that's their own JOIN condition), which
+#     is already captured as message_id -- reused directly, zero new SQL.
+#   - The four jid joins and four wa_contacts joins DID need one more SELECT
+#     column each (their own _id) added below -- previously computed and
+#     joined against, but never carried out to the row's own output dict.
+# Every table above lives in ONE of the two ATTACHed files, no table name
+# is shared by both (unlike chrome_web_history's real "urls"-in-two-files
+# collision), so no source_file_key disambiguation is needed here.
+# "rowid_fields" for Message tries "message_id" (this module's own run()
+# output for message._id) then "raw_rowid" (what a recoverable_tables-
+# carved row carries instead) — carved rows resolve to nothing today since
+# locate_live_row only walks the CURRENT live b-tree, not freed space,
+# expected for a genuinely deleted row, not a bug (and only applies to the
+# Message entry — recovery is only declared for "message" below, never
+# any of the others). Every OTHER entry here has exactly one rowid_fields
+# name since none of their own tables are ever carved.
 record_source = [
     {
         "label":        "Message",
@@ -76,16 +83,98 @@ record_source = [
         "table":        "chat",
         "rowid_fields": ["chat_id"],
     },
+    {
+        "label":        "Chat JID",
+        "file_key":     "msgstore",
+        "table":        "jid",
+        "rowid_fields": ["chat_jid_id"],
+    },
+    {
+        "label":        "Sender JID",
+        "file_key":     "msgstore",
+        "table":        "jid",
+        "rowid_fields": ["sender_jid_id"],
+    },
+    {
+        # LID-privacy identity variant of Chat JID -- present only when
+        # jid_map has a row for this chat (see the run()-time comment on
+        # jid_map sparsity); None on an ordinary chat is expected, and the
+        # Hex panel correctly reports "no record-location data" rather
+        # than silently resolving to the wrong (non-mapped) jid.
+        "label":        "Chat Mapped JID",
+        "file_key":     "msgstore",
+        "table":        "jid",
+        "rowid_fields": ["chat_mapped_jid_id"],
+    },
+    {
+        "label":        "Sender Mapped JID",
+        "file_key":     "msgstore",
+        "table":        "jid",
+        "rowid_fields": ["sender_mapped_jid_id"],
+    },
+    {
+        # message_media's own rowid IS message_id -- see the module-level
+        # note above on why no new SELECT column was needed for this one.
+        "label":        "Media",
+        "file_key":     "msgstore",
+        "table":        "message_media",
+        "rowid_fields": ["message_id"],
+        # message_id is ALWAYS populated (it's every row's own PK), so it
+        # can't say whether THIS row's LEFT JOIN to message_media actually
+        # matched anything -- presence_fields checks the real joined value
+        # instead, so a plain text message (no media_media row at all)
+        # correctly drops this entry from the list rather than offering a
+        # jump that would only ever report "not found".
+        "presence_fields": ["media_path"],
+    },
+    {
+        "label":        "Location",
+        "file_key":     "msgstore",
+        "table":        "message_location",
+        "rowid_fields": ["message_id"],
+        "presence_fields": ["latitude"],
+    },
+    {
+        "label":        "Chat Contact",
+        "file_key":     "wa",
+        "table":        "wa_contacts",
+        "rowid_fields": ["chat_contact_id"],
+    },
+    {
+        "label":        "Sender Contact",
+        "file_key":     "wa",
+        "table":        "wa_contacts",
+        "rowid_fields": ["sender_contact_id"],
+    },
+    {
+        "label":        "Chat Mapped Contact",
+        "file_key":     "wa",
+        "table":        "wa_contacts",
+        "rowid_fields": ["chat_mapped_contact_id"],
+    },
+    {
+        "label":        "Sender Mapped Contact",
+        "file_key":     "wa",
+        "table":        "wa_contacts",
+        "rowid_fields": ["sender_mapped_contact_id"],
+    },
 ]
 
-# chat_id exists ONLY to feed the "Chat" record_source entry above — pure
-# plumbing, never useful as report content (an examiner already sees the
-# resolved chat_subject/chat_jid columns, and the no-chat-record fallback
-# case already cites the raw FK inline via raw_chat_row_id, a separate
-# field that stays visible). message_id and source_table stay visible:
-# message_id is the row's OWN id, not a joined table's, and source_table
-# is a citation label, not a raw key.
-hidden_fields = ["chat_id"]
+# chat_id, and every *_jid_id/*_contact_id field the entries above need,
+# exist ONLY to feed record_source — pure plumbing, never useful as report
+# content (an examiner already sees each one resolved into chat_subject/
+# chat_jid/remote_party_jid/remote_name/media_path/latitude+longitude
+# above; the no-chat-record fallback case additionally cites the raw FK
+# inline via raw_chat_row_id, a separate field that stays visible).
+# message_id and source_table stay visible: message_id is the row's OWN
+# id, not a joined table's, and source_table is a citation label, not a
+# raw key.
+hidden_fields = [
+    "chat_id", "chat_jid_id", "sender_jid_id",
+    "chat_mapped_jid_id", "sender_mapped_jid_id",
+    "chat_contact_id", "sender_contact_id",
+    "chat_mapped_contact_id", "sender_mapped_contact_id",
+]
 
 # Declarative only — no recovery code belongs here; see description above
 # for what was actually found.
@@ -148,12 +237,16 @@ def run(paths):
             sender_mapped_jid._id                                               AS sender_mapped_jid_id,
             COALESCE(chat_contact.display_name, chat_contact.wa_name,
                      chat_contact.given_name)                                   AS chat_contact_name,
+            chat_contact._id                                                    AS chat_contact_id,
             COALESCE(chat_jidmap_contact.display_name, chat_jidmap_contact.wa_name,
                      chat_jidmap_contact.given_name)                            AS chat_mapped_contact_name,
+            chat_jidmap_contact._id                                             AS chat_mapped_contact_id,
             COALESCE(sender_contact.display_name, sender_contact.wa_name,
                      sender_contact.given_name)                                 AS sender_contact_name,
+            sender_contact._id                                                  AS sender_contact_id,
             COALESCE(sender_jidmap_contact.display_name, sender_jidmap_contact.wa_name,
                      sender_jidmap_contact.given_name)                          AS sender_mapped_contact_name,
+            sender_jidmap_contact._id                                           AS sender_mapped_contact_id,
             m.chat_row_id                                                       AS raw_chat_row_id,
             m.timestamp                                                         AS sent_time,
             m.text_data                                                         AS text,
@@ -241,6 +334,23 @@ def run(paths):
                                  if r["media_path"] else ''),
             "latitude":         r["latitude"],
             "longitude":        r["longitude"],
+            # Plumbing only, for record_source below (see hidden_fields) --
+            # an examiner already sees these resolved into chat_jid/
+            # remote_party_jid/remote_name above; the bare id adds nothing
+            # as report content, only as a jump target. *_mapped_* ones are
+            # None on any row with no LID-privacy identity (the common
+            # case -- see the jid_map comment above), which is expected,
+            # not a gap: that record_source entry correctly reports "No
+            # record-location data on this row" rather than resolving to
+            # the wrong (non-mapped) jid/contact by falling back silently.
+            "chat_jid_id":            r["chat_jid_id"],
+            "sender_jid_id":          r["sender_jid_id"],
+            "chat_mapped_jid_id":     r["chat_mapped_jid_id"],
+            "sender_mapped_jid_id":   r["sender_mapped_jid_id"],
+            "chat_contact_id":        r["chat_contact_id"],
+            "sender_contact_id":      r["sender_contact_id"],
+            "chat_mapped_contact_id": r["chat_mapped_contact_id"],
+            "sender_mapped_contact_id": r["sender_mapped_contact_id"],
             "recovered":        False,
             "source_table":     "message",
         })

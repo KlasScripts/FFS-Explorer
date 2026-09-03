@@ -1,4 +1,6 @@
 name = "Chrome Downloads"
+app_group_label = "Chrome"
+group_sort_key = 3
 description = (
     "Chrome's own download manager records, from the downloads table in "
     "the same History database as the Web History Summary/Full reports. "
@@ -33,10 +35,15 @@ optional_files = {
 }
 
 timestamp_fields = {"start_time": "webkit_us", "end_time": "webkit_us", "last_access_time": "webkit_us"}
+# When, what file, and whether it completed are the essentials of a
+# download record; tab_url/danger_type/interrupt_reason/byte counts are
+# useful detail, not needed for a first pass.
+core_fields = ["start_time", "target_path", "state"]
 
 # downloads.id is confirmed "INTEGER PRIMARY KEY" in the real schema (a
 # genuine rowid alias).
 record_source = {
+    "label": "Download",
     "file_key": "history",
     "table": "downloads",
     "rowid_fields": ["raw_download_id"],

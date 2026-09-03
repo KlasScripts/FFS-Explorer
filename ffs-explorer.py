@@ -41,13 +41,12 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       upsert_device_info_field,
                       start_run_log, complete_run_log, load_last_run,
                       load_run_history,
-                      save_nested_archive, save_nested_archive_entries,
-                      save_nested_archive_failure,
                       load_nested_archives, load_nested_archive_entries,
                       load_bookmark_groups, save_bookmark_group,
                       save_bookmark_entries, load_bookmark_entries,
                       delete_bookmark_group)
 import header_scan
+import nested_archive
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
 from keyword_search import KeywordSearchMixin
@@ -2236,7 +2235,7 @@ class NestedArchiveWorker(QThread):
     """Extracts Archive-type files from the FFS zip, repacks as ZIP_STORED,
     saves to case_dir/nested_archives/, and records each in casecache.db."""
 
-    progress      = Signal(int, int)      # (done, total)
+    progress      = Signal(int, int, str) # (done, total, ui_path currently being processed)
     item_done     = Signal(str, bool)    # (ui_path, success)
     item_error    = Signal(str, str)     # (ui_path, error_message)
     types_updated = Signal(dict)         # {ui_path: "JSON — gzip", ...}
@@ -2288,7 +2287,7 @@ class NestedArchiveWorker(QThread):
         for i, ui_path in enumerate(self._candidates):
             if self.isInterruptionRequested():
                 break
-            self.progress.emit(i, total)
+            self.progress.emit(i, total, ui_path)
             if ui_path in completed:
                 skipped += 1
                 ok += 1
@@ -2302,7 +2301,7 @@ class NestedArchiveWorker(QThread):
             else:
                 err += 1
             self.item_done.emit(ui_path, success)
-        self.progress.emit(total, total)
+        self.progress.emit(total, total, '')
         if gzip_types:
             self.types_updated.emit(gzip_types)
         self.finished.emit(ok, err)
@@ -2312,104 +2311,37 @@ class NestedArchiveWorker(QThread):
 
         compound_type is set for gzip files where the decompressed content
         type is known, e.g. 'JSON — gzip'.  None for zip files or unknown.
+
+        Thin wrapper (since 2026-08-30) around nested_archive.extract_one —
+        the actual extraction/decompression/DB-recording logic now lives
+        there, shared with artifact_runner.py's own requires_nested_
+        extraction (a parser declaring it needs a specific embedded
+        archive extracted first — see WRITING_ARTIFACT_PARSERS.md), so
+        there's exactly one implementation of "how to extract a nested
+        archive." This wrapper keeps the two things that ARE genuinely
+        GUI-specific: emitting item_error for progress reporting, and the
+        examiner-facing nested_archive_errors.log file (a parser-
+        triggered extraction doesn't write to that log — its own failure
+        just means the declared path stays absent from paths, handled by
+        whatever the parser's own run() does when a key it expected is
+        missing, same as any other optional_files miss).
         """
-        try:
-            physical  = self._adapter.resolve(ui_path)
-            meta      = self._ui_metadata.get(ui_path, {})
-            file_size = meta.get('size', 0)
-
-            # ── Read raw bytes from FFS zip ───────────────────────────────────
-            with zipfile.ZipFile(self._zip_path, 'r') as zf:
-                raw = zf.read(physical)
-
-            key             = hashlib.sha1(ui_path.encode()).hexdigest()[:12]
-            basename        = os.path.basename(ui_path) or 'content'
-            stored_filename = f"{key}_{basename}"
-            out_path        = os.path.join(out_dir, stored_filename)
-
-            if raw[:2] == b'\x1f\x8b':
-                # ── Gzip: decompress and store the raw decompressed file ──────
-                decompressed = gzip.decompress(raw)
-                with open(out_path, 'wb') as f:
-                    f.write(decompressed)
-                child_name = (basename[:-3] if basename.lower().endswith('.gz')
-                              else basename)
-                ft = _get_file_type(child_name)
-                if ft == 'Other' and decompressed:
-                    ft = header_scan.classify_magic(decompressed[:16]) or 'Other'
-                gz_mtime = struct.unpack_from('<I', raw, 4)[0] if len(raw) >= 8 else 0
-                gz_mdate = (datetime.fromtimestamp(gz_mtime, tz=timezone.utc)
-                            .strftime('%Y-%m-%d %H:%M:%S') if gz_mtime else None)
-                content_rows  = [(child_name, gz_mdate, len(decompressed), ft)]
-                entry_count   = 1
-                compound_type = f"{ft} — gzip" if ft != 'Other' else None
-
-            else:
-                # ── ZIP: repack as ZIP_STORED ─────────────────────────────────
-                tmp_path = out_path + '.tmp'
-                if file_size > self._MEM_LIMIT:
-                    with open(tmp_path, 'wb') as f:
-                        f.write(raw)
-                    src_arg = tmp_path
-                else:
-                    src_arg = None
-
-                entry_count   = 0
-                content_rows  = []
-                compound_type = None
-                src_handle   = open(src_arg, 'rb') if src_arg else io.BytesIO(raw)
-                try:
-                    with zipfile.ZipFile(src_handle, 'r') as src_zip, \
-                         zipfile.ZipFile(out_path, 'w',
-                                         compression=zipfile.ZIP_STORED) as dst_zip:
-                        for info in src_zip.infolist():
-                            if info.filename.endswith('/'):
-                                continue   # skip directory entries
-                            data = src_zip.read(info.filename)
-                            dst_zip.writestr(info, data,
-                                             compress_type=zipfile.ZIP_STORED)
-                            entry_count += 1
-                            name = info.filename
-                            ft   = _get_file_type(name.rsplit('/', 1)[-1])
-                            if ft == 'Other' and data:
-                                ft = header_scan.classify_magic(data[:16]) or 'Other'
-                            dt    = info.date_time
-                            mdate = (f"{dt[0]:04d}-{dt[1]:02d}-{dt[2]:02d} "
-                                     f"{dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}"
-                                     if any(dt) else None)
-                            content_rows.append((info.filename, mdate,
-                                                 info.file_size, ft))
-                finally:
-                    if src_arg:
-                        src_handle.close()
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-
-            # ── Record in casecache.db ────────────────────────────────────────
-            with closing(_open_cache_db(self._case_dir)) as db:
-                save_nested_archive(db, ui_path, stored_filename,
-                                    file_size, entry_count)
-                save_nested_archive_entries(db, ui_path, content_rows)
-            return True, compound_type
-
-        except Exception as exc:
-            msg = str(exc)
-            self.item_error.emit(ui_path, msg)
-            try:
-                with closing(_open_cache_db(self._case_dir)) as db:
-                    save_nested_archive_failure(db, ui_path, msg)
-            except Exception:
-                pass
+        physical  = self._adapter.resolve(ui_path)
+        meta      = self._ui_metadata.get(ui_path, {})
+        file_size = meta.get('size', 0)
+        success, compound_type, err = nested_archive.extract_one(
+            self._zip_path, self._case_dir, ui_path, physical, file_size,
+            _get_file_type)
+        if not success:
+            self.item_error.emit(ui_path, err or 'unknown error')
             try:
                 log_path = os.path.join(self._case_dir, 'nested_archive_errors.log')
                 ts = datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
                 with open(log_path, 'a', encoding='utf-8') as lf:
-                    lf.write(f"[{ts}] FAILED: {ui_path}\n  {msg}\n")
+                    lf.write(f"[{ts}] FAILED: {ui_path}\n  {err}\n")
             except OSError:
                 pass
-            return False, None
+        return success, compound_type
 
 
 _SHA256_HEX_RE = re.compile(rb'[0-9a-fA-F]{64}')
@@ -3177,9 +3109,15 @@ class ProcessDialog(QDialog):
         self._nested_worker.finished.connect(self._on_nested_done)
         self._nested_worker.start()
 
-    def _on_nested_progress(self, done: int, total: int):
+    def _on_nested_progress(self, done: int, total: int, ui_path: str):
+        # Clearly named phase ("Nested archive extraction", never just
+        # "Processing…") plus the exact file currently being decompressed
+        # — direct feedback that a bare count wasn't informative enough
+        # to tell at a glance what this step was actually doing.
+        name = ui_path.rsplit('/', 1)[-1] if ui_path else ''
+        suffix = f" — {name}" if name else ""
         self._status_label.setText(
-            f"Extracting nested archives: {done:,} / {total:,}")
+            f"Nested archive extraction: {done:,} / {total:,}{suffix}")
 
     def _on_nested_error(self, ui_path: str, msg: str):
         self._nested_errors.append(f"{os.path.basename(ui_path)}: {msg}")

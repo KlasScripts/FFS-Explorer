@@ -25,6 +25,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 
 
 def dev_credentials_path() -> str:
@@ -71,8 +72,9 @@ class McpServerController:
 
         persist_dev=True reuses the port+token last saved to
         dev_credentials_path() (or a fresh free port when that exact port is
-        no longer free — token still reused) instead of regenerating both
-        every call, and re-saves after picking them. See module docstring."""
+        still unavailable after a brief retry — token still reused) instead
+        of regenerating both every call, and re-saves after picking them.
+        See module docstring."""
         if self.running:
             return self.port, self.token
         import uvicorn                       # lazy — optional dependency
@@ -82,8 +84,8 @@ class McpServerController:
         port = None
         if persist_dev:
             port, token = _load_dev_credentials()
-            if port is not None and not self._port_free(port):
-                port = None      # last-used port taken by something else
+            if port is not None and not self._port_free_retry(port):
+                port = None      # still taken after retrying — genuinely gone
         self.token = token or secrets.token_urlsafe(16)
         self.port = port if port is not None else self._free_port()
         if persist_dev:
@@ -145,3 +147,27 @@ class McpServerController:
                 return True
             except OSError:
                 return False
+
+    @staticmethod
+    def _port_free_retry(port: int, attempts: int = 5, delay: float = 0.2) -> bool:
+        """Same check as _port_free, retried briefly before giving up.
+
+        Confirmed real cause of a persisted dev port silently drifting to a
+        new value: relaunching this app can start a new process before the
+        PREVIOUS one has actually released its listening socket yet (the
+        old process may still be mid-shutdown) — _port_free's SO_REUSEADDR
+        only rules out a TIME_WAIT false-positive, it does nothing for a
+        genuinely-still-bound socket from a process that hasn't exited yet.
+        Abandoning the persisted port on the very first check silently
+        breaks every already-configured external MCP client (Claude Code's
+        `claude mcp add`, LM Studio's mcp.json, ...) still pointed at the
+        old port, with no obvious symptom beyond "the connection is red"
+        and no indication why. A short bounded retry (~1s total) rides out
+        that ordinary startup race; a port that's still taken after this
+        many attempts is presumably held by something else entirely, and
+        falling back to a fresh port remains correct in that case."""
+        for _ in range(attempts):
+            if McpServerController._port_free(port):
+                return True
+            time.sleep(delay)
+        return False

@@ -25,7 +25,7 @@ _SEARCH_ENTRIES_VERSION = '1'
 
 # Bump whenever the schema changes incompatibly.
 # Cache DB is auto-deleted on mismatch; results DB raises OldSchemaError.
-_CACHE_SCHEMA_VERSION   = 14
+_CACHE_SCHEMA_VERSION   = 15
 _RESULTS_SCHEMA_VERSION = 1
 
 
@@ -185,6 +185,7 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
             hidden_vault_storage_other INTEGER,
             encryption_caveat    TEXT,
             scanned_at           INTEGER NOT NULL,
+            embedded_archives_json TEXT NOT NULL DEFAULT '[]',
             PRIMARY KEY (platform, app_id)
         )
     ''')
@@ -676,8 +677,9 @@ def save_app_intelligence(conn: 'sqlite3.Connection', rows: list) -> None:
         'hidden_vault_storage_path, hidden_vault_storage_bytes, '
         'hidden_vault_storage_other, encryption_caveat, scanned_at, '
         'preferences_modified, preferences_modified_utc, '
-        'splash_snapshot_modified, splash_snapshot_modified_utc) '
-        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'splash_snapshot_modified, splash_snapshot_modified_utc, '
+        'embedded_archives_json) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [(r['platform'], r['app_id'], r['display_name'], json.dumps(r['containers']),
           r['total_bytes'], r['file_count'], r['media_file_count'], r['last_activity'],
           r['last_activity_utc'], r['data_created'],
@@ -696,7 +698,8 @@ def save_app_intelligence(conn: 'sqlite3.Connection', rows: list) -> None:
           (r['hidden_vault_storage'] or {}).get('other_stores'),
           r['encryption_caveat'], r['scanned_at'],
           r['preferences_modified'], r['preferences_modified_utc'],
-          r['splash_snapshot_modified'], r['splash_snapshot_modified_utc'])
+          r['splash_snapshot_modified'], r['splash_snapshot_modified_utc'],
+          json.dumps(r['embedded_archives']))
          for r in rows],
     )
     conn.commit()
@@ -722,7 +725,8 @@ def load_app_intelligence(conn: 'sqlite3.Connection') -> list:
         'hidden_vault_storage_path, hidden_vault_storage_bytes, '
         'hidden_vault_storage_other, encryption_caveat, scanned_at, '
         'preferences_modified, preferences_modified_utc, '
-        'splash_snapshot_modified, splash_snapshot_modified_utc '
+        'splash_snapshot_modified, splash_snapshot_modified_utc, '
+        'embedded_archives_json '
         'FROM app_intelligence ORDER BY rowid'
     ).fetchall()
     out = []
@@ -749,6 +753,7 @@ def load_app_intelligence(conn: 'sqlite3.Connection') -> list:
             'scanned_at': r[31],
             'preferences_modified': r[32], 'preferences_modified_utc': r[33],
             'splash_snapshot_modified': r[34], 'splash_snapshot_modified_utc': r[35],
+            'embedded_archives': json.loads(r[36]),
         })
     return out
 

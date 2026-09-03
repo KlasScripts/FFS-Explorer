@@ -1,8 +1,10 @@
 """hex_viewer.py — hex-viewer constants, worker, and FastZipBrowser mixin."""
 
+import os
 import warnings
 import zipfile
 
+from header_scan import sniff_media_kind
 from zip_entry import ZipEntry
 from zip_reader import read_nested_entry
 from PySide6.QtWidgets import (
@@ -340,6 +342,7 @@ class HexViewerMixin:
         self.hex_view.setPlainText(self._render_hex(chunk))
         self._fit_hex_font()
         self._update_hex_label()
+        self._sync_text_preview(data, label)
 
     def _load_hex_preview_from_bytes_at(self, data: bytes, label: str,
                                          offset: int, length: int = 0) -> None:
@@ -367,6 +370,7 @@ class HexViewerMixin:
         self.hex_view.setPlainText(self._render_hex(chunk, win_start))
         self._fit_hex_font()
         self._update_hex_label()
+        self._sync_text_preview(data, label)
         QTimer.singleShot(0, lambda o=offset, l=length: self._jump_to_hex_range(o, l))
 
     def _open_hex_from_search(self, physical_path: str, display_label: str,
@@ -766,13 +770,53 @@ class HexViewerMixin:
         self.text_label.setText('')
         self.text_view.clear()
 
+    def _sync_text_preview(self, data: bytes, label: str) -> None:
+        """Keep the Text tab's content in step with whatever the Hex tab
+        just loaded — populated so it's ready the moment the examiner
+        switches tabs themselves, never forcing them off Hex the way
+        _load_text_preview's own tab-switch would (this is the one place
+        that actually keeps the Text tab populated; that older method has
+        no other caller left, kept only for a future direct "view as
+        text" action that would legitimately want the switch).
+
+        Classifies via sniff_media_kind (extension first, magic-byte/
+        is_text fallback below TEXT_SIZE_LIMIT) — 'text' or 'webpage'
+        (an MHTML archive's raw MIME source is real, readable text too,
+        independent of its own separate rendered view) decodes the FULL
+        buffer with no size cap of any kind, deliberately: an .mhtml
+        archive is exactly the multi-megabyte case is_text()'s own
+        TEXT_SIZE_LIMIT gate would otherwise reject, which is why that
+        format gets its own unconditional extension-based classification
+        in the first place (see WEBPAGE_ARCHIVE_EXTENSIONS' own comment)
+        — QPlainTextEdit, unlike QTextEdit, is built for documents this
+        size. Anything else (image/video/pdf/a binary database file/
+        unrecognized) clears the tab instead of decoding replacement-
+        character noise from binary bytes, so stale text from a
+        PREVIOUS, unrelated file never lingers under a new one that
+        isn't text at all — large binary files are cheap to rule out
+        here too: sniff_media_kind's own magic-byte/is_text fallback
+        only ever runs below TEXT_SIZE_LIMIT, so a multi-megabyte binary
+        database short-circuits to None immediately rather than
+        scanning its full content first."""
+        ext = os.path.splitext(label)[1].lower()
+        kind = sniff_media_kind(ext, data)
+        if kind in ('text', 'webpage'):
+            self.text_label.setText(label)
+            self.text_view.setPlainText(data.decode('utf-8', errors='replace'))
+        else:
+            self._clear_text_preview()
+
     def _clear_hex_preview(self, message: str = "No file selected") -> None:
         """Wipe the Hex tab without switching to it — used when the thing
         that populated it (e.g. an Artifact report row) is no longer the
         active selection, so stale evidence bytes don't linger once the
         examiner has moved on to something unrelated. *message* lets a
         caller explain WHY nothing is shown (e.g. "Record location not
-        available for this parser yet") rather than the generic default."""
+        available for this parser yet") rather than the generic default.
+        Clears the Text tab too — see _sync_text_preview, its counterpart
+        on the loading side — so the two tabs never fall out of step,
+        one showing stale content for a file the other has already
+        moved on from."""
         self._stop_hex_worker()
         self._hex_entry        = None
         self._hex_file_size    = 0
@@ -782,6 +826,7 @@ class HexViewerMixin:
         self.hex_progress_bar.hide()
         self.hex_view.clear()
         self.hex_label.setText(message)
+        self._clear_text_preview()
 
     def _load_text_preview(self, text: str, label: str) -> None:
         """Display *text* in the Text tab with *label* shown above it."""
@@ -792,10 +837,27 @@ class HexViewerMixin:
     # ── Raw byte reader ───────────────────────────────────────────────────────
 
     def _read_zip_bytes(self, ui_path: str, max_bytes: int = -1) -> bytes | None:
-        """Read raw (stored/decompressed) bytes for *ui_path* from the FFS zip.
+        """Read raw (stored/decompressed) bytes for *ui_path* from the FFS
+        zip — OR, if *ui_path* is an absolute local filesystem path, read
+        it directly from disk instead. An archive ui_path is never
+        absolute (always a relative virtual path like "data/data/..."),
+        so this needs no new field convention to distinguish the two —
+        every existing media_fields/record_source caller already just
+        works unchanged. Exists for a parser's own DERIVED file living in
+        case_dir/artifact_parser_files/<name>/ (see _parser_files_dir in
+        artifact_runner.py) — e.g. chrome_cache.py's synthesized .mhtml
+        reconstructions, assembled from several separately-cached
+        resources rather than being a copy of any single original
+        evidence file.
 
         max_bytes=-1 reads the entire entry.  Returns None on any error.
         """
+        if os.path.isabs(ui_path):
+            try:
+                with open(ui_path, 'rb') as f:
+                    return f.read(max_bytes) if max_bytes >= 0 else f.read()
+            except OSError:
+                return None
         physical = self._adapter.resolve(ui_path)
         try:
             zinfo = self._get_zip_handle().getinfo(physical)

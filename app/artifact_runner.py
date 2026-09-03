@@ -118,6 +118,39 @@ HOW) and has real code elsewhere doing the actual work:
                        found unreliable (e.g. a flag that turned out
                        constant regardless of truth) — the raw recovered
                        value is never altered, just labeled.
+    recovery_source_labels dict[str, str] — {table_name: friendly_label},
+                       matched against recoverable_tables entries. Optional
+                       — every recovered row gets a `source` field either
+                       way (see below), this only controls how readable it
+                       is. Needed because a carved row never runs through
+                       this script's own run(), so it can't set `source`
+                       itself the way a live row does; if this script's
+                       `core_fields` includes "source", a carved row would
+                       otherwise show blank there instead of merely
+                       ragged. The runner fills `source` on every recovered
+                       row automatically: `f"Carved — {label or table}"`,
+                       with an `" (unverified match)"` suffix appended when
+                       `recovery_method == "header_signature"` (no rowid at
+                       all — the weakest of the four carving paths, and the
+                       only one that can be a genuine truncated/false-
+                       positive match rather than a structurally-confirmed
+                       row; see sqlite_carve.py's own carve_by_header_
+                       signature docstring), upgraded to
+                       `" (likely false positive — ...)"` naming the exact
+                       reason when sqlite_carve's own confidence gate finds
+                       one — a NOT NULL live-schema column decoded blank, or
+                       a timestamp_fields-declared column decoding outside a
+                       plausible range (before 2000-01-01 UTC, or in the
+                       future). See recover_deleted_rows' `notnull_
+                       violations`/`timestamp_issues` and sqlite_carve.
+                       notnull_columns/_timestamp_plausible. The row is
+                       never withheld either way, only the label — this
+                       project's standing escalate-don't-silently-discard
+                       rule. Declare this whenever a
+                       parser's recoverable_tables spans more than one
+                       underlying table/database an examiner would
+                       otherwise have to infer from a bare SQL table name —
+                       see artifacts/android/chrome_web_history.py.
     media_fields list[str] — output field names holding an archive ui_path
                        (never a filesystem path, never bytes the parser
                        copied itself) to an attachment/media file; rendered
@@ -138,8 +171,13 @@ HOW) and has real code elsewhere doing the actual work:
                        own output rows are actually built from — a single
                        table needs one entry, a JOINed report (most of
                        them) typically wants one per joined table too. Each
-                       entry: {"label": str (only needed with >1 entry —
-                       shown in a picker), "file_key": str (a files/
+                       entry: {"label": str (recommended even for a single
+                       entry — the Hex panel's picker is always visible now,
+                       not just with >1 entry, so an omitted label falls
+                       back to the entry's own table name rather than
+                       showing nothing there; declare it explicitly for a
+                       clearer examiner-facing name than a bare SQL table),
+                       "file_key": str (a files/
                        optional_files key), "table_field": str (an output
                        field naming the source table, when it varies per
                        row) OR "table": str (a fixed table name, when it
@@ -147,11 +185,55 @@ HOW) and has real code elsewhere doing the actual work:
                        fields to try in order for the row's rowid in that
                        table — list more than one when a live row and a
                        recoverable_tables-carved row use different field
-                       names for the same concept)}. See
+                       names for the same concept), "source_match":
+                       list[str] (optional — only needed when this
+                       script's run() merges more than one live query
+                       into one report, e.g. chrome_web_history.py's
+                       Chrome History rows vs. Segmentation Platform
+                       rows; lists the "source" output-field values this
+                       entry applies to), "presence_fields": list[str]
+                       (optional — only needed when rowid_fields alone
+                       can't say whether this entry's OWN join matched
+                       for a given row, e.g. android/whatsapp.py's Media/
+                       Location entries, whose rowid is a value BORROWED
+                       from the row's own always-present message_id
+                       rather than re-selected from their own table;
+                       checks the actual joined column, e.g. "media_path",
+                       instead)}. A LIVE row only ever offers entries
+                       whose source_match includes its own "source" value
+                       (or that declare no source_match at all — the
+                       original, still-common single-query case, entirely
+                       unaffected) AND whose presence_fields (or, absent
+                       that, rowid_fields) has a real value on THIS row —
+                       a LEFT JOIN that found nothing for this particular
+                       row has nowhere to jump, so it's dropped from the
+                       list rather than offered as a dead end; this second
+                       check is genuinely per-row, not per-query — two
+                       rows from the same query can differ here depending
+                       on which of that query's own joins matched for
+                       each one. The Hex panel builds the combo fresh per
+                       row selection from just that subset, defaulting to
+                       the first matching entry (that query's own main
+                       table); picking a different one from the dropdown
+                       is how an examiner reaches a join. A CARVED row
+                       ignores source_match AND presence_fields entirely
+                       (it already knows exactly which table it was
+                       recovered from via source_table) — matched by
+                       table name instead, narrowed further by file_key
+                       only if more than one entry shares that bare table
+                       name (the identical collision recoverable_tables'
+                       own file_key pinning already exists to resolve at
+                       carve time — a recovered row carries
+                       source_file_key for exactly this). See
                        artifacts/ios/whatsapp.py for a worked 4-entry
-                       example, and CLAUDE.md's Conventions for the full
-                       writeup (including why it needs real-schema
-                       verification before declaring, not after).
+                       single-query example,
+                       artifacts/android/whatsapp.py for a worked
+                       12-entry example needing presence_fields,
+                       artifacts/android/chrome_web_history.py for a
+                       worked source_match example, and CLAUDE.md's
+                       Conventions for the full writeup (including why it
+                       needs real-schema verification before declaring,
+                       not after).
 
 Parser helpers — small, generic utilities importable directly from a
 script's own run() (`from artifact_runner import first_nonempty`), for a
@@ -180,6 +262,7 @@ import zipfile
 
 import nska_deserialize
 
+import nested_archive
 from zip_entry import ZipEntry
 
 if getattr(sys, 'frozen', False):
@@ -384,6 +467,26 @@ def _save_entry(zip_entry: ZipEntry, dest_path: str) -> None:
         f.write(data)
 
 
+def _make_zip_byte_reader(zip_path: str, zip_obj: zipfile.ZipFile | None):
+    """Returns a callable(physical_path) -> bytes | None that reads one
+    archive entry's bytes directly, no disk write — same ZipEntry path
+    _extract_candidate already uses for a normal files/optional_files
+    extraction, just without saving a copy. For _read_zip_bytes (see
+    run_artifact) — a parser that needs to read MANY files by name rather
+    than a fixed/globbed set. Best-effort like every other reserved-key
+    helper here: None (never raises) on any failure, including when
+    zip_obj itself wasn't supplied."""
+    def _read(physical_path: str) -> bytes | None:
+        if zip_obj is None:
+            return None
+        try:
+            zinfo = zip_obj.getinfo(physical_path)
+            return ZipEntry(zip_path, physical_path, zinfo).read()
+        except Exception:
+            return None
+    return _read
+
+
 def _extract_candidate(
     candidates: list[str],
     zip_path: str,
@@ -407,7 +510,8 @@ def _extract_candidate(
     return False
 
 
-def _recover_deleted_rows(paths: dict, table: str, field_notes: dict) -> list[dict]:
+def _recover_deleted_rows(paths: dict, table: str, field_notes: dict,
+                          file_key: str = None, timestamp_fields: dict = None) -> list[dict]:
     """One entry of a parser's `recoverable_tables` -> extra rows from
     app/sqlite_carve.py's freeblock/freed-page/WAL-history scan, or [] if
     nothing survived, the module can't be imported, or anything about the
@@ -417,12 +521,20 @@ def _recover_deleted_rows(paths: dict, table: str, field_notes: dict) -> list[di
     matching entry (if any) of a parser's optional `recovery_field_notes`
     — also declarative, a caveat string per column the parser's own
     cross-checking found unreliable, attached to the recovered row rather
-    than silently dropped or (worse) "corrected" to a guess."""
+    than silently dropped or (worse) "corrected" to a guess. *file_key*
+    is passed straight through to sqlite_carve.recover_deleted_rows — see
+    its own docstring for when a parser needs it (two of its own database
+    files defining a same-named table). *timestamp_fields* is the parser's
+    own module-level declaration, passed through so a header_signature
+    candidate's declared timestamp column can be checked for plausibility
+    — see recovery_source_labels below and sqlite_carve.recover_deleted_
+    rows' own docstring."""
     try:
         import sqlite_carve
     except ImportError:
         return []
-    return sqlite_carve.recover_deleted_rows(paths, table, field_notes)
+    return sqlite_carve.recover_deleted_rows(
+        paths, table, field_notes, file_key=file_key, timestamp_fields=timestamp_fields)
 
 
 # ── Running ───────────────────────────────────────────────────────────────────
@@ -595,6 +707,108 @@ def run_artifact(
         # to disk by the parser itself. See media_fields on the module and
         # artifacts/ios/whatsapp.py's `attachment_path` for the convention.
         paths['_app_base_ui_path'] = app_base
+
+        # Reserved keys for a parser that needs to enumerate/read MANY
+        # files by name rather than a fixed/globbed files/optional_files
+        # set — e.g. chrome_cache.py, which has to read every entry in a
+        # whole directory (Chrome's Simple Cache: thousands of
+        # arbitrarily-named files, no fixed set to declare up front).
+        # _zip_names is the full archive namelist (the parser filters it
+        # itself, e.g. by path prefix); _read_zip_bytes(name) reads one
+        # entry's bytes directly, no disk write. Both best-effort, same
+        # as _app_base_ui_path's own convention.
+        paths['_zip_names'] = zip_names
+        paths['_read_zip_bytes'] = _make_zip_byte_reader(zip_path, zip_obj)
+        # zip_names above is the ARCHIVE'S OWN PHYSICAL namelist (whatever
+        # zip_obj.namelist() returns — e.g. a "Dump/" root-folder prefix
+        # for a zip_extras-format archive), never the ui_path convention
+        # every OTHER reserved path here uses. A parser that needs to
+        # filter it by a ui_path-style prefix (e.g. chrome_cache.py
+        # scoping to "<app_base>/cache/Cache/Cache_Data/") MUST resolve
+        # that prefix through the adapter first — comparing a bare
+        # ui_path string against physical zip_names directly never
+        # matches on a real archive. Exposed here so a parser can do that
+        # resolution itself rather than guessing at the archive's own
+        # physical layout.
+        paths['_adapter'] = adapter
+        # This parser's own case_dir/artifact_parser_files/<name>/ folder
+        # (already created above for normal files/optional_files
+        # extraction) — for a parser that legitimately needs to write a
+        # DERIVED file rather than an extracted evidence copy, e.g.
+        # chrome_cache.py's synthesized .mhtml reconstructions (each one
+        # assembled from several separately-cached resources — not a copy
+        # of any single original evidence file, so media_fields' own
+        # "never bytes copied by the parser itself" rule, written for
+        # extracted-evidence paths, doesn't apply to it the same way). A
+        # media_fields value pointing HERE (an absolute local path) is
+        # read directly from disk rather than resolved against the
+        # archive — see hex_viewer._read_zip_bytes, which distinguishes
+        # the two by os.path.isabs(): an archive ui_path is never
+        # absolute, so this needs no new field convention at all.
+        paths['_parser_files_dir'] = dest_dir
+
+        # requires_nested_extraction (see WRITING_ARTIFACT_PARSERS.md): a
+        # parser declaring it needs a SPECIFIC embedded archive extracted
+        # before its own files/optional_files resolution can find what it
+        # needs — a file living inside an unextracted nested zip simply
+        # doesn't exist in the outer zip's own namelist yet, and would
+        # otherwise fail resolution below with a generic "file not
+        # found", indistinguishable from something genuinely absent. Per
+        # this project's core design principle (never do blanket work —
+        # the examiner's own "decompress everything" / per-file dialog /
+        # do-nothing-at-all choices are all deliberately manual, see
+        # ProcessDialog), this is scoped to EXACTLY the path(s) one
+        # parser declares, using the SAME shared extraction code
+        # (nested_archive.py) and the SAME on-disk record the examiner's
+        # own manual "Extract as Nested Archive" action writes — either
+        # one satisfies the other; a prior manual extraction is reused
+        # here (already_extracted), and an extraction triggered here is
+        # equally visible to the examiner afterward. The result is
+        # exposed via a reserved paths['_nested_archives'] dict (keyed by
+        # the archive's own ui_path -> its on-disk extracted-zip path) —
+        # the parser's own run() reads from it directly with plain
+        # zipfile calls, the same "give a reference, let run() use it"
+        # shape _app_base_ui_path above already established, not a new
+        # files/optional_files resolution path of its own. A declared
+        # archive that can't be found or fails to extract is recorded in
+        # paths['_nested_archive_errors'] ({ui_path: message}) rather
+        # than aborting the whole parser run — matching optional_files'
+        # own "missing is fine, run() decides what to do" philosophy,
+        # since a parser's own run() is in the best position to judge
+        # whether one specific nested archive is essential or optional.
+        nested_paths: dict[str, str] = {}
+        nested_errors: dict[str, str] = {}
+        for subpath in getattr(module, 'requires_nested_extraction', ()):
+            resolved = _resolve_glob_subpath(app_base, subpath, adapter, zip_names)
+            if resolved is None:
+                nested_errors[subpath] = 'not found in archive'
+                continue
+            ui_path = f"{app_base}/{resolved.lstrip('/')}"
+            if not nested_archive.already_extracted(case_dir, ui_path):
+                physical = adapter.resolve(ui_path)
+                try:
+                    info = zip_obj.getinfo(physical) if zip_obj is not None else None
+                except KeyError:
+                    info = None
+                if info is None:
+                    nested_errors[ui_path] = 'not found in archive'
+                    continue
+                success, _compound_type, err = nested_archive.extract_one(
+                    zip_path, case_dir, ui_path, physical, info.file_size,
+                    get_file_type=lambda _name: 'Other')
+                if not success:
+                    nested_errors[ui_path] = err or 'extraction failed'
+                    continue
+            extracted = nested_archive.extracted_path(case_dir, ui_path)
+            if extracted:
+                nested_paths[ui_path] = extracted
+            else:
+                nested_errors[ui_path] = 'extraction reported success but output file missing'
+        if nested_paths:
+            paths['_nested_archives'] = nested_paths
+        if nested_errors:
+            paths['_nested_archive_errors'] = nested_errors
+
         for key, subpath in module.files.items():
             resolved = _resolve_glob_subpath(app_base, subpath, adapter, zip_names)
             if resolved is None:
@@ -619,8 +833,50 @@ def run_artifact(
         except Exception as exc:
             return [], f"{script_name}: {exc}"
         all_notes = getattr(module, 'recovery_field_notes', {})
-        for table in getattr(module, 'recoverable_tables', ()):
-            rows = rows + _recover_deleted_rows(paths, table, all_notes.get(table, {}))
+        all_labels = getattr(module, 'recovery_source_labels', {})
+        all_timestamp_fields = getattr(module, 'timestamp_fields', {})
+        for entry in getattr(module, 'recoverable_tables', ()):
+            # A bare string is the common case (search every extracted
+            # file for this table name). A (file_key, table) tuple pins
+            # the search to one specific file — needed when two of a
+            # parser's own database files define a same-named table; see
+            # sqlite_carve.recover_deleted_rows' docstring.
+            if isinstance(entry, tuple):
+                file_key, table = entry
+            else:
+                file_key, table = None, entry
+            recovered = _recover_deleted_rows(paths, table, all_notes.get(table, {}),
+                                              file_key=file_key, timestamp_fields=all_timestamp_fields)
+            # A carved row never runs through this module's own run(), so
+            # it can't set `source` the way a live row does — without this,
+            # a report whose core_fields includes "source" shows a blank
+            # cell for exactly the rows where provenance matters most. See
+            # recovery_source_labels above. header_signature carves have no
+            # rowid at all (the other three paths are pre-filtered to an
+            # exact column-count match against the live schema before ever
+            # reaching here) — flagged as the weaker match it structurally
+            # is, not asserted as equally confirmed. sqlite_carve already
+            # cross-checked each header_signature row's NOT NULL columns and
+            # any declared timestamp field for plausibility (see
+            # notnull_violations/timestamp_issues on the row) — a genuine
+            # hit there escalates the label past the generic "(unverified
+            # match)" rather than silently dropping the row; the row itself
+            # is never withheld either way, per this project's standing
+            # escalate-don't-discard rule.
+            label = all_labels.get(table, table)
+            for r in recovered:
+                if r.get('recovery_method') == 'header_signature':
+                    reasons = []
+                    if r.get('notnull_violations'):
+                        reasons.append('NOT NULL columns blank: ' + ', '.join(r['notnull_violations']))
+                    if r.get('timestamp_issues'):
+                        reasons.append('implausible timestamp: ' + ', '.join(r['timestamp_issues']))
+                    confidence = (f' (likely false positive — {"; ".join(reasons)})' if reasons
+                                 else ' (unverified match)')
+                else:
+                    confidence = ''
+                r.setdefault('source', f"Carved — {label}{confidence}")
+            rows = rows + recovered
         return rows, ''
 
     # ── Single-file API (legacy) ──────────────────────────────────────────────

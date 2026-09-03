@@ -1,4 +1,6 @@
 name = "Chrome Offline Pages"
+app_group_label = "Chrome"
+group_sort_key = 6
 description = (
     "Full-page offline snapshots (.mhtml -- complete HTML + inline "
     "resources, openable/readable directly) Chrome automatically saves "
@@ -56,10 +58,15 @@ timestamp_fields = {
 }
 
 media_fields = ["archive_ui_path"]
+# What page was snapshotted, its real URL, and when are the essentials;
+# client_namespace/access_count/file_size/etc. are useful detail, not
+# needed for a first pass.
+core_fields = ["title", "online_url", "creation_time"]
 
 # offline_id is confirmed "INTEGER PRIMARY KEY NOT NULL" in the real
 # schema (a genuine rowid alias).
 record_source = {
+    "label": "Offline Page",
     "file_key": "metadata_db",
     "table": "offlinepages_v1",
     "rowid_fields": ["offline_id"],

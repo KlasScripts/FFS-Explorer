@@ -54,6 +54,7 @@ recoverable_tables = ["DbMessage"]
 # BurnerEntity/ContactEntity (attached as main_db, looked up by phone
 # number rather than by rowid above) aren't; a follow-up, not done here.
 record_source = {
+    "label":        "Burner Message",
     "file_key":     "messages",
     "table_field":  "source_table",
     "rowid_fields": ["raw_message_id", "raw_rowid"],

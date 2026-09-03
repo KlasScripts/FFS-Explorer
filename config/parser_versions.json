@@ -5,19 +5,61 @@
     "android:burner": {
       "changelog": {
         "2": "Added record_source: single-table Record-mode hex jump into DbMessage (the parser's live-query table) \u2014 the first non-WhatsApp parser wired for this feature.",
-        "3": "Use shared missing_ref_label() instead of inline f-string for the no-burner-record fallback (no output change)."
+        "3": "Use shared missing_ref_label() instead of inline f-string for the no-burner-record fallback (no output change).",
+        "4": "record_source gained an explicit label ('Burner Message'), same reason as chrome_autofill.py -- the combo no longer hides for a single entry."
       },
-      "hash": "127142fa6541ed8f",
-      "version": 3
+      "hash": "13e222834561f1b3",
+      "version": 4
     },
     "android:burner_messageentity": {
       "changelog": {},
       "hash": "9113ecb42194269c",
       "version": 1
     },
-    "android:chrome_downloads": {
+    "android:chrome_autofill": {
+      "changelog": {
+        "3": "record_source gained an explicit label ('Autofill Entry') -- the Hex panel's joined-record combo is now always visible even for a single entry, so an undeclared label would otherwise surface as a bare '?'."
+      },
+      "hash": "0ecdebced7db766b",
+      "version": 4
+    },
+    "android:chrome_bookmarks": {
       "changelog": {},
-      "hash": "7d7d7bc95dbb1312",
+      "hash": "9a1d8c5ad6791b3d",
+      "version": 2
+    },
+    "android:chrome_cache": {
+      "changelog": {
+        "1": "New parser: Chrome's HTTP disk cache (Simple Cache format, cache/Cache/Cache_Data/ -- reverse-engineered against real casework, 24-byte entry header). One row per cached resource; HTML entries get a synthesized .mhtml reconstruction (referenced sub-resources found elsewhere in the same cache embedded via Content-Location, same mechanism a real Chrome .mhtml uses) opened in the same in-app viewer as a real Offline Pages snapshot. Verified against two real pages (title matches Chrome History exactly); gzip/deflate/brotli/zstd all supported."
+      },
+      "hash": "147e44eb5f46e898",
+      "version": 4
+    },
+    "android:chrome_cache_media": {
+      "changelog": {},
+      "hash": "eaf333726ef9788c",
+      "version": 2
+    },
+    "android:chrome_cache_pages": {
+      "changelog": {},
+      "hash": "1536c35966b2f5f8",
+      "version": 2
+    },
+    "android:chrome_cookies": {
+      "changelog": {},
+      "hash": "2e1ab9b1b8e6630d",
+      "version": 1
+    },
+    "android:chrome_downloads": {
+      "changelog": {
+        "6": "record_source gained an explicit label ('Download'), same reason as chrome_autofill.py."
+      },
+      "hash": "20e42f69799b4775",
+      "version": 6
+    },
+    "android:chrome_favicons": {
+      "changelog": {},
+      "hash": "d7ff22859462f987",
       "version": 3
     },
     "android:chrome_history": {
@@ -30,15 +72,54 @@
       "hash": "a36577d8f4efd9d4",
       "version": 2
     },
+    "android:chrome_indexeddb_origins": {
+      "changelog": {},
+      "hash": "8f7489f8e2d4fa3c",
+      "version": 1
+    },
     "android:chrome_keyword_search_terms": {
       "changelog": {},
       "hash": "309f13d14764c367",
       "version": 2
     },
-    "android:chrome_offline_pages": {
+    "android:chrome_login_data": {
       "changelog": {},
-      "hash": "5f5401399386b8b4",
+      "hash": "dfbcfdbe0bea0e26",
       "version": 1
+    },
+    "android:chrome_network_action_predictor": {
+      "changelog": {},
+      "hash": "892f4cc3faf7481b",
+      "version": 1
+    },
+    "android:chrome_offline_pages": {
+      "changelog": {
+        "5": "record_source gained an explicit label ('Offline Page'), same reason as chrome_autofill.py."
+      },
+      "hash": "437e32f8214d30be",
+      "version": 5
+    },
+    "android:chrome_omnibox_shortcuts": {
+      "changelog": {},
+      "hash": "54b9feaf6afc6db9",
+      "version": 1
+    },
+    "android:chrome_overview": {
+      "changelog": {},
+      "hash": "dd376d04840dd1df",
+      "version": 3
+    },
+    "android:chrome_saved_data": {
+      "changelog": {},
+      "hash": "682c20159c34ee2b",
+      "version": 2
+    },
+    "android:chrome_search": {
+      "changelog": {
+        "4": "record_source gained an explicit label ('Search URL'), same reason as chrome_autofill.py."
+      },
+      "hash": "45477ac3822933e1",
+      "version": 4
     },
     "android:chrome_search_terms": {
       "changelog": {},
@@ -49,6 +130,24 @@
       "changelog": {},
       "hash": "b706092670c5703d",
       "version": 1
+    },
+    "android:chrome_site_settings": {
+      "changelog": {},
+      "hash": "0e7c1c8bc2f4dd23",
+      "version": 1
+    },
+    "android:chrome_top_sites": {
+      "changelog": {},
+      "hash": "81d98ea6cb985567",
+      "version": 1
+    },
+    "android:chrome_web_history": {
+      "changelog": {
+        "7": "Carved rows now self-label their source (recovery_source_labels: \"Chrome History (visits table)\" / \"Segmentation Platform (UKM, urls table)\"), flagged \"(unverified match)\" for a header_signature carve -- fixes a blank Source column on recovered rows (core_fields includes source, but a carved row never runs through run() to set it). Generic mechanism added to artifact_runner.py's recoverable_tables loop, reusable by any parser.",
+        "9": "Chrome History live rows now populate raw_url_id (was hardcoded None) and record_source gained a third entry, 'Chrome History URL' (History's own urls table -- the actual URL/title text join target, previously undeclared entirely), listed FIRST so it's the default Record-mode jump -- 'Chrome History Visit' (visits, an integer-FK table, never text) is second, reachable via the dropdown. Both entries and the ukm_db one gained source_match so the Hex panel's combo only ever offers the entries relevant to the query that built the selected row."
+      },
+      "hash": "f0573fe3f0cd7c08",
+      "version": 9
     },
     "android:chrome_web_visits": {
       "changelog": {},
@@ -95,15 +194,19 @@
     },
     "android:whatsapp": {
       "changelog": {
-        "2": "Use shared missing_ref_label() instead of inline f-string for the dangling-chat-FK fallback (no output change)."
+        "2": "Use shared missing_ref_label() instead of inline f-string for the dangling-chat-FK fallback (no output change).",
+        "3": "record_source expanded from 2 entries (Message, Chat) to 12: every other joined table's rowid status was checked against real WhatsApp casework (jid/message_media/message_location/wa_contacts all confirmed genuine INTEGER PRIMARY KEY rowid aliases -- wa_contacts specifically was previously flagged unconfirmed, now resolved). New SELECT columns added for the four wa_contacts joins' own _id (jid/media/location needed none -- media/location's rowid is provably identical to the already-captured message_id). New entries: Chat/Sender JID + their Mapped (LID) variants, Media, Location, Chat/Sender Contact + Mapped variants -- all newly-added id fields kept out of the Report table via hidden_fields (plumbing only, already resolved into visible columns).",
+        "4": "Media/Location record_source entries gained presence_fields (media_path / latitude) -- their reused rowid (message_id) is always populated regardless of whether that LEFT JOIN matched, so it alone couldn't tell the Hex panel's per-row combo whether to list them; now correctly hidden for a row whose join found nothing."
       },
-      "hash": "c5ee381054d923a8",
-      "version": 2
+      "hash": "4d24fe7d409aa67a",
+      "version": 4
     },
     "ios:instagram": {
-      "changelog": {},
-      "hash": "4af945423c8785e4",
-      "version": 1
+      "changelog": {
+        "2": "record_source gained an explicit label ('Direct Message'), same reason as chrome_autofill.py."
+      },
+      "hash": "5b10070955f9e474",
+      "version": 2
     },
     "ios:photos_metadata": {
       "changelog": {},

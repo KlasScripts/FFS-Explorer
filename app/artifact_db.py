@@ -41,10 +41,22 @@ def write_artifact_results(
     case_conn.execute(f'DROP TABLE IF EXISTS "{table}"')
     case_conn.execute(f'CREATE TABLE "{table}" ({col_defs})')
 
+    def _cell(row, c):
+        # NOT `row.get(c, '') or ''` -- that turns any legitimately falsy
+        # value (0, False) into '', indistinguishable from a genuinely
+        # missing/unknown field. Confirmed a real, shipped bug: found via
+        # chrome_overview.py's total_downloads (a real, meaningful
+        # confirmed-zero count) rendering as a blank cell everywhere this
+        # table is read (Report table, query_artifact, AI Summary).
+        # `.get(c)` alone still correctly returns '' for a genuinely
+        # missing key or a value that's already None.
+        value = row.get(c)
+        return str(value) if value is not None else ''
+
     placeholders = ', '.join('?' for _ in columns)
     case_conn.executemany(
         f'INSERT INTO "{table}" VALUES ({placeholders})',
-        [tuple(str(row.get(c, '') or '') for c in columns) for row in rows],
+        [tuple(_cell(row, c) for c in columns) for row in rows],
     )
     case_conn.commit()
     return len(rows)

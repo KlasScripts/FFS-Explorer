@@ -59,10 +59,23 @@ a = Analysis(
         'uuid',
         'struct',
         'plistlib',
-        # chrome_cache.py (app/chrome_cache.py, imported dynamically by
-        # artifacts/android/chrome_cache.py) lazy-imports these two only
-        # inside _decompress_body, for real 'br'/'zstd' Content-Encoding
-        # values (confirmed common on real casework — see requirements.txt).
+        # app/chrome_cache.py and app/chrome_shared.py are themselves only
+        # ever reached via a dynamic `import chrome_cache`/`import
+        # chrome_shared` INSIDE a dynamically-loaded artifact script
+        # (chrome_cache_media.py/chrome_cache_pages.py; chrome_login_data.py,
+        # chrome_cookies.py, chrome_favicons.py, chrome_autofill.py, etc. for
+        # chrome_shared) — never a static top-level import anywhere
+        # PyInstaller's own analysis walks, so — same reason as every other
+        # entry in this list — they're invisible to it and never get bundled
+        # without being listed here explicitly. Confirmed the real failure
+        # this causes when omitted: a frozen build's Chrome Cache/Favicons/
+        # Login Data/etc. parsers fail at runtime with "No module named
+        # 'chrome_cache'"/'chrome_shared', not just a theoretical risk.
+        'chrome_cache',
+        'chrome_shared',
+        # chrome_cache.py itself lazy-imports these two only inside
+        # _decompress_body, for real 'br'/'zstd' Content-Encoding values
+        # (confirmed common on real casework — see requirements.txt).
         'brotli',
         'zstandard',
         # nska_deserialize (NSKeyedArchiver plist decoding, artifact_runner.py's

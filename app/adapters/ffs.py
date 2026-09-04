@@ -33,6 +33,7 @@ from itertools import batched
 import msgpack
 
 import csstore as _cs
+from zip_cd_cache import compute_data_offsets
 from . import graykey as _gk
 
 # GIL-handoff cadence for O(n)-over-all-entries loops.  These may run inside
@@ -132,17 +133,24 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
     _z = zipfile.ZipFile(zip_path, 'r') if _close else z
     assert _z is not None
     try:
-        with open(zip_path, 'rb') as rf:
-            for entry in meta_files:
-                try:
-                    info = _z.getinfo(entry)
-                    rf.seek(info.header_offset + 26)
-                    fname_len, extra_len = struct.unpack('<HH', rf.read(4))
-                    data_offset = info.header_offset + 30 + fname_len + extra_len
-                    guid = entry.split('/')[-2]
-                    entries.append((guid, data_offset, info.file_size))
-                except (KeyError, OSError):
-                    pass
+        # Data offsets via compute_data_offsets (same probe-once-then-pure-
+        # arithmetic approach ZipEntry itself uses) rather than a per-entry
+        # seek+unpack hand-rolled here separately -- one shared
+        # implementation of "where does this entry's data actually start".
+        infos = []
+        guid_by_filename: dict[str, str] = {}
+        for entry in meta_files:
+            try:
+                info = _z.getinfo(entry)
+            except KeyError:
+                continue
+            infos.append(info)
+            guid_by_filename[info.filename] = entry.split('/')[-2]
+        offsets = compute_data_offsets(zip_path, infos)
+        for info in infos:
+            data_offset = offsets.get(info.filename)
+            if data_offset is not None:
+                entries.append((guid_by_filename[info.filename], data_offset, info.file_size))
     finally:
         if _close:
             _z.close()

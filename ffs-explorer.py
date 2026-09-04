@@ -376,13 +376,17 @@ def _parse_build_prop(content: str) -> dict:
     return props
 
 
-def _read_plist_from_zip(z: zipfile.ZipFile, names: frozenset, *candidates) -> dict:
+def _read_plist_from_zip(z, names: frozenset, *candidates) -> dict:
     """Try each candidate path in the zip and return the first successfully
-    parsed plist as a dict, or {} if none found."""
+    parsed plist as a dict, or {} if none found.
+
+    z.open(path).read(), not z.read(path) -- the convenience method
+    zipfile.ZipFile has but CachedZipView deliberately doesn't duplicate;
+    .open() alone lets *z* be either."""
     for path in candidates:
         if path in names:
             try:
-                return plistlib.loads(z.read(path))
+                return plistlib.loads(z.open(path).read())
             except Exception:
                 pass
     return {}
@@ -583,18 +587,27 @@ def _read_android_info(z: zipfile.ZipFile, names: frozenset, ffs_adapter) -> tup
     return fields, label
 
 
-def _read_device_info(zip_path: str) -> tuple[list[tuple[str,str,str]], str]:
+def _read_device_info(zip_path: str, case_dir: str | None = None) -> tuple[list[tuple[str,str,str]], str]:
     """Return (fields, label) extracted from the FFS zip.
 
     fields — [(field_name, data, source), ...]
     label  — short display string like 'Apple iPhone 14 Pro · iOS 17.4.1'
     Returns ([], '') on failure.
+
+    Reads via the local .zcd central-directory cache when *case_dir* is
+    given and the cache is already built -- a handful of small metadata
+    files (a plist or two, a build.prop), but the central-directory PARSE
+    itself is otherwise a full read over what can be a large network-
+    hosted archive; falls back to a plain zipfile.ZipFile only when the
+    cache isn't available.
     """
     fields, label = _read_device_info_from_ufd(zip_path)
     if fields:
         return fields, label
     try:
-        with zipfile.ZipFile(zip_path, 'r') as z:
+        infos = _cd_cache_load(zip_path, case_dir) if case_dir else None
+        view = CachedZipView(zip_path, infos) if infos is not None else None
+        with (view if view is not None else zipfile.ZipFile(zip_path, 'r')) as z:
             names = frozenset(z.namelist())
             ffs_adapter = FfsAdapter.detect(z, names)
             result = _read_ios_info(z, names, ffs_adapter)
@@ -706,13 +719,15 @@ class ExtractorWorker(QThread):
     status     = Signal(str)
     finished   = Signal(bool, str, str)
 
-    def __init__(self, zip_path, export_tasks, dest_dir, folder_map, path_resolver):
+    def __init__(self, zip_path, export_tasks, dest_dir, folder_map, path_resolver,
+                 case_dir=None):
         super().__init__()
         self.zip_path = zip_path
         self.export_tasks = export_tasks
         self.dest_dir = dest_dir
         self.folder_map = folder_map
         self.path_resolver = path_resolver
+        self.case_dir = case_dir
         self._cancelled = False
         self._used_dest_paths: set[str] = set()
         self._collision_count = 0
@@ -747,79 +762,106 @@ class ExtractorWorker(QThread):
         try:
             self.status.emit("Initializing extraction...")
 
-            # Build the file queue and pre-fetch all ZipInfo in one pass
-            with zipfile.ZipFile(self.zip_path, 'r') as z:
-                final_queue = []
-                for ui_logical_path, base_parent in self.export_tasks:
-                    if ui_logical_path in self.folder_map:
-                        children = self._get_all_children(ui_logical_path)
-                        for child in children:
-                            rel = os.path.relpath(child, start=base_parent)
-                            final_queue.append((child, rel))
-                    else:
-                        rel = os.path.basename(ui_logical_path)
-                        final_queue.append((ui_logical_path, rel))
+            # ZipInfo for every real entry comes from the local .zcd
+            # central-directory cache when available -- never a second/
+            # third full central-directory read over what can be a large
+            # network-hosted archive, just one local cache load. Falls
+            # back to a plain zipfile.ZipFile only when the cache isn't
+            # built yet (info_by_name stays identical either way, so
+            # everything below is unaffected by which path was taken).
+            infos = _cd_cache_load(self.zip_path, self.case_dir) if self.case_dir else None
+            if infos is not None:
+                info_by_name = {i.filename: i for i in infos}
+            else:
+                with zipfile.ZipFile(self.zip_path, 'r') as z:
+                    info_by_name = {i.filename: i for i in z.infolist()}
 
-                total = len(final_queue)
-                if total == 0:
-                    self.finished.emit(False, "No files found to export.", "")
-                    return
+            final_queue = []
+            for ui_logical_path, base_parent in self.export_tasks:
+                if ui_logical_path in self.folder_map:
+                    children = self._get_all_children(ui_logical_path)
+                    for child in children:
+                        rel = os.path.relpath(child, start=base_parent)
+                        final_queue.append((child, rel))
+                else:
+                    rel = os.path.basename(ui_logical_path)
+                    final_queue.append((ui_logical_path, rel))
 
-                # Pre-fetch ZipInfo for every file (one central-directory lookup each)
-                zip_infos = {}
-                for ui_path, _ in final_queue:
-                    phys = self.path_resolver(ui_path)
-                    try:
-                        zip_infos[phys] = z.getinfo(phys)
-                    except KeyError:
-                        pass
+            total = len(final_queue)
+            if total == 0:
+                self.finished.emit(False, "No files found to export.", "")
+                return
+
+            zip_infos = {}
+            for ui_path, _ in final_queue:
+                phys = self.path_resolver(ui_path)
+                info = info_by_name.get(phys)
+                if info is not None:
+                    zip_infos[phys] = info
 
             self.file_count.emit(total)
 
-            # Single raw file handle stays open for all STORED reads
-            with open(self.zip_path, 'rb') as raw_f, \
-                 zipfile.ZipFile(self.zip_path, 'r') as z:
+            # Data offsets for every STORED entry in this export, resolved
+            # in ONE batched pass (zip_cd_cache.compute_data_offsets) --
+            # the exact same offset math ZipEntry itself uses (seek to the
+            # local-header's own filename/extra lengths, add them to
+            # header_offset+30), written once rather than hand-rolled
+            # again here per file.
+            stored_infos = [i for i in zip_infos.values()
+                            if i.compress_type == zipfile.ZIP_STORED]
+            data_offsets = _compute_data_offsets(self.zip_path, stored_infos) if stored_infos else {}
 
-                for i, (ui_path, rel_path) in enumerate(final_queue):
-                    if self._cancelled:
-                        self.finished.emit(False, "Export cancelled.", "")
-                        return
+            # CachedZipView (backed by the SAME infos already loaded above)
+            # only for the rare compressed-entry fallback -- STORED entries
+            # (confirmed the overwhelming majority in real FFS archives)
+            # never touch it at all, going straight through raw_f below.
+            cached_view = CachedZipView(self.zip_path, infos) if infos is not None else None
+            fallback_zf = None if cached_view is not None else zipfile.ZipFile(self.zip_path, 'r')
 
-                    physical_path = self.path_resolver(ui_path)
-                    sanitized_rel = _sanitize_export_rel(rel_path)
-                    dest_path = _fs_path(os.path.join(self.dest_dir, sanitized_rel))
-                    dest_path = self._dedupe_dest(dest_path)
-                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            try:
+                with open(self.zip_path, 'rb') as raw_f:
+                    for i, (ui_path, rel_path) in enumerate(final_queue):
+                        if self._cancelled:
+                            self.finished.emit(False, "Export cancelled.", "")
+                            return
 
-                    if i % 50 == 0 or i == total - 1:
-                        self.status.emit(sanitized_rel)
+                        physical_path = self.path_resolver(ui_path)
+                        sanitized_rel = _sanitize_export_rel(rel_path)
+                        dest_path = _fs_path(os.path.join(self.dest_dir, sanitized_rel))
+                        dest_path = self._dedupe_dest(dest_path)
+                        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-                    zinfo = zip_infos.get(physical_path)
-                    if zinfo is None:
-                        continue
+                        if i % 50 == 0 or i == total - 1:
+                            self.status.emit(sanitized_rel)
 
-                    try:
-                        if zinfo.compress_type == zipfile.ZIP_STORED:
-                            raw_f.seek(zinfo.header_offset + 26)
-                            fname_len, extra_len = struct.unpack('<HH', raw_f.read(4))
-                            raw_f.seek(zinfo.header_offset + 30 + fname_len + extra_len)
-                            remaining = zinfo.file_size
-                            with open(dest_path, 'wb') as target:
-                                while remaining > 0:
-                                    chunk = raw_f.read(min(_CHUNK, remaining))
-                                    if not chunk:
-                                        break
-                                    target.write(chunk)
-                                    remaining -= len(chunk)
-                        else:
-                            with z.open(physical_path) as source, \
-                                 open(dest_path, 'wb') as target:
-                                while chunk := source.read(_CHUNK):
-                                    target.write(chunk)
-                    except KeyError:
-                        continue
+                        zinfo = zip_infos.get(physical_path)
+                        if zinfo is None:
+                            continue
 
-                    self.progress.emit(i + 1, total)
+                        try:
+                            if zinfo.compress_type == zipfile.ZIP_STORED:
+                                raw_f.seek(data_offsets[physical_path])
+                                remaining = zinfo.file_size
+                                with open(dest_path, 'wb') as target:
+                                    while remaining > 0:
+                                        chunk = raw_f.read(min(_CHUNK, remaining))
+                                        if not chunk:
+                                            break
+                                        target.write(chunk)
+                                        remaining -= len(chunk)
+                            else:
+                                zsrc = cached_view if cached_view is not None else fallback_zf
+                                with zsrc.open(physical_path) as source, \
+                                     open(dest_path, 'wb') as target:
+                                    while chunk := source.read(_CHUNK):
+                                        target.write(chunk)
+                        except KeyError:
+                            continue
+
+                        self.progress.emit(i + 1, total)
+            finally:
+                if fallback_zf is not None:
+                    fallback_zf.close()
 
             msg = f"Successfully exported {total} items."
             if self._collision_count:
@@ -2159,23 +2201,31 @@ class HeaderScanWorker(QThread):
     progress = Signal(int)   # remaining count
     done     = Signal(dict)  # {ui_path: detected_type}
 
-    def __init__(self, zip_path, ui_metadata, ffs_adapter, delta=None):
+    def __init__(self, zip_path, ui_metadata, ffs_adapter, delta=None, case_dir=None):
         super().__init__()
         self._zip_path        = zip_path
         self._ui_metadata     = ui_metadata
         self._adapter         = ffs_adapter
         self._delta           = delta
+        self._case_dir        = case_dir
 
     def run(self):
+        # Metadata only here (z.getinfo(), never a data read) -- the local
+        # .zcd central-directory cache covers this without opening the
+        # main archive raw at all when it's available; falls back to a
+        # plain zipfile.ZipFile only when the cache isn't built yet.
         z = None
+        infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
+        z = CachedZipView(self._zip_path, infos) if infos is not None else None
         try:
-            z = zipfile.ZipFile(self._zip_path, 'r')
+            if z is None:
+                z = zipfile.ZipFile(self._zip_path, 'r')
             candidates = _collect_header_candidates(
                 self._zip_path, self._ui_metadata, self._adapter,
                 z=z, delta=self._delta,
             )
         finally:
-            if z:
+            if isinstance(z, zipfile.ZipFile):
                 z.close()
 
         if not candidates:
@@ -2222,12 +2272,13 @@ class DeviceInfoWorker(QThread):
     """
     done = Signal(list, str)   # fields, label
 
-    def __init__(self, zip_path: str, parent=None):
+    def __init__(self, zip_path: str, case_dir: str | None = None, parent=None):
         super().__init__(parent)
         self._zip_path = zip_path
+        self._case_dir = case_dir
 
     def run(self):
-        fields, label = _read_device_info(self._zip_path)
+        fields, label = _read_device_info(self._zip_path, self._case_dir)
         self.done.emit(fields, label)
 
 
@@ -2973,6 +3024,7 @@ class ProcessDialog(QDialog):
             self._zip_path, self._ui_metadata,
             self._adapter,
             delta=self._delta,
+            case_dir=self._case_dir,
         )
         self._scan_worker.progress.connect(self._on_header_progress)
         self._scan_worker.done.connect(self._on_header_done)
@@ -3624,7 +3676,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._metadata_only_folders: set = set()
         self._file_count_cache: dict = {}
         self._precompute_zip_path: str = ""
-        self._zip_handle: zipfile.ZipFile | None = None
+        self._zip_handle: CachedZipView | zipfile.ZipFile | None = None
         self._zip_open_future = None
         self._local_extra_delta: int | None = None
         self._header_type_overrides: dict = {}   # {ui_path: detected_type}
@@ -4299,8 +4351,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.proxy_model.set_filter("", -1)
         self._log(f"Filter cleared in: {self._view_path}")
 
-    def _get_zip_handle(self) -> zipfile.ZipFile | None:
-        """Return the shared ZipFile handle, opening it lazily on first use."""
+    def _get_zip_handle(self) -> "CachedZipView | zipfile.ZipFile | None":
+        """Return the shared zip-metadata handle, opening it lazily on
+        first use -- usually already a CachedZipView by the time this is
+        called at all, set proactively in on_metadata_ready below once
+        the local .zcd cache is confirmed valid; this lazy path is only
+        the fallback for whatever set that up not having run yet. Every
+        real caller (hex_viewer.py) only ever calls .getinfo() on the
+        result, never a data read -- CachedZipView and zipfile.ZipFile
+        behave identically for that."""
         if self._zip_handle is None:
             if self._zip_open_future is not None:
                 try:
@@ -5490,7 +5549,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         dest_dir = self._get_export_dir()
         dlg = ExportProgressDialog(dest_dir, parent=self)
 
-        self.ex_worker = ExtractorWorker(self.zip_path, tasks, dest_dir, self.folder_map, self._adapter.resolve)
+        self.ex_worker = ExtractorWorker(self.zip_path, tasks, dest_dir, self.folder_map, self._adapter.resolve,
+                                         case_dir=self._case_dir)
         self.ex_worker.file_count.connect(dlg.on_file_count)
         self.ex_worker.progress.connect(dlg.on_progress)
         self.ex_worker.status.connect(dlg.on_status)
@@ -5895,11 +5955,27 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
         if self._zip_handle:
-            self._zip_handle.close()
+            # CachedZipView holds no real handle of its own and
+            # deliberately has no close() -- only a real zipfile.ZipFile
+            # (the fallback case) needs closing here.
+            if isinstance(self._zip_handle, zipfile.ZipFile):
+                self._zip_handle.close()
             self._zip_handle = None
         self._zip_open_future = None
         self._local_extra_delta  = getattr(self.worker, '_local_extra_delta', None)
-        self._zip_open_future = _BG_POOL.submit(zipfile.ZipFile, self.zip_path, 'r')
+        # ZipMetadataWorker.run() already ensured the local .zcd cache is
+        # valid before metadata parsing even started (see its own "Ensure
+        # local .zcd exists" step) -- a CachedZipView built from it is a
+        # fast LOCAL read, not the slow network zipfile open the
+        # background-submit below exists to avoid, so it's built
+        # synchronously right here rather than backgrounded. Only falls
+        # back to that background open when the cache is somehow still
+        # unavailable (e.g. no case_dir at all).
+        _infos = _cd_cache_load(self.zip_path, self._case_dir) if self._case_dir else None
+        if _infos is not None:
+            self._zip_handle = CachedZipView(self.zip_path, _infos)
+        else:
+            self._zip_open_future = _BG_POOL.submit(zipfile.ZipFile, self.zip_path, 'r')
         self._time_cols = self._detect_time_columns(data)
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'Path'])
@@ -7603,7 +7679,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         # Reading device info opens the zip — run it off the GUI thread.
         # partial binds the context up front; the signal appends (fields, label).
-        worker = DeviceInfoWorker(path)
+        worker = DeviceInfoWorker(path, case_dir=self._case_dir)
         worker.done.connect(partial(self._on_device_info_ready,
                                     path, self._case_dir, has_db_info, has_label))
         self._device_info_worker = worker

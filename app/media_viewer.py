@@ -8,6 +8,7 @@ import zipfile
 from itertools import batched
 
 from db_utils import _open_cache_db
+from zip_cd_cache import CachedZipView, load as _zcd_load
 # MEDIA_EXTENSIONS/VIDEO_THUMB_EXTENSIONS/TEXT_ATTACHMENT_EXTENSIONS/
 # sniff_media_kind moved to header_scan.py 2026-08-25 (re-exported here
 # unchanged, so existing `from media_viewer import ...` call sites keep
@@ -168,7 +169,21 @@ class ThumbnailWorker(QThread):
             pending = []
             items_list = list(self.items)
 
-            _zf = zipfile.ZipFile(self.zip_path, 'r')
+            # Read via the local .zcd central-directory cache when it's
+            # already available (same pattern as device_timezone.py's own
+            # detect_handset_zone) -- the main FFS archive itself is never
+            # compressed, so this is a direct offset seek per entry rather
+            # than a second full central-directory read/decompress pass
+            # over what can be a large network-hosted zip. Falls back to a
+            # plain zipfile.ZipFile only when no cache_dir was given or the
+            # cache isn't built yet -- never fails to load thumbnails just
+            # because the cache happens to be missing.
+            _view = None
+            if self.cache_dir:
+                infos = _zcd_load(self.zip_path, self.cache_dir)
+                if infos is not None:
+                    _view = CachedZipView(self.zip_path, infos)
+            _zf = _view if _view is not None else zipfile.ZipFile(self.zip_path, 'r')
             try:
                 for batch in batched(items_list, _DB_BATCH):
                     # Query DB for just this batch
@@ -230,7 +245,12 @@ class ThumbnailWorker(QThread):
                                 with open(ui_path, 'rb') as lf:
                                     data = lf.read()
                             else:
-                                data = _zf.read(physical)
+                                # .open(...).read(), not .read(name) -- the
+                                # convenience method zipfile.ZipFile has but
+                                # CachedZipView deliberately doesn't
+                                # duplicate; .open() alone keeps this line
+                                # identical for either backing object.
+                                data = _zf.open(physical).read()
                         except Exception:
                             continue
 
@@ -266,7 +286,11 @@ class ThumbnailWorker(QThread):
                                     pending.clear()
 
             finally:
-                if _zf is not None:
+                # CachedZipView holds no real handle (each read opens/closes
+                # its own file internally) and deliberately has no close()
+                # of its own -- only zipfile.ZipFile, the fallback case,
+                # needs closing here.
+                if isinstance(_zf, zipfile.ZipFile):
                     _zf.close()
 
             if db is not None and pending:

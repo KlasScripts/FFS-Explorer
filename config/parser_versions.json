@@ -20,8 +20,8 @@
       "changelog": {
         "3": "record_source gained an explicit label ('Autofill Entry') -- the Hex panel's joined-record combo is now always visible even for a single entry, so an undeclared label would otherwise surface as a bare '?'."
       },
-      "hash": "0ecdebced7db766b",
-      "version": 4
+      "hash": "9a5aa84107aacb66",
+      "version": 5
     },
     "android:chrome_bookmarks": {
       "changelog": {},
@@ -47,8 +47,8 @@
     },
     "android:chrome_cookies": {
       "changelog": {},
-      "hash": "2e1ab9b1b8e6630d",
-      "version": 1
+      "hash": "3dfc389fd331aad3",
+      "version": 2
     },
     "android:chrome_downloads": {
       "changelog": {
@@ -59,8 +59,8 @@
     },
     "android:chrome_favicons": {
       "changelog": {},
-      "hash": "d7ff22859462f987",
-      "version": 3
+      "hash": "71e3db5cbd1fee7d",
+      "version": 4
     },
     "android:chrome_history": {
       "changelog": {},
@@ -84,13 +84,13 @@
     },
     "android:chrome_login_data": {
       "changelog": {},
-      "hash": "dfbcfdbe0bea0e26",
-      "version": 1
+      "hash": "76af59d432ed0f4e",
+      "version": 2
     },
     "android:chrome_network_action_predictor": {
       "changelog": {},
-      "hash": "892f4cc3faf7481b",
-      "version": 1
+      "hash": "e9273df38d3367d9",
+      "version": 2
     },
     "android:chrome_offline_pages": {
       "changelog": {
@@ -101,8 +101,8 @@
     },
     "android:chrome_omnibox_shortcuts": {
       "changelog": {},
-      "hash": "54b9feaf6afc6db9",
-      "version": 1
+      "hash": "90a4342e16892fd4",
+      "version": 2
     },
     "android:chrome_overview": {
       "changelog": {},
@@ -138,8 +138,8 @@
     },
     "android:chrome_top_sites": {
       "changelog": {},
-      "hash": "81d98ea6cb985567",
-      "version": 1
+      "hash": "1fdb49b9c622c400",
+      "version": 2
     },
     "android:chrome_web_history": {
       "changelog": {

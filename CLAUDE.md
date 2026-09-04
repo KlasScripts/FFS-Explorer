@@ -26,7 +26,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 ## Data flow (opening an archive)
 
 1. `FastZipBrowser.start_loading()` → case dir chosen (`_get_or_ask_case_dir`).
-2. `ZipMetadataWorker` (ffs-explorer.py:1145) → `app/ffs_metadata.py
+2. `ZipMetadataWorker` (ffs-explorer.py:1187) → `app/ffs_metadata.py
    parse_archive_metadata()` in a child process: central-directory parse,
    `ui_metadata` build, folder tree/sizes; snapshot persisted to case dir
    (msgpack) so re-opens are instant.
@@ -331,6 +331,38 @@ underneath that verification.
 
 - `ui_path` = display path (adapter-normalised); physical zip name only via
   `FfsAdapter.resolve`. Never mix them.
+- **Never read the MAIN FFS archive via raw `zipfile.ZipFile(...)`/`.read(name)`
+  directly** (added 2026-09-04 as an explicit rule, after a project-wide audit
+  found 6 real violations that had accumulated silently — see the Conventions
+  entry below for the full list and what each one cost). The main archive is
+  never compressed in real FFS data (confirmed: 124,949/124,949 entries STORED
+  on this project's own Android 14 JoshHickman case, zero DEFLATED) — go
+  through the local `.zcd` central-directory sidecar (`zip_cd_cache.py`) plus
+  `app/zip_entry.ZipEntry` (direct offset seek, no central-directory re-parse,
+  no decompression for a STORED entry) instead, exactly as the "Data flow"
+  section above already describes as the intended design. `zipfile` itself is
+  still the right tool in two real, narrow cases: (1) the DEFLATED-entry
+  fallback inside `ZipEntry`/`CachedZipView` themselves (rare in real FFS
+  data, but real) — never reimplement that fallback elsewhere, call into
+  those; (2) a genuinely LOCAL, already-extracted file — a nested/embedded
+  archive extracted to `case_dir/nested_archives/`, a small already-local
+  temp file — where the whole "avoid re-parsing a huge network archive's
+  central directory" concern doesn't apply at all. When a metadata-only read
+  is needed (`.getinfo()`, `.namelist()`, `.infolist()` — never a data read),
+  `zip_cd_cache.CachedZipView` is a drop-in `zipfile.ZipFile`-compatible
+  object built from the SAME cached central directory — pass it anywhere a
+  caller expects "a zip handle" for metadata purposes; note it deliberately
+  has no `.close()`/`.read(name)` of its own (only `.open(name).read()`,
+  matching `zipfile.ZipFile`'s own equivalent method) and no `_infos` load
+  failure recovery beyond returning `None` — callers fall back to a plain
+  `zipfile.ZipFile` exactly when `.zcd` genuinely isn't available yet, same
+  pattern throughout this file's own examples. Filesystem fragmentation of
+  the main archive is NOT a reason to prefer sequential reads over direct
+  seeks either way — `seek()`/`read()` at the OS/filesystem layer already
+  resolves a logical offset to whatever physical extent holds it regardless
+  of fragmentation, the identical exposure `zipfile.ZipFile.open(name)`'s own
+  seek-to-that-entry already has, not something unique to this project's own
+  direct-seek approach.
 - Workers: create → connect → `_retire_worker` on replace; `_stop_all_workers`
   on close. Don't block the GUI thread; batch model updates (see
   `_populate_tree_children_batched`).
@@ -3093,6 +3125,105 @@ underneath that verification.
     ~117.96 seconds) — confirming the refactor changed structure, not
     results, the same standard this project held the Chrome Cache report
     split to.
+  - **Project-wide raw-`zipfile`-vs-`ZipEntry` audit, 6 real fixes**
+    (2026-09-04, direct request: "are you using the local code zipcar and
+    directly going to the data ... only use zipfile were there is a
+    specific reason ... make sure there is no duplicate code in this
+    area"). A background fork audited all 26 `zipfile.ZipFile(...)` call
+    sites across the whole codebase (not just this session's own new
+    code) — most turned out already correct (`ZipEntry`/`zip_cd_cache`'s
+    own internal DEFLATED-entry fallback, nested/local-archive reads,
+    already-`.zcd`-first-with-fallback patterns in `keyword_search.py`/
+    `device_timezone.py`), but found 6 real violations reading the MAIN
+    archive raw, plus duplicated local-header offset-math. Fixed all 6,
+    each verified against real data before moving to the next, not just
+    compiled — this touches evidence-facing code (export, hex viewing,
+    device info), so correctness was checked byte-for-byte, not assumed
+    from the diff:
+    - `media_viewer.py`'s `ThumbnailWorker` (hot path — every thumbnail
+      load, Media tab AND every artifact report with `media_fields`) —
+      now tries a local `.zcd`-backed `CachedZipView` first, falls back
+      to `zipfile.ZipFile` only when the cache isn't built yet. Verified:
+      a real archive entry decoded to an identical thumbnail (41×64)
+      through both paths.
+    - `nested_archive.py`'s `extract_one` — was opening the main archive
+      raw just to read the ONE entry being extracted. Verified: a real
+      embedded zip (an ad-SDK cache payload, 3 real entries) extracted
+      identically through both the cached and fallback paths, confirmed
+      as a genuinely valid, openable zip afterward (`testzip()` clean).
+    - `ffs-explorer.py`'s `ExtractorWorker` (the examiner's own Export
+      feature) — was opening the main archive raw TWICE per export
+      (once for `getinfo()`, once again as a `z.open()` companion handle)
+      and hand-rolling the offset math inline. Now: ZipInfo from the
+      local `.zcd` cache in one pass, STORED-entry offsets from
+      `zip_cd_cache.compute_data_offsets` in one BATCHED call, a
+      `CachedZipView` for the (rare) compressed-entry fallback. Verified
+      most thoroughly of the six, given this exports real evidence:
+      byte-for-byte identical output across 4 combinations — real STORED
+      entries (1KB/10KB/2.9MB) via both the cached and fallback path,
+      AND a synthetic DEFLATED+STORED archive (this project's own real
+      FFS data has zero DEFLATED entries to test against) via both paths
+      too, all matching a `ZipEntry`-read reference exactly.
+    - `ffs-explorer.py`'s `HeaderScanWorker` — fresh raw archive open on
+      every manual header re-scan, just for `.getinfo()` metadata. Now
+      builds a `CachedZipView` when available (the downstream function,
+      `_resolve_file_candidates`, already correctly called
+      `compute_data_offsets` itself — no duplication to fix there, just
+      which object got passed in as `z`). Verified: `CachedZipView`- and
+      raw-`zipfile.ZipFile`-backed calls produced identical
+      `(ui_path, data_offset, file_size)` tuples for real archive
+      entries.
+    - `ffs-explorer.py`'s `_read_device_info`/`DeviceInfoWorker` — traced
+      the call chain rather than assumed it was a legitimate before-
+      cache-exists bootstrap case per the audit's own open question:
+      `self._case_dir` is already set by the time this runs (confirmed
+      by reading `_fetch_and_store_label`, which checks `self._case_dir`
+      on the very same line before even constructing the worker) — a
+      real, fixable violation, not a bootstrap exception. Also fixed
+      `_read_plist_from_zip`'s own `z.read(path)` to `z.open(path).read()`
+      (the convenience method `CachedZipView` deliberately doesn't
+      duplicate) while in there. Verified on real Android build.prop data
+      (`CachedZipView` vs raw `zipfile.ZipFile`, identical "Google Pixel
+      7a · Android 14" result) AND a synthetic plist (since this
+      project's own Android case never exercises the iOS plist-reading
+      branch) — both matched.
+    - `ffs-explorer.py`'s shared `_get_zip_handle`/`on_metadata_ready`'s
+      own resubmit block — the single highest-impact site (feeds
+      `hex_viewer.py`'s three real call sites) but also the lowest-risk
+      to fix once actually traced: every real caller calls ONLY
+      `.getinfo()` on the returned handle, never a data read (the actual
+      bytes always come from a separately-built `ZipEntry` already).
+      `ZipMetadataWorker.run()` already GUARANTEES a valid local `.zcd`
+      exists before metadata parsing even starts (its own "Ensure local
+      .zcd exists" step, confirmed by reading it directly rather than
+      assumed) — so building a `CachedZipView` here is a fast LOCAL read,
+      not the slow network `zipfile.ZipFile` open the existing
+      background-thread-pool submit was specifically there to avoid;
+      built synchronously now, background submit kept only as the
+      fallback for the case the cache is somehow still unavailable.
+      Verified: `CachedZipView.getinfo()` → `ZipEntry` produced
+      byte-identical reads to raw-`zipfile.ZipFile.getinfo()` → `ZipEntry`
+      for real archive entries — the exact pattern all 3 real
+      `hex_viewer.py` callers use.
+    - `adapters/ffs.py`'s `_build_guid_bundle_map` — hand-rolled the same
+      local-header offset math a second time (a real, if minor,
+      duplication of `ZipEntry`'s own logic, already once fixed as
+      `zip_cd_cache.compute_data_offsets` for exactly this purpose).
+      Swapped the per-entry seek+unpack loop for one batched
+      `compute_data_offsets` call. Verified against a real iOS 17
+      JoshHickman archive by diffing the OLD (`git show HEAD:...`) and
+      NEW implementations side by side, not just eyeballing the change:
+      both produced the IDENTICAL 1,352-entry real GUID→bundle-id map
+      (`com.apple.mobilenotes`, `com.microsoft.msedge...`, etc.) —
+      confirms the swap changed how the offset gets computed, not what
+      it computes.
+
+    New explicit rule added to this project's own Conventions (the entry
+    directly above this one) — the underlying architecture was already
+    described in the "Data flow" section, but never stated as a hard,
+    enforceable rule anyone building new code would be forced to follow,
+    which is the real reason these 6 sites (most predating this session)
+    accumulated silently rather than being caught earlier.
   - **Parser version tracking** (`app/parser_versions.py`, added
     2026-08-22): every artifact parser script has a version number, auto-
     derived from a fast content hash of its own .py source — never hand-

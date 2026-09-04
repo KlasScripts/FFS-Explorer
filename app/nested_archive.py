@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 import header_scan
 from db_utils import (_open_cache_db, load_nested_archives, save_nested_archive,
                       save_nested_archive_entries, save_nested_archive_failure)
+from zip_cd_cache import CachedZipView, load as _zcd_load
 
 _MEM_LIMIT = 100 * 1024 * 1024   # 100 MB — larger files written to temp first
 
@@ -116,8 +117,18 @@ def extract_one(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
     out_dir = os.path.join(case_dir, 'nested_archives')
     os.makedirs(out_dir, exist_ok=True)
     try:
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            raw = zf.read(physical_path)
+        # Read via the local .zcd central-directory cache when available
+        # (same pattern as device_timezone.py's own detect_handset_zone) --
+        # the main FFS archive itself is never compressed, so this is a
+        # direct offset seek rather than a second full central-directory
+        # read over what can be a large network-hosted zip. Falls back to
+        # a plain zipfile.ZipFile only when the cache isn't built yet.
+        _view = None
+        infos = _zcd_load(zip_path, case_dir)
+        if infos is not None:
+            _view = CachedZipView(zip_path, infos)
+        with (_view if _view is not None else zipfile.ZipFile(zip_path, 'r')) as zf:
+            raw = zf.open(physical_path).read()
 
         key = hashlib.sha1(ui_path.encode()).hexdigest()[:12]
         basename = os.path.basename(ui_path) or 'content'

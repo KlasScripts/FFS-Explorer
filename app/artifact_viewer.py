@@ -1944,7 +1944,14 @@ class ArtifactViewerMixin:
         scoped = [e for e in entries
                  if 'source_match' not in e or row_source in e['source_match']]
         def _resolved(e):
-            fields = e.get('presence_fields') or e.get('rowid_fields', ())
+            # ui_path_field entries (see _art_load_record_hex) have no
+            # rowid concept at all -- their own presence check falls back
+            # to the ui_path field itself when neither of the other two
+            # is declared, so a row with nothing at that field (no nav
+            # decoded for it, say) is dropped the same way a missed
+            # SQL JOIN is, rather than offered as a dead end.
+            fields = (e.get('presence_fields') or e.get('rowid_fields')
+                     or (('ui_path_field' in e) and [e['ui_path_field']]) or ())
             return any(row.get(f) not in (None, '') for f in fields)
         return [e for e in scoped if _resolved(e)]
 
@@ -2139,6 +2146,40 @@ class ArtifactViewerMixin:
             # no-op rewrite) or the examiner just changed the combo for
             # THIS row (reset_source_combo False, the actual new choice).
             self._art_record_source_sticky[row.get('source')] = rs.get('label')
+
+        # ui_path_field entries: a parser that enumerates its own dynamically
+        # -named files (no fixed files/optional_files key for
+        # resolve_module_file_ui_path to key by — chrome_sessions.py/
+        # chrome_app_tabs.py, each file a different real timestamp/tab id)
+        # already knows the EXACT archive ui_path and byte offset for each
+        # of its own rows at parse time — added 2026-09-05 as a second,
+        # independent record_source declaration shape alongside the
+        # table/table_field+rowid_fields SQL one above, for exactly that
+        # case: no live-lookup needed (there's no database or b-tree to
+        # search), the row already carries its own answer directly.
+        if 'ui_path_field' in rs:
+            ui_path = row.get(rs['ui_path_field'])
+            if not ui_path:
+                self._show_art_hex_message("No record-location data on this row")
+                return
+            data = self._read_zip_bytes(ui_path)
+            if data is None:
+                self._show_art_hex_message(f"Not found in archive: {ui_path}")
+                return
+            try:
+                offset = int(row.get(rs.get('offset_field', 'raw_offset')))
+            except (TypeError, ValueError):
+                self._show_art_hex_message("No record-location data on this row")
+                return
+            try:
+                length = int(row.get(rs.get('length_field', 'raw_length')) or 0)
+            except (TypeError, ValueError):
+                length = 0
+            self._load_hex_preview_from_bytes_at(data, ui_path, offset, length)
+            self._art_hex_active = True
+            self.status_bar.showMessage(f"{ui_path}  —  offset: {offset:,}")
+            return
+
         table = rs['table'] if 'table' in rs else row.get(rs.get('table_field', 'source_table'))
         rowid = None
         for field in rs.get('rowid_fields', ()):

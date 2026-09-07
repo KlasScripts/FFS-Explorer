@@ -129,20 +129,31 @@ HOW) and has real code elsewhere doing the actual work:
                        otherwise show blank there instead of merely
                        ragged. The runner fills `source` on every recovered
                        row automatically: `f"Carved — {label or table}"`,
-                       with an `" (unverified match)"` suffix appended when
-                       `recovery_method == "header_signature"` (no rowid at
-                       all — the weakest of the four carving paths, and the
-                       only one that can be a genuine truncated/false-
-                       positive match rather than a structurally-confirmed
-                       row; see sqlite_carve.py's own carve_by_header_
-                       signature docstring), upgraded to
-                       `" (likely false positive — ...)"` naming the exact
-                       reason when sqlite_carve's own confidence gate finds
-                       one — a NOT NULL live-schema column decoded blank, or
-                       a timestamp_fields-declared column decoding outside a
-                       plausible range (before 2000-01-01 UTC, or in the
-                       future). See recover_deleted_rows' `notnull_
-                       violations`/`timestamp_issues` and sqlite_carve.
+                       upgraded to `" (likely false positive — ...)"`
+                       naming the exact reason whenever sqlite_carve's own
+                       confidence gate finds one — a NOT NULL live-schema
+                       column decoded blank, or a timestamp_fields-declared
+                       column decoding outside a plausible range (before
+                       1970-01-01 UTC, or noticeably in the future). This
+                       gate runs for EVERY carving path (generalized
+                       2026-09-05 from an original header_signature-only
+                       check, per direct instruction: an implausible
+                       decoded timestamp means the record itself is likely
+                       spurious, not a cosmetic nuance specific to one
+                       carving method), so any of the four can carry this
+                       label, not just header_signature. Absent a
+                       violation, header_signature candidates STILL get a
+                       plain `" (unverified match)"` suffix — that path has
+                       no rowid at all to cross-check against, the
+                       weakest of the four carving paths structurally (see
+                       sqlite_carve.py's own carve_by_header_signature
+                       docstring) — while a clean freeblock/freed-page/
+                       WAL-frame row gets no suffix at all, since those
+                       already passed a stronger structural check (exact
+                       column-count match + a real rowid decode) that
+                       header_signature can't offer. See
+                       recover_deleted_rows' `notnull_violations`/
+                       `timestamp_issues` and sqlite_carve._confidence_gate/
                        notnull_columns/_timestamp_plausible. The row is
                        never withheld either way, only the label — this
                        project's standing escalate-don't-silently-discard
@@ -234,6 +245,41 @@ HOW) and has real code elsewhere doing the actual work:
                        Conventions for the full writeup (including why it
                        needs real-schema verification before declaring,
                        not after).
+
+                       A SECOND, independent entry shape (added
+                       2026-09-05) for a parser with NO database at all —
+                       one that enumerates its own dynamically-named files
+                       itself (a different real file per row, e.g.
+                       chrome_sessions.py's Tabs_<timestamp>,
+                       chrome_app_tabs.py's tab<N>/tab_state<N>) rather
+                       than reading a fixed files/optional_files entry —
+                       "file_key"/"table"/"table_field"/"rowid_fields"
+                       don't apply there at all: there's no
+                       resolve_module_file_ui_path key to look up (a
+                       different file per row, not one fixed path per
+                       parser) and no SQL row to locate. Such a parser
+                       already knows its own row's exact archive ui_path
+                       and byte span at parse time, so the entry instead
+                       declares: "ui_path_field": str (an output field —
+                       usually hidden, see hidden_fields — holding the
+                       row's own real archive ui_path to open directly,
+                       no live-lookup/resolve_module_file_ui_path
+                       involved), "offset_field": str (optional, default
+                       "raw_offset" — the output field holding the byte
+                       offset to jump to), "length_field": str (optional,
+                       default "raw_length" — the field holding how many
+                       bytes to highlight). source_match/presence_fields
+                       both still work identically (presence_fields
+                       falls back to [ui_path_field] itself when neither
+                       is declared) — used exactly this way in
+                       chrome_app_tabs.py to list BOTH real pieces a
+                       TabState-format row is actually built from (its
+                       own decoded navigation entry, AND the surrounding
+                       per-tab metadata a different byte range of the
+                       SAME physical file holds), the same "list every
+                       real table a join draws from" principle as the
+                       SQL-backed entries above, just for two different
+                       byte ranges of one file instead of two SQL tables.
 
 Parser helpers — small, generic utilities importable directly from a
 script's own run() (`from artifact_runner import first_nonempty`), for a
@@ -865,14 +911,32 @@ def run_artifact(
             # escalate-don't-discard rule.
             label = all_labels.get(table, table)
             for r in recovered:
-                if r.get('recovery_method') == 'header_signature':
-                    reasons = []
-                    if r.get('notnull_violations'):
-                        reasons.append('NOT NULL columns blank: ' + ', '.join(r['notnull_violations']))
-                    if r.get('timestamp_issues'):
-                        reasons.append('implausible timestamp: ' + ', '.join(r['timestamp_issues']))
-                    confidence = (f' (likely false positive — {"; ".join(reasons)})' if reasons
-                                 else ' (unverified match)')
+                reasons = []
+                if r.get('notnull_violations'):
+                    reasons.append('NOT NULL columns blank: ' + ', '.join(r['notnull_violations']))
+                if r.get('timestamp_issues'):
+                    reasons.append('implausible timestamp: ' + ', '.join(r['timestamp_issues']))
+                if reasons:
+                    # The confidence GATE now runs for every carving path
+                    # (see sqlite_carve._confidence_gate), not just
+                    # header_signature — a freeblock/freed-page/WAL-frame
+                    # candidate can trip it too, even though those paths
+                    # already passed a stronger structural check (exact
+                    # column-count match + a real rowid decode) than
+                    # header_signature ever can. Either way, an implausible
+                    # decoded timestamp is treated as a strong sign the
+                    # RECORD ITSELF is spurious, not cosmetic — most
+                    # load-bearing for a report like Chrome web history,
+                    # where a plausible-looking but fabricated row would
+                    # misrepresent real user behavior. Never withheld,
+                    # only labeled, same as always.
+                    confidence = f' (likely false positive — {"; ".join(reasons)})'
+                elif r.get('recovery_method') == 'header_signature':
+                    # Clean confidence gate, but still the one carving path
+                    # with no rowid to cross-check at all — see
+                    # carve_by_header_signature's own docstring for why
+                    # that structurally makes it the weakest of the four.
+                    confidence = ' (unverified match)'
                 else:
                     confidence = ''
                 r.setdefault('source', f"Carved — {label}{confidence}")

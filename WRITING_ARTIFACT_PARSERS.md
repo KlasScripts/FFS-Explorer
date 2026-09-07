@@ -333,6 +333,38 @@ bytes it found, in either the main db file or a `-wal` sidecar — so
 `record_source` covers both live and recovered rows for free once
 declared; nothing extra to write for the recovered case.
 
+**If your parser has no database at all** — it reads its own set of
+files directly (a binary/LevelDB/whatever format), often a different
+real file per row because you enumerated a whole directory yourself
+rather than declaring a fixed `files`/`optional_files` entry (see
+`artifacts/android/chrome_sessions.py`/`chrome_app_tabs.py` for real
+examples) — `file_key`/`table`/`rowid_fields` don't apply: there's no
+SQL row to look up, and no single fixed path to resolve through. Use
+`ui_path_field` instead — your own `run()` already knows each row's
+real archive ui_path and byte span, so just say which output fields
+hold them:
+
+```python
+record_source = [
+    {"label": "Navigation Entry", "ui_path_field": "raw_ui_path"},
+    # optional: "offset_field"/"length_field" default to "raw_offset"/
+    # "raw_length" if you use those exact field names, as here
+]
+hidden_fields = ["raw_ui_path", "raw_offset", "raw_length"]
+```
+
+`raw_ui_path` is usually hidden (plumbing, not report content, per
+`hidden_fields` above) — set it to the exact archive ui_path of the
+specific physical file THIS row came from, `raw_offset`/`raw_length` to
+the exact byte span within it. Everything else (`source_match`,
+`presence_fields`, more than one entry for a real "join" — e.g. an
+outer per-file header plus one specific record decoded from within it,
+two different byte ranges of the SAME file) works identically to the
+SQL-backed entries above; `presence_fields` falls back to
+`[ui_path_field]` itself when you don't declare one, so a row with
+nothing at that field (nothing decoded for it) is dropped from the
+picker the same way a missed SQL JOIN is.
+
 ### `recoverable_tables` (if you've checked for deleted content)
 
 ```python

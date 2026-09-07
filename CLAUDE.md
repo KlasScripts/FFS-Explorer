@@ -190,6 +190,10 @@ ever contained. Persisted via `db_utils.save_app_registry`/`load_app_registry`
 exists there — `build_app_registry` returns `([], {})` immediately.
 
 | `ccl_abx.py` | Vendored Android Binary XML (ABX) decoder (added 2026-08-23) — MIT, CCL Forensics, lifted from ALEAPP's `ilapfuncs.py` `abxread()`, same vendoring convention as `app/ccl_segb/` (original license header kept verbatim in-file). `is_abx`/`abx_bytes_to_xml_root` are this project's own thin additions (not vendored) — the original takes a file path and opens it itself; callers here already have the bytes via `ctx.read_bytes`. Used by `app_intelligence.py` for `packages.xml`/`runtime-permissions.xml`, which are ABX on some Android devices/builds and plain XML on others — see that row for how this was discovered. |
+| `ccl_leveldb.py` / `ccl_simplesnappy.py` | Vendored LevelDB reader + its Snappy decompressor (added 2026-09-05) — MIT, CCL Forensics (Alex Caithness), lifted verbatim from the local iLEAPP checkout's `scripts/ccl_leveldb.py`/`ccl_simplesnappy.py` (same lineage `ccl_abx.py` above is vendored from), unmodified except one import line (`import scripts.ccl_simplesnappy` → `import ccl_simplesnappy`, to match this project's flat `app/` layout — diffed line-for-line to confirm nothing else changed). Found by directly reviewing Hindsight (`/Users/klastveita/script/hindsight-main`, a real, actively-maintained Chrome/Firefox forensics tool) — it depends on `ccl_chromium_reader`, which wraps this same `ccl_leveldb`/`ccl_chromium_cache` lineage rather than hand-rolling a LevelDB parser, confirming this was the right dependency to reach for instead of building one from scratch. `RawLevelDb(dir).iterate_records_raw()` reads real `.ldb`/`.log` files directly (no system LevelDB library) and yields EVERY record including deleted/superseded ones (`Record.state`: `Live`/`Deleted`/`Unknown`, plus its own `origin_file`/`offset`/`seq`/`was_compressed`) — the same "cite the raw bytes, never silently discard a deleted record" philosophy `sqlite_carve.py` already follows for SQLite. First (and so far only) consumer: `artifacts/android/chrome_local_storage.py`, below — needs real on-disk files to open/seek (not archive bytes directly), so its `run()` extracts the profile's `leveldb/` directory to `_parser_files_dir` first, same pattern `chrome_cache.py`'s own parser-generated-file convention already established. **Both listed in `ffs_explorer.spec`'s `hiddenimports`** — reached only via a dynamic `import ccl_leveldb` inside a dynamically-loaded artifact script, the exact same invisible-to-PyInstaller situation already fixed once for `chrome_cache`/`chrome_shared` (see that entry a few lines up) and the same bug class the user had already reported once ("No module named 'chrome_cache'" in a frozen build) — fixed here before shipping rather than repeated. |
+| `ccl_chromium_pickle.py` / `ccl_chromium_snss.py` | Vendored Chromium `base::Pickle` reader + SNSS (Session/Tab-restore) container reader (added 2026-09-05, for the deferred "tabs" work) — MIT, CCL Forensics (Alex Caithness), pinned to commit `ef840de30221c4d65bc96d2f4d9057e9ef2f526d` of `github.com/cclgroupltd/ccl_chromium_reader` (the exact commit Hindsight's own `requirements.txt` pins — fetched fresh via `git clone`+`checkout` at that commit, not assumed from memory), lifted from `ccl_chromium_reader/serialization_formats/ccl_easy_chromium_pickle.py` and `ccl_chromium_reader/ccl_chromium_snss2.py` respectively. `ccl_chromium_pickle.py` is unmodified (stdlib-only); `ccl_chromium_snss.py` has exactly one line changed (the relative `.serialization_formats.ccl_easy_chromium_pickle` import → a flat `ccl_chromium_pickle` import, matching this project's flat `app/` layout — diffed line-for-line against the pinned-commit source to confirm nothing else changed). Reads Chrome's own SNSS binary format (magic `b"SNSS"`, a stream of length-prefixed command records) used by `app_chrome/Default/Sessions/Session_*`/`Tabs_*` — `SnssFile.iter_session_commands()` yields a real `NavigationEntry` (url/title/transition/referrer/timestamp, decoded via the vendored `EasyPickleIterator`) for every real navigation command, and a bare `UnprocessedEntry` (offset + command id, never silently dropped) for every other real command type. `NavigationEntry.from_pickle` is ALSO reused directly (not just via `SnssFile`) by `app/chrome_tabs.py`'s own `parse_android_tab_state` for a second, structurally different real container — see that entry below — confirmed by direct reverse-engineering against real data that both containers embed the identical per-entry payload. **Both listed in `ffs_explorer.spec`'s `hiddenimports`** — reached only via a dynamic `import` inside `chrome_tabs.py`, the same invisible-to-PyInstaller situation already fixed for `chrome_cache`/`ccl_leveldb` above. |
+| `chrome_page_state.py` | Vendored Chromium Blink PageState binary-format parser (added 2026-09-05) — Apache-2.0, from Hindsight (`pyhindsight/lib/page_state.py`, Ryan Benson, pyhindsight `2026.06`), copied verbatim (stdlib-only, no import to adjust). Decodes the `page_state_raw` blob every real `NavigationEntry`/`SerializedNavigationEntry` carries — both Pickle-encoded (PageState v11-25) and Mojo-encoded (v26-33) real wire formats a real Chrome build can write — into referrer, scroll position, POST body/file-upload details, embedded iframe state, and filled-in form field NAMES/types (`FormElement`, deliberately not necessarily every submitted value). Verified directly against real data: a real npr.org page's embedded PageState correctly yielded its real Google-search referrer and real OneTrust cookie-consent checkbox states; a real Google-search page's own decoded scroll offset (5542px) is real evidence of how far the user actually scrolled results. Used by `app/chrome_tabs.py`'s `_page_state_referrer` as a referrer fallback when a `NavigationEntry`'s own bare `referrer_url` field is empty. |
+| `chrome_tabs.py` | Qt-free core for Chrome's tab/session persistence (added 2026-09-05) — this project's OWN original code (not vendored) wiring together the three vendored modules above across THREE genuinely different real on-disk formats, all reverse-engineered and verified directly against this project's own real Android 14 JoshHickman data: (1) `parse_snss_file` — a thin wrapper around `ccl_chromium_snss.SnssFile` for the desktop-style `Sessions/Session_*`/`Tabs_*` container (see `artifacts/android/chrome_sessions.py`); (2) `parse_android_tab_state` — Chrome-for-Android's own CURRENT per-tab `app_tabs/<id>/tab<N>` file (no underscore), confirmed against real Chromium source fetched directly from `chromium.googlesource.com` while building this (`TabStateFileManager.java`'s `readState()` for the outer, BIG-ENDIAN Java `DataOutputStream`-written wrapper — timestamps, parent/root tab id, tab group id, pinned/sensitive-content flags, all genuinely optional past the first three fields, matching the real Java source's own `try {} catch (EOFException)` tolerance exactly — plus `web_contents_state.cc`/`serialized_navigation_entry.cc` for the embedded, LITTLE-ENDIAN `base::Pickle`-encoded native WebContentsState blob, decoded via the SAME vendored `NavigationEntry.from_pickle` the desktop SNSS format uses); (3) `parse_android_tab_state_legacy` — files literally named `app_tabs/<id>/tab_state<N>` (WITH the underscore), a genuinely simpler, DIFFERENT format found alongside the modern one on this same real device under different (stale) tab ids, reverse-engineered PURELY from real data since no current or historical Chromium source names this exact convention (`chrome/browser/tabpersistence/`'s own file-prefix constant is literally `"tab"`, never `"tab_state"`, in every revision checked) — flagged plainly as unverified-against-source in this file's own docstring, unlike format 2. All three verified end-to-end against real files (not just compiled): the desktop-style container recovered a real navigation sequence matching Joshua Hickman's own independently documented ground-truth for this device exactly (a "mobile phone forensics" Google search immediately followed by the Cellebrite forensics page, with a real referrer chain confirming the click path); the `tab<N>` format decoded 6 independent real files with zero anomalies, including a real 2024-02-08 ad-redirect tab's own real title "Dulcetty" and a real multi-step Wickr/Cognito OAuth sign-in chain; the `tab_state<N>` format decoded 6 independent real files with exact byte-for-byte structural fit (zero leftover/unaccounted bytes every time). See `artifacts/android/chrome_sessions.py`/`chrome_app_tabs.py` below for the two Report-facing consumers. |
 | `validation_store.py` / `parser_validation.py` | Parser validation baselines: a one-time snapshot of a parser's SQLite schema + a *generalized* folder-structure fingerprint (see Conventions below), recorded against the specific GTD-documented image a parser was built/checked against. `validation_store.py` is the cross-case JSON store (`config/parser_validation.json`, same dev/frozen-path convention as `research_store.py`), keyed `"{platform}:{script_name}"` since e.g. `ios:whatsapp`/`android:whatsapp` are different apps sharing a filename. `parser_validation.py` has the actual snapshot/diff/render logic; `ArtifactViewerMixin._art_show_validation` (`artifact_viewer.py`) is the "Validation" tree leaf per parser — diffs the current case against the recorded baseline, or offers to record one (an explicit action, never automatic) |
 | `mcp_server.py` | Read-only MCP server (tools + prompts) over processed case data; Qt-free; audit-logs every tool call to `run_log` (run_type `mcp`). Tier 2: `list_apps` (added 2026-08-23) wraps `app_intelligence.scan_apps` — cached in `casecache.db`'s `app_intelligence` table, recomputed when the archive's indexed file count OR raw_content_enabled state has changed since the last scan (`app_intelligence_scan_key`, a `blobs` entry — not a new schema concept); works with or without raw content access, degrading gracefully rather than erroring. Note: the first scan of a large case walks every file under every app container in pure Python (~830k entries took roughly a minute in the case this was built against) — acceptable as a one-time cached cost, same tradeoff this project already made for media-thumbnail pre-warming (see `artifact_media.py` above), but worth knowing before assuming a slow first call is a hang. Tier 3 (opt-in, separate consent checkbox): `get_sqlite_schema`/`sample_sqlite_rows` extract any archive SQLite db to a locked-down read-only temp copy — no arbitrary raw SQL, no generic file-read tool. `build_artifact_parser(bundle_id)` prompt chains them into a drafted `artifacts/ios\|android/`-format parser for human review. `get_app_data_locations(bundle_id)` (added 2026-08-23) is a thin direct read of the already-built `app_registry` table — Bundle container, Data container, every App Group path, every PluginKit-extension bundle id, in one call, no fresh parsing at call time; the direct answer to "I don't care which folder holds it, I want everywhere this app's data could be". `get_ai_summary_settings(name)`/`set_ai_summary_settings(name, ...)`/`run_ai_summary(name)` (added 2026-08-29) expose `ai_summary.py`'s report-summarization pipeline over MCP — an AI client can read/tune a report's column selection, chunk size, time-gap threshold, and prompt template, then trigger a run; these are the SAME settings (`ai_summary_store.py`) the GUI's `AISummaryDialog` (`artifact_viewer.py`) edits, so a change from either surface is visible to the other |
 | `mcp_control.py` | Lifecycle for the embedded MCP server: uvicorn on a daemon thread, 127.0.0.1 + per-start bearer token (regenerated every start by default); lazy-imports mcp/uvicorn (optional deps). Opt-in **dev mode** (Preferences ▸ AI Access ▸ "Developer mode", off by default, own warning text) passes `persist_dev=True` into `start()`, which instead reuses a port+token saved plaintext in `config/dev_mcp_credentials.json` (gitignored) — so an external client's `claude mcp add`/mcp.json only needs entering once instead of after every app restart. Never enable outside a machine you control |
@@ -2408,6 +2412,95 @@ underneath that verification.
     `header_signature`, so it was never in scope for this specific check
     either way. `WRITING_ARTIFACT_PARSERS.md`'s `recoverable_tables`
     section updated in sync, same as the entry above.
+
+    **Gate generalized to EVERY carving path, and floor lowered to
+    1970, 2026-09-05** (`sqlite_carve.py`/`artifact_runner.py`, prompted
+    directly, unrelated to the `ccl_leveldb`/Local Storage work that day
+    — surfaced while separately checking Hindsight's own webkit-overflow
+    guard against this project's display code, per direct instruction:
+    "if the t[imestamp] and d[ata] is wrong then the record is more than
+    likely spurious... i would prefer to continue with this approch").
+    The confidence gate above only ever ran for `header_signature`
+    candidates — the OTHER three carving paths (freeblock, freed-page,
+    WAL-frame) had no timestamp/NOT-NULL plausibility check at all,
+    relying solely on their own already-stronger structural check (exact
+    column-count match against the live schema + a real rowid+payload-
+    length decode). Per direct instruction, the same reasoning that
+    motivated the original gate — an implausible decoded timestamp means
+    the RECORD ITSELF is likely spurious, not a cosmetic nuance — has
+    nothing structurally specific to `header_signature`, so it should
+    validate every carved record, not just that one path; the concrete
+    stated stakes: a report like Chrome web history describes real user
+    BEHAVIOR, and a plausible-looking but fabricated row reading as
+    ordinary confirmed history would misrepresent something the examiner
+    never actually did, a materially worse failure than a row merely
+    looking sparse. The user's own framing was explicit that this is
+    still never an outright drop, even for something as evidentially
+    loaded as web history — a row with a real URL should still be visible
+    to the examiner — only ever a caveat label naming exactly what looked
+    wrong, matching this project's pre-existing escalate-don't-discard
+    rule rather than introducing a new exception to it.
+
+    The two checks (`notnull_columns` against blank required fields,
+    `_timestamp_plausible` against a declared `timestamp_fields` column)
+    were pulled out of the `header_signature`-only inline code into one
+    shared `sqlite_carve._confidence_gate(fields, notnull_cols,
+    timestamp_fields)`, called from BOTH loops in `recover_deleted_rows`
+    now — the rowid-based one (freeblock/freed-page/WAL-frame candidates,
+    which previously got no `notnull_violations`/`timestamp_issues` keys
+    on their rows at all) and the pre-existing `header_signature` one
+    (now a thin call into the shared function instead of its own
+    duplicate inline logic). `artifact_runner.py`'s label-building loop
+    was un-gated from `recovery_method == 'header_signature'` to check
+    every recovered row's `notnull_violations`/`timestamp_issues`
+    regardless of path — a clean `header_signature` row still gets the
+    plain `" (unverified match)"` suffix (that path genuinely has no
+    rowid to cross-check, still the structurally weakest of the four),
+    while a clean freeblock/freed-page/WAL-frame row still gets no
+    suffix at all (unchanged from before — those paths' own stronger
+    structural check already earns that), and ANY path with a real
+    violation now gets the same `" (likely false positive — {reason})"`
+    label regardless of which carving method produced it.
+
+    Per the same direct instruction, `_TIMESTAMP_FLOOR_EPOCH` was also
+    lowered from 2000-01-01 to 1970-01-01 (the Unix epoch itself) — a
+    floor this permissive can never reject a genuinely old real device
+    timestamp (nothing on a real device predates 1970 at all), so it
+    only ever catches a decoded value that's actually negative/near-zero
+    garbage; the CEILING (`_TIMESTAMP_FUTURE_SLACK_SECONDS`, `now() + 1
+    day`) was deliberately left unchanged, since it was ALREADY relative
+    to `time.time()` at call time rather than any fixed future date —
+    confirmed to already satisfy the user's own explicit requirement
+    ("must be in relation to the current date... otherwise there is a
+    risk that in the future the application will remove real data") the
+    first time this gate was built, not something this pass needed to add.
+
+    Verified through the real code path against this project's real
+    Android 14 JoshHickman archive, not just compiled: re-extracted the
+    real `History`/`ukm_db` files fresh and re-ran `sqlite_carve.
+    recover_deleted_rows` for both `visits` and (`ukm_db`, `urls`) —
+    `visits` still 0 rows, no exception (unchanged); the historical real
+    false-positive UKM row from the entry above is now caught EARLIER,
+    by the pre-existing `_text_plausible` outright-rejection (its
+    `url`/`profile_id` fields are NUL-byte-dominated, which already
+    `continue`s past it before the row is ever built or labeled) — same
+    final outcome (never shown as ordinary confirmed history) as before
+    this change, just via a different one of this function's own checks;
+    not a regression, since `_text_plausible` was already the stricter,
+    earlier-running check for exactly this row even before today. Real
+    limitation stated honestly rather than glossed over: no case
+    currently on hand has a genuinely POPULATED real freeblock/freed-
+    page/WAL-frame recovered row (WhatsApp Android's own `message` table
+    and Burner's `DbMessage` both carve 0 real rows on this specific
+    archive, per their own existing module comments) to serve as an
+    actual true-positive-or-false-positive check of the newly-extended
+    gate on those three paths — only `header_signature`'s own behavior
+    has a real confirmed example either way. Worth re-checking against a
+    case that does have real populated rowid-based recovery (the Burner
+    GTD sweep referenced elsewhere confirmed real recoveries exist in
+    OTHER cases, just not this loaded one) before treating that specific
+    path's behavior as fully field-verified rather than reasoned-through
+    from the code and this case's own clean run.
   - **`chrome_cache.py` follow-ups, 2026-09-02: visibility bug fixed, then
     the custom tree view built and reverted same day, per direct user
     instruction each time.** (1) User reported the parser didn't appear
@@ -3072,6 +3165,234 @@ underneath that verification.
     direct instruction ("leave the tab to last") — a genuine binary-
     format reverse-engineering project on the same scale as
     `chrome_cache.py`'s own Simple Cache work, not a quick add.
+  - **New parser: `artifacts/android/chrome_local_storage.py`** (added
+    2026-09-05, prompted directly: "so the only thing worth adding is
+    implement ccl_leveldb and the tabs" — following up on the gap-sweep
+    entry above, which deferred `Local Storage`/`Session Storage` as
+    needing "actual LevelDB content parsing... a genuine new reverse-
+    engineering project, not attempted half-built"). That gap is now
+    closed for Local Storage specifically, via the vendored
+    `ccl_leveldb.py`/`ccl_simplesnappy.py` (see the module table entry
+    above for provenance). Reads `app_chrome/Default/Local Storage/
+    leveldb/` (a single LevelDB database shared across every origin) and
+    returns EVERY record — Live and Deleted — not just the current
+    value: LevelDB never overwrites a key in place, so an old/deleted
+    value genuinely still exists on disk until compaction reclaims the
+    space, same recovery philosophy as `sqlite_carve.py`.
+
+    The real key/value encoding was reverse-engineered directly against
+    this project's own real Android 14 JoshHickman data, not assumed
+    from Chromium source alone — checked against 440 real non-bookkeeping
+    records with zero anomalies: a real content key is `_<origin>` + a
+    single NUL byte + `\x01` + the actual stored key name; `^0` inside
+    the origin part separates an embedded/third-party origin from the
+    top-level site it was partitioned under (Chrome's Storage
+    Partitioning — confirmed real ad-tech domains like
+    ads.pubmatic.com/eus.rubiconproject.com embedded under real top-level
+    sites like mlb.com on this case). A value's own leading byte is
+    Chromium's own DOM Storage type tag (`0x00`=UTF-16LE, `0x01`=UTF-8) —
+    confirmed both branches against real data (a real npr.org
+    `PLAYER_STATE` value decoded correctly as UTF-16LE; ad-tech JSON/IDs
+    as UTF-8). A genuinely empty value is ALWAYS a Deleted tombstone in
+    this real data (confirmed: all 99 empty-value records checked were
+    `state=Deleted`, never a real empty string). `META:`-prefixed keys
+    and the bare `VERSION` key are Chrome's own internal bookkeeping (a
+    small protobuf blob, likely last-modified+size) — deliberately
+    skipped, not decoded, not miscounted as content.
+
+    `seq` (LevelDB's own monotonic sequence number) is exposed but
+    `timestamp_fields` is deliberately NOT declared — no wall-clock time
+    survives per-entry in this store at all, only relative ordering; the
+    module's own `warning` states this explicitly so `seq` is never
+    mistaken for or converted to a timestamp.
+
+    Verified end-to-end via the real parser `run()` (not just the
+    underlying library in isolation): 440 output rows (341 Live + 99
+    Deleted) against this project's real archive, including real
+    recovered DELETED tombstones invisible to any naive "read the current
+    LevelDB state" approach — e.g. discord.com's own `fingerprint` and
+    `scientist:triggered` keys, both genuinely deleted, both still
+    recovered here with their real prior key names (values are gone by
+    definition for a deletion tombstone — that's what Deleted means).
+
+    **Session Storage explicitly scoped OUT this pass** — checked its
+    real directory/schema on this case before deciding, not assumed
+    identical to Local Storage just because both are Chromium's DOM
+    Storage backend: it uses a genuinely different two-level schema
+    (`namespace-<uuid>-<origin>` → map-id indirection), and this case's
+    real Session Storage leveldb has only 5 total records (version/
+    next-map-id/namespace bookkeeping), zero populated real key/value
+    content to verify a decode against — building and shipping an
+    unverified decoder would violate this project's own standing
+    verify-against-real-data rule. A real, distinct follow-on once
+    populated real test data is available, not forgotten scope.
+
+    IndexedDB content parsing (as opposed to the existing directory-
+    name-only `chrome_indexeddb_origins.py`) and Service Worker
+    CacheStorage are both now unlocked by the vendored `ccl_leveldb.py`
+    too, but each has its own separately complex key encoding not yet
+    investigated — left as real, distinct follow-ons rather than
+    attempted alongside this pass.
+  - **"The tabs" — `artifacts/android/chrome_sessions.py` +
+    `chrome_app_tabs.py`** (added 2026-09-05, completing "implement
+    ccl_leveldb and the tabs" — the gap-sweep entry above explicitly
+    deferred `app_tabs/`/`Sessions/` to LAST as "a genuine binary-format
+    reverse-engineering project on the same scale as `chrome_cache.py`'s
+    own Simple Cache work, not a quick add"). Per direct instruction to
+    "record if we are using code from other repository in regard to
+    their [licenses]" — every vendored file below carries its own
+    provenance header (origin repo, exact pinned commit where
+    applicable, author, license) — see the module-table entries for
+    `ccl_chromium_pickle.py`/`ccl_chromium_snss.py`/`chrome_page_state.py`/
+    `chrome_tabs.py` above for the full detail; summarized here only for
+    the parser-level picture.
+
+    Split into TWO reports, matching the same "genuinely different real
+    source, genuinely different row shape" reasoning the Chrome Cache
+    Media/Pages split already established, rather than force-merging them:
+    - **Chrome Sessions** (`group_sort_key=18`) — the desktop-style SNSS
+      container (`app_chrome/Default/Sessions/Session_*`/`Tabs_*`), via
+      the vendored `ccl_chromium_snss.py`/`ccl_chromium_pickle.py` (MIT,
+      CCL Forensics, pinned to `ccl_chromium_reader`'s own commit
+      `ef840de30221c4d65bc96d2f4d9057e9ef2f526d` — the exact commit
+      Hindsight's own `requirements.txt` pins, confirmed by cloning that
+      exact commit rather than trusting memory of the file's contents)
+      and `chrome_page_state.py` (Apache-2.0, from Hindsight's own
+      `pyhindsight/lib/page_state.py`, `2026.06`). Both found via
+      directly reviewing Hindsight, a real actively-maintained Chrome
+      forensics tool, which depends on the exact same `ccl_chromium_
+      reader` library for its own SNSS parsing rather than a hand-rolled
+      reader.
+    - **Chrome App Tabs** (`group_sort_key=19`) — Chrome-for-Android's own
+      `app_tabs/<tab_id>/` per-tab persistence files, covering TWO real,
+      distinct on-disk formats (a `format` column distinguishes them,
+      never conflated into one shape): `TabState` (files literally named
+      `tab<N>`, no underscore — the current, real format, confirmed
+      directly against real Chromium source FETCHED LIVE from
+      `chromium.googlesource.com` while building this, not assumed from
+      training-data memory or an AI-summarized web search result — a real
+      summarization risk hit and deliberately avoided mid-session: an
+      early `WebFetch` call against a real Chromium source file returned
+      a plausible-sounding but wrong field list, caught by re-fetching
+      the same file's raw bytes directly via `curl`+`base64 -d` and
+      reading the literal C++/Java source myself instead of trusting a
+      second-hand AI summary of it) and `Legacy` (files literally named
+      `tab_state<N>`, WITH the underscore — a genuinely simpler, real,
+      but UN-sourced format: extensive searching found no current or
+      historical Chromium source naming this exact file convention at
+      all, so it is reverse-engineered purely from real data and flagged
+      as such directly in the parser's own `description`, not presented
+      with the same confidence as the source-grounded `TabState` format).
+
+    `app/chrome_tabs.py` (this project's own original code, NOT vendored)
+    is the one place that decodes both container formats and reuses the
+    vendored `ccl_chromium_snss.NavigationEntry.from_pickle` for BOTH the
+    desktop SNSS format's own records AND the `TabState` format's embedded
+    native WebContentsState blob — confirmed, not assumed, that both
+    really do share the identical per-entry payload, by successfully
+    decoding real examples of each through the same function. Both
+    parser scripts stay thin declarations over it (their own file
+    enumeration + row shaping), matching this project's `chrome_shared.py`
+    precedent of pushing shared complexity into one Qt-free core module
+    rather than duplicating it per parser.
+
+    Verified end-to-end against real data at every layer, not assumed
+    correct from the source review alone: `chrome_sessions.py` recovered
+    exactly Joshua Hickman's own independently documented ground-truth
+    browsing sequence for this device from a real `Tabs_*` file (a
+    "mobile phone forensics" Google search immediately followed by the
+    Cellebrite forensics page, both with real page titles and a real
+    referrer chain — from the entry's own embedded PageState blob, since
+    the bare `referrer_url` field was empty for one of them — confirming
+    the click came from the Google results, not a typed address);
+    `chrome_app_tabs.py` recovered a real 2024-02-08 ad-redirect tab's own
+    real decoded title "Dulcetty" and transition `Link; FromApi` (a
+    `TabState`-format single-entry file), a real multi-step Wickr/Cognito
+    OAuth sign-in chain across 4 real navigations in one tab, and a real
+    multi-step Google Fi signup flow across 6 real navigations in another
+    — 35 total real rows across 17 distinct real tab files on this
+    device, 24 `TabState` + 11 `Legacy`, zero parse errors. `chrome_tabs.
+    parse_android_tab_state_legacy`'s own per-entry `entry_seq` values
+    were independently cross-checked against the SAME real
+    tab_state0 file's manually-derived values from this session's own
+    earlier byte-level analysis (5, 13, 15, 19, 21, 24) and matched
+    exactly.
+
+    Known, deliberately-scoped-out gap: neither parser decodes the SNSS
+    stream's own structural bookkeeping commands (window/tab open-closed/
+    selected/pinned/grouped state) — `ccl_chromium_snss.SnssFile` already
+    surfaces these as `UnprocessedEntry` (offset + command id, never
+    silently dropped), but no parser here currently extracts a value from
+    them; a real, distinct follow-on if a future need for that structural
+    state (rather than just the navigation content) comes up.
+
+    **Hex-panel Record-mode wiring — a real gap found on review, same
+    day**: both parsers initially shipped with NO `record_source`
+    declaration at all — found by the user directly asking whether this
+    project's own established "every row needs its own raw-hex citation,
+    every join lists every table it draws from, an attachment shows in
+    the hex panel too" convention had been followed here. It hadn't: a
+    dynamically-discovered file per row (a different real `Tabs_*`/
+    `tab<N>`/`tab_state<N>` file each time) has no fixed `files`/
+    `optional_files` entry for the EXISTING `record_source` mechanism's
+    `resolve_module_file_ui_path` to key by at all — the same structural
+    problem `chrome_local_storage.py` already has (that parser's own
+    entry above documents choosing plain `origin_file`/`offset` columns
+    instead, with no hex-jump at all, for exactly this reason).
+
+    Rather than repeat that same compromise a second time, this added a
+    genuinely new, more general `record_source` entry shape —
+    `ui_path_field`/`offset_field`/`length_field` (see `artifact_runner.
+    py`'s own docstring and `WRITING_ARTIFACT_PARSERS.md` for the full
+    declarative writeup) — for a parser that already knows its own row's
+    real archive ui_path and exact byte span at parse time, bypassing
+    `resolve_module_file_ui_path`/the SQL `table`/`rowid` lookup
+    entirely. `_art_record_sources_for_row`'s presence check and
+    `_art_load_record_hex` (`app/artifact_viewer.py`) both gained a
+    parallel branch for it, additive only — every existing SQL-backed
+    `record_source` declaration is untouched and behaves identically.
+    `app/chrome_tabs.py`'s three parse functions were extended to track
+    the real byte offset/length of every piece they decode (not just the
+    navigation entry's own url/title/etc., which was already exposed):
+    the SNSS format uses consecutive real commands' own `.offset` values
+    (already exposed by the vendored `SnssFile`, no reimplementation of
+    its internal framing needed) to delimit each record's exact span; the
+    `TabState` format captures the exact absolute file offset of each
+    navigation's own sub-pickle bytes (via the vendored `EasyPickleIterator`'s
+    own stream position at the moment its length-prefix is consumed,
+    before alignment padding) PLUS a second span for the surrounding
+    per-tab metadata fields (which live in the file's own TAIL, past the
+    embedded WebContentsState blob, not its head); the `Legacy` format
+    already tracked byte positions internally and needed only to expose
+    them.
+
+    This is exactly the "join needs every table listed" case applied to
+    a non-SQL source: a `TabState`-format row is genuinely built from TWO
+    real pieces of the SAME physical file — its own decoded navigation
+    entry, and the surrounding tab-level metadata (parent/root id, theme
+    color, tab group, pinned/sensitive flags) — so it declares TWO
+    `record_source` entries ("Navigation Entry" + "Tab Metadata"),
+    `source_match`-scoped to `format == "TabState"`; `Legacy`-format rows
+    get the analogous "Navigation Entry" + "Legacy Header" pair. A
+    metadata-only row (a real file with zero navigations, though none
+    exist in this exact case's own real data — not yet exercised end to
+    end for that specific shape) correctly drops "Navigation Entry" via
+    `presence_fields: ["raw_offset"]`, leaving only the metadata/header
+    entry, the same "LEFT JOIN found nothing, don't offer a dead end"
+    behavior the SQL-backed mechanism already has.
+
+    Verified end to end through a full simulation of the real GUI code
+    path (not just the underlying parse functions in isolation): for
+    both parsers, every resolved `record_source` entry's own
+    offset+length segment was read back from the real archive and
+    checked — every "Navigation Entry" segment genuinely contains that
+    row's own real URL bytes; the "Tab Metadata"/"Legacy Header" segments
+    correctly point at their own distinct, real, non-navigation regions.
+    Neither parser has a `media_fields` declaration — there is no
+    separate attachment concept here (a chat's photo, a browser's
+    favicon) distinct from the row's own primary content, so nothing
+    was missing on that front; the gap was specifically the missing
+    Record-mode citation, now closed.
   - **`app/chrome_shared.py` — the gap-sweep batch's own boilerplate
     factored out, same day** (2026-09-03, direct instruction: "remember
     the idea that each artifact script is meant to be as simple as

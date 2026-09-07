@@ -755,11 +755,19 @@ def notnull_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in info if row[3]}
 
 
-# Generous floor -- no real device evidence in this project's casework
-# predates 2000-01-01 UTC (smartphones didn't exist yet); a decoded
-# timestamp below this is far more consistent with a header-signature match
-# landing on non-timestamp garbage bytes than with a genuine old record.
-_TIMESTAMP_FLOOR_EPOCH = 946684800  # 2000-01-01T00:00:00Z
+# Floor at the Unix epoch itself (1970-01-01 UTC) -- lowered 2026-09-05
+# from an earlier 2000-01-01 floor, per direct instruction: a floor this
+# far in the past can never reject a genuinely old real timestamp (nothing
+# on a real device predates 1970 at all), so it only ever catches a
+# decoded value that's actually negative/zero/near-zero garbage -- a
+# header-signature (or any other carving path's) match landing on
+# non-timestamp bytes, not a real record. The ceiling just below is
+# DELIBERATELY relative to time.time() rather than any fixed future date,
+# for the same reason it was built that way originally: a fixed date
+# would eventually start rejecting genuinely real, current evidence as
+# real time passes past it -- the risk explicitly flagged when this
+# constant was revisited.
+_TIMESTAMP_FLOOR_EPOCH = 0  # 1970-01-01T00:00:00Z
 # A day of slack past "now" absorbs ordinary device/analysis-machine clock
 # skew without over-trusting a value that's substantially in the future,
 # which a decoded value genuinely never should be.
@@ -802,6 +810,38 @@ def _timestamp_plausible(raw_value, unit_code: str) -> bool | None:
     if secs is None:
         return None
     return _TIMESTAMP_FLOOR_EPOCH <= secs <= time.time() + _TIMESTAMP_FUTURE_SLACK_SECONDS
+
+
+def _confidence_gate(fields: dict, notnull_cols: set[str],
+                     timestamp_fields: dict | None) -> tuple[list[str], list[str]]:
+    """Shared validation for EVERY carved-row path -- freeblock/freed-page/
+    WAL-frame candidates (the rowid-based loop in recover_deleted_rows)
+    just as much as header_signature ones, generalized 2026-09-05 from an
+    earlier header_signature-only gate per direct instruction, following
+    the exact precedent that motivated the original gate: a real false
+    positive (a header_signature UKM row) was found and confirmed BY its
+    implausible timestamp, not by anything else -- an implausible decoded
+    date/time is treated as a strong sign the RECORD ITSELF is spurious,
+    not a cosmetic display nuance, and that reasoning has nothing
+    structurally specific to header_signature, so it now runs for every
+    path a carved row can come from.
+
+    Returns (notnull_violations, timestamp_issues), both sorted lists of
+    column names, empty when nothing looks wrong. Never used to drop a
+    row (this project's standing escalate-don't-discard rule) -- only to
+    label it more specifically than a bare "recovered" row would
+    otherwise be. This distinction matters most for a report like Chrome
+    web history: a row the examiner can still see (never silently
+    withheld) but that's clearly labeled as likely spurious is very
+    different from one that reads as confirmed, ordinary web history --
+    the latter would misrepresent real user behavior the examiner never
+    actually engaged in, which is the actual danger a false positive
+    poses here, not merely visual noise in the report."""
+    notnull_violations = sorted(col for col in notnull_cols if fields.get(col) is None)
+    timestamp_issues = sorted(
+        name for name, unit_code in (timestamp_fields or {}).items()
+        if name in fields and _timestamp_plausible(fields[name], unit_code) is False)
+    return notnull_violations, timestamp_issues
 
 
 # A genuine TEXT value (URL, name, JSON, whatever a real column holds) is
@@ -1053,6 +1093,17 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None,
                     continue
                 content_seen.add(content_key)
                 is_wal = c['source'] == 'wal_frame'
+                # Same confidence gate header_signature candidates get
+                # below -- see _confidence_gate's own docstring for why
+                # this now runs for every carving path, not just that one.
+                # These candidates already passed a stronger structural
+                # check (exact column-count match against the live schema,
+                # plus a real rowid+payload-length decode) than
+                # header_signature ever can, so this rarely fires here --
+                # but "rarely" isn't "never", and the row is never
+                # withheld either way, only labeled, same as always.
+                notnull_violations, timestamp_issues = _confidence_gate(
+                    fields, notnull_cols, timestamp_fields)
                 row = {
                     'recovered': True,
                     'recovery_method': c['source'],
@@ -1092,6 +1143,8 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None,
                     'raw_offset': (c['wal_offset'] if is_wal
                                    else (c['page'] - 1) * header['page_size'] + c['offset']),
                     'raw_length': c.get('length') or c.get('cell_len'),
+                    'notnull_violations': notnull_violations,
+                    'timestamp_issues': timestamp_issues,
                 }
                 row.update(fields)
                 row.update(_try_link_foreign_keys(conn, table, fields))
@@ -1118,19 +1171,17 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None,
                 if content_key in content_seen:
                     continue
                 content_seen.add(content_key)
-                # Confidence gate, header_signature only (see notnull_cols'
-                # own comment above and _timestamp_plausible): a NOT NULL
-                # column decoding as blank, or a declared timestamp column
-                # decoding outside a sane range, is a structural sign this
-                # candidate isn't really a row of *table* at all — never
-                # used to drop the row (this project's standing rule is
-                # escalate, don't silently discard), only to label it more
-                # specifically than the bare "(unverified match)" every
-                # header_signature row already gets.
-                notnull_violations = sorted(col for col in notnull_cols if fields.get(col) is None)
-                timestamp_issues = sorted(
-                    name for name, unit_code in (timestamp_fields or {}).items()
-                    if name in fields and _timestamp_plausible(fields[name], unit_code) is False)
+                # Same shared confidence gate the rowid-based loop above now
+                # also runs (see _confidence_gate's own docstring) — a NOT
+                # NULL column decoding as blank, or a declared timestamp
+                # column decoding outside a sane range, is a structural
+                # sign this candidate isn't really a row of *table* at all
+                # — never used to drop the row (this project's standing
+                # rule is escalate, don't silently discard), only to label
+                # it more specifically than the bare "(unverified match)"
+                # every header_signature row already gets.
+                notnull_violations, timestamp_issues = _confidence_gate(
+                    fields, notnull_cols, timestamp_fields)
                 # Outright rejection, not a label — see _text_plausible's
                 # own docstring for why NUL-dominated "text" is a
                 # mechanical fact about the bytes, not a content-meaning

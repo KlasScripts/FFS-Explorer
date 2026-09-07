@@ -16,6 +16,11 @@
       "hash": "9113ecb42194269c",
       "version": 1
     },
+    "android:chrome_app_tabs": {
+      "changelog": {},
+      "hash": "4b19b19572669365",
+      "version": 1
+    },
     "android:chrome_autofill": {
       "changelog": {
         "3": "record_source gained an explicit label ('Autofill Entry') -- the Hex panel's joined-record combo is now always visible even for a single entry, so an undeclared label would otherwise surface as a bare '?'."
@@ -82,6 +87,11 @@
       "hash": "309f13d14764c367",
       "version": 2
     },
+    "android:chrome_local_storage": {
+      "changelog": {},
+      "hash": "dc796698403678ad",
+      "version": 1
+    },
     "android:chrome_login_data": {
       "changelog": {},
       "hash": "76af59d432ed0f4e",
@@ -129,6 +139,11 @@
     "android:chrome_segmentation_platform": {
       "changelog": {},
       "hash": "b706092670c5703d",
+      "version": 1
+    },
+    "android:chrome_sessions": {
+      "changelog": {},
+      "hash": "59ba32abb6b9d52b",
       "version": 1
     },
     "android:chrome_site_settings": {

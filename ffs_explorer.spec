@@ -73,6 +73,27 @@ a = Analysis(
         # 'chrome_cache'"/'chrome_shared', not just a theoretical risk.
         'chrome_cache',
         'chrome_shared',
+        # app/ccl_leveldb.py and app/ccl_simplesnappy.py (vendored 2026-09-05
+        # from iLEAPP, same CCL Forensics lineage as ccl_segb/ccl_abx) are
+        # only ever reached via a dynamic `import ccl_leveldb` INSIDE
+        # chrome_local_storage.py's run() — same invisible-to-PyInstaller
+        # situation as chrome_cache/chrome_shared just above, and the exact
+        # bug class already reported once for those ("No module named
+        # 'chrome_cache'" in a frozen build). Listed here so it isn't
+        # repeated for the new Local Storage parser.
+        'ccl_leveldb',
+        'ccl_simplesnappy',
+        # app/ccl_chromium_pickle.py, app/ccl_chromium_snss.py, app/
+        # chrome_page_state.py, and app/chrome_tabs.py (vendored/built
+        # 2026-09-05 for the "tabs" work — Chrome Sessions/App Tabs) are
+        # only ever reached via a dynamic `import chrome_tabs` (which
+        # itself imports the other three) INSIDE
+        # chrome_sessions.py/chrome_app_tabs.py — same invisible-to-
+        # PyInstaller situation as every other entry in this list.
+        'ccl_chromium_pickle',
+        'ccl_chromium_snss',
+        'chrome_page_state',
+        'chrome_tabs',
         # chrome_cache.py itself lazy-imports these two only inside
         # _decompress_body, for real 'br'/'zstd' Content-Encoding values
         # (confirmed common on real casework — see requirements.txt).

@@ -40,6 +40,26 @@ recoverable_tables = ["chat_history"]
 # are Unix epoch milliseconds.
 timestamp_fields = {"timestamp": "ms", "created_time": "ms"}
 
+# Checked directly against the real schema before declaring this (PRAGMA
+# table_info), not assumed: chat_history.id IS a genuine
+# INTEGER PRIMARY KEY AUTOINCREMENT (a real rowid alias) — "id" is also
+# listed as a rowid_fields fallback since sqlite_carve dumps a recovered
+# row's columns under the table's own names verbatim, not this parser's
+# renamed "raw_message_id". chat.chat_id, by contrast, is a TEXT PRIMARY
+# KEY — SQLite only aliases rowid for an INTEGER PRIMARY KEY, so chat_id's
+# own value is NOT interchangeable with chat's real internal rowid; the
+# Chat entry below points at raw_chat_rowid instead (chat's own real
+# rowid, fetched separately in run() specifically to make this citation
+# possible — chat_id alone could not have been used here without silently
+# citing the wrong bytes).
+hidden_fields = ["raw_chat_rowid"]
+record_source = [
+    {"label": "Message", "file_key": "naver_line", "table": "chat_history",
+     "rowid_fields": ["raw_message_id", "id"]},
+    {"label": "Chat", "file_key": "naver_line", "table": "chat",
+     "rowid_fields": ["raw_chat_rowid"]},
+]
+
 # attachement_type values observed in this schema (no vendor documentation
 # found; derived from cross-checking against ground-truth action labels).
 _ATTACH_IMAGE = 1
@@ -64,8 +84,14 @@ def run(paths):
     conn = sqlite3.connect(paths["naver_line"])
     conn.row_factory = sqlite3.Row
 
-    chat_names = {r["chat_id"]: r["chat_name"]
-                 for r in conn.execute("SELECT chat_id, chat_name FROM chat")}
+    # rowid fetched explicitly alongside chat_id -- chat_id itself is a
+    # TEXT PRIMARY KEY (confirmed via PRAGMA table_info, not assumed), so
+    # it is NOT chat's own real rowid the way an INTEGER PRIMARY KEY would
+    # be; record_source's "Chat" entry needs the genuine rowid to cite the
+    # correct bytes, not a guess.
+    chat_rows = conn.execute("SELECT rowid, chat_id, chat_name FROM chat").fetchall()
+    chat_names = {r["chat_id"]: r["chat_name"] for r in chat_rows}
+    chat_rowid_by_chat_id = {r["chat_id"]: r["rowid"] for r in chat_rows}
     # contacts.m_id -> display name; empty on the extraction this was built
     # against (no contacts synced), but joined for cases where it isn't.
     contact_names = {r["m_id"]: (r["name"] or r["server_name"] or r["custom_name"])
@@ -146,6 +172,7 @@ def run(paths):
             "message": body,
             "raw_message_id": r["id"],
             "raw_chat_id": r["chat_id"],
+            "raw_chat_rowid": chat_rowid_by_chat_id.get(r["chat_id"]),
             "recovered": False,
             "source_table": "chat_history",
         })

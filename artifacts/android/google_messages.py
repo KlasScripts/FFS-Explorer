@@ -57,6 +57,35 @@ timestamp_fields = {"date": "ms", "received_timestamp": "ms", "timestamp": "ms"}
 # rather than trusting the extension here.
 media_fields = ["attachment_path"]
 
+# Checked directly against the real schema before declaring this (PRAGMA
+# table_info / CREATE TABLE), not assumed: messages._id, conversations._id,
+# participants._id, and parts._id are all genuine
+# INTEGER PRIMARY KEY AUTOINCREMENT columns (real rowid aliases).
+# raw_conversation_id reuses messages.conversation_id (a real FK to
+# conversations._id) rather than parts.conversation_id, even though the
+# query joins through the latter — confirmed identical on every real row
+# in this database (0 mismatches checked directly) before relying on
+# that, not assumed from the schema's own FK declarations alone.
+# raw_sender_id can genuinely be NULL (a self-originated message with no
+# LEFT JOIN match) — presence_fields drops the entry rather than citing a
+# nonexistent participant row. raw_first_part_id cites only the FIRST
+# part grouped under this row (parts._id) — a report row can aggregate
+# several real part rows (text + one or more attachments), matching the
+# same "first cached attachment" precedent this file's own attachment_path
+# already follows; hidden since it's the specific representative part
+# chosen for citation, not a standalone identifier for the row as a whole.
+hidden_fields = ["raw_first_part_id"]
+record_source = [
+    {"label": "Message", "file_key": "bugle_db", "table": "messages",
+     "rowid_fields": ["raw_message_id", "_id"]},
+    {"label": "Conversation", "file_key": "bugle_db", "table": "conversations",
+     "rowid_fields": ["raw_conversation_id"]},
+    {"label": "Sender", "file_key": "bugle_db", "table": "participants",
+     "rowid_fields": ["raw_sender_id"], "presence_fields": ["raw_sender_id"]},
+    {"label": "Part", "file_key": "bugle_db", "table": "parts",
+     "rowid_fields": ["raw_first_part_id"]},
+]
+
 
 def run(paths):
     import sqlite3
@@ -173,6 +202,10 @@ def run(paths):
             "body": body,
             "attachment_count": len(media),
             "attachment_types": ", ".join(sorted({m["part_content_type"] for m in media if m["part_content_type"]})) or None,
+            "raw_message_id": r["id"],
+            "raw_conversation_id": r["conversation_id"],
+            "raw_sender_id": r["sender_id"],
+            "raw_first_part_id": parts[0]["part_id"],
         })
 
     conn.close()

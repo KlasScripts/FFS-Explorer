@@ -48,6 +48,20 @@ files = {
 timestamp_fields = {"last_modified": "webkit_us", "expiration": "webkit_us"}
 core_fields = ["category", "origin", "last_modified"]
 
+# A plain JSON file, not a SQLite table -- no per-row on-disk cell to jump
+# to the way a SQL row has (every row here is one entry inside the SAME
+# big Preferences file), so this uses the ui_path_field record_source
+# shape (see artifacts/android/chrome_sessions.py, the first user of it)
+# rather than table/rowid_fields: every row cites the whole file (offset
+# 0, length = the real file's own size) -- selecting a row loads it into
+# the Hex/Text preview panel, where the Text tab is the useful view (a
+# JSON file's own bytes are already plain, readable text; Hex would just
+# show illegible hex pairs for content that's human-readable as-is).
+hidden_fields = ["raw_ui_path", "raw_offset", "raw_length"]
+record_source = [
+    {"label": "Preferences File", "ui_path_field": "raw_ui_path"},
+]
+
 
 def _clean_origin(key: str) -> str:
     """Chromium content-setting keys are "<primary_pattern>,<secondary_
@@ -65,6 +79,7 @@ def _webkit_us_or_none(value):
 
 def run(paths):
     import json
+    import os
 
     with open(paths["preferences"], "r", encoding="utf-8") as f:
         prefs = json.load(f)
@@ -72,6 +87,13 @@ def run(paths):
     exceptions = (
         prefs.get("profile", {}).get("content_settings", {}).get("exceptions", {})
     )
+
+    app_base = paths.get("_app_base_ui_path", "")
+    raw_ui_path = f"{app_base}/app_chrome/Default/Preferences"
+    # Local extracted copy is a byte-for-byte copy of the real archive
+    # entry (see _extract_candidate) -- its size is the real file's size,
+    # just cheaper to read than re-fetching the archive entry's own size.
+    raw_length = os.path.getsize(paths["preferences"])
 
     out = []
     for category, entries in exceptions.items():
@@ -87,5 +109,8 @@ def run(paths):
                 "expiration": _webkit_us_or_none(entry.get("expiration")),
                 "setting_json": json.dumps(entry.get("setting"), sort_keys=True),
                 "raw_key": key,
+                "raw_ui_path": raw_ui_path,
+                "raw_offset": 0,
+                "raw_length": raw_length,
             })
     return out

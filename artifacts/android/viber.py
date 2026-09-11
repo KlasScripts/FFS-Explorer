@@ -37,6 +37,27 @@ recoverable_tables = ["messages"]
 # rows are unioned in, so both need declaring.
 timestamp_fields = {"timestamp": "ms", "msg_date": "ms"}
 
+# Checked directly against the real schema before declaring this (PRAGMA
+# table_info), not assumed: messages._id and participants._id are both
+# genuine INTEGER PRIMARY KEY AUTOINCREMENT columns (real rowid aliases).
+# "_id" is also listed as a rowid_fields fallback for the Message entry
+# since sqlite_carve dumps a recovered row's columns under the table's own
+# names verbatim, not this parser's renamed "raw_message_id". No
+# "Conversation" entry: conversation_id has no directly-queried table row
+# in this script to cite (no `conversations` table is read here) — citing
+# it would mean guessing at an unverified table, which this project's own
+# standing rule says not to do. participants_info (contact_name/viber_name/
+# number, already folded into the visible sender/conversation fields) is
+# similarly not given its own entry — reaching it needs a second hop
+# (participants.participant_info_id) not currently carried per output row.
+hidden_fields = ["raw_participant_id"]
+record_source = [
+    {"label": "Message", "file_key": "viber_messages", "table": "messages",
+     "rowid_fields": ["raw_message_id", "_id"]},
+    {"label": "Participant", "file_key": "viber_messages", "table": "participants",
+     "rowid_fields": ["raw_participant_id"]},
+]
+
 _MIME_CALL = 1002
 _CALL_LABELS = {
     'outgoing_call': 'Outgoing audio call',
@@ -145,6 +166,7 @@ def run(paths):
             "message": body,
             "raw_message_id": r["id"],
             "raw_conversation_id": r["conversation_id"],
+            "raw_participant_id": r["participant_id"],
             "recovered": False,
             "source_table": "messages",
         })

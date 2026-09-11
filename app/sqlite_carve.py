@@ -168,6 +168,11 @@ def parse_db_header(raw: bytes) -> dict:
         page_size = 65536
     return {
         'page_size': page_size,
+        # "Bytes of unused reserved space at the end of each page" per the
+        # real SQLite file-format header — almost always 0, but reading it
+        # rather than assuming matters for locate_live_row's own overflow-
+        # threshold math below (usable_size = page_size - reserved_bytes).
+        'reserved_bytes': raw[20],
         'first_freelist_trunk': struct.unpack('>I', raw[32:36])[0],
         'n_freelist_pages': struct.unpack('>I', raw[36:40])[0],
     }
@@ -272,6 +277,32 @@ def walk_table_leaf_pages(raw: bytes, page_size: int, root_page: int,
     return leaves
 
 
+def _cell_local_payload_size(payload_len: int, usable_size: int) -> tuple[int, bool]:
+    """SQLite's own table-b-tree-leaf-cell overflow-threshold formula (see
+    the file format spec's "Cell Payload Overflow" section) — how many of
+    *payload_len* real payload bytes are actually stored INLINE on the
+    cell's own page (immediately followed by a 4-byte overflow-page
+    pointer when the record doesn't fit entirely), versus spilled onto a
+    chain of overflow pages elsewhere on disk. `decode_leaf_page_cells`
+    deliberately does NOT compute this (see its own docstring) since the
+    carving paths that use it need the payload to fully decode to trust a
+    candidate at all — but locate_live_row (below) already knows the
+    rowid unambiguously from a live SQL query, so it has no analogous
+    reason to reject an overflowing cell; it only needs to report a byte
+    SPAN that's actually correct. Naively highlighting the full logical
+    payload_len for an overflowing cell would run past the real on-page
+    bytes into whatever unrelated content follows on that page (or past
+    the page boundary entirely) — a silently WRONG citation, worse than
+    the honest "not found" this replaces. Returns (local_size, overflows).
+    """
+    x = usable_size - 35
+    if payload_len <= x:
+        return payload_len, False
+    m = ((usable_size - 12) * 32) // 255 - 23
+    k = m + (payload_len - m) % (usable_size - 4)
+    return (k if k <= x else m), True
+
+
 def locate_live_row(raw: bytes, table: str, rowid: int) -> dict | None:
     """Find the on-disk (page, cell-offset, cell-length) of a currently
     LIVE row by its rowid — for the Artifact Viewer's "jump the hex view
@@ -283,11 +314,25 @@ def locate_live_row(raw: bytes, table: str, rowid: int) -> dict | None:
     (never the archive or a persistent extracted file) opened `mode=ro` —
     same reasoning as record_column_names/rowid_alias_column elsewhere in
     this module: a real SQLite reader correctly follows overflow pages for
-    a long `sqlite_master.sql` CREATE TABLE text, which the raw cell
-    decoder below deliberately does not attempt (decode_leaf_page_cells
-    skips a cell it can't decode fully on-page). The connection is
+    a long `sqlite_master.sql` CREATE TABLE text, which this function's
+    own cell-matching loop below does NOT need to do (it only needs the
+    cell's rowid and its correctly-bounded on-page byte span, never the
+    decoded field values — see _cell_local_payload_size). The connection is
     read-only, touches nothing but sqlite_master, and the temp file is
     removed immediately after.
+
+    Deliberately does NOT call decode_leaf_page_cells (unlike every other
+    reader in this module) — that function skips a cell whose payload
+    can't fully decode on-page, the right call for the CARVING paths that
+    use it (an undecodable candidate there is a real false-positive risk),
+    but wrong here: a rowid reaching this function is already known-good
+    from a live SQL query, so a cell that merely overflows onto another
+    page must still be matched and cited, with an honest on-page-only
+    span (via _cell_local_payload_size) rather than silently discarded —
+    a real bug this function used to have, found and fixed 2026-09-09 via
+    real sms.db messages whose long text/attributedBody content overflows
+    a page: confirmed missing before the fix, found and byte-verified
+    (including reading across the real overflow-page boundary) after.
 
     Returns None (never raises) if the table doesn't exist, the rowid
     isn't found in the table's CURRENT live b-tree (it may only exist in
@@ -323,21 +368,49 @@ def locate_live_row(raw: bytes, table: str, rowid: int) -> dict | None:
     if root_page is None:
         return None
 
+    usable_size = header['page_size'] - header.get('reserved_bytes', 0)
+
     try:
         for page_no in walk_table_leaf_pages(raw, header['page_size'], root_page):
             header_offset = 100 if page_no == 1 else 0
             page = _page_bytes(raw, header['page_size'], page_no)
             if len(page) < header_offset + 12 or page[header_offset] != _LEAF_TABLE_PAGE:
                 continue
-            for cell in decode_leaf_page_cells(page, page_no, header_offset):
-                if cell['rowid'] == rowid:
-                    return {
-                        'page':        page_no,
-                        'offset':      cell['offset'],
-                        'length':      cell['cell_len'],
-                        'abs_offset':  (page_no - 1) * header['page_size'] + cell['offset'],
-                        'page_size':   header['page_size'],
-                    }
+            # Deliberately NOT decode_leaf_page_cells here (unlike every
+            # other reader in this module) -- that function skips a cell
+            # whose payload doesn't fully decode on-page, which is the
+            # right call for the CARVING paths (an undecodable candidate
+            # is a real false-positive risk there) but wrong here: this
+            # rowid is already known-good from a live SQL query, so a
+            # cell that merely overflows onto another page must still be
+            # matched and cited, just with an honest, overflow-aware
+            # on-page length (see _cell_local_payload_size) instead of
+            # either skipping it (the original bug this replaced) or
+            # naively highlighting the full logical payload_len past the
+            # real on-page bytes (which _cell_local_payload_size's own
+            # docstring explains would be silently wrong the other way).
+            n_cells = struct.unpack('>H', page[header_offset + 3:header_offset + 5])[0]
+            ptr_array_start = header_offset + 8
+            for i in range(n_cells):
+                ptr_off = ptr_array_start + i * 2
+                cell_off = struct.unpack('>H', page[ptr_off:ptr_off + 2])[0]
+                if cell_off == 0 or cell_off >= len(page):
+                    continue
+                payload_len, c1 = read_varint(page, cell_off)
+                cell_rowid, c2 = read_varint(page, cell_off + c1)
+                cell_rowid = _to_signed_rowid(cell_rowid)
+                if cell_rowid != rowid:
+                    continue
+                local_size, overflows = _cell_local_payload_size(payload_len, usable_size)
+                cell_len = c1 + c2 + local_size + (4 if overflows else 0)
+                return {
+                    'page':        page_no,
+                    'offset':      cell_off,
+                    'length':      cell_len,
+                    'abs_offset':  (page_no - 1) * header['page_size'] + cell_off,
+                    'page_size':   header['page_size'],
+                    'overflows':   overflows,
+                }
     except Exception:
         return None
     return None

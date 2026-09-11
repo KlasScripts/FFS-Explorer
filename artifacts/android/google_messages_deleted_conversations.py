@@ -40,6 +40,28 @@ optional_files = {
 # description above), Unix epoch milliseconds.
 timestamp_fields = {"first_audit_event": "ms", "last_audit_event": "ms"}
 
+# Checked directly against the real schema before declaring this (PRAGMA
+# table_info), not assumed: conversation_to_participants_audit_log._id is
+# a genuine INTEGER PRIMARY KEY AUTOINCREMENT column (a real rowid alias).
+# One report row here summarizes potentially MANY real audit-log rows for
+# one conversation_id (audit_event_count) -- there is no single row that
+# "is" the conversation the way a live message row is one row of one
+# table, so this cites the two audit rows the report's own visible
+# first_audit_event/last_audit_event fields already correspond to,
+# directly and non-arbitrarily, rather than an arbitrary "first"
+# participant the way google_messages.py's Part entry does (there is no
+# single obviously-representative participant here — parties is a real
+# list of however many people were ever on the conversation).
+hidden_fields = ["raw_first_audit_id", "raw_last_audit_id"]
+record_source = [
+    {"label": "First Audit Event", "file_key": "bugle_db",
+     "table": "conversation_to_participants_audit_log",
+     "rowid_fields": ["raw_first_audit_id"]},
+    {"label": "Last Audit Event", "file_key": "bugle_db",
+     "table": "conversation_to_participants_audit_log",
+     "rowid_fields": ["raw_last_audit_id"]},
+]
+
 
 def run(paths):
     import sqlite3
@@ -55,7 +77,7 @@ def run(paths):
     out = []
     for conv_id in deleted_ids:
         audit_rows = conn.execute("""
-            SELECT operation_datetime, operation_type, participant_id
+            SELECT _id, operation_datetime, operation_type, participant_id
             FROM conversation_to_participants_audit_log
             WHERE conversation_id = ?
             ORDER BY operation_datetime, _id
@@ -103,6 +125,8 @@ def run(paths):
             "message_content": "[not recoverable — secure_delete zeroed the freed bytes, see report description]",
             "recovered": True,
             "source_table": "conversation_to_participants_audit_log",
+            "raw_first_audit_id": audit_rows[0]["_id"],
+            "raw_last_audit_id": audit_rows[-1]["_id"],
         })
 
     conn.close()

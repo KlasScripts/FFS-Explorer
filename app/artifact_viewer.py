@@ -2214,7 +2214,14 @@ class ArtifactViewerMixin:
             return
         self._load_hex_preview_from_bytes_at(data, ui_path, loc['abs_offset'], loc['length'])
         self._art_hex_active = True
-        self.status_bar.showMessage(f"{ui_path}  —  offset: {loc['abs_offset']:,}")
+        # A record whose payload overflows onto another page (see
+        # sqlite_carve._cell_local_payload_size) is only PARTIALLY shown
+        # here — the highlighted span is the real, correctly-bounded
+        # on-page portion, never guessed past it, but the rest of this
+        # row's own content genuinely continues on a page this view
+        # doesn't show; said explicitly rather than implying completeness.
+        overflow_note = "  (record continues on an overflow page, not shown)" if loc.get('overflows') else ""
+        self.status_bar.showMessage(f"{ui_path}  —  offset: {loc['abs_offset']:,}{overflow_note}")
 
     def _on_art_tree_clicked(self, index):
         self._clear_art_hex()

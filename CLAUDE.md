@@ -3393,6 +3393,171 @@ underneath that verification.
     favicon) distinct from the row's own primary content, so nothing
     was missing on that front; the gap was specifically the missing
     Record-mode citation, now closed.
+  - **`record_source` gaps closed in the 6 remaining live-query parsers
+    identified by the same-day audit, 2026-09-05/07/09** (`line.py`,
+    `viber.py`, `groupme.py`, `google_messages.py`,
+    `google_messages_deleted_conversations.py`, `sms_messages.py` (iOS) —
+    per direct instruction, fixed one at a time, each independently
+    schema-verified before declaring, never assumed from a similar-
+    looking sibling parser). Real, non-obvious traps found and worked
+    around, not just mechanical additions:
+    - **LINE's `chat.chat_id` and GroupMe's `chats.user_id`/`groups.
+      group_id` are NOT their own table's rowid** — all three are
+      plain `TEXT UNIQUE` columns (confirmed via `PRAGMA table_info`,
+      not assumed), even though each is exactly the value
+      `chat_history.chat_id`/`messages.conversation_id` joins against.
+      Using the business key directly as if it were a rowid would have
+      silently cited the wrong bytes (or, worse, a coincidentally-
+      numeric business key matching some unrelated real rowid). Fixed
+      by fetching each table's own real `rowid`/`_id` alongside its
+      business key in `run()` and citing THAT instead
+      (`raw_chat_rowid` for LINE; `raw_conversation_rowid` +
+      `conversation_table` for GroupMe, since `conversation_id` can
+      resolve against either `chats` or `groups` per row — a
+      `table_field`-based entry picks the right one dynamically).
+    - **`google_messages.py`'s `messages`/`parts` tables hold genuinely
+      DIFFERENT content** — `messages` has no `text` column at all
+      (metadata only: sender/timestamps/status); the real message body
+      lives in `parts`. Confirmed directly, not assumed: citing
+      "Message" for a real text message correctly does NOT contain that
+      text, while citing "Part" does — both are correct, complementary
+      citations of real, distinct bytes, not a bug. Four entries total
+      (Message/Conversation/Sender/Part — the last two verified via
+      `PRAGMA table_info` as real `INTEGER PRIMARY KEY AUTOINCREMENT`
+      columns, and `parts.conversation_id` cross-checked as identical to
+      `messages.conversation_id` on every real row, 0 mismatches, before
+      relying on the latter for the Conversation entry). Verified against
+      all 1,100 real rows in this case with zero resolution failures.
+    - **`google_messages_deleted_conversations.py`** — one report row
+      here summarizes potentially MANY real audit-log rows for one
+      conversation (no single row "is" the conversation the way an
+      ordinary message row is one row of one table), so instead of an
+      arbitrary "first participant" entry (there is no single
+      obviously-representative one — `parties` is a real list of
+      however many people were ever on the conversation), the two
+      entries declared ("First Audit Event"/"Last Audit Event") cite
+      the exact two audit rows the report's own visible
+      `first_audit_event`/`last_audit_event` fields already correspond
+      to — a direct, non-arbitrary correspondence. Verified against all
+      5 real deleted conversations in this case (a real, populated case
+      for this report, contrary to its own description's stated
+      expectation of a 0-row negative — noted, not otherwise acted on).
+    - **`sms_messages.py`** — four entries (Message/Chat/Sender/
+      Attachment), all four tables confirmed real `ROWID INTEGER
+      PRIMARY KEY AUTOINCREMENT` (the column literally named `ROWID`
+      itself in every one), `chat_message_join.chat_id`/`message.
+      handle_id` cross-checked as resolving with zero orphans to real
+      `chat.ROWID`/`handle.ROWID` values before relying on them.
+      Attachment cites only the first attachment on a message with more
+      than one, matching the same precedent `attachment_path`/
+      `media_fields` already established for this exact file.
+
+    **A real, separate bug in `sqlite_carve.locate_live_row` itself was
+    found and fixed while verifying `sms_messages.py`** — 6 of 89 real
+    messages in this case's real `sms.db` (all with either a long text
+    body or a sizeable `attributedBody` BLOB) came back "not found" by
+    `locate_live_row` despite being genuinely live, confirmed directly
+    via plain SQL. Root cause: `decode_leaf_page_cells` (which
+    `locate_live_row` used to call) reads a cell's payload as a pure
+    on-page slice with no overflow-page following, by design, for the
+    CARVING paths that also use it — there, a payload that doesn't fully
+    decode on-page is a real false-positive risk worth rejecting. But
+    `locate_live_row` doesn't need the payload DECODED at all — it
+    already has an unambiguous rowid from a live SQL query, and only
+    needs to report which bytes the cell occupies — so the exact same
+    "skip if truncated" rule silently discarded a perfectly good rowid
+    match purely because content-decoding wasn't attempted, for every
+    live row anywhere in the project whose real content happens to
+    overflow onto another page. This was NOT scoped to `sms_messages.py`
+    — it silently affected the Hex-panel citation for ANY `record_source`
+    -cited row, in any parser, project-wide, whenever that row's content
+    was large enough to need an overflow page — and the failure mode
+    was actively misleading: the shown message ("may be WAL-only, or
+    deleted") implied the row might genuinely be gone, when it was
+    neither.
+
+    Fixed with a NEW, dedicated minimal cell-scan inside `locate_live_row`
+    itself (`decode_leaf_page_cells` was deliberately left completely
+    untouched, so the carving paths' own correct, more conservative
+    behavior is unaffected) plus a new `_cell_local_payload_size(
+    payload_len, usable_size)` implementing SQLite's real table-b-tree-
+    leaf-cell overflow-threshold formula from the file format spec.
+    `parse_db_header` gained a `reserved_bytes` field (read from the
+    real header byte, not assumed 0) so `usable_size = page_size -
+    reserved_bytes` is computed correctly rather than guessed. Getting
+    this right mattered specifically because the FIRST fix considered —
+    simply reporting the cell's full logical `payload_len` as the
+    highlight length once a match is found — would have been WRONG in a
+    different, worse way: `payload_len` is the total LOGICAL length
+    including whatever spilled onto overflow pages elsewhere on disk, not
+    a contiguous span on the matched page — naively highlighting that
+    many bytes from the cell's own on-page offset would run past the
+    real on-page content into unrelated bytes (or past the page boundary
+    entirely). `locate_live_row`'s returned dict gained an `overflows`
+    flag so `_art_load_record_hex` (`app/artifact_viewer.py`) can say so
+    explicitly in the status-bar message ("record continues on an
+    overflow page, not shown") rather than silently implying the
+    highlighted span is the row's complete content.
+
+    Verified against all 6 real previously-failing rows, not just
+    "stopped returning None": every returned span was confirmed to stay
+    within its own page's bounds; the 4-byte value immediately following
+    every returned span decoded to a plausible real page number (checked
+    against the file's own actual page count, not just "some integer");
+    and, going one step further, the actual overflow chain was followed
+    for one real row (a real spam-text message, rowid 65) and its
+    content read byte-for-byte across the page boundary — the on-page
+    span ends mid-sentence ("...start a career you can be proud of. (Requ"
+    — actually ends "...be a p") and the very next bytes on the real
+    overflow page continue it exactly ("art of America's booming job
+    market..."), confirming the formula and the byte accounting are
+    genuinely correct, not just plausible-looking. Re-ran the full
+    verification suite for all 6 parsers fixed in this same pass
+    afterward (4,710 total `record_source` entries across 1,344 rows) to
+    confirm this shared-engine change caused zero regressions elsewhere —
+    identical zero-failure result before and after.
+
+    **`chrome_bookmarks.py`/`chrome_site_settings.py` closed the same
+    way, 2026-09-11**, per a direct design discussion: both read a plain
+    JSON file, not a database, so there's no per-row on-disk CELL the
+    way a SQL row has — but there IS a whole real file every row equally
+    belongs to, so both now declare a single `ui_path_field` entry
+    ("Bookmarks File"/"Preferences File") citing the WHOLE file (offset
+    0, length = the file's own real size — `os.path.getsize()` on the
+    already-extracted local copy, a byte-for-byte match for the real
+    archive entry). `media_fields` was considered and explicitly
+    rejected for this, per the same discussion: it exists for a row that
+    references a genuinely SEPARATE file elsewhere in the archive (a
+    message's own photo, a favicon's own PNG) — neither report has that;
+    every row's data simply IS the one JSON file it came from, which is
+    exactly what `record_source` means, and `media_fields` would have
+    additionally added a thumbnail-delegate column showing the same
+    generic broken-icon fallback on every single row (since neither file
+    is an image), pure noise for no benefit. Hex has little independent
+    value for a JSON file's own bytes (already plain, readable text —
+    hex would just show illegible byte pairs for content that doesn't
+    need decoding) — the point of wiring this at all is that selecting
+    a row auto-populates the already-existing, already-synced Text tab
+    (`_sync_text_preview`) with the full readable JSON, which is small
+    enough in real casework to just visually scan/search directly (the
+    real `Bookmarks`/`Preferences` files on this project's own Android 14
+    JoshHickman case are ~2KB/~28KB) — a real, deliberately NOT-built
+    "jump to the exact JSON node's own text position" feature would be
+    genuine over-engineering for content this size, and no such
+    text-position-jump mechanism exists anywhere else in this project
+    to begin with. Verified against real data: `chrome_site_settings.py`
+    across all 42 real rows on this case (every resolved segment is the
+    whole real 28,287-byte file, and genuinely contains that row's own
+    origin string); `chrome_bookmarks.py` against a synthetic bookmark
+    node (this parser's own established verification method, since real
+    ground truth has zero populated bookmarks — see its own description)
+    confirmed the same mechanism resolves correctly when a real row
+    exists to test.
+
+    `chrome_indexeddb_origins.py` remains the one open gap from the
+    original audit — directory names only, no real byte content to cite
+    at all (there's no file, JSON or otherwise, backing an origin-name
+    row) — not something this mechanism can help with regardless.
   - **`app/chrome_shared.py` — the gap-sweep batch's own boilerplate
     factored out, same day** (2026-09-03, direct instruction: "remember
     the idea that each artifact script is meant to be as simple as

@@ -34,6 +34,26 @@ recoverable_tables = ["messages"]
 # epoch SECONDS (not ms — confirmed by this table's own values).
 timestamp_fields = {"timestamp": "s", "created_at": "s", "deleted_at": "s"}
 
+# Checked directly against the real schema before declaring this (PRAGMA
+# table_info), not assumed: messages._id, chats._id, and groups._id are
+# all genuine INTEGER PRIMARY KEY AUTOINCREMENT columns (real rowid
+# aliases) — but messages.conversation_id itself matches chats.user_id or
+# groups.group_id (see the comment in run() above), and NEITHER of those
+# is its own table's rowid (both are plain TEXT UNIQUE columns) — the
+# same trap as LINE's chat_id. The "Chat/Group" entry below therefore
+# points at raw_conversation_rowid (each table's own real _id, fetched
+# separately in run() specifically for this citation) rather than
+# conversation_id itself, and conversation_table (set to "chats" or
+# "groups" per row, since which table conversation_id resolved against
+# varies per message) tells it which table to jump into.
+hidden_fields = ["raw_conversation_rowid", "conversation_table"]
+record_source = [
+    {"label": "Message", "file_key": "groupme", "table": "messages",
+     "rowid_fields": ["raw_message_id", "_id"]},
+    {"label": "Chat/Group", "file_key": "groupme", "table_field": "conversation_table",
+     "rowid_fields": ["raw_conversation_rowid"]},
+]
+
 
 def run(paths):
     import json as _json
@@ -54,11 +74,22 @@ def run(paths):
     # image) only LEFT JOINs `groups`, never `chats` — every DM message in
     # its report gets a blank conversation label; deliberately joining both
     # here instead.
+    # _id fetched explicitly alongside user_id/group_id -- neither of
+    # those business keys is its own table's real rowid (both are plain
+    # TEXT UNIQUE columns, confirmed via PRAGMA table_info, not assumed),
+    # so record_source's "Chat/Group" entry needs each table's genuine
+    # _id to cite the correct bytes.
     convo_label = {}
-    for r in conn.execute("SELECT user_id, name FROM chats"):
+    convo_rowid = {}
+    convo_table = {}
+    for r in conn.execute("SELECT _id, user_id, name FROM chats"):
         convo_label[r["user_id"]] = r["name"] or f"[DM with raw user_id={r['user_id']}]"
-    for r in conn.execute("SELECT group_id, name FROM groups"):
+        convo_rowid[r["user_id"]] = r["_id"]
+        convo_table[r["user_id"]] = "chats"
+    for r in conn.execute("SELECT _id, group_id, name FROM groups"):
         convo_label[r["group_id"]] = r["name"] or f"[group, raw group_id={r['group_id']}]"
+        convo_rowid[r["group_id"]] = r["_id"]
+        convo_table[r["group_id"]] = "groups"
 
     # Self (device owner) identification: no explicit "this is me" flag
     # exists anywhere in this schema. A first attempt used "whichever
@@ -149,6 +180,8 @@ def run(paths):
             "message": body,
             "raw_message_id": r["_id"],
             "raw_conversation_id": r["conversation_id"],
+            "raw_conversation_rowid": convo_rowid.get(r["conversation_id"]),
+            "conversation_table": convo_table.get(r["conversation_id"]),
             "recovered": False,
             "source_table": "messages",
         }

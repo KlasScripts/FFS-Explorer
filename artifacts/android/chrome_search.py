@@ -55,11 +55,11 @@ record_source = {
 
 
 def run(paths):
-    import sqlite3
     import urllib.parse
 
-    conn = sqlite3.connect(paths["history"])
-    conn.row_factory = sqlite3.Row
+    from artifact_runner import open_db_readonly
+
+    conn = open_db_readonly(paths["history"])
 
     keyword_rows = conn.execute("""
         SELECT keyword_search_terms.rowid AS rid, keyword_id, term, url_id, last_visit_time

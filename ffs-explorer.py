@@ -7846,6 +7846,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _stop(getattr(self, '_sql_preview_worker', None), method='requestInterruption')
         for w in list(getattr(self, '_retired_workers', [])):
             _stop(w, has_stop=hasattr(w, 'stop'))
+        # SqlHitInterpretWorker instances (app/keyword_search.py) — kept in
+        # a dict, not a single attribute, since more than one "Interpret as
+        # SQL Record" click can be in flight at once. Each normally finishes
+        # in single-digit-to-tens of milliseconds, well inside the same
+        # 2-second wait() budget every other worker here already gets.
+        for w in list(getattr(self, '_sql_interpret_workers', {}).values()):
+            _stop(w)
 
     def closeEvent(self, event):
         self._stop_all_workers()

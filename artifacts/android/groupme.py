@@ -57,12 +57,10 @@ record_source = [
 
 def run(paths):
     import json as _json
-    import sqlite3
 
-    from artifact_runner import missing_ref_label
+    from artifact_runner import missing_ref_label, open_db_readonly
 
-    conn = sqlite3.connect(paths["groupme"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["groupme"])
 
     # Conversation label lookup. Unlike Viber, no participant-indirection
     # table is needed here — messages.name already carries the sender's

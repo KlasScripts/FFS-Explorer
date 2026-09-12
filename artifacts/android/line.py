@@ -77,12 +77,9 @@ def _parse_call_params(parameter):
 
 
 def run(paths):
-    import sqlite3
+    from artifact_runner import missing_ref_label, open_db_readonly
 
-    from artifact_runner import missing_ref_label
-
-    conn = sqlite3.connect(paths["naver_line"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["naver_line"])
 
     # rowid fetched explicitly alongside chat_id -- chat_id itself is a
     # TEXT PRIMARY KEY (confirmed via PRAGMA table_info, not assumed), so

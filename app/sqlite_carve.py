@@ -35,6 +35,14 @@ import time
 
 _LEAF_TABLE_PAGE = 0x0D
 _INTERIOR_TABLE_PAGE = 0x05
+_LEAF_INDEX_PAGE = 0x0A
+_INTERIOR_INDEX_PAGE = 0x02
+_PAGE_TYPE_NAMES = {
+    _LEAF_TABLE_PAGE: 'table_leaf',
+    _INTERIOR_TABLE_PAGE: 'table_interior',
+    _LEAF_INDEX_PAGE: 'index_leaf',
+    _INTERIOR_INDEX_PAGE: 'index_interior',
+}
 
 
 # ── varint / record decoding (SQLite's own on-disk format) ─────────────────
@@ -414,6 +422,758 @@ def locate_live_row(raw: bytes, table: str, rowid: int) -> dict | None:
     except Exception:
         return None
     return None
+
+
+def locate_offset(raw: bytes, offset: int, page_map: dict | None = None) -> dict | None:
+    """Reverse of locate_live_row(): given an absolute byte OFFSET into
+    *raw* — e.g. a Keyword Search hit that landed somewhere inside a
+    `.db`/`.sqlite` file — find which table/rowid (and, best-effort,
+    which column) that byte belongs to. ios-ffs-browser had no way to
+    ask "which report row does this byte belong to" before this; added
+    2026-09-12 after CRUSH_REVIEW.md flagged Crush's own two-directional
+    `CellLocator.locate_cell`/`locate_offset` protocol as worth a look —
+    Crush's own version takes the table name as an INPUT (its Table
+    Viewer already knows which report/table the examiner has open); this
+    one has to DISCOVER the table, since a raw search hit carries no such
+    context — the harder, opposite half of that same protocol.
+
+    Deliberately scoped to the CURRENT LIVE b-tree only, matching Crush's
+    own scope — an offset landing in an overflow page, an interior page,
+    a freelist page, or unmerged WAL content returns None here, never a
+    guess. (Attributing a DELETED/freed-space byte to a row is a much
+    harder, separate problem — schema-matching a candidate against every
+    table's own shape with no page-ownership record to consult, not a
+    lookup — left to a caller that already has recover_deleted_rows' own
+    carving primitives to reach for; see CLAUDE.md's own TODO history for
+    the planned Search-tab feature this exists to support.)
+
+    Cheap short-circuit first: computes which page *offset* falls on and
+    bails immediately if that page isn't currently a table-leaf page at
+    all — the common case for an arbitrary offset, since most of a real
+    database is interior/overflow/freelist pages or the file header —
+    before ever touching sqlite_master, the one genuinely not-cheap part
+    of this function (a linear scan over every table's own b-tree, via
+    the existing walk_table_leaf_pages, to find which one owns this
+    specific leaf page; SQLite maintains no reverse page-to-table index
+    of its own to consult instead). Meant to be called lazily, once per
+    examiner-initiated interpretation of one specific search hit — not a
+    bulk/every-hit operation.
+
+    Returns None (never raises) on anything that doesn't resolve cleanly.
+    On success:
+      table          — the table name that owns this page
+      rowid          — the specific row's rowid
+      page/offset/length/abs_offset/overflows — the SAME shape
+                       locate_live_row already returns, for this exact
+                       cell, so a caller can highlight/report it
+                       identically either direction
+      column_index   — which column (0-based, on-disk record-body order)
+                       *offset* falls inside, or None if it lands in the
+                       cell's own header/rowid-varint/record-header bytes,
+                       or the record header couldn't be decoded (an
+                       overflowing record whose header itself doesn't
+                       fully fit on-page — rare, but honestly reported as
+                       "row found, column unknown" rather than guessed)
+      column_name    — record_column_names(...)[column_index], or None
+
+    *page_map*, if given (see build_page_map below), skips this
+    function's own temp-file-write + sqlite3-connect + schema-walk for
+    the "which table owns this page" step — a plain dict lookup instead.
+    Added 2026-09-12 once repeated Keyword Search hits inside the SAME
+    file (an ordinary case — one search often finds many hits in one
+    db) turned out to redo that identical, file-wide walk from scratch
+    on every single hit; a caller interpreting more than one hit in the
+    same file should build (or load a cached) page_map ONCE and pass it
+    to every call, rather than the previous cost of a fresh temp-file+
+    connect+schema-walk per call. Omitting it (the default) preserves
+    the exact prior self-sufficient behavior — this parameter is a pure
+    optimization, never a behavior change: a supplied page_map must
+    still only ever mark a page 'table' if that table's own current
+    b-tree genuinely reaches it, identical to what this function's own
+    fallback walk would find."""
+    try:
+        header = parse_db_header(raw)
+    except Exception:
+        return None
+    page_size = header['page_size']
+    usable_size = page_size - header.get('reserved_bytes', 0)
+    if page_size <= 0 or offset < 0:
+        return None
+
+    page_no = offset // page_size + 1
+    header_offset = 100 if page_no == 1 else 0
+    page = _page_bytes(raw, page_size, page_no)
+    if len(page) < header_offset + 12 or page[header_offset] != _LEAF_TABLE_PAGE:
+        return None
+
+    if page_map is not None:
+        entry = page_map.get(page_no)
+        # Deliberately excludes 'sqlite_master' even though build_page_map
+        # (built for identify_structure's benefit, which DOES want to
+        # recognize schema-table hits) marks its own pages as a real
+        # 'table' match -- the ORIGINAL, pre-cache locate_offset never
+        # covered sqlite_master at all (its own fallback query below is
+        # `WHERE type='table'`, which structurally excludes sqlite_master
+        # since it never lists itself as one of its own rows), and a
+        # schema-table hit already has its own clean, purpose-built
+        # message via identify_structure -- attributing it here too would
+        # just be a second, more confusingly-worded path to the same
+        # information, not a real improvement. Found and fixed during
+        # verification: an early version of this cached path silently
+        # started resolving sqlite_master's own CREATE TABLE/INDEX rows
+        # as ordinary "live rows," a real scope change the caching
+        # refactor was never meant to introduce.
+        if entry is None or entry.get('kind') != 'table' or entry.get('name') == 'sqlite_master':
+            return None
+        return _scan_leaf_page_for_offset(
+            raw, page, page_no, page_size, usable_size, offset, entry.get('name'), None)
+
+    fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+    conn = None
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
+
+        table = None
+        for name, rootpage in conn.execute(
+                "SELECT name, rootpage FROM sqlite_master WHERE type='table'").fetchall():
+            if page_no in walk_table_leaf_pages(raw, page_size, rootpage):
+                table = name
+                break
+        if table is None:
+            return None
+        return _scan_leaf_page_for_offset(
+            raw, page, page_no, page_size, usable_size, offset, table, conn)
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _scan_leaf_page_for_offset(raw: bytes, page: bytes, page_no: int, page_size: int,
+                               usable_size: int, offset: int, table: str,
+                               conn: sqlite3.Connection | None) -> dict | None:
+    """Shared cell-scan core for locate_offset's two paths (a cached
+    page_map already told it which table owns this page, vs. its own
+    fallback schema walk) — once the owning TABLE is known, find which
+    cell on this page spans *offset* and resolve column_index/column_name
+    the same way either path. *conn*, if given, is reused for the
+    record_column_names lookup (the schema-walk fallback path already has
+    one open); if None (the cached-page_map fast path, which by design
+    never opens a connection just to find the table) a throwaway one is
+    opened just for this single PRAGMA call — and only when a
+    column_index was actually found, which most calls never reach at
+    all, so this doesn't undo the fast path's own main saving (skipping
+    the full schema walk)."""
+    header_offset = 100 if page_no == 1 else 0
+    n_cells = struct.unpack('>H', page[header_offset + 3:header_offset + 5])[0]
+    ptr_array_start = header_offset + 8
+    for i in range(n_cells):
+        ptr_off = ptr_array_start + i * 2
+        cell_off = struct.unpack('>H', page[ptr_off:ptr_off + 2])[0]
+        if cell_off == 0 or cell_off >= len(page):
+            continue
+        payload_len, c1 = read_varint(page, cell_off)
+        rowid, c2 = read_varint(page, cell_off + c1)
+        rowid = _to_signed_rowid(rowid)
+        local_size, overflows = _cell_local_payload_size(payload_len, usable_size)
+        cell_len = c1 + c2 + local_size + (4 if overflows else 0)
+        abs_cell_start = (page_no - 1) * page_size + cell_off
+        if not (abs_cell_start <= offset < abs_cell_start + cell_len):
+            continue
+
+        # Found the cell -- best-effort column resolution, on-page
+        # bytes only (same overflow honesty as locate_live_row: an
+        # offset inside a spilled record's OVERFLOW portion correctly
+        # gets column_index=None rather than a wrong guess). *offset*
+        # is an ABSOLUTE file position, so the comparison needs an
+        # absolute payload start too -- but slicing `page` (a
+        # page-relative buffer) needs the page-relative one instead;
+        # cell_off/c1/c2 are page-relative, abs_cell_start already
+        # anchors that same cell_off absolutely above.
+        payload_start_rel = cell_off + c1 + c2
+        payload_start_abs = abs_cell_start + c1 + c2
+        column_index = None
+        column_name = None
+        column_names = None
+        row_values = None
+        rel = offset - payload_start_abs
+        payload = page[payload_start_rel:payload_start_rel + local_size]
+        try:
+            types, hdr_len = parse_record_header(payload)
+        except ValueError:
+            types, hdr_len = [], -1
+        if hdr_len >= 0:
+            if 0 <= rel < local_size and rel >= hdr_len:
+                body_pos = hdr_len
+                for idx, t in enumerate(types):
+                    size = _serial_type_size(t)
+                    if body_pos <= rel < body_pos + size:
+                        column_index = idx
+                        break
+                    body_pos += size
+            # Full row decode -- additive, needed by a WAL-frame caller
+            # (locate_wal_offset below) which has no live SQL connection
+            # of its own to fall back on the way the base-file "live" path
+            # does via read_live_row; decoded here regardless of where in
+            # the cell *offset* landed, unlike column_index above (which
+            # is specifically "which column did the CLICK land in").
+            try:
+                values, _truncated = decode_body(payload, types, hdr_len)
+                row_values = values
+            except Exception:
+                pass
+        if column_index is not None or row_values is not None:
+            alias_col = None
+            if conn is not None:
+                try:
+                    column_names = record_column_names(conn, table)
+                    alias_col = rowid_alias_column(conn, table)
+                except Exception:
+                    pass
+            else:
+                fd2, tmp_path2 = tempfile.mkstemp(suffix='.sqlite')
+                tmp_conn = None
+                try:
+                    with os.fdopen(fd2, 'wb') as f2:
+                        f2.write(raw)
+                    tmp_conn = sqlite3.connect(f'file:{tmp_path2}?mode=ro', uri=True, timeout=5)
+                    column_names = record_column_names(tmp_conn, table)
+                    alias_col = rowid_alias_column(tmp_conn, table)
+                except Exception:
+                    pass
+                finally:
+                    if tmp_conn is not None:
+                        tmp_conn.close()
+                    try:
+                        os.remove(tmp_path2)
+                    except OSError:
+                        pass
+            if column_names:
+                if column_index is not None and column_index < len(column_names):
+                    column_name = column_names[column_index]
+                if row_values is not None:
+                    row_values = {column_names[i]: v for i, v in enumerate(row_values)
+                                 if i < len(column_names)}
+                    # A rowid-alias column (single-column INTEGER PRIMARY
+                    # KEY, e.g. sqlite's own `docid` in an FTS content
+                    # table) always decodes as a placeholder NULL in the
+                    # record body itself -- the real value is the cell's
+                    # own rowid, already known directly here, not
+                    # something that needs a live query to recover (see
+                    # rowid_alias_column's own docstring). Only matters
+                    # for a WAL-sourced row_values in practice -- the
+                    # base-file "live" path already gets this
+                    # substitution for free from its own real SQL query
+                    # (read_live_row), which SQLite itself performs this
+                    # same substitution for automatically.
+                    if alias_col and alias_col in row_values:
+                        row_values[alias_col] = rowid
+
+        return {
+            'table':        table,
+            'rowid':        rowid,
+            'page':         page_no,
+            'offset':       cell_off,
+            'length':       cell_len,
+            'abs_offset':   abs_cell_start,
+            'page_size':    page_size,
+            'overflows':    overflows,
+            'column_index': column_index,
+            'column_name':  column_name,
+            'row_values':   row_values,
+        }
+    return None
+
+
+def locate_wal_offset(wal: bytes, offset: int, page_size: int, base_page_map: dict,
+                      base_conn: sqlite3.Connection, reserved_bytes: int = 0) -> dict | None:
+    """WAL-file equivalent of `locate_offset` — given an absolute byte
+    OFFSET into a `-wal` sidecar file (a Keyword Search hit that landed
+    there rather than in the main db file), find which table/rowid that
+    byte belongs to, PLUS the row's own full decoded values straight from
+    this WAL frame's own page image. Added 2026-09-12, the direct
+    follow-up TODO item to the base-file version above.
+
+    A WAL frame carries no schema of its own (see CLAUDE.md's own
+    Conventions entry) — *base_page_map* must come from
+    `build_page_map()` run against the SIBLING base `.db` file (the one
+    this WAL is a journal for), and *base_conn* a read-only connection
+    to that same base file (needed for real column NAMES — a bare page
+    image has no schema text to read them from). This function does NOT
+    build either of those itself, unlike `locate_offset`'s own optional
+    *page_map* — there's no sensible self-sufficient fallback here the
+    way there is for a whole base file, since the schema genuinely lives
+    in a different file entirely.
+
+    Deliberately excludes `sqlite_master` matches, same reasoning as
+    `locate_offset`'s own cached-path exclusion — a WAL frame holding an
+    old image of the schema table itself is structural content, not an
+    application row, and gets identify_wal_structure's own honest label
+    instead if this returns None for that reason.
+
+    A real, disclosed limitation, not glossed over: this resolves the
+    frame's own page number against the BASE file's CURRENT schema — if
+    that exact page number was reassigned to a DIFFERENT table/index
+    between when this WAL frame was written and now (schema changes,
+    not just row changes), the attribution would describe the WRONG
+    object. Not expected to be common (SQLite doesn't reassign a page's
+    role lightly), but not verified against a real case where it
+    happened either — an honest gap, matching this project's own
+    standing discipline about what's confirmed versus reasoned-through.
+
+    Returns the same core shape `locate_offset` does (table/rowid/page/
+    column_index/column_name/row_values), but 'offset'/'abs_offset'/
+    'length' are relative to the WAL FILE itself (this frame's own
+    bytes), not the base file — a caller hex-jumping into the `-wal`
+    sidecar needs WAL-relative coordinates, and translating back to
+    base-file coordinates wouldn't even make sense (this frame may hold
+    now-superseded content the base file's own current page doesn't
+    have at all). Also carries 'wal_frame_index' (which of possibly
+    several images of the same page this WAL file holds — see
+    iter_wal_frames) and 'is_wal': True, so a caller can tell which
+    coordinate space it's looking at without guessing from field names
+    alone."""
+    if page_size <= 0 or offset < 0 or offset >= len(wal):
+        return None
+    usable_size = page_size - reserved_bytes
+    for frame in iter_wal_frames(wal, page_size):
+        frame_data_start = frame['frame_offset'] + 24
+        if not (frame_data_start <= offset < frame_data_start + page_size):
+            continue
+        page_no = frame['page']
+        entry = base_page_map.get(page_no)
+        if entry is None or entry.get('kind') != 'table' or entry.get('name') == 'sqlite_master':
+            return None
+        table = entry.get('name')
+        # _scan_leaf_page_for_offset's own internal math assumes byte 0 of
+        # its `raw`/`page` pair is the start of page 1 -- translate this
+        # WAL-absolute *offset* into that same "(page_no-1)*page_size +
+        # page-relative" coordinate space so its cell-matching comparison
+        # lines up correctly, then translate the RETURNED offset/
+        # abs_offset back to real WAL-file coordinates below.
+        fake_offset = (page_no - 1) * page_size + (offset - frame_data_start)
+        result = _scan_leaf_page_for_offset(
+            b'', frame['image'], page_no, page_size, usable_size, fake_offset, table, base_conn)
+        if result is None:
+            return None
+        page_relative_offset = result['offset']
+        result['offset'] = frame_data_start + page_relative_offset
+        result['abs_offset'] = frame_data_start + page_relative_offset
+        result['wal_frame_index'] = frame['frame_index']
+        result['is_wal'] = True
+        return result
+    return None
+
+
+def identify_wal_structure(wal: bytes, offset: int, page_size: int, base_page_map: dict,
+                          base_conn: sqlite3.Connection | None = None) -> dict | None:
+    """WAL-file equivalent of `identify_structure` — for the case
+    `locate_wal_offset` above already declined (not a live table row in
+    this frame). Resolves the frame's own page number against
+    *base_page_map* the same way `identify_structure` resolves a
+    base-file offset — same 'kind' vocabulary (table/index/
+    unattached_btree_page/unidentified; 'freelist'/'schema_table'-as-
+    page-1 don't meaningfully apply to a single WAL frame's own image,
+    since those are whole-file concepts) — plus 'wal_frame_index' and
+    'is_wal': True. *base_conn*, if given, resolves an index match's own
+    column names (same PRAGMA index_info lookup identify_structure
+    itself does); omit it to skip that one enrichment rather than fail.
+
+    Same disclosed limitation as locate_wal_offset: describes this page
+    per the base file's CURRENT schema, which may not match what this
+    specific historical frame actually was at the time it was written."""
+    if page_size <= 0 or offset < 0 or offset >= len(wal):
+        return None
+    for frame in iter_wal_frames(wal, page_size):
+        frame_data_start = frame['frame_offset'] + 24
+        if not (frame_data_start <= offset < frame_data_start + page_size):
+            continue
+        page_no = frame['page']
+        entry = base_page_map.get(page_no)
+        if entry is None:
+            return {'kind': 'unidentified', 'page': page_no,
+                   'wal_frame_index': frame['frame_index'], 'is_wal': True}
+        result = {'kind': entry['kind'], 'page': page_no,
+                 'wal_frame_index': frame['frame_index'], 'is_wal': True}
+        if entry['kind'] in ('table', 'index'):
+            result['is_leaf'] = entry.get('is_leaf')
+            result['name'] = entry.get('name')
+            result['table'] = entry.get('table')
+            if entry['kind'] == 'index' and base_conn is not None:
+                try:
+                    columns = [r[2] for r in base_conn.execute(
+                        f'PRAGMA index_info("{entry["name"]}")').fetchall()]
+                    result['columns'] = [c for c in columns if c is not None]
+                except sqlite3.Error:
+                    pass
+        elif entry['kind'] == 'unattached_btree_page':
+            result['page_type'] = entry.get('name')
+        return result
+    return None
+
+
+def read_live_row(raw: bytes, table: str, rowid: int) -> tuple[list[str], list] | None:
+    """Real column NAMES and DECODED values for one currently-LIVE row,
+    given a table+rowid already known (e.g. from `locate_offset` above) —
+    a plain `SELECT * FROM table WHERE rowid=?` against a throwaway
+    read-only temp copy of *raw*, same connect pattern `locate_live_row`
+    already uses for its own rootpage lookup. Deliberately simpler than
+    re-deriving decoded values from raw page bytes a second time: a live
+    row's real values are exactly what a normal SQL query already returns
+    correctly-typed (INTEGER/TEXT/REAL/BLOB), so there's no reason to
+    hand-decode serial types again just because `locate_offset` already
+    touched the same page — this is the one place in this module that
+    reads content rather than just locating a byte span, for a caller
+    (the Search-tab "interpret this hit as a SQL record" feature — see
+    CLAUDE.md's `locate_offset` Conventions entry) that needs to show a
+    live-but-unsupported row with its real column names, not just cite
+    where it lives.
+
+    Returns (column_names, values) in `PRAGMA table_info` order, or None
+    if the table/rowid doesn't resolve (never raises)."""
+    fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+    conn = None
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
+        cursor = conn.execute(f'SELECT * FROM "{table}" WHERE rowid = ?', (rowid,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        columns = [d[0] for d in cursor.description]
+        return columns, list(row)
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _walk_all_btree_pages(raw: bytes, page_size: int, root_page: int) -> set[int]:
+    """Every page (interior AND leaf) belonging to the b-tree rooted at
+    *root_page* — a table's or an index's, indistinguishable at this
+    level since an interior page's cell format only needs its leading
+    4-byte child-page-number read to walk the tree topology, identical
+    for table-interior (0x05) and index-interior (0x02) pages (the
+    difference — an index-interior cell also carries a key payload right
+    after that pointer — only matters for decoding content, never for
+    finding where to walk next). A separate function from
+    walk_table_leaf_pages (which deliberately returns only LEAVES, the
+    right answer for every existing carving-path caller) rather than a
+    parameter on it — this one exists for a structurally different need
+    (identify_structure below, which must be able to say a hit landed on
+    an INTERIOR page too, not just attribute leaf content to a row)."""
+    pages = set()
+    stack = [root_page]
+    seen = set()
+    while stack:
+        page_no = stack.pop()
+        if page_no in seen:
+            continue
+        seen.add(page_no)
+        pages.add(page_no)
+        header_offset = 100 if page_no == 1 else 0
+        page = _page_bytes(raw, page_size, page_no)
+        if len(page) < header_offset + 12:
+            continue
+        page_type = page[header_offset]
+        if page_type in (_INTERIOR_TABLE_PAGE, _INTERIOR_INDEX_PAGE):
+            n_cells = struct.unpack('>H', page[header_offset + 3:header_offset + 5])[0]
+            right_child = struct.unpack('>I', page[header_offset + 8:header_offset + 12])[0]
+            stack.append(right_child)
+            ptr_array_start = header_offset + 12
+            for i in range(n_cells):
+                ptr_off = ptr_array_start + i * 2
+                cell_off = struct.unpack('>H', page[ptr_off:ptr_off + 2])[0]
+                if cell_off and cell_off + 4 <= len(page):
+                    child = struct.unpack('>I', page[cell_off:cell_off + 4])[0]
+                    stack.append(child)
+    return pages
+
+
+def build_page_map(raw: bytes) -> dict[int, dict] | None:
+    """Classify EVERY page in *raw* once — {page_no: {'kind', 'name',
+    'table', 'is_leaf'}} — the shared, cacheable foundation both
+    `locate_offset` and `identify_structure` can build on instead of each
+    independently opening its own temp sqlite3 connection and re-walking
+    the whole schema on every single call. Added 2026-09-12 once repeated
+    Keyword Search hits in the SAME file (an ordinary case — one search
+    often finds many hits in one db) turned out to redo that identical,
+    file-wide walk from scratch per hit; building it ONCE per file and
+    persisting the result (see db_utils.save_evidence_page_map/
+    load_evidence_page_map, casecache.db's `evidence_page_map` table) means
+    even the FIRST examiner to ever interpret a hit in a given file, in
+    any session, pays this cost once for the life of the case — safe to
+    cache indefinitely, since a case's evidence bytes never change once
+    extracted.
+
+    `kind` is one of:
+      'table' / 'index'      — a real sqlite_master object owns this
+                                page (`name`/`table`/`is_leaf` set) —
+                                see identify_structure's own docstring
+                                for the WITHOUT-ROWID-table and
+                                sqlite_master-itself cases this
+                                deliberately covers via the same
+                                synthetic-candidate-plus-both-types
+                                matching identify_structure used before
+                                this refactor.
+      'freelist'              — reclaimed, currently-unused space.
+      'unattached_btree_page' — a page whose own leading byte matches a
+                                real b-tree page-type value but isn't
+                                reachable from ANY current object's own
+                                walk (including sqlite_master's) — the
+                                real page-type name is stashed in `name`
+                                for this one kind (never a real object
+                                name, since there isn't one) so a caller
+                                can still say what SHAPE it has.
+      'unidentified'          — anything else (unallocated space, or a
+                                byte pattern that isn't a recognized
+                                b-tree page type at all).
+    Page 1's own 100-byte file header region is NOT a page-map concept —
+    callers check `offset < 100` themselves, same as identify_structure
+    already did before this refactor.
+
+    Returns None on a structural failure (bad header) — never partial."""
+    try:
+        header = parse_db_header(raw)
+    except Exception:
+        return None
+    page_size = header['page_size']
+    if page_size <= 0:
+        return None
+    page_count = len(raw) // page_size
+    if page_count <= 0:
+        return None
+
+    page_map: dict[int, dict] = {}
+    for pn in iter_freelist_pages(raw, page_size, header):
+        page_map[pn] = {'kind': 'freelist', 'name': None, 'table': None, 'is_leaf': None}
+
+    fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+    conn = None
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
+        # sqlite_master's own rootpage is ALWAYS page 1 (never stored
+        # anywhere, since it can't list itself as one of its own rows) —
+        # prepended as a synthetic first candidate so its own interior/
+        # leaf pages get attributed the same as any other object's, not
+        # just literal page 1. Checks BOTH schema types for every real
+        # object regardless of the page's own byte shape (a `WITHOUT
+        # ROWID` table is physically index-shaped despite
+        # sqlite_master.type saying 'table' — see identify_structure's
+        # own docstring for the confirmed-real Chromium example this
+        # covers).
+        candidates = [('sqlite_master', 'table', 'sqlite_master', 1)] + conn.execute(
+            "SELECT name, type, tbl_name, rootpage FROM sqlite_master "
+            "WHERE type IN ('table','index') AND rootpage IS NOT NULL").fetchall()
+        for name, obj_type, tbl_name, rootpage in candidates:
+            for pn in _walk_all_btree_pages(raw, page_size, rootpage):
+                if pn in page_map:
+                    continue   # freelist already claimed it -- real freed space wins
+                header_offset = 100 if pn == 1 else 0
+                pg = _page_bytes(raw, page_size, pn)
+                is_leaf = len(pg) > header_offset and pg[header_offset] in (
+                    _LEAF_TABLE_PAGE, _LEAF_INDEX_PAGE)
+                page_map[pn] = {'kind': obj_type, 'name': name, 'table': tbl_name, 'is_leaf': is_leaf}
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    for pn in range(1, page_count + 1):
+        if pn in page_map:
+            continue
+        header_offset = 100 if pn == 1 else 0
+        pg = _page_bytes(raw, page_size, pn)
+        if len(pg) < header_offset + 8:
+            page_map[pn] = {'kind': 'unidentified', 'name': None, 'table': None, 'is_leaf': None}
+            continue
+        type_name = _PAGE_TYPE_NAMES.get(pg[header_offset])
+        if type_name is None:
+            page_map[pn] = {'kind': 'unidentified', 'name': None, 'table': None, 'is_leaf': None}
+        else:
+            page_map[pn] = {'kind': 'unattached_btree_page', 'name': type_name,
+                            'table': None, 'is_leaf': None}
+    return page_map
+
+
+def identify_structure(raw: bytes, offset: int, page_map: dict | None = None) -> dict | None:
+    """What kind of SQLite on-disk structure *offset* falls inside, for
+    the case `locate_offset` above already declined (not a live table
+    row) — so a Search-tab "Interpret as SQL Record" result can say
+    something more specific than a flat negative, e.g. "index entry in
+    urls_url_index (indexes urls.url)" rather than just "not
+    attributable." Added 2026-09-12 per direct user request after a real
+    Keyword Search hit landed on a SQLite index page and the tool could
+    only say "not attributable," which is honest but uninformative when
+    the actual structure is just as identifiable as a table row is.
+
+    Checked in this order, each a genuinely different on-disk concept:
+    1. The first 100 bytes of page 1 — the database file header itself
+       (page/reserved/freelist-count fields etc.), never row content.
+    2. The freelist — checked BEFORE trusting any page-type byte, since a
+       freed page's own leading bytes are simply whatever was last
+       written there before it was freed (stale content, not a real page
+       header) and could coincidentally resemble a b-tree type byte.
+    3. A live b-tree page (table or index, interior or leaf) — resolved
+       to its OWNING object by the same sqlite_master/b-tree-walk
+       technique `locate_offset` already uses for tables, extended here
+       two ways: (a) checks EVERY schema object regardless of the page's
+       own byte shape (table or index) via the new
+       `_walk_all_btree_pages` (not `walk_table_leaf_pages`, which
+       deliberately only returns leaves) — matters for a real, confirmed
+       case: a `CREATE TABLE ... WITHOUT ROWID` table is physically
+       stored as an index-shaped b-tree even though `sqlite_master.type`
+       still says 'table' for it, so pre-filtering by the page's own
+       apparent shape would silently miss it (confirmed real, not
+       theoretical: Chromium's own History schema has two such tables,
+       `clusters_and_visits`/`cluster_visit_duplicates` — found and fixed
+       after an early version of this function misreported both of
+       their real, current root pages as unattached during
+       verification); (b) also checks `sqlite_master`'s OWN tree
+       (rootpage always 1, a fixed file-format convention it can never
+       list as one of its own rows, so it's prepended as a synthetic
+       candidate rather than ever matching the query itself) — a schema
+       large enough to span multiple pages (confirmed real: WhatsApp's
+       own msgstore.db schema root alone has 46 cells) has real non-root
+       schema pages too, not just literal page 1.
+    4. A page whose leading byte matches a real b-tree page-type value
+       but isn't reachable from ANY current object's own interior/leaf
+       walk (including sqlite_master's own, per point 3b) — deliberately
+       reported as `unattached_btree_page`, not "orphaned": the real
+       remaining causes here are a genuinely DROPPED/renamed table or
+       index whose old pages haven't been reclaimed onto the freelist yet
+       (`PRAGMA auto_vacuum=NONE`), or a live OVERFLOW page (a value long
+       enough to spill off its own cell's home page — linked from within
+       a single cell's own payload, never via the interior-page
+       child-pointer array this function's walk follows, so it looks
+       identical to a dropped object's leftover page from here). Neither
+       is distinguished further; both are reported the same honest way
+       rather than guessing which. (An EARLIER version of this docstring
+       attributed real WhatsApp `msgstore.db` hits here to overflow pages
+       specifically — checked more closely and that diagnosis was wrong:
+       those exact pages decode as literal, readable `CREATE TABLE`/
+       `CREATE TRIGGER` schema text sitting on ORDINARY, non-overflow
+       LEAF pages of sqlite_master's own multi-page schema tree; point 3b
+       above — walking sqlite_master's own tree past its root — is what
+       actually resolved them, not an overflow distinction. Left as a
+       real, still-possible cause in principle, not as something
+       confirmed to occur on real data the way point 3b's fix was.)
+    5. Anything else (genuinely unallocated, never-written space) —
+       reported as "unidentified," never guessed at further.
+
+    Returns None only on a structural failure (bad header, offset out of
+    range) — every other case above returns a real dict with at least a
+    'kind' key, since even a "don't know" answer here is itself useful,
+    specific information distinct from locate_offset's own plain None.
+
+    *page_map*, if given, must come from `build_page_map(raw)` (or a
+    cached equivalent, e.g. db_utils.load_evidence_page_map) — the
+    schema-walk step (point 3/4 above) becomes a plain dict lookup
+    instead of this function's own temp-file-write + sqlite3-connect +
+    full-schema walk. Omitting it (the default) builds one fresh via
+    `build_page_map` internally, preserving the exact prior
+    self-sufficient behavior — same pure-optimization relationship
+    `locate_offset`'s own *page_map* parameter has to it."""
+    try:
+        header = parse_db_header(raw)
+    except Exception:
+        return None
+    page_size = header['page_size']
+    if page_size <= 0 or offset < 0 or offset >= len(raw):
+        return None
+
+    if offset < 100:
+        return {'kind': 'file_header', 'page': 1}
+
+    page_no = offset // page_size + 1
+    header_offset = 100 if page_no == 1 else 0
+    page = _page_bytes(raw, page_size, page_no)
+
+    if page_no in set(iter_freelist_pages(raw, page_size, header)):
+        return {'kind': 'freelist', 'page': page_no}
+
+    if len(page) < header_offset + 8:
+        return {'kind': 'unidentified', 'page': page_no}
+    page_type = page[header_offset]
+    type_name = _PAGE_TYPE_NAMES.get(page_type)
+    if type_name is None:
+        return {'kind': 'unidentified', 'page': page_no}
+
+    is_leaf = page_type in (_LEAF_TABLE_PAGE, _LEAF_INDEX_PAGE)
+
+    if page_map is None:
+        page_map = build_page_map(raw)
+    if page_map is None:
+        return {'kind': 'unidentified', 'page': page_no}
+
+    entry = page_map.get(page_no)
+    if entry is None:
+        return {'kind': 'unidentified', 'page': page_no}
+
+    if entry['kind'] == 'freelist':
+        return {'kind': 'freelist', 'page': page_no}
+
+    if entry['kind'] in ('table', 'index'):
+        name, tbl_name = entry['name'], entry['table']
+        result = {
+            'kind':      entry['kind'],   # 'table' or 'index', per sqlite_master itself
+            'is_leaf':   is_leaf,
+            'name':      name,
+            'table':     tbl_name,
+            'page':      page_no,
+        }
+        if entry['kind'] == 'index':
+            # Index column names aren't stored in the cached map itself
+            # (would mean repeating the same list on every one of that
+            # index's own pages for no benefit) -- one small extra lookup
+            # here instead, only when an index match actually happens.
+            fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+            conn = None
+            try:
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(raw)
+                conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
+                columns = [r[2] for r in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
+                result['columns'] = [c for c in columns if c is not None]
+            except sqlite3.Error:
+                pass
+            finally:
+                if conn is not None:
+                    conn.close()
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        return result
+
+    # entry['kind'] is 'unattached_btree_page' or 'unidentified' --
+    # build_page_map already did the same page-type-byte classification
+    # this function used to do inline; its own stashed 'name' field IS
+    # the page_type string for the unattached case (see build_page_map's
+    # own docstring on that deliberate one-kind field reuse).
+    if entry['kind'] == 'unattached_btree_page':
+        return {'kind': 'unattached_btree_page', 'page_type': entry['name'], 'page': page_no}
+    return {'kind': 'unidentified', 'page': page_no}
 
 
 def iter_freelist_pages(raw: bytes, page_size: int, header: dict):

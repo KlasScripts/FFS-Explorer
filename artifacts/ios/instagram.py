@@ -61,13 +61,11 @@ record_source = {
 
 
 def run(paths):
-    import sqlite3
     from datetime import timezone
 
-    from artifact_runner import decode_plist_blob
+    from artifact_runner import decode_plist_blob, open_db_readonly
 
-    conn = sqlite3.connect(paths["direct_db"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["direct_db"])
     db_rows = conn.execute("""
         SELECT messages.message_id, messages.thread_id, messages.archive,
                messages.row_id, threads.viewer_id

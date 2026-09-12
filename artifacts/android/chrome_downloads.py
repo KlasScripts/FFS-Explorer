@@ -117,10 +117,9 @@ def _column_exists(conn, table, column):
 
 
 def run(paths):
-    import sqlite3
+    from artifact_runner import open_db_readonly
 
-    conn = sqlite3.connect(paths["history"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["history"])
 
     has_last_access = _column_exists(conn, "downloads", "last_access_time")
     has_tab_url = _column_exists(conn, "downloads", "tab_url")

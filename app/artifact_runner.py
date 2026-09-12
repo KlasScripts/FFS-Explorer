@@ -448,6 +448,38 @@ def decode_plist_blob(data: bytes):
     return content
 
 
+def open_db_readonly(db_path: str) -> sqlite3.Connection:
+    """Open a sqlite file for a plain live query, READ-ONLY — every
+    parser's own run() should call this instead of a bare
+    sqlite3.connect(), whether or not the parser declares
+    recoverable_tables. A bare connect (even for a pure SELECT, no
+    explicit write) can trigger SQLite's own checkpoint-on-close
+    behavior, silently DELETING the file's own -wal/-shm sidecars before
+    anything else gets a chance to read them — destroying exactly the
+    historical/superseded WAL frame content sqlite_carve.py's own
+    recoverable_tables carving pass needs afterward for deleted-row
+    recovery (see CLAUDE.md's own WAL-checkpoint Conventions entry).
+
+    Added 2026-09-12, confirmed by direct testing that a read-only URI
+    connect (`file:{path}?mode=ro`) returns byte-for-byte identical
+    live-query results to a bare read-write connect on the same real
+    evidence files — this is a pure safety fix, never a behavior change
+    to any report's own output. An ATTACHed second database (see
+    artifacts/android/whatsapp.py, burner.py) inherits the same
+    read-only restriction from a read-only main connection automatically
+    — standard SQLite behavior, nothing this project has to enforce
+    itself. Returns a connection with row_factory already set to
+    sqlite3.Row (row["col_name"], never a bare tuple) — the exact shape
+    chrome_shared.query_rows already gave its own callers; that function
+    now opens through this helper internally rather than duplicating the
+    connect/row_factory ceremony, and this is the ONE place every
+    SQL-based parser's live-query connect should go through, Chrome or
+    not — see chrome_shared.py's own module docstring."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 # ── Loading ───────────────────────────────────────────────────────────────────
 
 def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[str, str]]]:
@@ -658,8 +690,10 @@ def resolve_module_file_ui_path(module, file_key: str, guid_to_bundle: dict | No
     (`record_source` on a module) to re-read a source database's CURRENT
     archive bytes at click time, long after the parser run that populated
     the report table. Deliberately never returns a path to the cached
-    extracted copy in artifact_parser_files/ — that copy was opened by the
-    parser's own (non-read-only) sqlite3.connect() and could have been
+    extracted copy in artifact_parser_files/ — the parser's own live query
+    now opens that copy read-only (see open_db_readonly), but the same
+    cached copy can still be opened non-read-only elsewhere (the Database
+    tab's own sqlite_viewer.py, browsing that exact extracted file) and
     checkpointed since, where the archive entry itself never changes.
     Mirrors run_artifact's own app_base/ui_path join; returns None if the
     module uses the single-file `target_paths` API instead (nothing to key
@@ -954,7 +988,7 @@ def run_artifact(
         if not _extract_candidate(candidates, zip_path, dest_path, zip_obj):
             continue
         try:
-            db   = sqlite3.connect(dest_path)
+            db   = open_db_readonly(dest_path)
             rows = module.run(db)
             db.close()
             return rows or [], ''

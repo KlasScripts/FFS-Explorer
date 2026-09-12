@@ -1,0 +1,4 @@
+# Development-only dependencies — never bundled into the frozen build
+# (requirements.txt is the one PyInstaller reads from). Install with:
+#   venv/bin/pip install -r requirements-dev.txt
+pytest

@@ -88,14 +88,11 @@ record_source = [
 
 
 def run(paths):
-    import sqlite3
-
-    from artifact_runner import first_nonempty, resolve_path_after_marker
+    from artifact_runner import first_nonempty, open_db_readonly, resolve_path_after_marker
 
     app_base = paths.get("_app_base_ui_path")
 
-    conn = sqlite3.connect(paths["bugle_db"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["bugle_db"])
 
     rows = conn.execute("""
         SELECT

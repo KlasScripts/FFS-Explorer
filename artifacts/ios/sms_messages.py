@@ -149,12 +149,9 @@ def _parse_attributed_body(blob):
 
 
 def run(paths):
-    import sqlite3
+    from artifact_runner import missing_ref_label, open_db_readonly, resolve_path_after_marker
 
-    from artifact_runner import missing_ref_label, resolve_path_after_marker
-
-    conn = sqlite3.connect(paths["sms"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["sms"])
 
     chats = {r["ROWID"]: r for r in conn.execute(
         "SELECT ROWID, chat_identifier, display_name, room_name FROM chat")}

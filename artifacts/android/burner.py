@@ -70,13 +70,15 @@ timestamp_fields = {"timestamp": "ms", "dateCreated": "ms"}
 
 
 def run(paths):
-    import sqlite3
+    from artifact_runner import missing_ref_label, open_db_readonly
 
-    from artifact_runner import missing_ref_label
-
-    conn = sqlite3.connect(paths["messages"])
-    conn.row_factory = sqlite3.Row
-    conn.execute("ATTACH DATABASE ? AS main_db", (paths["main"],))
+    conn = open_db_readonly(paths["messages"])
+    # A read-only main connection does NOT make an ATTACHed database
+    # read-only on its own -- confirmed by direct testing, not assumed --
+    # so the attached path must be its own file: URI too, or main.db's
+    # own WAL/SHM would be exposed to the exact same checkpoint-on-close
+    # risk open_db_readonly exists to close for messages.db.
+    conn.execute("ATTACH DATABASE ? AS main_db", (f'file:{paths["main"]}?mode=ro',))
 
     # Own Burner number(s) — BurnerEntity.id is the internal burner uuid,
     # phoneNumber is the actual assigned number ("My Burner" in this data).

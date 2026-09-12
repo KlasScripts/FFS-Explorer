@@ -64,10 +64,9 @@ record_source = [
 
 
 def run(paths):
-    import sqlite3
+    from artifact_runner import open_db_readonly
 
-    conn = sqlite3.connect(paths["bugle_db"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["bugle_db"])
 
     deleted_ids = [r["conversation_id"] for r in conn.execute("""
         SELECT DISTINCT conversation_id FROM conversation_to_participants_audit_log

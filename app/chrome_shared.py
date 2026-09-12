@@ -9,9 +9,23 @@ column dict — not a place to re-derive "how do I open a sqlite file" or
 plumbing lives here once, the same "one shared Qt-free core module,
 imported by name" pattern app/chrome_cache.py already established for
 chrome_cache_media.py/chrome_cache_pages.py.
-"""
+
+`query_rows` itself is NOT Chrome-specific in its own logic — it's
+plain connect/row_factory/close boilerplate any SQL-based parser needs,
+regardless of app — it only ever lived in this Chrome-named file
+because that's the batch of parsers where the duplication was first
+noticed (2026-09-03 gap sweep). It's kept here, as a thin wrapper around
+the real, universal implementation in artifact_runner.open_db_readonly,
+so every existing Chrome parser that already imports `query_rows` from
+this module keeps working unchanged — but a NON-Chrome parser should
+import `open_db_readonly` directly from artifact_runner instead of
+reaching into this module for it. Only `url_set`/`history_visits` below
+are genuinely Chrome-schema-specific (Chrome History's own urls/visits
+tables) and belong here for real."""
 
 import sqlite3
+
+from artifact_runner import open_db_readonly
 
 
 def query_rows(db_path: str, sql: str) -> list[sqlite3.Row]:
@@ -19,9 +33,10 @@ def query_rows(db_path: str, sql: str) -> list[sqlite3.Row]:
     dict-like sqlite3.Row objects (row["col_name"], never a bare tuple
     a caller has to hand-count positions for) — the connect/row_factory/
     close boilerplate every single-table Chrome parser in this project
-    was otherwise writing out by hand."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    was otherwise writing out by hand. Opens read-only via
+    artifact_runner.open_db_readonly — see that function's own
+    docstring for why a live-query connect must never be read-write."""
+    conn = open_db_readonly(db_path)
     try:
         return conn.execute(sql).fetchall()
     finally:

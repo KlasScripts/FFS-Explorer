@@ -70,12 +70,9 @@ _CALL_LABELS = {
 
 
 def run(paths):
-    import sqlite3
+    from artifact_runner import first_nonempty, missing_ref_label, open_db_readonly
 
-    from artifact_runner import first_nonempty, missing_ref_label
-
-    conn = sqlite3.connect(paths["viber_messages"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["viber_messages"])
 
     # All members of every conversation, keyed by conversation_id — used both
     # to build a conversation label and to resolve each message's sender.

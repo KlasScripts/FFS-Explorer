@@ -52,8 +52,13 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
   see that row's `find_evidence_databases` entry), `app_registry` (schema
   v6, added 2026-08-23 — one row per iOS bundle id: display name, Team ID,
   Bundle/Data container paths, App-Group paths, `has_parser`; see "iOS app
-  registry (LaunchServices)" below). On schema mismatch it is auto-deleted
-  and rebuilt.
+  registry (LaunchServices)" below), `evidence_page_map` (schema v16, added
+  2026-09-12 — per-file SQLite page-ownership map, see `sqlite_carve.
+  build_page_map`/the "Interpret as SQL Record" Conventions entry below;
+  named to avoid SQLite's own reserved `sqlite_`-prefix table-name
+  restriction, confirmed directly after `sqlite_page_map` failed with
+  "object name reserved for internal use"). On schema mismatch it is
+  auto-deleted and rebuilt.
 - `caseresults.db` — precious results (never auto-deleted): search_index /
   search_results, bookmarks, device_info, run_log (an `artifact_<script_name>`
   row's `parser_version` column records the parser's version — see
@@ -85,7 +90,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers (2026-08-19, after a survey found 25+ hand-rebuilt Cancel/OK button rows, 24+ wordWrap note labels, and four different ad-hoc warning/error colors): `button_row()` (Cancel/OK, `on_ok`/`on_cancel` default to accept/reject — only fits a plain two-button row in that fixed order, a dialog with a third button or different order keeps its own hand-built row), `note_label()`, `error_label()`, and `WARNING_COLOR`/`ERROR_COLOR` reusing `research_store.py`'s existing `#b8860b`/`#c62828` rather than inventing new ones. No case/business logic — pure widget construction |
 | `timestamp_display.py` | `TimestampDisplayMixin` (extracted from `ffs-explorer.py` 2026-08-19, same treatment as the other mixins below): the shared timestamp-mode banner, `format_ts` (the single entry point every view calls to display an evidence timestamp per the case's UTC/handset/acquisition/manual setting), and the Timestamp Display dialog. Module-level `_format_ts_cached`/`_format_ts_named_zone` do the actual formatting. Tool-provenance formatting (`_format_tool_ts_local`) is a different concern and stays in `ffs-explorer.py` |
 | `device_timezone.py` | Best-effort timezone detection for the opt-in device-local timestamp display: `detect_handset_zone` (iOS `private/var/db/timezone/localtime`), `detect_acquisition_offset`/`guess_acquisition_zones` (the `.ufd`'s recorded UTC offset, Cellebrite-only), `detect_system_zone` (the analysis machine's own current zone — macOS/Linux via `/etc/localtime`, Windows via the registry + a bundled CLDR name mapping since Windows has no IANA-named equivalent). All best-effort, never raise, never applied silently — see the Conventions timestamp section |
-| `keyword_search.py` | Search workers (live + nested archives), saved-search DB loaders, dialogs, `KeywordSearchMixin` |
+| `keyword_search.py` | Search workers (live + nested archives), saved-search DB loaders, dialogs, `KeywordSearchMixin`. `SqlHitInterpretWorker` (added 2026-09-12) is the background half of "Interpret as SQL Record" — see Conventions |
 | `hex_viewer.py` | Hex tab (`HexViewerMixin`, `HexLoadWorker`). Also builds the Record/Attachment toggle and the joined-record source combo shown beside "File Preview" — see Conventions — but has no artifact-report knowledge itself, just the checkable buttons, the combo widget, and `_hex_source_is_record()`; `ArtifactViewerMixin` owns what each mode/entry loads |
 | `media_viewer.py` | Thumbnail grid, ffmpeg video frames (`MediaViewerMixin`). Selecting a thumbnail (`_on_thumb_clicked`) also loads that file into the shared bottom Hex panel — see "Per-tab state on switching" |
 | `sqlite_viewer.py` | Database tab: temp-copy extraction, table browser, **WAL net-change diff view** (`SqliteDiffModel`) |
@@ -99,12 +104,12 @@ also carries reserved `_nested_archives`/`_nested_archive_errors` keys
 when a parser declares `requires_nested_extraction` — see Conventions
 and `nested_archive.py` above |
 | `chrome_cache.py` | Qt-free core for Chrome's HTTP disk cache (Simple Cache format) — entry parsing, HTML reference scanning, and synthetic `.mhtml` reconstruction, plus `parse_all_entries(paths)`, the shared full-directory pass both `artifacts/android/chrome_cache_media.py` and `chrome_cache_pages.py` filter/project down to their own content-type rather than each re-implementing the decode loop. See its own module docstring for the reverse-engineered on-disk format and the Conventions entries on the Chrome Cache report split |
-| `chrome_shared.py` | Small helpers shared across the `artifacts/android/chrome_*.py` parser family (Login Data, Cookies, Network Action Predictor, Top Sites, Shortcuts, Favicons, Autofill, ...) — `query_rows` (the connect/row_factory/close boilerplate every simple single-table Chrome parser needs), `url_set` (distinct values of one column, with a real None-vs-empty-set "couldn't check" distinction for an optional cross-reference file), and `history_visits` (Chrome History's own visits/urls joined and webkit_us-converted once). Same "one Qt-free core module, imported by name" pattern as `chrome_cache.py` above — each consuming parser script stays a thin declaration (its own SQL + per-row shaping), not a place to re-derive this plumbing. See Conventions for the gap-sweep entry this was factored out of |
+| `chrome_shared.py` | Small helpers shared across the `artifacts/android/chrome_*.py` parser family (Login Data, Cookies, Network Action Predictor, Top Sites, Shortcuts, Favicons, Autofill, ...) — `url_set` (distinct values of one column, with a real None-vs-empty-set "couldn't check" distinction for an optional cross-reference file) and `history_visits` (Chrome History's own visits/urls joined and webkit_us-converted once) are genuinely Chrome-schema-specific and belong here. `query_rows` (the connect/row_factory/close boilerplate every simple single-table parser needs) is NOT actually Chrome-specific in its own logic — only Chrome-named because that's the batch of parsers where the duplication was first noticed (2026-09-03 gap sweep) — it's now a thin wrapper around the real, universal `artifact_runner.open_db_readonly` (added 2026-09-12, see that Conventions entry), kept here only so its existing Chrome-parser callers needed no changes; a NON-Chrome parser should import `open_db_readonly` directly instead. Same "one Qt-free core module, imported by name" pattern as `chrome_cache.py` above — each consuming parser script stays a thin declaration (its own SQL + per-row shaping), not a place to re-derive this plumbing. See Conventions for the gap-sweep entry this was factored out of, and the `open_db_readonly` entry for the read-only-connect fix |
 | `ai_summary.py` | The AI Summary feature's core logic (added 2026-08-29): reads an already-completed report's rows straight from `caseresults.db` (the same source `query_artifact` reads, so this only ever summarizes what's already been reviewed as a normal Report, never a fresh unreviewed parse), splits them into time-gap-bounded chunks (`_chunk_by_time_gap` — natural session boundaries in the real timestamps, not fixed row counts, so a redirect/sign-in chain never gets cut in half), sends each chunk to a local LLM (`local_llm.py`) for a mini-summary, then combines the mini-summaries into one final narrative via a size-bounded hierarchical reduce (`_reduce_hierarchically`). That last step exists because a flat single reduce call was confirmed by direct testing to hit the exact same context-length ceiling an unchunked report does, once there are enough chunks — a real 75-row/2.5-month case produced 24 chunks whose concatenated mini-summaries (37,505 chars) failed the same way the original unchunked 61-row case did at 32,575 chars; `_reduce_hierarchically` batches under a safe character budget and recurses until one narrative remains. Qt-free; used by both `mcp_server.py`'s AI Summary tools and `artifact_viewer.py`'s `AISummaryDialog`, so there is exactly one implementation of "what gets sent and how" |
 | `ai_summary_store.py` | Global (cross-case) settings for AI Summary (added 2026-08-29): the local LLM connection (endpoint/API key/model — LM Studio by default) plus, per report (keyed by bare `script_name`, matching `query_artifact`'s own `name` parameter), which columns get sent, chunk size, max time-gap-per-chunk, and the editable prompt template (must contain a `{data}` placeholder). `config/ai_summary_settings.json`, same dev/frozen-path convention and mtime+size load cache as `research_store.py` |
 | `local_llm.py` | Thin stdlib-only (`urllib`) HTTP client for a local OpenAI-compatible chat server (added 2026-08-29, LM Studio by default): `call_chat` (one chat-completion request) and `list_models` (which model id is actually loaded right now). Never raises — a local model server being unreachable, misconfigured, or slow is an ordinary, expected condition for this optional feature, not a bug to propagate as an exception. `call_chat`'s `timeout` is enforced as a genuine WALL-CLOCK deadline (a helper thread + `future.result(timeout=...)`), not just passed to `urlopen()`'s own `timeout=` — confirmed necessary the same day by direct testing: a real reduce call once ran 5,217 SECONDS (87 minutes) despite `urlopen`'s timeout being set to 240s, because LM Studio's server sends occasional keep-alive bytes during a long generation that reset urllib's per-read idle timer indefinitely without the response ever completing. A `max_tokens` cap (2048 default) is a second, independent safeguard against the same failure mode server-side |
 | `nested_archive.py` | Extracts one embedded/nested archive (ZIP or gzip) from an FFS zip's raw bytes into `case_dir/nested_archives/`, recording it in `casecache.db` — Qt-free (added 2026-08-30, factored out of `ffs-explorer.py`'s own `NestedArchiveWorker._process_one`, since `app/` modules never import from the top-level script) so there is exactly ONE implementation shared by the examiner's manual "Extract as Nested Archive" / batch action AND `artifact_runner.py`'s own `requires_nested_extraction` (a parser declaring it needs one specific embedded archive extracted first — see `WRITING_ARTIFACT_PARSERS.md` and the Conventions entry below). `already_extracted`/`extracted_path` give a caller the same idempotency check `NestedArchiveWorker` already used, so a prior manual extraction and a parser-triggered one never redo each other's work |
-| `sqlite_carve.py` | Below-SQL-layer deleted-record recovery: freeblocks, freed/freelist pages, and full WAL frame history (not just the current valid chain `sqlite3.connect()` would replay) — decodes SQLite's on-disk record format directly, since a `DELETE`d row's bytes usually survive until something else reuses that space. Invoked automatically by `artifact_runner.py` for any table a parser names in `recoverable_tables`; no recovery code belongs in a parser script itself. Every recovered row also carries its own exact `raw_file`/`raw_offset`/`raw_length` (see `record_source` in Conventions) for the same Hex-panel Record-mode jump a live row gets. Also holds `locate_live_row` — the opposite case, finding a currently-LIVE row's on-disk cell by rowid for the Artifact Viewer's "Record" hex mode |
+| `sqlite_carve.py` | Below-SQL-layer deleted-record recovery: freeblocks, freed/freelist pages, and full WAL frame history (not just the current valid chain `sqlite3.connect()` would replay) — decodes SQLite's on-disk record format directly, since a `DELETE`d row's bytes usually survive until something else reuses that space. Invoked automatically by `artifact_runner.py` for any table a parser names in `recoverable_tables`; no recovery code belongs in a parser script itself. Every recovered row also carries its own exact `raw_file`/`raw_offset`/`raw_length` (see `record_source` in Conventions) for the same Hex-panel Record-mode jump a live row gets. Also holds `locate_live_row` — the opposite case, finding a currently-LIVE row's on-disk cell by rowid for the Artifact Viewer's "Record" hex mode. `locate_offset` (added 2026-09-12, see Conventions) is the REVERSE of `locate_live_row` — byte offset in, table/rowid/column out — the prerequisite for the planned Search-tab "interpret this hit as a SQL record" feature (see `TODO.md`). `identify_structure` (same day) classifies an offset that ISN'T a live table row (index/schema-table/freelist/unattached page). `build_page_map` (same day) computes the shared, cacheable page→object map both of those consult — see the "Interpret as SQL Record" Conventions entry's own caching sub-entry, and `db_utils.py`'s `evidence_page_map` table |
 | `artifact_media.py` | `MediaThumbnailDelegate` (per-column QTableView delegate painting a thumbnail instead of raw path text) and `MediaFullViewDialog` (full-size image / video playback with transport controls, opened on double-click) for Report table `media_fields` columns — see Conventions below. Reuses `media_viewer.ThumbnailWorker` for decoding, so results share the Media tab's own on-disk thumbnail cache |
 | `research_store.py` | Global (cross-case) artifact research notes in `config/research_status.json`, keyed by stream/bundle identity, drives row colouring |
 | `parser_versions.py` | Global (cross-case) parser version tracking in `config/parser_versions.json`, same dev/frozen-path convention as `research_store.py` — a hash-derived version number per parser script plus an optional human-authored changelog; drives the Artifact Viewer's "newer parser version available" banner. See Conventions |
@@ -1274,6 +1279,581 @@ underneath that verification.
     when this sweep was done; flagged for a future pass rather than
     changed on an unverified guess, per this project's own
     verify-against-real-data rule.
+
+    **`open_db_readonly` — the WAL-checkpoint-destroys-evidence fix,
+    shipped as the universal shared connect helper (2026-09-12)**, closing
+    a real, confirmed-active bug found earlier via direct comparison with
+    ALEAPP's own `attach_sqlite_db_readonly()` convention: every parser
+    that opened its own evidence sqlite file via a bare `sqlite3.connect()`
+    — 15 files total, both `recoverable_tables`-declaring parsers and
+    plain live-query ones — could silently trigger SQLite's own
+    checkpoint-on-close behavior and destroy the file's own `-wal`/`-shm`
+    sidecars, even for a pure read-only `SELECT` with no explicit write.
+    Confirmed directly, not assumed, with an isolated synthetic test
+    before touching any real parser: a genuinely un-checkpointed 16.5KB
+    WAL (built via a blocking-reader trick so a normal `close()` couldn't
+    already checkpoint it away) survived byte-for-byte through a
+    read-only `file:...?mode=ro` URI connect, while an otherwise-identical
+    bare read-write connect deleted the WAL file entirely on close — same
+    live-query rows either way, only the WAL's own survival differed.
+
+    Fixed with one new helper, `open_db_readonly(db_path)`
+    (`artifact_runner.py`'s "Parser helpers" section) — a read-only URI
+    connect with `row_factory` already set to `sqlite3.Row`, the ONE place
+    every SQL-based parser's live-query connect should go through, Chrome
+    or not (see chrome_shared.py's own updated module docstring, which now
+    states plainly that `query_rows`'s own connect/row_factory/close
+    boilerplate was never actually Chrome-specific in its own logic —
+    only Chrome-named because that's the batch of parsers where the
+    duplication was first noticed on 2026-09-03; `query_rows` now opens
+    through `open_db_readonly` internally, so all 7 of its existing
+    Chrome-parser callers got the fix for free with zero changes to those
+    files). All 15 direct bare-connect sites were switched to it:
+    `artifacts/ios/whatsapp.py`, `instagram.py`, `photos_metadata.py` (two
+    connects — the search-index cross-reference AND the main Photos db),
+    `sms_messages.py`; `artifacts/android/chrome_downloads.py`,
+    `groupme.py`, `whatsapp.py`, `line.py`, `chrome_web_history.py` (two
+    connects — History AND ukm_db, the latter already using a read-only
+    URI by hand before this, now going through the same shared helper as
+    everything else), `google_messages.py`, `viber.py`, `chrome_search.py`,
+    `burner.py`, `google_messages_deleted_conversations.py`.
+
+    A real, second bug surfaced and had to be fixed while doing this: a
+    read-only MAIN connection does NOT automatically make an `ATTACH`ed
+    second database read-only too — confirmed directly by synthetic test
+    (a write to an attached db succeeded even with the main connection
+    opened `mode=ro`) before assuming otherwise. `android/whatsapp.py`
+    (`ATTACH DATABASE ? AS contacts_db`, attaching `wa.db`) and
+    `android/burner.py` (`ATTACH DATABASE ? AS main_db`, attaching
+    `main.db`) both needed their own ATTACH statement's path rewritten as
+    its own `file:...?mode=ro` URI string — confirmed this DOES correctly
+    force the attached db read-only too (a write attempt then fails with
+    "attempt to write a readonly database") once the main connection was
+    already opened via a URI (`uri=True`), which `open_db_readonly`
+    already ensures.
+
+    Verified end-to-end against real archive data for every touched
+    parser except `ios/instagram.py` (compiles and follows the identical,
+    already-proven pattern, but the real IOS17 JoshHickman device's own
+    Instagram install has no matching database file to actually exercise
+    `run()` against — a pre-existing, unrelated real-data gap, not caused
+    by this fix): `android/whatsapp.py` 230 rows, `viber.py` 34,
+    `line.py` 30, `groupme.py` 86, `chrome_web_history.py` 41 (query-only,
+    matching the documented 41-live/42-with-one-carved-false-positive
+    split), `chrome_downloads.py` 0, `chrome_search.py` 2,
+    `google_messages.py` 1,100, `google_messages_deleted_conversations.py`
+    5, `burner.py` 16 (confirming the ATTACH fix works end-to-end, not
+    just in isolation), `ios/sms_messages.py` 91, `ios/whatsapp.py` 60,
+    `ios/photos_metadata.py` 567 — all run via a direct `run_artifact()`
+    harness against the real Android 14 JoshHickman / IOS17 JoshHickman
+    archives, not simulated. The 7 `chrome_shared.query_rows` consumers
+    were separately re-verified through the same harness and matched
+    their own previously-documented exact row counts with zero
+    regression: Login Data 3, Cookies 703, Network Action Predictor 4,
+    Top Sites 1, Shortcuts 0, Favicons 40, Autofill 4.
+
+    The actual FIX for whether this bug has cost real casework a real
+    recovered row anywhere (as opposed to the mechanism being real, which
+    is now conclusively confirmed) remains exactly as honestly unresolved
+    as before this pass — see the still-open "checking a different
+    archive with an already-documented positive WAL recovery" item in
+    `TODO.md`'s own history; this fix closes the risk going forward, it
+    doesn't retroactively prove or disprove a specific past loss.
+
+    **`sqlite_carve.locate_offset` — the reverse of `locate_live_row`,
+    added 2026-09-12** (`TODO.md` item 5, the direct prerequisite for
+    item 1's planned Search-tab "interpret this hit as a SQL record"
+    feature): given an absolute byte OFFSET into a sqlite file's raw
+    bytes, finds which table/rowid (and, best-effort, which column) that
+    byte belongs to — the opposite direction from `locate_live_row`
+    (table/rowid in, byte offset out), which this project had no way to
+    ask before. Prompted by CRUSH_REVIEW.md flagging Crush's own
+    two-directional `CellLocator.locate_cell`/`locate_offset` protocol as
+    worth a look; Crush's own `locate_offset` takes the table name as an
+    INPUT (its Table Viewer already knows which report/table is open) —
+    this one has to DISCOVER the table, since a raw Keyword Search hit
+    carries no such context, the harder, opposite half of that same
+    protocol.
+
+    Cheap short-circuit first: computes which page the offset falls on
+    and bails immediately (no sqlite_master lookup at all) if that page
+    isn't currently a table-leaf page — the common case for an arbitrary
+    offset, since most of a real database is interior/overflow/freelist
+    pages or the 100-byte file header. Only once a leaf page is confirmed
+    does it do the more expensive part: a linear scan over every table's
+    own b-tree (reusing the existing `walk_table_leaf_pages`) to find
+    which one owns that specific page — SQLite maintains no reverse
+    page-to-table index of its own to consult instead, so there's no
+    cheaper way to answer "which table is this." Deliberately scoped to
+    the CURRENT LIVE b-tree only, matching Crush's own scope — an offset
+    landing in an overflow page, a freelist page, or unmerged WAL content
+    returns `None`, never a guess; attributing a DELETED/freed-space byte
+    to a row is a much harder, separate problem (schema-matching a
+    candidate against every table's own shape with no page-ownership
+    record to consult) left to whichever caller builds item 1's own
+    fallback logic, reusing `recover_deleted_rows`' existing carving
+    primitives for that harder case rather than folding it into this
+    function.
+
+    Column-level resolution (best-effort, `column_index`/`column_name`)
+    walks the record's own decoded serial-type sizes forward from the
+    header's end to find which column's byte span contains the offset —
+    `None` for an offset landing in the cell's own varint-header bytes
+    (payload-length/rowid/record-header, structural, not column content)
+    or an offset inside a spilled record's overflow portion (on-page
+    bytes only, same overflow honesty `locate_live_row` already
+    established, never a guess past what's actually on this page). A
+    real bug was found and fixed during verification, before this ever
+    ran against real data: the column-math mixed an ABSOLUTE file
+    *offset* with page-RELATIVE cell/payload positions — computing `rel
+    = offset - payload_start` where `payload_start` was still
+    page-relative — which silently made every column resolution fail
+    (always landing far outside `[0, local_size)`), while row-level
+    resolution still worked (that math was correctly absolute
+    throughout). Caught by an exhaustive per-byte test on one real row
+    before trusting the fix, not just re-running the original case.
+
+    Verified against real data at three separate levels, not just
+    compiled: (1) **round-trip** — for 10 real live rows across Chrome
+    History's `urls`/`visits` tables, `locate_live_row`'s own returned
+    `abs_offset` fed back into `locate_offset` correctly resolved the
+    identical table/rowid every time, both at the cell's start and at an
+    arbitrary mid-cell offset; (2) **exhaustive per-byte** — every single
+    byte offset across one real `visits` row's full cell span was tested
+    individually: the varint-header bytes correctly resolved to
+    `column_index=None`, and the column boundaries that followed matched
+    the real schema exactly (`url`/`visit_time`/`transition`, in the
+    real on-disk column order, `id`'s own rowid-alias column correctly
+    never landed on since it occupies zero body bytes); (3) **random
+    stress test with independent cross-check** — 200 random offsets
+    across the real Chrome History file (13 landed on a live cell, 187
+    correctly returned `None`) and 500 across the real, 12-distinct-table
+    WhatsApp `msgstore.db` (103 hits, 397 correct `None`s, every one of
+    the 12 real tables correctly identified at least once) — every
+    single hit in both runs was independently re-verified as a genuinely
+    live row via a separate `SELECT ... WHERE rowid = ?` existence
+    query, zero mismatches across 713 total random offsets tried.
+    Explicit negative cases also confirmed clean: the 100-byte file
+    header, a negative offset, and an offset past EOF all correctly
+    return `None` rather than raising. Average latency ~0.2-1.5ms per
+    call (scales with how many tables a real db has, since the
+    page-to-table scan is linear) — comfortably inside the "lazy,
+    computed once per examiner-initiated interpretation of one hit"
+    budget item 1's own design calls for, not a bulk/every-hit operation.
+    *Source: Crush (`core/cell_locator.py`'s `CellLocator` protocol,
+    `core/sqlite_wal.py`'s concrete `locate_offset` implementation).*
+
+    **"Interpret as SQL Record" — the Search-tab feature built on top of
+    `locate_offset`, shipped v1 2026-09-12** (`TODO.md` item 1;
+    `app/keyword_search.py`'s `SqlHitInterpretWorker` +
+    `KeywordSearchMixin._interpret_search_hit_as_sql`/
+    `_on_sql_hit_interpreted`). Right-click any Keyword Search hit row →
+    "Interpret as SQL Record" (offered unconditionally for any hit, not
+    gated by file extension — most real db files in this project's own
+    casework have no extension at all, e.g. `History`, `viber_messages`,
+    `naver_line`, so an extension filter would hide the option for
+    exactly the common case; the worker's own magic-byte check reports
+    "Not a SQLite database" cleanly when it doesn't apply, at negligible
+    cost since this only ever runs for a hit the examiner explicitly
+    asked about). A `"⏳  Computing…"` placeholder child appears under
+    the hit immediately and stays visible for the whole background
+    computation — the explicit usability requirement behind this
+    feature's own "lazy is fine, but never a silently frozen wait"
+    design brief.
+
+    `SqlHitInterpretWorker` (a `QThread`, never touches any GUI object,
+    reads its own archive bytes fresh via `CachedZipView`/`ZipEntry` for
+    a main-archive hit or `read_nested_entry` for a nested-archive one —
+    same "workers own their own reader, never share the GUI's cached zip
+    handle" convention `KeywordSearchWorker`/`NestedArchiveSearchWorker`
+    already establish in this file) does, in order: (1) magic-byte check
+    (`SQLite format 3\x00`) — `{'kind': 'not_sqlite'}` if it fails; (2)
+    `sqlite_carve.locate_offset` — `{'kind': 'unresolved'}` if the offset
+    isn't attributable to any live row; (3) `_find_report_match` — scans
+    every loaded parser module's `record_source` for a FIXED `table`
+    entry (never a `table_field`-based one — there's no live row read
+    yet to determine which table that would even mean) whose resolved
+    ui_path matches the hit's own file, then queries that report's own
+    `artifact_<script_name>` table in `caseresults.db` for a row citing
+    the resolved rowid — `{'kind': 'report', report_name, row}` on a
+    match, stopping at the first one rather than ranking several (a
+    documented, narrow v1 scope); (4) falls back to the new
+    `sqlite_carve.read_live_row` (a plain `SELECT * FROM table WHERE
+    rowid=?` against a throwaway read-only temp copy — simpler and more
+    correct than re-deriving decoded values from raw page bytes a second
+    time, since a live row's real values are exactly what an ordinary
+    query already returns correctly-typed) — `{'kind': 'live', table,
+    rowid, row, column_name}`, `column_name` carrying `locate_offset`'s
+    own best-effort column resolution when available.
+
+    **A real path-space bug was found and fixed BEFORE this ever ran
+    against real data**, caught by reasoning through the code rather than
+    by a failed test: the natural first draft compared the hit's tree
+    `PATH_ROLE` (the DISPLAY path shown to the examiner) against
+    `resolve_module_file_ui_path`'s own output — but `PATH_ROLE` has
+    every iOS third-party app's GUID container segment substituted with
+    its bundle id for readability (`_display_path`, `ffs-explorer.py`),
+    while `resolve_module_file_ui_path` (via `adapters/ffs.py`'s
+    `resolve()`/`strip_display_prefix()`) always produces a ui_path with
+    the RAW GUID still in it — that substitution is a separate, later,
+    display-only step neither of those functions ever performs. Comparing
+    the two directly would have silently NEVER matched any iOS app's
+    report (Android is unaffected — no GUID indirection exists there at
+    all, confirmed via `adapters/ffs.py`'s own `resolve()`, which only
+    does a plain prefix prepend for `FORMAT_ZIP_EXTRAS`), a bug that
+    would have looked like normal "live row, no report" behavior rather
+    than an obvious crash — exactly the kind of quiet, plausible-looking
+    wrong answer this project's own record_source machinery already
+    treats as worse than a loud failure. Fixed by deriving `hit_ui_path`
+    from the hit's own RAW physical/archive path (`item.data(_PHYS_ROLE)`,
+    never GUID-substituted) via `self._strip_archive_prefix()` instead —
+    the correct ui_path space either platform.
+
+    Also guarded against a real, if lower-probability, PySide6 crash
+    risk: a `QStandardItemModel.clear()` (a new search, a recent-search
+    reload — 4 call sites in this file) destroys the underlying C++
+    object of every item in the tree, including one a still-running
+    `SqlHitInterpretWorker` holds a Python reference to. A new
+    `self._search_generation` counter, bumped at all 4 clear sites, is
+    captured when a worker starts and checked in its completion handler
+    before touching the item at all — a mismatch means the tree was
+    cleared out from under it, so the handler returns immediately rather
+    than risking a `RuntimeError: Internal C++ object already deleted`
+    (or worse, a use-after-free) on a stale reference; a `try/except
+    RuntimeError` around the actual mutation is a second, narrower
+    backstop for the same failure mode.
+
+    Verified against real data at each layer before wiring the GUI
+    (since the GUI side itself can't be driven programmatically): (1)
+    the FULL report-match cross-reference, run standalone against the
+    real Android 14 JoshHickman case exactly as the worker's own code
+    does it — a real Chrome History `urls` rowid=56 resolved through
+    `locate_offset`, the corrected ui_path derivation, and the
+    `caseresults.db` lookup, correctly matched to `chrome_web_history`'s
+    own report row with the exact real field values (url/title/
+    transition_type/source/raw_url_id, etc.); (2) the live-row fallback,
+    confirmed against Chrome History's own `meta` table (genuinely
+    uncovered by any parser's `record_source`) returning real
+    `key`/`value` column names and content; (3) a headless
+    `QApplication` (offscreen platform) smoke test exercising the actual
+    tree-mutation code for all five real result shapes
+    (`not_sqlite`/`unresolved`/`error`/`report`/`live`) end to end with
+    no exceptions, confirming the placeholder-then-replace rendering is
+    correct. The one thing NOT verified at write time was the live
+    click-through in the real running GUI (no way to drive a PySide6
+    window directly) — everything short of that step had been checked
+    against real data or a real (if headless) Qt model.
+
+    **Live-GUI click-through subsequently verified for real, same day**,
+    by driving the actual running `FastZipBrowser` in-process (a real
+    `QApplication`, cocoa platform, real visible window on the dev
+    machine — constructed via `importlib.util.spec_from_file_location`
+    on `ffs-explorer.py` so the file's own `if __name__ == "__main__":`
+    guard never fires, then `window.start_loading(real_zip_path)` +
+    `window._start_keyword_search()` + `window._interpret_search_hit_as_sql(
+    real_hit_item)`, the exact same methods a real click invokes, no
+    reimplementation): confirmed all three branches end to end against
+    the real Android 14 JoshHickman archive — `Ohtani` (a real, non-indexed
+    title string) correctly resolved to `→ Covered by report: Chrome Web
+    History` with the real row's full fields; `early_expiration_threshold`
+    correctly resolved to a live, uncovered `meta` row with real
+    `key`/`value` columns; `ServiceLogin` correctly came back "not
+    attributable" — investigated why rather than assumed broken, see the
+    index-page finding immediately below. A real screenshot (`window.grab()`)
+    visually confirms the `Ohtani` result rendered live in the actual
+    tree, nested under the real hit row. Two real full-archive keyword
+    searches against this project's own ~98k-entry archive take roughly
+    25-30 seconds EACH (confirmed via a raw, GUI-free timing of
+    `KeywordSearchWorker` directly) — a real, inherent cost of the search
+    itself, unrelated to this feature, worth knowing before mistaking a
+    slow run for a hang.
+
+    **Index-page hits — a real finding from investigating the
+    `ServiceLogin` "not attributable" result, 2026-09-12.** `locate_offset`
+    is scoped to table-leaf pages only (page type `0x0D`); a hit landing
+    on a SQLite INDEX page (`0x0A` leaf / `0x02` interior) correctly
+    returns the same honest negative as any other non-table-leaf case,
+    which is CORRECT (an index page isn't a row), but was initially
+    mistaken for a possible bug until checked directly: confirmed page 44
+    of the real `History` file is page-type `0x0A`, owned by
+    `urls_url_index` (`CREATE INDEX urls_url_index ON urls (url)`) —
+    Chromium indexes the `url` column, so a URL string genuinely exists
+    on disk TWICE (once in the `urls` table's own row, once again inside
+    this separate lookup structure), and the keyword search naturally
+    found the SAME text in both places. The real `urls` rowid=56 row
+    (found instead at page 48) confirms nothing was actually missed.
+    **Not yet built, but a real, concrete, buildable follow-up** (see
+    `TODO.md` item 1's own follow-up note): report an index-page hit by
+    NAME instead of a flat negative — resolve which index owns the page
+    (identical `sqlite_master`/b-tree-walk technique, just `type='index'`)
+    and read its own `sql`/`PRAGMA index_info` to say which table+column
+    it indexes, e.g. "Index entry in urls_url_index — indexes urls.url."
+
+    **A genuinely live-tested negative result, prompted directly by the
+    natural next question ("could a cleared index still hold recoverable
+    content the table itself lost?"), 2026-09-12.** Tested against a
+    real ground-truth case already in this project's own test data —
+    `androidVmGTD/packages/google-search-clear-history/2026-08-26T21-24-16.601Z`
+    (a real Android device: Googled "crime is fun," opened a real
+    Instagram result, then genuinely used Chrome's own "Clear Web
+    History," with a real `ground_truth.json` timeline confirming every
+    step). Extracted the real post-clear `History` file directly and
+    checked, rather than assumed: `urls`/`visits`/`keyword_search_terms`
+    are genuinely 0 rows (the clear really happened), but a raw byte
+    search for the real visited content (`instagram.com`,
+    `crimeisfunpodcast`, `crime is fun`) found NOTHING anywhere in the
+    file — not in the table's freed space, not in the index's.
+    Investigated why directly: `PRAGMA freelist_count` is 0 (no freed
+    pages at all), the `urls` table's own leaf page has zero freeblocks,
+    and `urls_url_index`'s own single page has only 14 non-zero bytes out
+    of 4096 — and those 14 are just the page's own structural header
+    (type/first-freeblock/cell-count/content-start pointers), everything
+    else genuinely zero. A fresh, rebuilt-clean index page, not a
+    row-unlinked-but-bytes-still-there state. So for this specific real
+    device/Chrome build, "Clear Browsing Data" evidently rebuilds or
+    fully zeroes BOTH the table and its index for this schema — the
+    general principle that a table and its index get reused on
+    independent schedules (already the documented rationale behind
+    `chrome_favicons.py` shipping despite adding no net-new recovery on
+    ITS OWN test case) is sound, but this specific hoped-for case (index
+    survives a History clear) came back empty when actually tested, not
+    just theorized. Recorded in `TODO.md` precisely so this doesn't get
+    silently re-derived and re-attempted later as a promising unexplored
+    idea — it was tried, on real data, and didn't pan out, though this is
+    one real test on one device/Chrome build/table, not a claim that
+    covers every version or every table's own index.
+
+    **`sqlite_carve.build_page_map` + `casecache.db`'s `evidence_page_map`
+    table — per-file page-ownership caching, 2026-09-12.** Every "Interpret
+    as SQL Record" click was independently writing the WHOLE file to a
+    temp path, opening its own `sqlite3` connection, and walking the
+    ENTIRE schema (every table, every index) just to find which one owns
+    ONE page — real, repeated cost for an ordinary case (one search often
+    finds many hits inside the same file). `build_page_map(raw)` computes
+    that page→(kind, name, table, is_leaf) map ONCE per file; both
+    `locate_offset` and `identify_structure` gained an optional `page_map`
+    parameter (default `None` preserves the exact prior self-sufficient
+    behavior — a pure optimization, confirmed via 1,600 random offsets
+    across 4 structurally different real databases with ZERO output
+    difference between the cached and freshly-built path, after fixing
+    one real divergence found by that same check — see below).
+    `db_utils.save_evidence_page_map`/`load_evidence_page_map` persist it
+    in `casecache.db` (schema v16) keyed by `ui_path`, following the exact
+    same "rebuildable cache" reasoning as `thumbnails`/`app_intelligence`
+    above — safe to cache indefinitely since a case's evidence bytes never
+    change once extracted, so even the FIRST examiner to ever interpret a
+    hit in a given file, in any session, pays the schema-walk cost once
+    for the life of the case. `SqlHitInterpretWorker._get_page_map`
+    (`keyword_search.py`) is the only caller that builds/saves it; any
+    failure there (a locked/corrupt casecache.db) falls back to building
+    fresh rather than blocking the interpretation itself — caching is
+    strictly a speed optimization, never load-bearing for correctness.
+
+    **A real table-naming trap, found immediately**: `CREATE TABLE
+    sqlite_page_map` fails outright — SQLite reserves any table name
+    starting with `sqlite_` for its own internal use ("object name
+    reserved for internal use"), confirmed directly rather than assumed
+    when the very first test run hit it. Renamed to `evidence_page_map`
+    throughout (table name, both save/load function names, every
+    docstring reference) before it ever reached real casework.
+
+    **A real, second divergence WAS found and fixed by the cached-vs-fresh
+    comparison test, this one a genuine scope change the refactor was
+    never meant to introduce**: `build_page_map` (built for
+    `identify_structure`'s benefit) deliberately includes `sqlite_master`
+    itself as a matchable "table" — its own rootpage is always page 1, a
+    fixed convention it can never list as one of its own rows, so it's
+    added as a synthetic candidate (see the `identify_structure` entry
+    above). But `locate_offset`'s ORIGINAL, pre-cache fallback query was
+    always scoped to `WHERE type='table'` — which structurally EXCLUDES
+    `sqlite_master` for the identical reason — so `locate_offset` had
+    NEVER covered schema-table hits at all, by original design (a
+    schema-table hit already gets its own clean, purpose-built message
+    via `identify_structure`; duplicating that through `locate_offset` as
+    an ordinary "live row" would just be a second, more confusingly-worded
+    path to the same information). Wiring `locate_offset`'s cached path
+    through the SAME shared map silently started resolving real
+    `sqlite_master` rows (real `CREATE TABLE`/`CREATE INDEX` schema text,
+    e.g. `rowid=31, column=sql`) as ordinary live table rows — caught
+    immediately by the cached-vs-fresh comparison test (12-20 real
+    mismatches per file, every one a real `sqlite_master` row) before this
+    ever shipped. Fixed by explicitly excluding `name == 'sqlite_master'`
+    from `locate_offset`'s cached-path match, restoring exact parity with
+    the original fallback's own scope — re-verified afterward at 0
+    mismatches across all 4 files.
+
+    **Live-GUI verified, including real cross-session persistence** (in-
+    process `FastZipBrowser`, same driving technique as the feature's own
+    initial verification): confirmed a real `Ohtani` search-hit
+    interpretation produces the byte-identical, correct
+    "Covered by report: Chrome Web History" result whether the cache is
+    cold (0 rows in `evidence_page_map` beforehand) or warm (56 rows,
+    already-built) — and, serendipitously, the test harness's own process
+    restarted mid-run (an unrelated Qt/PySide6 teardown issue in the
+    *test script itself* — see the `_stop_all_workers` fix immediately
+    below, not the shipped feature), which ended up demonstrating cross-
+    session persistence more convincingly than planned: the SECOND,
+    independent run of the exact same script reported
+    "`evidence_page_map` rows before any interpretation: 56" — the map
+    genuinely survived into what was, for all practical purposes, a brand
+    new process. Wall-clock interpretation time (250-295ms per click,
+    both cache states) is dominated by re-reading the whole archive entry
+    and re-executing every parser script (`list_artifacts()`, for the
+    report cross-reference) — costs unrelated to this cache and unchanged
+    by it; the cache's own real saving is the schema-walk specifically
+    (single-digit milliseconds even on this project's largest real
+    evidence db), confirmed via direct, isolated timing rather than
+    inferred from the noisier end-to-end number.
+
+    **A real, separate shutdown-safety gap found via that same test run,
+    unrelated to caching correctness itself**: the test harness's own
+    process aborted (SIGABRT, exit 134) during cleanup after both runs
+    had already fully succeeded — traced to `ffs-explorer.py`'s own
+    `_stop_all_workers()` (its docstring already states exactly this
+    failure mode: "Qt aborts with SIGABRT if QThread is destroyed while
+    still running") never having been taught about
+    `self._sql_interpret_workers` (a dict, added today, since more than
+    one "Interpret as SQL Record" click can be in flight at once — every
+    OTHER worker in this project gets a `_stop(...)` call in this exact
+    method). A real, if narrow, window existed: closing the app in the
+    brief span while a `SqlHitInterpretWorker` was still running could
+    hit the identical crash in real use, not just in this session's own
+    test harness. Fixed by adding the same `_stop(...)`/`wait(2000)`
+    treatment for every worker in that dict, matching the established
+    convention exactly.
+
+    **WAL-file support for "Interpret as SQL Record," 2026-09-12** (the
+    direct follow-up TODO item to the caching work above — see `TODO.md`
+    for the original gap this closes: a search hit landing in a `-wal`
+    sidecar previously got a flat, technically-true-but-unhelpful "Not a
+    SQLite database" from the plain `raw[:16] != b'SQLite format
+    3\x00'` check, since a WAL file's own real magic bytes
+    (`\x37\x7f\x06\x82`/`\x83`) are completely different). A WAL frame
+    stores exactly one raw page IMAGE (keyed by the base db's own page
+    number) but carries no schema of its own — so resolving "which
+    table does this frame's page belong to" needs the sibling BASE
+    file's own page map, not anything derivable from the WAL file alone.
+
+    `sqlite_carve.locate_wal_offset`/`identify_wal_structure` are the WAL
+    counterparts of `locate_offset`/`identify_structure`: given a WAL-
+    file-relative offset, a page_size (read straight from the WAL
+    header's own bytes 8-11 — confirmed real via a direct byte check,
+    matching the sibling base file's own page_size exactly, before ever
+    trusting it), and a page map already built from the BASE file,
+    `iter_wal_frames` (pre-existing) locates the containing frame, then
+    the SAME `_scan_leaf_page_for_offset` core `locate_offset` already
+    uses (now extended, additively, to also decode and return the row's
+    own FULL values via `decode_body` — not just the one clicked
+    column — since a WAL frame has no live SQL connection of its own to
+    fall back on the way the base-file "live" case uses `read_live_row`
+    for) does the actual cell match, working in the frame's own page-
+    image coordinate space and translating the result back to real
+    WAL-file-relative offsets for the caller. Deliberately excludes
+    `sqlite_master` matches, same reasoning as `locate_offset`'s own
+    exclusion. A real, honestly-disclosed limitation: this describes a
+    historical frame per the base file's CURRENT schema, which could in
+    principle be wrong if that exact page number was reassigned to a
+    different table/index since the frame was written — not verified
+    against a real case where that happened, an open gap, not a
+    theoretical worry glossed over.
+
+    `SqlHitInterpretWorker` gained a new `_run_wal` branch (checked
+    before the ordinary `not_sqlite` fallback): resolves the sibling base
+    file's own physical path by stripping the literal `-wal` suffix
+    (scoped to main-archive hits only, matching `hit_ui_path`'s own
+    existing scoping — a nested-archive WAL hit falls through to the
+    ordinary `not_sqlite` message, a documented v1 gap), reads it via the
+    same `_read_raw_bytes` (now generalized with an optional
+    `physical_override` parameter for exactly this reuse), and gets its
+    page map via the SAME `_get_page_map` cache — keyed by the BASE
+    file's own ui_path, not the WAL's, so a WAL-triggered build shares
+    its cache entry with (and benefits from) an ordinary base-file
+    interpretation of the same db, and vice versa. Resolves to a NEW
+    `wal_row` result kind (never silently folded into the ordinary
+    `report`/`live` cases) — deliberately does NOT attempt
+    `_find_report_match` for a WAL-sourced row: cross-referencing a row
+    that may be historical or genuinely deleted against a report built
+    from a live query is a materially riskier semantic claim than the
+    base-file "covered by this report" case, so the rendered message
+    explicitly says "found in the WAL sidecar, not (necessarily) in the
+    live database" and tells the examiner to check the live database
+    separately to tell which, rather than asserting a status this code
+    can't actually confirm.
+
+    **Real, striking proof of value, not just theorized**: tested
+    directly against a real WAL file already in this project's own test
+    data — `LINE — Recovered full-text search index`'s own
+    `unencrypted_test_full_text_search_message.db-wal` (a real, 106-frame
+    WAL, confirmed present in the actual archive, not just a cached
+    extraction). A broad scan of every frame whose page the base file's
+    own page map attributes to a table, decoding every resolvable row and
+    diffing it against the CURRENT live table for the same rowid, found:
+    (1) a genuinely DELETED message — "And this is your bad message. Let
+    me know when you trash it." (docid=27) — confirmed absent from the
+    live `fts_message_content` table entirely (its own docid sequence
+    jumps straight from 26 to 28); (2) 15+ further rows in
+    `fts_message_segdir`/`fts_message_stat` showing real, structurally
+    different historical states of the FTS index's own internal
+    segment b-tree and global term-frequency statistics, from before
+    SQLite's own FTS module merged/optimized them — a genuine, if less
+    dramatic, historical-state recovery distinct from the docid=27
+    deletion. Verified live in the real running app via the identical
+    search-hit → `_interpret_search_hit_as_sql` flow every other case in
+    this Conventions entry was verified through — a real search for
+    `"trash it"` correctly lands in the `-wal` file and correctly
+    recovers the same deleted message text through the actual GUI code
+    path, not a reimplementation.
+
+    Also confirmed, incidentally, while building this: the `docid`/
+    `message_id`/`id`-style column showing as `None` in every recovered
+    WAL row's own `row_values` is CORRECT, not a bug — these are all
+    `INTEGER PRIMARY KEY` rowid-alias columns, which SQLite always stores
+    as a genuine 0-byte NULL in the record body itself (the same
+    behavior `rowid_alias_column`'s own docstring already documents for
+    the carving paths) — the real value is always available separately
+    via the result's own explicit `rowid` field, so nothing is actually
+    lost, just not substituted into the dict the way a live SQL query
+    would.
+
+    **Fixed the same day, per direct follow-up**: `_scan_leaf_page_for_offset`
+    now calls the existing `rowid_alias_column` helper (already built for
+    exactly this — see its own docstring) whenever it resolves
+    `column_names`/`row_values`, and substitutes the real, already-known
+    cell rowid into that column's `row_values` entry in place of the raw
+    `None`. Applies to BOTH callers of `row_values` — the WAL path (which
+    has no live SQL connection to get this substitution for free the way
+    `read_live_row` does) and `locate_offset`'s own base-file `row_values`
+    field (added the same session, previously unused by the worker's own
+    'live' kind — which gets the correct value for free from
+    `read_live_row`'s real query regardless — but now correct for any
+    OTHER direct caller of `locate_offset` too). Verified against real
+    data both ways: the LINE WAL's own deleted `docid=27` message now
+    shows `docid: 27` instead of `None`; Chrome History's own `urls`
+    table (a plain base-file case, `id INTEGER PRIMARY KEY`) now shows
+    `id: 56` instead of `None` for the same real row tested throughout
+    this session. Full cached-vs-fresh regression re-run afterward
+    (History + msgstore.db, 400 random offsets each) — zero mismatches,
+    confirming this was a pure enhancement, not a behavior change to
+    anything else already relying on `locate_offset`'s own existing
+    fields.
+
+    **Result-tree column split, 2026-09-12, direct feedback**: every
+    result line (report/live/wal_row/unresolved) originally rendered as
+    one long combined string in the tree's Name column (e.g. "→ Covered
+    by report: Chrome Web History", "    from_url: https://..."),
+    forcing constant manual column-resizing to read. `_render_
+    unresolved_structure` and `_on_sql_hit_interpreted`'s own kind-
+    dispatch now build (label, value) tuples instead of plain strings —
+    label goes in the tree's Name column, value in its existing Context
+    column (already present for ordinary keyword-hit snippets, just
+    unused by this feature until now). Header lines were restructured
+    into proper separate label/value rows too, not just split at a
+    colon that often wasn't there in a clean place (e.g. "Live row in
+    ... — not covered by any existing report  [hit landed in column:
+    key]" has no single clean split point) — `Table`/`Rowid`/`Column`/
+    `Status`/`Source` are now their own rows. `resizeColumnToContents(0)`
+    called once after populating, so Name sizes itself to the (now much
+    shorter) labels automatically.
   - **`hidden_fields`** (a module-level list of output-field names,
     added 2026-08-22 alongside `record_source` below): a generic
     `ArtifactTableModel` feature, not specific to record_source, for a

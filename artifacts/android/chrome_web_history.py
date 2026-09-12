@@ -167,12 +167,11 @@ def _decode_transition(value):
 
 
 def run(paths):
-    import sqlite3
+    from artifact_runner import open_db_readonly
 
     out = []
 
-    conn = sqlite3.connect(paths["history"])
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["history"])
     urls_by_id = {r["id"]: (r["url"], r["title"])
                  for r in conn.execute("SELECT id, url, title FROM urls")}
     visit_rows = conn.execute("""
@@ -220,8 +219,7 @@ def run(paths):
         history_times_by_url = {}
         for o in out:
             history_times_by_url.setdefault(o["url"], []).append(o["timestamp"])
-        conn = sqlite3.connect(f'file:{paths["ukm_db"]}?mode=ro', uri=True)
-        conn.row_factory = sqlite3.Row
+        conn = open_db_readonly(paths["ukm_db"])
         for r in conn.execute("SELECT url_id, url, title, last_timestamp FROM urls"):
             candidates = history_times_by_url.get(r["url"], [])
             if any(abs(r["last_timestamp"] - t) <= DUP_WINDOW_US

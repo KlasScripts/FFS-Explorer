@@ -12,9 +12,11 @@ import msgpack
 from adapters import FfsAdapter
 from db_utils import (_open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob,
                       load_bookmark_groups, load_bookmark_entries,
-                      save_search_scope_files, load_search_scope_files)
+                      save_search_scope_files, load_search_scope_files,
+                      save_evidence_page_map, load_evidence_page_map)
 from highlight_delegate import HighlightDelegate
-from zip_cd_cache import load as _zcd_load, compute_data_offsets as _compute_data_offsets
+from zip_cd_cache import CachedZipView, load as _zcd_load, compute_data_offsets as _compute_data_offsets
+from zip_entry import ZipEntry
 from zip_reader import ZipReader, read_nested_entry
 
 _SEARCH_ENTRIES_VERSION = '1'
@@ -381,6 +383,311 @@ class NestedArchiveSearchWorker(QThread):
         self.finished.emit(hits, done, total)
 
 
+# ── SqlHitInterpretWorker ─────────────────────────────────────────────────────
+
+class SqlHitInterpretWorker(QThread):
+    """Background computation for "Interpret as SQL Record" — a Keyword
+    Search hit's file may be a SQLite database, in which case the hit's
+    own byte offset can be attributed to a specific table/rowid (and,
+    best-effort, column) via sqlite_carve.locate_offset, then further
+    resolved to either an existing artifact report's own row (the
+    common, most useful case) or a live-but-unsupported row shown with
+    its real PRAGMA table_info column names. See CLAUDE.md's
+    `locate_offset` Conventions entry for the byte-level mechanism this
+    builds on, and TODO.md item 1 for the feature this implements.
+
+    Never touches any GUI object — reads its own archive bytes fresh
+    (same "workers own their own reader, never share the GUI's cached
+    zip handle" convention KeywordSearchWorker/NestedArchiveSearchWorker
+    already establish in this file) and opens caseresults.db via its own
+    short-lived connection. Emits exactly one `finished(dict)` — never
+    raises, any failure surfaces as a `{'kind': 'error', ...}` result
+    rather than crashing the worker silently.
+    """
+
+    finished = Signal(dict)
+
+    def __init__(self, zip_path: str, case_dir: str, offset: int,
+                 physical: str | None, stored_path: str | None, entry_path: str | None,
+                 hit_ui_path: str, guid_to_bundle: dict, adapter, zip_names,
+                 platform: str, parent=None):
+        super().__init__(parent)
+        self.zip_path       = zip_path
+        self.case_dir       = case_dir
+        self.offset         = offset
+        self.physical       = physical
+        self.stored_path    = stored_path
+        self.entry_path     = entry_path
+        self.hit_ui_path    = hit_ui_path
+        self.guid_to_bundle = guid_to_bundle
+        self.adapter        = adapter
+        self.zip_names      = zip_names
+        self.platform       = platform
+
+    def _read_raw_bytes(self, physical_override: str | None = None) -> bytes | None:
+        """Read this hit's own file, or — when *physical_override* is
+        given — an arbitrary OTHER main-archive path (used to read the
+        sibling BASE `.db` file's bytes for a WAL hit, see run()'s own
+        WAL branch below; a WAL sidecar's own schema-less content means
+        the base file has to be read too, and that's always a plain
+        main-archive path, never inside a nested archive — the same
+        scoping `_interpret_search_hit_as_sql`'s own `hit_ui_path`
+        derivation already applies)."""
+        if physical_override is not None:
+            physical = physical_override
+        elif self.stored_path and self.entry_path:
+            return read_nested_entry(self.stored_path, self.entry_path)
+        else:
+            physical = self.physical
+        if not physical:
+            return None
+        try:
+            infos = _zcd_load(self.zip_path, self.case_dir) if self.case_dir else None
+            zf = CachedZipView(self.zip_path, infos) if infos is not None else zipfile.ZipFile(self.zip_path, 'r')
+            zinfo = zf.getinfo(physical)
+            entry = ZipEntry(self.zip_path, physical, zinfo)
+            return entry.read()
+        except Exception:
+            return None
+
+    def _find_report_match(self, table: str, rowid: int) -> dict | None:
+        """First loaded parser whose SQL-backed record_source declares
+        *table* against the SAME file this hit is in, whose report
+        already has a row citing *rowid* — or None. Deliberately only
+        matches a FIXED `table` entry (never a per-row `table_field`
+        one — there's no live row here to read that field from), and
+        stops at the first match rather than trying to rank several —
+        a documented, narrow v1 scope, not an oversight."""
+        from artifact_runner import list_artifacts, resolve_module_file_ui_path
+        from artifact_db import list_completed_artifacts
+
+        try:
+            with closing(_open_results_db(self.case_dir)) as case_conn:
+                completed = set(list_completed_artifacts(case_conn))
+                for script_name, mod in list_artifacts(self.platform):
+                    if script_name not in completed:
+                        continue
+                    raw_rs = getattr(mod, 'record_source', None)
+                    if not raw_rs:
+                        continue
+                    entries = raw_rs if isinstance(raw_rs, list) else [raw_rs]
+                    for entry in entries:
+                        if 'table' not in entry or entry.get('table') != table:
+                            continue
+                        file_key = entry.get('file_key')
+                        if not file_key:
+                            continue
+                        try:
+                            ui_path = resolve_module_file_ui_path(
+                                mod, file_key, self.guid_to_bundle,
+                                adapter=self.adapter, zip_names=self.zip_names)
+                        except Exception:
+                            continue
+                        if ui_path != self.hit_ui_path:
+                            continue
+                        rowid_fields = entry.get('rowid_fields') or []
+                        if not rowid_fields:
+                            continue
+                        table_name = f"artifact_{script_name}"
+                        for field in rowid_fields:
+                            try:
+                                cursor = case_conn.execute(
+                                    f'SELECT * FROM "{table_name}" WHERE "{field}" = ?',
+                                    (str(rowid),))
+                                row = cursor.fetchone()
+                            except Exception:
+                                row = None
+                            if row is not None:
+                                cols = [d[0] for d in cursor.description]
+                                report_name = getattr(mod, 'name', script_name)
+                                return {
+                                    'kind':        'report',
+                                    'script_name': script_name,
+                                    'report_name': report_name,
+                                    'row':         dict(zip(cols, row)),
+                                }
+        except Exception:
+            pass
+        return None
+
+    def _get_page_map(self, raw: bytes, ui_path: str | None = None):
+        """The page-ownership map locate_offset/identify_structure both
+        consult (see sqlite_carve.build_page_map's own docstring) —
+        loaded from casecache.db's `evidence_page_map` table when a
+        previous interpretation (this session or any earlier one, same
+        case) already built it for this exact file, built and saved
+        fresh on a miss. *ui_path* defaults to `self.hit_ui_path` (the
+        hit's own file); a WAL hit passes the SIBLING BASE file's own
+        ui_path instead, so its page map is cached/shared under the
+        base file's own identity -- the natural key, and one a later
+        ordinary (non-WAL) hit in that same base file benefits from too.
+        Skipped entirely when no ui_path applies at all (a nested-archive
+        hit — see _interpret_search_hit_as_sql's own comment on why a
+        nested entry has no ui_path in the main archive's own space to
+        key a cache entry by); build_page_map still runs, just without
+        persistence, identical to every file's very first interpretation."""
+        import sqlite_carve
+        key = ui_path if ui_path is not None else self.hit_ui_path
+        if not key or not self.case_dir:
+            return sqlite_carve.build_page_map(raw)
+        try:
+            with closing(_open_cache_db(self.case_dir)) as cache_conn:
+                cached = load_evidence_page_map(cache_conn, key)
+                if cached is not None:
+                    return cached
+                page_map = sqlite_carve.build_page_map(raw)
+                if page_map is not None:
+                    save_evidence_page_map(cache_conn, key, page_map)
+                return page_map
+        except Exception:
+            # Caching is a pure optimization -- any failure here (a
+            # locked/corrupt casecache.db, an unexpected exception) must
+            # never block the interpretation itself, only its speed.
+            return sqlite_carve.build_page_map(raw)
+
+    def _run_wal(self, wal_raw: bytes):
+        """WAL-file counterpart of run()'s own base-file path — see
+        sqlite_carve.locate_wal_offset/identify_wal_structure's own
+        docstrings and CLAUDE.md's Conventions entry for why a WAL hit
+        needs the sibling BASE file's own schema/page map rather than
+        being self-sufficient the way a base-file hit is. Deliberately
+        does NOT attempt _find_report_match for a WAL-sourced row (see
+        TODO.md) — cross-referencing a row that may be historical or
+        genuinely deleted against a report built from a LIVE query is a
+        materially different, riskier claim than the base-file "live row
+        covered by this report" case, so a WAL hit always reports as its
+        own `wal_row` kind, never silently folded into `report`/`live`."""
+        import os
+        import struct
+        import tempfile
+        import sqlite_carve
+
+        # Scoped to main-archive WAL hits only, matching hit_ui_path's
+        # own scoping in _interpret_search_hit_as_sql -- a nested-archive
+        # entry has no ui_path in the main archive's own space to derive
+        # a sibling base file's identity from.
+        if self.stored_path or not self.physical or not self.physical.endswith('-wal'):
+            self.finished.emit({'kind': 'not_sqlite'})
+            return
+
+        base_physical = self.physical[:-len('-wal')]
+        base_raw = self._read_raw_bytes(physical_override=base_physical)
+        if base_raw is None or base_raw[:16] != b'SQLite format 3\x00':
+            self.finished.emit({'kind': 'error',
+                                'message': "Could not read this WAL file's sibling base database"})
+            return
+
+        try:
+            wal_page_size = struct.unpack('>I', wal_raw[8:12])[0]
+        except Exception:
+            self.finished.emit({'kind': 'error', 'message': 'Malformed WAL header'})
+            return
+
+        try:
+            base_header = sqlite_carve.parse_db_header(base_raw)
+        except Exception:
+            base_header = {}
+        reserved_bytes = base_header.get('reserved_bytes', 0)
+
+        base_ui_path = (self.hit_ui_path[:-len('-wal')]
+                       if self.hit_ui_path and self.hit_ui_path.endswith('-wal') else None)
+        base_page_map = self._get_page_map(base_raw, ui_path=base_ui_path)
+        if base_page_map is None:
+            self.finished.emit({'kind': 'error',
+                                'message': "Could not read the base database's schema"})
+            return
+
+        fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+        base_conn = None
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(base_raw)
+            base_conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
+
+            loc = sqlite_carve.locate_wal_offset(
+                wal_raw, self.offset, wal_page_size, base_page_map, base_conn,
+                reserved_bytes=reserved_bytes)
+            if loc is None:
+                structure = sqlite_carve.identify_wal_structure(
+                    wal_raw, self.offset, wal_page_size, base_page_map, base_conn=base_conn)
+                self.finished.emit({'kind': 'unresolved', 'structure': structure})
+                return
+
+            self.finished.emit({
+                'kind':             'wal_row',
+                'table':            loc['table'],
+                'rowid':            loc['rowid'],
+                'row':              loc.get('row_values') or {},
+                'column_name':      loc.get('column_name'),
+                'wal_frame_index':  loc.get('wal_frame_index'),
+            })
+        finally:
+            if base_conn is not None:
+                base_conn.close()
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def run(self):
+        raw = self._read_raw_bytes()
+        if raw is None:
+            self.finished.emit({'kind': 'error', 'message': 'Could not read this file'})
+            return
+        # A WAL sidecar's own magic bytes are NOT "SQLite format 3\x00" —
+        # checked first, as its own real case, rather than falling
+        # through to the generic not_sqlite negative below (see _run_wal
+        # and CLAUDE.md's Conventions entry for why this needed its own
+        # separate handling: no schema of its own to resolve against).
+        if raw[:4] in (b'\x37\x7f\x06\x82', b'\x37\x7f\x06\x83'):
+            self._run_wal(raw)
+            return
+        if raw[:16] != b'SQLite format 3\x00':
+            self.finished.emit({'kind': 'not_sqlite'})
+            return
+
+        import sqlite_carve
+        page_map = self._get_page_map(raw)
+        loc = sqlite_carve.locate_offset(raw, self.offset, page_map=page_map)
+        if loc is None:
+            # Not a live table row -- but that doesn't mean "somewhere in
+            # the db" is the best this can say. identify_structure names
+            # the actual on-disk structure (an index, the schema table
+            # itself, the freelist, the file header, ...) whenever it can
+            # tell — see its own docstring and CLAUDE.md's Conventions
+            # entry for the real ServiceLogin/urls_url_index case this
+            # was built to stop flattening into a generic negative.
+            structure = sqlite_carve.identify_structure(raw, self.offset, page_map=page_map)
+            self.finished.emit({'kind': 'unresolved', 'structure': structure})
+            return
+
+        table, rowid = loc['table'], loc['rowid']
+
+        report_match = self._find_report_match(table, rowid)
+        if report_match is not None:
+            self.finished.emit(report_match)
+            return
+
+        live = sqlite_carve.read_live_row(raw, table, rowid)
+        if live is None:
+            # locate_offset already confirmed this rowid is live -- a
+            # failure here means something narrower went wrong (e.g. a
+            # column value sqlite3 itself can't decode), not that the
+            # row doesn't exist -- report it honestly as such rather
+            # than silently falling back to "unresolved".
+            self.finished.emit({'kind': 'error', 'message':
+                                f'Found live row {table}.rowid={rowid} but could not read its values'})
+            return
+        columns, values = live
+        self.finished.emit({
+            'kind':         'live',
+            'table':        table,
+            'rowid':        rowid,
+            'row':          dict(zip(columns, values)),
+            'column_name':  loc.get('column_name'),
+        })
+
+
 # ── DbSearchLoader ────────────────────────────────────────────────────────────
 
 class DbSearchLoader(QThread):
@@ -614,6 +921,15 @@ class KeywordSearchMixin:
         self.search_results_model = QStandardItemModel()
         self.search_results_model.setHorizontalHeaderLabels(
             ["Name", "Hits", "Context", "Offset"])
+        # Bumped every time the results model is cleared (a new search, a
+        # recent-search reload, ...) -- guards SqlHitInterpretWorker's
+        # completion handler against mutating a QStandardItem whose
+        # underlying C++ object the model has since destroyed (a real
+        # PySide6 crash risk, not just a cosmetic stale-update concern),
+        # since that worker can finish well after the tree it was
+        # started against is gone.
+        self._search_generation = 0
+        self._sql_interpret_workers = {}  # keep QThread refs alive while running
         self.search_results_view = QTreeView()
         self.search_results_view.setModel(self.search_results_model)
         self.search_results_view.setEditTriggers(QTreeView.EditTrigger.NoEditTriggers)
@@ -1092,10 +1408,201 @@ class KeywordSearchMixin:
         full_path = item.data(Qt.ItemDataRole.UserRole)
         if not physical or not full_path or full_path.endswith('/'):
             return
+        offset = item.data(Qt.ItemDataRole.UserRole + 1)   # only set on a real hit row, never a file/folder row
+
         menu   = QMenu(self)
         action = menu.addAction("Open Parent Folder")
-        if menu.exec(self.search_results_view.viewport().mapToGlobal(pos)) == action:
+        sql_action = None
+        if offset is not None:
+            sql_action = menu.addAction("Interpret as SQL Record")
+        chosen = menu.exec(self.search_results_view.viewport().mapToGlobal(pos))
+        if chosen == action:
             self._open_parent_folder_from_search(full_path)
+        elif sql_action is not None and chosen == sql_action:
+            self._interpret_search_hit_as_sql(item)
+
+    def _interpret_search_hit_as_sql(self, item: QStandardItem):
+        """Kick off a background SqlHitInterpretWorker for the hit *item*
+        (lazy -- only ever runs for a hit the examiner explicitly asked
+        about, never eagerly for every hit) and show a "Computing…"
+        placeholder child under it until the result is ready — the
+        explicit usability requirement behind this feature (never a
+        silently-frozen wait): see CLAUDE.md's `locate_offset` Conventions
+        entry and TODO.md item 1."""
+        _PATH_ROLE        = Qt.ItemDataRole.UserRole
+        _OFFSET_ROLE      = Qt.ItemDataRole.UserRole + 1
+        _PHYS_ROLE        = Qt.ItemDataRole.UserRole + 2
+        _STORED_PATH_ROLE = Qt.ItemDataRole.UserRole + 3
+        _ENTRY_PATH_ROLE  = Qt.ItemDataRole.UserRole + 4
+
+        offset      = item.data(_OFFSET_ROLE)
+        physical    = item.data(_PHYS_ROLE)
+        stored_path = item.data(_STORED_PATH_ROLE)
+        entry_path  = item.data(_ENTRY_PATH_ROLE)
+        if offset is None or not self._case_dir:
+            return
+        # NOT item.data(_PATH_ROLE) -- that's the DISPLAY path, which for
+        # an iOS third-party app has its GUID segment substituted with the
+        # bundle id (_display_path, for readability). record_source's own
+        # resolve_module_file_ui_path always resolves to a ui_path with
+        # the RAW GUID still in it (adapters/ffs.py's resolve()/
+        # strip_display_prefix() never do that substitution -- only
+        # _display_path does, a separate, later step) -- comparing the
+        # display path against it would silently never match any iOS
+        # app's report. _strip_archive_prefix on the RAW physical/archive
+        # path (no GUID substitution applied to it at all) gives the
+        # right ui_path space instead. Only meaningful for a main-archive
+        # hit -- a nested-archive hit's entry_path lives inside an
+        # extracted sidecar file, not the main archive's own ui_path
+        # space, so it correctly never matches any record_source entry.
+        hit_ui_path = self._strip_archive_prefix(physical) if physical and not stored_path else None
+
+        # Replace any previous interpretation (re-invoked on the same hit)
+        # rather than stacking a second result underneath it.
+        item.removeRows(0, item.rowCount())
+        placeholder = QStandardItem("⏳  Computing…")
+        placeholder.setEditable(False)
+        item.appendRow([placeholder, QStandardItem(''), QStandardItem(''), QStandardItem('')])
+        self.search_results_view.expand(item.index())
+
+        platform = 'android' if self._is_android_archive() else 'ios'
+        generation = self._search_generation
+        worker = SqlHitInterpretWorker(
+            self.zip_path, self._case_dir, offset, physical, stored_path, entry_path,
+            hit_ui_path, self.guid_to_bundle, self._adapter, self.zip_names, platform)
+        worker.finished.connect(
+            lambda result, it=item, gen=generation, w=worker:
+                self._on_sql_hit_interpreted(it, gen, result, w))
+        self._sql_interpret_workers[id(worker)] = worker
+        worker.start()
+
+    def _render_unresolved_structure(self, structure: dict | None) -> list[tuple[str, str]]:
+        """Turn sqlite_carve.identify_structure's result into the actual
+        (label, value) rows shown for an "unresolved" (not a live table
+        row) hit — naming the real on-disk structure whenever
+        identify_structure could tell, instead of a single flat
+        "somewhere in the db" negative. See CLAUDE.md's own Conventions
+        entry for the real ServiceLogin/urls_url_index case this replaces
+        a plain negative for, and identify_structure's own docstring for
+        the full priority order/reasoning behind each case below.
+
+        Returns (label, value) pairs — label goes in the tree's Name
+        column, value in its existing Context column — rather than one
+        long combined string, per direct feedback that cramming both
+        into Name forced constant manual column-resizing to read."""
+        if structure is None:
+            return [("Result", "Not attributable to any current database "
+                               "structure (could not be determined)")]
+        kind = structure.get('kind')
+        if kind == 'file_header':
+            return [("Result", "Inside the database file's own header — "
+                               "not row content"),
+                   ("Detail", "page 1's own structural fields (page size, "
+                             "reserved bytes, freelist count, ...)")]
+        if kind == 'freelist':
+            return [("Result", "On a freelist page"),
+                   ("Detail", "reclaimed, currently-unused database space "
+                             "— not a specific row")]
+        if kind in ('table', 'index'):
+            name = structure['name']
+            owner = structure['table']
+            role = "leaf" if structure.get('is_leaf') else "interior (internal navigation)"
+            if kind == 'index':
+                cols = structure.get('columns') or []
+                indexed = f"{owner}.{', '.join(cols)}" if cols else owner
+                return [("Result", "Index entry — not a table row itself"),
+                       ("Index", name),
+                       ("Indexes", indexed),
+                       ("Page type", role)]
+            # sqlite_master itself is a real 'table' match (its rootpage
+            # is page 1, per identify_structure's own docstring) but
+            # deserves its own clearer wording rather than the generic
+            # "table" phrasing below -- it's schema/structural content
+            # (CREATE TABLE/INDEX/TRIGGER text), never application data.
+            if name == 'sqlite_master':
+                return [("Result", "Schema table (sqlite_master)"),
+                       ("Detail", "structural/schema content — e.g. CREATE "
+                                 "TABLE/INDEX/TRIGGER text, not application "
+                                 "row data")]
+            # Any other 'table' match here (locate_offset already returned
+            # None) means the offset sits on a live leaf/interior page
+            # belonging to a real table, but NOT inside any of that page's
+            # own currently-used cells -- e.g. unused/freed slack within an
+            # otherwise-live page, or (for an interior page) the table's
+            # own navigation structure rather than a row.
+            if role == "leaf":
+                return [("Result", "On a live table page, not inside a used row"),
+                       ("Table", name),
+                       ("Detail", "likely unused/freed space within this page")]
+            return [("Result", "Table's own internal navigation structure"),
+                   ("Table", name),
+                   ("Detail", "an interior b-tree page, not row content")]
+        if kind == 'unattached_btree_page':
+            return [("Result", "Unlinked page"),
+                   ("Detail", "has the shape of a real database page but isn't "
+                             "linked to any current table or index — may be a "
+                             "live overflow page for some record's own long "
+                             "field, or a remnant of a dropped/renamed structure")]
+        return [("Result", "Not attributable to any current database "
+                           "structure (may be unallocated space)")]
+
+    def _on_sql_hit_interpreted(self, item: QStandardItem, generation: int,
+                                result: dict, worker: 'SqlHitInterpretWorker'):
+        self._sql_interpret_workers.pop(id(worker), None)
+        if generation != self._search_generation:
+            # A new search (or a recent-search reload) cleared the tree
+            # while this was running -- `item` may already be a dangling
+            # reference to a QStandardItem the model has destroyed
+            # (clear() releases the whole hierarchy), so nothing about it
+            # is safe to touch, not even a row-count check.
+            return
+        try:
+            item.removeRows(0, item.rowCount())
+        except RuntimeError:
+            return   # underlying C++ item already deleted -- nothing to update
+
+        kind = result.get('kind')
+        if kind == 'not_sqlite':
+            rows = [("Result", "Not a SQLite database")]
+        elif kind == 'error':
+            rows = [("Error", result.get('message', 'unknown error'))]
+        elif kind == 'unresolved':
+            rows = self._render_unresolved_structure(result.get('structure'))
+        elif kind == 'report':
+            rows = [("Covered by report", result['report_name'])]
+            rows += list(result['row'].items())
+        elif kind == 'live':
+            rows = [("Table", result['table']), ("Rowid", str(result['rowid']))]
+            col = result.get('column_name')
+            if col:
+                rows.append(("Column", col))
+            rows.append(("Status", "not covered by any existing report"))
+            rows += list(result['row'].items())
+        elif kind == 'wal_row':
+            rows = [("Table", result['table']), ("Rowid", str(result['rowid']))]
+            col = result.get('column_name')
+            if col:
+                rows.append(("Column", col))
+            rows.append(("Source", "WAL sidecar — not (necessarily) in the live database"))
+            rows += list(result['row'].items())
+            rows.append(("Note", "this may be current, superseded, or genuinely "
+                                 "deleted content — check the live database "
+                                 "separately to tell which"))
+        else:
+            rows = [("Result", f"Unexpected result: {result!r}")]
+
+        # label -> Name column, value -> the tree's existing Context column
+        # (index 2) rather than both crammed into one long Name string —
+        # per direct feedback that the combined form forced constant
+        # manual column-resizing to read.
+        for name, context in rows:
+            name_item = QStandardItem(str(name))
+            name_item.setEditable(False)
+            context_item = QStandardItem(str(context))
+            context_item.setEditable(False)
+            item.appendRow([name_item, QStandardItem(''), context_item, QStandardItem('')])
+        self.search_results_view.expand(item.index())
+        self.search_results_view.resizeColumnToContents(0)
 
     def _open_parent_folder_from_search(self, full_file_path: str):
         """Navigate the tree to the parent folder of *full_file_path*."""
@@ -1222,6 +1729,7 @@ class KeywordSearchMixin:
 
         if count == 0:
             self.search_results_model.clear()
+            self._search_generation += 1
             self.search_results_model.setHorizontalHeaderLabels(
                 ["Name", "Hits", "Context", "Offset"])
             self._search_folder_items.clear()
@@ -1250,6 +1758,7 @@ class KeywordSearchMixin:
             self._db_loader.wait()
 
         self.search_results_model.clear()
+        self._search_generation += 1
         self.search_results_model.setHorizontalHeaderLabels(
             ["Name", "Hits", "Context", "Offset"])
         self._search_folder_items.clear()
@@ -1303,6 +1812,7 @@ class KeywordSearchMixin:
         self._current_scope_ui_paths = None
         self._set_incomplete_banner()   # clear any banner left from the previous archive
         self.search_results_model.clear()
+        self._search_generation += 1
         self.search_field.clear()
         self.search_status.setText("")
         self._search_scope_files_btn.setVisible(False)
@@ -1353,6 +1863,7 @@ class KeywordSearchMixin:
         self._stop_keyword_search()
         self._set_incomplete_banner()
         self.search_results_model.clear()
+        self._search_generation += 1
         self.search_results_model.setHorizontalHeaderLabels(
             ["Name", "Hits", "Context", "Offset"])
         self._search_folder_items.clear()

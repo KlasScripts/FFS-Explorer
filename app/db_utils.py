@@ -25,7 +25,7 @@ _SEARCH_ENTRIES_VERSION = '1'
 
 # Bump whenever the schema changes incompatibly.
 # Cache DB is auto-deleted on mismatch; results DB raises OldSchemaError.
-_CACHE_SCHEMA_VERSION   = 15
+_CACHE_SCHEMA_VERSION   = 16
 _RESULTS_SCHEMA_VERSION = 1
 
 
@@ -187,6 +187,29 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
             scanned_at           INTEGER NOT NULL,
             embedded_archives_json TEXT NOT NULL DEFAULT '[]',
             PRIMARY KEY (platform, app_id)
+        )
+    ''')
+
+    # Per-file SQLite page ownership map (app/sqlite_carve.py's
+    # build_page_map) — which table/index (and leaf-vs-interior) owns
+    # each page of a given evidence sqlite file. Fully re-derivable from
+    # the archive (a pure function of that file's own bytes, which never
+    # change for a given case), so it belongs here, not caseresults.db —
+    # same "rebuildable cache" reasoning as thumbnails/app_intelligence
+    # above. Built lazily (see keyword_search.py's SqlHitInterpretWorker)
+    # the first time an examiner interprets a Keyword Search hit inside
+    # that file, then reused for every later hit in the same file, this
+    # session or any future one — the whole point of persisting it here
+    # rather than only caching it in memory for the current process.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS evidence_page_map (
+            ui_path  TEXT    NOT NULL,
+            page_no  INTEGER NOT NULL,
+            kind     TEXT    NOT NULL,
+            name     TEXT,
+            tbl_name TEXT,
+            is_leaf  INTEGER,
+            PRIMARY KEY (ui_path, page_no)
         )
     ''')
 
@@ -875,6 +898,41 @@ def load_nested_archives(conn: 'sqlite3.Connection') -> list:
     return [{'ui_path': r[0], 'stored_filename': r[1], 'original_size': r[2],
              'entry_count': r[3], 'processed_at': r[4], 'error_msg': r[5]}
             for r in rows]
+
+
+def save_evidence_page_map(conn: 'sqlite3.Connection', ui_path: str,
+                         page_map: dict) -> None:
+    """Persist one file's page-ownership map (see sqlite_carve.build_page_map)
+    — {page_no: {'kind', 'name', 'table', 'is_leaf'}}. Delete-then-insert
+    rather than INSERT OR REPLACE per row, matching
+    save_nested_archive_entries above: simpler than reconciling which
+    page numbers a re-save might have dropped versus added (this file's
+    own page count never changes, but a straightforward full replace
+    costs nothing extra here — at most a few hundred rows)."""
+    conn.execute('DELETE FROM evidence_page_map WHERE ui_path=?', (ui_path,))
+    conn.executemany(
+        'INSERT INTO evidence_page_map (ui_path, page_no, kind, name, tbl_name, is_leaf) '
+        'VALUES (?,?,?,?,?,?)',
+        [(ui_path, page_no, info['kind'], info.get('name'), info.get('table'),
+          None if info.get('is_leaf') is None else int(info['is_leaf']))
+         for page_no, info in page_map.items()],
+    )
+    conn.commit()
+
+
+def load_evidence_page_map(conn: 'sqlite3.Connection', ui_path: str) -> dict | None:
+    """Return the cached page-ownership map for *ui_path*, or None if it
+    hasn't been built yet (an empty map is never a real state — every
+    sqlite file has at least page 1)."""
+    rows = conn.execute(
+        'SELECT page_no, kind, name, tbl_name, is_leaf '
+        'FROM evidence_page_map WHERE ui_path=?', (ui_path,)
+    ).fetchall()
+    if not rows:
+        return None
+    return {r[0]: {'kind': r[1], 'name': r[2], 'table': r[3],
+                   'is_leaf': None if r[4] is None else bool(r[4])}
+            for r in rows}
 
 
 def save_nested_archive_failure(conn: 'sqlite3.Connection',

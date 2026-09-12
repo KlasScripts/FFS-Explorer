@@ -65,9 +65,8 @@ optional_files = {
 }
 
 def run(paths):
-    import sqlite3
-    conn = sqlite3.connect(paths["main_db"])
-    conn.row_factory = sqlite3.Row
+    from artifact_runner import open_db_readonly
+    conn = open_db_readonly(paths["main_db"])
 
     rows = conn.execute("SELECT id, sender, body, sent_at FROM messages").fetchall()
     conn.close()
@@ -422,6 +421,27 @@ preview locally instead of the full media file (WhatsApp iOS's
 for). If you find yourself needing the same small building block a second
 time, add it to that file's "Parser helpers" section rather than
 re-writing it inline — that's what it's there for.
+
+**Always open your evidence sqlite file through `open_db_readonly`, never
+a bare `sqlite3.connect()`** — see the example at the top of this
+document. A bare connect, even for a read-only `SELECT`, can trigger
+SQLite's own checkpoint-on-close behavior and silently delete the file's
+own `-wal`/`-shm` sidecars before anything else (a `recoverable_tables`
+carving pass, or just a re-opened case) gets a chance to read them —
+destroying deleted-row history that was recoverable a moment earlier.
+
+```python
+from artifact_runner import open_db_readonly
+conn = open_db_readonly(paths["main_db"])   # already row_factory=sqlite3.Row
+```
+
+If your parser needs a second file via `ATTACH DATABASE`, attach it as its
+own read-only URI too — a read-only main connection does NOT make an
+attached database read-only on its own (confirmed by direct testing):
+
+```python
+conn.execute("ATTACH DATABASE ? AS other", (f'file:{paths["other_db"]}?mode=ro',))
+```
 
 ## Validating what you wrote
 

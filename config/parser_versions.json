@@ -8,8 +8,8 @@
         "3": "Use shared missing_ref_label() instead of inline f-string for the no-burner-record fallback (no output change).",
         "4": "record_source gained an explicit label ('Burner Message'), same reason as chrome_autofill.py -- the combo no longer hides for a single entry."
       },
-      "hash": "13e222834561f1b3",
-      "version": 4
+      "hash": "dc43c336963fc456",
+      "version": 5
     },
     "android:burner_messageentity": {
       "changelog": {},
@@ -18,8 +18,8 @@
     },
     "android:chrome_app_tabs": {
       "changelog": {},
-      "hash": "4b19b19572669365",
-      "version": 1
+      "hash": "c736b47bcd1a5fb6",
+      "version": 2
     },
     "android:chrome_autofill": {
       "changelog": {
@@ -30,8 +30,8 @@
     },
     "android:chrome_bookmarks": {
       "changelog": {},
-      "hash": "9a1d8c5ad6791b3d",
-      "version": 2
+      "hash": "442e9cb026ae0f19",
+      "version": 3
     },
     "android:chrome_cache": {
       "changelog": {
@@ -59,8 +59,8 @@
       "changelog": {
         "6": "record_source gained an explicit label ('Download'), same reason as chrome_autofill.py."
       },
-      "hash": "20e42f69799b4775",
-      "version": 6
+      "hash": "1f2ad4f535f00cdc",
+      "version": 7
     },
     "android:chrome_favicons": {
       "changelog": {},
@@ -128,8 +128,8 @@
       "changelog": {
         "4": "record_source gained an explicit label ('Search URL'), same reason as chrome_autofill.py."
       },
-      "hash": "45477ac3822933e1",
-      "version": 4
+      "hash": "929c57c4157e5257",
+      "version": 5
     },
     "android:chrome_search_terms": {
       "changelog": {},
@@ -143,13 +143,13 @@
     },
     "android:chrome_sessions": {
       "changelog": {},
-      "hash": "59ba32abb6b9d52b",
-      "version": 1
+      "hash": "9d43e707485aa2bc",
+      "version": 2
     },
     "android:chrome_site_settings": {
       "changelog": {},
-      "hash": "0e7c1c8bc2f4dd23",
-      "version": 1
+      "hash": "84aa81250ce3d006",
+      "version": 2
     },
     "android:chrome_top_sites": {
       "changelog": {},
@@ -161,8 +161,8 @@
         "7": "Carved rows now self-label their source (recovery_source_labels: \"Chrome History (visits table)\" / \"Segmentation Platform (UKM, urls table)\"), flagged \"(unverified match)\" for a header_signature carve -- fixes a blank Source column on recovered rows (core_fields includes source, but a carved row never runs through run() to set it). Generic mechanism added to artifact_runner.py's recoverable_tables loop, reusable by any parser.",
         "9": "Chrome History live rows now populate raw_url_id (was hardcoded None) and record_source gained a third entry, 'Chrome History URL' (History's own urls table -- the actual URL/title text join target, previously undeclared entirely), listed FIRST so it's the default Record-mode jump -- 'Chrome History Visit' (visits, an integer-FK table, never text) is second, reachable via the dropdown. Both entries and the ukm_db one gained source_match so the Hex panel's combo only ever offers the entries relevant to the query that built the selected row."
       },
-      "hash": "f0573fe3f0cd7c08",
-      "version": 9
+      "hash": "fde3e136a6f333c6",
+      "version": 10
     },
     "android:chrome_web_visits": {
       "changelog": {},
@@ -173,27 +173,27 @@
       "changelog": {
         "2": "Removed local _display_name()/_resolve_cache_path() in favor of shared first_nonempty(default=...)/resolve_path_after_marker() (no output change)."
       },
-      "hash": "fcb31a4e3fa83365",
-      "version": 2
+      "hash": "ce043b697d4ce4f7",
+      "version": 3
     },
     "android:google_messages_deleted_conversations": {
       "changelog": {},
-      "hash": "116808dca4e56785",
-      "version": 1
+      "hash": "f203f9787b712895",
+      "version": 2
     },
     "android:groupme": {
       "changelog": {
         "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat/group-record and no-name fallbacks (no output change)."
       },
-      "hash": "c12e85e9be3beba4",
-      "version": 2
+      "hash": "08756b1df733bc5e",
+      "version": 3
     },
     "android:line": {
       "changelog": {
         "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat-name and no-contact-record fallbacks (no output change)."
       },
-      "hash": "4a3ab6b292c7ba9d",
-      "version": 2
+      "hash": "7d07a8880c284036",
+      "version": 3
     },
     "android:line_fts": {
       "changelog": {},
@@ -204,8 +204,8 @@
       "changelog": {
         "2": "Removed local _display_name() in favor of shared first_nonempty(default=...); use shared missing_ref_label() for the no-participant-record fallbacks (no output change)."
       },
-      "hash": "06c84ca56bfc1fdc",
-      "version": 2
+      "hash": "569ec9b8a3fda06b",
+      "version": 3
     },
     "android:whatsapp": {
       "changelog": {
@@ -213,8 +213,8 @@
         "3": "record_source expanded from 2 entries (Message, Chat) to 12: every other joined table's rowid status was checked against real WhatsApp casework (jid/message_media/message_location/wa_contacts all confirmed genuine INTEGER PRIMARY KEY rowid aliases -- wa_contacts specifically was previously flagged unconfirmed, now resolved). New SELECT columns added for the four wa_contacts joins' own _id (jid/media/location needed none -- media/location's rowid is provably identical to the already-captured message_id). New entries: Chat/Sender JID + their Mapped (LID) variants, Media, Location, Chat/Sender Contact + Mapped variants -- all newly-added id fields kept out of the Report table via hidden_fields (plumbing only, already resolved into visible columns).",
         "4": "Media/Location record_source entries gained presence_fields (media_path / latitude) -- their reused rowid (message_id) is always populated regardless of whether that LEFT JOIN matched, so it alone couldn't tell the Hex panel's per-row combo whether to list them; now correctly hidden for a row whose join found nothing."
       },
-      "hash": "4d24fe7d409aa67a",
-      "version": 4
+      "hash": "5b009f566681d3ec",
+      "version": 5
     },
     "ios:instagram": {
       "changelog": {

@@ -18,6 +18,8 @@ import struct
 import unicodedata
 import uuid
 
+from artifact_runner import open_db_readonly
+
 name           = "Photos Metadata"
 app_path       = "mobile/Media/PhotoData"
 files          = {"photos_db": "Photos.sqlite"}
@@ -297,7 +299,7 @@ def _load_classifications(psi_path: str) -> dict:
     index (psi.sqlite).  Labels come from the on-device scene/object
     classifier.  Returns {} on any problem — never raises."""
     try:
-        psi = sqlite3.connect(psi_path)
+        psi = open_db_readonly(psi_path)
     except sqlite3.Error:
         return {}
     try:
@@ -334,7 +336,7 @@ def _load_classifications(psi_path: str) -> dict:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(paths):
-    db = sqlite3.connect(paths["photos_db"])
+    db = open_db_readonly(paths["photos_db"])
     try:
         tables = _tables(db)
         asset_t = next((t for t in ('ZASSET', 'ZGENERICASSET')

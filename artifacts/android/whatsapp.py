@@ -1,5 +1,3 @@
-import sqlite3
-
 name     = "WhatsApp Messages"
 description = ("Messages from WhatsApp's local database (msgstore.db, "
               "table message), live rows plus anything freeblocks/freed "
@@ -205,7 +203,7 @@ media_fields = ["attachment_path"]
 
 
 def run(paths):
-    from artifact_runner import missing_ref_label
+    from artifact_runner import missing_ref_label, open_db_readonly
 
     # sent_time is the raw m.timestamp value (ms), not converted in SQL at
     # all — deliberately not `datetime(m.timestamp/1000, 'unixepoch')`
@@ -217,8 +215,13 @@ def run(paths):
     # not the device's — a bug once shipped here, verified wrong on this
     # project's own UK-based dev machine, silently 5 hours off a January
     # EST timestamp by pure winter-GMT coincidence.
-    conn = sqlite3.connect(paths["msgstore"])
-    conn.execute("ATTACH DATABASE ? AS contacts_db", (paths["wa"],))
+    conn = open_db_readonly(paths["msgstore"])
+    # A read-only main connection does NOT make an ATTACHed database
+    # read-only on its own -- confirmed by direct testing, not assumed --
+    # so the attached path must be its own file: URI too, or wa.db's
+    # own WAL/SHM would be exposed to the exact same checkpoint-on-close
+    # risk open_db_readonly exists to close for msgstore.db.
+    conn.execute("ATTACH DATABASE ? AS contacts_db", (f'file:{paths["wa"]}?mode=ro',))
     cur = conn.cursor()
 
     cur.execute("""

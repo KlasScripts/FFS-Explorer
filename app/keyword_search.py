@@ -75,6 +75,17 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 
+# Role holding (script_name, report_rowid) on the "Jump to this row in the
+# report" child item _on_sql_hit_interpreted appends for a 'report'-kind
+# result -- read back by _on_search_results_double_clicked to jump the
+# Artifact Viewer straight to that exact row (see
+# ArtifactViewerMixin._art_jump_to_report_row). Distinct from the
+# UserRole..UserRole+4 roles a HIT row itself carries (path/offset/etc,
+# defined locally in _perform_search) -- this is a different item several
+# levels deeper in the tree, so there's no real collision risk either way,
+# but a separate, named constant keeps the two readable independently.
+_REPORT_JUMP_ROLE = Qt.ItemDataRole.UserRole + 10
+
 
 # ── Shared zip-entry scanner ─────────────────────────────────────────────────
 
@@ -491,20 +502,36 @@ class SqlHitInterpretWorker(QThread):
                         table_name = f"artifact_{script_name}"
                         for field in rowid_fields:
                             try:
+                                # rowid AS "_report_rowid" -- the SAME
+                                # implicit SQLite rowid ArtifactTableModel's
+                                # own DB mode keys its rows by (see
+                                # _art_show_report's `SELECT rowid FROM
+                                # ... ORDER BY rowid`), captured here so a
+                                # caller can jump the Artifact Viewer
+                                # straight to this exact row instead of
+                                # only naming the report (see
+                                # ArtifactViewerMixin._art_jump_to_report_row).
+                                # Selected as its own aliased column, not
+                                # mixed into `row` below, so it never shows
+                                # up as a spurious extra field in the
+                                # rendered result.
                                 cursor = case_conn.execute(
-                                    f'SELECT * FROM "{table_name}" WHERE "{field}" = ?',
-                                    (str(rowid),))
+                                    f'SELECT rowid AS "_report_rowid", * FROM "{table_name}" '
+                                    f'WHERE "{field}" = ?', (str(rowid),))
                                 row = cursor.fetchone()
                             except Exception:
                                 row = None
                             if row is not None:
                                 cols = [d[0] for d in cursor.description]
+                                row_dict = dict(zip(cols, row))
+                                report_rowid = row_dict.pop('_report_rowid')
                                 report_name = getattr(mod, 'name', script_name)
                                 return {
-                                    'kind':        'report',
-                                    'script_name': script_name,
-                                    'report_name': report_name,
-                                    'row':         dict(zip(cols, row)),
+                                    'kind':          'report',
+                                    'script_name':   script_name,
+                                    'report_name':   report_name,
+                                    'row':           row_dict,
+                                    'report_rowid':  report_rowid,
                                 }
         except Exception:
             pass
@@ -1357,6 +1384,14 @@ class KeywordSearchMixin:
         col0  = idx.siblingAtColumn(0)
         model = self.search_results_model
         view  = self.search_results_view
+
+        jump_item = model.itemFromIndex(col0)
+        jump_data = jump_item.data(_REPORT_JUMP_ROLE) if jump_item is not None else None
+        if jump_data is not None:
+            script_name, report_rowid = jump_data
+            self._art_jump_to_report_row(script_name, report_rowid)
+            return
+
         if model.rowCount(col0) == 0:
             return
         if view.isExpanded(col0):
@@ -1601,6 +1636,21 @@ class KeywordSearchMixin:
             context_item = QStandardItem(str(context))
             context_item.setEditable(False)
             item.appendRow([name_item, QStandardItem(''), context_item, QStandardItem('')])
+
+        # A 'report' result names the report and shows its row's values
+        # inline, but doesn't yet select that exact row in the Artifact
+        # Viewer's own Report table -- this child row is the jump. Only
+        # possible when _find_report_match actually resolved a real
+        # underlying rowid (report_rowid); every current caller of that
+        # method does, so this is unconditional on kind=='report' rather
+        # than a defensive .get() check masking a real gap.
+        if kind == 'report':
+            jump_item = QStandardItem("→ Jump to this row in the report")
+            jump_item.setEditable(False)
+            jump_item.setData(
+                (result['script_name'], result['report_rowid']), _REPORT_JUMP_ROLE)
+            item.appendRow([jump_item, QStandardItem(''), QStandardItem(''), QStandardItem('')])
+
         self.search_results_view.expand(item.index())
         self.search_results_view.resizeColumnToContents(0)
 

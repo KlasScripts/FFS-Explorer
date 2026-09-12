@@ -64,7 +64,33 @@ headers — even though nothing here is a vendored copy the way those files are.
    since no "select this exact underlying row" mechanism exists there yet.
    Building that is a natural fast-follow, and should be shared work with
    item 11 (bookmark row-citation) below, which needs the identical
-   capability. Also v1-scoped: only matches a record_source entry with a
+   capability. **[DONE 2026-09-12] Jump-to-exact-row, built as this
+   fast-follow.** `_find_report_match` (keyword_search.py) now also
+   captures the matched row's own implicit SQLite `rowid` in
+   `caseresults.db`'s `artifact_<script>` table (`SELECT rowid AS
+   "_report_rowid", * FROM ...` — the exact same rowid space
+   `ArtifactTableModel`'s DB mode already keys its rows by, so no new
+   identity concept was needed). A "→ Jump to this row in the report"
+   child item appears under a `report`-kind result, carrying
+   `(script_name, report_rowid)` on a new `_REPORT_JUMP_ROLE`; double-
+   clicking it calls the new `ArtifactViewerMixin._art_jump_to_report_row`,
+   which switches to the Artifact Viewer tab, opens the report, selects
+   the matching tree node, and selects+scrolls to that exact row — clearing
+   the "Hide likely false positives" filter first (inline, via the
+   filter's own synchronous fast path) if that's specifically what's
+   hiding the target row, without touching the free-text or date filters
+   (both deliberate examiner choices this jump shouldn't silently
+   override). Verified end-to-end in the real running app (in-process,
+   same methodology as the rest of this feature): a real "Ohtani" search
+   hit inside Chrome History resolved to `chrome_web_history` rowid 10,
+   and the jump correctly switched tabs, selected that exact model row,
+   and the row's own displayed content (title/url/from_url/etc.) matched
+   the interpreted result exactly.
+   *Source: user's own "go for it" confirmation of this item as the
+   recommended next piece of work — not from any of the four sibling
+   tools.*
+
+   Also v1-scoped: only matches a record_source entry with a
    FIXED `table` key (skips a `table_field`-based entry, e.g. GroupMe's
    Chat-or-Group dynamic table — there's no live row read yet to
    determine which table that entry would even mean); stops at the first
@@ -369,19 +395,33 @@ headers — even though nothing here is a vendored copy the way those files are.
     itself to across all 369 of its own plugins.
     *Source: ALEAPP (`__artifacts_v2__`'s `sample_data` dict).*
 
-19. **[Crush + mf-scan confirm this is real and valuable; ALEAPP is a real
-    counter-example] Stand up a real pytest suite with committed
-    micro-fixtures.** Still a real, large gap (ios-ffs-browser has zero
-    automated tests) — but the honest, updated picture after checking a
-    third and fourth sibling tool: 2 of 4 mature siblings reviewed
-    (Crush, mf-scan) have genuine fixture-backed test suites; ALEAPP
-    (also mature, also widely used) has almost none; FQLite wasn't
-    checked for this. Not "everyone but us has tests" — a real, if
-    imperfect, norm, not a universal one. Start with what's already been
-    manually verified this session and is cheapest to freeze:
-    `sqlite_carve._cell_local_payload_size` (pure arithmetic, no archive
-    needed) and `chrome_tabs.py`'s three parse functions (small real
-    files already confirmed byte-for-byte this session).
+19. **[DONE 2026-09-12 — first cut] Stand up a real pytest suite with
+    committed micro-fixtures.** `requirements-dev.txt` + `tests/`
+    (`conftest.py`'s `basic_db_raw`/`wal_db` fixtures, both real files
+    built via genuine `sqlite3` calls, never hand-encoded bytes) — 18
+    tests, all passing: `_cell_local_payload_size`'s overflow-threshold
+    boundary math; `build_page_map`/`locate_offset`/`identify_structure`
+    against a fixture reproducing both real bugs found this session
+    (a `WITHOUT ROWID` table misattributed by page-shape alone; the
+    `sqlite_master`-exclusion scope gap in `locate_offset`'s cached
+    path), plus cached-vs-fresh equivalence and rowid-alias substitution;
+    `locate_wal_offset`/`identify_wal_structure` recovering a genuinely
+    deleted row from an un-checkpointed WAL fixture built with the same
+    "blocking reader" trick verified live against LINE's real WAL
+    earlier this session. One real fixture bug caught before trusting
+    it: the WAL fixture needed an explicit `PRAGMA wal_checkpoint(TRUNCATE)`
+    before the blocking reader attaches, or the base file never gets a
+    chance to checkpoint at all and comes back with no schema.
+
+    **Still open, not yet covered**: `chrome_tabs.py`'s three parse
+    functions (this item's own original second target — small real
+    files already verified byte-for-byte this session, but not yet
+    frozen as committed fixtures) and every other module this project's
+    manual verification has already checked by hand but never pinned
+    down as an automated regression (the record_source/hex-citation
+    fixes, the parser-family gap-sweep additions, etc.) — this is a
+    first cut establishing the harness and covering today's own new
+    code, not a claim of broad coverage.
     *Source: Crush (`crush/tests/`), mf-scan (`tests/`), with ALEAPP as an
     explicit counter-finding.*
 

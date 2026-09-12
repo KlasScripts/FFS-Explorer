@@ -1786,6 +1786,78 @@ class ArtifactViewerMixin:
         # pattern _art_update_parser_version already uses to restore ITS
         # own specific report afterward rather than this method guessing.
 
+    def _art_find_tree_item_by_role(self, role_value: str):
+        """Depth-first search of the Artifact tree for the item whose
+        Qt.ItemDataRole.UserRole data equals *role_value* exactly (e.g.
+        _ART_GROUP + script_name) -- needed because a report's own group
+        item can sit either directly under Apps or nested one level
+        deeper inside an app_group parent (see _refresh_artifact_tab), so
+        a flat child(0)/child(1) walk the way _art_select_and_show_apps
+        uses for Apps itself (always position 0) isn't enough here."""
+        root = self._art_tree_model.invisibleRootItem()
+        stack = [root.child(i) for i in range(root.rowCount())]
+        while stack:
+            it = stack.pop()
+            if it is None:
+                continue
+            if it.data(Qt.ItemDataRole.UserRole) == role_value:
+                return it
+            stack.extend(it.child(i) for i in range(it.rowCount()))
+        return None
+
+    def _art_jump_to_report_row(self, script_name: str, report_rowid) -> None:
+        """Switch to the Artifact Viewer tab, open *script_name*'s report,
+        and select+scroll to the row whose implicit SQLite rowid is
+        *report_rowid* -- the "jump to exact row" fast-follow to the
+        v1 "Interpret as SQL Record" feature's 'report' case (TODO.md
+        item 1), which previously only named the report and showed that
+        row's values inline without navigating there. Shared groundwork
+        with item 11 (bookmark row-citation), which needs the identical
+        row-select capability.
+
+        A no-op (with a status-bar explanation) if the report no longer
+        has that row -- e.g. the parser was re-run since this hit was
+        interpreted and the underlying data changed -- rather than
+        selecting the wrong row or raising."""
+        self.center_tabs.setCurrentIndex(3)
+        self._art_show_report(script_name)
+
+        group_item = self._art_find_tree_item_by_role(_ART_GROUP + script_name)
+        if group_item is not None:
+            self._art_tree_view.setCurrentIndex(
+                self._art_tree_model.indexFromItem(group_item))
+
+        # The target row may be present in the report's own full row set
+        # (_all_ids) but hidden by the default "Hide likely false
+        # positives" filter _art_show_report just applied (checked by
+        # default -- see _apply_art_filter). Unchecking it takes the
+        # SYNCHRONOUS clear_filter() fast path in _apply_art_filter (no
+        # term, no hide_lowconf -> no background ArtifactFilterWorker), so
+        # this is safe to do inline rather than needing to wait on a
+        # worker callback. Only attempted when the row is genuinely
+        # hidden by this specific filter -- never touches the free-text
+        # filter box or the optional date-range filter, both deliberate
+        # examiner choices this jump shouldn't silently override.
+        if (report_rowid not in self._art_table_model._rowids
+                and report_rowid in self._art_table_model._all_ids
+                and self._art_hide_lowconf_checkbox.isVisible()
+                and self._art_hide_lowconf_checkbox.isChecked()):
+            self._art_hide_lowconf_checkbox.blockSignals(True)
+            self._art_hide_lowconf_checkbox.setChecked(False)
+            self._art_hide_lowconf_checkbox.blockSignals(False)
+            self._apply_art_filter()
+
+        try:
+            row = self._art_table_model._rowids.index(report_rowid)
+        except ValueError:
+            self.status_bar.showMessage(
+                "That report row is no longer present, or is excluded by "
+                "the current filter (the parser may have been re-run "
+                "since this hit was interpreted).")
+            return
+        self._art_report_view.selectRow(row)
+        self._art_report_view.scrollTo(self._art_table_model.index(row, 0))
+
     def _art_select_and_show_apps(self) -> None:
         """Select and show the Apps node — the "nothing selected yet"
         default for a genuinely fresh tree (first case load). Call right

@@ -1854,6 +1854,68 @@ underneath that verification.
     `Status`/`Source` are now their own rows. `resizeColumnToContents(0)`
     called once after populating, so Name sizes itself to the (now much
     shorter) labels automatically.
+
+    **Jump-to-exact-row, 2026-09-12, the TODO.md-flagged v1 fast-follow**:
+    a `report`-kind result previously only named the report and showed
+    that row's values inline — no way to actually navigate to it. Fixed
+    two ways together: `SqlHitInterpretWorker._find_report_match` now
+    also selects the matched row's own implicit SQLite `rowid` from
+    `caseresults.db`'s `artifact_<script>` table (`SELECT rowid AS
+    "_report_rowid", * FROM ...`, popped back out of the returned `row`
+    dict before rendering so it never shows up as a spurious extra
+    field) — the SAME rowid space `ArtifactTableModel`'s DB mode already
+    keys its own rows by (`_art_show_report`'s `SELECT rowid FROM ...
+    ORDER BY rowid`), so no new row-identity concept was needed, just
+    exposing one that already existed on both sides. `_on_sql_hit_
+    interpreted` appends a "→ Jump to this row in the report" child item
+    carrying `(script_name, report_rowid)` on a new `_REPORT_JUMP_ROLE`;
+    `_on_search_results_double_clicked` checks for that role before its
+    existing expand/collapse logic and, when present, calls the new
+    `ArtifactViewerMixin._art_jump_to_report_row(script_name,
+    report_rowid)` instead.
+
+    That method switches `center_tabs` to the Artifact Viewer (index 3),
+    calls the existing `_art_show_report(script_name)`, selects the
+    matching tree node (`_art_find_tree_item_by_role`, a depth-first
+    search — needed since a report's group item can sit either directly
+    under Apps or nested inside an `app_group_label` parent, unlike
+    Apps itself which is always position 0), then selects+scrolls to the
+    target row via `QTableView.selectRow`. One real edge case handled
+    explicitly rather than silently mis-selecting or failing: the target
+    row can be present in the report's own full row set but hidden by
+    the "Hide likely false positives" filter `_art_show_report`'s own
+    end-of-load `_apply_art_filter()` call just re-applied (checked by
+    default for a `recoverable_tables` report) — detected by checking
+    `report_rowid` against `_all_ids` vs. the currently-filtered
+    `_rowids`, and cleared by unchecking that one checkbox specifically
+    (never the free-text filter box or the optional date-range filter,
+    both deliberate examiner choices this jump shouldn't silently
+    override) — safe to do inline rather than needing to await a
+    background filter worker, since unchecking it with no text term
+    active takes `_apply_art_filter`'s own SYNCHRONOUS `clear_filter()`
+    fast path, not the async `ArtifactFilterWorker` branch. A row that's
+    genuinely gone (the parser was re-run since this hit was interpreted)
+    reports an honest status-bar message rather than selecting the wrong
+    row.
+
+    Verified end-to-end in the real running app (in-process, same
+    `importlib.util.spec_from_file_location` + real `QApplication` +
+    `app.processEvents()` polling methodology this whole feature was
+    verified with earlier, offscreen platform this time): a real
+    "Ohtani" keyword-search hit inside Chrome History resolved to
+    `chrome_web_history` rowid 10, the new jump child item carried the
+    correct `(script_name, report_rowid)` payload, and invoking
+    `_art_jump_to_report_row` correctly switched to tab index 3 and
+    selected the exact model row whose own displayed content (title/
+    url/from_url/etc.) matched the interpreted result exactly — not just
+    that a row got selected, but the RIGHT one. Incidentally also
+    surfaced and fixed a real hang risk in this project's own headless
+    in-process test methodology, not the shipped feature: a real modal
+    (`_start_keyword_search`'s own first-time "Search Coverage" reminder,
+    a `QDialog`, not the `QMessageBox` this project's test scripts had
+    already learned to watch for) blocks forever under an offscreen Qt
+    platform with nothing to click it — worth remembering for the next
+    headless verification script, not just this one.
   - **`hidden_fields`** (a module-level list of output-field names,
     added 2026-08-22 alongside `record_source` below): a generic
     `ArtifactTableModel` feature, not specific to record_source, for a

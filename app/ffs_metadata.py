@@ -367,14 +367,17 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
     # container GUIDs, App Group entitlements) independent of the
     # per-container metadata plists build_ui_metadata's guid_to_bundle
     # came from — confirmed on real casework to sometimes be missing on
-    # GrayKey extractions. Opens its own zip handle (z=None) rather than
-    # reusing z_ctx (a CachedZipView, already closed above) — cheap,
-    # one-time. Its guid_map takes priority on overlap (the richer,
-    # independently-verified source — see CLAUDE.md); it never REMOVES an
-    # entry the per-container plist method already resolved, only adds to
-    # or confirms it.
+    # GrayKey extractions. Reuses z_ctx (a CachedZipView) — its own
+    # __exit__ is a no-op, so it's still perfectly usable here despite
+    # the earlier `finally` block having "closed" it; passing it avoids
+    # a raw zipfile.ZipFile fallback on the main archive (this project's
+    # own standing Convention has no exception for this case). Its
+    # guid_map takes priority on overlap (the richer, independently-
+    # verified source — see CLAUDE.md); it never REMOVES an entry the
+    # per-container plist method already resolved, only adds to or
+    # confirms it.
     status("Building app registry from LaunchServices…")
-    app_registry_rows, ls_guid_map = ffs_adapter.build_app_registry(zip_path, zip_names)
+    app_registry_rows, ls_guid_map = ffs_adapter.build_app_registry(zip_path, zip_names, z=z_ctx)
     if ls_guid_map:
         guid_to_bundle = {**guid_to_bundle, **ls_guid_map}
 

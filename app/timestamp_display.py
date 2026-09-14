@@ -108,19 +108,25 @@ class TimestampDisplayMixin:
     calls to display an evidence timestamp per the case's active setting.
     """
 
-    def _setup_timestamp_banner(self, layout) -> None:
-        """Build the shared timestamp-mode banner and add it to layout —
-        one indicator above every tab (File Browser, Media, Search,
-        Artifacts) rather than a per-tab label or per-column header suffix,
-        since the case's UTC/handset/acquisition/manual setting applies to
-        every timestamp shown anywhere. This is the only place it's shown
-        — the window title stays plain, so the mode isn't stated twice
-        (see _refresh_timestamp_mode_indicator)."""
+    def _setup_timestamp_banner(self) -> QLabel:
+        """Build the shared timestamp-mode banner widget — one indicator
+        above every tab (File Browser, Media, Search, Artifacts) rather
+        than a per-tab label or per-column header suffix, since the
+        case's UTC/handset/acquisition/manual setting applies to every
+        timestamp shown anywhere. This is the only place it's shown — the
+        window title stays plain, so the mode isn't stated twice (see
+        _refresh_timestamp_mode_indicator).
+
+        Deliberately does NOT add itself to a layout (unlike its own
+        pre-2026-09-13 version) — per direct instruction not to waste
+        vertical screen space, the caller now places this on the SAME
+        row as the header-scan banner instead of stacking them; see
+        ffs-explorer.py's own __init__ for that shared row."""
         self._timestamp_mode_banner = QLabel()
         self._timestamp_mode_banner.setStyleSheet(
             "color: #e07b00; font-weight: bold; font-size: 12px; padding: 2px 6px;")
         self._timestamp_mode_banner.setVisible(False)
-        layout.addWidget(self._timestamp_mode_banner)
+        return self._timestamp_mode_banner
 
     def format_ts(self, ts):
         if not ts: return "---"

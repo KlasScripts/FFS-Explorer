@@ -247,7 +247,7 @@ def _load_launchservices_store(zip_path: str, zip_names: frozenset,
     _close = z is None
     _z = zipfile.ZipFile(zip_path, 'r') if _close else z
     try:
-        raw = _z.read(entry)
+        raw = _z.open(entry).read()
     except (KeyError, OSError, zipfile.BadZipFile):
         return None
     finally:

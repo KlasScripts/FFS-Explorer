@@ -2,7 +2,6 @@
 
 import os
 import warnings
-import zipfile
 
 from header_scan import sniff_media_kind
 from zip_entry import ZipEntry
@@ -62,12 +61,25 @@ def _ascii_col_to_byte(col: int) -> int | None:
 # ── Worker ────────────────────────────────────────────────────────────────────
 
 class HexLoadWorker(QThread):
-    """Fallback worker for compressed zip entries — reads via zipfile decompression."""
+    """Fallback worker for compressed zip entries. Reads via
+    ZipEntry.read() itself — never reimplements zipfile access here, per
+    this project's own standing Convention ("never reimplement [the
+    DEFLATED-entry fallback] elsewhere, call into" ZipEntry/CachedZipView.
+    An earlier version of this worker opened `zipfile.ZipFile` directly
+    and streamed it in chunks for per-chunk progress/cancellation — a
+    real duplicate of ZipEntry's own already-sanctioned fallback, found
+    and fixed the same day the rest of this project's remaining
+    main-archive zipfile fallbacks were swept. Confirmed real DEFLATED
+    entries are essentially unobserved in real FFS data (this project's
+    own audit: 124,949/124,949 entries STORED on a real case, zero
+    DEFLATED) and this read is capped at 64KB regardless, so the
+    per-chunk progress/cancellation this gave up was never meaningfully
+    exercised in practice — a single bounded `entry.read()` call is
+    materially simpler for the same real-world outcome."""
     progress      = Signal(int, int)   # bytes_read, total_bytes
     load_complete = Signal(bytes)
     error         = Signal(str)
 
-    CHUNK = 8192
     LIMIT = 65536
 
     def __init__(self, entry: ZipEntry):
@@ -77,18 +89,11 @@ class HexLoadWorker(QThread):
 
     def run(self):
         try:
-            data = bytearray()
-            with zipfile.ZipFile(self.entry.zip_path, 'r') as z:
-                with z.open(self.entry.physical_path) as f:
-                    while len(data) < self.LIMIT:
-                        if self.isInterruptionRequested():
-                            return
-                        chunk = f.read(self.CHUNK)
-                        if not chunk:
-                            break
-                        data.extend(chunk)
-                        self.progress.emit(len(data), self.total_bytes)
-            self.load_complete.emit(bytes(data[:self.LIMIT]))
+            data = self.entry.read(limit=self.LIMIT)
+            if self.isInterruptionRequested():
+                return
+            self.progress.emit(len(data), self.total_bytes)
+            self.load_complete.emit(data)
         except Exception as e:
             self.error.emit(str(e))
 

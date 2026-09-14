@@ -1,15 +1,39 @@
 # ios_ffs_browser.spec
 # -*- mode: python ; coding: utf-8 -*-
 
+import glob
+import os
 import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
+# app/media_viewer.py's video-thumbnail decoder (`av`/PyAV, since
+# 2026-09-14) is built from source in CI, linked against a real FFmpeg's
+# shared DLLs (see build-windows-exe.yml — the official PyPI wheel's own
+# bundled FFmpeg build was confirmed unable to decode HEVC). The
+# `pyinstaller-hooks-contrib` `av` hook is tuned for the OFFICIAL wheel's
+# own DLL-bundling layout (Windows wheels from 9.1.1+ carry their DLLs
+# inside the package itself) — a from-source build instead dynamically
+# links against DLLs sitting in the CI runner's chocolatey install
+# directory, a genuinely different layout that hook was never written for,
+# so its own automatic discovery is not trusted here. Explicitly globbing
+# and bundling every DLL from the same ffmpeg-shared install CI just built
+# `av` against, as a belt-and-braces safety net. UNVERIFIED against a real
+# frozen Windows build as of the commit that added this — see TODO.md item
+# 17 and build-windows-exe.yml's own comment for the full investigation;
+# check the next Windows CI run actually plays a real video thumbnail,
+# not just that the exe launches, before trusting this.
+_ffmpeg_dlls = []
+if sys.platform == 'win32':
+    _ffmpeg_dirs = glob.glob(r'C:\ProgramData\chocolatey\lib\ffmpeg-shared\tools\*\bin')
+    if _ffmpeg_dirs:
+        _ffmpeg_dlls = [(dll, '.') for dll in glob.glob(os.path.join(_ffmpeg_dirs[0], '*.dll'))]
+
 a = Analysis(
     ['ffs-explorer.py'],
     pathex=['app'],
-    binaries=[],
+    binaries=_ffmpeg_dlls,
     datas=[
         # Bundle config JSON files under config/ next to the exe
         ('config/hardware_models.json', 'config'),
@@ -126,11 +150,17 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Trim things you definitely don't need
+        # Trim things you definitely don't need. 'PIL' was removed from
+        # this list 2026-09-14 — av.VideoFrame.to_image() (media_viewer.py's
+        # video-thumbnail decoder) genuinely needs it now; a clean rebuild
+        # with 'PIL' still excluded here silently produced a frozen build
+        # where every video thumbnail would have raised ImportError at
+        # runtime, confirmed directly via this project's own build log
+        # ("excluded module named PIL - imported by av.video.frame
+        # (delayed)") before this was caught.
         'matplotlib',
         'numpy',
         'scipy',
-        'PIL',
         'tkinter',
     ],
     win_no_prefer_redirects=False,

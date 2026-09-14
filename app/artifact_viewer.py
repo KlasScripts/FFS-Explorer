@@ -5,7 +5,6 @@ import os
 import pathlib
 import re
 import sqlite3
-import zipfile
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -21,10 +20,16 @@ from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
 
 from db_utils import _open_results_db, start_run_log, complete_run_log, load_last_run
+from zip_cd_cache import CachedZipView, load as _zcd_load
 from highlight_delegate import HighlightDelegate
 from artifact_media import (
-    MediaThumbnailDelegate, MediaFullViewDialog, WebpageThumbnailRenderer, THUMB_CELL_SIZE,
+    MediaThumbnailDelegate, WebpageThumbnailRenderer, THUMB_CELL_SIZE,
 )
+# MediaFullViewDialog lives in media_viewer.py (moved there 2026-09-14 when
+# the Media Browser grew its own double-click call site) rather than
+# artifact_media.py, where it originally lived as this file's own single
+# caller.
+from media_viewer import MediaFullViewDialog
 from dialog_helpers import note_label, error_label, ERROR_STYLE, WARNING_COLOR, ACTIVE_BUTTON_STYLE
 import validation_store
 import parser_validation
@@ -606,8 +611,23 @@ class ArtifactRunnerWorker(QThread):
             self.done.emit()
             return
 
+        # CachedZipView (the local .zcd sidecar), never a raw
+        # zipfile.ZipFile on the main archive — this project's own
+        # standing Convention has no exception for this case. Confirmed
+        # safe: every real use of zip_obj in artifact_runner.py
+        # (_make_zip_byte_reader, _extract_candidate) only ever calls
+        # .namelist()/.getinfo() on it — metadata-only, exactly what
+        # CachedZipView provides — routing every actual byte read through
+        # ZipEntry itself, never zip_obj.read(name) directly (the one
+        # convenience method CachedZipView deliberately doesn't
+        # replicate). case_dir is always set for this worker (a parser
+        # run only ever happens inside an already-loaded case), so .zcd
+        # is already guaranteed to exist by the time this runs.
         try:
-            zip_obj = zipfile.ZipFile(self._zip_path, 'r')
+            infos = _zcd_load(self._zip_path, self._case_dir)
+            if infos is None:
+                raise RuntimeError("Local .zcd cache not available")
+            zip_obj = CachedZipView(self._zip_path, infos)
         except Exception as exc:
             self.log.emit(f"Could not open archive: {exc}")
             case_conn.close()
@@ -649,8 +669,22 @@ class ArtifactRunnerWorker(QThread):
             self.log.emit(f"\nUnexpected error: {exc}")
         finally:
             case_conn.close()
-            if zip_obj:
-                zip_obj.close()
+            # CachedZipView holds no real handle of its own (each read
+            # opens/closes its own file internally, see zip_entry.ZipEntry)
+            # -- unlike the raw zipfile.ZipFile this replaced, there is
+            # nothing to close here. A real, self-inflicted regression:
+            # this `zip_obj.close()` call survived the zipfile->CachedZipView
+            # swap and raised AttributeError on every single run since,
+            # which — because it fired inside `finally`, after the `except`
+            # above had already handled the try block's own exceptions —
+            # propagated straight out of run() uncaught, meaning
+            # self.done.emit() a few lines below was NEVER reached. Every
+            # caller waiting on that signal (the Photos.sqlite quick-process
+            # offer's QProgressDialog, and the main "Run Artifact Parsers"
+            # dialog) hung forever with no error shown, since a QThread's
+            # own unhandled exception doesn't crash the app or surface in
+            # the GUI, only prints to stderr. Found via a direct user
+            # report: "went to the DCIM folder... it is not completing."
 
         self.log.emit("\nAll selected parsers finished.")
         self.done.emit()

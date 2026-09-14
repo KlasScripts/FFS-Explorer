@@ -54,7 +54,7 @@ from artifact_viewer import ArtifactViewerMixin
 from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
 from timestamp_display import TimestampDisplayMixin
-from dialog_helpers import button_row, error_label, note_label, WARNING_STYLE
+from dialog_helpers import button_row, error_label, note_label, WARNING_STYLE, ACTIVE_COLOR
 import research_store as _research
 from artifact_db import load_artifact_results
 from zip_reader import read_nested_entry
@@ -594,20 +594,25 @@ def _read_device_info(zip_path: str, case_dir: str | None = None) -> tuple[list[
     label  — short display string like 'Apple iPhone 14 Pro · iOS 17.4.1'
     Returns ([], '') on failure.
 
-    Reads via the local .zcd central-directory cache when *case_dir* is
-    given and the cache is already built -- a handful of small metadata
-    files (a plist or two, a build.prop), but the central-directory PARSE
-    itself is otherwise a full read over what can be a large network-
-    hosted archive; falls back to a plain zipfile.ZipFile only when the
-    cache isn't available.
+    Reads via the local .zcd central-directory cache only — never a raw
+    zipfile.ZipFile on the main archive (this project's own standing
+    Convention has no exception for this case, even for a
+    metadata-only central-directory parse). Returns ([], '') rather than
+    falling back to a network central-directory read when *case_dir* is
+    missing or the cache isn't built yet — the one real caller only ever
+    invokes this after the case has fully loaded, so .zcd is already
+    guaranteed present by then.
     """
     fields, label = _read_device_info_from_ufd(zip_path)
     if fields:
         return fields, label
+    if not case_dir:
+        return [], ''
     try:
-        infos = _cd_cache_load(zip_path, case_dir) if case_dir else None
-        view = CachedZipView(zip_path, infos) if infos is not None else None
-        with (view if view is not None else zipfile.ZipFile(zip_path, 'r')) as z:
+        infos = _cd_cache_load(zip_path, case_dir)
+        if infos is None:
+            return [], ''
+        with CachedZipView(zip_path, infos) as z:
             names = frozenset(z.namelist())
             ffs_adapter = FfsAdapter.detect(z, names)
             result = _read_ios_info(z, names, ffs_adapter)
@@ -763,18 +768,18 @@ class ExtractorWorker(QThread):
             self.status.emit("Initializing extraction...")
 
             # ZipInfo for every real entry comes from the local .zcd
-            # central-directory cache when available -- never a second/
-            # third full central-directory read over what can be a large
-            # network-hosted archive, just one local cache load. Falls
-            # back to a plain zipfile.ZipFile only when the cache isn't
-            # built yet (info_by_name stays identical either way, so
-            # everything below is unaffected by which path was taken).
+            # central-directory cache ONLY — never a raw zipfile.ZipFile
+            # on the main archive (this project's own standing Convention
+            # has no exception for this case). Raises (caught by this
+            # method's own outer except, producing the normal "Export
+            # Failed: ..." message) rather than falling back to a network
+            # central-directory read when the cache isn't available — an
+            # export only ever runs on an already-loaded case, so .zcd is
+            # already guaranteed present by then in practice.
             infos = _cd_cache_load(self.zip_path, self.case_dir) if self.case_dir else None
-            if infos is not None:
-                info_by_name = {i.filename: i for i in infos}
-            else:
-                with zipfile.ZipFile(self.zip_path, 'r') as z:
-                    info_by_name = {i.filename: i for i in z.infolist()}
+            if infos is None:
+                raise RuntimeError("Local .zcd cache not available for export")
+            info_by_name = {i.filename: i for i in infos}
 
             final_queue = []
             for ui_logical_path, base_parent in self.export_tasks:
@@ -815,8 +820,10 @@ class ExtractorWorker(QThread):
             # only for the rare compressed-entry fallback -- STORED entries
             # (confirmed the overwhelming majority in real FFS archives)
             # never touch it at all, going straight through raw_f below.
-            cached_view = CachedZipView(self.zip_path, infos) if infos is not None else None
-            fallback_zf = None if cached_view is not None else zipfile.ZipFile(self.zip_path, 'r')
+            # infos is guaranteed non-None here (the raise above already
+            # returned otherwise), so this is never None either -- no
+            # raw-zipfile fallback object needed or created.
+            cached_view = CachedZipView(self.zip_path, infos)
 
             try:
                 with open(self.zip_path, 'rb') as raw_f:
@@ -850,8 +857,7 @@ class ExtractorWorker(QThread):
                                         target.write(chunk)
                                         remaining -= len(chunk)
                             else:
-                                zsrc = cached_view if cached_view is not None else fallback_zf
-                                with zsrc.open(physical_path) as source, \
+                                with cached_view.open(physical_path) as source, \
                                      open(dest_path, 'wb') as target:
                                     while chunk := source.read(_CHUNK):
                                         target.write(chunk)
@@ -860,8 +866,7 @@ class ExtractorWorker(QThread):
 
                         self.progress.emit(i + 1, total)
             finally:
-                if fallback_zf is not None:
-                    fallback_zf.close()
+                pass   # CachedZipView holds no real handle of its own to close
 
             msg = f"Successfully exported {total} items."
             if self._collision_count:
@@ -918,14 +923,205 @@ def _format_tool_ts_local(iso_str: str) -> str:
     return f"{local:%Y-%m-%d %H:%M:%S} (UTC{sign}{hh:02d}:{mm:02d})"
 
 
-def _count_header_candidates(ui_metadata: dict, ffs_adapter) -> int:
-    """Count 'Other'-typed files in scan_folders — no I/O, used for dialog display."""
+# Single source of truth for the three tiers' own wording — used by
+# CaseSettingsDialog's picker, ProcessDialog's upgrade picker, and
+# FastZipBrowser's blue banner, so the three surfaces can never drift
+# into describing the same tier differently. See TODO.md item 20.
+_HEADER_SCAN_TIER_LABELS = {
+    1: "Tier 1 — unknown-extension files, app/user-accessible areas",
+    2: "Tier 2 — all files, app/user-accessible areas (includes Tier 1)",
+    3: "Tier 3 — all files, everywhere (exhaustive — can take a very long time)",
+}
+
+
+def _confirm_tier3(parent) -> bool:
+    """The Tier-3 confirm gate — shared by CaseSettingsDialog's own first-
+    open picker and ProcessDialog's upgrade picker so the two surfaces
+    never carry two different (and potentially differently-persuasive)
+    warnings for the same choice. Custom button text ("Yes, Scan Every
+    File" / "No, Use a Different Tier"), not a generic Yes/No, per direct
+    instruction to make sure there's "enough in the dialog" that a click
+    genuinely has to be a deliberate choice, not a reflexive one — a
+    generic Yes/No pair is far easier to click through without reading.
+    Defaults to the declining button. Returns True only if the examiner
+    explicitly confirmed."""
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle("Scan Every File?")
+    box.setText("Tier 3 scans <b>every file in the entire archive</b> — "
+                "not just app/user-accessible areas.")
+    box.setInformativeText(
+        "This can take a very long time on a large or slow/network "
+        "archive, for very little forensic benefit in most cases: the "
+        "areas outside app/user-accessible folders are ones a suspect "
+        "has no ordinary way to write into anyway. Tier 2 already "
+        "catches a deliberately mislabeled file everywhere a suspect "
+        "could actually reach.\n\n"
+        "Only choose this if you have a specific, case-related reason to "
+        "suspect something is hidden outside the normal app/user-"
+        "accessible areas.")
+    yes_btn = box.addButton("Yes, Scan Every File", QMessageBox.ButtonRole.AcceptRole)
+    no_btn  = box.addButton("No, Use a Different Tier", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(no_btn)   # Enter/Return activates the declining choice, not the expensive one
+    box.exec()
+    return box.clickedButton() is yes_btn
+
+
+def _header_candidate_matches(ui_path: str, scan_folders: tuple, tier: int) -> bool:
+    """Does *ui_path* need a header read under *tier*? Shared predicate for
+    both the counting and collecting passes, so the three tiers can never
+    silently drift apart between "how many will this scan" (dialog display)
+    and "which ones actually get read" (the real scan) — see TODO.md item 20
+    for the full three-tier design this implements:
+      1 — unknown-extension files only, within scan_folders() (today's
+          original, only behavior; free extension check first, byte read
+          only for the genuinely ambiguous case)
+      2 — every file, within scan_folders() (also catches a DELIBERATELY
+          mislabeled extension, still cost-bounded to app/user-writable
+          areas — never re-reads the huge OS/system trees outside them)
+      3 — every file, everywhere (no folder restriction — the exhaustive
+          backstop for "the curated scan_folders() list itself might be
+          wrong or incomplete for this case," not a routine default)
+    """
+    if tier <= 0:
+        return False
+    if tier >= 3:
+        return True
+    if not ui_path.startswith(scan_folders):
+        return False
+    if tier == 2:
+        return True
+    return _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
+
+
+def _show_scan_folders_dialog(parent, adapter) -> None:
+    """The real, per-format paths a header scan's own folder-scoped tiers
+    (1/2) restrict to — see TODO.md item 20's own "Transparency
+    requirement": named directly, per this archive's OWN detected format
+    (iOS vs Android/GrayKey — adapter.scan_folders() already branches on
+    self.format), not a generic combined list, so the examiner can judge
+    the real boundary rather than trust a description of it. Shared by
+    ProcessDialog's own pre-existing "Scanned Folders…" button (format
+    already known there) and CaseSettingsDialog's new one (format detected
+    on demand — see _DetectFormatWorker, since this dialog runs before the
+    archive is otherwise opened at all)."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Header Scan Coverage")
+    dlg.setMinimumSize(520, 300)
+    lay = QVBoxLayout(dlg)
+    intro = QLabel(
+        "These are the app/user-accessible folders this archive's own "
+        "detected format defines. A folder-scoped scan tier (\"unknown-"
+        "extension files\" or \"all files, in these folders\") only ever "
+        "reads bytes from files inside them — anywhere else keeps its "
+        "plain extension-based type unless the exhaustive \"all files, "
+        "everywhere\" tier is chosen instead.")
+    intro.setWordWrap(True)
+    lay.addWidget(intro)
+    folder_list = QListWidget()
+    for prefix in adapter.scan_folders():
+        QListWidgetItem(prefix, folder_list)
+    lay.addWidget(folder_list)
+    btn_row = QHBoxLayout()
+    btn_row.addStretch()
+    close_btn = QPushButton("Close")
+    close_btn.clicked.connect(dlg.accept)
+    btn_row.addWidget(close_btn)
+    lay.addLayout(btn_row)
+    dlg.exec()
+
+
+class _DetectFormatWorker(QThread):
+    """One-off, on-demand format detection for CaseSettingsDialog's own
+    "Show scan locations…" button — this dialog runs BEFORE any case
+    folder exists at all (the whole point of it is to CHOOSE one), so
+    there is structurally no .zcd possible yet (it lives inside the case
+    folder). Genuinely different from every other site in this project
+    fixed the same day for the same underlying issue — those all had a
+    real .zcd available and simply weren't using it; this one has no
+    case_dir to build one from at all.
+
+    Still never opens the main archive via raw zipfile.ZipFile, per this
+    project's own standing Convention having no exception for that either
+    way: uses zip_cd_cache._extract_cd_payload directly (the exact same
+    raw-seek EOCD/CD read zip_cd_cache.save() itself uses to build a real
+    .zcd — no case_dir needed, since it only returns bytes rather than
+    writing them anywhere), then parses that small in-memory payload via
+    zipfile.ZipFile(io.BytesIO(...)) — the identical sanctioned pattern
+    zip_cd_cache.load() already uses for its own cached-payload parse,
+    never a raw open of the main archive. Confirmed safe: FfsAdapter.
+    detect()'s own internal checks (_is_graykey/_has_ut_extras) only ever
+    read each ZipInfo's `.extra` field and `.infolist()` — pure central-
+    directory metadata, never actual entry content — so a CD-only payload
+    is sufficient, not a partial/incorrect substitute."""
+    done  = Signal(object)   # FfsAdapter, or None on failure
+    error = Signal(str)
+
+    def __init__(self, zip_path: str, parent=None):
+        super().__init__(parent)
+        self._zip_path = zip_path
+
+    def run(self):
+        try:
+            import io
+            from zip_cd_cache import _extract_cd_payload
+            payload = _extract_cd_payload(self._zip_path)
+            with zipfile.ZipFile(io.BytesIO(payload)) as z:
+                names = frozenset(z.namelist())
+                adapter = FfsAdapter.detect(z, names)
+            self.done.emit(adapter)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+def _count_header_candidates(ui_metadata: dict, ffs_adapter, tier: int = 1) -> int:
+    """Count files that qualify for a header read under *tier* — no I/O,
+    used for dialog display only (see _header_candidate_matches)."""
     scan_folders = tuple(ffs_adapter.scan_folders())
     return sum(
         1 for ui_path in ui_metadata
-        if ui_path.startswith(scan_folders)
-        and _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
+        if _header_candidate_matches(ui_path, scan_folders, tier)
     )
+
+
+def _classify_header_scan_results(results: dict) -> tuple[int, int]:
+    """Split a header scan's raw {ui_path: detected_type} results into
+    (newly_identified, mismatch_found) — the two categories actually
+    worth reporting, per direct instruction: a file whose extension
+    ALREADY correctly predicted its real type is a confirmation, not
+    news, and inflates the reported count with nothing actionable —
+    genuinely possible only under Tier 2/3, which (unlike Tier 1)
+    re-checks every file, not just unknown-extension ones. Tier 1's own
+    candidates are ALWAYS 'Other'-typed by construction, so every one of
+    its results already falls under 'newly_identified' with zero
+    possible mismatches — unaffected by this split, same count as always.
+
+      - newly_identified: extension gave no type at all ('Other') and
+        the header check found a real one — same meaning this count
+        always had.
+      - mismatch_found: extension already implied a DIFFERENT type than
+        what the file's real header content is — the actual signal a
+        mislabeled-extension scan (Tier 2/3) exists to surface.
+
+    'Archive' vs 'Compressed' is deliberately NOT counted as a mismatch —
+    confirmed as a real trap before shipping this, not assumed: a
+    correctly-named `.gz`/`.bz2`/`.xz` file is extension-classified as
+    'Archive' (_EXT_TO_TYPE, via ARCHIVE_EXTENSIONS) but its real header
+    content is 'Compressed' (header_scan.py's own signature table) —
+    same broad kind of file, two different label vocabularies, not a
+    mislabeled file. Reuses the exact same {'Archive', 'Compressed'}
+    grouping _EXTRACTABLE_TYPES already treats as interchangeable
+    elsewhere in this file, rather than inventing a second one."""
+    new = mismatch = 0
+    for ui_path, detected in results.items():
+        if not detected:
+            continue
+        ext_type = _get_file_type(ui_path.rsplit('/', 1)[-1])
+        if ext_type == 'Other':
+            new += 1
+        elif detected != ext_type and not {detected, ext_type} <= _EXTRACTABLE_TYPES:
+            mismatch += 1
+    return new, mismatch
 
 
 _EXTRACTABLE_TYPES = {'Archive', 'Compressed'}
@@ -1074,16 +1270,29 @@ def _discover_all_archives(
     ui_metadata: dict,
     ffs_adapter,
     header_type_overrides: dict,
+    unscoped: bool = False,
 ) -> list[dict]:
-    """Return all archives across container + Library paths.
+    """Return all archives across container + Library paths — or, when
+    *unscoped* is True, across the ENTIRE archive regardless of folder.
+
+    *unscoped* is only meaningful once a Tier 3 header scan has already
+    classified every file's real type (see TODO.md item 21): the normal
+    `archive_discovery_folders()` restriction exists purely to bound
+    COST for the folder-scoped tiers, but once Tier 3 has already paid
+    that cost for the whole archive, re-applying the same folder filter
+    here would silently hide an embedded archive Tier 3 already found
+    outside the normal app/user-accessible areas — a real, previously-
+    unnoticed mismatch between what the scan knows and what this
+    discovery step surfaced. No extra I/O either way — this only changes
+    which cached `header_type_overrides` entries are considered.
 
     Each entry: {'ui_path', 'category', 'file_type', 'mtime'}
     mtime is nanoseconds since epoch (0 if unknown).
     """
-    scan_roots = tuple(ffs_adapter.archive_discovery_folders())
+    scan_roots = None if unscoped else tuple(ffs_adapter.archive_discovery_folders())
     results = []
     for ui_path, meta in ui_metadata.items():
-        if not ui_path.startswith(scan_roots):
+        if scan_roots is not None and not ui_path.startswith(scan_roots):
             continue
         name = ui_path.rsplit('/', 1)[-1]
         ft = _get_file_type(name)
@@ -1134,36 +1343,31 @@ def _resolve_file_candidates(
 ) -> list[tuple[str, int, int]]:
     """Return [(ui_path, data_offset, file_size)] for the given ui_paths.
 
-    Opens its own ZipFile when *z* isn't supplied.
+    *z* must be supplied (a CachedZipView, backed by the local .zcd
+    cache) — deliberately no raw-zipfile fallback on the main archive
+    when it isn't, per this project's own standing Convention. Returns
+    [] honestly rather than opening the main archive directly; every
+    real caller either already has a case_dir-backed CachedZipView to
+    pass, or has been fixed to build one rather than relying on this
+    function's own former fallback.
     """
-    if not ui_paths:
+    if not ui_paths or z is None:
         return []
     candidates: list[tuple[str, int, int]] = []
     resolve = ffs_adapter.resolve
-
-    close_z = z is None
-    if close_z:
+    target_infos = []
+    target_meta: dict[str, tuple[str, int]] = {}  # filename → (ui_path, file_size)
+    for ui_path in ui_paths:
         try:
-            z = zipfile.ZipFile(zip_path, 'r')
-        except Exception:
-            return []
-    try:
-        target_infos = []
-        target_meta: dict[str, tuple[str, int]] = {}  # filename → (ui_path, file_size)
-        for ui_path in ui_paths:
-            try:
-                info = z.getinfo(resolve(ui_path))
-                target_infos.append(info)
-                target_meta[info.filename] = (ui_path, info.file_size)
-            except KeyError:
-                pass
-        offsets = _compute_data_offsets(zip_path, target_infos, delta=delta)
-        for filename, data_offset in offsets.items():
-            ui_path, file_size = target_meta[filename]
-            candidates.append((ui_path, data_offset, file_size))
-    finally:
-        if close_z:
-            z.close()
+            info = z.getinfo(resolve(ui_path))
+            target_infos.append(info)
+            target_meta[info.filename] = (ui_path, info.file_size)
+        except KeyError:
+            pass
+    offsets = _compute_data_offsets(zip_path, target_infos, delta=delta)
+    for filename, data_offset in offsets.items():
+        ui_path, file_size = target_meta[filename]
+        candidates.append((ui_path, data_offset, file_size))
     return candidates
 
 
@@ -1173,13 +1377,14 @@ def _collect_header_candidates(
     ffs_adapter,
     z=None,
     delta: int | None = None,
+    tier: int = 1,
 ) -> list[tuple[str, int, int]]:
-    """Return [(ui_path, data_offset, file_size)] for 'Other'-typed files in scan_folders."""
+    """Return [(ui_path, data_offset, file_size)] that qualify for a header
+    read under *tier* — see _header_candidate_matches for the three tiers."""
     scan_folders = tuple(ffs_adapter.scan_folders())
     targets = [
         ui_path for ui_path in ui_metadata
-        if ui_path.startswith(scan_folders)
-        and _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
+        if _header_candidate_matches(ui_path, scan_folders, tier)
     ]
     return _resolve_file_candidates(zip_path, targets, ffs_adapter, z=z, delta=delta)
 
@@ -1203,11 +1408,19 @@ class ZipMetadataWorker(QThread):
     header_scan_progress = Signal(int)   # remaining (decreasing)
     header_scan_done     = Signal(dict)  # {ui_path: detected_type}
 
-    def __init__(self, zip_path: str, scan_headers: bool = False, case_dir: str | None = None):
+    def __init__(self, zip_path: str, header_scan_tier: int = 0, case_dir: str | None = None):
         super().__init__()
         self.zip_path = zip_path
-        self.scan_headers = scan_headers
+        self.header_scan_tier = header_scan_tier
         self.case_dir = case_dir
+
+    @property
+    def scan_headers(self) -> bool:
+        """True whenever ANY tier is active — every existing boolean gate
+        below (fast-snapshot skip, offloaded-parse skip) only ever cared
+        whether a scan runs at all, not which tier; _collect_header_
+        candidates itself is what actually reads header_scan_tier."""
+        return self.header_scan_tier > 0
 
     def _try_load_from_snapshot(self, first_load: bool = False) -> bool:
         """Fast re-open: restore the previous load's full result from casecache.db.
@@ -1430,9 +1643,18 @@ class ZipMetadataWorker(QThread):
                 if z_ctx is None:
                     raise RuntimeError("Failed to load central directory from local copy")
             else:
-                # No case dir — open the network file directly
-                z_ctx = zipfile.ZipFile(self.zip_path, 'r')
-                z_ctx.__enter__()
+                # No case dir at all — genuinely unreachable via this
+                # project's own UI today (confirmed by inspection: the
+                # one real construction site, start_loading(), returns
+                # immediately if _get_or_ask_case_dir gives back None,
+                # before ZipMetadataWorker is ever built — case_dir is
+                # always real by the time this runs). Previously fell
+                # back to a raw zipfile.ZipFile network open here; per
+                # this project's own standing Convention (no exception
+                # for this case either) and direct instruction, this now
+                # fails honestly instead of silently reaching for
+                # zipfile for a state that can't actually occur.
+                raise RuntimeError("ZipMetadataWorker requires a case_dir")
 
             try:
                 self.status_update.emit("Reading zip directory...")
@@ -1484,6 +1706,7 @@ class ZipMetadataWorker(QThread):
                         self.zip_path, ui_metadata, ffs_adapter,
                         z=z_ctx,
                         delta=self._local_extra_delta,
+                        tier=self.header_scan_tier,
                     )
             finally:
                 if z_ctx is not None:
@@ -1491,11 +1714,13 @@ class ZipMetadataWorker(QThread):
 
             # LaunchServices csstore: same enrichment as the subprocess path
             # in ffs_metadata.parse_archive_metadata — see that function's
-            # comment for the full rationale. Opens its own zip handle
-            # rather than reusing z_ctx (already closed above).
+            # comment for the full rationale. Reuses z_ctx (its own
+            # __exit__ is a no-op, so it's still usable after the earlier
+            # `finally` block) rather than falling back to a raw
+            # zipfile.ZipFile on the main archive.
             self.status_update.emit("Building app registry from LaunchServices…")
             _app_registry_rows, _ls_guid_map = ffs_adapter.build_app_registry(
-                self.zip_path, zip_names)
+                self.zip_path, zip_names, z=z_ctx)
             if _ls_guid_map:
                 guid_to_bundle = {**guid_to_bundle, **_ls_guid_map}
 
@@ -1585,15 +1810,25 @@ class ZipMetadataWorker(QThread):
 
             if header_candidates:
                 self.status_update.emit(
-                    f"Scanning headers: {len(header_candidates):,} unknown files...")
+                    f"Scanning headers: {len(header_candidates):,} candidate files...")
                 self.header_scan_progress.emit(len(header_candidates))
                 results = header_scan.scan_entries(
                     self.zip_path, header_candidates,
                     progress_cb=self.header_scan_progress.emit,
                 )
                 self.header_scan_done.emit(results)
-                self.status_update.emit(
-                    f"Header scan complete — {len(results):,} types identified")
+                # Tier 2/3 re-check every file, not just unknown-extension
+                # ones, so a raw len(results) count would mostly be boring
+                # reconfirmations of what the extension already said —
+                # see _classify_header_scan_results for why only these
+                # two categories are worth reporting (Tier 1's own count
+                # is unaffected: every one of its results is already
+                # 'newly_identified' by construction).
+                new, mismatch = _classify_header_scan_results(results)
+                msg = f"Header scan complete — {new:,} newly identified"
+                if mismatch:
+                    msg += f", {mismatch:,} mismatched extension{'s' if mismatch != 1 else ''} found"
+                self.status_update.emit(msg)
         except Exception as e:
             self.status_update.emit(f"Error: {str(e)}")
 
@@ -1976,10 +2211,42 @@ class CaseSettingsDialog(QDialog):
         self._name_edit.textChanged.connect(self._on_name_changed)
         layout.addWidget(self._name_edit)
 
-        # Header scan option
-        self._scan_cb = QCheckBox("Scan unknown file headers for precise type detection")
-        self._scan_cb.setChecked(False)
-        layout.addWidget(self._scan_cb)
+        # Header scan tier — always at least Tier 1, per direct instruction
+        # ("I want to have only the 3 options available so unknown files
+        # are always typed") — there is deliberately no "don't scan"
+        # choice; unknown-extension files always get a real type. See
+        # TODO.md item 20 for the full three-tier design, and
+        # _header_candidate_matches for the shared predicate every tier
+        # ultimately runs through.
+        layout.addWidget(QLabel("<b>Header scan (file type recognition)</b>"))
+        self._detect_worker: '_DetectFormatWorker | None' = None
+        self._tier_group = QButtonGroup(self)
+        self._rb_tier1 = QRadioButton(_HEADER_SCAN_TIER_LABELS[1])
+        self._rb_tier2 = QRadioButton(_HEADER_SCAN_TIER_LABELS[2])
+        self._rb_tier3 = QRadioButton(_HEADER_SCAN_TIER_LABELS[3])
+        for t, rb in ((1, self._rb_tier1), (2, self._rb_tier2), (3, self._rb_tier3)):
+            self._tier_group.addButton(rb, t)
+            layout.addWidget(rb)
+        self._rb_tier1.setChecked(True)
+        self._prev_tier_id = 1
+        self._tier_group.idClicked.connect(self._on_tier_clicked)
+
+        self._tier_coverage_label = QLabel()
+        self._tier_coverage_label.setWordWrap(True)
+        self._tier_coverage_label.setStyleSheet("color: grey; padding-left: 4px;")
+        layout.addWidget(self._tier_coverage_label)
+
+        locations_row = QHBoxLayout()
+        locations_row.addStretch()
+        self._locations_btn = QPushButton("Show scan locations…")
+        self._locations_btn.setToolTip(
+            "Show the real app/user-accessible folders Tier 1/2 restrict "
+            "to for this archive's own detected format.")
+        self._locations_btn.clicked.connect(self._on_show_locations)
+        locations_row.addWidget(self._locations_btn)
+        layout.addLayout(locations_row)
+
+        self._update_tier_coverage_label()
 
         layout.addStretch()
 
@@ -1992,6 +2259,51 @@ class CaseSettingsDialog(QDialog):
 
     def _on_name_changed(self):
         self._save_btn.setEnabled(bool(self._name_edit.text().strip()))
+
+    def _on_tier_clicked(self, tier_id: int):
+        """Tier 3 gets its own confirm gate, per direct instruction — it's
+        the exhaustive, no-folder-restriction tier, real cost for usually
+        little gain (see TODO.md item 20). Declining reverts the
+        selection to whatever was previously chosen and leaves THIS
+        dialog open — never closes/cancels it — so the examiner can
+        immediately pick a different tier instead of starting over."""
+        if tier_id == 3 and not _confirm_tier3(self):
+            prev_btn = self._tier_group.button(self._prev_tier_id)
+            self._tier_group.blockSignals(True)
+            prev_btn.setChecked(True)
+            self._tier_group.blockSignals(False)
+            self._update_tier_coverage_label()
+            return
+        self._prev_tier_id = tier_id
+        self._update_tier_coverage_label()
+
+    def _update_tier_coverage_label(self):
+        tier = self._tier_group.checkedId()
+        text = {
+            1: "Covers: unknown-extension files inside app/user-accessible areas only.",
+            2: "Covers: every file inside app/user-accessible areas — includes Tier 1's own unknown-extension coverage.",
+            3: "Covers: every file in the entire archive, including OS/system areas outside the normal app/user-accessible list.",
+        }.get(tier, "")
+        self._tier_coverage_label.setText(text)
+
+    def _on_show_locations(self):
+        self._locations_btn.setEnabled(False)
+        self._locations_btn.setText("Detecting…")
+        self._detect_worker = _DetectFormatWorker(self._zip_path, self)
+        self._detect_worker.done.connect(self._on_format_detected)
+        self._detect_worker.error.connect(self._on_format_detect_error)
+        self._detect_worker.start()
+
+    def _on_format_detected(self, adapter):
+        self._locations_btn.setEnabled(True)
+        self._locations_btn.setText("Show scan locations…")
+        _show_scan_folders_dialog(self, adapter)
+
+    def _on_format_detect_error(self, message: str):
+        self._locations_btn.setEnabled(True)
+        self._locations_btn.setText("Show scan locations…")
+        QMessageBox.warning(self, "Could Not Detect Format",
+                            f"Could not read this archive to detect its format:\n\n{message}")
 
     def _on_save(self):
         base = self._base_folder
@@ -2028,8 +2340,8 @@ class CaseSettingsDialog(QDialog):
         return self._accepted_dir
 
     @property
-    def scan_headers(self) -> bool:
-        return self._scan_cb.isChecked()
+    def header_scan_tier(self) -> int:
+        return self._tier_group.checkedId()
 
 
 class PreferencesDialog(QDialog):
@@ -2201,32 +2513,35 @@ class HeaderScanWorker(QThread):
     progress = Signal(int)   # remaining count
     done     = Signal(dict)  # {ui_path: detected_type}
 
-    def __init__(self, zip_path, ui_metadata, ffs_adapter, delta=None, case_dir=None):
+    def __init__(self, zip_path, ui_metadata, ffs_adapter, delta=None, case_dir=None, tier: int = 1):
         super().__init__()
         self._zip_path        = zip_path
         self._ui_metadata     = ui_metadata
         self._adapter         = ffs_adapter
         self._delta           = delta
         self._case_dir        = case_dir
+        self.tier              = tier
 
     def run(self):
         # Metadata only here (z.getinfo(), never a data read) -- the local
         # .zcd central-directory cache covers this without opening the
-        # main archive raw at all when it's available; falls back to a
-        # plain zipfile.ZipFile only when the cache isn't built yet.
-        z = None
+        # main archive raw at all. Deliberately NO raw-zipfile fallback
+        # when the cache isn't built yet — this project's own standing
+        # Convention has no exception for that, even metadata-only; this
+        # is also the ORIGINAL worker the same fallback pattern was once
+        # copied from into other workers, all since fixed the same way.
+        # _collect_header_candidates/_resolve_file_candidates already
+        # return no candidates (never raise) when z is None, so a missing
+        # .zcd here just means "nothing to scan yet," not a crash — and
+        # in practice never actually happens, since a header scan only
+        # ever runs on an already-loaded case, where .zcd is already
+        # guaranteed present.
         infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
         z = CachedZipView(self._zip_path, infos) if infos is not None else None
-        try:
-            if z is None:
-                z = zipfile.ZipFile(self._zip_path, 'r')
-            candidates = _collect_header_candidates(
-                self._zip_path, self._ui_metadata, self._adapter,
-                z=z, delta=self._delta,
-            )
-        finally:
-            if isinstance(z, zipfile.ZipFile):
-                z.close()
+        candidates = _collect_header_candidates(
+            self._zip_path, self._ui_metadata, self._adapter,
+            z=z, delta=self._delta, tier=self.tier,
+        )
 
         if not candidates:
             self.done.emit({})
@@ -2245,17 +2560,27 @@ class SingleFileScanWorker(QThread):
     """Scan file headers for a specific list of ui_paths (not just 'Other' files)."""
     done = Signal(dict)   # {ui_path: detected_type}
 
-    def __init__(self, zip_path, ui_paths, ffs_adapter, delta=None):
+    def __init__(self, zip_path, ui_paths, ffs_adapter, delta=None, case_dir=None):
         super().__init__()
         self._zip_path        = zip_path
         self._ui_paths        = ui_paths
         self._ffs_adapter     = ffs_adapter
         self._delta           = delta
+        self._case_dir        = case_dir
 
     def run(self):
+        # A real .zcd-backed CachedZipView, never a raw zipfile.ZipFile —
+        # previously missing entirely (case_dir was never threaded
+        # through to this worker at all), so _resolve_file_candidates'
+        # own former internal fallback was ALWAYS exercised for every
+        # single-file rescan. .zcd is already guaranteed present by the
+        # time this worker can run (only reachable from an already-loaded
+        # case), so this is never actually a loss of real coverage.
+        infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
+        z = CachedZipView(self._zip_path, infos) if infos is not None else None
         candidates = _resolve_file_candidates(
             self._zip_path, self._ui_paths, self._ffs_adapter,
-            delta=self._delta,
+            z=z, delta=self._delta,
         )
         if not candidates:
             self.done.emit({})
@@ -2544,6 +2869,7 @@ class IntegrityCheckWorker(QThread):
 class ProcessDialog(QDialog):
     """Lets the user view header-scan history and re-run the file header scan."""
     header_scan_done       = Signal(dict)
+    header_scan_tier_done  = Signal(int)   # emitted ONLY for an actual tier upgrade run — see _on_header_done
     header_types_cleared   = Signal()   # emitted before a rescan so the main window can reset
     nested_extraction_done = Signal()   # emitted after NestedArchiveWorker finishes
 
@@ -2562,7 +2888,8 @@ class ProcessDialog(QDialog):
         self._adapter         = ffs_adapter
         self._ui_metadata     = ui_metadata
         self._delta           = delta
-        self._candidate_count  = _count_header_candidates(ui_metadata, ffs_adapter)
+        self._candidate_count      = 0   # recomputed once an upgrade tier is actually picked
+        self._pending_upgrade_tier = 0   # set by _run_operations right before a scan actually starts
         self._scan_worker:      HeaderScanWorker     | None = None
         self._nested_worker:    NestedArchiveWorker  | None = None
         self._integrity_worker: IntegrityCheckWorker | None = None
@@ -2608,25 +2935,50 @@ class ProcessDialog(QDialog):
 
         layout.addWidget(QLabel("<hr><b>Operations</b>"))
 
-        header_row = QHBoxLayout()
-        self._chk_header = QCheckBox("Scan file headers")
-        self._chk_header.setChecked(False)
-        header_row.addWidget(self._chk_header, 1)
+        # Header scan: UPGRADE-ONLY, per direct instruction — every case now
+        # gets at least Tier 1 automatically at creation (CaseSettingsDialog
+        # no longer offers "don't scan"), so this dialog only ever offers
+        # tiers STRICTLY HIGHER than whatever already ran; there is no
+        # downgrade and no re-running the same tier. See TODO.md item 20.
+        layout.addWidget(QLabel("<b>Header scan</b>"))
+        header_status_row = QHBoxLayout()
+        self._header_status_label = QLabel()
+        self._header_status_label.setWordWrap(True)
+        header_status_row.addWidget(self._header_status_label, 1)
         scan_folders_btn = QPushButton("Scanned Folders…")
         scan_folders_btn.setToolTip(
-            "Show which folders the header scan covers — files outside "
-            "these are not scanned.")
+            "Show which folders Tier 1/2 restrict to — files outside these "
+            "keep their plain extension-based type unless Tier 3 is used.")
         scan_folders_btn.clicked.connect(self._show_scan_folders)
-        header_row.addWidget(scan_folders_btn)
-        layout.addLayout(header_row)
+        header_status_row.addWidget(scan_folders_btn)
+        layout.addLayout(header_status_row)
+
+        # Plain checkboxes, manually kept mutually exclusive, NOT a
+        # QRadioButton/QButtonGroup — a real Qt quirk found and worked
+        # around directly: an exclusive-group radio button cannot be
+        # reliably programmatically unchecked back to "nothing selected"
+        # from within its own click handler (confirmed by direct testing,
+        # even deferred via QTimer.singleShot — QButtonGroup.checkedId()
+        # kept reporting the just-clicked id regardless). This dialog
+        # genuinely needs a "nothing chosen yet" state (unlike
+        # CaseSettingsDialog's picker, which always starts on Tier 1), so
+        # checkboxes with hand-rolled exclusivity (confirmed reliable —
+        # setChecked(False) from within a checkbox's own toggled handler
+        # works exactly as expected) are used instead.
+        self._tier_radios_container = QVBoxLayout()
+        layout.addLayout(self._tier_radios_container)
+        self._tier_upgrade_cbs: dict[int, QCheckBox] = {}
+        self._selected_upgrade_tier = 0
+        self._current_tier = 0
+        self._rebuild_tier_upgrade_ui()
 
         self._chk_nested = QCheckBox("Find and select archives for extraction")
         self._chk_nested.setChecked(False)
         self._chk_nested.setToolTip(
             "Scans app containers, iCloud/Files, Mail and SMS locations for archive "
             "files,\nthen shows a selection dialog so you can choose which to extract.\n"
-            "Requires a completed header scan to catch extensionless archives.")
-        self._chk_nested.toggled.connect(self._on_nested_toggled)
+            "Extensionless archives are already covered by this case's own "
+            "header scan (at least Tier 1 always runs at case creation).")
         layout.addWidget(self._chk_nested)
 
         # Stats block
@@ -2647,13 +2999,12 @@ class ProcessDialog(QDialog):
         self._cancel_btn.setVisible(False)
         self._cancel_btn.clicked.connect(self._on_cancel)
         btn_row.addWidget(self._cancel_btn)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
+        self._close_btn = QPushButton("Close")
+        self._close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self._close_btn)
         layout.addLayout(btn_row)
 
         self._refresh_stats()
-        self._sync_header_checkbox()
         if preselect_nested:
             self._chk_nested.setChecked(True)
         if auto_archive_selection and self._scan_complete():
@@ -2709,27 +3060,7 @@ class ProcessDialog(QDialog):
         self._integrity_hist_btn.setVisible(True)
 
     def _show_scan_folders(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Header Scan Coverage")
-        dlg.setMinimumSize(520, 300)
-        lay = QVBoxLayout(dlg)
-        intro = QLabel(
-            "The header scan only examines files <b>without a recognised "
-            "extension</b> inside the folders below. Files anywhere else "
-            "keep their extension-based type and are <b>not</b> scanned.")
-        intro.setWordWrap(True)
-        lay.addWidget(intro)
-        folder_list = QListWidget()
-        for prefix in self._adapter.scan_folders():
-            QListWidgetItem(prefix, folder_list)
-        lay.addWidget(folder_list)
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        btn_row.addWidget(close_btn)
-        lay.addLayout(btn_row)
-        dlg.exec()
+        _show_scan_folders_dialog(self, self._adapter)
 
     def _show_integrity_history(self):
         history = self._load_integrity_history()
@@ -2777,10 +3108,11 @@ class ProcessDialog(QDialog):
             return []
 
     def _refresh_stats(self):
-        n = self._candidate_count
         last = self._load_last_run()
 
-        lines = [f"<b>Other-typed files in scan folders:</b> {n:,}"]
+        lines = []
+        if self._selected_upgrade_tier > 0:
+            lines.append(f"<b>Files this upgrade will scan:</b> {self._candidate_count:,}")
 
         if last is None:
             lines.append("No previous header scan recorded.")
@@ -2834,8 +3166,8 @@ class ProcessDialog(QDialog):
             return   # mismatch — error shown, keep current case folder
         self._case_dir = folder
         self._case_edit.setText(folder)
+        self._rebuild_tier_upgrade_ui()
         self._refresh_stats()
-        self._sync_header_checkbox()
 
     # ── Operations ────────────────────────────────────────────────────────────
 
@@ -2843,41 +3175,140 @@ class ProcessDialog(QDialog):
         last = self._load_last_run()
         return last is not None and bool(last.get('complete'))
 
-    def _sync_header_checkbox(self):
-        """Lock the header-scan checkbox to reflect what Run will actually do."""
-        if self._scan_complete():
-            # Already done — show ticked and locked; Run will not redo it.
-            self._chk_header.setChecked(True)
-            self._chk_header.setEnabled(False)
-            self._chk_header.setToolTip(
-                "Header scan already completed for this case — it will not be re-run.")
-        elif self._chk_nested.isChecked():
-            # Extraction needs a completed scan first — force it on.
-            self._chk_header.setChecked(True)
-            self._chk_header.setEnabled(False)
-            self._chk_header.setToolTip(
-                "A header scan is required before archive extraction.")
-        else:
-            self._chk_header.setEnabled(True)
-            self._chk_header.setToolTip("")
+    def _load_current_header_tier(self) -> int:
+        """0 if genuinely unknown (a legacy case predating this feature, no
+        case_dir yet, or a scan that's still running in the background) —
+        every tier 1/2/3 is then still offered as a fresh choice.
+        Otherwise the tier this case's `header_types` cache is actually
+        COMPLETE for (case_settings, key 'header_scan_complete_tier') —
+        deliberately NOT the same as 'header_scan_tier' (see that key's
+        own comment at its write site): a real race was found and fixed
+        here — 'header_scan_tier' is persisted the MOMENT a tier is
+        chosen, before its scan has even started, specifically so the
+        banner can show the examiner's choice immediately even while a
+        large Tier 3 scan is still running. Reading that same optimistic
+        value here to decide whether the underlying data is trustworthy
+        (available upgrades, and _show_archive_selection's own unscoped
+        discovery) would answer both wrong while a scan is in flight —
+        confirmed directly: opening this dialog (or checking "Find and
+        select archives") shortly after choosing Tier 3 at case creation,
+        before its background scan finished, showed archives outside
+        scan_folders() as still 'Other' and silently excluded, exactly
+        because the scan simply hadn't reached them yet despite the tier
+        already reading '3'. See TODO.md item 20/21."""
+        if not self._case_dir:
+            return 0
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                return int(load_case_setting(db, 'header_scan_complete_tier', '0'))
+        except Exception:
+            return 0
 
-    def _on_nested_toggled(self, checked: bool):
-        self._sync_header_checkbox()
+    def _rebuild_tier_upgrade_ui(self):
+        """(Re)builds the upgrade-only tier checkboxes for whatever tier
+        is currently persisted for self._case_dir — called once from
+        __init__ and again from _browse_case, since switching case
+        folders can genuinely switch which tiers are still available to
+        upgrade to (a different case may already be further along)."""
+        for cb in self._tier_upgrade_cbs.values():
+            cb.deleteLater()
+        while self._tier_radios_container.count():
+            self._tier_radios_container.takeAt(0)   # only ever holds these checkboxes
+
+        self._current_tier = self._load_current_header_tier()
+        self._selected_upgrade_tier = 0
+        self._tier_upgrade_cbs = {}
+        for t in (1, 2, 3):
+            if t <= self._current_tier:
+                continue   # no downgrade, no re-running an already-done tier
+            cb = QCheckBox(f"Upgrade to {_HEADER_SCAN_TIER_LABELS[t]}")
+            cb.toggled.connect(lambda checked, t=t: self._on_process_tier_toggled(t, checked))
+            self._tier_upgrade_cbs[t] = cb
+            self._tier_radios_container.addWidget(cb)
+        self._candidate_count = 0
+        self._update_header_status_label()
+
+    def _load_requested_header_tier(self) -> int:
+        """The tier last CHOSEN (written the moment it's picked, before
+        its own scan starts) — read here only to detect and warn about a
+        scan still running in the background, never to gate a real
+        decision (see _load_current_header_tier's own comment for why
+        that distinction matters)."""
+        if not self._case_dir:
+            return 0
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                return int(load_case_setting(db, 'header_scan_tier', '0'))
+        except Exception:
+            return 0
+
+    def _update_header_status_label(self):
+        if self._current_tier <= 0:
+            text = "No header scan recorded yet for this case."
+        else:
+            text = f"Current: {_HEADER_SCAN_TIER_LABELS[self._current_tier]}"
+        if self._current_tier >= 3:
+            text += " — already at the maximum tier, nothing higher to upgrade to."
+        requested = self._load_requested_header_tier()
+        if requested > self._current_tier:
+            text += (f" ⚠ A Tier {requested} scan was requested and is still "
+                     "running in the background — archive/type data may be "
+                     "incomplete until it finishes.")
+        self._header_status_label.setText(text)
+
+    def _on_process_tier_toggled(self, tier_id: int, checked: bool):
+        """Upgrade-only, no going back — see the __init__ comment above
+        this picker. Manually-exclusive checkboxes, not a QButtonGroup —
+        see that same comment for the real Qt quirk this works around.
+        Tier 3 gets the same shared confirm gate as CaseSettingsDialog's
+        own picker (_confirm_tier3)."""
+        if not checked:
+            if self._selected_upgrade_tier == tier_id:
+                self._selected_upgrade_tier = 0
+                self._candidate_count = 0
+                self._refresh_stats()
+            return
+        if tier_id == 3 and not _confirm_tier3(self):
+            cb = self._tier_upgrade_cbs[3]
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+            return
+        # Hand-rolled exclusivity: unchecking any other currently-checked
+        # box (confirmed reliable from within a checkbox's own toggled
+        # handler, unlike the radio-button case above).
+        for t, other in self._tier_upgrade_cbs.items():
+            if t != tier_id and other.isChecked():
+                other.blockSignals(True)
+                other.setChecked(False)
+                other.blockSignals(False)
+        self._selected_upgrade_tier = tier_id
+        # Deliberately just a COUNT here, not a file-path list — matching
+        # Tier 1's own always-been-count-only display (see _refresh_stats'
+        # "Files this upgrade will scan: N" line and _on_header_progress's
+        # own live countdown once the scan actually runs). A per-path
+        # list was tried and explicitly walked back per direct feedback:
+        # the two tiers should behave the same way Tier 1 already did,
+        # not gain an extra widget Tier 1 never had.
+        self._candidate_count = _count_header_candidates(
+            self._ui_metadata, self._adapter, tier=tier_id)
+        self._refresh_stats()
+        self._refresh_stats()
 
     def _run_operations(self):
-        run_scan      = self._chk_header.isChecked() and not self._scan_complete()
+        upgrade_tier  = self._selected_upgrade_tier   # 0 if none picked
+        run_scan      = upgrade_tier > 0
         run_integrity = self._chk_integrity.isChecked()
         if not run_integrity and not run_scan and not self._chk_nested.isChecked():
-            self._status_label.setText(
-                "Nothing to do — header scan already completed."
-                if self._chk_header.isChecked() else
-                "Nothing to do — no operations selected.")
+            self._status_label.setText("Nothing to do — no operations selected.")
             return
         self._run_btn.setEnabled(False)
+        self._close_btn.setEnabled(False)
         self._cancel_btn.setVisible(True)
         self._scan_cancelled = False
         self._status_label.setText("")
         self._post_integrity_scan = run_scan
+        self._pending_upgrade_tier = upgrade_tier if run_scan else 0
 
         if run_integrity:
             self._start_integrity_check()
@@ -3020,11 +3451,14 @@ class ProcessDialog(QDialog):
                 pass
 
         self._status_label.setText("Starting header scan…")
+        self._candidate_count = _count_header_candidates(
+            self._ui_metadata, self._adapter, tier=self._pending_upgrade_tier)
         self._scan_worker = HeaderScanWorker(
             self._zip_path, self._ui_metadata,
             self._adapter,
             delta=self._delta,
             case_dir=self._case_dir,
+            tier=self._pending_upgrade_tier,
         )
         self._scan_worker.progress.connect(self._on_header_progress)
         self._scan_worker.done.connect(self._on_header_done)
@@ -3050,24 +3484,68 @@ class ProcessDialog(QDialog):
                     with closing(_open_results_db(self._case_dir)) as results_db:
                         complete_run_log(results_db, self._run_id,
                                          processed=n_total, output_rows=n_found)
+                # Persisted here (not left to the main window) since
+                # ProcessDialog already owns this exact connection/case_dir
+                # at this point — deliberately NOT nested inside the
+                # run_id/complete_run_log block above: a missing run_id
+                # (start_run_log itself failing) is a separate, unrelated
+                # bookkeeping concern from whether the tier upgrade itself
+                # actually completed. A cancelled run does NOT count as
+                # reaching the upgrade tier, only a real completion does —
+                # this scan DOES support real cancellation (unlike the
+                # creation-time path), which is exactly why 'cancelled' is
+                # checked here at all before writing either key. Both keys
+                # get the same value here because this point IS genuine
+                # completion for THIS dialog's own run — see
+                # _load_current_header_tier's own comment on why the two
+                # keys can otherwise diverge (the creation-time path's
+                # optimistic write happens far earlier, before its scan
+                # even starts).
+                if not cancelled and self._pending_upgrade_tier > 0:
+                    with closing(_open_results_db(self._case_dir)) as results_db:
+                        save_case_setting(results_db, 'header_scan_tier',
+                                          str(self._pending_upgrade_tier))
+                        save_case_setting(results_db, 'header_scan_complete_tier',
+                                          str(self._pending_upgrade_tier))
             except Exception:
                 pass
 
         self.header_scan_done.emit(results)
+        if not cancelled and self._pending_upgrade_tier > 0:
+            self.header_scan_tier_done.emit(self._pending_upgrade_tier)
 
         if self._chk_nested.isChecked() and not cancelled:
             self._show_archive_selection()
         else:
-            msg = (f"Cancelled — {n_found:,} type{'s' if n_found != 1 else ''} "
-                   "identified before cancellation."
-                   if cancelled else
-                   f"Header scan done — {n_found:,} type{'s' if n_found != 1 else ''} "
-                   f"identified from {n_total:,} candidate{'s' if n_total != 1 else ''}.")
+            # Tier 2/3 re-check every file, not just unknown-extension
+            # ones, so a raw n_found count would mostly be boring
+            # reconfirmations of what the extension already said — see
+            # _classify_header_scan_results for why only "newly
+            # identified" and "mismatch found" are reported (Tier 1's own
+            # message is unaffected: every one of its results is already
+            # 'newly_identified' by construction, so the number shown is
+            # identical to what n_found always was).
+            new, mismatch = _classify_header_scan_results(results)
+            if cancelled:
+                msg = (f"Cancelled — {new:,} newly identified before cancellation")
+                if mismatch:
+                    msg += f", {mismatch:,} mismatched extension{'s' if mismatch != 1 else ''} found"
+                msg += "."
+            else:
+                msg = (f"Header scan done — {new:,} newly identified")
+                if mismatch:
+                    msg += f", {mismatch:,} mismatched extension{'s' if mismatch != 1 else ''} found"
+                msg += f", from {n_total:,} candidate{'s' if n_total != 1 else ''}."
             self._status_label.setText(msg)
             self._finish_operations()
 
     def _show_archive_selection(self):
-        """Load header overrides, discover archives, show selection dialog, then extract."""
+        """Load header overrides, discover archives, show selection dialog,
+        then extract. Discovery is UNSCOPED (whole archive, not just
+        app/user-accessible areas) once this case's effective tier is
+        Tier 3 — see TODO.md item 21 for why Tier 3 alone doesn't already
+        guarantee this without the explicit check below, and
+        _discover_all_archives's own docstring for what unscoped changes."""
         overrides = {}
         guid_to_bundle = {}
         if self._case_dir:
@@ -3078,7 +3556,35 @@ class ProcessDialog(QDialog):
             except Exception:
                 pass
 
-        archives = _discover_all_archives(self._ui_metadata, self._adapter, overrides)
+        # The effective tier accounts for an upgrade that just completed
+        # in THIS run (self._current_tier isn't refreshed from
+        # case_settings until _finish_operations, which runs after this
+        # method) as well as whatever was already persisted before this
+        # run started.
+        effective_tier = self._current_tier
+        if not self._scan_cancelled and self._pending_upgrade_tier > effective_tier:
+            effective_tier = self._pending_upgrade_tier
+        unscoped = effective_tier >= 3
+        if unscoped:
+            self._status_label.setText(
+                "Reviewing every embedded archive across the whole case "
+                "(Tier 3) — most turn out to be app-internal SDK/telemetry "
+                "caches, not evidence; extraction usually isn't necessary "
+                "before a routine search.")
+        elif self._load_requested_header_tier() > effective_tier:
+            # Real symptom this guards against, confirmed directly: a
+            # Tier 3 scan requested at case creation runs in the
+            # background and can still be in progress when this dialog
+            # opens — without this note, the list silently looks scoped
+            # to app/user areas with no indication that more may appear
+            # once the scan actually finishes.
+            self._status_label.setText(
+                f"Note: a Tier {self._load_requested_header_tier()} scan is "
+                "still running in the background — this list is limited to "
+                "app/user-accessible areas until it completes.")
+
+        archives = _discover_all_archives(self._ui_metadata, self._adapter,
+                                          overrides, unscoped=unscoped)
 
         # Build lookup: ui_path -> DB record (includes error_msg)
         db_records: dict[str, dict] = {}
@@ -3229,9 +3735,10 @@ class ProcessDialog(QDialog):
 
     def _finish_operations(self):
         self._run_btn.setEnabled(True)
+        self._close_btn.setEnabled(True)
         self._cancel_btn.setVisible(False)
+        self._rebuild_tier_upgrade_ui()
         self._refresh_stats()
-        self._sync_header_checkbox()
 
     def _is_scanning(self) -> bool:
         return ((bool(self._scan_worker and self._scan_worker.isRunning())) or
@@ -3464,6 +3971,17 @@ class ArchiveSelectionDialog(QDialog):
         mail_items:  list[dict] = []
         files_items: list[dict] = []
         app_buckets: dict[str, list[dict]] = {}
+        # Same real gap as _build_tree_android's own 'Other' bucket, fixed
+        # the same day — an archive that's neither SMS/Mail/Files NOR
+        # inside a real app container (only reachable at all once Tier
+        # 3's unscoped discovery is active, per TODO.md item 21) used to
+        # fall into app_buckets['Unknown'], which then nested under
+        # "Third-Party Apps" — implying an unidentified THIRD-PARTY APP's
+        # own data, when the real situation is "not inside any app
+        # container at all" (e.g. mobile/Library/Caches/, mobile/Media/,
+        # private/var/db/, mobile/Library/Biome/). Kept as its own group
+        # instead, never folded into either app bucket.
+        other_archives: list[dict] = []
 
         for arc in self._archives:
             cat = arc['category']
@@ -3474,8 +3992,11 @@ class ArchiveSelectionDialog(QDialog):
             elif cat == 'Files':
                 files_items.append(arc)
             else:
-                bid = _bundle_id_for_path(arc['ui_path'], g2b) or 'Unknown'
-                app_buckets.setdefault(bid, []).append(arc)
+                bid = _bundle_id_for_path(arc['ui_path'], g2b)
+                if bid:
+                    app_buckets.setdefault(bid, []).append(arc)
+                else:
+                    other_archives.append(arc)
 
         def make_top_level(label: str, items: list[dict]) -> QTreeWidgetItem:
             node = QTreeWidgetItem(self._tree)
@@ -3498,17 +4019,37 @@ class ArchiveSelectionDialog(QDialog):
         self._make_app_group("Default Apps", apple)
         self._make_app_group("Third-Party Apps", third_party)
 
+        # Other — neither SMS/Mail/Files nor a resolvable app container
+        if other_archives:
+            self._make_app_node(self._tree, "Other", other_archives)
+
     def _build_tree_android(self):
         app_buckets:   dict[str, list[dict]] = {}
         media_buckets: dict[str, dict[str, list[dict]]] = {}  # volume → subfolder → archives
+        # Genuinely a third case, not a variant of "App Data" — an archive
+        # that's neither under data/media/ NOR inside a real app's own
+        # data/data/<package>/ folder (only reachable at all once Tier 3's
+        # unscoped discovery is active — see TODO.md item 21). Previously
+        # folded into app_buckets under a literal 'Unknown' package name,
+        # which read as "some app we couldn't identify" when the real
+        # situation is "not inside any app's data folder at all" — a
+        # materially different, potentially more interesting fact,
+        # confirmed as real (not just theoretical) directly against a
+        # live case before this was built, not assumed from the code
+        # alone. Kept as its own top-level group so it's never confused
+        # with an actual app.
+        other_archives: list[dict] = []
 
         for arc in self._archives:
             if arc['category'] == 'AndroidMedia':
                 vol, sub = _android_media_parts(arc['ui_path'])
                 media_buckets.setdefault(vol, {}).setdefault(sub, []).append(arc)
             else:
-                pkg = _android_package(arc['ui_path']) or 'Unknown'
-                app_buckets.setdefault(pkg, []).append(arc)
+                pkg = _android_package(arc['ui_path'])
+                if pkg:
+                    app_buckets.setdefault(pkg, []).append(arc)
+                else:
+                    other_archives.append(arc)
 
         # App Data — all packages sorted by most recently active
         self._make_app_group("App Data", app_buckets)
@@ -3530,6 +4071,10 @@ class ArchiveSelectionDialog(QDialog):
                 sub_node.setExpanded(True)
                 for arc in sorted(arcs, key=self._mtime_key, reverse=True):
                     self._make_file_item(sub_node, arc)
+
+        # Other — neither app data nor media storage (see comment above)
+        if other_archives:
+            self._make_app_node(self._tree, "Other", other_archives)
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int):
         if column != 0 or self._updating:
@@ -3811,7 +4356,26 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         archive_bar.addWidget(self.folder_view_btn)
         layout.addLayout(archive_bar)
 
-        self._setup_timestamp_banner(layout)  # see app/timestamp_display.py
+        # Timestamp-mode and header-scan-tier banners share ONE row, per
+        # direct instruction not to waste vertical screen space — two
+        # independent, unrelated settings, kept visually distinct by
+        # colour alone (timestamp: orange; header scan:
+        # dialog_helpers.ACTIVE_COLOR blue) plus a small separator between
+        # them, rather than by each getting its own full-width line.
+        timestamp_banner = self._setup_timestamp_banner()  # see app/timestamp_display.py
+        self._header_scan_banner = QLabel()
+        self._header_scan_banner.setStyleSheet(
+            f"color: {ACTIVE_COLOR}; font-weight: bold; font-size: 12px; padding: 2px 6px;")
+        self._header_scan_banner.setVisible(False)
+        banner_row = QHBoxLayout()
+        banner_row.setSpacing(4)
+        banner_row.addWidget(timestamp_banner)
+        banner_sep = QLabel("|")
+        banner_sep.setStyleSheet("color: palette(mid);")
+        banner_row.addWidget(banner_sep)
+        banner_row.addWidget(self._header_scan_banner)
+        banner_row.addStretch()
+        layout.addLayout(banner_row)
 
         _section_style = (
             "font-weight: bold; padding: 3px 6px;"
@@ -4351,24 +4915,32 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.proxy_model.set_filter("", -1)
         self._log(f"Filter cleared in: {self._view_path}")
 
-    def _get_zip_handle(self) -> "CachedZipView | zipfile.ZipFile | None":
+    def _get_zip_handle(self) -> "CachedZipView | None":
         """Return the shared zip-metadata handle, opening it lazily on
         first use -- usually already a CachedZipView by the time this is
         called at all, set proactively in on_metadata_ready below once
         the local .zcd cache is confirmed valid; this lazy path is only
         the fallback for whatever set that up not having run yet. Every
         real caller (hex_viewer.py) only ever calls .getinfo() on the
-        result, never a data read -- CachedZipView and zipfile.ZipFile
-        behave identically for that."""
+        result, never a data read -- exactly what CachedZipView provides.
+
+        Deliberately never a raw zipfile.ZipFile fallback on the main
+        archive (this project's own standing Convention has no exception
+        for this case) — can return None when .zcd genuinely isn't
+        available, which every real caller already handles: hex_viewer.py
+        calls .getinfo() inside its own try/except, so a None handle
+        surfaces as the same honest load-error it already shows for any
+        other failure, not a crash."""
         if self._zip_handle is None:
             if self._zip_open_future is not None:
                 try:
                     self._zip_handle = self._zip_open_future.result()
                 except Exception:
-                    self._zip_handle = zipfile.ZipFile(self.zip_path, 'r')
+                    self._zip_handle = None
                 self._zip_open_future = None
-            else:
-                self._zip_handle = zipfile.ZipFile(self.zip_path, 'r')
+            if self._zip_handle is None:
+                infos = _cd_cache_load(self.zip_path, self._case_dir) if self._case_dir else None
+                self._zip_handle = CachedZipView(self.zip_path, infos) if infos is not None else None
         return self._zip_handle
 
     def _in_zip(self, ui_path) -> bool:
@@ -4690,13 +5262,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         parent, stem = self._zip_stem()
         return str(parent / f"{stem}_Export")
 
-    def _get_or_ask_case_dir(self, zip_path: str) -> tuple[str | None, bool]:
-        """Return (case_dir, scan_headers) for zip_path, showing dialog if needed."""
+    def _get_or_ask_case_dir(self, zip_path: str) -> tuple[str | None, int]:
+        """Return (case_dir, header_scan_tier) for zip_path, showing dialog
+        if needed. header_scan_tier is 0-3 — see TODO.md item 20 and
+        CaseSettingsDialog.header_scan_tier for the three-tier design."""
         existing = self._archive_entry(zip_path)
         if existing and existing.get('case_dir'):
             stored = existing['case_dir']
             if os.path.isdir(stored):
-                return stored, False   # valid — no auto-scan for known archives
+                return stored, 0   # valid — no auto-scan for known archives
             # Case folder has moved or been deleted
             btn = QMessageBox.question(
                 self, "Case Folder Not Found",
@@ -4721,7 +5295,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                         )
                     elif _do_path_change_check(self, zip_path, new_case):
                         self._upsert_archive(zip_path, new_case)
-                        return new_case, False
+                        return new_case, 0
                     # else: mismatch error shown by _do_path_change_check
             # User declined or didn't pick — fall through to CaseSettingsDialog
 
@@ -4735,10 +5309,22 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     break
         dlg = CaseSettingsDialog(zip_path, base_folder, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            return None, False
+            return None, 0
         case_dir = dlg.case_dir
+        tier = dlg.header_scan_tier
         self._upsert_archive(zip_path, case_dir)
-        return case_dir, dlg.scan_headers
+        # Persisted immediately (not only after the scan finishes) so the
+        # banner reflects the examiner's own choice even if the scan is
+        # still running or gets interrupted — _on_header_scan_done below
+        # re-persists once results actually land, in case a later manual
+        # rescan (still tier-1-only today, see TODO.md item 20's own
+        # "share this exact same tier-selection UI" follow-up) changes it.
+        try:
+            with closing(_open_results_db(case_dir)) as _db:
+                save_case_setting(_db, 'header_scan_tier', str(tier))
+        except Exception:
+            pass
+        return case_dir, tier
 
     def _get_log_path(self):
         parent, stem = self._zip_stem()
@@ -5771,6 +6357,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         )
         dlg.header_types_cleared.connect(self._on_header_types_cleared)
         dlg.header_scan_done.connect(self._on_header_scan_done)
+        # ProcessDialog persists the new tier itself (it already owns the
+        # case_dir/case_settings write at the moment the scan completes) —
+        # this connection only refreshes the blue banner to match, no
+        # second persist. See ProcessDialog._on_header_done.
+        dlg.header_scan_tier_done.connect(lambda _t: self._refresh_header_scan_indicator())
         dlg.nested_extraction_done.connect(self._on_nested_extraction_done)
         dlg.exec()
         # Came here from a keyword search — run that search automatically
@@ -5838,7 +6429,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.start_loading(path)
 
     def start_loading(self, zip_path):
-        case_dir, scan_headers = self._get_or_ask_case_dir(zip_path)
+        case_dir, header_scan_tier = self._get_or_ask_case_dir(zip_path)
         if case_dir is None:
             return   # user cancelled the dialog
         self._shutdown_mcp_server("archive changed")
@@ -5919,12 +6510,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # non-blocking pattern as _thumb_worker above, so a stale worker can
         # never clobber this load's state or crash on GC while running.
         self._retire_worker(getattr(self, 'worker', None))
-        self.worker = ZipMetadataWorker(zip_path, scan_headers=scan_headers,
+        self.worker = ZipMetadataWorker(zip_path, header_scan_tier=header_scan_tier,
                                         case_dir=self._case_dir)
         self.worker.status_update.connect(self.status_bar.showMessage)
         self.worker.metadata_ready.connect(self.on_metadata_ready)
         self.worker.header_scan_progress.connect(self._on_header_scan_progress)
-        self.worker.header_scan_done.connect(self._on_header_scan_done)
+        self.worker.header_scan_done.connect(
+            lambda results, _tier=header_scan_tier: self._on_header_scan_done(results, tier=_tier))
         self.worker.finished.connect(self._on_load_worker_finished)
         self.worker.start()
 
@@ -5966,16 +6558,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # ZipMetadataWorker.run() already ensured the local .zcd cache is
         # valid before metadata parsing even started (see its own "Ensure
         # local .zcd exists" step) -- a CachedZipView built from it is a
-        # fast LOCAL read, not the slow network zipfile open the
-        # background-submit below exists to avoid, so it's built
-        # synchronously right here rather than backgrounded. Only falls
-        # back to that background open when the cache is somehow still
-        # unavailable (e.g. no case_dir at all).
+        # fast LOCAL read, so it's built synchronously right here rather
+        # than backgrounded. No raw-zipfile background-submit fallback
+        # for the "cache somehow still unavailable" case any more (this
+        # project's own standing Convention has no exception for it
+        # either) -- _get_zip_handle()'s own lazy path already covers
+        # that by building a fresh CachedZipView on demand (or returning
+        # None, which every real caller already handles honestly).
         _infos = _cd_cache_load(self.zip_path, self._case_dir) if self._case_dir else None
         if _infos is not None:
             self._zip_handle = CachedZipView(self.zip_path, _infos)
-        else:
-            self._zip_open_future = _BG_POOL.submit(zipfile.ZipFile, self.zip_path, 'r')
         self._time_cols = self._detect_time_columns(data)
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'Path'])
@@ -6064,6 +6656,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
              self._manual_zone_name,
              self._timestamp_display_mode, is_first_load) = tz
             self._refresh_timestamp_mode_indicator()
+            self._refresh_header_scan_indicator()
             if self._view_is_recursive:
                 self._rebuild_file_view_from_checked(preserve_filter=True)
             else:
@@ -6304,7 +6897,38 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._header_type_overrides.clear()
         self._refresh_folder_view()
 
-    def _on_header_scan_done(self, results: dict):
+    def _on_header_scan_done(self, results: dict, tier: int | None = None):
+        """*tier* is only passed by the fresh-case-open path (the worker
+        knows its own header_scan_tier at construction time) — left None
+        for ProcessDialog's own generic header_scan_done, which is also
+        reused for two unrelated events (nested-archive type updates,
+        gzip detection) that are NOT a header-scan tier run at all, so
+        guessing a tier there would mislabel the banner. (ProcessDialog's
+        own tier upgrades persist and signal through the separate,
+        narrowly-scoped header_scan_tier_done instead — see
+        _open_process_dialog's own connection.)
+
+        This firing at all means the scan genuinely finished — the
+        creation-time worker's header-scan call has no cancel/interrupt
+        path (confirmed directly in ZipMetadataWorker.run()) — so this is
+        also the ONE place that's safe to mark 'header_scan_complete_tier'
+        for the creation-time path, distinct from 'header_scan_tier'
+        (written earlier, the moment the tier was CHOSEN, before this
+        scan even started — see _get_or_ask_case_dir's own comment on
+        why). Conflating the two was a real bug: anything reading the
+        chosen-but-not-yet-scanned tier as if it meant "this case's data
+        is actually complete for this tier" — ProcessDialog's own
+        available-upgrades list and _show_archive_selection's unscoped
+        discovery — would silently trust incomplete data while a large
+        Tier 3 scan was still running in the background."""
+        if tier is not None and self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    save_case_setting(db, 'header_scan_tier', str(tier))
+                    save_case_setting(db, 'header_scan_complete_tier', str(tier))
+            except Exception:
+                pass
+            self._refresh_header_scan_indicator()
         if not results:
             return
         self._header_type_overrides.update(results)
@@ -6318,6 +6942,47 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._rebuild_file_view_from_checked(preserve_filter=True)
         else:
             self._refresh_folder_view(preserve_filter=True)
+
+    _HEADER_SCAN_TIER_TEXT = {
+        0: "Header scan: Off (extension-based typing only)",
+        1: "Header scan: Tier 1 — unknown-extension files, app/user-accessible areas",
+        2: "Header scan: Tier 2 — all files, app/user-accessible areas",
+        3: "Header scan: Tier 3 — all files, everywhere",
+    }
+
+    def _refresh_header_scan_indicator(self):
+        """Updates the blue header-scan-tier banner — see TODO.md item 20.
+        A different colour from the timestamp banner's own orange
+        (_refresh_timestamp_mode_indicator) so the two independent,
+        unrelated settings are never mistaken for one another at a glance.
+        Always states the tier explicitly, including "Off" — same
+        "never silently omit an active default" convention the timestamp
+        banner already established — rather than hiding when nothing was
+        chosen. Hidden entirely until a case is open, since no tier is
+        meaningful before then.
+
+        Reads BOTH 'header_scan_tier' (requested — written the moment a
+        tier is chosen, before its scan starts) and
+        'header_scan_complete_tier' (written only once that scan actually
+        finishes — see ProcessDialog._load_current_header_tier's own
+        comment on the real race this split was built to fix) so a large
+        Tier 3 scan still running in the background reads honestly as
+        "in progress," never silently as if it had already finished."""
+        if not self._case_dir:
+            self._header_scan_banner.setVisible(False)
+            return
+        tier = complete_tier = 0
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                tier = int(load_case_setting(db, 'header_scan_tier', '0'))
+                complete_tier = int(load_case_setting(db, 'header_scan_complete_tier', '0'))
+        except Exception:
+            pass
+        text = self._HEADER_SCAN_TIER_TEXT.get(tier, self._HEADER_SCAN_TIER_TEXT[0])
+        if tier > complete_tier:
+            text += " — scan in progress…"
+        self._header_scan_banner.setText(text)
+        self._header_scan_banner.setVisible(True)
 
     def _inject_nested_archives(self):
         """Inject extracted nested-archive entries into folder_map and full_metadata
@@ -6507,7 +7172,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 pass
         self._single_scan_worker = SingleFileScanWorker(
             self.zip_path, ui_paths, self._adapter,
-            self._local_extra_delta,
+            self._local_extra_delta, case_dir=self._case_dir,
         )
         self._single_scan_worker.done.connect(self._on_single_scan_done)
         self._single_scan_worker.start()

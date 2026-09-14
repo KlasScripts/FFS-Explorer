@@ -17,7 +17,6 @@ import configparser
 import os
 import re
 import sys
-import zipfile
 from datetime import datetime
 from zoneinfo import available_timezones, ZoneInfo
 
@@ -194,20 +193,24 @@ def detect_handset_zone(zip_path: str, adapter, case_dir: str | None = None) -> 
     every other artifact parser already reads from), not the OS/system
     partition.
 
-    When *case_dir* is given, reads via the local .zcd central-directory
-    cache (zip_cd_cache) instead of opening a fresh zipfile.ZipFile — avoids
-    a second full central-directory read over the network, and never touches
-    the app's shared, non-thread-safe zip handle (this runs off the GUI
-    thread). Falls back to opening the zip directly when no case_dir is
-    given or the cache isn't available yet.
+    Reads via the local .zcd central-directory cache (zip_cd_cache) only —
+    never a raw zipfile.ZipFile on the main archive (this project's own
+    standing Convention has no exception for this case). Never touches the
+    app's shared, non-thread-safe zip handle either way (this runs off the
+    GUI thread). Returns None (no zone detected) rather than falling back
+    to a raw zip open when case_dir is missing or the cache isn't
+    available yet — the one real caller (timestamp_display.py) only ever
+    invokes this from inside an already-open case_dir-keyed DB connection,
+    so case_dir is always truthy in practice; this only matters as an
+    honest default for a hypothetical caller that doesn't.
     """
+    if not case_dir:
+        return None
     try:
-        view = None
-        if case_dir:
-            infos = _zcd_load(zip_path, case_dir)
-            if infos is not None:
-                view = CachedZipView(zip_path, infos)
-        with (view if view is not None else zipfile.ZipFile(zip_path)) as z:
+        infos = _zcd_load(zip_path, case_dir)
+        if infos is None:
+            return None
+        with CachedZipView(zip_path, infos) as z:
             names = frozenset(z.namelist())
             for candidate in adapter.user_candidates('db/timezone/localtime'):
                 if candidate not in names:

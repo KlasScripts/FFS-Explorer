@@ -1,5 +1,6 @@
 """keyword_search.py — keyword search worker, dialogs, and FastZipBrowser mixin."""
 
+import os
 import sqlite3
 import threading
 import time
@@ -66,7 +67,7 @@ def _decode_search_key(db_key: str) -> tuple:
 from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QPushButton, QComboBox,
     QVBoxLayout, QHBoxLayout, QTreeView, QTableWidget, QTableWidgetItem,
-    QDialog, QProgressBar,
+    QDialog, QProgressBar, QMessageBox,
     QPlainTextEdit, QMenu,
     QHeaderView,
 )
@@ -94,33 +95,29 @@ def _build_zip_entries(zip_path: str, stop,
                        delta: int | None = None) -> list:
     """Return list of (name, data_offset, file_size) for all STORED entries.
     *stop* is a threading.Event; set it to abort early.
-    *case_dir*, when set, allows using the local .zcd sidecar to avoid
-    reading the central directory from the network."""
+
+    Deliberately NO raw-zipfile fallback on the main archive — per this
+    project's own standing Convention and direct instruction, this never
+    reads the main archive any other way than through the local .zcd
+    sidecar. Returns empty (search finds nothing) rather than a network
+    central-directory read when .zcd genuinely isn't available — which,
+    for every real caller of this function, means the case hasn't
+    finished loading yet, since .zcd creation is the very first step of
+    that load; a keyword search can't run before then regardless."""
     entries = []
-
-    # Use the local .zcd sidecar when available — avoids a full network CD read.
-    infolist = None
-    if case_dir:
-        try:
-            infolist = _zcd_load(zip_path, case_dir)
-        except Exception:
-            pass
-
+    if not case_dir:
+        return entries
     try:
-        if infolist is not None:
-            stored = [
-                info for info in infolist
-                if info.compress_type == zipfile.ZIP_STORED and info.file_size > 0
-            ]
-        else:
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                stored = [
-                    info for info in z.infolist()
-                    if info.compress_type == zipfile.ZIP_STORED and info.file_size > 0
-                ]
+        infolist = _zcd_load(zip_path, case_dir)
     except Exception:
+        infolist = None
+    if infolist is None:
         return entries
 
+    stored = [
+        info for info in infolist
+        if info.compress_type == zipfile.ZIP_STORED and info.file_size > 0
+    ]
     offsets = _compute_data_offsets(zip_path, stored, delta=delta)
     for info in stored:
         if stop.is_set():
@@ -211,7 +208,8 @@ class KeywordSearchWorker(QThread):
 
     def __init__(self, zip_path: str, keyword: str,
                  entries=None, scope="all",
-                 exclude_prefixes: tuple = (), parent=None):
+                 exclude_prefixes: tuple = (), case_dir: str | None = None,
+                 delta: int | None = None, parent=None):
         super().__init__(parent)
         self.zip_path          = zip_path
         self.keyword           = keyword.encode('utf-8', errors='replace')
@@ -219,6 +217,18 @@ class KeywordSearchWorker(QThread):
         self._prebuilt_entries = entries
         self._scope            = scope
         self._exclude_prefixes = exclude_prefixes
+        # Only ever actually used when *entries* is None — the first
+        # search of a session, before self._search_entries has been
+        # cached (see _resolve_search_scope). Previously missing
+        # entirely, which meant that first search always fell through to
+        # _build_zip_entries' own (now removed) raw-zipfile fallback,
+        # silently re-reading the WHOLE central directory over the
+        # network a second time despite .zcd already existing by the
+        # time any search can run at all — the exact cost the .zcd
+        # sidecar exists to eliminate, on the single most common path in
+        # the app. Threaded through here to fix that at the source.
+        self._case_dir         = case_dir
+        self._delta            = delta
         self.entries: list     = []
         self._patterns: list   = _make_patterns(keyword)
 
@@ -226,7 +236,8 @@ class KeywordSearchWorker(QThread):
         self._stop.set()
 
     def _build_entries(self) -> list:
-        return _build_zip_entries(self.zip_path, self._stop)
+        return _build_zip_entries(self.zip_path, self._stop,
+                                  case_dir=self._case_dir, delta=self._delta)
 
     def run(self):
         if self._prebuilt_entries is not None:
@@ -394,6 +405,179 @@ class NestedArchiveSearchWorker(QThread):
         self.finished.emit(hits, done, total)
 
 
+# ── Bulk SQL/WAL hit discovery ────────────────────────────────────────────────
+# See TODO.md item 1 for the full three-constraint design this implements:
+# after a keyword search finishes, offer to bulk-run "Interpret as SQL
+# Record" over every hit whose own file is a real SQLite/WAL file — never
+# eagerly for a hit the examiner hasn't asked about, and never at the cost
+# of reading real bytes off every hit file just to build the offer.
+
+# Deliberately a small, LOCAL copy of ffs-explorer.py's own DATABASE_
+# EXTENSIONS/WAL-suffix check, not an import from it — app/ modules never
+# import from the top-level script, per this project's own standing
+# convention (see ffs-explorer.py's Conventions section).
+_SQL_DB_EXTENSIONS = {'.db', '.sqlite', '.sqlite3', '.db3'}
+
+
+def _looks_like_sqlite_by_name(name: str) -> bool:
+    """Cheap, free (no I/O) check: does this filename's own extension
+    already suggest a SQLite base file or WAL/SHM sidecar? The first,
+    free layer of the three this feature's discovery pass tries in
+    order — extension, then this case's own already-computed header_
+    types cache, then (only if still genuinely unresolved) a real header
+    byte read. Most real hit files carry a self-describing extension,
+    same reasoning as app_intelligence.find_evidence_databases's own
+    "Row-merge + magic-byte fallback" this mirrors."""
+    lower = name.lower()
+    if lower.endswith(('-wal', '-shm')):
+        return True
+    return os.path.splitext(lower)[1] in _SQL_DB_EXTENSIONS
+
+
+class SqlHitDiscoveryWorker(QThread):
+    """Background pass, run once after a keyword search finishes: for
+    each DISTINCT hit file (never per-hit — many hits commonly land in
+    the same file), determine whether it's a SQLite base file or WAL
+    sidecar. Extension-first (free) → this case's own already-loaded
+    header_types cache (free, main-archive hits only — a nested-archive
+    entry has no ui_path in that cache's own space) → a real header
+    byte-peek ONLY for a file still genuinely unresolved after both.
+
+    A magic-byte check here is a classification heuristic, not an
+    integrity guarantee — a deliberately altered/corrupted header could
+    make a real SQLite/WAL file silently NOT count toward the offer this
+    feeds; stated here, not just in TODO.md, since this is the one place
+    that limitation actually matters. The reverse (a forged header
+    falsely counting a non-database file) is lower-stakes — it only
+    costs one interpretation attempt, which already fails cleanly as
+    `not_sqlite`.
+
+    *files* is a list of dicts: {'key', 'name', 'physical', 'stored_path',
+    'entry_path'} — one per distinct hit file, 'key' matching
+    FastZipBrowser._search_file_items' own dict key. Emits done({key:
+    bool}) — True means "interpret this file's hits.\""""
+    done = Signal(dict)
+
+    def __init__(self, zip_path: str, case_dir: str | None,
+                 header_type_overrides: dict, files: list[dict], parent=None):
+        super().__init__(parent)
+        self._zip_path = zip_path
+        self._case_dir = case_dir
+        self._header_type_overrides = header_type_overrides
+        self._files = files
+
+    def run(self):
+        results: dict = {}
+        # Deliberately NO raw-zipfile fallback here, per this project's
+        # own standing Convention ("Never read the MAIN FFS archive via
+        # raw zipfile.ZipFile(...)/.read(name) directly" — neither of
+        # that rule's two narrow exceptions applies to this worker) and
+        # direct instruction. A main-archive byte-peek simply doesn't run
+        # (that file's own extension/cache result stands) when the local
+        # .zcd isn't available — z stays None and _peek_header's own
+        # `if z is None: return None` already handles that path. This
+        # never actually costs real coverage in practice: a keyword
+        # search — the only thing that ever constructs this worker — can
+        # only run once the case has fully loaded, and .zcd creation is
+        # the very first step of that load (ZipMetadataWorker.run(),
+        # before metadata_ready even fires), so by the time this worker
+        # exists at all the .zcd is already guaranteed to exist.
+        infos = _zcd_load(self._zip_path, self._case_dir) if self._case_dir else None
+        z = CachedZipView(self._zip_path, infos) if infos is not None else None
+        reader = ZipReader(self._zip_path)
+        for f in self._files:
+            try:
+                results[f['key']] = self._resolve_one(f, z, reader)
+            except Exception:
+                results[f['key']] = False
+        self.done.emit(results)
+
+    def _resolve_one(self, f: dict, z, reader: ZipReader) -> bool:
+        if _looks_like_sqlite_by_name(f['name']):
+            return True
+        if not f['stored_path']:
+            cached = self._header_type_overrides.get(f['physical'])
+            if cached == 'Database':
+                return True
+            if cached is not None:
+                # Confidently something else already (e.g. this case's own
+                # header scan already classified it as 'Picture') — no
+                # need to spend a byte read confirming a negative.
+                return False
+        header = self._peek_header(f, z, reader)
+        if not header:
+            return False
+        return (header[:16] == b'SQLite format 3\x00' or
+                header[:4] in (b'\x37\x7f\x06\x82', b'\x37\x7f\x06\x83'))
+
+    def _peek_header(self, f: dict, z, reader: ZipReader) -> bytes | None:
+        if f['stored_path'] and f['entry_path']:
+            # Nested archive: always an already-extracted local file (see
+            # nested_archive.py's own Conventions entry) — no zip_cd_cache
+            # offset applies here at all; read_nested_entry has no
+            # partial-read option, so this reads the whole entry. Nested
+            # entries are typically small local files, unlike the
+            # network-hosted-main-archive case the offset path below is
+            # specifically there to avoid downloading in full.
+            data = read_nested_entry(f['stored_path'], f['entry_path'])
+            return data[:16] if data else None
+        if z is None or not f['physical']:
+            return None
+        try:
+            info = z.getinfo(f['physical'])
+            offsets = _compute_data_offsets(self._zip_path, [info])
+            data_offset = offsets.get(info.filename)
+            if data_offset is None:
+                return None
+            return reader.read_at(data_offset, 16, max_bytes=16)
+        except Exception:
+            return None
+
+
+class BulkSqlInterpretProgressDialog(QDialog):
+    """Modal progress dialog for bulk "Interpret as SQL Record" — same
+    visual convention as SearchProgressDialog above (label + QProgressBar
+    + Cancel), not QProgressDialog, for consistency with this file's own
+    existing dialog style. Cancelling stops queuing further hits — an
+    already-running SqlHitInterpretWorker isn't interrupted mid-flight
+    (that worker has no cancellation support today), it's just the last
+    one started."""
+
+    cancelled = Signal()
+
+    def __init__(self, total: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Interpreting SQL/WAL Hits")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        self._label = QLabel(f"Interpreting hit 1 of {total:,}…" if total else "")
+        layout.addWidget(self._label)
+        self._bar = QProgressBar()
+        self._bar.setRange(0, total)
+        layout.addWidget(self._bar)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self.cancelled.emit)
+        btn_row.addWidget(self._cancel_btn)
+        layout.addLayout(btn_row)
+
+    def update_progress(self, done: int, total: int):
+        self._bar.setValue(done)
+        if done < total:
+            self._label.setText(f"Interpreting hit {done + 1:,} of {total:,}…")
+        else:
+            self._label.setText("Finishing…")
+
+    def mark_finished(self, total: int):
+        self._bar.setValue(total)
+        self._label.setText(
+            f"Done — interpreted {total:,} hit{'s' if total != 1 else ''}.")
+        self._cancel_btn.setText("Close")
+
+
 # ── SqlHitInterpretWorker ─────────────────────────────────────────────────────
 
 class SqlHitInterpretWorker(QThread):
@@ -453,8 +637,19 @@ class SqlHitInterpretWorker(QThread):
         if not physical:
             return None
         try:
+            # No raw-zipfile fallback on the main archive here either
+            # (see SqlHitDiscoveryWorker.run()'s own comment for the
+            # full reasoning) — a search hit can only exist once the
+            # case has fully loaded, and .zcd creation is the very first
+            # step of that load, so it's already guaranteed present by
+            # the time any hit could be interpreted at all. `infos is
+            # None` (case_dir unset, e.g. no case folder at all) falls
+            # through to the existing `except Exception: return None`
+            # below via CachedZipView(None) failing its own getinfo,
+            # same honest "couldn't read it" outcome as every other
+            # failure this method already handles this way.
             infos = _zcd_load(self.zip_path, self.case_dir) if self.case_dir else None
-            zf = CachedZipView(self.zip_path, infos) if infos is not None else zipfile.ZipFile(self.zip_path, 'r')
+            zf = CachedZipView(self.zip_path, infos)
             zinfo = zf.getinfo(physical)
             entry = ZipEntry(self.zip_path, physical, zinfo)
             return entry.read()
@@ -1456,14 +1651,21 @@ class KeywordSearchMixin:
         elif sql_action is not None and chosen == sql_action:
             self._interpret_search_hit_as_sql(item)
 
-    def _interpret_search_hit_as_sql(self, item: QStandardItem):
+    def _interpret_search_hit_as_sql(self, item: QStandardItem, on_done=None):
         """Kick off a background SqlHitInterpretWorker for the hit *item*
         (lazy -- only ever runs for a hit the examiner explicitly asked
         about, never eagerly for every hit) and show a "Computing…"
         placeholder child under it until the result is ready — the
         explicit usability requirement behind this feature (never a
         silently-frozen wait): see CLAUDE.md's `locate_offset` Conventions
-        entry and TODO.md item 1."""
+        entry and TODO.md item 1.
+
+        *on_done*, if given, is called once this hit's own interpretation
+        is fully processed — used ONLY by the bulk runner
+        (_advance_bulk_sql_interpret) to know when to move on to the next
+        queued hit; the ordinary right-click path never passes it. Called
+        on every exit path, including the early-return below, so a
+        malformed hit item can never silently stall the bulk queue."""
         _PATH_ROLE        = Qt.ItemDataRole.UserRole
         _OFFSET_ROLE      = Qt.ItemDataRole.UserRole + 1
         _PHYS_ROLE        = Qt.ItemDataRole.UserRole + 2
@@ -1475,6 +1677,8 @@ class KeywordSearchMixin:
         stored_path = item.data(_STORED_PATH_ROLE)
         entry_path  = item.data(_ENTRY_PATH_ROLE)
         if offset is None or not self._case_dir:
+            if on_done is not None:
+                on_done()
             return
         # NOT item.data(_PATH_ROLE) -- that's the DISPLAY path, which for
         # an iOS third-party app has its GUID segment substituted with the
@@ -1508,6 +1712,8 @@ class KeywordSearchMixin:
         worker.finished.connect(
             lambda result, it=item, gen=generation, w=worker:
                 self._on_sql_hit_interpreted(it, gen, result, w))
+        if on_done is not None:
+            worker.finished.connect(lambda *_args: on_done())
         self._sql_interpret_workers[id(worker)] = worker
         worker.start()
 
@@ -1653,6 +1859,98 @@ class KeywordSearchMixin:
 
         self.search_results_view.expand(item.index())
         self.search_results_view.resizeColumnToContents(0)
+
+    # ── Bulk SQL/WAL hit discovery + interpretation ─────────────────────────
+
+    def _collect_hit_files_for_sql_discovery(self) -> list[dict]:
+        """One entry per DISTINCT hit file currently in the results tree
+        (self._search_file_items) — never per-hit, matching this
+        feature's own bounded-cost design (TODO.md item 1)."""
+        _PHYS_ROLE        = Qt.ItemDataRole.UserRole + 2
+        _STORED_PATH_ROLE = Qt.ItemDataRole.UserRole + 3
+        _ENTRY_PATH_ROLE  = Qt.ItemDataRole.UserRole + 4
+        files = []
+        for key, file_item in self._search_file_items.items():
+            stored_path = file_item.data(_STORED_PATH_ROLE)
+            entry_path  = file_item.data(_ENTRY_PATH_ROLE)
+            files.append({
+                'key':         key,
+                'name':        key.rsplit('/', 1)[-1],
+                'physical':    None if stored_path else key,
+                'stored_path': stored_path,
+                'entry_path':  entry_path,
+            })
+        return files
+
+    def _start_sql_hit_discovery(self):
+        """Kicked off once, right after a keyword search finishes (see
+        _on_search_finished) — never eagerly for every search, only when
+        there's at least one hit file to check at all. See TODO.md item 1
+        for the full design; SqlHitDiscoveryWorker for the actual
+        extension → cache → byte-peek resolution."""
+        files = self._collect_hit_files_for_sql_discovery()
+        if not files:
+            return
+        self._sql_discovery_worker = SqlHitDiscoveryWorker(
+            self.zip_path, self._case_dir,
+            dict(self._header_type_overrides), files, parent=self)
+        self._sql_discovery_worker.done.connect(self._on_sql_discovery_done)
+        self._sql_discovery_worker.start()
+
+    def _on_sql_discovery_done(self, results: dict):
+        qualifying_keys = {k for k, v in results.items() if v}
+        if not qualifying_keys:
+            return
+        items = []
+        for key in qualifying_keys:
+            file_item = self._search_file_items.get(key)
+            if file_item is None:
+                continue
+            for row in range(file_item.rowCount()):
+                items.append(file_item.child(row, 0))
+        if not items:
+            return
+        total_hits = sum(fi.rowCount() for fi in self._search_file_items.values())
+        ans = QMessageBox.question(
+            self, "Interpret SQL/WAL Hits?",
+            f"{len(items):,} of these {total_hits:,} hits are inside SQLite/"
+            f"WAL files (checked by real header bytes, not just file "
+            f"extension). Interpret them all now?\n\n"
+            "This runs the same background \"Interpret as SQL Record\" "
+            "step already available per hit via right-click — just "
+            "sequentially, for all of them.\n\n"
+            "Note: a header-byte check is a classification heuristic, not "
+            "an integrity guarantee — a deliberately altered file header "
+            "could make a real SQLite/WAL file not count toward this "
+            "number.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._start_bulk_sql_interpret(items)
+
+    def _start_bulk_sql_interpret(self, items: list[QStandardItem]):
+        self._bulk_sql_items = items
+        self._bulk_sql_index = 0
+        self._bulk_sql_cancelled = False
+        self._bulk_sql_progress = BulkSqlInterpretProgressDialog(len(items), parent=self)
+        self._bulk_sql_progress.cancelled.connect(self._on_bulk_sql_cancel)
+        self._bulk_sql_progress.show()
+        self._advance_bulk_sql_interpret()
+
+    def _on_bulk_sql_cancel(self):
+        self._bulk_sql_cancelled = True
+
+    def _advance_bulk_sql_interpret(self):
+        total = len(self._bulk_sql_items)
+        if self._bulk_sql_cancelled or self._bulk_sql_index >= total:
+            self._bulk_sql_progress.mark_finished(self._bulk_sql_index)
+            return
+        self._bulk_sql_progress.update_progress(self._bulk_sql_index, total)
+        item = self._bulk_sql_items[self._bulk_sql_index]
+        self._bulk_sql_index += 1
+        self._interpret_search_hit_as_sql(item, on_done=self._advance_bulk_sql_interpret)
 
     def _open_parent_folder_from_search(self, full_file_path: str):
         """Navigate the tree to the parent folder of *full_file_path*."""
@@ -1977,7 +2275,9 @@ class KeywordSearchMixin:
             self.zip_path, term,
             entries=scoped_entries,
             scope=worker_scope,
-            exclude_prefixes=worker_exclude)
+            exclude_prefixes=worker_exclude,
+            case_dir=self._case_dir,
+            delta=getattr(self, '_local_extra_delta', None))
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
         self._search_worker.result_found.connect(self._on_search_result)
         self._search_worker.progress.connect(self._on_search_progress)
@@ -2113,3 +2413,8 @@ class KeywordSearchMixin:
         self._update_search_status_bar()
         for col in range(self.search_results_model.columnCount()):
             self.search_results_view.resizeColumnToContents(col)
+
+        # Last step of the search, per direct design instruction — never
+        # interleaved with the search itself, and never for a search with
+        # no hits at all. See TODO.md item 1 / _start_sql_hit_discovery.
+        self._start_sql_hit_discovery()

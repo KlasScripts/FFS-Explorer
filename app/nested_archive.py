@@ -117,17 +117,21 @@ def extract_one(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
     out_dir = os.path.join(case_dir, 'nested_archives')
     os.makedirs(out_dir, exist_ok=True)
     try:
-        # Read via the local .zcd central-directory cache when available
-        # (same pattern as device_timezone.py's own detect_handset_zone) --
-        # the main FFS archive itself is never compressed, so this is a
-        # direct offset seek rather than a second full central-directory
-        # read over what can be a large network-hosted zip. Falls back to
-        # a plain zipfile.ZipFile only when the cache isn't built yet.
-        _view = None
+        # Read via the local .zcd central-directory cache only — never a
+        # raw zipfile.ZipFile on the main archive (this project's own
+        # standing Convention has no exception for this case). The main
+        # FFS archive itself is never compressed, so this is a direct
+        # offset seek rather than a second full central-directory read
+        # over what can be a large network-hosted zip. case_dir is
+        # already a required parameter here (out_dir is built from it
+        # unconditionally above), so .zcd is already guaranteed present
+        # by the time this ever runs — raises honestly if it somehow
+        # isn't, caught by this function's own surrounding try/except
+        # (returns a real error_message rather than crashing silently).
         infos = _zcd_load(zip_path, case_dir)
-        if infos is not None:
-            _view = CachedZipView(zip_path, infos)
-        with (_view if _view is not None else zipfile.ZipFile(zip_path, 'r')) as zf:
+        if infos is None:
+            raise RuntimeError("Local .zcd cache not available")
+        with CachedZipView(zip_path, infos) as zf:
             raw = zf.open(physical_path).read()
 
         key = hashlib.sha1(ui_path.encode()).hexdigest()[:12]

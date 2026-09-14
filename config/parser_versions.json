@@ -220,27 +220,27 @@
       "changelog": {
         "2": "record_source gained an explicit label ('Direct Message'), same reason as chrome_autofill.py."
       },
-      "hash": "5b10070955f9e474",
-      "version": 2
+      "hash": "08e736eb88415e67",
+      "version": 3
     },
     "ios:photos_metadata": {
       "changelog": {},
-      "hash": "f56ed50cf1a409e6",
-      "version": 3
+      "hash": "bcfe01dfcbb37fbd",
+      "version": 4
     },
     "ios:sms_messages": {
       "changelog": {
         "2": "Use shared missing_ref_label()/resolve_path_after_marker() instead of inline f-strings/startswith logic for the no-chat/no-handle-record fallbacks and attachment path resolution (no output change)."
       },
-      "hash": "c0922e86025c30f9",
-      "version": 2
+      "hash": "18c06a706b0458ed",
+      "version": 3
     },
     "ios:whatsapp": {
       "changelog": {
         "3": "Use shared missing_ref_label() instead of inline f-string for the no-chat-record fallback (no output change)."
       },
-      "hash": "a9723c0e7ff5b0e0",
-      "version": 3
+      "hash": "60ecfe163f691ab9",
+      "version": 4
     }
   }
 }

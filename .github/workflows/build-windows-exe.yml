@@ -26,10 +26,38 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      # `av` (PyAV, app/media_viewer.py's video-thumbnail decoder since
+      # 2026-09-14) MUST be built from source here, linked against a real
+      # FFmpeg with a working HEVC decoder -- the plain prebuilt PyPI wheel
+      # was confirmed (directly, against real HEVC iPhone video) to yield
+      # zero decoded frames for HEVC content, Apple's default recording
+      # codec since iOS 11. This whole step is UNVERIFIED end-to-end on a
+      # real Windows build as of the commit that added it -- confirmed
+      # working in a macOS dev build (Homebrew ffmpeg + pkg-config), but
+      # this exact Windows recipe (choco packages, pkg-config discovery of
+      # the shared-ffmpeg dev files) has not been run on a real Windows
+      # runner yet. If this step fails, check pyav-org/PyAV's own Windows
+      # build docs for the current recommended approach before assuming
+      # the whole idea is broken -- see TODO.md item 17 for the full
+      # investigation this was built from.
+      - name: Install FFmpeg dev files (for building PyAV from source)
         run: |
+          choco install ffmpeg-shared -y
+          choco install pkgconfiglite -y
+
+      - name: Install dependencies
+        env:
+          # ffmpeg-shared's own install location -- choco installs it under
+          # C:\ProgramData\chocolatey\lib\ffmpeg-shared\tools\ffmpeg-*-shared,
+          # which includes lib\pkgconfig\*.pc alongside the DLLs/headers.
+          # Wildcarded via PowerShell below since the exact version-suffixed
+          # folder name isn't knowable in advance.
+          PKG_CONFIG: pkgconf
+        run: |
+          $ffmpegDir = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg-shared\tools" -Directory | Select-Object -First 1
+          echo "PKG_CONFIG_PATH=$($ffmpegDir.FullName)\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install --no-binary av -r requirements.txt pyinstaller
 
       - name: Build with PyInstaller
         run: |

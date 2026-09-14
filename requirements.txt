@@ -1,5 +1,35 @@
 msgpack
 PySide6
+# app/media_viewer.py's video-thumbnail extraction (replaced a subprocess
+# `ffmpeg` call 2026-09-14). The official PyPI wheel's bundled FFmpeg build
+# cannot decode HEVC (confirmed directly: 6/6 real HEVC test videos yielded
+# zero frames) -- CI must build this from source linked against a real
+# FFmpeg (see build-windows-exe.yml), not just `pip install av`. A plain
+# `pip install -r requirements.txt` on a dev machine (as CLAUDE.md's "Always
+# run with the project venv" instructions assume) will pull the prebuilt
+# wheel instead and silently lose HEVC support -- fine for most manual
+# testing, but NOT what the shipped Windows exe uses.
+av
+# av.VideoFrame.to_image() (used by _video_frame_bytes above) requires PIL/
+# Pillow -- confirmed a real gap during a local PyInstaller smoke build:
+# PIL was only present in the dev venv as an incidental transitive
+# dependency of something else, was never declared here, and the build
+# log showed it EXCLUDED from the frozen bundle as a result ("excluded
+# module named PIL - imported by av.video.frame (delayed)") -- a fresh
+# `pip install -r requirements.txt` without this line would ship an exe
+# where every video thumbnail silently raises ImportError at runtime.
+# Declared explicitly so it's always bundled.
+Pillow
+# app/media_viewer.py's _load_qimage HEIC/HEIF fallback (added 2026-09-14).
+# Qt's own QImage.loadFromData() only decodes HEIC when the OS itself
+# supplies a codec -- macOS does (confirmed working via its ImageIO
+# framework), Windows (this project's primary shipped target) has none by
+# default -- confirmed directly, not assumed: grepped ffs_explorer.spec and
+# the Windows CI workflow for any bundled HEIC codec, zero hits. Without
+# this, every real HEIC photo (Apple's default photo format since iOS 11)
+# would silently show as an undecodable placeholder on Windows, both as a
+# thumbnail and in the full-size viewer.
+pillow-heif
 blackboxprotobuf
 pytypedstream
 nska_deserialize

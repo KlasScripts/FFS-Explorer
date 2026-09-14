@@ -26,7 +26,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 ## Data flow (opening an archive)
 
 1. `FastZipBrowser.start_loading()` → case dir chosen (`_get_or_ask_case_dir`).
-2. `ZipMetadataWorker` (ffs-explorer.py:1187) → `app/ffs_metadata.py
+2. `ZipMetadataWorker` (ffs-explorer.py:1392) → `app/ffs_metadata.py
    parse_archive_metadata()` in a child process: central-directory parse,
    `ui_metadata` build, folder tree/sizes; snapshot persisted to case dir
    (msgpack) so re-opens are instant.
@@ -92,7 +92,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `device_timezone.py` | Best-effort timezone detection for the opt-in device-local timestamp display: `detect_handset_zone` (iOS `private/var/db/timezone/localtime`), `detect_acquisition_offset`/`guess_acquisition_zones` (the `.ufd`'s recorded UTC offset, Cellebrite-only), `detect_system_zone` (the analysis machine's own current zone — macOS/Linux via `/etc/localtime`, Windows via the registry + a bundled CLDR name mapping since Windows has no IANA-named equivalent). All best-effort, never raise, never applied silently — see the Conventions timestamp section |
 | `keyword_search.py` | Search workers (live + nested archives), saved-search DB loaders, dialogs, `KeywordSearchMixin`. `SqlHitInterpretWorker` (added 2026-09-12) is the background half of "Interpret as SQL Record" — see Conventions |
 | `hex_viewer.py` | Hex tab (`HexViewerMixin`, `HexLoadWorker`). Also builds the Record/Attachment toggle and the joined-record source combo shown beside "File Preview" — see Conventions — but has no artifact-report knowledge itself, just the checkable buttons, the combo widget, and `_hex_source_is_record()`; `ArtifactViewerMixin` owns what each mode/entry loads |
-| `media_viewer.py` | Thumbnail grid, ffmpeg video frames (`MediaViewerMixin`). Selecting a thumbnail (`_on_thumb_clicked`) also loads that file into the shared bottom Hex panel — see "Per-tab state on switching" |
+| `media_viewer.py` | Thumbnail grid, in-process video-frame decoding via `av`/PyAV (`MediaViewerMixin`; switched from a subprocess `ffmpeg` call 2026-09-14 — see Conventions' "Video thumbnails: PyAV, built from source" entry for the two real bugs that switch fixed). Selecting a thumbnail (`_on_thumb_clicked`) also loads that file into the shared bottom Hex panel — see "Per-tab state on switching". Also owns `MediaFullViewDialog` (added 2026-09-02 in `artifact_media.py`, moved here 2026-09-14) — double-clicking a thumbnail (`_on_thumb_double_clicked`) opens the full-size image/video viewer, non-modal, and single-clicking a DIFFERENT thumbnail while it's open swaps its content to follow selection (`_media_sync_open_dialog`) rather than the examiner needing to close and re-double-click for every file — same "open viewer follows selection" convention `artifact_viewer.py`'s Report table already established for its own media columns, now shared by both real call sites. `_load_qimage(data, ext)` (also added 2026-09-14) is the one shared entry point both `ThumbnailWorker` and `MediaFullViewDialog._build_image` use to decode a QImage — Qt's own decode first, falling back to `pillow_heif` only for HEIC/HEIF once that's already failed (Qt has no native HEIC codec on Windows at all) — see Conventions' "Video thumbnails: PyAV, built from source" entry, whose write-up now also covers this HEIC fallback and a real EXIF-orientation bug found in `pillow_heif` itself along the way |
 | `sqlite_viewer.py` | Database tab: temp-copy extraction, table browser, **WAL net-change diff view** (`SqliteDiffModel`) |
 | `segb_viewer.py` | SEGB/Biome tab: parses records via vendored `app/ccl_segb`, decodes protobuf with `blackboxprotobuf`; empty-record hiding + deleted-record toggle |
 | `segb_schemas.py` | Built-in per-stream protobuf typedefs + field labels for known Biome streams; user-authored schemas persist to `caseresults.db` via `db_utils.save_segb_schema` and override the built-ins |
@@ -110,7 +110,7 @@ and `nested_archive.py` above |
 | `local_llm.py` | Thin stdlib-only (`urllib`) HTTP client for a local OpenAI-compatible chat server (added 2026-08-29, LM Studio by default): `call_chat` (one chat-completion request) and `list_models` (which model id is actually loaded right now). Never raises — a local model server being unreachable, misconfigured, or slow is an ordinary, expected condition for this optional feature, not a bug to propagate as an exception. `call_chat`'s `timeout` is enforced as a genuine WALL-CLOCK deadline (a helper thread + `future.result(timeout=...)`), not just passed to `urlopen()`'s own `timeout=` — confirmed necessary the same day by direct testing: a real reduce call once ran 5,217 SECONDS (87 minutes) despite `urlopen`'s timeout being set to 240s, because LM Studio's server sends occasional keep-alive bytes during a long generation that reset urllib's per-read idle timer indefinitely without the response ever completing. A `max_tokens` cap (2048 default) is a second, independent safeguard against the same failure mode server-side |
 | `nested_archive.py` | Extracts one embedded/nested archive (ZIP or gzip) from an FFS zip's raw bytes into `case_dir/nested_archives/`, recording it in `casecache.db` — Qt-free (added 2026-08-30, factored out of `ffs-explorer.py`'s own `NestedArchiveWorker._process_one`, since `app/` modules never import from the top-level script) so there is exactly ONE implementation shared by the examiner's manual "Extract as Nested Archive" / batch action AND `artifact_runner.py`'s own `requires_nested_extraction` (a parser declaring it needs one specific embedded archive extracted first — see `WRITING_ARTIFACT_PARSERS.md` and the Conventions entry below). `already_extracted`/`extracted_path` give a caller the same idempotency check `NestedArchiveWorker` already used, so a prior manual extraction and a parser-triggered one never redo each other's work |
 | `sqlite_carve.py` | Below-SQL-layer deleted-record recovery: freeblocks, freed/freelist pages, and full WAL frame history (not just the current valid chain `sqlite3.connect()` would replay) — decodes SQLite's on-disk record format directly, since a `DELETE`d row's bytes usually survive until something else reuses that space. Invoked automatically by `artifact_runner.py` for any table a parser names in `recoverable_tables`; no recovery code belongs in a parser script itself. Every recovered row also carries its own exact `raw_file`/`raw_offset`/`raw_length` (see `record_source` in Conventions) for the same Hex-panel Record-mode jump a live row gets. Also holds `locate_live_row` — the opposite case, finding a currently-LIVE row's on-disk cell by rowid for the Artifact Viewer's "Record" hex mode. `locate_offset` (added 2026-09-12, see Conventions) is the REVERSE of `locate_live_row` — byte offset in, table/rowid/column out — the prerequisite for the planned Search-tab "interpret this hit as a SQL record" feature (see `TODO.md`). `identify_structure` (same day) classifies an offset that ISN'T a live table row (index/schema-table/freelist/unattached page). `build_page_map` (same day) computes the shared, cacheable page→object map both of those consult — see the "Interpret as SQL Record" Conventions entry's own caching sub-entry, and `db_utils.py`'s `evidence_page_map` table |
-| `artifact_media.py` | `MediaThumbnailDelegate` (per-column QTableView delegate painting a thumbnail instead of raw path text) and `MediaFullViewDialog` (full-size image / video playback with transport controls, opened on double-click) for Report table `media_fields` columns — see Conventions below. Reuses `media_viewer.ThumbnailWorker` for decoding, so results share the Media tab's own on-disk thumbnail cache |
+| `artifact_media.py` | `MediaThumbnailDelegate` (per-column QTableView delegate painting a thumbnail instead of raw path text) and `WebpageThumbnailRenderer` for Report table `media_fields` columns — see Conventions below. Reuses `media_viewer.ThumbnailWorker` for decoding, so results share the Media tab's own on-disk thumbnail cache. `MediaFullViewDialog` (full-size image/video playback, opened on double-click) moved to `media_viewer.py` 2026-09-14 once the Media Browser grew its own double-click call site — imported from there, not defined here anymore |
 | `research_store.py` | Global (cross-case) artifact research notes in `config/research_status.json`, keyed by stream/bundle identity, drives row colouring |
 | `parser_versions.py` | Global (cross-case) parser version tracking in `config/parser_versions.json`, same dev/frozen-path convention as `research_store.py` — a hash-derived version number per parser script plus an optional human-authored changelog; drives the Artifact Viewer's "newer parser version available" banner. See Conventions |
 | `report_columns_store.py` | Per-report column ORDER and VISIBILITY state for the Artifact Viewer's Report table (added 2026-08-30), keyed by bare `script_name`. The two halves are deliberately persisted DIFFERENTLY, per direct design instruction: display ORDER (`get_column_order`/`set_column_order`) is a genuine permanent, global (cross-case) preference — `config/report_columns.json`, same dev/frozen-path convention as `research_store.py`, survives every future run of the app. VISIBILITY (`get_visible_columns`/`set_visible_columns`, which columns are ticked/shown) is deliberately SESSION-ONLY — held in a plain in-memory dict, never written to disk — so reopening the same report later in the same run restores exactly what the examiner had, but restarting the app always resets to Core columns (or every column if the parser declares no `core_fields`); a hidden-column choice is exactly the kind of thing that should never be able to silently persist forever and leave material evidence permanently out of sight. `None` and `[]` are deliberately different states for visibility ("never customized this session" vs. "examiner explicitly chose to show nothing"). Drives the Report table's own "Columns" dialog — see Conventions and `core_fields` in `WRITING_ARTIFACT_PARSERS.md` |
@@ -288,6 +288,25 @@ File order, top to bottom:
 - `requirements.txt`: msgpack, PySide6, blackboxprotobuf (+ pyobjc on macOS);
   mcp + uvicorn are optional at runtime (lazy-imported by the AI-access
   feature) but listed so frozen builds include them.
+- **`av` (PyAV) must be built from source in CI, not installed as a plain
+  wheel** (added 2026-09-14) — see the Conventions "Video thumbnails: PyAV,
+  built from source" entry below for why, and `build-windows-exe.yml`'s own
+  comments for the exact (UNVERIFIED on a real Windows build as of this
+  commit) recipe. `pip install -r requirements.txt` alone on a dev machine
+  pulls the prebuilt wheel instead — fine for manual dev testing, NOT what
+  the shipped exe uses; don't mistake a working dev-venv HEVC thumbnail for
+  proof the frozen build works.
+- **`ffs_explorer.spec`'s `excludes=` list bit the project once already**
+  (2026-09-14) — `'PIL'` sat in the "trim things you definitely don't need"
+  list from before this project had any real use for it; once
+  `media_viewer.py` started depending on it (via `av.VideoFrame.to_image()`)
+  a clean rebuild still silently excluded it until this was caught by
+  reading the build's own warning log, not assumed fixed just because
+  `Pillow` was added to `requirements.txt`. Lesson for the next dependency
+  added here: check `build/ffs_explorer/warn-ffs_explorer.txt` after a
+  CLEAN rebuild (`rm -rf build dist` first — a stale build/ cache can hide
+  a real exclusion) for "excluded module named X" naming anything the new
+  code actually needs, don't just confirm the package installs.
 
 ## Keeping this map current (instruction to Claude)
 
@@ -4465,3 +4484,149 @@ underneath that verification.
   - When adding a new artifact parser or any other timestamp conversion,
     grep the diff for `fromtimestamp(` and `'localtime'` before calling it
     done — neither announces itself as wrong in casual review.
+
+- **Media decoding on Windows: PyAV built from source (video) + `pillow_heif`
+  (HEIC/HEIF), neither of which Qt handles natively there.** Two related
+  gaps closed the same day, both in `app/media_viewer.py`, both because
+  Qt's own decode path silently doesn't work on this project's primary
+  shipped platform for a real, common iOS evidence category.
+
+  **Video thumbnails: PyAV, built from source, not a plain `pip install av`**
+  (`app/media_viewer.py`'s `_video_frame_bytes`, replaced a subprocess
+  `ffmpeg` call 2026-09-14). Prompted by a direct user question ("is there
+  any way we can be faster?") after the zipfile-elimination sweep's own
+  real-archive speed testing, then narrowed to "I want simple, I like the
+  idea of it being in the exe" once TODO.md's own pre-existing item 17
+  (`[CRUSH_REVIEW.md] Evaluate av (PyAV) as a replacement for the
+  subprocess ffmpeg call`) was picked back up. Two real bugs were found
+  and fixed by this switch, confirmed directly against real video files
+  from this project's own IOS17 JoshHickman test archive, not assumed from
+  the library comparison alone:
+
+  1. **The OLD subprocess-ffmpeg implementation had a real, pre-existing
+     correctness bug**, independent of PyAV: it piped video bytes to
+     ffmpeg via `pipe:0` (stdin), which is NOT seekable. Real camera-
+     original MOV/MP4 files (as opposed to web-optimized "faststart"
+     files) commonly store their index (`moov` atom) at the END of the
+     file — ffmpeg reading from a pipe cannot jump there, and failed with
+     "Invalid data found when processing input" on 13/15 real videos
+     sampled from real casework, including ordinary H.264 content, not
+     just an edge case. Confirmed directly: the identical bytes fed to
+     ffmpeg via a real seekable temp file decoded correctly every time.
+     `av.open(io.BytesIO(...))` gives PyAV a genuinely seekable in-memory
+     stream, the same fix, without a temp file at all.
+  2. **PyAV's own official PyPI wheel cannot decode HEVC** (Apple's
+     default recording codec since iOS 11) — confirmed directly: 6/6 real
+     HEVC test videos demuxed every packet in the whole file (matching
+     each file's own declared frame count) with ZERO frames ever decoded,
+     via the library's own documented high-level `container.decode(stream)`
+     API, no exception raised. The HEVC decoder IS registered
+     (`av.codec.Codec('hevc', 'r')` succeeds, real extradata present) but
+     never actually produces output — a real gap in the prebuilt wheel's
+     bundled FFmpeg build, not a fundamental HEVC limitation: the exact
+     same files decode correctly via a real system FFmpeg
+     (Homebrew, `libavcodec 63.1.101`). Confirmed the fix directly too,
+     not just the diagnosis: building PyAV from source
+     (`pip install --no-binary av av==<version>`) linked against that real
+     FFmpeg via `pkg-config` fixed all 6 files, exact frame counts
+     matching their own container metadata (176/901/470/360/360/360).
+
+  This means `av` can NOT just be `pip install`ed for this project's real
+  needs — see `requirements.txt`'s own comment and `build-windows-exe.yml`
+  for the from-source build (real Windows FFmpeg dev package via
+  chocolatey + `pkg-config` discovery) this now requires. **A third real
+  bug was caught before shipping, by actually running a local PyInstaller
+  build rather than assuming the dev-venv result would carry over**:
+  `av.VideoFrame.to_image()` needs PIL/Pillow, which was only present in
+  the dev venv as an incidental transitive dependency of something else —
+  never declared in `requirements.txt`, AND `ffs_explorer.spec` had `'PIL'`
+  sitting in its own `excludes=` list from before this project had any
+  real use for it. A clean rebuild's own warning log
+  (`excluded module named PIL - imported by av.video.frame (delayed)`)
+  caught this directly — see the Build/CI gotchas entry above. Both are
+  now fixed (`Pillow` in `requirements.txt`, `'PIL'` removed from the
+  spec's excludes).
+
+  **Verified so far**: correctness against real archive data (14/15 and
+  39/40 real videos decoded correctly across two independent random
+  samples — the only 2 failures were a genuine 0-byte file and a genuine
+  audio-only MP4 with zero video streams, both correct negatives, not
+  bugs); a local macOS PyInstaller build with the from-source `av`
+  correctly bundled the linked FFmpeg dylibs (PyInstaller's own dependency
+  walker discovered and included `libavcodec.63.dylib` etc. automatically,
+  no manual `binaries=` entry needed on macOS) and PIL's compiled
+  extensions, with zero "excluded"/"missing" warnings for either; the
+  frozen macOS exe launches and stays running (no immediate import-time
+  crash). **NOT yet verified**: the actual Windows CI build — the
+  `ffmpeg-shared`+`pkgconfiglite` chocolatey recipe in
+  `build-windows-exe.yml`, and `ffs_explorer.spec`'s own explicit DLL-glob
+  safety net (added because the community `pyinstaller-hooks-contrib`
+  `av` hook is tuned for the OFFICIAL wheel's DLL-bundling layout, not a
+  from-source build linked against an external chocolatey install) are
+  this session's best-effort implementation of PyAV's own documented
+  Windows build approach, never actually run on a Windows machine. Check
+  the next real Windows build (the user has Parallels available for this)
+  actually plays a real HEVC video thumbnail, not just that the exe
+  launches, before trusting this — see TODO.md item 17 for the full
+  investigation.
+
+  **HEIC/HEIF photos: `pillow_heif`, a fallback behind Qt's own decode,
+  not a replacement for it** (`app/media_viewer.py`'s new
+  `_load_qimage(data, ext)` — the one shared entry point `ThumbnailWorker`
+  and `MediaFullViewDialog._build_image` both now call instead of
+  constructing a bare `QImage` directly). Picked back up directly
+  ("remember we will need this for the thumb and full size since heic
+  cannot be used on a pc via qt ntvlly") once the PyAV work above made the
+  underlying platform gap concrete — TODO.md's own pre-existing item 6
+  (`[CRUSH_REVIEW.md] Verify real HEIC/HEIF photo rendering on an actual
+  Windows frozen build`) had already flagged this but was previously left
+  unstarted. `_load_qimage` tries Qt's native decode first — every format
+  Qt already handles on any platform (JPEG/PNG/etc.) is completely
+  unaffected, never reaches the fallback at all — and only falls back to
+  `pillow_heif` for a `.heic`/`.heif` extension once Qt's own decode has
+  already failed, which is every single HEIC file on Windows (no native
+  codec there at all) but never on macOS (Qt already decodes HEIC
+  natively there via Apple's ImageIO framework).
+
+  **A real, non-obvious bug was found and fixed before this shipped, the
+  same "verify, don't assume the library's own name is enough" discipline
+  the PyAV/HEVC work above already established**: `pillow_heif` reads a
+  HEIC file's real EXIF orientation tag internally but resets the
+  STANDARD orientation tag (`0x0112`) it exposes back to `1` ("no rotation
+  needed"), stashing the true value separately under
+  `img.info['original_orientation']` instead — so `PIL.ImageOps.
+  exif_transpose()` (which only ever reads the standard tag) silently
+  never rotates a real portrait photo, landing every portrait-orientation
+  HEIC sideways (width/height transposed). Found by cross-checking
+  pillow_heif's raw decode against Qt's own (correct, orientation-
+  applying) macOS decode of 20 real portrait HEIC photos from the IOS17
+  JoshHickman archive: 9/20 came out transposed before the fix, 0/20
+  after. Fixed by writing the real `original_orientation` value back into
+  the image's own exif data (`exif[0x0112] = real_orientation`) before
+  calling `ImageOps.exif_transpose()`, so well-tested standard library
+  code does the actual rotation rather than a hand-rolled transform table
+  — deliberately not reimplementing PIL's own orientation-to-transform
+  mapping, the same "call into the sanctioned implementation, never
+  reimplement it elsewhere" discipline this project's zipfile Convention
+  already established for a completely different reason.
+
+  **Verified against real data at every step, not assumed**: since Qt
+  already decodes HEIC natively on this macOS dev machine, the fallback
+  path itself was force-exercised by monkeypatching `QImage.
+  loadFromData` to always fail — the exact condition Windows is always in
+  — and 20/20 real HEIC photos then matched Qt's own ground-truth
+  dimensions through the forced `pillow_heif` path. Both real integration
+  points were independently confirmed under the same forced condition:
+  `MediaFullViewDialog` correctly rendered a real HEIC photo, and
+  `ThumbnailWorker` produced a correctly-scaled (160×120, exact 4:3 aspect
+  match to Qt's own ground truth) thumbnail for a real landscape-oriented
+  photo — confirming the fix holds through scaling and JPEG re-encoding
+  for the on-disk cache, not just the raw decode step. A local macOS
+  PyInstaller build confirmed `pillow_heif`'s own bundled native libraries
+  (`libheif`/`libde265`/`libx265` — bundled INSIDE its own wheel, unlike
+  `av`, so no from-source build or CI chocolatey step is needed for this
+  one) are picked up automatically with zero exclusion warnings, and the
+  frozen macOS exe launches cleanly. **NOT yet verified**: an actual
+  Windows machine, where every real HEIC file must go through this
+  fallback for real (not just the forced-test condition) — same Parallels
+  follow-up as the video work above.

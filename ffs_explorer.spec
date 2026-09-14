@@ -1,7 +1,6 @@
 # ios_ffs_browser.spec
 # -*- mode: python ; coding: utf-8 -*-
 
-import glob
 import os
 import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -19,16 +18,24 @@ block_cipher = None
 # directory, a genuinely different layout that hook was never written for,
 # so its own automatic discovery is not trusted here. Explicitly globbing
 # and bundling every DLL from the same ffmpeg-shared install CI just built
-# `av` against, as a belt-and-braces safety net. UNVERIFIED against a real
-# frozen Windows build as of the commit that added this — see TODO.md item
-# 17 and build-windows-exe.yml's own comment for the full investigation;
-# check the next Windows CI run actually plays a real video thumbnail,
-# not just that the exe launches, before trusting this.
+# `av` against, as a belt-and-braces safety net.
+#
+# The first real Windows CI run (2026-09-14) proved the original hardcoded
+# `tools\*\bin` path guess wrong — the `choco install ffmpeg-shared`
+# package doesn't extract there. Rewritten below to search recursively for
+# wherever the DLLs actually are, matching build-windows-exe.yml's own
+# equivalent fix for the pkg-config discovery step, rather than guessing a
+# second specific path. Still UNVERIFIED end-to-end (a real frozen build
+# actually playing a real video thumbnail) as of this commit — see TODO.md
+# item 17 for the full investigation.
 _ffmpeg_dlls = []
 if sys.platform == 'win32':
-    _ffmpeg_dirs = glob.glob(r'C:\ProgramData\chocolatey\lib\ffmpeg-shared\tools\*\bin')
-    if _ffmpeg_dirs:
-        _ffmpeg_dlls = [(dll, '.') for dll in glob.glob(os.path.join(_ffmpeg_dirs[0], '*.dll'))]
+    _ffmpeg_root = r'C:\ProgramData\chocolatey\lib\ffmpeg-shared'
+    if os.path.isdir(_ffmpeg_root):
+        for _dirpath, _dirnames, _filenames in os.walk(_ffmpeg_root):
+            for _fn in _filenames:
+                if _fn.lower().endswith('.dll'):
+                    _ffmpeg_dlls.append((os.path.join(_dirpath, _fn), '.'))
 
 a = Analysis(
     ['ffs-explorer.py'],

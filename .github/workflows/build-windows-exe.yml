@@ -27,54 +27,32 @@ jobs:
           python-version: '3.12'
 
       # `av` (PyAV, app/media_viewer.py's video-thumbnail decoder since
-      # 2026-09-14) MUST be built from source here, linked against a real
-      # FFmpeg with a working HEVC decoder -- the plain prebuilt PyPI wheel
-      # was confirmed (directly, against real HEVC iPhone video) to yield
-      # zero decoded frames for HEVC content, Apple's default recording
-      # codec since iOS 11. This whole step was UNVERIFIED end-to-end on a
-      # real Windows build as of the commit that first added it, and the
-      # first real run confirmed why: the hardcoded assumption about where
-      # `choco install ffmpeg-shared` extracts its files
-      # (`...\tools\ffmpeg-*-shared\lib\pkgconfig`) was wrong --
-      # `Get-ChildItem` found nothing there at all. Rewritten below to
-      # search for the real `.pc` file wherever the package actually put
-      # it, and to print the full extracted tree first so a future
-      # failure here comes with real diagnostic data instead of another
-      # blind guess. If ffmpeg-shared itself turns out not to ship
-      # pkg-config files at all, check pyav-org/PyAV's own Windows build
-      # docs for its `--ffmpeg-dir`/`FFMPEG_ROOT` alternative to
-      # pkg-config discovery -- see TODO.md item 17 for the full
-      # investigation this was built from.
-      - name: Install FFmpeg dev files (for building PyAV from source)
-        run: |
-          choco install ffmpeg-shared -y
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "choco install ffmpeg-shared failed with exit code $LASTEXITCODE"
-            exit $LASTEXITCODE
-          }
-          choco install pkgconfiglite -y
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "choco install pkgconfiglite failed with exit code $LASTEXITCODE"
-            exit $LASTEXITCODE
-          }
-          Write-Host "=== ffmpeg-shared install tree ==="
-          Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg-shared" -Recurse -ErrorAction SilentlyContinue |
-            Select-Object -First 200 FullName
-
+      # 2026-09-14): the plain prebuilt PyPI wheel was confirmed on macOS
+      # to yield zero decoded frames for real HEVC content (Apple's
+      # default recording codec since iOS 11). A from-source build linked
+      # against a real FFmpeg fixed it there -- but getting an equivalent
+      # Windows FFmpeg dev environment through chocolatey burned two real
+      # CI failures (a stale package checksum, then no pkg-config files at
+      # all in the standard Windows FFmpeg distribution), and reliably
+      # passing PyAV's own `--ffmpeg-dir=` setup.py flag through a modern
+      # `pip install`'s build isolation turned out to be genuinely
+      # uncertain territory neither this session nor a web search could
+      # nail down without just trying it. Per direct instruction, testing
+      # the cheaper hypothesis FIRST instead of continuing to engineer
+      # that blind: the macOS finding was only ever checked against the
+      # macOS wheel -- the Windows wheel is a separately-built artifact
+      # and may simply have HEVC support the macOS one doesn't (Windows
+      # FFmpeg builds are commonly compiled with a more complete codec
+      # set than Apple's own bundling choices). Back to a plain
+      # `pip install -r requirements.txt` for this run -- if the real
+      # Windows build plays a real HEVC thumbnail correctly, the whole
+      # from-source detour was unnecessary; if not, we've ruled it out
+      # cheaply before returning to engineer that path for real. See
+      # TODO.md item 17 for the full investigation.
       - name: Install dependencies
-        env:
-          PKG_CONFIG: pkgconf
         run: |
-          $pcFile = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg-shared" -Recurse -Filter "libavcodec.pc" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $pcFile) {
-            Write-Host "No libavcodec.pc found under the ffmpeg-shared install -- see the previous step's printed tree to find where its files actually landed."
-            exit 1
-          }
-          $pkgConfigDir = $pcFile.DirectoryName
-          Write-Host "Found pkg-config files at: $pkgConfigDir"
-          echo "PKG_CONFIG_PATH=$pkgConfigDir" | Out-File -FilePath $env:GITHUB_ENV -Append
           python -m pip install --upgrade pip
-          pip install --no-binary av -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller
 
       - name: Build with PyInstaller
         run: |

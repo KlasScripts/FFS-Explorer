@@ -1,46 +1,26 @@
 # ios_ffs_browser.spec
 # -*- mode: python ; coding: utf-8 -*-
 
-import os
 import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
 # app/media_viewer.py's video-thumbnail decoder (`av`/PyAV, since
-# 2026-09-14) is built from source in CI, linked against a real FFmpeg's
-# shared DLLs (see build-windows-exe.yml — the official PyPI wheel's own
-# bundled FFmpeg build was confirmed unable to decode HEVC). The
-# `pyinstaller-hooks-contrib` `av` hook is tuned for the OFFICIAL wheel's
-# own DLL-bundling layout (Windows wheels from 9.1.1+ carry their DLLs
-# inside the package itself) — a from-source build instead dynamically
-# links against DLLs sitting in the CI runner's chocolatey install
-# directory, a genuinely different layout that hook was never written for,
-# so its own automatic discovery is not trusted here. Explicitly globbing
-# and bundling every DLL from the same ffmpeg-shared install CI just built
-# `av` against, as a belt-and-braces safety net.
-#
-# The first real Windows CI run (2026-09-14) proved the original hardcoded
-# `tools\*\bin` path guess wrong — the `choco install ffmpeg-shared`
-# package doesn't extract there. Rewritten below to search recursively for
-# wherever the DLLs actually are, matching build-windows-exe.yml's own
-# equivalent fix for the pkg-config discovery step, rather than guessing a
-# second specific path. Still UNVERIFIED end-to-end (a real frozen build
-# actually playing a real video thumbnail) as of this commit — see TODO.md
-# item 17 for the full investigation.
-_ffmpeg_dlls = []
-if sys.platform == 'win32':
-    _ffmpeg_root = r'C:\ProgramData\chocolatey\lib\ffmpeg-shared'
-    if os.path.isdir(_ffmpeg_root):
-        for _dirpath, _dirnames, _filenames in os.walk(_ffmpeg_root):
-            for _fn in _filenames:
-                if _fn.lower().endswith('.dll'):
-                    _ffmpeg_dlls.append((os.path.join(_dirpath, _fn), '.'))
+# 2026-09-14). CI currently installs the plain prebuilt PyPI wheel (see
+# build-windows-exe.yml's own comment for why the from-source-build
+# detour was reverted, pending a real HEVC check against the Windows
+# wheel specifically) — its DLLs are bundled inside the wheel itself
+# (Windows wheels from 9.1.1+), which `pyinstaller-hooks-contrib`'s `av`
+# hook is already tuned for, so no explicit `binaries=` entry is needed
+# here for it, unlike the from-source-build case this project tried and
+# reverted. If a from-source build comes back later, that DLL-bundling
+# problem will need solving again then — see TODO.md item 17.
 
 a = Analysis(
     ['ffs-explorer.py'],
     pathex=['app'],
-    binaries=_ffmpeg_dlls,
+    binaries=[],
     datas=[
         # Bundle config JSON files under config/ next to the exe
         ('config/hardware_models.json', 'config'),

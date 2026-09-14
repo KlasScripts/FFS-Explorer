@@ -4557,18 +4557,32 @@ underneath that verification.
   no manual `binaries=` entry needed on macOS) and PIL's compiled
   extensions, with zero "excluded"/"missing" warnings for either; the
   frozen macOS exe launches and stays running (no immediate import-time
-  crash). **NOT yet verified**: the actual Windows CI build — the
-  `ffmpeg-shared`+`pkgconfiglite` chocolatey recipe in
-  `build-windows-exe.yml`, and `ffs_explorer.spec`'s own explicit DLL-glob
-  safety net (added because the community `pyinstaller-hooks-contrib`
-  `av` hook is tuned for the OFFICIAL wheel's DLL-bundling layout, not a
-  from-source build linked against an external chocolatey install) are
-  this session's best-effort implementation of PyAV's own documented
-  Windows build approach, never actually run on a Windows machine. Check
-  the next real Windows build (the user has Parallels available for this)
-  actually plays a real HEVC video thumbnail, not just that the exe
-  launches, before trusting this — see TODO.md item 17 for the full
-  investigation.
+  crash). **The Windows from-source build was tried for real and reverted
+  the same day**, after two consecutive real CI failures: chocolatey's
+  `ffmpeg-shared` package itself failed (a pinned checksum stale against
+  gyan.dev's rolling "latest" URL — a real, structural fragility in that
+  specific package, not a retry-able fluke), and separately, the standard
+  Windows FFmpeg distribution (confirmed by downloading and inspecting a
+  real, pinned, checksummed mirror at `github.com/GyanD/codexffmpeg`) ships
+  NO pkg-config `.pc` files at all — meaning the whole `PKG_CONFIG_PATH`
+  discovery approach this recipe was built around can never work against
+  it. PyAV's own `setup.py` has a documented `--ffmpeg-dir=` flag for
+  exactly this case, but reliably passing it through a modern `pip
+  install`'s build isolation turned out to be genuinely uncertain even
+  after direct research. Per direct instruction, reverted to a plain
+  `pip install av` for Windows CI to test a cheaper hypothesis first: the
+  HEVC gap was only ever confirmed against the macOS wheel specifically —
+  the Windows wheel is a separately-built artifact that may simply not
+  have the same gap (Windows FFmpeg builds are often compiled with a more
+  complete codec set than Apple's own bundling choices). `ffs_explorer.
+  spec`'s DLL-glob safety net (only needed for a from-source build) was
+  reverted alongside it. **NOT yet verified**: whether the plain Windows
+  wheel actually plays a real HEVC video thumbnail correctly — check the
+  next real Windows build (the user has Parallels available for this)
+  before trusting either way; if it still fails, the `--ffmpeg-dir=`/raw-
+  `setup.py` approach is the documented next step, now that pkg-config is
+  confirmed a dead end for this distribution — see TODO.md item 17 for
+  the full investigation.
 
   **HEIC/HEIF photos: `pillow_heif`, a fallback behind Qt's own decode,
   not a replacement for it** (`app/media_viewer.py`'s new

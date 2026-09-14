@@ -895,18 +895,58 @@ headers — even though nothing here is a vendored copy the way those files are.
     walker found `libavcodec.63.dylib` etc. automatically) and PIL's
     compiled extensions with zero remaining exclusion warnings; the frozen
     macOS exe launches and stays running with no import-time crash.
-    **NOT verified**: the actual Windows CI build. The chocolatey/
-    pkg-config recipe and the spec's DLL-glob safety net are this
-    session's best-effort implementation of PyAV's own documented Windows
-    build approach (confirmed via direct research, not guessed), never
-    run on a real Windows machine — check that the next Windows build (the
-    user has Parallels available for this) actually plays a real HEVC
-    video thumbnail, not just that the exe launches, before trusting this.
+    **The Windows from-source build was attempted for real and reverted,
+    2026-09-14, same day** — two consecutive real CI failures, not
+    theoretical risk: (1) `choco install ffmpeg-shared` failed outright —
+    its own pinned checksum (`8030dc46...`, expecting v8.0.1) no longer
+    matched what gyan.dev's live "latest" URL actually served
+    (`cb4d5e8d...`, v9.0.1) — a real, structural fragility in that
+    specific chocolatey package (it wraps a rolling upstream URL behind a
+    stale pinned hash), not something a retry fixes. (2) Before that was
+    even found, the FIRST attempt failed at a different step: the
+    hardcoded assumption about where the package extracts its files
+    (`...\tools\ffmpeg-*-shared\lib\pkgconfig`) was simply wrong — fixed
+    to search recursively instead, which is what surfaced failure (1).
+    Investigated a direct (non-chocolatey) alternative — a real, pinned,
+    checksummed mirror exists at `github.com/GyanD/codexffmpeg/releases`
+    (confirmed via the GitHub API: a real `9.0.1` tag with a
+    `ffmpeg-9.0.1-full_build-shared.zip` asset) — but downloading and
+    inspecting it directly surfaced a THIRD real problem: this standard
+    Windows FFmpeg distribution ships `.lib`/`.dll.a` import libraries and
+    headers, but **no pkg-config `.pc` files at all** — meaning the
+    `PKG_CONFIG_PATH`-based discovery this whole recipe was built around
+    can never work against it regardless of which download source is
+    used. PyAV's own `setup.py` does have a documented `--ffmpeg-dir=`
+    flag for exactly this no-pkgconfig case, but reliably getting that
+    flag through a modern `pip install`'s build-isolation subprocess
+    turned out to be genuinely uncertain even after direct research (would
+    likely need a raw `setup.py build_ext --ffmpeg-dir=... install`
+    invocation instead of `pip install`, itself unverified).
+
+    Per direct instruction, rather than keep engineering an increasingly
+    complex, still-unverified recipe, **reverted to a plain
+    `pip install av` for Windows CI** to test a cheaper hypothesis first:
+    the HEVC-decode gap was only ever confirmed against the *macOS*
+    prebuilt wheel — the Windows wheel is a separately-built artifact and
+    Windows FFmpeg builds are often compiled with a more complete codec
+    set than Apple's own bundling choices, so it may simply not have the
+    same gap. `ffs_explorer.spec`'s DLL-glob safety net (needed only for
+    a from-source build) was reverted alongside it — the plain wheel
+    bundles its own DLLs, which `pyinstaller-hooks-contrib`'s `av` hook is
+    already built for.
+    **NOT yet verified**: the actual Windows CI build under this reverted,
+    simpler recipe — specifically, whether the plain Windows wheel plays
+    a real HEVC video thumbnail correctly or not. If it doesn't, the
+    from-source path above will need to be revisited with the
+    `--ffmpeg-dir=`/raw-`setup.py` approach, now that the pkg-config path
+    is confirmed to be a dead end for this distribution.
     *Source: Crush (`av` dependency vs. this project's own subprocess
     `ffmpeg` call) for the original idea; the HEVC-decode bug, its
-    from-source fix, and the pipe-seekability bug were all found via this
-    session's own direct investigation, not from Crush or any other
-    sibling tool.*
+    from-source fix (macOS), the pipe-seekability bug, and the full
+    Windows CI investigation (all three real failures, and the decision
+    to revert and test the simpler hypothesis first) were all found via
+    this session's own direct investigation and real CI runs, not from
+    Crush or any other sibling tool.*
 
 18. **[ALEAPP, low cost] Consider a `sample_data`-style lightweight
     provenance note per parser** — a one-line "confirmed N rows on

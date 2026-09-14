@@ -1,14 +1,16 @@
 msgpack
 PySide6
 # app/media_viewer.py's video-thumbnail extraction (replaced a subprocess
-# `ffmpeg` call 2026-09-14). The official PyPI wheel's bundled FFmpeg build
-# cannot decode HEVC (confirmed directly: 6/6 real HEVC test videos yielded
-# zero frames) -- CI must build this from source linked against a real
-# FFmpeg (see build-windows-exe.yml), not just `pip install av`. A plain
-# `pip install -r requirements.txt` on a dev machine (as CLAUDE.md's "Always
-# run with the project venv" instructions assume) will pull the prebuilt
-# wheel instead and silently lose HEVC support -- fine for most manual
-# testing, but NOT what the shipped Windows exe uses.
+# `ffmpeg` call 2026-09-14). The official macOS PyPI wheel's bundled
+# FFmpeg build cannot decode HEVC (confirmed directly: 6/6 real HEVC test
+# videos yielded zero frames) -- a from-source build linked against a
+# real FFmpeg fixed it there. A from-source Windows build was attempted
+# in CI too, but reverted after two real failures (chocolatey package
+# fragility, then no pkg-config files in the standard Windows FFmpeg
+# distribution) -- CI currently installs the plain wheel and this is
+# PENDING a real check of whether the separately-built WINDOWS wheel
+# has the same HEVC gap the macOS one does (never confirmed either way).
+# See build-windows-exe.yml's own comment and TODO.md item 17.
 av
 # av.VideoFrame.to_image() (used by _video_frame_bytes above) requires PIL/
 # Pillow -- confirmed a real gap during a local PyInstaller smoke build:

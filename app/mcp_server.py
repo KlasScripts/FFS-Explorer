@@ -466,7 +466,7 @@ def build_server(ctx: CaseContext):
         if path not in ui_metadata and path not in folder_map:
             return {'error': f'path not in archive: {path!r} — try find_paths'}
         d = _entry_meta(path, ui_metadata, folder_map)
-        bundle = (ctx.adapter.bundle_id_for_path(path, ctx.get_guid_to_bundle())
+        bundle = (ctx.adapter.bundle_id_for_path(path, ctx.get_guid_to_bundle(), folder_map)
                  if ctx.adapter else None)
         if bundle:
             d['app_bundle'] = bundle
@@ -481,7 +481,11 @@ def build_server(ctx: CaseContext):
         guid_map = ctx.get_guid_to_bundle()
         folder_map = ctx.get_folder_map()
         sizes = ctx.get_folder_sizes()
-        parents = ctx.adapter.container_parents() if ctx.adapter else []
+        # folder_map passed through: FORMAT_GRAYKEY and FORMAT_CELLEBRITE
+        # are both ambiguous between iOS/Android (see FfsAdapter.is_android's
+        # own docstring) — without it this silently returned 0 containers
+        # for a GrayKey- or Cellebrite-format Android archive.
+        parents = ctx.adapter.container_parents(folder_map) if ctx.adapter else []
         out = []
         for parent in parents:
             for child in folder_map.get(parent, []):

@@ -92,14 +92,14 @@ def main() -> int:
         guid_to_bundle = {**guid_to_bundle, **ls_guid_map}
     group_owner = _group_owner_from_registry(app_registry_rows)
 
-    platform = 'android' if adapter.format == adapter.FORMAT_ZIP_EXTRAS else 'ios'
+    platform = 'android' if adapter.is_android(folder_map) else 'ios'
     read_bytes = _make_read_bytes(args.zip_path, adapter) if args.raw else None
 
     # {identity_app_id: [container_path, ...]} — same Data/Application +
     # Shared/AppGroup merge-by-owning-bundle-id scan_apps does, so this
     # test exercises exactly what list_apps' live mechanism would see.
     containers_by_app: dict[str, list[str]] = {}
-    for parent in adapter.container_parents():
+    for parent in adapter.container_parents(folder_map):
         for child in folder_map.get(parent, []):
             own_id = adapter.container_bundle_id(child, guid_to_bundle)
             if not own_id:

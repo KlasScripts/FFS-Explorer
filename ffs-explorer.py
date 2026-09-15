@@ -6218,12 +6218,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         return ''
 
     def _is_android_archive(self) -> bool:
-        fmt = self._adapter.format
-        if fmt == FfsAdapter.FORMAT_ZIP_EXTRAS:
-            return True
-        if fmt == FfsAdapter.FORMAT_GRAYKEY:
-            return 'data/data' in self.folder_map
-        return False
+        return self._adapter.is_android(self.folder_map)
 
     def _android_shortcuts(self) -> list:
         user_data = self._android_user_data_path or 'data/media/0'

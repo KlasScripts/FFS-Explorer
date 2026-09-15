@@ -1157,16 +1157,19 @@ def scan_apps(ctx) -> list:
     permissions_declared are only filled when ctx.raw_content_enabled —
     otherwise left None and scored as 'unknown', never as confirmed-absent.
     """
-    platform = 'android' if (ctx.adapter and
-        ctx.adapter.format == ctx.adapter.FORMAT_ZIP_EXTRAS) else 'ios'
-    coverage = resolve_parser_coverage(platform)
-    parser_locations = resolve_parser_locations(platform)
-
     guid_map = ctx.get_guid_to_bundle()
     folder_map = ctx.get_folder_map()
     ui_metadata = ctx.get_ui_metadata()
     sizes = ctx.get_folder_sizes()
-    parents = ctx.adapter.container_parents() if ctx.adapter else []
+    # is_android(folder_map), not a bare format check: both FORMAT_GRAYKEY
+    # and FORMAT_CELLEBRITE are genuinely ambiguous between iOS/Android —
+    # see FfsAdapter.is_android's own docstring. A bare format check here
+    # silently returned 0 apps for a real GrayKey- or Cellebrite-format
+    # Android archive before this fix (2026-09-16).
+    platform = 'android' if (ctx.adapter and ctx.adapter.is_android(folder_map)) else 'ios'
+    coverage = resolve_parser_coverage(platform)
+    parser_locations = resolve_parser_locations(platform)
+    parents = ctx.adapter.container_parents(folder_map) if ctx.adapter else []
 
     # A file's own mtime can legitimately postdate this analysis machine's
     # clock (an old case reopened later) but can NEVER legitimately postdate
@@ -1454,8 +1457,8 @@ def scan_apps(ctx) -> list:
             # 'Client', its actual .app folder name) or simply blank
             # (com.viber) — only reachable when raw_content_enabled, so
             # falls back to the always-available csstore name, then to the
-            # bare bundle id (unchanged final fallback, artifact_viewer.py's
-            # _flatten_app_intelligence_row).
+            # bare bundle id (unchanged final fallback, this module's own
+            # flatten_row).
             'display_name': plist_display_name or display_names.get(app_id),
             'containers': [{'app_id': mid, 'path': child, 'kind': kind}
                           for mid, child, kind in members],
@@ -1680,3 +1683,18 @@ def flatten_row(row: dict, registry_by_bundle: dict, plugins_by_bundle: dict) ->
         'has_parser':                    'Yes' if row.get('has_parser') else 'No',
         'category':                      category,
     }
+
+
+def build_app_report_rows(ctx) -> list:
+    """The shared body of artifacts/ios|android/app_report.py's own
+    run() — both scripts were byte-for-byte identical here (scan_apps ->
+    build_app_registry_lookup -> flatten_row per row), which is exactly
+    the copy-paste-drift risk this project's own "parser scripts stay
+    thin declarations over shared logic in app/" convention exists to
+    avoid: a future change to this sequence only needed to happen in one
+    file, not stay in sync across two. Factored out 2026-09-16 after a
+    direct restructuring review flagged the duplication."""
+    rows = scan_apps(ctx)
+    app_ids = [r.get("app_id", "") for r in rows]
+    registry_by_bundle, plugins_by_bundle = build_app_registry_lookup(ctx.case_dir, app_ids)
+    return [flatten_row(r, registry_by_bundle, plugins_by_bundle) for r in rows]

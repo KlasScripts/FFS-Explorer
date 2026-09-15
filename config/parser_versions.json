@@ -3,9 +3,11 @@
   "format_version": 1,
   "parsers": {
     "android:app_report": {
-      "changelog": {},
-      "hash": "a0ee789d087f3816",
-      "version": 1
+      "changelog": {
+        "2": "Factored the duplicated run() body (shared with ios/app_report.py) into app_intelligence.build_app_report_rows()."
+      },
+      "hash": "6a0278408fed7ca4",
+      "version": 2
     },
     "android:burner": {
       "changelog": {
@@ -222,9 +224,11 @@
       "version": 5
     },
     "ios:app_report": {
-      "changelog": {},
-      "hash": "a6db62161f70195e",
-      "version": 3
+      "changelog": {
+        "4": "Factored the duplicated run() body (shared with android/app_report.py) into app_intelligence.build_app_report_rows()."
+      },
+      "hash": "60e9288611b3455f",
+      "version": 4
     },
     "ios:instagram": {
       "changelog": {

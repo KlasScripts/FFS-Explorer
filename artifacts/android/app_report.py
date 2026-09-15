@@ -55,13 +55,7 @@ byte_fields = ["total_bytes"]
 def run(paths):
     import app_intelligence
 
-    ctx = paths["_case_context"]
-    rows = app_intelligence.scan_apps(ctx)
-    app_ids = [r.get("app_id", "") for r in rows]
-    # build_app_registry_lookup still safe to call on Android -- returns
-    # ({}, plugins_by_bundle) since app_registry is iOS-only, matching
-    # app_intelligence.py's own documented behavior for this case.
-    registry_by_bundle, plugins_by_bundle = app_intelligence.build_app_registry_lookup(
-        ctx.case_dir, app_ids)
-    return [app_intelligence.flatten_row(r, registry_by_bundle, plugins_by_bundle)
-           for r in rows]
+    # build_app_report_rows' own build_app_registry_lookup call is safe on
+    # Android too -- returns ({}, plugins_by_bundle) since app_registry is
+    # iOS-only, matching app_intelligence.py's own documented behavior.
+    return app_intelligence.build_app_report_rows(paths["_case_context"])

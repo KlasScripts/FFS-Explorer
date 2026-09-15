@@ -290,7 +290,7 @@ def _find_metadata_only_folders(
 
 def _find_missing_plists(folder_map: dict, ffs_adapter, guid_to_bundle: dict) -> list:
     """Return UUID container folders whose MCM metadata plist is unresolved."""
-    parents = ffs_adapter.container_parents()
+    parents = ffs_adapter.container_parents(folder_map)
     return [
         p for p in folder_map
         if p.rsplit('/', 1)[0] in parents

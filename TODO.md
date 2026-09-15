@@ -1948,6 +1948,73 @@ headers — even though nothing here is a vendored copy the way those files are.
     click Update, see it clear) is the one remaining unverified step.
     *Source: direct user request, 2026-09-15.*
 
+28. **[FIXED, 2026-09-16] `app_report`/`list_apps` returned 0 apps for a
+    GrayKey- or Cellebrite-format Android archive — a real, pre-existing
+    bug found while re-verifying item 26's restructuring, not caused by
+    it.** Confirmed by `git blame`: the buggy code (`container_parents`,
+    `container_bundle_id`, `scan_apps`'s own `platform` line) predates
+    this session's commit entirely — the OLD hardcoded "Apps" GUI node
+    would have been equally broken for these two archives, it just never
+    got tested against them before.
+
+    Root cause: `FfsAdapter.format` has only three values —
+    `FORMAT_ZIP_EXTRAS` (always Android), `FORMAT_GRAYKEY`, and
+    `FORMAT_CELLEBRITE` — but the latter two are each genuinely AMBIGUOUS
+    between iOS and Android; every piece of code that assumed
+    "not `FORMAT_ZIP_EXTRAS` means iOS" was wrong for two real archives in
+    this project's own test data: "Android 14 CTF26 Magnet" detects as
+    `FORMAT_GRAYKEY`, and "Android 15 CTF25 Cellebrite" — a real Android
+    device — detects as plain `FORMAT_CELLEBRITE`. `ffs-explorer.py`'s own
+    `_is_android_archive()` already knew about the GrayKey half of this
+    (checking `'data/data' in folder_map`) but not the Cellebrite half,
+    and `app_intelligence.scan_apps()`/`FfsAdapter.container_parents()`/
+    `container_bundle_id()` didn't use that check at all — three
+    independent, incomplete ways of answering the same "is this Android"
+    question, exactly the "5 slightly different ways to do the same
+    thing" the restructuring review was asked to watch for.
+
+    Fixed with one new canonical method, `FfsAdapter.is_android(folder_map
+    =None)`: `FORMAT_ZIP_EXTRAS` is always Android; otherwise, when a
+    folder_map is available, `'data/data' in folder_map` decides it
+    (confirmed absent from every real iOS archive checked — never a
+    legitimate iOS ui_path prefix); with no folder_map yet (a few
+    first-parse-time callers), conservatively falls back to the
+    pre-existing iOS assumption rather than guessing.
+    `container_parents(folder_map=None)` and `bundle_id_for_path(...,
+    folder_map=None)` both gained the same optional parameter and now
+    call `is_android()` instead of a bare format check.
+    `container_bundle_id()` needed a different, more local fix (it has no
+    folder_map to check): its own `child_path` argument already carries
+    an unambiguous signal — only Android's own container layout ever
+    produces a `data/data/` prefix, regardless of format — so it checks
+    that directly rather than threading folder_map through a third
+    parameter. `ffs-explorer.py`'s own `_is_android_archive()` now
+    delegates to `self._adapter.is_android(self.folder_map)` instead of
+    keeping its own (incomplete) copy of this logic — one definition,
+    not two. `app_intelligence.scan_apps()`, `mcp_server.py`'s
+    `list_app_containers`/`get_file_metadata`, `ffs_metadata.py`'s
+    `_find_missing_plists`, and `scripts/validate_evidence_ranking.py`
+    all updated to pass `folder_map` through at their own call sites.
+
+    The iOS-side GrayKey-vs-Cellebrite path-prefix distinction
+    (`private/var/` vs no prefix) inside `container_parents()` is
+    completely separate logic, untouched by this fix — confirmed
+    explicitly, not just assumed, against real archives for all four
+    real combinations: Cellebrite iOS (IOS17 JoshHickman, no prefix,
+    1,096 apps, unchanged), GrayKey iOS (IOS18 CTF25 Magnet, correct
+    `private/var/` prefix, `is_android()` correctly `False`), Cellebrite
+    Android (Android 15 CTF25 Cellebrite, **0 → 197 apps**), GrayKey
+    Android (Android 14 CTF26 Magnet, **0 → 485 apps**). A synthetic
+    unit test also confirmed `is_android()`'s behavior across every
+    format × folder_map combination directly, including the
+    no-folder-map fallback case.
+    *Source: found during a direct-request restructuring review, then
+    confirmed via a direct follow-up question ("did you check both
+    cellebrite and graykey ffs android work") and a reminder ("remember
+    that ios is different for cellebrite and greykey as well") that
+    prompted verifying all four real combinations rather than stopping
+    at two.*
+
 ## Considered and NOT recommended (kept here so they aren't silently lost)
 
 - **A full Cellebrite-style single-unified-table rewrite of the four

@@ -13,10 +13,10 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QComboBox, QHBoxLayout, QVBoxLayout,
     QTableView, QTreeView, QPlainTextEdit, QStackedWidget, QSplitter,
     QScrollArea, QCheckBox, QPushButton, QDialog, QMessageBox,
-    QProgressDialog, QMenu, QDateEdit, QSpinBox, QDoubleSpinBox, QGroupBox,
+    QProgressDialog, QMenu, QSpinBox, QDoubleSpinBox, QGroupBox,
     QTextBrowser, QListWidget, QListWidgetItem, QAbstractItemView,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex, QDate
+from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
 
 from db_utils import _open_results_db, start_run_log, complete_run_log, load_last_run

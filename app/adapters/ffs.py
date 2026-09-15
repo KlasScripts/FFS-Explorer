@@ -545,9 +545,47 @@ class FfsAdapter:
                 candidates.append(f"/{s}")
         return candidates
 
-    def container_parents(self) -> tuple[str, ...]:
-        """Return ui_path prefixes for app container parent folders."""
+    def is_android(self, folder_map: dict | None = None) -> bool:
+        """Whether this archive is Android, not iOS.
+
+        FORMAT_ZIP_EXTRAS is always Android. FORMAT_GRAYKEY and
+        FORMAT_CELLEBRITE are BOTH genuinely ambiguous — confirmed on two
+        separate real archives, not just GrayKey: "Android 14 CTF26
+        Magnet" detects as FORMAT_GRAYKEY despite its own tool name, and
+        "Android 15 CTF25 Cellebrite" — a real Android device — detects as
+        plain FORMAT_CELLEBRITE (the same zip layout/prefix-detection
+        heuristic Cellebrite uses for iOS, since a Cellebrite Android
+        extraction apparently isn't distinguished by container_parents'
+        old per-format branching at all). Disambiguated the same way
+        regardless of which of these two formats it is: checking for
+        Android's own `data/data` folder in the archive's already-built
+        folder_map — confirmed absent from every real iOS archive checked
+        (no legitimate iOS ui_path ever starts with `data/data`, an
+        Android/Linux-specific convention). The single canonical
+        definition of this check, shared by every caller that used to
+        hand-roll its own equivalent (ffs-explorer.py's
+        FastZipBrowser._is_android_archive, before it was fixed
+        2026-09-16 to delegate here instead — that version only checked
+        FORMAT_GRAYKEY, missing the FORMAT_CELLEBRITE case entirely too).
+        *folder_map* is optional only because a few callers
+        (ffs_metadata.py, at first-parse time) don't have one yet — no
+        folder_map means this conservatively falls back to the
+        pre-existing iOS-only assumption rather than guessing."""
         if self.format == self.FORMAT_ZIP_EXTRAS:
+            return True
+        if folder_map is not None:
+            return 'data/data' in folder_map
+        return False
+
+    def container_parents(self, folder_map: dict | None = None) -> tuple[str, ...]:
+        """Return ui_path prefixes for app container parent folders.
+
+        Pass *folder_map* when available (every real caller has one) so a
+        GrayKey- or Cellebrite-format ANDROID archive correctly gets
+        Android's own `data/data` prefix instead of the iOS-only default
+        below — see is_android()'s own docstring for why neither format
+        alone can decide this."""
+        if self.is_android(folder_map):
             return ("data/data",)
         pv = "private/var/" if self.format == self.FORMAT_GRAYKEY else ""
         return (
@@ -596,16 +634,25 @@ class FfsAdapter:
         Android's data/data/<package> layout needs no indirection — the
         folder name already *is* the package id. iOS containers are
         GUID-named; resolve through the guid->bundle map built at
-        metadata-parse time."""
+        metadata-parse time. Checks the child_path's OWN 'data/data/'
+        prefix directly, not self.format == FORMAT_ZIP_EXTRAS alone —
+        that alone misses a GrayKey-format ANDROID archive (FORMAT_GRAYKEY
+        is genuinely ambiguous between iOS/Android, see is_android()'s own
+        docstring); the child_path itself already carries an unambiguous
+        signal no format check is needed for, since only Android's own
+        container layout ever produces a 'data/data/' prefix regardless of
+        which tool acquired it."""
         name = child_path.rsplit('/', 1)[-1]
-        if self.format == self.FORMAT_ZIP_EXTRAS:
+        if self.format == self.FORMAT_ZIP_EXTRAS or child_path.startswith('data/data/'):
             return name
         return guid_map.get(name)
 
-    def bundle_id_for_path(self, path: str, guid_map: dict) -> str | None:
+    def bundle_id_for_path(self, path: str, guid_map: dict, folder_map: dict | None = None) -> str | None:
         """Resolve the owning app's bundle/package id for an arbitrary path
-        that falls under one of container_parents(), or None if it doesn't."""
-        for parent in self.container_parents():
+        that falls under one of container_parents(), or None if it doesn't.
+        Pass folder_map when available — see container_parents()'s own
+        docstring for why a GrayKey-format Android archive needs it."""
+        for parent in self.container_parents(folder_map):
             prefix = parent + '/'
             if path.startswith(prefix):
                 child_name = path[len(prefix):].split('/', 1)[0]

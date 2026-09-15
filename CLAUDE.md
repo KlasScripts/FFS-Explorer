@@ -79,7 +79,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 
 | File | What it is |
 |---|---|
-| `adapters/ffs.py` | `FfsAdapter` — single place for Cellebrite/GrayKey/iOS/Android differences; path resolution, plist candidate paths, prefix detection. `build_app_registry()` (added 2026-08-23) is the primary source of iOS's `app_registry` table — see "iOS app registry (LaunchServices)" below; a no-op returning `([], {})` on Android |
+| `adapters/ffs.py` | `FfsAdapter` — single place for Cellebrite/GrayKey/iOS/Android differences; path resolution, plist candidate paths, prefix detection. `build_app_registry()` (added 2026-08-23) is the primary source of iOS's `app_registry` table — see "iOS app registry (LaunchServices)" below; a no-op returning `([], {})` on Android. `is_android(folder_map=None)` (added 2026-09-16, see Conventions' "FORMAT_GRAYKEY/FORMAT_CELLEBRITE are both iOS/Android-ambiguous" entry) is the ONE canonical "is this archive Android" check — only `FORMAT_ZIP_EXTRAS` is unambiguously Android by format alone; `FORMAT_GRAYKEY`/`FORMAT_CELLEBRITE` both need a real folder_map (`'data/data'` presence) to tell |
 | `csstore.py` | Vendored parser (added 2026-08-23) for Apple's undocumented **LaunchServices csstore** binary format (`bdsl` magic) — MIT, from `github.com/JJTech0130/launchservices`; verbatim except removing a debug `print()` in `hashmap_from_stream()` that would spam stdout on every case load (documented in the file's own provenance header). Only the low-level `CSStore`/`CSTable`/string-table classes are used — `lsdatabase.py`'s higher-level wrapper was deliberately NOT vendored (confirmed crashing on real data decoding `icon_files`); the `Bundle`/`PropertyList` table field offsets `adapters/ffs.py` actually reads were reverse-engineered fresh against real casework instead — see below |
 | `adapters/graykey.py` | GrayKey zip metadata (timestamps/xattrs from extra fields), based on gkls |
 | `ffs_metadata.py` | Qt-free first-open parsing (runs in child process); msgpack snapshot pack/unpack. `load_snapshot_from_case(case_dir)` (added 2026-09-15) reloads the persisted snapshot from disk alone, no live GUI object — used by `artifact_runner.py`'s `device_wide` parser capability (see Conventions) |
@@ -4725,6 +4725,55 @@ underneath that verification.
   addressed follow-up, not something this pass fixed; every other
   sub-step measured is sub-30ms and not worth chasing further. See
   TODO.md item 25 for the full investigation.
+
+- **`FORMAT_GRAYKEY`/`FORMAT_CELLEBRITE` are both iOS/Android-ambiguous —
+  use `FfsAdapter.is_android(folder_map)`, never a bare format check**
+  (2026-09-16, found while re-verifying the App Report restructuring
+  below against real data, not caused by it — confirmed via `git blame`
+  that the buggy code predated this session). `FfsAdapter.format` has
+  only three values: `FORMAT_ZIP_EXTRAS` is always Android, but
+  `FORMAT_GRAYKEY` and `FORMAT_CELLEBRITE` are each genuinely ambiguous
+  — confirmed on two real archives in this project's own test data:
+  "Android 14 CTF26 Magnet" detects as `FORMAT_GRAYKEY` despite its own
+  tool name, and "Android 15 CTF25 Cellebrite" — a real Android device —
+  detects as plain `FORMAT_CELLEBRITE`. Three call sites each had their
+  own incomplete way of guessing platform — `ffs-explorer.py`'s
+  `_is_android_archive()` checked the GrayKey half only (`'data/data' in
+  folder_map`), while `app_intelligence.scan_apps()`/
+  `FfsAdapter.container_parents()`/`container_bundle_id()` didn't check
+  either ambiguous case at all — meaning `app_report`/`list_apps`/
+  `list_app_containers` all silently returned 0 apps for a GrayKey- or
+  Cellebrite-format Android archive.
+
+  Fixed with one canonical `FfsAdapter.is_android(folder_map=None)`:
+  `FORMAT_ZIP_EXTRAS` → always Android; otherwise, with a real
+  folder_map, `'data/data' in folder_map` decides it (confirmed absent
+  from every real iOS archive checked — never a legitimate iOS ui_path
+  prefix); with no folder_map yet (a few first-parse-time callers),
+  conservatively keeps the old iOS-only assumption rather than guessing.
+  `container_parents(folder_map=None)`/`bundle_id_for_path(...,
+  folder_map=None)` both call it instead of a bare format check.
+  `container_bundle_id()` uses a more local fix instead (no folder_map
+  argument to thread through): its own `child_path` already carries an
+  unambiguous signal — only Android's container layout ever produces a
+  `data/data/` prefix, regardless of format. `ffs-explorer.py`'s
+  `_is_android_archive()` now delegates to
+  `self._adapter.is_android(self.folder_map)` instead of keeping its own
+  incomplete copy — one definition, not several slightly different ones.
+  `app_intelligence.scan_apps()`, `mcp_server.py`'s
+  `list_app_containers`/`get_file_metadata`, `ffs_metadata.py`'s
+  `_find_missing_plists`, and `scripts/validate_evidence_ranking.py` all
+  updated to pass `folder_map` through.
+
+  The pre-existing iOS-side GrayKey-vs-Cellebrite path-prefix distinction
+  inside `container_parents()` (`private/var/` vs no prefix) is separate
+  logic, untouched by this fix — confirmed against real archives for all
+  four real combinations, not just reasoned through: Cellebrite iOS
+  (IOS17 JoshHickman, no prefix, 1,096 apps, unchanged), GrayKey iOS
+  (IOS18 CTF25 Magnet, correct `private/var/` prefix, `is_android()`
+  correctly `False`), Cellebrite Android (Android 15 CTF25 Cellebrite,
+  0 → 197 apps), GrayKey Android (Android 14 CTF26 Magnet, 0 → 485
+  apps). See TODO.md item 28 for the full writeup.
 
 - **App Report parser scripts (device_wide API)** (2026-09-15) — what
   used to be a hardcoded "Apps" tree node (see the SUPERSEDED entry

@@ -142,6 +142,48 @@ def get_changelog_entry(platform: str, script_name: str, version) -> str | None:
     return entry.get("changelog", {}).get(str(version))
 
 
+def get_coverage_fingerprint(platform: str) -> int:
+    """A stable fingerprint over EVERY known parser's own version for
+    *platform*, changing whenever any parser's content changes, a new
+    parser is added, or one is removed.
+
+    Added 2026-09-15 for `device_wide` parsers (see artifact_runner.py's
+    own module docstring) whose OWN output depends on the FULL SET of
+    available parsers, not just their own script content —
+    artifacts/ios|android/app_report.py's `has_parser`/`score` columns
+    are exactly this: derived from which OTHER parsers exist at scan
+    time, per app_intelligence.resolve_parser_coverage(). The existing
+    per-script version check above (get_current_version, used by the
+    "newer parser version available" banner) only ever detects THIS
+    script's own content changing — it has no way to notice that a
+    DIFFERENT script was added or updated, which is exactly the case
+    that makes app_report's own has_parser/score stale. Direct user
+    request: "if a new artifact script is added the [app report] can see
+    that and it ask the user if they want to rerun" — same passive,
+    examiner-decides banner+button pattern as the existing per-script
+    version check, not a new interruptive dialog.
+
+    Call this AFTER list_artifacts(platform) has run for this session
+    (it calls check_version() for every script it loads), so the store
+    already reflects every parser's current version — the same
+    precondition get_current_version's own callers already rely on."""
+    data = _load()
+    prefix = f"{platform}:"
+    entries = sorted(
+        (key[len(prefix):], v.get("version", 0))
+        for key, v in data.items() if key.startswith(prefix)
+    )
+    # signed=True: this gets stored in run_log's own INTEGER column
+    # (SQLite's INTEGER storage class is a signed 64-bit value) — an
+    # unsigned int.from_bytes() read of a full 8-byte digest can exceed
+    # 2**63-1, which sqlite3's own INTEGER binding rejects outright
+    # (OverflowError) rather than silently truncating. Two's-complement
+    # sign only affects which HALF of the value space this lands in, not
+    # its usefulness as a change-detection fingerprint.
+    digest = hashlib.blake2b(repr(entries).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
 def record_changelog(platform: str, script_name: str, description: str) -> bool:
     """Attach a human-authored description to the CURRENT version of a
     parser. Call this deliberately right after intentionally editing a

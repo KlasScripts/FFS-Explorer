@@ -281,6 +281,46 @@ HOW) and has real code elsewhere doing the actual work:
                        SQL-backed entries above, just for two different
                        byte ranges of one file instead of two SQL tables.
 
+Device-wide API (added 2026-09-15, for a parser that scans the WHOLE
+device rather than one app's own files — currently only
+artifacts/ios/app_report.py and artifacts/android/app_report.py, moved
+here from what used to be a hardcoded "Apps" tree node in
+artifact_viewer.py, per direct user request to make it a normal,
+manually-run report instead of something that auto-populated at case
+load):
+    device_wide  bool  — True instead of app_path/app_group/files. No
+                          single app to scope to, so the normal
+                          files/optional_files resolution is skipped
+                          entirely.
+    run(paths)             — same call shape as the multi-file API
+                              above, with the same reserved keys
+                              (_zip_names, _read_zip_bytes, _adapter,
+                              _parser_files_dir) PLUS a new one:
+    paths['_case_context']  — a mcp_server.CaseContext built fresh from
+                              the case's own persisted load-snapshot
+                              (ffs_metadata.load_snapshot_from_case) —
+                              never the live GUI window object, so a
+                              device-wide parser stays exactly as
+                              headless/testable as every other one. Give
+                              this straight to app_intelligence.scan_apps()
+                              — same object shape, same function, the GUI's
+                              own former "Apps" tab used. raw_content_enabled
+                              is always True here (this is a direct,
+                              examiner-triggered parser run against the
+                              examiner's own already-open case, not an
+                              AI/MCP client needing separate consent — same
+                              reasoning the GUI's own former Apps view
+                              already used). Returns [], "<script>: case
+                              snapshot not available..." if the case was
+                              never fully opened (no snapshot on disk yet)
+                              — the parser's own run() is never even called
+                              in that case, matching every other early-
+                              return failure shape in this function.
+    recoverable_tables/media_fields/timestamp_fields/record_source all
+    still work identically for a device_wide parser's own output rows —
+    nothing about this API changes how the OUTPUT is declared, only how
+    run() gets its INPUT.
+
 Parser helpers — small, generic utilities importable directly from a
 script's own run() (`from artifact_runner import first_nonempty`), for a
 pattern more than one parser needs, so the logic lives once instead of
@@ -309,6 +349,7 @@ import zipfile
 import nska_deserialize
 
 import nested_archive
+from db_utils import _open_cache_db, load_folder_data, load_guid_bundle_map
 from zip_entry import ZipEntry
 
 if getattr(sys, 'frozen', False):
@@ -565,6 +606,80 @@ def _make_zip_byte_reader(zip_path: str, zip_obj: zipfile.ZipFile | None):
     return _read
 
 
+def _build_case_context(zip_path: str, case_dir: str, adapter, guid_to_bundle: dict | None,
+                        read_physical_bytes):
+    """Build a mcp_server.CaseContext for a `device_wide` parser (see
+    run_artifact's own device_wide branch), loaded fresh from the case's
+    own persisted snapshot — never the live GUI window object, so a
+    device-wide parser stays headless/testable like every other one.
+    Returns None if no snapshot exists yet (case never fully opened).
+
+    A real, subtle mismatch was caught before this shipped, not assumed
+    correct from the two functions' similar names: `_make_zip_byte_reader`
+    (the source of *read_physical_bytes* here — run_artifact's own
+    `_read_zip_bytes` reserved key) takes a PHYSICAL zip entry name, but
+    `CaseContext.read_bytes` (per its own docstring, and confirmed via
+    app_intelligence.scan_apps()'s real usage) is called with a UI_PATH,
+    which the CALLEE resolves internally — exactly what the GUI's own
+    former Apps-tab construction did via `self._read_zip_bytes(ui_path)`
+    (hex_viewer.py, which resolves ui_path -> physical before reading).
+    Passing the physical-path reader straight through as read_bytes would
+    have silently failed every single read (a ui_path never matches a
+    real physical zip entry name directly for a GUID-containerized iOS
+    app) — this wraps it with the same resolve-then-read step instead.
+
+    guid_to_bundle is loaded fresh from disk (db_utils.load_guid_bundle_map)
+    rather than trusting the *guid_to_bundle* parameter — found necessary
+    by direct testing: scan_apps() resolves every GUID-named container to
+    its real app via exactly this map (container_bundle_id), and an empty
+    or stale one silently makes every container resolve to nothing, not
+    an error. run_artifact's own callers today do thread a live, correct
+    guid_to_bundle through, so this parameter would likely also work — but
+    reading it fresh from the same persisted table the live value is
+    itself sourced from removes any dependency on that being true, keeping
+    this context construction fully self-sufficient from case_dir alone,
+    same reasoning as ui_metadata/folder_map/folder_sizes above. The
+    parameter is kept as a fallback for the (should never happen) case the
+    disk read itself fails."""
+    from ffs_metadata import load_snapshot_from_case
+    from mcp_server import CaseContext
+
+    snap = load_snapshot_from_case(case_dir)
+    if snap is None:
+        return None
+    ui_metadata = snap['ui_metadata']
+    folder_map  = snap['folder_map']
+
+    try:
+        with contextlib.closing(_open_cache_db(case_dir)) as db:
+            _, folder_sizes = load_folder_data(db)
+            disk_guid_to_bundle = load_guid_bundle_map(db)
+    except Exception:
+        folder_sizes = {}
+        disk_guid_to_bundle = None
+    guid_to_bundle = disk_guid_to_bundle or guid_to_bundle or {}
+
+    def _read_ui_path_bytes(ui_path: str):
+        try:
+            physical = adapter.resolve(ui_path)
+        except Exception:
+            return None
+        return read_physical_bytes(physical)
+
+    return CaseContext(
+        case_dir=case_dir,
+        zip_path=zip_path,
+        get_ui_metadata=lambda: ui_metadata,
+        get_folder_map=lambda: folder_map,
+        get_folder_sizes=lambda: folder_sizes,
+        get_guid_to_bundle=lambda: guid_to_bundle,
+        get_header_types=lambda: {},
+        adapter=adapter,
+        raw_content_enabled=True,
+        read_bytes=_read_ui_path_bytes,
+    )
+
+
 def _extract_candidate(
     candidates: list[str],
     zip_path: str,
@@ -759,6 +874,26 @@ def run_artifact(
     """
     parser_name = getattr(module, 'name', script_name)
     dest_dir    = _parser_files_dir(case_dir, parser_name)
+
+    # ── Device-wide API ──────────────────────────────────────────────────────
+    if getattr(module, 'device_wide', False):
+        zip_names = zip_obj.namelist() if zip_obj is not None else []
+        paths: dict[str, object] = {}
+        paths['_zip_names']       = zip_names
+        paths['_read_zip_bytes']  = _make_zip_byte_reader(zip_path, zip_obj)
+        paths['_adapter']         = adapter
+        paths['_parser_files_dir'] = dest_dir
+        ctx = _build_case_context(zip_path, case_dir, adapter, guid_to_bundle,
+                                  paths['_read_zip_bytes'])
+        if ctx is None:
+            return [], (f"{script_name}: case snapshot not available yet "
+                        f"(re-open the case, then try running this report again)")
+        paths['_case_context'] = ctx
+        try:
+            rows = module.run(paths) or []
+        except Exception as exc:
+            return [], f"{script_name}: {exc}"
+        return rows, ''
 
     # ── Multi-file API ────────────────────────────────────────────────────────
     has_app_path      = hasattr(module, 'app_path')      and hasattr(module, 'files')

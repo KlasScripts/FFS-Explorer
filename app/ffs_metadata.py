@@ -28,7 +28,7 @@ import msgpack
 from adapters import FfsAdapter
 from db_utils import (_open_cache_db, load_guid_bundle_map, load_folder_data,
                       save_blob, save_guid_bundle_map, save_folder_sizes,
-                      save_app_registry)
+                      save_app_registry, open_blob)
 from zip_cd_cache import (CachedZipView, load as _cd_cache_load,
                           probe_delta as _probe_delta)
 
@@ -116,6 +116,34 @@ def unpack_snapshot(raw, yield_cb=None) -> dict:
         'ui_metadata':   ui_metadata,
         'folder_map':    folder_map,
     }
+
+
+def load_snapshot_from_case(case_dir: str) -> dict | None:
+    """Load the persisted load-snapshot straight from case_dir, with no
+    live GUI/window object involved — added 2026-09-15 for
+    `artifact_runner.py`'s `device_wide` parser capability (see its own
+    docstring), which needs `ui_metadata`/`folder_map` for a parser like
+    `artifacts/ios/app_report.py` that scans every app on the device
+    rather than one app's own `files`. Reuses the exact same read this
+    module's own snapshot fast-path already does for an instant re-open
+    (ffs-explorer.py's `_try_load_from_snapshot`) — this is the SAME
+    persisted data, just reachable from a Qt-free context (a parser
+    script must stay headless/testable like every other one, never reach
+    into the live window object). Returns None if no snapshot exists yet
+    (the case was never fully opened) — the caller decides how to report
+    that; this function never raises for a missing/corrupt snapshot,
+    matching every other cache-read in this project's own established
+    style."""
+    try:
+        with closing(_open_cache_db(case_dir)) as db:
+            blob = open_blob(db, SNAPSHOT_KEY, SNAPSHOT_VERSION)
+            if blob is None:
+                return None
+            with closing(blob):
+                return unpack_snapshot(blob)
+    except Exception:
+        return None
+
 
 # iOS container metadata files: a folder that contains only these (and nothing
 # else) is labelled "Folder - Metadata Only" rather than a regular folder.

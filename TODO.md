@@ -1674,6 +1674,280 @@ headers — even though nothing here is a vendored copy the way those files are.
     self-inflicted by this session's own earlier work (item 1), not from
     any of the four sibling tools.*
 
+25. **[FIXED, 2026-09-15] Real beach-ball on case load — found and fixed
+    the actual cause, not the one guessed at.** Direct report: "is there
+    no way to stop the spinning ball when loading a ffs... it seems to
+    relate to loading the massive tree into the gui... is there no way to
+    have this as a background thread?" Investigated directly rather than
+    assumed: the folder tree itself was already correctly architected
+    (lazy `QTreeView`/`QStandardItemModel`, only top-level children built
+    at load time, chunked via `QTimer.singleShot` frame-budget batching in
+    `_populate_tree_children_batched`) — not the real cause at all.
+
+    Profiled a real reopen of the 830,298-entry IOS17 JoshHickman archive
+    with cProfile and found the actual bottleneck: `on_metadata_ready`
+    (the main-thread slot that fires the instant metadata arrives) was
+    blocking for **4.1–4.4 seconds**, 90% of it one call —
+    `zip_cd_cache.load()` re-parsing the ENTIRE central directory through
+    `zipfile.ZipFile()` from scratch, synchronously, on the GUI thread.
+
+    User asked the sharper follow-up directly: "do we not already have the
+    data as part of the cache we have created using the sidecar" — correct,
+    and it exposed a real, systemic gap: the `.zcd` sidecar already avoids
+    re-fetching the central directory over the network, but `load()` had
+    **zero memoization of its own PARSED result** — every one of the 17+
+    independent call sites across this project (every keyword search,
+    every "Interpret as SQL Record" click, every media thumbnail load with
+    a fresh case_dir, every nested-archive extraction, every single-file
+    scan, ...) re-paid this same ~1.6–3.9s parse from scratch, every time,
+    for the life of a session.
+
+    Two fixes, both verified against real data:
+    1. **`zip_cd_cache.load()` now memoizes its own parsed `ZipInfo` list
+       in-memory**, keyed by the real `.zcd` file path (never bare
+       `zip_path` — the same archive can legitimately be open under two
+       different case_dirs in one session, each with its own `.zcd`, and
+       keying by zip_path alone would silently cross-contaminate them),
+       invalidated by the `.zcd` file's own `(mtime, size)` so a rebuilt
+       cache is never served stale. Verified directly: 1st call 1.6s,
+       2nd/3rd calls 0.0000s (same object returned); after touching the
+       real `.zcd` file's mtime, correctly re-parsed a fresh object
+       rather than serving stale data.
+    2. **`ffs-explorer.py`'s own `on_metadata_ready` no longer builds
+       `self._zip_handle` synchronously** — submitted to the existing
+       `_BG_POOL` background thread pool instead (via a new module-level
+       `_build_cached_zip_view` helper), reusing `_get_zip_handle()`'s
+       own ALREADY-EXISTING `self._zip_open_future` lazy-fallback
+       mechanism (a dormant code path from before an earlier session's
+       zipfile-elimination sweep removed its previous raw-zipfile use —
+       confirmed nothing else in the codebase reads `self._zip_handle`
+       directly, bypassing that getter, before reusing it).
+
+    Verified end-to-end against real data, not assumed: `on_metadata_ready`
+    itself dropped from 4.1–4.4s to a consistent ~1.6–1.9s across three
+    fresh-process runs; `_get_zip_handle()` called after load correctly
+    returned a working, fully-populated handle (`.getinfo()` succeeded on
+    a real file) with the background future already resolved. Sub-step
+    timing then isolated exactly what's LEFT: `_art_select_and_show_apps`
+    (the Apps-tree-node default-view population, a supposedly-fast
+    "cache hit" path per its own existing design) now accounts for ~90%
+    of the remaining time (0.6–1.0s) — a separate, smaller, well-scoped
+    follow-up, not yet addressed; every other sub-step measured
+    (`_detect_android_user_data`, `_detect_time_columns`,
+    `_inject_nested_archives`, `reload_tree_entirely`,
+    `_refresh_artifact_tab`, `_start_case_meta_load`) is sub-30ms and not
+    worth chasing further.
+    *Source: direct user report and direct user follow-up question,
+    2026-09-15 — found and fixed via this session's own direct profiling,
+    not from any of the four sibling tools.*
+
+26. **[DONE, 2026-09-15] Converted the hardcoded "Apps" tree node into two
+    normal, manually-run parser scripts — a real architectural change,
+    not just a move.** Direct request: "can we move the app table to be
+    an artifact script instead of where it is just now... this will
+    require the tree to be change to not have apps as the top root
+    note... also make an android and ios specific artifact script for the
+    application report, since they have different data... run from that
+    dialog and not when the case is loaded." Confirmed with the user
+    before implementing that per-app GROUPING (Chrome's sub-reports
+    nesting under one "Chrome" node) should stay — only the fixed "Apps"
+    PARENT container that used to wrap every report goes away.
+
+    Real blockers found via direct research before writing any code, not
+    assumed away: no existing parser API supported whole-device scope (every
+    parser is scoped to one app's own `files`), and `mcp_server.CaseContext`
+    (which already has the exact shape `app_intelligence.scan_apps()`
+    needs) turned out to be a LIVE bridge from the GUI's own in-memory
+    state, not something a headless parser script could construct itself
+    — a real correction to an initial hope that it could.
+
+    **New `device_wide` parser capability** (`artifact_runner.py`): a
+    parser declares `device_wide = True` instead of `app_path`/`files`;
+    `run_artifact()` builds a `paths['_case_context']` (a real
+    `mcp_server.CaseContext`) loaded fresh from the case's own persisted
+    load-snapshot (`ffs_metadata.load_snapshot_from_case`, a new function
+    extracting the exact same read `_try_load_from_snapshot` already did
+    for instant re-opens) plus `folder_sizes`/`guid_to_bundle` from
+    `casecache.db` — never the live GUI window object, keeping a
+    device-wide parser exactly as headless/testable as every other one.
+    `raw_content_enabled=True` always (a direct, examiner-triggered run
+    against their own already-open case, same reasoning the GUI's former
+    Apps view already used, no AI-consent boundary to protect).
+
+    Two real, non-obvious bugs were caught by direct testing before this
+    shipped, not assumed correct from the design alone:
+    - `_make_zip_byte_reader`'s reserved `_read_zip_bytes` key takes a
+      PHYSICAL zip entry name, but `CaseContext.read_bytes` (per its own
+      docstring and `scan_apps()`'s real usage) is called with a UI_PATH
+      that the callee must resolve itself — passing the physical-path
+      reader straight through would have silently failed every single
+      read. Fixed with a wrapper doing `adapter.resolve(ui_path)` first.
+    - The very first real test returned 0 apps. Root cause: `scan_apps()`
+      resolves every GUID-named container to its real app via
+      `container_bundle_id(child, guid_map)` — an empty/wrong
+      `guid_to_bundle` silently makes every container resolve to
+      nothing, not an error. Fixed by having `_build_case_context` load
+      `guid_to_bundle` fresh from `casecache.db` itself
+      (`db_utils.load_guid_bundle_map`) rather than trusting the
+      parameter threaded through from the caller — makes the whole
+      context construction self-sufficient from `case_dir` alone, not
+      dependent on every future caller getting this right.
+
+    **Two new parser scripts**, `artifacts/ios/app_report.py` and
+    `artifacts/android/app_report.py` — thin wrappers matching every
+    other parser's shape, calling `app_intelligence.scan_apps(ctx)` then
+    two new Qt-free functions moved from what used to be
+    `artifact_viewer.py`'s own GUI-only flattening
+    (`build_app_registry_lookup`/`flatten_row` in `app_intelligence.py`,
+    ported behavior-for-behavior, just producing a normal snake_case row
+    dict instead of the old GUI's positional tuple + Title-Case header
+    list). The iOS parser's own real, useful documentation about the four
+    timestamp columns' meaning and limits (fabricated far-future mtimes
+    from third-party disk-cache libraries, etc.) — previously a special
+    hand-authored "Application Report Notes" tree page — was preserved by
+    moving it into the parser's own `description`, which every report
+    already shows via the standard "Report Notes/Warning" page, no
+    special-casing needed.
+
+    **New `byte_fields` declarative convention** (`_art_show_report`,
+    matching the existing `timestamp_fields`/`media_fields` shape) —
+    generalizes what used to be a one-off manual `set_byte_columns(["Total
+    Size"])` call hardcoded to the old Apps table into something any
+    report can declare, for a raw byte-count column that should MB-format
+    at display time while staying numerically sortable in storage.
+
+    **Tree restructuring**: `_refresh_artifact_tab`'s build loop now
+    appends standalone reports and app-grouped report nodes directly to
+    the tree root instead of to a fixed "Apps" parent (which no longer
+    exists) — per-app grouping itself (`app_group_label`) is completely
+    unchanged. `ffs-explorer.py`'s `on_metadata_ready` no longer force-
+    selects anything at case load — a freshly opened case now starts on
+    the blank "Select a Report or Script..." placeholder, exactly
+    answering the literal request ("run from that dialog and not when the
+    case is loaded"). Confirmed via direct research (not assumed) that
+    the "Jump to this row in the report" feature's own tree search
+    already used a generic depth-first role search with no position-0
+    dependency, and that MCP's `list_apps` tool is fully independent of
+    this GUI tree (builds its own CaseContext, shares only the
+    `casecache.db` cache table as a pure cache) — neither needed any
+    change.
+
+    A large amount of now-genuinely-dead code was removed outright rather
+    than left as unused: `AppIntelligenceWorker` (the GUI's own
+    QThread wrapper — MCP's `list_apps` never used it, it has its own
+    complete cache read/write cycle), `_art_show_apps`/
+    `_populate_apps_table`/`_art_select_and_show_apps`/
+    `_retire_art_apps_worker`/`_on_art_apps_scan_done`, the entire
+    Category-checklist + Date-range filter UI (`_art_category_filter_*`/
+    `_art_date_filter_*`/`_apply_apps_combined_filter` and ~9 related
+    methods) which was Apps-table-only special UI, not a generic report
+    feature — this is a real, acknowledged loss of a previously-requested
+    convenience feature (triage-by-category on a ~1000-row table), openly
+    flagged to the user rather than silently dropped; picking it back up
+    as a new declarative convention (if missed) would be a separate,
+    future ask.
+
+    **Verified end-to-end against real data at every layer, not assumed
+    correct from the design alone**: `_build_case_context` tested
+    directly (830,291 ui_metadata entries, 179,273 folder_map entries,
+    correct real HEIC bytes read via the ui_path-resolving wrapper);
+    `scan_apps()`+flattening tested directly (1,096 real apps on the
+    IOS17 JoshHickman case, including correct real WhatsApp/Instagram/
+    TikTok rows with real container paths, plugins, sizes, timestamps);
+    the Android script tested against a real Android archive (197 real
+    apps, e.g. a real 1.86GB WeChat container). Then the FULL real
+    pipeline end-to-end, driving the actual `FastZipBrowser` in-process:
+    a freshly loaded case correctly shows no "Apps" node anywhere and
+    stays on the blank placeholder (not auto-populating); running the new
+    parser via the real `ArtifactRunnerWorker` (the exact same class the
+    "Run Artifact Parsers" dialog uses) wrote 1,096 real rows to
+    `caseresults.db`; the refreshed tree correctly shows "App Report" as
+    a normal standalone top-level item; `_art_show_report('app_report')`
+    correctly displayed all 1,096 rows via the standard DB-mode path with
+    `byte_fields` MB-formatting working ("564.08 MB" for a real value).
+    Separately confirmed on a real Android case that app-grouped reports
+    (Chrome's 3 sub-reports under one "Chrome" node) still nest correctly
+    — the one thing explicitly required to be preserved.
+    *Source: direct user request, 2026-09-15 — not from any of the four
+    sibling tools.*
+
+27. **[DONE, 2026-09-15] `app_report` now flags itself stale when a
+    DIFFERENT parser is added/updated, reusing the existing "newer
+    parser version available" banner.** Direct follow-up to item 26:
+    "can we just make it like when a parser is updated that information
+    is at the top of the parser and it can be rerun — can we also have
+    that for the app report, i.e. if a new artifact script is added the
+    script can see that and it ask the user if they want to rerun." The
+    existing banner mechanism (`parser_versions.py`/
+    `_update_art_version_banner`) only ever detects a script's OWN
+    content changing — it has no way to notice that a DIFFERENT script
+    was added or updated, which is exactly the case that makes
+    `app_report`'s own `has_parser`/`score`/`category` columns stale
+    (they're derived from which OTHER parsers exist at scan time, per
+    `app_intelligence.resolve_parser_coverage`).
+
+    New `parser_versions.get_coverage_fingerprint(platform)` — a stable
+    blake2b-derived fingerprint over every known parser's own version for
+    that platform, changing whenever any parser's content changes, a new
+    one is added, or one is removed. Self-caught bug before any testing:
+    the first draft used `int.from_bytes(digest, "big")` (unsigned) —
+    corrected to `signed=True`, since `run_log`'s `coverage_fingerprint`
+    column is SQLite's signed-64-bit INTEGER storage class, and an
+    unsigned read of a full 8-byte digest can exceed `2**63-1`
+    (`sqlite3`'s own INTEGER binding raises `OverflowError` outright
+    rather than truncating).
+
+    `run_log` gained a `coverage_fingerprint INTEGER` column (same
+    `ALTER TABLE ... ADD COLUMN` + `except sqlite3.OperationalError: pass`
+    migration pattern as `parser_version`/`completed_at`), threaded
+    through `start_run_log`/`load_last_run`/`load_run_history`.
+    `ArtifactRunnerWorker.run()` computes and records it, but ONLY for a
+    `device_wide` module (`getattr(module, 'device_wide', False)`) —
+    every other parser's `coverage_fingerprint` stays `NULL`, since only
+    a device-wide parser's output actually depends on the full parser
+    set. Relies on the same precondition `get_current_version`'s own
+    callers already rely on — `list_artifacts(platform)`/`load_artifacts`
+    must have already run this session (it calls `check_version()` for
+    every script it loads) so the store reflects every parser's current
+    version; true by construction here, since `ArtifactRunnerDialog`
+    already calls `load_artifacts` to build its own selection list before
+    a worker can run at all.
+
+    `_update_art_version_banner` (`artifact_viewer.py`) restructured
+    (not just extended) to check both signals in one place: the existing
+    own-script-version comparison first (unchanged behavior/wording for
+    every parser), falling through — only for a `device_wide` module
+    whose `used_fingerprint` was actually recorded — to a coverage-
+    fingerprint comparison with its own, differently-worded banner text
+    ("A parser script has been added or updated since this report last
+    ran — has_parser/score/category may be out of date."), since the
+    reason is genuinely different (a DIFFERENT parser changed, not this
+    one) and conflating the two messages would mislead about what
+    actually needs re-running. Reuses the SAME banner widget and Update
+    button (`_on_art_update_parser_version`) with zero changes needed
+    there — clicking Update re-runs `app_report` via the same
+    `ArtifactRunnerWorker` path either way, which then records a fresh,
+    current `coverage_fingerprint`, clearing the banner.
+
+    Verified end-to-end against the real IOS17 JoshHickman case DB
+    (`case_data/IOS17JoshHickman`), not just compiled — reproduced the
+    exact `_update_art_version_banner` decision logic standalone against
+    three real inserted `run_log` rows: (1) matching parser version, a
+    coverage fingerprint deliberately offset from the current real one →
+    correctly decided "coverage stale"; (2) matching version, matching
+    real fingerprint → correctly decided "fp matches", no banner; (3) a
+    non-`device_wide` parser (`whatsapp`) with `coverage_fingerprint=NULL`
+    and a matching own version → correctly decided "not device_wide", no
+    banner, confirming zero effect on every ordinary parser. All three
+    test rows removed from the real case DB afterward — this was a
+    verification harness, not left as test pollution. Not yet exercised
+    through the actual running GUI (no way to drive this session's own
+    PySide6 window) — the underlying decision logic and DB round-trip are
+    both confirmed correct against real data; the click-through itself
+    (open App Report, add a var/change a sibling parser, see the banner,
+    click Update, see it clear) is the one remaining unverified step.
+    *Source: direct user request, 2026-09-15.*
+
 ## Considered and NOT recommended (kept here so they aren't silently lost)
 
 - **A full Cellebrite-style single-unified-table rewrite of the four

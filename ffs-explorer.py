@@ -105,6 +105,18 @@ FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface r
 # where the zip-reopen alone could occupy a slot for a long time.
 _BG_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='ffs-bg')
 
+
+def _build_cached_zip_view(zip_path: str, case_dir: str) -> "CachedZipView | None":
+    """Build self._zip_handle's value off the GUI thread — see
+    on_metadata_ready's own comment for why this is submitted to
+    _BG_POOL rather than called directly. A plain module-level function
+    (not a bound method) so nothing here can accidentally touch GUI
+    state from a background thread; _get_zip_handle() is the only place
+    that ever reads the resulting Future."""
+    infos = _cd_cache_load(zip_path, case_dir)
+    return CachedZipView(zip_path, infos) if infos is not None else None
+
+
 # Load-snapshot cache: the complete result of a first archive load, stored in
 # casecache.db so re-opens skip the CD parse, metadata read, and derivations.
 # _SNAPSHOT_KEY / _SNAPSHOT_VERSION are imported from ffs_metadata (single
@@ -6557,17 +6569,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._local_extra_delta  = getattr(self.worker, '_local_extra_delta', None)
         # ZipMetadataWorker.run() already ensured the local .zcd cache is
         # valid before metadata parsing even started (see its own "Ensure
-        # local .zcd exists" step) -- a CachedZipView built from it is a
-        # fast LOCAL read, so it's built synchronously right here rather
-        # than backgrounded. No raw-zipfile background-submit fallback
-        # for the "cache somehow still unavailable" case any more (this
-        # project's own standing Convention has no exception for it
-        # either) -- _get_zip_handle()'s own lazy path already covers
-        # that by building a fresh CachedZipView on demand (or returning
-        # None, which every real caller already handles honestly).
-        _infos = _cd_cache_load(self.zip_path, self._case_dir) if self._case_dir else None
-        if _infos is not None:
-            self._zip_handle = CachedZipView(self.zip_path, _infos)
+        # local .zcd exists" step) -- but building the CachedZipView itself
+        # is NOT actually cheap: confirmed via direct profiling that
+        # parsing a real 830k-entry central directory through
+        # zipfile.ZipFile() costs ~1.6-3.9s of pure CPU time, found while
+        # investigating a real user-reported beach ball on case load.
+        # This whole slot runs synchronously between two frames -- same
+        # "anything slow here is a beach ball" reasoning as
+        # _start_case_meta_load a few lines below -- so this is now
+        # submitted to the background pool instead of built here directly.
+        # zip_cd_cache.load() itself is separately memoized in-memory per
+        # .zcd file now too (2026-09-15, found via a direct user question
+        # about why the already-cached data wasn't being reused), so this
+        # is only ever the real, unavoidable FIRST parse cost for this
+        # archive in this process -- every later caller anywhere in the
+        # app (keyword search, "Interpret as SQL Record", media
+        # thumbnails, nested-archive extraction, ...) gets it for free
+        # regardless of whether this background build has finished yet.
+        # _get_zip_handle()'s own existing lazy-fallback path already
+        # knows how to wait on self._zip_open_future (or build fresh if it
+        # somehow fails) -- nothing else needed to wire this up, that
+        # mechanism was already there for exactly this shape of future.
+        if self._case_dir:
+            self._zip_open_future = _BG_POOL.submit(
+                _build_cached_zip_view, self.zip_path, self._case_dir)
         self._time_cols = self._detect_time_columns(data)
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'Path'])
@@ -6584,15 +6609,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # even when the label is already cached in ffs_archives.json.
         QTimer.singleShot(0, partial(self._fetch_and_store_label, self.zip_path))
         self._refresh_artifact_tab()
-        # Nothing has been selected in the Artifact Viewer tree yet for this
-        # (freshly loaded) case — default to the Apps report rather than
-        # leaving it on the blank "Select a Report..." placeholder. Only
-        # done here, not inside _refresh_artifact_tab itself, since that
-        # method also reruns after a parser finishes (parsers_completed)
-        # and forcing a switch there would discard whatever report the
-        # examiner had open mid-session — see _art_select_and_show_apps'
-        # own docstring.
-        self._art_select_and_show_apps()
+        # No auto-selected report at case load any more (removed
+        # 2026-09-15, per direct user request, alongside the former
+        # hardcoded "Apps" tree node that used to auto-populate here — the
+        # per-app inventory it showed is now a normal parser script,
+        # artifacts/ios|android/app_report.py, run manually from the "Run
+        # Artifact Parsers" dialog like every other report). A freshly
+        # loaded case starts on the blank "Select a Report or Script..."
+        # placeholder, same as it always did before any parser had run.
         self._artifact_act.setEnabled(True)
         self._mcp_act.setEnabled(True)
         self._timestamp_display_act.setEnabled(True)

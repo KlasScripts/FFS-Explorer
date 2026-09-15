@@ -315,6 +315,16 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         conn.execute('ALTER TABLE run_log ADD COLUMN parser_version INTEGER')
     except sqlite3.OperationalError:
         pass  # column already exists
+    # Migration: add coverage_fingerprint — for a `device_wide` parser
+    # (app_report.py), a hash over EVERY parser's own version for that
+    # platform at run time (parser_versions.get_coverage_fingerprint),
+    # since that parser's own has_parser/score output depends on the full
+    # set of available parsers, not just its own script content. NULL for
+    # every other run_type, including a non-device_wide artifact run.
+    try:
+        conn.execute('ALTER TABLE run_log ADD COLUMN coverage_fingerprint INTEGER')
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS bookmark_groups (
@@ -562,7 +572,8 @@ def clear_header_types(conn: 'sqlite3.Connection') -> None:
 def start_run_log(conn: 'sqlite3.Connection', run_type: str,
                   total: int | None = None,
                   notes: str | None = None,
-                  parser_version: int | None = None) -> int:
+                  parser_version: int | None = None,
+                  coverage_fingerprint: int | None = None) -> int:
     """Insert an in-progress run record and return its id.
 
     Call this when a scan/artifact run begins, then call complete_run_log()
@@ -571,11 +582,16 @@ def start_run_log(conn: 'sqlite3.Connection', run_type: str,
     app/parser_versions.py) — only meaningful for an 'artifact_*' run_type;
     leave None for anything else. Recorded so a report opened later can
     tell whether the parser producing it has since changed.
+    coverage_fingerprint (parser_versions.get_coverage_fingerprint) is
+    only meaningful for a `device_wide` parser (app_report.py) — a hash
+    over every OTHER parser's own version for this platform, since that
+    parser's has_parser/score output depends on the whole parser set, not
+    just its own script. Leave None for anything else.
     """
     cur = conn.execute(
-        'INSERT INTO run_log (run_type, total, complete, notes, parser_version) '
-        'VALUES (?, ?, 0, ?, ?)',
-        (run_type, total, notes, parser_version),
+        'INSERT INTO run_log (run_type, total, complete, notes, parser_version, coverage_fingerprint) '
+        'VALUES (?, ?, 0, ?, ?, ?)',
+        (run_type, total, notes, parser_version, coverage_fingerprint),
     )
     conn.commit()
     return cur.lastrowid
@@ -595,7 +611,8 @@ def complete_run_log(conn: 'sqlite3.Connection', run_id: int,
 def load_last_run(conn: 'sqlite3.Connection', run_type: str) -> dict | None:
     """Return the most recent run_log entry for *run_type*, or None."""
     row = conn.execute(
-        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes, parser_version '
+        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes, '
+        'parser_version, coverage_fingerprint '
         'FROM run_log WHERE run_type=? ORDER BY id DESC LIMIT 1',
         (run_type,),
     ).fetchone()
@@ -605,20 +622,23 @@ def load_last_run(conn: 'sqlite3.Connection', run_type: str) -> dict | None:
         'run_at': row[0], 'completed_at': row[1], 'total': row[2],
         'processed': row[3], 'output_rows': row[4],
         'complete': bool(row[5]), 'notes': row[6], 'parser_version': row[7],
+        'coverage_fingerprint': row[8],
     }
 
 
 def load_run_history(conn: 'sqlite3.Connection', run_type: str) -> list:
     """Return all run_log entries for *run_type*, newest first."""
     rows = conn.execute(
-        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes, parser_version '
+        'SELECT run_at, completed_at, total, processed, output_rows, complete, notes, '
+        'parser_version, coverage_fingerprint '
         'FROM run_log WHERE run_type=? ORDER BY id DESC',
         (run_type,),
     ).fetchall()
     return [
         {'run_at': r[0], 'completed_at': r[1], 'total': r[2],
          'processed': r[3], 'output_rows': r[4],
-         'complete': bool(r[5]), 'notes': r[6], 'parser_version': r[7]}
+         'complete': bool(r[5]), 'notes': r[6], 'parser_version': r[7],
+         'coverage_fingerprint': r[8]}
         for r in rows
     ]
 

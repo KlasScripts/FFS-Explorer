@@ -192,18 +192,60 @@ def save(zip_path: str, case_dir: str, progress_cb=None) -> bool:
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
+# In-memory memoization of load()'s own PARSED result, keyed by the real
+# .zcd path (never bare zip_path -- the same archive can legitimately be
+# opened into two different case_dirs in one session, each with its own
+# .zcd file, and keying by zip_path alone would silently serve one case's
+# parsed infolist to the other). Added 2026-09-15, found via direct user
+# question ("do we not already have the data as part of the cache...")
+# after profiling a real beach-ball report: the .zcd sidecar already
+# avoids a NETWORK re-read of the central directory, but every call to
+# load() was still re-parsing the same local bytes through
+# zipfile.ZipFile() from scratch -- confirmed via cProfile to cost ~3.9s
+# of pure CPU time for a real 830,298-entry archive. With 17+ independent
+# call sites across this project (every keyword search, every "Interpret
+# as SQL Record" click, every media thumbnail load with a fresh case_dir,
+# every nested-archive extraction, ...), that cost was being paid over
+# and over within a single session, not just once at load time.
+# Invalidated by the real .zcd file's own (mtime, size) so a rebuilt
+# cache is never served stale -- cheap to check (one os.stat) even on
+# a cache hit. A memory tradeoff, not a free lunch: this keeps one
+# 830k-entry ZipInfo list per distinct .zcd resident for the life of the
+# process -- but every existing caller already independently builds and
+# holds its own such list today (e.g. FastZipBrowser.self._zip_handle),
+# so a single shared, memoized list is a wash at worst and a real
+# reduction at best, not a new cost class.
+_parsed_cache: dict[str, tuple[float, int, list]] = {}
+
+
 def load(zip_path: str, case_dir: str) -> list[zipfile.ZipInfo] | None:
-    """Return the cached ZipInfo list, or None if the cache is missing/corrupt."""
-    if not is_valid(zip_path, case_dir):
-        return None
+    """Return the cached ZipInfo list, or None if the cache is missing/corrupt.
+
+    Memoized in-memory per .zcd file for the life of the process — see
+    _parsed_cache's own comment above for why this matters and how it's
+    kept safe to invalidate."""
+    path = cache_path(zip_path, case_dir)
     try:
-        with open(cache_path(zip_path, case_dir), 'rb') as fh:
-            fh.read(4)       # skip magic
+        st = os.stat(path)
+    except OSError:
+        return None
+
+    cached = _parsed_cache.get(path)
+    if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+
+    try:
+        with open(path, 'rb') as fh:
+            if fh.read(4) != _MAGIC:
+                return None
             payload = fh.read()
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-            return zf.infolist()
+            infos = zf.infolist()
     except Exception:
         return None
+
+    _parsed_cache[path] = (st.st_mtime, st.st_size, infos)
+    return infos
 
 
 # ── CachedZipView ─────────────────────────────────────────────────────────────

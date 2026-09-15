@@ -442,10 +442,10 @@ class ArtifactTableModel(QAbstractTableModel):
                 new_order = sorted(self._rowids, key=_key, reverse=reverse)
             except TypeError:
                 # Same column holding genuinely mixed, mutually-incomparable
-                # types (shouldn't happen by construction — each parser/
-                # _flatten_app_intelligence_row column is one type — but
-                # degrade to a string sort rather than leaving the click
-                # silently doing nothing, same spirit as the old no-op).
+                # types (shouldn't happen by construction — each parser's
+                # own row-dict column is one type — but degrade to a
+                # string sort rather than leaving the click silently doing
+                # nothing, same spirit as the old no-op).
                 new_order = sorted(self._rowids, key=lambda i: str(_key(i)), reverse=reverse)
             self.beginResetModel()
             self._rowids = new_order
@@ -534,47 +534,8 @@ class ArtifactFilterWorker(QThread):
         self.done.emit(rowids, where, args)
 
 
-class AppIntelligenceWorker(QThread):
-    """Runs app_intelligence.scan_apps() on a background thread — a first
-    scan of a large case can take ~1 minute (documented in CLAUDE.md's
-    mcp_server.py entry), so this must never run on the GUI thread. Takes
-    the pre-built CaseContext in __init__ (mirrors ArtifactRunnerWorker's
-    pattern of snapshotting plain data at construction time rather than
-    reading `self.xxx` live off the calling widget from a different
-    thread) — ctx's own lambdas already close over the FastZipBrowser's
-    plain dict/list attributes, the same cross-thread-safe shape the MCP
-    server's own daemon thread already uses for the identical CaseContext.
-    Also persists the result to casecache.db (save_app_intelligence +
-    save_blob) exactly like list_apps' own miss-path, so this scan and a
-    later (or earlier) MCP list_apps call share one cache instead of each
-    re-walking the archive."""
-
-    done = Signal(list, str)   # (rows, error) — error is '' on success
-
-    def __init__(self, ctx, cache_key: str, parent=None):
-        super().__init__(parent)
-        self._ctx = ctx
-        self._cache_key = cache_key
-
-    def run(self) -> None:
-        import app_intelligence
-        from db_utils import _open_cache_db, save_app_intelligence, save_blob
-        try:
-            rows = app_intelligence.scan_apps(self._ctx)
-            with closing(_open_cache_db(self._ctx.case_dir)) as cache_db:
-                save_app_intelligence(cache_db, rows)
-                save_blob(cache_db, 'app_intelligence_scan_key', '1',
-                         self._cache_key.encode())
-        except Exception as exc:
-            self.done.emit([], str(exc))
-            return
-        self.done.emit(rows, '')
-
-
 # ── Tree node role sentinels ──────────────────────────────────────────────────
-_ART_APPS   = "__art_apps__"     # singleton — no per-script suffix
 _ART_AI_SUMMARY = "__art_ai_summary__"  # singleton — opens AISummaryDialog, no page of its own
-_ART_APP_NOTES = "__art_app_notes__"  # singleton — Apps node's own notes, not per-parser
 _ART_GROUP  = "__art_group__:"   # app-name node — clicking it shows the Report
 _ART_APP_GROUP = "__art_app_group__:"  # multi-report app parent (see app_group_label
                                         # below) — clicking it shows one designated
@@ -642,8 +603,19 @@ class ArtifactRunnerWorker(QThread):
                 try:
                     import parser_versions
                     version = parser_versions.get_current_version(self._platform, script_name)
+                    # device_wide parsers (app_report.py) derive has_parser/
+                    # score from the FULL set of available parsers, not just
+                    # their own script — recording a coverage fingerprint
+                    # alongside the ordinary per-script version lets the
+                    # "newer parser version available" banner also catch a
+                    # DIFFERENT parser having changed since this last ran.
+                    # See parser_versions.get_coverage_fingerprint's own
+                    # docstring.
+                    fingerprint = (parser_versions.get_coverage_fingerprint(self._platform)
+                                  if getattr(module, 'device_wide', False) else None)
                     run_id = start_run_log(case_conn, f'artifact_{script_name}',
-                                           parser_version=version)
+                                           parser_version=version,
+                                           coverage_fingerprint=fingerprint)
                 except Exception:
                     pass
                 rows, error = run_artifact(
@@ -750,6 +722,17 @@ class ArtifactRunnerDialog(QDialog):
             return any(c in zip_names for c in candidates)
 
         def _mod_matches(mod):
+            if getattr(mod, 'device_wide', False):
+                # Scans every app on the device rather than one app's own
+                # files — there's no single app_path/files/target_paths
+                # to check existence against, and there's nothing to
+                # check anyway: a device-wide report is always relevant
+                # for its own platform (this dialog is already filtered
+                # to iOS-only or Android-only parsers before _mod_matches
+                # ever runs), the same reasoning chrome_cache.py's own
+                # existence_check_paths fallback exists for, just with no
+                # existence check needed at all here.
+                return True
             if hasattr(mod, 'app_path') and hasattr(mod, 'files'):
                 app_base = mod.app_path.strip('/')
                 # A parser that enumerates a whole directory itself rather
@@ -1456,48 +1439,6 @@ class ArtifactViewerMixin:
         self._art_hide_lowconf_checkbox.setVisible(False)
         report_filter_row.addWidget(self._art_hide_lowconf_checkbox)
 
-        # Apps-table-only filters (added 2026-08-26, same widget pattern as
-        # ffs-explorer.py's own File Browser Date/Type filters — see
-        # _populate_apps_table/_art_show_report for the show/hide toggle
-        # that keeps these hidden for every other report). Category: a
-        # checklist popup menu over the existing Category column's distinct
-        # values (including a toggleable '(blank)' entry), not the free-text
-        # box above, since it's a small fixed set of values, not a search
-        # term — same UX shape as the File Browser's own Type filter menu.
-        self._art_category_filter_selected: set | None = None   # None = all
-        self._art_category_filter_btn = QPushButton("Category: All")
-        self._art_category_menu = QMenu(self._art_category_filter_btn)
-        self._art_category_menu.aboutToShow.connect(self._populate_art_category_menu)
-        self._art_category_filter_btn.setMenu(self._art_category_menu)
-        report_filter_row.addWidget(self._art_category_filter_btn)
-
-        # Date: pick which of the Apps table's own timestamp columns, then
-        # a From/To range — identical shape to ffs-explorer.py's
-        # filter_date_enable/_combo/_from/_to, just a separate instance
-        # since the Apps table is a different QTableView/model entirely.
-        self._art_date_filter_enable = QCheckBox("Date")
-        self._art_date_filter_enable.toggled.connect(self._on_art_date_filter_toggled)
-        report_filter_row.addWidget(self._art_date_filter_enable)
-        self._art_date_filter_combo = QComboBox()
-        self._art_date_filter_combo.addItems(self._APPS_DATE_COLUMNS)
-        self._art_date_filter_combo.currentIndexChanged.connect(
-            lambda _=None: self._apply_art_filter_if_date_enabled())
-        report_filter_row.addWidget(self._art_date_filter_combo)
-        self._art_date_filter_from = QDateEdit(QDate(2000, 1, 1))
-        self._art_date_filter_to   = QDateEdit(QDate.currentDate())
-        for de in (self._art_date_filter_from, self._art_date_filter_to):
-            de.setDisplayFormat("yyyy-MM-dd")
-            de.setCalendarPopup(True)
-            de.dateChanged.connect(lambda _=None: self._apply_art_filter_if_date_enabled())
-        report_filter_row.addWidget(self._art_date_filter_from)
-        report_filter_row.addWidget(QLabel("–"))
-        report_filter_row.addWidget(self._art_date_filter_to)
-        self._set_art_date_filter_enabled(False)
-        for w in (self._art_category_filter_btn, self._art_date_filter_enable,
-                 self._art_date_filter_combo, self._art_date_filter_from,
-                 self._art_date_filter_to):
-            w.setVisible(False)   # shown only in _populate_apps_table
-
         report_layout.addLayout(report_filter_row)
 
         self._art_table_model   = ArtifactTableModel()
@@ -1519,8 +1460,6 @@ class ArtifactViewerMixin:
         self._art_report_view.setItemDelegate(self._art_highlight_delegate)
         self._art_media_delegate = MediaThumbnailDelegate(self._art_report_view)
         self._art_media_thumb_worker = None
-        self._art_apps_worker = None
-        self._art_showing_apps = False
         self._art_hex_active = False
         self._art_current_mod = None
         self._art_current_script: str | None = None
@@ -1680,7 +1619,6 @@ class ArtifactViewerMixin:
         self._cancel_art_filter_worker()
         self._retire_art_media_worker()
         self._retire_art_webpage_worker()
-        self._retire_art_apps_worker()
         dialog = getattr(self, '_art_media_dialog', None)
         if dialog is not None:
             dialog.close()   # _on_art_media_dialog_closed clears the reference
@@ -1714,22 +1652,19 @@ class ArtifactViewerMixin:
                 it.setData(role_val, Qt.ItemDataRole.UserRole)
             return it
 
-        apps_item = _item("Apps", _ART_APPS)
-        apps_item.setFont(QFont("Arial", weight=QFont.Weight.Bold))
-        # The Apps table's own notes — distinct from a per-parser group's
-        # "Report Notes/Warning" child below, since the Apps table isn't
-        # backed by any one parser's module/description. First child, not
-        # appended after the per-app groups, so it reads before the list of
-        # apps rather than after (see _art_show_app_notes for content).
-        apps_item.appendRow(_item("Application Report Notes", _ART_APP_NOTES))
-
+        # No fixed "Apps" wrapping node any more (removed 2026-09-15, per
+        # direct user request — the per-app inventory that used to live
+        # there is now a normal parser script, artifacts/ios|android/
+        # app_report.py, run manually from the "Run Artifact Parsers"
+        # dialog like every other report, not auto-populated at case
+        # load). Standalone reports and app-grouped reports below both
+        # append directly to the tree root instead of to that former
+        # parent — per-app GROUPING itself (app_group_label, e.g. every
+        # Chrome sub-report nesting under one "Chrome" node) is unchanged.
         if not completed:
-            # The Apps node's own table (app_intelligence) doesn't depend
-            # on any parser having run — still worth showing/clicking —
-            # this is just a note that no per-app report groups exist yet.
-            no_parsers = _item("No parsers run yet")
+            no_parsers = _item("No parsers run yet — see Tools ▸ Run Artifact Parsers")
             no_parsers.setEnabled(False)
-            apps_item.appendRow(no_parsers)
+            self._art_tree_model.invisibleRootItem().appendRow(no_parsers)
 
         def _build_report_item(script_name):
             mod   = modules.get(script_name)
@@ -1769,7 +1704,7 @@ class ArtifactViewerMixin:
                 standalone.append(script_name)
 
         for script_name in standalone:
-            apps_item.appendRow(_build_report_item(script_name))
+            self._art_tree_model.invisibleRootItem().appendRow(_build_report_item(script_name))
 
         for app_label in sorted(app_groups):
             members = app_groups[app_label]
@@ -1785,25 +1720,18 @@ class ArtifactViewerMixin:
             app_item.setFont(QFont("Arial", weight=QFont.Weight.Bold))
             for script_name in members:
                 app_item.appendRow(_build_report_item(script_name))
-            apps_item.appendRow(app_item)
-
-        self._art_tree_model.invisibleRootItem().appendRow(apps_item)
+            self._art_tree_model.invisibleRootItem().appendRow(app_item)
 
         # A second, always-present top-level sibling — clicking it opens
         # AISummaryDialog directly (see _on_art_tree_clicked) rather than
         # showing a page of its own in _art_stack, so it needs no report-
         # notes/script/source/etc. children the way a per-parser group
-        # does. Always shown, even with nothing parsed yet, same as Apps —
-        # the dialog itself explains when there's nothing to summarize yet.
+        # does. Always shown, even with nothing parsed yet — the dialog
+        # itself explains when there's nothing to summarize yet.
         ai_summary_item = _item("AI Summary", _ART_AI_SUMMARY)
         ai_summary_item.setFont(QFont("Arial", weight=QFont.Weight.Bold))
         self._art_tree_model.invisibleRootItem().appendRow(ai_summary_item)
 
-        # Only the Apps node itself starts expanded — its per-app children
-        # (Notes/Warning, Script, Source, Exported Files, Validation) stay
-        # collapsed until the examiner deliberately opens one, so the tree
-        # reads as "Apps -> the ones with a report" at a glance.
-        self._art_tree_view.expand(self._art_tree_model.indexFromItem(apps_item))
         # Deliberately NOT auto-selecting/showing anything here, even
         # though this method also runs after a parser finishes running
         # (parsers_completed -> _refresh_artifact_tab) — forcing a switch
@@ -1812,22 +1740,21 @@ class ArtifactViewerMixin:
         # once (see the Artifact Viewer per-tab-state note in CLAUDE.md's
         # Conventions section: _on_center_tab_changed used to call this
         # unconditionally and it "discarded whichever report was open").
-        # "If nothing is selected, default to Apps" only has a real
-        # instance at first case-load, before anything has ever been
-        # picked — that specific moment is handled by the CALLER
-        # (ffs-explorer.py's archive-open completion handler), which
-        # explicitly selects/shows Apps right after this returns, the same
-        # pattern _art_update_parser_version already uses to restore ITS
-        # own specific report afterward rather than this method guessing.
+        # ffs-explorer.py's archive-open completion handler no longer
+        # force-selects anything here either (removed 2026-09-15 alongside
+        # the former Apps node) — a freshly-loaded case now starts on the
+        # blank "Select a Report or Script..." placeholder like it always
+        # did before any parser had ever been run, since there's no longer
+        # a report that exists unconditionally before the examiner runs
+        # something.
 
     def _art_find_tree_item_by_role(self, role_value: str):
         """Depth-first search of the Artifact tree for the item whose
         Qt.ItemDataRole.UserRole data equals *role_value* exactly (e.g.
         _ART_GROUP + script_name) -- needed because a report's own group
-        item can sit either directly under Apps or nested one level
+        item can sit either directly at the tree root or nested one level
         deeper inside an app_group parent (see _refresh_artifact_tab), so
-        a flat child(0)/child(1) walk the way _art_select_and_show_apps
-        uses for Apps itself (always position 0) isn't enough here."""
+        a flat child(0)/child(1) walk isn't enough here."""
         root = self._art_tree_model.invisibleRootItem()
         stack = [root.child(i) for i in range(root.rowCount())]
         while stack:
@@ -1891,22 +1818,6 @@ class ArtifactViewerMixin:
             return
         self._art_report_view.selectRow(row)
         self._art_report_view.scrollTo(self._art_table_model.index(row, 0))
-
-    def _art_select_and_show_apps(self) -> None:
-        """Select and show the Apps node — the "nothing selected yet"
-        default for a genuinely fresh tree (first case load). Call right
-        after _refresh_artifact_tab() has just rebuilt the tree; a no-op
-        if the tree ended up empty (no case dir, DB error — see that
-        method). Apps is always the FIRST top-level item when present —
-        AI Summary is a second sibling added right after it, but child(0)
-        is always Apps regardless — so no role-value search is needed to
-        find it."""
-        root = self._art_tree_model.invisibleRootItem()
-        if root.rowCount() == 0:
-            return
-        apps_item = root.child(0)
-        self._art_tree_view.setCurrentIndex(self._art_tree_model.indexFromItem(apps_item))
-        self._art_show_apps()
 
     def _clear_art_hex(self) -> None:
         """Wipe the shared bottom Hex panel and mark it as no longer showing
@@ -2334,12 +2245,8 @@ class ArtifactViewerMixin:
         role_val = index.data(Qt.ItemDataRole.UserRole)
         if not role_val:
             return
-        if role_val == _ART_APPS:
-            self._art_show_apps()
-        elif role_val == _ART_AI_SUMMARY:
+        if role_val == _ART_AI_SUMMARY:
             self._open_ai_summary_dialog()
-        elif role_val == _ART_APP_NOTES:
-            self._art_show_app_notes()
         elif role_val.startswith(_ART_GROUP):
             self._art_show_report(role_val[len(_ART_GROUP):])
         elif role_val.startswith(_ART_APP_GROUP):
@@ -2378,11 +2285,8 @@ class ArtifactViewerMixin:
 
         *script_name*/*core_fields* drive the Columns menu (see
         report_columns_store.py) — only given by _art_show_report for a
-        real per-parser report; _art_show_files/_populate_apps_table call
-        this with neither, which correctly hides the Columns button the
-        same way Category/Date already hide themselves for a non-Apps
-        report (just inverted: this one is Apps/Files-only-HIDDEN rather
-        than Apps-only-shown).
+        real per-parser report; _art_show_files calls this with neither,
+        which correctly hides the Columns button for that list-mode view.
 
         *has_recoverable* shows the "Hide likely false positives" checkbox
         (see its own construction comment) only for a report whose parser
@@ -2409,23 +2313,6 @@ class ArtifactViewerMixin:
             self._art_filter_col.addItem(col, i)
         self._art_filter_col.blockSignals(False)
         self._art_filter_btn.setEnabled(True)
-
-        # Category/Date filters are Apps-table-only (see _populate_apps_table)
-        # — reset to hidden/off by default on every report load; a caller
-        # showing the Apps table itself re-enables them right after this
-        # returns, same show-only-for-this-tab pattern as the Hex panel's
-        # Record/Attachment toggle.
-        self._art_showing_apps = False
-        self._art_category_filter_selected = None
-        self._art_category_filter_btn.setText("Category: All")
-        self._art_date_filter_enable.blockSignals(True)
-        self._art_date_filter_enable.setChecked(False)
-        self._art_date_filter_enable.blockSignals(False)
-        self._set_art_date_filter_enabled(False)
-        for w in (self._art_category_filter_btn, self._art_date_filter_enable,
-                 self._art_date_filter_combo, self._art_date_filter_from,
-                 self._art_date_filter_to):
-            w.setVisible(False)
 
         # Columns state (see report_columns_store.py) — recomputed on
         # every load, same reset-per-load convention as everything else
@@ -2686,15 +2573,17 @@ class ArtifactViewerMixin:
 
     def _update_art_version_banner(self, script_name: str, platform: str) -> None:
         """Show/hide the non-blocking version banner above the report
-        table: visible only when the parser version that produced THIS
+        table: visible either when the parser version that produced THIS
         report (run_log.parser_version, recorded at run time) is older
-        than the parser's current on-disk version (parser_versions.py).
-        Never blocks viewing the existing (older) results — the examiner
-        decides whether/when to update via the banner's own button."""
+        than the parser's current on-disk version (parser_versions.py), OR
+        — for a `device_wide` parser like app_report.py, whose own
+        has_parser/score output depends on the FULL SET of available
+        parsers, not just its own script — when a DIFFERENT parser has
+        been added or updated since this report last ran
+        (parser_versions.get_coverage_fingerprint). Never blocks viewing
+        the existing (older) results — the examiner decides whether/when
+        to update via the banner's own button."""
         self._art_version_banner.setVisible(False)
-        current_version = parser_versions.get_current_version(platform, script_name)
-        if current_version is None:
-            return
         try:
             with closing(_open_results_db(self._case_dir)) as db:
                 last_run = load_last_run(db, f'artifact_{script_name}')
@@ -2702,18 +2591,39 @@ class ArtifactViewerMixin:
             return
         if not last_run:
             return
+
+        current_version = parser_versions.get_current_version(platform, script_name)
         used_version = last_run.get('parser_version')
         # used_version is None for a report run before this feature existed,
         # or if recording it failed at run time (start_run_log is
         # best-effort) — nothing to honestly compare against, so stay quiet
         # rather than claim an update is available when we can't say from what.
-        if used_version is None or current_version <= used_version:
+        if current_version is not None and used_version is not None and current_version > used_version:
+            changelog = parser_versions.get_changelog_entry(platform, script_name, current_version)
+            note = changelog or "No changelog has been recorded for this update."
+            self._art_version_banner_label.setText(
+                f"A newer version of this parser is available "
+                f"(v{used_version} → v{current_version}). {note}")
+            self._art_version_banner.setVisible(True)
             return
-        changelog = parser_versions.get_changelog_entry(platform, script_name, current_version)
-        note = changelog or "No changelog has been recorded for this update."
+
+        # device_wide coverage-staleness check — only meaningful for a
+        # parser that actually declares device_wide (app_report.py); every
+        # other parser's used_fingerprint is always None and this is a
+        # silent no-op for them.
+        mod = self._art_current_mod
+        if not getattr(mod, 'device_wide', False):
+            return
+        used_fingerprint = last_run.get('coverage_fingerprint')
+        if used_fingerprint is None:
+            return
+        current_fingerprint = parser_versions.get_coverage_fingerprint(platform)
+        if current_fingerprint == used_fingerprint:
+            return
         self._art_version_banner_label.setText(
-            f"A newer version of this parser is available "
-            f"(v{used_version} → v{current_version}). {note}")
+            "A parser script has been added or updated since this report "
+            "last ran — has_parser/score/category may be out of date. "
+            "Re-run to refresh against the current parser coverage.")
         self._art_version_banner.setVisible(True)
 
     def _on_art_update_parser_version(self) -> None:
@@ -2893,6 +2803,17 @@ class ArtifactViewerMixin:
             self._art_table_model.set_timestamp_formatting(units, _fmt)
         else:
             self._art_table_model.set_timestamp_formatting({}, None)
+
+        # Raw-value byte-count columns (see byte_fields on the parser
+        # module, added 2026-09-15 for artifacts/ios|android/app_report.py
+        # — same reasoning as timestamp_fields above: the stored value
+        # stays a raw, numerically-sortable int, MB-formatted only at
+        # display time. Generalizes what used to be a one-off manual
+        # set_byte_columns(["Total Size"]) call hardcoded to the former
+        # "Apps" tree node's own list-mode table (see CLAUDE.md's Apps-
+        # node Conventions entry) into a declarative convention any report
+        # can use, matching timestamp_fields' own shape.
+        self._art_table_model.set_byte_columns(list(getattr(mod, 'byte_fields', ())) if mod else [])
 
         # Media columns: thumbnail delegate per-column (never touches the
         # other columns' normal HighlightDelegate), row height tall enough
@@ -3084,64 +3005,6 @@ class ArtifactViewerMixin:
         self._art_notes_label.setText(html_body)
         self._art_stack.setCurrentIndex(3)
 
-    def _art_show_app_notes(self):
-        """Application Report Notes page — the Apps table's own notes,
-        added 2026-08-26 alongside the Data/Shared Folder Created and
-        Preferences/Splash Snapshot Modified columns below, since (unlike
-        a per-parser Report Notes/Warning child) this table isn't backed
-        by any one script's own `description` — reuses the same
-        _art_notes_label/index-3 page as _art_show_notes, just with
-        hand-authored content instead of a module attribute.
-
-        Explains why the previous Last Activity (Data Folder)/(Shared
-        Folder) columns (2026-08-25) were REMOVED rather than kept
-        (real casework — IOS17 JoshHickman, 2026-08-26 — confirmed at
-        least 3 unrelated apps write files with a fabricated far-future
-        mtime via their own third-party disk-cache libraries; a container-
-        wide max() has no way to tell that from a real recent write), and
-        what each replacement column actually measures and its own
-        specific limitation — an examiner reading a timestamp column
-        should know exactly what it can and can't tell them, not just
-        trust a single opaque "last activity" number."""
-        html_body = (
-            '<div style="font-size:14px; font-weight:600; margin-bottom:8px;">'
-            'Application Report</div>'
-            + _notes_html_paragraphs(
-                "This table is the case's full app inventory (app_intelligence.scan_apps), "
-                "not tied to any one parser script, so these notes explain the table's own "
-                "columns rather than one report's description. "
-                "`Data Folder Created`/`Shared Folder Created` are each container's own "
-                "creation time (its filesystem birth time, not its last-modified time) — "
-                "confirmed against this case's own ground-truth documentation to be an exact, "
-                "reliable proxy for when the app was first installed/set up on this device, "
-                "for both its private Data container and its Shared/App-Group container. "
-                "`Preferences Modified` is the mtime of the app's own "
-                "`Library/Preferences/<bundle id>.plist` — a file virtually every iOS app "
-                "writes to during normal use — confirmed to closely track real last use in "
-                "most cases, but it can UNDERSHOOT the true last-used date if the app's final "
-                "session never happened to rewrite its settings file. "
-                "`Splash Snapshot Modified` is the mtime of the OS-generated app-switcher "
-                "snapshot under `Library/SplashBoard/Snapshots/` — captured by iOS itself "
-                "every time the app is foregrounded then backgrounded — confirmed the closest "
-                "single proxy for true last use across every app checked so far, but it is "
-                "still a proxy, not a certainty: an app that was never backgrounded normally "
-                "(a crash, a forced kill) may not get a fresh snapshot. "
-                "These replaced a single Last Activity (Data Folder)/(Shared Folder) pair "
-                "(added 2026-08-25) that took the maximum mtime across every file in the "
-                "whole container — removed 2026-08-26 after real casework showed multiple, "
-                "unrelated apps' own third-party disk-cache libraries writing cache files "
-                "with a deliberately fabricated far-future modification time (one app's cache "
-                "uniformly stamped over a decade in the future), which a plain maximum has no "
-                "way to distinguish from a genuine recent write. "
-                "None of these four columns is a substitute for reviewing an app's own real "
-                "content when a parser or manual database review is available — they exist to "
-                "help triage which unparsed apps are worth that closer look."))
-        self._art_notes_label.setStyleSheet(
-            "background: palette(base); border: 1px solid palette(mid); "
-            "border-radius: 4px; padding: 10px 12px;")
-        self._art_notes_label.setText(html_body)
-        self._art_stack.setCurrentIndex(3)
-
     # ── Validation baseline ─────────────────────────────────────────────────
 
     def _device_os_string(self) -> str:
@@ -3263,10 +3126,6 @@ class ArtifactViewerMixin:
     # ── Filtering ─────────────────────────────────────────────────────────────
 
     def _apply_art_filter(self):
-        if self._art_showing_apps:
-            self._apply_apps_combined_filter()
-            return
-
         term    = self._art_filter_input.text()
         col_idx = self._art_filter_col.currentData()   # -1 = all columns; see _setup_report_filter_ui
         if col_idx is None:
@@ -3325,129 +3184,6 @@ class ArtifactViewerMixin:
             except Exception:
                 pass
         self._art_filter_worker = None
-
-    # ── Apps-table-only filters (Category checklist + Date range) ─────────────
-    # Added 2026-08-26, same widget pattern as ffs-explorer.py's own File
-    # Browser Type/Date filters (_populate_type_menu/_filter_by_date etc.) —
-    # see _apply_apps_combined_filter for why the Apps table needs its own
-    # combined filter method rather than reusing filter_rows_inmem, which
-    # only ever handled the single free-text dimension.
-
-    def _all_art_category_values(self) -> set:
-        rows, columns = self._art_table_model._rows, self._art_table_model._columns
-        if not rows or "Category" not in columns:
-            return set()
-        idx = columns.index("Category")
-        return {(row[idx] or '') for row in rows}
-
-    def _populate_art_category_menu(self):
-        self._art_category_menu.clear()
-        all_act = self._art_category_menu.addAction("All Categories")
-        all_act.triggered.connect(partial(self._set_art_category_filter, None))
-        # Empty (not None) selected set — every row's category check
-        # ('row[cat_idx] not in cat_selected') fails against an empty set,
-        # so this starts from nothing shown; the examiner then checks just
-        # the one or two categories they actually want, rather than having
-        # to uncheck everything else one at a time from "All".
-        none_act = self._art_category_menu.addAction("No Categories")
-        none_act.triggered.connect(partial(self._set_art_category_filter, set()))
-        self._art_category_menu.addSeparator()
-        values = self._all_art_category_values()
-        selected = self._art_category_filter_selected
-        for v in sorted(values, key=lambda x: (x == '', x)):
-            act = self._art_category_menu.addAction(v if v else "(blank)")
-            act.setCheckable(True)
-            act.setChecked(selected is None or v in selected)
-            act.toggled.connect(partial(self._on_art_category_menu_toggled, v))
-
-    def _on_art_category_menu_toggled(self, value: str, checked: bool):
-        all_values = self._all_art_category_values()
-        cur = (set(all_values) if self._art_category_filter_selected is None
-               else set(self._art_category_filter_selected))
-        cur = cur | {value} if checked else cur - {value}
-        self._set_art_category_filter(None if cur >= all_values else cur)
-
-    def _set_art_category_filter(self, selected: set | None):
-        self._art_category_filter_selected = selected
-        if selected is None:
-            label = "Category: All"
-        elif not selected:
-            label = "Category: None"
-        else:
-            label = "Category: Filtered"
-        self._art_category_filter_btn.setText(label)
-        self._apply_apps_combined_filter()
-
-    def _set_art_date_filter_enabled(self, on: bool):
-        self._art_date_filter_combo.setEnabled(on)
-        self._art_date_filter_from.setEnabled(on)
-        self._art_date_filter_to.setEnabled(on)
-
-    def _on_art_date_filter_toggled(self, on: bool):
-        self._set_art_date_filter_enabled(on)
-        self._apply_apps_combined_filter()
-
-    def _apply_art_filter_if_date_enabled(self):
-        if self._art_date_filter_enable.isChecked():
-            self._apply_apps_combined_filter()
-
-    def _apply_apps_combined_filter(self):
-        """Apps table's own filter: intersects the free-text box (same
-        _art_filter_input/_art_filter_col every other report uses) with the
-        Category checklist and the Date range — all three narrow the SAME
-        visible row set together, unlike a normal report's single free-text
-        dimension. List-mode only (the Apps table is never DB-backed, see
-        _populate_apps_table's load_rows call) — a plain Python pass over
-        every row is cheap at this table's size (~1-2k rows, not the
-        hundreds-of-thousands a DB-backed report can hold)."""
-        if not self._art_showing_apps:
-            return
-        rows, columns = self._art_table_model._rows, self._art_table_model._columns
-        total = len(rows)
-
-        term = self._art_filter_input.text()
-        self._art_active_filter = term
-        t = term.casefold()
-        col_idx = self._art_filter_col.currentData()
-        if col_idx is None:
-            col_idx = -1
-
-        cat_idx = columns.index("Category") if "Category" in columns else -1
-        cat_selected = self._art_category_filter_selected
-
-        date_idx = -1
-        date_lo = date_hi = None
-        if self._art_date_filter_enable.isChecked():
-            date_header = self._art_date_filter_combo.currentText()
-            if date_header in columns:
-                date_idx = columns.index(date_header)
-                date_lo = self._art_date_filter_from.date().toString('yyyy-MM-dd')
-                date_hi = self._art_date_filter_to.date().toString('yyyy-MM-dd')
-
-        ids = []
-        for i, row in enumerate(rows):
-            if t:
-                if col_idx < 0:
-                    if not any(t in str(v).casefold() for v in row):
-                        continue
-                elif t not in str(row[col_idx]).casefold():
-                    continue
-            if cat_selected is not None and cat_idx >= 0:
-                if (row[cat_idx] or '') not in cat_selected:
-                    continue
-            if date_idx >= 0:
-                # Stored as 'YYYY-MM-DD HH:MM:SS UTC' (_format_last_activity)
-                # — a plain 10-char prefix slice sorts/compares correctly
-                # against the From/To 'YYYY-MM-DD' strings, same technique
-                # ffs-explorer.py's own date filter already uses.
-                d = (row[date_idx] or '')[:10]
-                if not d or not (date_lo <= d <= date_hi):
-                    continue
-            ids.append(i)
-
-        self._cancel_art_filter_worker()
-        self._art_table_model.apply_rowids(ids)
-        self._art_row_label.setText(f"{len(ids):,} of {total:,} app(s)")
 
     # ── Script / source / files views ─────────────────────────────────────────
 
@@ -3527,318 +3263,6 @@ class ArtifactViewerMixin:
         self._art_row_label.setText(f"{len(rows)} file(s)")
         self._art_stack.setCurrentIndex(1)
         self.status_bar.showMessage(f"Exported files — {folder}")
-
-    # ── Apps (app_intelligence + app_registry) ─────────────────────────────────
-    #
-    # app_registry — built once per case load from the device's own
-    # com.apple.LaunchServices-<version>-v2.csstore (see CLAUDE.md's "iOS
-    # app registry (LaunchServices)" section) — is the real STARTING POINT
-    # for this table, per direct user design guidance 2026-08-25: app
-    # name, bundle id, every Shared/AppGroup folder, the Data folder, and
-    # every PluginKit extension all come directly from that one registry,
-    # not from app_intelligence's own merged/summarized fields. score/
-    # has_parser/category and total size/last-activity still come from
-    # app_intelligence.scan_apps() (already correct, no reason to
-    # recompute), but the identity/location columns below are grounded in
-    # app_registry first, falling back to app_intelligence's own
-    # `containers` list only when no app_registry row exists for that
-    # app_id (Android — app_registry is iOS-only — or an unlinked App-
-    # Group identity). iOS-only concept, so Android rows show blank
-    # Shared/Data Folder/Plugin(s) cells rather than a guess.
-
-    _APPS_COLUMNS = ["App", "Bundle ID", "Shared Data Folder", "Data Folder",
-                     "Plugin(s)", "Total Size", "Media Files",
-                     "Data Folder Created", "Shared Folder Created",
-                     "Preferences Modified", "Splash Snapshot Modified",
-                     "Score", "Has Parser", "Category"]
-    # The four timestamp columns above, offered in the Apps table's own
-    # Date filter combo (added 2026-08-26, same pattern as the File
-    # Browser's filter_date_combo) — picking one applies a From/To range
-    # against ITS stored 'YYYY-MM-DD ...' string (string-prefix compare,
-    # same technique ffs-explorer.py's own date filter already uses).
-    _APPS_DATE_COLUMNS = ["Data Folder Created", "Shared Folder Created",
-                          "Preferences Modified", "Splash Snapshot Modified"]
-
-    @staticmethod
-    def _container_path_to_ui_path(raw_path: str) -> str:
-        """Normalize an app_registry bundle_container_path/
-        data_container_path (a literal on-device absolute path, e.g.
-        '/private/var/mobile/Containers/Data/Application/<GUID>/') into
-        this project's own ui_path convention. Confirmed against real
-        Cellebrite casework (iOS 16.5 CTF23) that stripping a leading
-        '/private/var' and any trailing slash exactly matches the SAME
-        container's own path as it already appears in app_intelligence's
-        `containers` field. Not independently verified against GrayKey (no
-        GrayKey iOS test case was available when this was written) — this
-        mirrors the same unconditional (no format branching) convention
-        artifact_runner._resolve_app_group_base already uses for an
-        App-Group container's own ui_path, so any GrayKey gap here is the
-        same one already latent there, not something new."""
-        return (raw_path or '').removeprefix('/private/var').strip('/')
-
-    def _build_app_registry_lookup(self, app_ids: list) -> tuple[dict, dict]:
-        """Returns (registry_by_bundle_id, plugins_by_bundle_id).
-
-        registry_by_bundle_id: {bundle_id: app_registry row} — from
-        app_registry (the LaunchServices csstore), main identity/location
-        fields only (display name, Data/App-Group container paths).
-
-        plugins_by_bundle_id: {host_bundle_id: [extension_bundle_id, ...]},
-        built from *app_ids* — the CURRENT app_intelligence.scan_apps()
-        result being displayed, NOT app_registry — confirmed by direct
-        testing 2026-08-25 that app_registry does NOT reliably carry
-        PluginKit extension bundle ids at all (WhatsApp's 6 real
-        extensions — ServiceExtension, NotificationExtension,
-        ShareExtension, TodayExtension, IntentsUI, Intents — are ABSENT
-        from app_registry on real casework, since the csstore's own Bundle
-        table simply doesn't always have a row for them); app_intelligence
-        DOES always know about them, as their own separate rows (each
-        PluginKitPlugin container resolves its own bundle id via the
-        per-container metadata plist / guid_to_bundle, independent of
-        the csstore — see CLAUDE.md's app_intelligence.py entry on why an
-        extension is never merged into its host's own identity). Same
-        dotted-suffix convention either way (e.g.
-        'net.whatsapp.WhatsApp.ShareExtension' under host
-        'net.whatsapp.WhatsApp'), just checked against the right source.
-
-        registry_by_bundle_id is {} (not an error) if app_registry hasn't
-        been built for this case — Android always, or an iOS case never
-        (re)opened since this feature shipped."""
-        registry_by_bundle: dict = {}
-        if self._case_dir:
-            from db_utils import _open_cache_db, load_app_registry
-            try:
-                with closing(_open_cache_db(self._case_dir)) as cache_db:
-                    registry_by_bundle = {r['bundle_id']: r for r in load_app_registry(cache_db)}
-            except Exception:
-                registry_by_bundle = {}
-        plugins_by_bundle: dict = {}
-        for host in app_ids:
-            kids = sorted(x for x in app_ids if x != host and x.startswith(host + '.'))
-            if kids:
-                plugins_by_bundle[host] = kids
-        return registry_by_bundle, plugins_by_bundle
-
-    def _flatten_app_intelligence_row(self, row: dict, registry_by_bundle: dict,
-                                      plugins_by_bundle: dict) -> tuple:
-        """One scan_apps() row -> one flat tuple for the Apps table. Every
-        value here is a short string/number — deliberately never a raw
-        list/dict cell: a flat table should only carry what reads sensibly
-        in one cell, so a Shared Data Folder/Plugin(s) cell with more than
-        one real value is comma-joined rather than truncated to the first
-        (per direct user instruction — WhatsApp alone has 5 real App-Group
-        folders on real casework, confirmed 2026-08-25; showing only one
-        would silently hide four). Total Size is the RAW byte count
-        (int), not a pre-formatted string — ArtifactTableModel.data()
-        MB-formats it at display time (see set_byte_columns(), called in
-        _populate_apps_table) so the underlying value stays numerically
-        sortable; a value baked into '51.80 MB' before storage would sort
-        lexicographically ('10.00 MB' before '9.00 MB'), the same failure
-        mode timestamp columns avoid by storing a raw epoch value and
-        formatting only at display time."""
-        app_id = row.get('app_id', '')
-        reg = registry_by_bundle.get(app_id)
-        plugins = plugins_by_bundle.get(app_id, [])
-        containers = row.get('containers') or []
-
-        if reg:
-            data_folder = self._container_path_to_ui_path(reg.get('data_container_path', ''))
-            shared_folder = ', '.join(
-                f"mobile/Containers/Shared/AppGroup/{guid}"
-                for guid in sorted((reg.get('app_group_paths') or {}).values()))
-        else:
-            # No app_registry row for this identity (Android, an unlinked
-            # App-Group, OR a PluginKit extension — app_registry doesn't
-            # reliably carry extension bundle ids at all, see
-            # _build_app_registry_lookup's own docstring) — fall back to
-            # app_intelligence's own already-merged container list rather
-            # than leaving a blank cell when the data is actually right
-            # there. 'plugin' included alongside 'data' here (confirmed
-            # 2026-08-26, per direct user question, that a plugin row's
-            # own container path was previously shown nowhere at all —
-            # neither this branch nor the app_registry one above ever
-            # looked at kind=='plugin'): a PluginKitPlugin container always
-            # forms its own separate row, never merged with a host app's
-            # data/app_group containers (see scan_apps' identity-grouping
-            # comment in app_intelligence.py), so a real app's data_folder
-            # here is never accidentally joined with an unrelated plugin's
-            # path — the two kinds never co-occur in the same row's
-            # containers list.
-            data_folder = ', '.join(c['path'] for c in containers
-                                    if c.get('kind') in ('data', 'plugin'))
-            shared_folder = ', '.join(c['path'] for c in containers if c.get('kind') == 'app_group')
-
-        # Display-only category fallbacks (added 2026-08-26, per direct user
-        # requests) — GUI-table-only: never written back into row['category']
-        # itself, which stays exactly what scan_apps() actually found (or
-        # genuinely didn't); a real declared category (from iTunesMetadata/
-        # Info.plist — see app_intelligence.py's scan_ios_bundle_containers)
-        # always wins over both fallbacks below, never overridden.
-        #   1. 'Plug-in' — ANY vendor's PluginKit extension (WhatsApp's own
-        #      ShareExtension just as much as Apple's), derived from the
-        #      row's own containers' 'kind' field — a PluginKitPlugin
-        #      container always forms its own separate row, never merged
-        #      with a host app's data/app_group containers (see
-        #      app_intelligence.py's scan_apps identity-grouping comment),
-        #      so a row is unambiguously one or the other, never both. Takes
-        #      priority over fallback 2 below (an extension is still an
-        #      extension whichever vendor built it) — was the actual real
-        #      ask this whole Category-filter feature started from: telling
-        #      a real app apart from a PluginKit extension in a ~1000-row
-        #      table with no other way to do it at a glance.
-        #   2. 'Built-in Apple App' — a com.apple.* bundle id that's NOT a
-        #      plugin (fallback 1 already claimed those) and has no real
-        #      declared category — Apple's own built-in apps mostly have no
-        #      iTunesMetadata.plist at all (baked into iOS, not App Store
-        #      installs), so real category data is usually genuinely absent
-        #      for them; this label is a display convenience, not a claim
-        #      that Apple declared it.
-        category = row.get('category') or ''
-        if not category:
-            if any(c.get('kind') == 'plugin' for c in containers):
-                category = 'Plug-in'
-            elif app_id.startswith('com.apple.'):
-                category = 'Built-in Apple App'
-
-        return (
-            row.get('display_name') or app_id,
-            app_id,
-            shared_folder,
-            data_folder,
-            ', '.join(plugins),
-            row.get('total_bytes'),
-            row.get('media_file_count', 0),
-            row.get('data_created_utc') or '',
-            row.get('shared_created_utc') or '',
-            row.get('preferences_modified_utc') or '',
-            row.get('splash_snapshot_modified_utc') or '',
-            row.get('score', ''),
-            'Yes' if row.get('has_parser') else 'No',
-            category,
-        )
-
-    def _populate_apps_table(self, rows: list) -> None:
-        registry_by_bundle, plugins_by_bundle = self._build_app_registry_lookup(
-            [r.get('app_id', '') for r in rows])
-        flat = [self._flatten_app_intelligence_row(r, registry_by_bundle, plugins_by_bundle)
-               for r in rows]
-        # No parser module/record_source for this table at all — reset
-        # explicitly rather than leaving whatever a previously-viewed
-        # Report left behind (see _art_load_record_hex: an empty
-        # _art_current_record_sources list is what makes it show "Record
-        # location not available" instead of trying to resolve a stale
-        # module's rowid_fields against a row shape that was never built
-        # for it).
-        self._art_current_mod = None
-        self._art_current_script = None
-        self._art_current_record_sources = []
-        self._art_record_source_sticky = {}
-        self._hex_record_source_combo.setVisible(False)
-        self._art_table_model.load_rows(self._APPS_COLUMNS, flat)
-        self._art_table_model.set_byte_columns(["Total Size"])
-        for col in range(self._art_table_model.columnCount()):
-            self._art_report_view.setItemDelegateForColumn(col, self._art_highlight_delegate)
-        self._art_report_view.verticalHeader().setDefaultSectionSize(80)
-        self._setup_report_filter_ui(self._APPS_COLUMNS)
-        self._art_showing_apps = True
-        for w in (self._art_category_filter_btn, self._art_date_filter_enable,
-                 self._art_date_filter_combo, self._art_date_filter_from,
-                 self._art_date_filter_to):
-            w.setVisible(True)
-        # Default view (added 2026-08-26, per direct user request): start
-        # with '(blank)' and 'Plug-in' unchecked rather than "All" — this is
-        # the actual fix for the original complaint that a flat ~1000-row
-        # table full of empty PluginKit extensions/system daemons was
-        # unusable for triage. Nothing is hidden permanently — it's just
-        # this filter's OWN starting selection, exactly like checking those
-        # two boxes off by hand; still one click away via the Category menu.
-        self._set_art_category_filter(self._all_art_category_values() - {'', 'Plug-in'})
-        self._art_resize_columns()
-        self._art_stack.setCurrentIndex(1)
-
-    def _retire_art_apps_worker(self):
-        worker = getattr(self, '_art_apps_worker', None)
-        if worker is not None:
-            self._retire_worker(worker)
-            self._art_apps_worker = None
-
-    def _art_show_apps(self):
-        """Apps tree node: the same per-app inventory the MCP list_apps
-        tool returns (app_intelligence.scan_apps), flattened into the
-        Report table widget — every app gathered for this case, not just
-        ones with a parser. Shares casecache.db's app_intelligence table/
-        staleness key with list_apps, so a scan triggered from here and a
-        later (or earlier) AI-access list_apps call don't redundantly
-        re-walk the archive — see AppIntelligenceWorker's own docstring."""
-        self._retire_art_apps_worker()
-        if not self._case_dir:
-            return
-        from mcp_server import CaseContext
-        from db_utils import _open_cache_db, load_app_intelligence, load_blob
-
-        ui_metadata = self.full_metadata
-        # Unlike the AI-access consent toggle, there is no external-client
-        # boundary here — the GUI already reads raw archive bytes freely
-        # everywhere else (Hex viewer, SQLite viewer). raw_content_enabled
-        # only affects the CACHE KEY (below), so a stricter, consent-gated
-        # MCP scan and this always-True GUI scan never silently share a
-        # result across that boundary — whichever ran last just wins under
-        # its own key, and the other side's next call detects the mismatch
-        # and rescans on its own terms.
-        ctx = CaseContext(
-            case_dir=self._case_dir,
-            zip_path=self.zip_path or '',
-            get_ui_metadata=lambda: self.full_metadata,
-            get_folder_map=lambda: self.folder_map,
-            get_folder_sizes=lambda: self._folder_sizes,
-            get_guid_to_bundle=lambda: self.guid_to_bundle,
-            get_header_types=lambda: self._header_type_overrides,
-            adapter=getattr(self, '_adapter', None),
-            raw_content_enabled=True,
-            read_bytes=lambda p: self._read_zip_bytes(p),
-        )
-        import app_intelligence
-        cache_key = f'{len(ui_metadata)}:{True}:{app_intelligence.scan_logic_version()}'
-
-        try:
-            with closing(_open_cache_db(self._case_dir)) as cache_db:
-                stale = load_blob(cache_db, 'app_intelligence_scan_key', '1')
-                cached_rows = load_app_intelligence(cache_db)
-        except Exception:
-            stale, cached_rows = None, []
-
-        if cached_rows and stale is not None and stale.decode() == cache_key:
-            self._populate_apps_table(cached_rows)
-            self.status_bar.showMessage(f"Apps — {len(cached_rows):,} app(s), cached scan")
-            return
-
-        # Miss/stale: scan on a background thread — a first pass over a
-        # large case can take ~1 minute (see CLAUDE.md's mcp_server.py
-        # entry), must not block the GUI thread. Must ALSO switch the
-        # stack to the report page here, not just on completion — found by
-        # direct testing (2026-08-25): _art_row_label lives on the report
-        # page (stack index 1), so leaving the stack on the index-0
-        # placeholder page during a slow scan meant the "Scanning apps…"
-        # text was updated but never actually visible, reading as "nothing
-        # happened" for however long the scan took.
-        self._art_table_model.clear()
-        self._setup_report_filter_ui(self._APPS_COLUMNS)
-        self._art_row_label.setText("Scanning apps…")
-        self._art_stack.setCurrentIndex(1)
-        self.status_bar.showMessage("Scanning apps — this can take a while on a large case…")
-        worker = AppIntelligenceWorker(ctx, cache_key)
-        worker.done.connect(self._on_art_apps_scan_done)
-        self._art_apps_worker = worker
-        worker.start()
-
-    def _on_art_apps_scan_done(self, rows: list, error: str) -> None:
-        self._art_apps_worker = None
-        if error:
-            self.status_bar.showMessage(f"App scan failed: {error}")
-            self._art_row_label.setText("Scan failed")
-            return
-        self._populate_apps_table(rows)
-        self.status_bar.showMessage(f"Apps — {len(rows):,} app(s)")
 
     def _open_artifact_runner(self):
         if not self.zip_path:

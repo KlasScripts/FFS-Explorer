@@ -31,9 +31,8 @@ from header_scan import sniff_media_kind, classify_magic
 
 
 def scan_logic_version() -> str:
-    """Short content hash of this module's own source — folded into both
-    callers' app_intelligence cache keys (artifact_viewer.py's
-    _art_show_apps, mcp_server.py's list_apps) alongside the existing
+    """Short content hash of this module's own source — folded into
+    mcp_server.py's list_apps cache key alongside the existing
     files_indexed/raw_content_enabled components.
 
     Found necessary 2026-08-26: the cache key previously reflected only
@@ -1327,10 +1326,11 @@ def scan_apps(ctx) -> list:
         # once here since _walk_container's own accurate media count now
         # needs it too, not just find_evidence_databases' magic-byte
         # fallback. None (no raw reads at all) when raw_content_enabled is
-        # off — the GUI's own automatic case-load scan always passes True
-        # here (see artifact_viewer.py's _art_show_apps), so this only
-        # actually degrades an AI client's own consent-restricted
-        # list_apps call, never the app's own internal processing.
+        # off — every direct, examiner-triggered caller (the App Report
+        # parser scripts, artifact_runner.py's own device_wide context
+        # construction) always passes True here, so this only actually
+        # degrades an AI client's own consent-restricted list_apps call,
+        # never a direct examiner-triggered scan.
         _rb = ctx.read_bytes if ctx.raw_content_enabled else None
         for _own_id, child, _kind in members:
             fc, la, mc = _walk_container(child, folder_map, ui_metadata,
@@ -1537,3 +1537,146 @@ def scan_apps(ctx) -> list:
         d['total_bytes'],
     ), reverse=True)
     return out
+
+
+# ── Flat row output for artifacts/ios|android/app_report.py ─────────────────
+#
+# Ported 2026-09-15 from what used to be artifact_viewer.py's own
+# _build_app_registry_lookup/_flatten_app_intelligence_row (the former
+# "Apps" tree node's own GUI-only flattening, used by its list-mode table)
+# — moved here, Qt-free, once that node became a normal parser script per
+# direct user request ("move the app table to be an artifact script
+# instead of where it is just now"). Behavior is unchanged from the
+# original; only the output shape changed, from a positional display
+# tuple to a normal parser row dict (matching every other parser's own
+# lowercase-snake_case field-name convention, not the old GUI's literal
+# "App"/"Bundle ID" column-header strings).
+
+def container_path_to_ui_path(raw_path: str) -> str:
+    """Normalize an app_registry bundle_container_path/data_container_path
+    (a literal on-device absolute path, e.g. '/private/var/mobile/
+    Containers/Data/Application/<GUID>/') into this project's own ui_path
+    convention. Confirmed against real Cellebrite casework (iOS 16.5
+    CTF23) that stripping a leading '/private/var' and any trailing slash
+    exactly matches the SAME container's own path as it already appears
+    in app_intelligence's `containers` field. Not independently verified
+    against GrayKey (no GrayKey iOS test case was available when this was
+    written) — this mirrors the same unconditional (no format branching)
+    convention artifact_runner._resolve_app_group_base already uses for
+    an App-Group container's own ui_path, so any GrayKey gap here is the
+    same one already latent there, not something new."""
+    return (raw_path or '').removeprefix('/private/var').strip('/')
+
+
+def build_app_registry_lookup(case_dir: str, app_ids: list) -> tuple[dict, dict]:
+    """Returns (registry_by_bundle_id, plugins_by_bundle_id).
+
+    registry_by_bundle_id: {bundle_id: app_registry row} — from
+    app_registry (the LaunchServices csstore), main identity/location
+    fields only (display name, Data/App-Group container paths).
+
+    plugins_by_bundle_id: {host_bundle_id: [extension_bundle_id, ...]},
+    built from *app_ids* — the CURRENT scan_apps() result being
+    processed, NOT app_registry — confirmed by direct testing 2026-08-25
+    that app_registry does NOT reliably carry PluginKit extension bundle
+    ids at all (WhatsApp's 6 real extensions are absent from app_registry
+    on real casework, since the csstore's own Bundle table simply doesn't
+    always have a row for them); scan_apps DOES always know about them,
+    as their own separate rows. Same dotted-suffix convention either way
+    (e.g. 'net.whatsapp.WhatsApp.ShareExtension' under host
+    'net.whatsapp.WhatsApp'), just checked against the right source.
+
+    registry_by_bundle_id is {} (not an error) if app_registry hasn't been
+    built for this case — Android always, or an iOS case never (re)opened
+    since that feature shipped."""
+    registry_by_bundle: dict = {}
+    if case_dir:
+        try:
+            with closing(_open_cache_db(case_dir)) as cache_db:
+                registry_by_bundle = {r['bundle_id']: r for r in load_app_registry(cache_db)}
+        except Exception:
+            registry_by_bundle = {}
+    plugins_by_bundle: dict = {}
+    for host in app_ids:
+        kids = sorted(x for x in app_ids if x != host and x.startswith(host + '.'))
+        if kids:
+            plugins_by_bundle[host] = kids
+    return registry_by_bundle, plugins_by_bundle
+
+
+def flatten_row(row: dict, registry_by_bundle: dict, plugins_by_bundle: dict) -> dict:
+    """One scan_apps() row -> one flat parser-row dict. Every value here
+    is a short string/number — deliberately never a raw list/dict cell: a
+    flat report table should only carry what reads sensibly in one cell,
+    so a shared_data_folder/plugins cell with more than one real value is
+    comma-joined rather than truncated to the first (per direct user
+    instruction — WhatsApp alone has 5 real App-Group folders on real
+    casework, confirmed 2026-08-25; showing only one would silently hide
+    four). total_bytes is the RAW byte count (int), not a pre-formatted
+    string — declared in byte_fields on the parser module so
+    ArtifactTableModel MB-formats it at display time, keeping the
+    underlying value numerically sortable."""
+    app_id = row.get('app_id', '')
+    reg = registry_by_bundle.get(app_id)
+    plugins = plugins_by_bundle.get(app_id, [])
+    containers = row.get('containers') or []
+
+    if reg:
+        data_folder = container_path_to_ui_path(reg.get('data_container_path', ''))
+        shared_folder = ', '.join(
+            f"mobile/Containers/Shared/AppGroup/{guid}"
+            for guid in sorted((reg.get('app_group_paths') or {}).values()))
+    else:
+        # No app_registry row for this identity (Android, an unlinked
+        # App-Group, OR a PluginKit extension — app_registry doesn't
+        # reliably carry extension bundle ids at all, see
+        # build_app_registry_lookup's own docstring) — fall back to
+        # scan_apps' own already-merged container list rather than
+        # leaving a blank cell when the data is actually right there.
+        # 'plugin' included alongside 'data': a PluginKitPlugin container
+        # always forms its own separate row, never merged with a host
+        # app's data/app_group containers, so a real app's data_folder
+        # here is never accidentally joined with an unrelated plugin's
+        # path — the two kinds never co-occur in the same row's
+        # containers list.
+        data_folder = ', '.join(c['path'] for c in containers
+                                if c.get('kind') in ('data', 'plugin'))
+        shared_folder = ', '.join(c['path'] for c in containers if c.get('kind') == 'app_group')
+
+    # Display-only category fallbacks — never written back into
+    # row['category'] itself, which stays exactly what scan_apps()
+    # actually found (or genuinely didn't); a real declared category
+    # always wins over both fallbacks below, never overridden.
+    #   1. 'Plug-in' — ANY vendor's PluginKit extension, derived from the
+    #      row's own containers' 'kind' field. Takes priority over
+    #      fallback 2 below (an extension is still an extension whichever
+    #      vendor built it).
+    #   2. 'Built-in Apple App' — a com.apple.* bundle id that's NOT a
+    #      plugin and has no real declared category — Apple's own
+    #      built-in apps mostly have no iTunesMetadata.plist at all
+    #      (baked into iOS, not App Store installs), so real category
+    #      data is usually genuinely absent for them; this label is a
+    #      display convenience, not a claim that Apple declared it.
+    category = row.get('category') or ''
+    if not category:
+        if any(c.get('kind') == 'plugin' for c in containers):
+            category = 'Plug-in'
+        elif app_id.startswith('com.apple.'):
+            category = 'Built-in Apple App'
+
+    return {
+        'display_name':                  row.get('display_name') or app_id,
+        'app_id':                        app_id,
+        'shared_data_folder':            shared_folder,
+        'data_folder':                   data_folder,
+        'plugins':                       ', '.join(plugins),
+        'total_bytes':                   row.get('total_bytes'),
+        'media_file_count':              row.get('media_file_count', 0),
+        'data_folder_created_utc':       row.get('data_created_utc') or '',
+        'shared_folder_created_utc':     row.get('shared_created_utc') or '',
+        'preferences_modified_utc':      row.get('preferences_modified_utc') or '',
+        'splash_snapshot_modified_utc':  row.get('splash_snapshot_modified_utc') or '',
+        'score':                         row.get('score', ''),
+        'has_parser':                    'Yes' if row.get('has_parser') else 'No',
+        'category':                      category,
+    }

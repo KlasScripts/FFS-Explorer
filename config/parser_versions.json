@@ -2,6 +2,11 @@
   "_note": "Auto-generated: 'version'/'hash' are derived purely from each parser script's own content and should not be hand-edited. 'changelog' entries are the only part meant for manual editing \u2014 see parser_versions.py.",
   "format_version": 1,
   "parsers": {
+    "android:app_report": {
+      "changelog": {},
+      "hash": "a0ee789d087f3816",
+      "version": 1
+    },
     "android:burner": {
       "changelog": {
         "2": "Added record_source: single-table Record-mode hex jump into DbMessage (the parser's live-query table) \u2014 the first non-WhatsApp parser wired for this feature.",
@@ -215,6 +220,11 @@
       },
       "hash": "5b009f566681d3ec",
       "version": 5
+    },
+    "ios:app_report": {
+      "changelog": {},
+      "hash": "a6db62161f70195e",
+      "version": 3
     },
     "ios:instagram": {
       "changelog": {

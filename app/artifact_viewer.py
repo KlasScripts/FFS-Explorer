@@ -1559,6 +1559,26 @@ class ArtifactViewerMixin:
         self._art_ai_summary_view.setOpenExternalLinks(False)
         ai_summary_page_layout.addWidget(self._art_ai_summary_view)
 
+        # Document page — a report declaring view_mode = "document" (e.g.
+        # artifacts/ios|android/device_info.py) renders as prose/markdown
+        # here instead of the normal table, via the SAME QTextBrowser
+        # widget the AI Summary page above already uses — this page is
+        # deliberately a separate, generic instance rather than reusing
+        # ai_summary_page itself, since that one is specifically tied to
+        # ai_summary.py's own generated-at/chunk-count label and the
+        # group_overview_mode dispatch, neither of which applies here.
+        # Storage stays completely unchanged: the module's run() still
+        # returns list[dict] like every other parser (one row, one
+        # "document_markdown" column) via the normal write_artifact_results
+        # path — only the RENDER branch differs (_art_show_report checks
+        # view_mode before deciding table vs. this page).
+        document_page = QWidget()
+        document_page_layout = QVBoxLayout(document_page)
+        document_page_layout.setContentsMargins(4, 4, 4, 4)
+        self._art_document_view = QTextBrowser()
+        self._art_document_view.setOpenExternalLinks(False)
+        document_page_layout.addWidget(self._art_document_view)
+
         self._art_stack = QStackedWidget()
         self._art_stack.addWidget(self._art_placeholder)  # 0
         self._art_stack.addWidget(report_page)             # 1
@@ -1566,6 +1586,7 @@ class ArtifactViewerMixin:
         self._art_stack.addWidget(_notes_scroll)           # 3
         self._art_stack.addWidget(validation_page)          # 4
         self._art_stack.addWidget(ai_summary_page)          # 5
+        self._art_stack.addWidget(document_page)            # 6
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._art_tree_view)
@@ -2716,6 +2737,28 @@ class ArtifactViewerMixin:
         # already current — just compare it against whatever version
         # produced THIS report (recorded in run_log at run time).
         self._update_art_version_banner(script_name, platform)
+
+        # view_mode = "document" (see artifacts/ios|android/device_info.py):
+        # a report whose run() returns ONE row with a single
+        # "document_markdown" column renders as prose via QTextBrowser
+        # instead of the normal table — everything below this branch
+        # (record_source, media columns, filter UI, ArtifactTableModel)
+        # only applies to table-shaped reports, so a document report
+        # skips it all rather than building table machinery for a table
+        # that will never actually be shown. Storage is completely
+        # unchanged (write_artifact_results, same as any other parser) —
+        # only this render branch differs.
+        if mod is not None and getattr(mod, 'view_mode', None) == 'document':
+            try:
+                row = conn.execute(
+                    f'SELECT document_markdown FROM "{table}" LIMIT 1').fetchone()
+            except Exception as exc:
+                row = None
+                self.status_bar.showMessage(f"Could not load report: {exc}")
+            conn.close()
+            self._art_document_view.setMarkdown(row[0] if row else "*No data.*")
+            self._art_stack.setCurrentIndex(6)
+            return
 
         # record_source (see Conventions): a list of {label, file_key,
         # table_field/table, rowid_fields, source_match} entries, one per

@@ -176,6 +176,13 @@
       "hash": "162d4f17507e3e73",
       "version": 1
     },
+    "android:device_info": {
+      "changelog": {
+        "2": "New parser -- the Android counterpart to ios/device_info.py, same four sections from entirely different sources: system/build.prop (build number, security patch level), telephony.db siminfo (every SIM: phone number, carrier, ICCID, IMSI, MCC/MNC, eSIM-vs-physical), accounts_de.db with accounts_ce.db fallback (the Google account), and contacts2.db (email cross-reference). Verified field-by-field against the Android 14 JoshHickman archive and its documented ground truth, and against a real 3-SIM device (Android 15 CTF25 Cellebrite). Reads siminfo.display_name before carrier_name and mcc_string/mnc_string rather than the legacy integer columns -- on the real Pixel 7a carrier_name is empty and mcc/mnc are both 0. States outright that an Android extraction carries no on-disk IMEI rather than leaving a silently missing field."
+      },
+      "hash": "00034d5faf03fcd9",
+      "version": 2
+    },
     "android:google_messages": {
       "changelog": {
         "2": "Removed local _display_name()/_resolve_cache_path() in favor of shared first_nonempty(default=...)/resolve_path_after_marker() (no output change)."
@@ -229,6 +236,13 @@
       },
       "hash": "60e9288611b3455f",
       "version": 4
+    },
+    "ios:device_info": {
+      "changelog": {
+        "3": "Evidence databases (Accounts3.sqlite, AddressBook.sqlitedb) are now materialized WITH their -wal/-shm sidecars and opened via open_db_readonly, so the report reads each database's real current state rather than its last-checkpointed one -- measured on the IOS17 JoshHickman archive, replaying AddressBook's 1.2 MB WAL surfaces 7 ABMultiValue email rows where the main database alone shows 6. The Apple ID and linked-contact results are unchanged on that archive, but a device whose owner-contact row lived only in the WAL would previously have reported no linked contact. Sources are now written to artifact_parser_files/ for inspection instead of a leaked tempfile. 'FFS Type' now names the detected archive LAYOUT ('Cellebrite-style archive layout') instead of printing the format constant as if it identified the acquisition tool -- a claim this project cannot stand behind (see the FORMAT_GRAYKEY/FORMAT_CELLEBRITE ambiguity Convention)."
+      },
+      "hash": "74e0547a0e99e193",
+      "version": 3
     },
     "ios:instagram": {
       "changelog": {

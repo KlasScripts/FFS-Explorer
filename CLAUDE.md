@@ -4945,3 +4945,95 @@ underneath that verification.
   — SQLite's INTEGER column is signed 64-bit, an unsigned 8-byte digest
   read can overflow it) and what's still unverified (the live GUI
   click-through).
+
+- **`view_mode = "document"` — a report rendered as prose, not a table**
+  (2026-09-16/17). A parser module declaring `view_mode = "document"`
+  returns ONE row with a single `document_markdown` column, which
+  `_art_show_report` renders as markdown through a `QTextBrowser`
+  (`_art_stack` index 6) instead of building a table. The first two
+  users are `artifacts/ios/device_info.py` and
+  `artifacts/android/device_info.py` — a one-page summary of the DEVICE
+  itself (make/model/OS, archive layout, timezone, cellular identifiers,
+  the account signed in, and any Contacts entry that account's email
+  matches), which is a handful of unrelated single facts rather than N
+  rows of one shape, so a table was the wrong container for it.
+
+  **Storage is completely unchanged** — `run()` still returns
+  `list[dict]` like every other parser and still goes through the normal
+  `write_artifact_results` path into an ordinary `artifact_<script_name>`
+  table, so MCP's `query_artifact`/`get_case_overview` already see these
+  reports with zero new plumbing. ONLY the render branch differs. That
+  branch returns early, before `record_source`/media columns/filter
+  UI/`ArtifactTableModel` — all of which only apply to a table-shaped
+  report — rather than building table machinery for a table that will
+  never be shown.
+
+  The document page is a separate, generic `QTextBrowser` page rather
+  than a reuse of the existing AI Summary page (index 5), which is
+  specifically tied to `ai_summary.py`'s own generated-at/chunk-count
+  label and the `group_overview_mode` dispatch, neither of which applies
+  here.
+
+  **Two real evidentiary corrections made while verifying these against
+  real archives**, both worth knowing before writing the next
+  document-mode report:
+
+  1. **A parser that opens an evidence database MUST copy its
+     `-wal`/`-shm` sidecars too.** `device_info.py`'s own `_sqlite_at`
+     materializes the database plus both sidecars into the parser's
+     `artifact_parser_files/` folder (never a tempfile — the bytes the
+     report was built from stay on disk for inspection, and nothing
+     leaks per run) and opens it via `artifact_runner.open_db_readonly`.
+     A sidecar the archive lacks is skipped; one left by an earlier run
+     is DELETED, since a stale `-wal` against freshly rewritten main-DB
+     bytes is worse than none. Not theoretical: on IOS17 JoshHickman,
+     `AddressBook.sqlitedb` ships a 1.2 MB `-wal` against a 1.4 MB main
+     DB and `Accounts3.sqlite` a 918 KB `-wal` against a 256 KB one, and
+     replaying AddressBook's WAL surfaces **7** `ABMultiValue` email rows
+     where the main DB alone shows **6**. ALEAPP's own `siminfo.py`
+     collects the same sidecars, for the same stated reason. This is the
+     read-path counterpart to the existing WAL-checkpoint Convention
+     (which is about not DESTROYING sidecars); both matter.
+
+  2. **`FfsAdapter.format` is an archive LAYOUT, never an
+     acquisition-tool identification** — the reports label it
+     accordingly (`_LAYOUT_LABELS`: "Cellebrite-style archive layout",
+     etc.) and say so directly in their own `description`. The first
+     draft printed `adapter.format.title()` as "FFS Type: Cellebrite",
+     which reads as a claim about which tool produced the extraction —
+     a claim this project demonstrably cannot stand behind, per the
+     `FORMAT_GRAYKEY`/`FORMAT_CELLEBRITE` ambiguity entry above and its
+     own real counter-example (the "Android 14 CTF26 Magnet" archive, a
+     Magnet acquisition, detects as `FORMAT_GRAYKEY`).
+
+  **Every field verified against real archives and documented ground
+  truth, never reasoned through.** iOS (IOS17 JoshHickman): phone number
+  `19195794674` matches ground truth's `919-579-4674`; Apple ID
+  `thisisdfir@gmail.com` matches its documented `apple_account.email`;
+  the linked-contact cross-reference found a real contact, "This Is
+  DFIR". `ZACCOUNTTYPE=26` is specifically
+  `com.apple.account.AppleIDAuthentication`, confirmed from that file's
+  own `ZACCOUNTTYPE` table — the row to trust when one `ZUSERNAME`
+  appears under 10 different account types, as this device's real
+  account does. Android (Android 14 JoshHickman): build
+  `UQ1A.240105.004` and patch `2024-01-05` match ground truth exactly;
+  `siminfo.number` `19199282177` matches its documented
+  `919-928-2177`; `display_name` "Google Fi" matches `carrier_1`;
+  `is_embedded=1` matches its documented eSIM provisioning; the Google
+  account `ldehner505@gmail.com` matches `google_account.email`.
+
+  Three Android findings that only came from reading real rows rather
+  than trusting a column list: `siminfo.carrier_name` is EMPTY on the
+  real Pixel 7a while `display_name` holds the carrier (so carrier reads
+  `display_name` first); the legacy integer `mcc`/`mnc` columns are both
+  0 while `mcc_string`/`mnc_string` hold the real `310`/`240`; and EVERY
+  `siminfo` row is reported rather than the first, verified against a
+  real 3-SIM device (Android 15 CTF25 Cellebrite, a Poco X7 Pro — which
+  independently matches ALEAPP's own recorded sample count of 3 rows for
+  that same device). Two honest negatives were confirmed rather than
+  papered over: the Android device's Google-account email matches NONE
+  of its 29 contacts' 2 email rows, so the Linked Contact section
+  correctly does not appear; and an Android FFS extraction has no
+  on-disk IMEI at all (it comes from the radio at runtime, and ALEAPP
+  recovers none either), which the report states outright instead of
+  leaving a silently missing field.

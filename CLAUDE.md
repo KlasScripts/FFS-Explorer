@@ -5037,3 +5037,95 @@ underneath that verification.
   on-disk IMEI at all (it comes from the radio at runtime, and ALEAPP
   recovers none either), which the report states outright instead of
   leaving a silently missing field.
+
+- **Raw file browser now decodes binary plists (`bplist00`), not just
+  hex — cross-checked against Crush and iLEAPP before writing anything,
+  since both cover this exact ground** (2026-09-17). Previously
+  `_render_as_text` (`ffs-explorer.py`) bailed to hex-only the instant
+  it saw the `bplist` magic, before even attempting a parse — on this
+  project's own IOS17 JoshHickman archive alone, over 3,000 real
+  `.plist` files are binary-format, every one of them completely
+  uninterpreted in the raw browser until now (an XML plist already
+  rendered fine — it's plain XML — so this gap was binary-format only).
+
+  **What the sibling tools do, and why this project didn't just copy
+  either one.** Crush (a close analog — a generic forensic file
+  browser, same as this project's own raw preview) has a dedicated
+  `plist_parser.py` that uses a *vendored* `ccl_bplist` + its own custom
+  NSKeyedArchiver class-name table (NSData/NSNull/NSDateComponents
+  special-cased by hand) instead of stdlib `plistlib`. iLEAPP instead
+  trusts stdlib `plistlib.loads()` as the primary path, detects the
+  `$archiver == 'NSKeyedArchiver'` envelope, and re-decodes via the
+  `nska_deserialize` library — the same design this project's own
+  `artifact_runner.decode_plist_blob` already used (added 2026-08-25,
+  see that entry above), so THAT part needed no change: reused as-is
+  rather than duplicated, exactly the "not something to reimplement"
+  reasoning already written into its own docstring. Crush's alternate
+  route wasn't adopted — no real gap `nska_deserialize` leaves open was
+  found that `ccl_bplist` would close, and switching would mean two
+  different NSKeyedArchiver decoders in the codebase for the same
+  problem.
+
+  **A real bug DID come out of checking iLEAPP's code, not a
+  reimplementation risk avoided.** iLEAPP's `ilapfuncs.py` carries a
+  second helper, `_read_binary_plist_tolerantly`, specifically because
+  stdlib `plistlib` has a real defect: a single CFDate field outside
+  Python's `datetime` representable range (year 1–9999) makes
+  `_read_object` raise `OverflowError`, which `.parse()`'s own blanket
+  `except` re-raises as `InvalidFileException` — losing every other,
+  well-formed key in the file, even though Apple's own `plutil` reads
+  it fine. Confirmed this is real and current, not an old bug already
+  fixed upstream: reproduced directly against this project's own Python
+  3.14 by mutating a valid plistlib-written CFDate's 8 bytes to an
+  absurd value and watching the exact `OverflowError` → `InvalidFileException`
+  chain iLEAPP's own code comment describes. Then confirmed it's not
+  theoretical for this project either — in a random 6,000-file sample of
+  this project's own IOS17 JoshHickman archive's real `.plist` entries,
+  the FIRST real file to hit this was `mobile/Library/Preferences/
+  com.apple.sleepd.plist` (sleep-tracking preferences: bedtime/wake
+  schedule, alarm config, wake-detection state) — previously reported as
+  a total decode failure (`None`), now recovers all 60 real keys with
+  only the 3 offending date fields coming back `None` instead of the
+  real date. Ported to `artifact_runner._read_binary_plist_tolerantly`
+  — same technique (subclass the private `plistlib._BinaryPlistParser`,
+  override `_read_object` to catch `OverflowError` per-object instead of
+  failing the whole parse), adapted from a file path to in-memory bytes
+  via `BytesIO` to match `decode_plist_blob`'s own existing bytes-in
+  convention, with the same signature-inspection guard iLEAPP uses for
+  the Python-3.12+-only `aware_datetime` parameter — verified those
+  signatures still match on this project's own (newer, 3.14) Python
+  before trusting them. Degrades to the pre-existing behavior (return
+  `None`) if the private API is ever renamed/removed by a future
+  CPython, rather than raising.
+
+  **The raw-browser wiring itself** (`_render_as_text`): a `bplist00`
+  file now calls `decode_plist_blob` (reused, not duplicated) and, on
+  success, `json.dumps(content, indent=2, ensure_ascii=False,
+  default=str)` — `default=str` (same choice Crush's own parser makes,
+  for the same reason) covers whatever the decoder hands back that
+  isn't natively JSON-serializable: a `datetime.datetime` from a CFDate
+  field, or raw `bytes` from an `NSData` field (confirmed on a real
+  NSKeyedArchiver-wrapped `configuration.plist` from
+  `com.apple.nsurlsessiond` — its `_atsContext` field is itself a
+  nested embedded bplist, rendered as its own byte-string rather than
+  crashing the outer render). A file `decode_plist_blob` genuinely can't
+  recover (rare — real corruption, not the CFDate case above, which is
+  now handled) still falls through to hex-only, same as before this
+  existed — no case gets WORSE, only previously-hex-only ones improve.
+
+  **Verified against real data, at every stage, not assumed**: stress-
+  tested `decode_plist_blob` + `json.dumps(default=str)` against 5,027
+  real binary plists sampled from the IOS17 JoshHickman archive — 100%
+  rendered, zero `json.dumps` failures, zero unhandled exceptions (the
+  ONE genuine failure in an earlier, smaller sample was the sleepd.plist
+  CFDate case above, now fixed). Then called the real
+  `FastZipBrowser._render_as_text` method itself (not just the
+  standalone function) against: the real sleepd.plist (renders in
+  full), the real NSKeyedArchiver `configuration.plist` above (renders
+  in full), a genuine non-plist binary file — a PNG — (still correctly
+  returns `None`, hex-only, no false-positive plist detection), and a
+  deliberately corrupted `bplist00`-prefixed file with random garbage
+  after the magic (still correctly returns `None`, no crash).
+  `_load_nested_entry_preview` (embedded/nested archives) needed no
+  separate change or test — it already calls the same
+  `_render_as_text`.

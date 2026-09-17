@@ -446,6 +446,63 @@ def resolve_path_after_marker(base: str, raw_path: str, marker: str) -> str:
     return f"{base}/{raw_path[i + len(marker):]}"
 
 
+def _read_binary_plist_tolerantly(data: bytes):
+    """Parse a binary plist that plistlib rejects outright for one bad
+    value. Adapted from iLEAPP's own `_read_binary_plist_tolerantly`
+    (ilapfuncs.py) — same technique, ported from a file path to in-memory
+    bytes (via BytesIO) to match this project's own decode_plist_blob
+    convention (everything reads bytes out of the archive, no scratch
+    file for a plain parse).
+
+    A single CFDate outside datetime's representable range (year 1–9999)
+    makes plistlib raise OverflowError for the WHOLE file — every other,
+    well-formed key is lost too, even though Apple's own `plutil` reads
+    the file fine. Confirmed a REAL, non-theoretical problem on this
+    project's own IOS17 JoshHickman archive, not just iLEAPP's
+    documented rationale: the very first real bplist to fail
+    `plistlib.loads()` in a 6,000-file random sample of this archive's
+    own .plist entries was `.../mobile/Library/Preferences/
+    com.apple.sleepd.plist` — a real sleep-tracking preferences file.
+    This tolerant reader recovers all 60 of its real keys (bedtime/wake
+    schedule, alarm config, wake-detection state) with only the 3
+    offending date fields coming back None, where plistlib.loads() alone
+    returns nothing at all for the file. Verified directly against this
+    project's own Python 3.14: plistlib's private `_BinaryPlistParser`
+    (and its `_read_object`/`parse`/`__init__(dict_type, aware_datetime)`
+    signatures) still match what iLEAPP's code assumes.
+
+    Overriding the per-object read means only the offending value is
+    dropped (becomes None), not the whole file. Returns None when the
+    data isn't a binary plist or the private parser is unavailable (a
+    future CPython could rename/remove it — this degrades to the
+    existing "give up" behavior rather than raising), so the caller
+    keeps its own existing fallback."""
+    parser_class = getattr(plistlib, '_BinaryPlistParser', None)
+    if parser_class is None or data[:8] != b'bplist00':
+        return None
+
+    skipped = []
+
+    class _Tolerant(parser_class):
+        def _read_object(self, ref):
+            try:
+                return super()._read_object(ref)
+            except OverflowError:
+                skipped.append(ref)
+                return None
+
+    try:
+        import inspect
+        arguments = {'dict_type': dict}
+        # aware_datetime is 3.12+; pass it only where it exists so this
+        # neither breaks nor silently no-ops on an older Python.
+        if 'aware_datetime' in inspect.signature(parser_class.__init__).parameters:
+            arguments['aware_datetime'] = False
+        return _Tolerant(**arguments).parse(io.BytesIO(data))
+    except Exception:
+        return None
+
+
 def decode_plist_blob(data: bytes):
     """Decode a plist BLOB, transparently unarchiving it first if it's an
     NSKeyedArchiver payload (Apple's standard Objective-C object-archive
@@ -475,11 +532,20 @@ def decode_plist_blob(data: bytes):
     — a known, non-actionable library quirk (an unhashable-dict-key
     exception print on every such record, confirmed by iLEAPP's own code
     comment) that can otherwise flood output on a database with thousands
-    of records."""
+    of records.
+
+    A binary plist that plistlib's normal parser rejects outright (one
+    out-of-range CFDate poisoning the whole file — see
+    `_read_binary_plist_tolerantly`'s own docstring for a real example
+    found on this project's own test data) is retried through that
+    tolerant reader before giving up, same as iLEAPP's own
+    `get_plist_file_content` does."""
     try:
         content = plistlib.loads(data)
     except Exception:
-        return None
+        content = _read_binary_plist_tolerantly(data)
+        if content is None:
+            return None
     if isinstance(content, dict) and content.get('$archiver') == 'NSKeyedArchiver':
         try:
             with contextlib.redirect_stdout(io.StringIO()):

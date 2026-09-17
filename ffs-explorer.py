@@ -5375,7 +5375,31 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _render_as_text(self, data: bytes, name: str) -> str | None:
         """Return a (possibly pretty-printed) string for *data*, or None if binary."""
         if data[:6] == b'bplist':
-            return None
+            # Binary plist — not text at all, but decodable structured data.
+            # artifact_runner.decode_plist_blob is the project's one real
+            # plist decoder (plistlib, transparently unarchiving an
+            # NSKeyedArchiver payload via nska_deserialize when present,
+            # falling back to a tolerant binary-plist reader for a file
+            # with one out-of-range CFDate poisoning the whole parse — see
+            # that function's own docstring for a real example recovered
+            # from this project's own test data) — reused here rather
+            # than a second plist parser, same as every other caller.
+            # json.dumps(default=str) covers whatever decode_plist_blob
+            # hands back that isn't natively JSON-serializable (a
+            # datetime.datetime from a CFDate field, raw bytes from an
+            # NSData field) — stress-tested against 5,000+ real binary
+            # plists from this project's own IOS17 JoshHickman archive
+            # with zero json.dumps failures. A file decode_plist_blob
+            # can't recover at all (rare — genuine corruption) falls
+            # through to hex-only, same as before this existed.
+            from artifact_runner import decode_plist_blob
+            content = decode_plist_blob(data)
+            if content is None:
+                return None
+            try:
+                return json.dumps(content, indent=2, ensure_ascii=False, default=str)
+            except Exception:
+                return None
 
         ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
         stripped = data.lstrip()

@@ -53,6 +53,7 @@ from keyword_search import KeywordSearchMixin
 from artifact_viewer import ArtifactViewerMixin
 from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
+from leveldb_viewer import LevelDbViewerMixin, _looks_like_leveldb_dir
 from timestamp_display import TimestampDisplayMixin
 from dialog_helpers import button_row, error_label, note_label, WARNING_STYLE, ACTIVE_COLOR
 import research_store as _research
@@ -4216,7 +4217,7 @@ def _do_path_change_check(
     return passed
 
 
-class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, SqliteViewerMixin, SegbViewerMixin, TimestampDisplayMixin):  # type: ignore[reportIncompatibleMethodOverride]
+class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, SqliteViewerMixin, SegbViewerMixin, LevelDbViewerMixin, TimestampDisplayMixin):  # type: ignore[reportIncompatibleMethodOverride]
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FFS Explorer")
@@ -4628,6 +4629,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._setup_sqlite_tab(), "Database")
         self._segb_tab_index = self.preview_tabs.addTab(
             self._setup_segb_tab(), "SEGB")
+        self._ldb_tab_index = self.preview_tabs.addTab(
+            self._setup_leveldb_tab(), "LevelDB")
 
         self.outer_splitter = QSplitter(Qt.Orientation.Vertical)
         self.outer_splitter.addWidget(self.splitter)
@@ -5899,6 +5902,21 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 menu, partial(self._collect_bookmark_paths, folder_path))
             self._research_menu_action(menu, folder_path)
             menu.addSeparator()
+            # Only offered when this folder's own real children (via
+            # folder_map — files and subfolders both, checked directly,
+            # never guessed from the folder's own name) actually look
+            # like a LevelDB directory — see leveldb_viewer.py's own
+            # _looks_like_leveldb_dir. folder_map is a complete,
+            # precomputed dict built once at case-load time, independent
+            # of the tree's own lazy QStandardItem materialization (a
+            # separate, display-only concern), so this check is correct
+            # even for a tree branch never expanded before.
+            if self._case_dir and _looks_like_leveldb_dir(self.folder_map, folder_path):
+                ldb_act = QAction("🗄️ Open as LevelDB", self)
+                ldb_act.triggered.connect(
+                    partial(self._open_leveldb_folder, folder_path))
+                menu.addAction(ldb_act)
+                menu.addSeparator()
         export_act = QAction("📁 Export Folder (Recursive)", self)
         export_act.triggered.connect(partial(self.handle_export_request, is_tree=True))
         menu.addAction(export_act)

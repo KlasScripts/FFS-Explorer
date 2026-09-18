@@ -26,7 +26,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 ## Data flow (opening an archive)
 
 1. `FastZipBrowser.start_loading()` → case dir chosen (`_get_or_ask_case_dir`).
-2. `ZipMetadataWorker` (ffs-explorer.py:1404) → `app/ffs_metadata.py
+2. `ZipMetadataWorker` (ffs-explorer.py:1405) → `app/ffs_metadata.py
    parse_archive_metadata()` in a child process: central-directory parse,
    `ui_metadata` build, folder tree/sizes; snapshot persisted to case dir
    (msgpack) so re-opens are instant.
@@ -96,6 +96,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `sqlite_viewer.py` | Database tab: temp-copy extraction, table browser, **WAL net-change diff view** (`SqliteDiffModel`) |
 | `segb_viewer.py` | SEGB/Biome tab: parses records via vendored `app/ccl_segb`, decodes protobuf with `blackboxprotobuf`; empty-record hiding + deleted-record toggle |
 | `segb_schemas.py` | Built-in per-stream protobuf typedefs + field labels for known Biome streams; user-authored schemas persist to `caseresults.db` via `db_utils.save_segb_schema` and override the built-ins |
+| `leveldb_viewer.py` | LevelDB tab (`LevelDbViewerMixin`, added 2026-09-18): browse a real LevelDB directory's own raw key/value records via vendored `app/ccl_leveldb.py`, triggered from `show_tree_context_menu`'s "Open as LevelDB" folder action (`_looks_like_leveldb_dir` decides when to offer it — checked against the folder's real children, never guessed from a name convention) rather than the automatic file-magic-byte detection SQLite/SEGB/bplist/ABX all use, since LevelDB is a directory, not one file. Double-clicking a record's Key/Value cell reuses `FastZipBrowser._render_as_text` directly (same class, via mixin composition) for the exact same JSON/XML/bplist/ABX decoding a double-clicked file already gets — see Conventions |
 | `artifact_runner.py` / `artifact_db.py` / `artifact_viewer.py` | Plugin system: parser scripts in `artifacts/ios|android/` (e.g. `photos_metadata.py`, `sms_messages.py`, per-platform `whatsapp.py`) run against the archive, results into `casedata.db`, browsed in Artifacts tab. Third-party iOS apps declare `app_group` instead of `app_path` — their container is GUID-named per install, resolved via the case's `guid_to_bundle` map at run time (`artifact_runner._resolve_app_group_base`); see `artifacts/ios/whatsapp.py`. A THIRD parser shape (added 2026-09-15), `device_wide = True`, is for a parser scanning the whole device rather than one app — see the "App Report parser scripts (device_wide API)" Conventions entry. The `paths` dict `run()` receives also carries a reserved `_app_base_ui_path` key (the container's own ui_path) for a parser that needs to *reference* another file inside the container — e.g. an attachment path stored in a DB column — without extracting it itself; see `media_fields` below. `artifact_runner.py`
 also exposes small importable helpers a parser's own `run()` can reach for
 directly (`from artifact_runner import first_nonempty`, etc.) — see "Parser
@@ -5433,3 +5434,106 @@ underneath that verification.
   mtimes unchanged from the first, output still identical).
   `WRITING_ARTIFACT_PARSERS.md`'s own "Reusable helpers" section
   documents this the same way it already documents `open_db_readonly`.
+
+- **LevelDB folder browsing — the remaining half of the raw-file-browser
+  work above, and the reason its two open pieces (folder-browsing itself,
+  the shared parser helper) were split and done in that order**
+  (2026-09-18). LevelDB is structurally different from bplist/ABX: a real
+  on-disk DIRECTORY of files (`CURRENT`, `MANIFEST-*`, `NNNNNN.ldb/.log`),
+  never one file with a magic-byte header — the exact reason this needed
+  its own design pass rather than sliding into `_render_as_text` the way
+  bplist/ABX did.
+
+  **Entry point**: `show_tree_context_menu`'s new "🗄️ Open as LevelDB"
+  folder action — chosen over inventing a new UI surface, since a real,
+  directly comparable folder-scoped action ("📦 Extract as Nested
+  Archive") already exists in this project as precedent (checked before
+  designing, not assumed). Only offered when
+  `leveldb_viewer._looks_like_leveldb_dir` confirms the selected folder's
+  own real children (via `folder_map`, which holds files AND subfolders
+  both — confirmed by reading `_get_all_children`'s own use of it, not
+  guessed) genuinely include a `CURRENT` file plus at least one
+  `MANIFEST-*`/`NNNNNN.{ldb,log,sst}` data file — the same real shape
+  `ccl_leveldb.RawLevelDb.__init__` itself expects, checked directly
+  against that class rather than a directory-name convention (which
+  varies: `"...leveldb"`, `".../Storage/leveldb"`, no fixed suffix at
+  all for a non-Chrome app).
+
+  **New `app/leveldb_viewer.py` (`LevelDbViewerMixin`)** — a new "LevelDB"
+  tab in the shared `preview_tabs` bottom panel (same registration shape
+  as `SqliteViewerMixin`/`SegbViewerMixin`), showing one row per raw
+  record (`Key`, `Value`, `State`, `Seq`, `Source File`, `Offset`) via
+  `ArtifactTableModel`'s existing "list mode" (`load_rows`) — reused as-is
+  rather than a new table model, since it was already built for exactly
+  this shape (a small in-memory dataset, no live DB connection). Opening a
+  folder is a small, deliberately PARALLEL extraction routine to
+  `artifact_runner.open_leveldb` (see that function's own Conventions
+  entry above), not a reuse of it — that helper is shaped for a running
+  PARSER's own `paths` dict (`_read_zip_bytes` there takes a PHYSICAL zip
+  entry name); the live GUI's own `self._read_zip_bytes` takes a UI_PATH
+  and resolves it internally instead, a real, already-documented
+  distinction elsewhere in this project — small enough (about a dozen
+  lines) that unifying the two shapes wasn't worth the added indirection
+  for either caller. Deliberately does NOT auto-clear when switching
+  files/tabs the way the SQL/SEGB preview tabs do (see "Per-tab state on
+  switching") — a LevelDB folder is opened via an explicit, deliberate
+  action, not automatic file-selection, so it should stay populated until
+  the examiner explicitly opens a different one, not vanish the moment
+  they click elsewhere.
+
+  **Double-clicking a Key or Value cell reuses
+  `FastZipBrowser._render_as_text` directly** (`self._render_as_text` —
+  works because `LevelDbViewerMixin` is composed into that same class) —
+  the exact reason this whole feature was sequenced after the bplist/ABX
+  work above rather than before it: a LevelDB record's own raw value can
+  be a binary plist (or JSON, XML, or ABX), and this generalizes that
+  detection to ANY LevelDB value's bytes rather than needing a dedicated
+  parser that already knew in advance a given column held one. Verified
+  directly, not assumed to follow from the raw-browser work automatically
+  working the same way: built a REAL binary plist value (`plistlib.dumps`,
+  `fmt=FMT_BINARY`), injected it as a real LevelDB record's own `.value`,
+  and drove the actual `_on_leveldb_cell_double_clicked` method (not just
+  `_render_as_text` standalone) — the resulting dialog correctly shows
+  `"...(decoded)"` and the real pretty-printed JSON content
+  (`{"deviceOwner": "Josh Hickman", "enrolledAt": "2024-07-01 12:00:00"}`).
+
+  **A real decode-quality gap found and fixed by testing against real
+  data, not by assuming `_render_as_text` would "just work" for this new
+  caller too**: `_render_as_text`'s own lenient UTF-8 fallback
+  (`errors='replace'`) only kicks in for a real file whose EXTENSION
+  already says it should be text — a LevelDB value has no such extension.
+  Passing a plain `.bin` hint means `_render_as_text` correctly still
+  catches bplist/JSON/XML/ABX (those checks are magic-byte/content-based,
+  not extension-gated) but returns `None` for genuinely plain, non-JSON/
+  XML-shaped text — confirmed directly against the real Android 14
+  JoshHickman archive's own Chrome Local Storage LevelDB directory (522
+  real records). The fix lives ONLY in `leveldb_viewer.py`, not in
+  `_render_as_text` itself (zero risk to the file-preview path this
+  session already verified): when `_render_as_text` returns `None`, a
+  STRICT-ONLY (never lenient) UTF-8 decode is tried as a last resort
+  before falling back to hex — strict-only specifically because an
+  earlier attempt with the LENIENT fallback (matching what a real `.txt`
+  file gets) produced literal replacement-character garbage for a
+  genuinely-binary Chrome-internal protobuf bookkeeping value, which is
+  worse than hex, not better. Verified against 60 real records: a real
+  UTF-8-tagged Chrome DOM-Storage value decodes cleanly this way (with
+  Chrome's own single-byte type-tag visible as a literal leading control
+  character — this generic viewer deliberately doesn't know Chrome's own
+  app-specific value-encoding convention, that stays
+  `chrome_local_storage.py`'s own job), while a genuinely-binary
+  protobuf-shaped value correctly still falls through to hex rather than
+  rendering as garbage.
+
+  **Verified against real data throughout, at every stage**: a real
+  `FastZipBrowser` instance (built from a real, persisted case snapshot
+  via `ffs_metadata.load_snapshot_from_case`, not a synthetic fixture)
+  correctly detects the real Chrome Local Storage LevelDB directory
+  (`_looks_like_leveldb_dir` → `True`) and correctly rejects three real
+  non-LevelDB folders (the app's own root container, a parent directory
+  of several LevelDB dirs, the archive root — all → `False`, ruling out a
+  false-positive). Opening it loads 522 real raw records (more than
+  `chrome_local_storage.py`'s own reported 440 — expected and correct,
+  not a discrepancy: that parser's own `_parse_key` deliberately filters
+  out Chrome's internal `VERSION`/`META:` bookkeeping keys, while this
+  generic raw browser intentionally shows every raw record, filtered or
+  not, since raw browsing is its whole purpose).

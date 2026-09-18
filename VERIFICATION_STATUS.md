@@ -79,6 +79,7 @@ Same grouping as CLAUDE.md's module table.
 | `media_viewer.py` | 🔴 | | |
 | `sqlite_viewer.py` | 🔴 | | |
 | `segb_viewer.py` | 🔴 | | |
+| `leveldb_viewer.py` | 🔴 | | New 2026-09-18 -- browse a real LevelDB directory's own raw key/value records; double-click reuses _render_as_text for JSON/XML/bplist/ABX decoding. Machine-verified against a real Android 14 JoshHickman Chrome Local Storage directory (522 real records) and a synthetic bplist-valued record driven through the real double-click handler. NOT yet human-reviewed |
 | `segb_schemas.py` | 🔴 | | |
 | `artifact_runner.py` | 🔴 | | |
 | `artifact_db.py` | 🔴 | | |

@@ -43,6 +43,7 @@ the most consequential kind in this whole codebase.
 |---|---|---|---|
 | `ios/device_info.py` | 🔴 | | New 2026-09-16/17 — device summary (make/model/OS, archive layout, timezone, IMEI/ICCID/phone/carrier, Apple ID, linked contact). Every field machine-checked against the IOS17 JoshHickman archive and its documented ground truth, but NOT yet human-reviewed |
 | `android/device_info.py` | 🔴 | | New 2026-09-17 — Android counterpart, entirely different sources (build.prop, telephony.db siminfo, accounts_de.db, contacts2.db). Machine-checked against the Android 14 JoshHickman archive + ground truth and a real 3-SIM device, but NOT yet human-reviewed |
+| `ios/wifi_known_networks.py` | 🔴 | | New 2026-09-18 -- every known WiFi network + 5 real timestamps, from com.apple.wifi.known-networks.plist. Built to exercise decode_plist_blob against a whole plist FILE (not a DB blob) in a shipped parser. Machine-checked: 17 rows, exactly matching iLEAPP's own documented count for the same real device. NOT yet human-reviewed |
 | `ios/whatsapp.py` | 🔴 | | |
 | `ios/sms_messages.py` | 🔴 | | |
 | `ios/photos_metadata.py` | 🔴 | | |

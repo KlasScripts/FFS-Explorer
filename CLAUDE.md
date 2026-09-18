@@ -5129,3 +5129,98 @@ underneath that verification.
   `_load_nested_entry_preview` (embedded/nested archives) needed no
   separate change or test — it already calls the same
   `_render_as_text`.
+
+- **`artifacts/ios/wifi_known_networks.py` — a real artifact parser
+  built specifically to test the bplist raw-browser work above "in
+  anger"** (2026-09-18, direct request: does iLEAPP have any artifact
+  parsers that decode bplist, and if so build a test artifact script
+  here that works like it, to prove the new code against a real shipped
+  parser rather than only a manual script). Every existing
+  `decode_plist_blob` caller (`artifacts/ios/instagram.py`) only ever
+  fed it a plist **BLOB out of a SQL column** — this is the first
+  parser in the project to feed it a **whole plist FILE**, the same
+  shape the raw-browser fix decodes.
+
+  **Finding the right iLEAPP precedent**: `grep`-ing iLEAPP's own
+  `scripts/artifacts/` for `get_plist_file_content`/`get_plist_content`
+  turned up 60+ real plist-based parsers. `appleWifiPlist.py`
+  (`appleWifiKnownNetworks`) was picked deliberately, not the first hit
+  — its own `sample_data` block documents `"iphone11_ios17": "iOS 17.3 |
+  17 rows"`, and this project's own IOS17 JoshHickman archive is that
+  same real device (iPhone 11, iOS 17.3) — meaning iLEAPP's own
+  documented output gives an independent, real, cross-tool number to
+  verify against, not just "the code ran without an exception."
+
+  **Modeled on iLEAPP's field set, not copied line-for-line — two
+  differences, both checked against real data before choosing them, not
+  assumed.** (1) iLEAPP's own `appleWifiKnownNetworks` branches on TWO
+  real plist shapes (`'List of known networks'` — a list, from the
+  legacy `com.apple.wifi.plist`; a dict-of-dicts keyed by
+  `'wifi.network.ssid.<name>'`, from the newer
+  `com.apple.wifi.known-networks.plist`). Checked directly against this
+  project's own real archive: on iOS 17.3, `com.apple.wifi.plist`
+  carries NO `'List of known networks'` key at all — confirmed by
+  decoding it and printing every real top-level key, all device-wide
+  WiFi *settings*, nothing per-network — so only the dict-of-dicts
+  shape is targeted; replicating the list-shape branch here would have
+  been dead code against this project's own test data, not a real
+  second source. (2) iLEAPP splits the five real timestamps
+  (Added/Updated/JoinedByUser/JoinedBySystem/LastDiscovered) into a
+  SEPARATE `appleWifiKnownNetworksTimes` report, since its own output
+  model has no per-column timestamp-unit declaration; this project's
+  `timestamp_fields` convention puts them on the same row instead.
+
+  **A real ui_path bug, found by testing against the real archive
+  rather than assumed from `sms_messages.py`'s similar-looking
+  `app_path`**: the file's real on-device location is
+  `/private/var/preferences/com.apple.wifi.known-networks.plist`, but
+  `app_path = "private/var/preferences"` (the naive first guess) failed
+  with `file not found` — this archive's adapter has `old_layout=True`,
+  which already prepends `private/var/` internally
+  (`app/adapters/ffs.py`'s own `resolve()`). Confirmed directly by
+  calling `adapter.resolve()` with several candidate ui_paths against
+  the real archive's own namelist rather than guessing: the correct
+  `app_path` is `"preferences"` alone. `sms_messages.py`'s own
+  `app_path = "mobile/Library/SMS"` never raised this question because
+  that file lives under `mobile/`, not `private/var/` — genuinely not
+  the same case, checked rather than pattern-matched from.
+
+  **CFDate → Unix-seconds conversion, done the way the timestamp
+  Conventions above require, not the shortcut that silently breaks**:
+  `decode_plist_blob` (via `plistlib`) already turns each CFDate into a
+  naive `datetime.datetime` whose wall-clock VALUE is the correct UTC
+  moment (CFDate has no timezone of its own — always seconds since
+  2001-01-01 UTC by definition). The parser's own `_to_unix` explicitly
+  attaches `tzinfo=UTC` before calling `.timestamp()` — never a bare
+  `.timestamp()` on a still-naive value, which silently uses the
+  analysis machine's own local zone (exactly the bug class
+  `WRITING_ARTIFACT_PARSERS.md`'s own `timestamp_fields` section warns
+  about, and a real, shipped bug in this project more than once before).
+
+  **Verified end-to-end against real data**: `run_artifact()` against
+  the real IOS17 JoshHickman archive returns exactly **17 rows**,
+  matching iLEAPP's own documented count exactly. Real, plausible SSIDs
+  present — "Matt_Foley", "Hilton Garden Inn Guest",
+  "DNCR-Aquarium_Visitor", "ncsu-guest", "Free PHL Airport WiFi" — a
+  real travel/hotel/venue/university history, not placeholder data. All
+  five timestamp fields decoded to sane real 2023–2024 dates on every
+  row, none of which happened to hit the CFDate-out-of-range case
+  `decode_plist_blob`'s own tolerant fallback exists for (see the
+  `view_mode = "document"` entry above for a real example elsewhere on
+  this same archive that DOES hit it) — this report's own happy path
+  and that fallback are now both covered by real shipped code, just not
+  the same file. Confirmed uniform row shape (one key set across all 17
+  rows — a ragged-columns bug would silently break the Report table)
+  and a full `write_artifact_results` → read-back round trip through a
+  throwaway copy of the case database. `known_bss_count` (each
+  network's own `BSSList` — every physical access point seen under that
+  SSID, iLEAPP's own separate `appleWifiBSSList` report) is a plain
+  count only, not exploded into its own rows — real content, left out
+  on purpose to keep this parser's scope to "one row per known
+  network," stated in its own `description` rather than silently
+  dropped. `Moving` (a real key present on every entry) is not
+  surfaced at all — its actual meaning was never confirmed against any
+  authoritative source, so it isn't presented as if it were. Not yet
+  human-reviewed (`VERIFICATION_STATUS.md`, still 🔴) and not yet
+  exercised through the live GUI's own `record_source` Hex-panel jump —
+  both real, stated gaps, not overclaimed as done.

@@ -269,6 +269,13 @@
       },
       "hash": "60ecfe163f691ab9",
       "version": 4
+    },
+    "ios:wifi_known_networks": {
+      "changelog": {
+        "2": "New parser -- every WiFi network this device has joined, from private/var/preferences/com.apple.wifi.known-networks.plist. Built specifically to exercise artifact_runner.decode_plist_blob against a real, WHOLE plist FILE in a shipped parser (every prior caller only fed it a BLOB column). Modeled on iLEAPP's own appleWifiPlist.py, with two deliberate differences documented in this module's own docstring. Verified against the real IOS17 JoshHickman archive: 17 real network rows, exactly matching iLEAPP's own documented sample_data count for its 'iphone11_ios17' test archive (the same iPhone 11 / iOS 17.3 device) -- a real cross-tool number check, not just 'the code ran'."
+      },
+      "hash": "c127dbc96214b1cd",
+      "version": 2
     }
   }
 }

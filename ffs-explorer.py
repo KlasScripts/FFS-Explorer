@@ -5401,6 +5401,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 return None
 
+        if data[:4] == b'ABX\x00':
+            # Android Binary XML — same idea as bplist above: not text,
+            # but decodable structured data, via the vendored ccl_abx.py
+            # (app/ccl_abx.py — see its own module docstring for two real
+            # correctness fixes applied on top of the vendored original,
+            # found and verified against ~500 real ABX files across this
+            # project's own three Android test archives before this was
+            # ever wired in here). Decoded to a plain xml.etree Element,
+            # then serialized to ordinary XML bytes and REROUTED through
+            # the exact same is_xml_content/minidom pretty-printer below
+            # rather than a second pretty-printer — the decoded content
+            # is real XML at that point, no different in shape from a
+            # file that was never ABX-encoded to begin with. A file
+            # ccl_abx can't decode at all (genuine corruption, past what
+            # its own tolerant multi_root retry recovers) falls through
+            # to hex-only, same degrade-gracefully shape as bplist above.
+            from ccl_abx import abx_bytes_to_xml_root
+            import xml.etree.ElementTree as _ET
+            try:
+                root = abx_bytes_to_xml_root(data)
+                data = _ET.tostring(root, encoding='utf-8')
+            except Exception:
+                return None
+
         ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
         stripped = data.lstrip()
         is_json_content = stripped[:1] in (b'{', b'[')

@@ -5268,3 +5268,102 @@ underneath that verification.
     physically here") are not interchangeable, so this report isn't
     shipped until that's actually resolved — ideally against a device
     with its own documented real movements, not another blog citation.
+
+- **Raw file browser now decodes Android Binary XML (ABX), not just hex —
+  and two real, confirmed bugs in the vendored decoder were fixed along
+  the way, found by stress-testing rather than trusting the vendored
+  code as-is** (2026-09-18, direct follow-up to the bplist work above:
+  "does iLEAPP/ALEAPP have this, check their code for issues before
+  trusting it"). `app/ccl_abx.py` (vendored from ALEAPP's own
+  `ilapfuncs.py:abxread()`, MIT, CCL Forensics/Alex Caithness) already
+  existed in this project for one narrow use — `app_intelligence.py`'s
+  `packages.xml`/`runtime-permissions.xml` parsing — but was never wired
+  into the general raw-file preview, so every other real ABX file (system
+  settings, biometric enrollment, network policy, sync-adapter registries
+  — 157/175/169 real ABX files found across this project's own three
+  Android archives) showed hex-only, same gap class as bplist above.
+
+  **Before wiring anything in, stress-tested the EXISTING vendored
+  decoder against ~500 real ABX files across all three archives** — not
+  assumed correct from reading the code. Result: 456/501 succeeded,
+  **45 failed outright**, discarding the ENTIRE file's content on
+  failure, not just one field. Investigating those 45 (not just noting
+  the count) found two real, confirmed bugs, both fixed in `ccl_abx.py`
+  directly (see that file's own module docstring for the full technical
+  writeup):
+
+  1. **Signed/unsigned 16-bit length bug.** `_read_short()` reads a
+     SIGNED short (needed for `_read_interned_string()`'s own -1
+     sentinel), but `_read_string_raw()` and the `TYPE_BYTES_HEX`/
+     `TYPE_BYTES_BASE64` branches used it as an unsigned byte-count —
+     any real value >= 32768 bytes reads back negative, and the vendored
+     original's own `_read_string_raw` treated that as corruption and
+     ABORTED THE WHOLE DOCUMENT PARSE. The two bytes-type branches had
+     no guard at ALL — confirmed directly that a negative length passed
+     to `_read_raw` → `self._stream.read(length)` silently reads to EOF
+     for ANY negative Python `read()` size (not just exactly -1),
+     consuming the rest of the document as one attribute's value. The
+     original author's own `# is this safe?` comment on that exact line
+     — present in ALEAPP's current upstream source, dropped when this
+     file was lifted to module scope — was a live, unresolved doubt,
+     not idle. Confirmed real on this project's own evidence, not
+     theoretical: `settings_config.xml` (361 KB, Android 14 JoshHickman)
+     failed outright on a real config value that is exactly 33510 bytes
+     once reinterpreted unsigned — `struct.unpack('>h', b'\x82\xe6')[0]
+     == -32026` and `(-32026) & 0xFFFF == 33510`, confirmed to the
+     byte. Fixed via `length & 0xFFFF` at all three call sites.
+  2. **`is_multi_root` defaults to `False`, but a real, common class of
+     files needs `True`.** 9 of the 10 real failures shown in this
+     session's own investigation were files whose real top-level content
+     is multiple sibling elements with no enclosing root
+     (`settings_secure.xml`, `settings_global.xml`, `settings_ssaid.xml`
+     — a real Android ID/SSAID key — biometric enrollment files,
+     `netpolicy.xml`, `device_policy_state.xml`) — all recovered cleanly
+     once retried with `multi_root=True`. `abx_bytes_to_xml_root` now
+     tries `False` first (unmodified-shape for the more common
+     single-root case, e.g. `packages.xml`) and retries with `True`
+     ONLY on the specific `AbxDecodeError` a genuine multi-root document
+     raises — never masking a different real exception type. Confirmed
+     by reading `AbxReader.read()`'s own logic that `multi_root=True`
+     unconditionally wraps output in a synthetic `<root>` — trying
+     `False` first avoids injecting a fabricated element into every
+     file's rendered XML, not just the ones that actually need it.
+
+  **Zero-regression check, not assumed**: re-ran the ORIGINAL (unfixed)
+  reader against every one of the 456 previously-succeeding files and
+  diffed its output byte-for-byte against the fixed version's own output
+  — identical on all 456. The fix only ever changes behavior for a
+  length that was previously negative (a real bug trigger); every
+  positive-length read is bit-identical before and after, confirmed
+  rather than inferred from the arithmetic alone. Final result: **501/501
+  real ABX files decode successfully**, up from 456/501.
+
+  **Raw-browser wiring** (`_render_as_text`, same function the bplist fix
+  lives in — both call sites, main archive and nested archives, share it):
+  a `b'ABX\x00'`-prefixed file is decoded via `ccl_abx.abx_bytes_to_xml_root`
+  to an `xml.etree` Element, serialized to plain XML bytes, and REROUTED
+  through the exact same `is_xml_content`/`minidom` pretty-printer already
+  used for genuine XML — no second pretty-printer written. A file
+  `ccl_abx` genuinely can't decode (past what the `multi_root` retry
+  recovers — rare, real corruption) falls through to hex-only, same
+  degrade-gracefully shape as bplist. `app_intelligence.py`'s existing
+  `packages.xml`/`runtime-permissions.xml` callers needed zero changes —
+  both already use the default `multi_root=None`, so they transparently
+  gained the retry-on-failure behavior; re-verified directly against a
+  real Android 14 CTF26 Magnet archive afterward: 486 real `<package>`
+  elements parsed, unchanged from before this session's fixes.
+
+  **Verified against real data at every stage**: the real
+  `FastZipBrowser._render_as_text` method itself (not just the standalone
+  decoder) called against a real multi-root file (renders correctly
+  `<root>`-wrapped), the real 361 KB unsigned-length-bug file (renders in
+  full), a real single-root file (renders WITHOUT a spurious `<root>`
+  wrapper, confirming the try-`False`-first order matters), a genuine
+  non-ABX binary file — a PNG — (still correctly hex-only, no false
+  positive), and a deliberately corrupted `ABX\x00`-prefixed file with
+  random garbage after the magic (still correctly `None`, no crash). No
+  new `VERIFICATION_STATUS.md` row — vendored library files
+  (`ccl_leveldb.py`, `ccl_segb/`) aren't tracked as their own rows in
+  that ledger, and the raw-browser surface itself is already tracked
+  under "FastZipBrowser preview dispatch + tree/table/export" (still
+  🔴, untouched by this change).

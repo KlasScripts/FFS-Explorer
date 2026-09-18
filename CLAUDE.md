@@ -96,7 +96,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `sqlite_viewer.py` | Database tab: temp-copy extraction, table browser, **WAL net-change diff view** (`SqliteDiffModel`) |
 | `segb_viewer.py` | SEGB/Biome tab: parses records via vendored `app/ccl_segb`, decodes protobuf with `blackboxprotobuf`; empty-record hiding + deleted-record toggle |
 | `segb_schemas.py` | Built-in per-stream protobuf typedefs + field labels for known Biome streams; user-authored schemas persist to `caseresults.db` via `db_utils.save_segb_schema` and override the built-ins |
-| `leveldb_viewer.py` | LevelDB tab (`LevelDbViewerMixin`, added 2026-09-18): browse a real LevelDB directory's own raw key/value records via vendored `app/ccl_leveldb.py`, triggered from `show_tree_context_menu`'s "Open as LevelDB" folder action (`_looks_like_leveldb_dir` decides when to offer it — checked against the folder's real children, never guessed from a name convention) rather than the automatic file-magic-byte detection SQLite/SEGB/bplist/ABX all use, since LevelDB is a directory, not one file. Double-clicking a record's Key/Value cell reuses `FastZipBrowser._render_as_text` directly (same class, via mixin composition) for the exact same JSON/XML/bplist/ABX decoding a double-clicked file already gets — see Conventions |
+| `leveldb_viewer.py` | `LevelDbViewerMixin` (rearchitected 2026-09-19, no longer a separate tab — see that day's Conventions entry for why): decodes a real LevelDB directory's own records into synthetic per-record leaf paths injected into `folder_map`/`full_metadata`/`_nested_virtual_paths`, the SAME machinery `_inject_nested_archives` already uses for extracted zip archives — so a record shows up as an ordinary "file" (its key, sanitized, as the name) browsable and previewable through the file browser's own existing pipeline, no bespoke UI. Triggered automatically the first time a real LevelDB-shaped folder (`_looks_like_leveldb_dir`) is navigated into (`on_folder_selected`); persists across case reopen by re-detecting already-extracted folders on disk (`_rescan_decoded_leveldb_folders`), no new DB table needed. A record's own value previews via `FastZipBrowser._display_preview_bytes` (the same JSON/XML/bplist/ABX/text/hex rendering a real file gets) — see Conventions |
 | `artifact_runner.py` / `artifact_db.py` / `artifact_viewer.py` | Plugin system: parser scripts in `artifacts/ios|android/` (e.g. `photos_metadata.py`, `sms_messages.py`, per-platform `whatsapp.py`) run against the archive, results into `casedata.db`, browsed in Artifacts tab. Third-party iOS apps declare `app_group` instead of `app_path` — their container is GUID-named per install, resolved via the case's `guid_to_bundle` map at run time (`artifact_runner._resolve_app_group_base`); see `artifacts/ios/whatsapp.py`. A THIRD parser shape (added 2026-09-15), `device_wide = True`, is for a parser scanning the whole device rather than one app — see the "App Report parser scripts (device_wide API)" Conventions entry. The `paths` dict `run()` receives also carries a reserved `_app_base_ui_path` key (the container's own ui_path) for a parser that needs to *reference* another file inside the container — e.g. an attachment path stored in a DB column — without extracting it itself; see `media_fields` below. `artifact_runner.py`
 also exposes small importable helpers a parser's own `run()` can reach for
 directly (`from artifact_runner import first_nonempty`, etc.) — see "Parser
@@ -5435,105 +5435,108 @@ underneath that verification.
   `WRITING_ARTIFACT_PARSERS.md`'s own "Reusable helpers" section
   documents this the same way it already documents `open_db_readonly`.
 
-- **LevelDB folder browsing — the remaining half of the raw-file-browser
-  work above, and the reason its two open pieces (folder-browsing itself,
-  the shared parser helper) were split and done in that order**
-  (2026-09-18). LevelDB is structurally different from bplist/ABX: a real
-  on-disk DIRECTORY of files (`CURRENT`, `MANIFEST-*`, `NNNNNN.ldb/.log`),
-  never one file with a magic-byte header — the exact reason this needed
-  its own design pass rather than sliding into `_render_as_text` the way
-  bplist/ABX did.
+- **LevelDB folder browsing, rearchitected 2026-09-19 (first version,
+  2026-09-18, was a dedicated "LevelDB" preview tab — replaced entirely
+  per direct follow-up request for a "records as files" approach
+  instead) — records injected into the file browser itself as ordinary
+  navigable/previewable virtual files, reusing this project's own
+  EXISTING nested-archive mechanism rather than a bespoke UI.**
 
-  **Entry point**: `show_tree_context_menu`'s new "🗄️ Open as LevelDB"
-  folder action — chosen over inventing a new UI surface, since a real,
-  directly comparable folder-scoped action ("📦 Extract as Nested
-  Archive") already exists in this project as precedent (checked before
-  designing, not assumed). Only offered when
-  `leveldb_viewer._looks_like_leveldb_dir` confirms the selected folder's
-  own real children (via `folder_map`, which holds files AND subfolders
-  both — confirmed by reading `_get_all_children`'s own use of it, not
-  guessed) genuinely include a `CURRENT` file plus at least one
-  `MANIFEST-*`/`NNNNNN.{ldb,log,sst}` data file — the same real shape
-  `ccl_leveldb.RawLevelDb.__init__` itself expects, checked directly
-  against that class rather than a directory-name convention (which
-  varies: `"...leveldb"`, `".../Storage/leveldb"`, no fixed suffix at
-  all for a non-Chrome app).
+  **Why this design, not the tab**: studied `_inject_nested_archives`/
+  `_nested_virtual_paths`/`full_metadata` (the machinery an extracted
+  nested `.zip`'s own entries already use to appear as ordinary files)
+  directly before redesigning, rather than guessing at a parallel
+  mechanism. LevelDB records now use the EXACT SAME `folder_map`/
+  `full_metadata`/`_nested_virtual_paths`, marked with
+  `_leveldb_folder`/`_leveldb_record_index` instead of `_archive_path` —
+  `ffs-explorer.py`'s new `_load_virtual_entry_preview` is the one place
+  that needs to know which of the two a given virtual path is; every
+  OTHER `_nested_virtual_paths` check (double-click routing, display-
+  name, file-type classification) needed zero changes, since a virtual
+  leaf's SOURCE was never what those checks cared about.
 
-  **New `app/leveldb_viewer.py` (`LevelDbViewerMixin`)** — a new "LevelDB"
-  tab in the shared `preview_tabs` bottom panel (same registration shape
-  as `SqliteViewerMixin`/`SegbViewerMixin`), showing one row per raw
-  record (`Key`, `Value`, `State`, `Seq`, `Source File`, `Offset`) via
-  `ArtifactTableModel`'s existing "list mode" (`load_rows`) — reused as-is
-  rather than a new table model, since it was already built for exactly
-  this shape (a small in-memory dataset, no live DB connection). Opening a
-  folder is a small, deliberately PARALLEL extraction routine to
-  `artifact_runner.open_leveldb` (see that function's own Conventions
-  entry above), not a reuse of it — that helper is shaped for a running
-  PARSER's own `paths` dict (`_read_zip_bytes` there takes a PHYSICAL zip
-  entry name); the live GUI's own `self._read_zip_bytes` takes a UI_PATH
-  and resolves it internally instead, a real, already-documented
-  distinction elsewhere in this project — small enough (about a dozen
-  lines) that unifying the two shapes wasn't worth the added indirection
-  for either caller. Deliberately does NOT auto-clear when switching
-  files/tabs the way the SQL/SEGB preview tabs do (see "Per-tab state on
-  switching") — a LevelDB folder is opened via an explicit, deliberate
-  action, not automatic file-selection, so it should stay populated until
-  the examiner explicitly opens a different one, not vanish the moment
-  they click elsewhere.
+  **Deliberately NOT sharing `_nested_archive_map` itself** — checked
+  directly before assuming it was safe, not after: `keyword_search.py`'s
+  own `_filter_entries_by_ui_paths` reads that map and routes each entry
+  to `NestedArchiveSearchWorker`, which opens the entry's own
+  `stored_path` as a real ZIP FILE. A LevelDB folder's own extracted
+  copy is a DIRECTORY, not a zip — sharing the map would have either
+  crashed that worker or silently misbehaved the first time a decoded
+  LevelDB folder fell inside a keyword-search scope. LevelDB folders get
+  their own `self._leveldb_folder_map` instead; the handful of
+  `_nested_archive_map` checks that are purely cosmetic (never-hide-as-
+  empty at `_should_hide_folder`, the `'Archive'`→now-also-`'LevelDB'`
+  file-type label at `_classify_entry`, the precomputed-size branch at
+  `_build_entry_cols`, the bold-italic row styling) each gained one
+  extra, explicit `or path in self._leveldb_folder_map` condition
+  instead of a blind dict merge.
 
-  **Double-clicking a Key or Value cell reuses
-  `FastZipBrowser._render_as_text` directly** (`self._render_as_text` —
-  works because `LevelDbViewerMixin` is composed into that same class) —
-  the exact reason this whole feature was sequenced after the bplist/ABX
-  work above rather than before it: a LevelDB record's own raw value can
-  be a binary plist (or JSON, XML, or ABX), and this generalizes that
-  detection to ANY LevelDB value's bytes rather than needing a dedicated
-  parser that already knew in advance a given column held one. Verified
-  directly, not assumed to follow from the raw-browser work automatically
-  working the same way: built a REAL binary plist value (`plistlib.dumps`,
-  `fmt=FMT_BINARY`), injected it as a real LevelDB record's own `.value`,
-  and drove the actual `_on_leveldb_cell_double_clicked` method (not just
-  `_render_as_text` standalone) — the resulting dialog correctly shows
-  `"...(decoded)"` and the real pretty-printed JSON content
+  **Interaction model, confirmed with the user before building, not
+  assumed** (two real open questions, both resolved by direct
+  confirmation): (1) double-clicking (or otherwise navigating into) a
+  real, undecoded LevelDB-shaped folder decodes it AUTOMATICALLY, in
+  place, the first time — `_maybe_decode_leveldb_on_navigate`, hooked
+  into `on_folder_selected` (the one real interception point every
+  navigation path — tree click, double-click-in-table via
+  `navigate_tree_to_path` — already funnels through). The one deliberate
+  departure from the nested-archive precedent (which needs an explicit
+  "Extract as Nested Archive" action first) — a double-click here IS the
+  explicit action. (2) Once decoded, the folder's listing PERMANENTLY
+  becomes one virtual file per record, for this session AND future
+  reopens (re-detected from already-extracted files on disk at load
+  time — `_rescan_decoded_leveldb_folders`, called right after
+  `_inject_nested_archives` in the case-load path — no new DB table
+  needed, unlike nested archives: re-decoding from already-extracted
+  files is cheap, re-scanning a huge zip's own central directory is what
+  THAT persistence is avoiding). Right-click → "👁️ View Raw LevelDB
+  Files" is confirmed a ONE-OFF PEEK, never a persistent toggle:
+  `folder_map[ui_path]` is swapped to the real physical children
+  (`CURRENT`/`MANIFEST-*`/`.ldb`/`.log`), the file table refreshed once,
+  then swapped back immediately — single-threaded Qt, so nothing else
+  can observe the swapped-out state in between.
+
+  **A record's own key becomes its virtual "filename"; its value becomes
+  the file's own content.** A real key can hold NUL bytes, `/`, and
+  arbitrary binary garbage (confirmed real: Chrome's own
+  `"_<origin>\x00\x01<key>"` key shape) — `_sanitize_record_name` keeps
+  an INDEX-PREFIXED, character-restricted string as the actual vpath
+  (never ambiguous, never breaks path handling elsewhere) separately
+  from a more readable (but still bounded) `_display_name` shown in the
+  file browser.
+
+  **Previewing a record reuses `FastZipBrowser._display_preview_bytes`
+  directly** — a small helper factored out of what was
+  `_load_nested_entry_preview`'s own tail (verified this refactor
+  changes nothing for that existing nested-archive caller: same
+  behavior, same WAL/SHM `sidecar_reader` it already passed for a SQLite
+  entry, just moved) — the exact same JSON/XML/bplist/ABX/text/hex
+  rendering a real file already gets. This is the whole reason this
+  feature exists: a record whose value happens to be a binary plist
+  decodes correctly with zero LevelDB-specific special-casing. Verified
+  directly, not assumed to follow automatically: built a REAL binary
+  plist (`plistlib.dumps`, `fmt=FMT_BINARY`), injected it as a real
+  record's own value into an already-decoded folder, and drove the
+  actual `_load_leveldb_record_preview` method — correctly produces the
+  real pretty-printed JSON
   (`{"deviceOwner": "Josh Hickman", "enrolledAt": "2024-07-01 12:00:00"}`).
 
-  **A real decode-quality gap found and fixed by testing against real
-  data, not by assuming `_render_as_text` would "just work" for this new
-  caller too**: `_render_as_text`'s own lenient UTF-8 fallback
-  (`errors='replace'`) only kicks in for a real file whose EXTENSION
-  already says it should be text — a LevelDB value has no such extension.
-  Passing a plain `.bin` hint means `_render_as_text` correctly still
-  catches bplist/JSON/XML/ABX (those checks are magic-byte/content-based,
-  not extension-gated) but returns `None` for genuinely plain, non-JSON/
-  XML-shaped text — confirmed directly against the real Android 14
-  JoshHickman archive's own Chrome Local Storage LevelDB directory (522
-  real records). The fix lives ONLY in `leveldb_viewer.py`, not in
-  `_render_as_text` itself (zero risk to the file-preview path this
-  session already verified): when `_render_as_text` returns `None`, a
-  STRICT-ONLY (never lenient) UTF-8 decode is tried as a last resort
-  before falling back to hex — strict-only specifically because an
-  earlier attempt with the LENIENT fallback (matching what a real `.txt`
-  file gets) produced literal replacement-character garbage for a
-  genuinely-binary Chrome-internal protobuf bookkeeping value, which is
-  worse than hex, not better. Verified against 60 real records: a real
-  UTF-8-tagged Chrome DOM-Storage value decodes cleanly this way (with
-  Chrome's own single-byte type-tag visible as a literal leading control
-  character — this generic viewer deliberately doesn't know Chrome's own
-  app-specific value-encoding convention, that stays
-  `chrome_local_storage.py`'s own job), while a genuinely-binary
-  protobuf-shaped value correctly still falls through to hex rather than
-  rendering as garbage.
-
-  **Verified against real data throughout, at every stage**: a real
-  `FastZipBrowser` instance (built from a real, persisted case snapshot
-  via `ffs_metadata.load_snapshot_from_case`, not a synthetic fixture)
-  correctly detects the real Chrome Local Storage LevelDB directory
-  (`_looks_like_leveldb_dir` → `True`) and correctly rejects three real
-  non-LevelDB folders (the app's own root container, a parent directory
-  of several LevelDB dirs, the archive root — all → `False`, ruling out a
-  false-positive). Opening it loads 522 real raw records (more than
-  `chrome_local_storage.py`'s own reported 440 — expected and correct,
-  not a discrepancy: that parser's own `_parse_key` deliberately filters
-  out Chrome's internal `VERSION`/`META:` bookkeeping keys, while this
-  generic raw browser intentionally shows every raw record, filtered or
-  not, since raw browsing is its whole purpose).
+  **Verified against real data at every stage**: a real `FastZipBrowser`
+  instance (built from a real, persisted case snapshot via
+  `ffs_metadata.load_snapshot_from_case`) correctly turns the real
+  Chrome Local Storage LevelDB directory's 9 real files into 522 real
+  virtual record files on first navigation (more than
+  `chrome_local_storage.py`'s own reported 440 — expected: that parser's
+  own `_parse_key` filters Chrome's internal bookkeeping keys, this
+  generic browser intentionally doesn't); a second `_maybe_decode_...`
+  call on the same folder is confirmed idempotent (no re-extraction, no
+  duplicate children); the raw-files peek confirmed to show the real 9
+  files during the peek and correctly restore to 522 decoded records
+  immediately after; a completely FRESH `FastZipBrowser` instance
+  pointed at the same `case_dir` (simulating a real case reopen, no
+  in-memory state carried over) correctly auto-restores all 522 decoded
+  records via the rescan, with zero re-extraction from the main archive.
+  `_should_hide_folder`/`_classify_entry`/`_build_entry_cols` all
+  verified directly against the real decoded folder: never hidden as
+  empty, file type `'LevelDB'`, and the size column showing the real
+  precomputed total (497,245 bytes — the true sum of all 522 real
+  record values) rather than 0 or blank.

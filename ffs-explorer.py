@@ -4241,6 +4241,22 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._nested_archive_map:   dict        = {}   # archive_ui_path → {stored_path, entries}
         self._nested_virtual_paths: frozenset   = frozenset()  # virtual file paths (leaves)
         self._nested_virtual_folders: frozenset = frozenset()  # virtual folder paths (non-root)
+        # LevelDB folder → {extract_dir, records, real_children} — see
+        # leveldb_viewer.py. Deliberately its own dict, NOT folded into
+        # _nested_archive_map even though both mark "this folder's own
+        # children are synthetic" the same way: keyword_search.py's own
+        # _filter_entries_by_ui_paths reads _nested_archive_map entries
+        # and routes them to NestedArchiveSearchWorker, which opens each
+        # entry's own stored_path as a real ZIP FILE — a LevelDB folder's
+        # own stored_path is a DIRECTORY, not a zip, so sharing the same
+        # dict would either crash that worker or silently misbehave the
+        # first time a LevelDB folder fell inside a keyword-search scope.
+        # Checked directly before deciding this, not assumed safe.
+        # Record VIRTUAL LEAF paths still go in the shared
+        # _nested_virtual_paths above, unlike this one — that set is only
+        # ever used for plain membership testing (never a dict value
+        # read), so there's no shape mismatch risk sharing it.
+        self._leveldb_folder_map: dict = {}
         self._hex_worker: QThread | None = None
         self._device_info_worker: QThread | None = None
         self._retired_workers: list = []   # stopped workers awaiting thread exit
@@ -4629,8 +4645,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._setup_sqlite_tab(), "Database")
         self._segb_tab_index = self.preview_tabs.addTab(
             self._setup_segb_tab(), "SEGB")
-        self._ldb_tab_index = self.preview_tabs.addTab(
-            self._setup_leveldb_tab(), "LevelDB")
 
         self.outer_splitter = QSplitter(Qt.Orientation.Vertical)
         self.outer_splitter.addWidget(self.splitter)
@@ -4974,6 +4988,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return False
         if path in self._nested_archive_map:
             return False  # extracted archives are always browseable
+        if path in self._leveldb_folder_map:
+            return False  # decoded LevelDB folders are always browseable
         if path in self._missing_plist_paths:
             return False
         if path not in self._folder_sizes:
@@ -5371,7 +5387,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if ui_path in self.folder_map:
             self.navigate_tree_to_path(ui_path)
         elif ui_path in self._nested_virtual_paths:
-            self._load_nested_entry_preview(ui_path)
+            self._load_virtual_entry_preview(ui_path)
         elif ui_path and self._in_zip(ui_path):
             self._load_file_preview(ui_path)
 
@@ -5507,9 +5523,63 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._clear_sqlite_preview()
             self._clear_segb_preview()
 
+    def _display_preview_bytes(self, ui_path: str, data: bytes, name: str,
+                               sidecar_reader=None) -> None:
+        """Render already-in-memory *data* into the shared bottom preview
+        panel (Text/Hex, plus the structured Database/SEGB tabs on a
+        magic-byte match) — the common tail every "I already have this
+        entry's bytes, not a direct archive read" preview source shares.
+        Factored out 2026-09-19 when a second real source of such bytes
+        (a LevelDB record's own value — see leveldb_viewer.py) needed the
+        exact same rendering, not just nested-archive entries; verified
+        this refactor changes nothing for the existing nested-archive
+        caller by keeping its own behavior (including the WAL/SHM
+        sidecar_reader it passes for a SQLite entry) unchanged, just
+        moved here.
+
+        *sidecar_reader(suffix)* — like `_load_file_preview`'s own
+        equivalent, an optional callable returning a `-wal`/`-shm`
+        sidecar's bytes for a SQLite entry; a plain byte value with no
+        such concept of its own (a LevelDB record) passes None, same as
+        `_load_sqlite_preview`'s own default already handles."""
+        self._fb_last_preview_path = ui_path
+        text = self._render_as_text(data, name)
+        self._load_hex_preview_from_bytes(data, ui_path)
+        if text is not None:
+            self._load_text_preview(text, ui_path)
+        else:
+            self._clear_text_preview()
+        if data[:16] == _SQLITE_MAGIC:
+            self._clear_segb_preview()
+            self._load_sqlite_preview(ui_path, raw=data, sidecar_reader=sidecar_reader)
+            self.preview_tabs.setCurrentIndex(self._sql_tab_index)
+        elif is_segb(data):
+            self._clear_sqlite_preview()
+            self._load_segb_preview(ui_path, data)
+            self.preview_tabs.setCurrentIndex(self._segb_tab_index)
+        else:
+            self._clear_sqlite_preview()
+            self._clear_segb_preview()
+
+    def _load_virtual_entry_preview(self, ui_path: str) -> None:
+        """Dispatch a virtual-leaf path (member of _nested_virtual_paths)
+        to whichever real reader its own full_metadata marker names —
+        a nested-archive entry (_archive_path, the original, still the
+        common case) or a LevelDB record's own value
+        (_leveldb_folder — see leveldb_viewer.py). One shared set,
+        two real sources, so every OTHER _nested_virtual_paths check
+        (double-click routing here, display-name/file-type
+        classification elsewhere) needed no change at all — only the
+        two spots that actually READ an entry's bytes needed to learn
+        the new source."""
+        meta = self.full_metadata.get(ui_path, {})
+        if meta.get('_leveldb_folder'):
+            self._load_leveldb_record_preview(ui_path)
+        else:
+            self._load_nested_entry_preview(ui_path)
+
     def _load_nested_entry_preview(self, ui_path: str) -> None:
         """Read an entry from an extracted nested archive and display it."""
-        self._fb_last_preview_path = ui_path
         meta      = self.full_metadata.get(ui_path, {})
         arch_path = meta.get('_archive_path')
         arch      = self._nested_archive_map.get(arch_path) if arch_path else None
@@ -5521,27 +5591,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return
 
         name = meta.get('_display_name') or ui_path.rsplit('/', 1)[-1]
-        text = self._render_as_text(data, name)
-        self._load_hex_preview_from_bytes(data, ui_path)
-        if text is not None:
-            self._load_text_preview(text, ui_path)
-        else:
-            self._clear_text_preview()
-        if data[:16] == _SQLITE_MAGIC:
-            stored = arch['stored_path']
-            self._clear_segb_preview()
-            self._load_sqlite_preview(
-                ui_path, raw=data,
-                sidecar_reader=lambda suffix: read_nested_entry(
-                    stored, entry_path + suffix))
-            self.preview_tabs.setCurrentIndex(self._sql_tab_index)
-        elif is_segb(data):
-            self._clear_sqlite_preview()
-            self._load_segb_preview(ui_path, data)
-            self.preview_tabs.setCurrentIndex(self._segb_tab_index)
-        else:
-            self._clear_sqlite_preview()
-            self._clear_segb_preview()
+        stored = arch['stored_path']
+        self._display_preview_bytes(
+            ui_path, data, name,
+            sidecar_reader=lambda suffix: read_nested_entry(stored, entry_path + suffix))
 
     def _resync_file_browser_preview(self) -> None:
         """Reload File Browser's own last-previewed file (_fb_last_preview_path)
@@ -5558,7 +5611,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._clear_hex_preview()
             return
         if path in self._nested_virtual_paths:
-            self._load_nested_entry_preview(path)
+            self._load_virtual_entry_preview(path)
         elif self._in_zip(path):
             self._load_file_preview(path)
 
@@ -5667,6 +5720,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.status_bar.showMessage(f"{folder_path}    |    Tip: Right-click to export")
         self._log(f"Folder viewed: {folder_path}")
 
+        # Single interception point for every real navigation path into a
+        # folder (tree click here, and double-click-in-table via
+        # navigate_tree_to_path, which ends by calling this same method)
+        # — decodes an undecoded LevelDB-shaped folder's records in place
+        # of its raw files, the FIRST time it's navigated into, per direct
+        # user request ("double click a leveldb and you go inside... see
+        # the records as if they are files"). A no-op for every other
+        # folder (checked internally) and for a folder already decoded
+        # this session or a prior one (see leveldb_viewer.py).
+        self._maybe_decode_leveldb_on_navigate(folder_path)
+
         self._view_path = folder_path
         self._view_is_recursive = False
         self._refresh_folder_view()
@@ -5723,7 +5787,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             else:
                 cols.extend([''] * len(_PHOTO_HEADERS))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
-                path in self._nested_archive_map)
+                path in self._nested_archive_map or path in self._leveldb_folder_map)
 
     def _display_name(self, segment: str) -> str:
         """Return the bundle ID for a GUID segment, otherwise the segment itself."""
@@ -5753,6 +5817,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if is_folder:
             if path in self._nested_archive_map:
                 return 'Archive', False, False  # extracted archive browseable as folder
+            if path in self._leveldb_folder_map:
+                return 'LevelDB', False, False  # decoded LevelDB, records browseable as folder
             if self._should_hide_folder(path):
                 return None, None, True
             if path in self._metadata_only_folders:
@@ -5790,8 +5856,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         cols: list = [self._display_name(name)]
         for _, key in self._time_cols:
             cols.append(self.format_ts(meta.get(key)))
-        if is_folder and path in self._nested_archive_map:
-            size_val = meta.get('size', 0)   # show original archive file size
+        if is_folder and (path in self._nested_archive_map or path in self._leveldb_folder_map):
+            size_val = meta.get('size', 0)   # original archive size, or (LevelDB) the
+                                             # precomputed sum of all real record values
         elif is_folder:
             size_val = self._folder_total_size(path)
         else:
@@ -5902,19 +5969,26 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 menu, partial(self._collect_bookmark_paths, folder_path))
             self._research_menu_action(menu, folder_path)
             menu.addSeparator()
-            # Only offered when this folder's own real children (via
-            # folder_map — files and subfolders both, checked directly,
-            # never guessed from the folder's own name) actually look
-            # like a LevelDB directory — see leveldb_viewer.py's own
-            # _looks_like_leveldb_dir. folder_map is a complete,
-            # precomputed dict built once at case-load time, independent
-            # of the tree's own lazy QStandardItem materialization (a
-            # separate, display-only concern), so this check is correct
-            # even for a tree branch never expanded before.
-            if self._case_dir and _looks_like_leveldb_dir(self.folder_map, folder_path):
-                ldb_act = QAction("🗄️ Open as LevelDB", self)
+            # Offered whenever this folder either still looks like a real,
+            # undecoded LevelDB directory (folder_map still shows its own
+            # real CURRENT/MANIFEST/.ldb/.log children — see
+            # leveldb_viewer.py's own _looks_like_leveldb_dir) OR has
+            # already been decoded (on_folder_selected does this
+            # automatically on first double-click/navigation — see
+            # _maybe_decode_leveldb_on_navigate) — in which case
+            # folder_map[folder_path] now holds synthetic per-record
+            # paths instead, so _looks_like_leveldb_dir itself would no
+            # longer recognize it, hence the second, explicit
+            # _leveldb_folder_map check. Either way this action is a
+            # one-off PEEK (per direct user confirmation) — it never
+            # changes what a normal double-click on this folder shows
+            # afterward, records stay the default.
+            if self._case_dir and (
+                    folder_path in self._leveldb_folder_map
+                    or _looks_like_leveldb_dir(self.folder_map, folder_path)):
+                ldb_act = QAction("👁️ View Raw LevelDB Files", self)
                 ldb_act.triggered.connect(
-                    partial(self._open_leveldb_folder, folder_path))
+                    partial(self._peek_leveldb_raw_files, folder_path))
                 menu.addAction(ldb_act)
                 menu.addSeparator()
         export_act = QAction("📁 Export Folder (Recursive)", self)
@@ -6663,6 +6737,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.save_recent_list(self.zip_path)
         fmt_label = "GrayKey" if ffs_adapter.format == FfsAdapter.FORMAT_GRAYKEY else "Cellebrite"
         self._inject_nested_archives()
+        # Re-establish any LevelDB folder decoded in an earlier session of
+        # this same case — see leveldb_viewer.py's own docstring for why
+        # this needs no separate persisted DB table the way nested
+        # archives do (re-decoding from already-extracted files is cheap;
+        # re-scanning a huge zip's own central directory is what nested
+        # archives are avoiding). Must run AFTER _inject_nested_archives
+        # (harmless either order in practice, but this one relies on
+        # folder_map already reflecting this case's real archive layout).
+        self._rescan_decoded_leveldb_folders()
         self.reload_tree_entirely()
         self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
         # Fetch device label and populate device_info after archive is loaded.
@@ -7691,7 +7774,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # bookmarked this), shown local per _format_tool_ts_local.
             cols.append(_format_tool_ts_local(entry.get('bookmarked_at', '')))
             batch.append((cols, ui_path, fc, is_folder and not grey_row,
-                          grey_row, ui_path in self._nested_archive_map))
+                          grey_row, ui_path in self._nested_archive_map
+                          or ui_path in self._leveldb_folder_map))
 
         new_model.append_rows_batch(batch)
         self._view_path = f"{_BM_GROUP_PREFIX}{group_id}"

@@ -587,6 +587,102 @@ def open_db_readonly(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def open_leveldb(paths: dict, relative_dir: str, extract_subdir: str | None = None):
+    """Extract a LevelDB directory out of the archive to a local scratch
+    folder and open it via ccl_leveldb.RawLevelDb — the ONE place every
+    LevelDB-backed parser's own extract-then-open boilerplate should go
+    through, same role this file's own open_db_readonly plays for SQL.
+    ccl_leveldb needs real files on a real filesystem (it opens/seeks its
+    own .ldb/.log files directly, unlike a SQLite connect it can't work
+    from in-memory bytes) — added 2026-09-18 after finding
+    chrome_local_storage.py, the first real caller, had hand-rolled
+    ~15 lines of exactly this (extract dir → RawLevelDb → the caller
+    iterates/closes) with no shared home for it, the same gap
+    open_db_readonly itself closed for SQL earlier.
+
+    Lives here rather than a new leveldb_shared.py — this logic isn't
+    Chrome-schema-specific at all (any app storing data in LevelDB could
+    use it), the same reasoning that already keeps chrome_shared.py
+    scoped to its own two genuinely Chrome-specific functions
+    (url_set/history_visits) while open_db_readonly itself lives here,
+    not in a sql_shared.py. One canonical place, matching the existing
+    convention.
+
+    *relative_dir* — the LevelDB directory's own path relative to the
+    app's own container base (paths['_app_base_ui_path']), no leading or
+    trailing slash — e.g. "app_chrome/Default/Local Storage/leveldb".
+    *extract_subdir* — name of the local scratch subfolder under this
+    parser's own artifact_parser_files/ directory the directory's files
+    are copied into; defaults to *relative_dir* with '/' replaced by '_'
+    so two different LevelDB directories the same parser reads don't
+    collide onto the same folder, but an explicit name reads better for
+    a parser reading only one (chrome_local_storage.py's own
+    "local_storage_leveldb", kept as-is on refactor rather than
+    renamed, so a re-run of an already-processed case reuses its
+    existing extracted files instead of duplicating them under a new
+    auto-derived name).
+
+    A file already extracted from a prior run is skipped, not
+    re-written — this project's own standing extraction convention
+    (`run_artifact`'s own module docstring, `_save_entry`), a real
+    improvement over chrome_local_storage.py's own original inline
+    version, which re-wrote every file on every run.
+
+    Returns an open ccl_leveldb.RawLevelDb the caller must close (same
+    convention as this function's own open_db_readonly above — a plain
+    try/finally or contextlib.closing, not a new shape) — or None if the
+    directory has no matching entries in this archive at all (a fresh
+    app install with no Local Storage yet, say), the same "missing is
+    fine, the caller decides" shape optional_files already has, never an
+    exception for that specific case. A directory that DOES have real
+    entries but that RawLevelDb itself can't make sense of is not
+    caught here — confirmed by reading RawLevelDb.__init__ directly, it
+    only ever raises for a path that isn't a directory at all (never
+    true here, this always os.makedirs's the extract dir first) and
+    otherwise degrades to an empty/no-manifest db rather than raising —
+    so there is genuinely nothing this helper would be catching by
+    wrapping the open call, and a future, different failure mode
+    propagating to run_artifact's own top-level catch (a clear
+    "{script_name}: {exc}" message) is more honest than silently
+    returning None for something this function didn't actually see
+    happen on real data."""
+    import os
+    import ccl_leveldb
+
+    zip_names = paths.get("_zip_names") or []
+    read_bytes = paths.get("_read_zip_bytes")
+    app_base = paths.get("_app_base_ui_path", "")
+    parser_dir = paths.get("_parser_files_dir")
+    adapter = paths.get("_adapter")
+    if not zip_names or read_bytes is None or not app_base or adapter is None or not parser_dir:
+        return None
+
+    ui_prefix = f"{app_base}/{relative_dir}/"
+    try:
+        physical_prefix = adapter.resolve(ui_prefix.rstrip("/")) + "/"
+    except Exception:
+        return None
+    entry_names = [n for n in zip_names if n.startswith(physical_prefix) and not n.endswith("/")]
+    if not entry_names:
+        return None
+
+    subdir = extract_subdir or relative_dir.replace("/", "_")
+    extract_dir = os.path.join(parser_dir, subdir)
+    os.makedirs(extract_dir, exist_ok=True)
+    for physical_path in entry_names:
+        basename = physical_path.rsplit("/", 1)[-1]
+        dest = os.path.join(extract_dir, basename)
+        if os.path.exists(dest):
+            continue
+        data = read_bytes(physical_path)
+        if data is None:
+            continue
+        with open(dest, "wb") as f:
+            f.write(data)
+
+    return ccl_leveldb.RawLevelDb(extract_dir)
+
+
 # ── Loading ───────────────────────────────────────────────────────────────────
 
 def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[str, str]]]:

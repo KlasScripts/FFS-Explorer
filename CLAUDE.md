@@ -5394,3 +5394,42 @@ underneath that verification.
   only, stated as a real limitation in the parser's own `description`
   — every real archive checked only ever has a user 0, but a genuine
   multi-user/work-profile device's other users would not be covered.
+
+- **`artifact_runner.open_leveldb` — the shared LevelDB extract-then-open
+  helper, closing the same gap `open_db_readonly` already closed for
+  SQL** (2026-09-18, direct request as part of the LevelDB folder-
+  browsing work below: "so a coder could add a new artifact parser that
+  has data in LevelDB with minimal work"). `chrome_local_storage.py` —
+  the only real caller before this — had hand-rolled ~15 lines of
+  extract-to-a-scratch-dir-then-`ccl_leveldb.RawLevelDb`-then-iterate/
+  close, with no shared home for it, matching exactly the gap
+  `open_db_readonly` itself closed for SQL earlier. Lives in
+  `artifact_runner.py` directly, not a new `leveldb_shared.py` — this
+  logic isn't Chrome-schema-specific (any LevelDB-backed app could use
+  it), the same reasoning that keeps `chrome_shared.py` scoped to its
+  own two genuinely Chrome-specific functions while `open_db_readonly`
+  itself lives here, not in a `sql_shared.py`.
+
+  Signature: `open_leveldb(paths, relative_dir, extract_subdir=None)` —
+  returns an open `ccl_leveldb.RawLevelDb` the caller closes (same
+  convention as `open_db_readonly`'s own connection — try/finally or
+  `contextlib.closing`, not a new shape), or `None` if the directory has
+  no matching entries in this archive at all, the same "missing is
+  fine, the caller decides" shape `optional_files` already has. A real
+  improvement over `chrome_local_storage.py`'s own original inline
+  version, not just a lift-and-shift: a file already extracted from a
+  prior run is now skipped rather than re-written every time, matching
+  this project's own standing extraction convention
+  (`run_artifact`'s own docstring, `_save_entry`) that the original
+  hand-rolled version didn't follow.
+
+  `chrome_local_storage.py` refactored to call it — verified this is a
+  pure refactor, not a behavior change, two ways: ran the ORIGINAL
+  (pre-refactor, hand-rolled) code and the new helper-based code against
+  the same real Android 14 JoshHickman archive and diffed the full
+  output — 440 rows, byte-for-byte identical either way; then confirmed
+  the new skip-if-already-extracted behavior directly (two consecutive
+  runs against the same case dir, second run's extracted files'
+  mtimes unchanged from the first, output still identical).
+  `WRITING_ARTIFACT_PARSERS.md`'s own "Reusable helpers" section
+  documents this the same way it already documents `open_db_readonly`.

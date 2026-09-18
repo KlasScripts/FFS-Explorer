@@ -95,9 +95,11 @@
       "version": 2
     },
     "android:chrome_local_storage": {
-      "changelog": {},
-      "hash": "dc796698403678ad",
-      "version": 1
+      "changelog": {
+        "2": "Refactored to call the new artifact_runner.open_leveldb shared helper instead of its own hand-rolled extract-then-open code -- pure refactor, not a behavior change: verified the original and refactored code produce byte-for-byte identical output (440 rows) against the real Android 14 JoshHickman archive. Also gains open_leveldb's skip-if-already-extracted behavior (the original inline version re-wrote every file on every run)."
+      },
+      "hash": "f00faa71d11fbeed",
+      "version": 2
     },
     "android:chrome_login_data": {
       "changelog": {},

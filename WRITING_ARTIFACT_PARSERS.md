@@ -443,6 +443,36 @@ attached database read-only on its own (confirmed by direct testing):
 conn.execute("ATTACH DATABASE ? AS other", (f'file:{paths["other_db"]}?mode=ro',))
 ```
 
+**If your app stores data in LevelDB** (Chrome's own Local Storage,
+IndexedDB, and Session Storage all do — see
+`artifacts/android/chrome_local_storage.py` for a real, complete
+example), use `open_leveldb` instead of hand-rolling the extract-then-
+open dance yourself:
+
+```python
+from artifact_runner import open_leveldb
+
+db = open_leveldb(paths, "app_chrome/Default/Local Storage/leveldb")
+if db is None:
+    return []   # directory doesn't exist in this archive at all
+
+try:
+    for rec in db.iterate_records_raw():
+        ...   # rec.user_key, rec.value, rec.state (Live/Deleted/Unknown), rec.seq
+finally:
+    db.close()
+```
+
+LevelDB never overwrites a key in place — an update or delete just
+writes a new record at a higher sequence number, so `iterate_records_raw()`
+hands back every version, live and superseded/deleted, not just the
+current one (see `rec.state`/`rec.seq` above). `open_leveldb`'s first
+argument is the directory's own path relative to the app's container
+base (no leading/trailing slash); the extracted files land under this
+parser's own `artifact_parser_files/` folder, same as any other
+extracted evidence, and a file already extracted from a prior run is
+reused rather than re-copied.
+
 ## Validating what you wrote
 
 Every parser here was built against one specific test image (a known

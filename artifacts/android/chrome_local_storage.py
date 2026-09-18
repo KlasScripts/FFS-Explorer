@@ -99,38 +99,22 @@ def _parse_key(user_key: bytes):
 
 def run(paths):
     import os
-    import ccl_leveldb
+    from artifact_runner import open_leveldb
 
-    zip_names = paths.get("_zip_names") or []
-    read_bytes = paths.get("_read_zip_bytes")
-    app_base = paths.get("_app_base_ui_path", "")
-    parser_dir = paths.get("_parser_files_dir")
-    adapter = paths.get("_adapter")
-    if not zip_names or read_bytes is None or not app_base or adapter is None or not parser_dir:
+    # Extract-then-open boilerplate now lives in artifact_runner.open_leveldb
+    # (added 2026-09-18) -- this was the first, hand-rolled version of
+    # exactly that helper; refactored to call it instead of keeping a
+    # second copy. "local_storage_leveldb" kept as the extract_subdir
+    # name (rather than letting it auto-derive from relative_dir) so a
+    # re-run of an already-processed case reuses this parser's own
+    # existing extracted files instead of duplicating them under a new
+    # name.
+    db = open_leveldb(paths, "app_chrome/Default/Local Storage/leveldb",
+                       extract_subdir="local_storage_leveldb")
+    if db is None:
         return []
-
-    ldb_ui_prefix = f"{app_base}/app_chrome/Default/Local Storage/leveldb/"
-    ldb_physical_prefix = adapter.resolve(ldb_ui_prefix.rstrip("/")) + "/"
-    entry_names = [n for n in zip_names if n.startswith(ldb_physical_prefix) and not n.endswith("/")]
-    if not entry_names:
-        return []
-
-    # ccl_leveldb needs real files on a real filesystem (it opens/seeks
-    # its own .ldb/.log files directly) -- extract this one profile's
-    # LevelDB directory to a local scratch folder once, same idea as
-    # chrome_cache.py's own parser-generated-file convention.
-    extract_dir = os.path.join(parser_dir, "local_storage_leveldb")
-    os.makedirs(extract_dir, exist_ok=True)
-    for physical_path in entry_names:
-        data = read_bytes(physical_path)
-        if data is None:
-            continue
-        basename = physical_path.rsplit("/", 1)[-1]
-        with open(os.path.join(extract_dir, basename), "wb") as f:
-            f.write(data)
 
     out = []
-    db = ccl_leveldb.RawLevelDb(extract_dir)
     try:
         for rec in db.iterate_records_raw():
             parsed = _parse_key(rec.user_key)

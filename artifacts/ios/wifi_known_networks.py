@@ -61,7 +61,10 @@ purpose to keep this parser's own scope to "one row per known network".
 `Moving` (a real key seen on every entry checked) is NOT surfaced at all —
 its actual forensic meaning wasn't confirmed against any authoritative
 source, and this project's own standing rule is to never present a field
-whose meaning isn't actually verified."""
+whose meaning isn't actually verified. See `description` below for the
+research done on `Moving` since this parser first shipped — a real,
+converging pattern, but still a hypothesis, which is exactly why it lives
+in prose on the Notes page rather than as a report column."""
 
 # The real on-device path is /private/var/preferences/... — "preferences"
 # here (not "private/var/preferences") is deliberate, not a typo: this
@@ -90,7 +93,68 @@ description = (
     "the individual BSSIDs themselves are NOT broken out into their own "
     "rows here (iLEAPP does this as a separate report); left out on "
     "purpose to keep this parser's scope to one row per known network, "
-    "not silently dropped without a count at all."
+    "not silently dropped without a count at all.\n\n"
+    "A NOT-surfaced field, on record: every real network entry also "
+    "carries a 'Moving' boolean, deliberately left out of this report's "
+    "own output -- no authoritative source (Apple's own docs, iLEAPP, "
+    "ALEAPP, or the two dedicated public write-ups on this exact plist, "
+    "forge-work.com and forensafe.com -- neither mentions it at all) "
+    "confirms what it actually means. Researched directly (2026-09-18) "
+    "rather than left as a total unknown: across this project's own "
+    "three real iOS test archives (67 known-network entries total), "
+    "Moving=True appears on exactly 2 -- 'Kia_gdJZ' and 'HERO7 Black' "
+    "on the iOS16.5 CTF23 Cellebrite archive -- both SSIDs naming a "
+    "mobile device's own hotspot (a car's onboard WiFi; a GoPro "
+    "camera's companion-app hotspot) rather than fixed infrastructure. "
+    "Two competing hypotheses were tested directly against this same "
+    "data and NEITHER held up: (1) that Moving marks a network restored/"
+    "synced in from another of the user's own devices -- contradicted, "
+    "every real AddReason='Cloud Sync' entry in this same dataset shows "
+    "Moving=None (absent), never True; (2) that it relates to iOS's "
+    "WiFi Password Sharing feature -- unsupported, both real True "
+    "entries were added via AddReason='WiFi Settings' and "
+    "'3rd Party App', nothing sharing-related. The best-supported "
+    "working hypothesis from this real pattern is that Moving flags "
+    "whether the network's OWN ACCESS POINT is itself mobile (a "
+    "vehicle, a wearable, a personal hotspot) rather than fixed "
+    "infrastructure -- plausible given Apple's WiFi subsystem also "
+    "does its own crowd-sourced/Significant-Locations geolocation, "
+    "where a moving AP would need excluding from anything treating a "
+    "known network as a fixed landmark. Still just 2 real positive "
+    "examples on 1 device, not a confirmed fact -- treat as a lead for "
+    "a future re-check against more real data with positive Moving "
+    "values, not as this report's own claim.\n\n"
+    "password_modified_at (added 2026-09-18) -- __OSSpecific__."
+    "WiFiNetworkPasswordModificationDate, present on 8/17 and 21/48 "
+    "real network entries across this project's own two checked "
+    "archives (a network never given a password, or never changed, "
+    "has no value here -- expected, not a gap). forensafe.com's own "
+    "public write-up on this exact plist independently documents a "
+    "'WiFi Password Modification Date' field by name, corroborating "
+    "this as a real, recognized concept for this artifact -- but that "
+    "write-up gives no code, so the name match alone doesn't confirm "
+    "WHEN this field actually fires.\n\n"
+    "That part was checked directly instead of taken on the blog's "
+    "word, across all 29 real occurrences in this project's own two "
+    "archives: password_modified_at lands within a fraction of a "
+    "second of that same network's own added_at on 21 of 29 -- and "
+    "the remaining 8, EVERY ONE, is a network whose add_reason is "
+    "'Cloud Sync' (never any other reason), a 100% split with zero "
+    "exceptions. That's a clean, real pattern: for a network added "
+    "directly on THIS device (WiFi Settings, a 3rd-party app, a "
+    "recommendation), password_modified_at fires at the same instant "
+    "as added_at -- consistent with 'the password was entered the "
+    "moment the network was joined.' For a network synced in from "
+    "ANOTHER of the user's own devices via iCloud Keychain, it "
+    "diverges -- consistent with the password having actually been "
+    "set earlier, on that OTHER device, with only the sync event "
+    "itself timestamped locally as added_at. Read as 'a timestamp "
+    "associated with this network's currently-stored password,' "
+    "corroborated by this project's own direct behavioral check, not "
+    "just a matching field name -- still not an Apple-documented "
+    "fact, and still worth re-checking against a device with a real, "
+    "documented password-CHANGE event (as opposed to first-join) if "
+    "one becomes available."
 )
 timestamp_fields = {
     "added_at": "s",
@@ -98,6 +162,7 @@ timestamp_fields = {
     "joined_by_user_at": "s",
     "joined_by_system_at": "s",
     "last_discovered_at": "s",
+    "password_modified_at": "s",
 }
 byte_fields = ["network_usage_bytes"]
 core_fields = ["ssid", "bssid", "joined_by_user_at", "last_discovered_at",
@@ -177,6 +242,8 @@ def run(paths):
             "joined_by_user_at": _to_unix(net.get("JoinedByUserAt")),
             "joined_by_system_at": _to_unix(net.get("JoinedBySystemAt")),
             "last_discovered_at": _to_unix(net.get("LastDiscoveredAt")),
+            "password_modified_at": _to_unix(
+                os_specific.get("WiFiNetworkPasswordModificationDate")),
             "network_key": network_key,
             "raw_ui_path": ui_path,
         })

@@ -5224,3 +5224,47 @@ underneath that verification.
   human-reviewed (`VERIFICATION_STATUS.md`, still 🔴) and not yet
   exercised through the live GUI's own `record_source` Hex-panel jump —
   both real, stated gaps, not overclaimed as done.
+
+  **A direct follow-up discussion (2026-09-18) graded every proposed
+  further field/report addition by its ACTUAL evidentiary tier before
+  touching anything** — GTD-confirmed / iLEAPP-confirmed (real code, same
+  field names) / forensics-blog-corroborated (name matches, no code) /
+  direct-observation-only (a real key seen in real data, meaning inferred
+  purely from its English name, zero external corroboration) / actively
+  contested (a real, open question even in the public forensics
+  community). Two concrete outcomes from that grading:
+
+  - **Added `password_modified_at`** (`__OSSpecific__.`
+    `WiFiNetworkPasswordModificationDate`) — Tier 2/3. forensafe.com
+    independently names this field for this exact plist (real
+    corroboration the CONCEPT is recognized), but gives no code, so the
+    name match alone doesn't confirm WHEN it actually fires. Checked
+    directly rather than taken on the blog's word: across all 29 real
+    occurrences on this project's own two archives, it lands within a
+    fraction of a second of that same network's own `added_at` on 21 of
+    29 — and every one of the remaining 8, with zero exceptions, is a
+    network whose `AddReason` is `'Cloud Sync'`. A clean, self-derived
+    pattern (password entered at join time locally; diverges when the
+    network was actually set up on a DIFFERENT device and only synced in
+    here), stated in the parser's own `description` as corroborated-by-
+    direct-check, not as an Apple-documented fact.
+  - **Held off on a BSSList/geolocation report.** Its field set (`SSID`,
+    `BSSID`, `Channel`, `LocationLatitude`/`Longitude`/`Accuracy`,
+    `LocationTimestamp`) is real, iLEAPP-confirmed — read iLEAPP's own
+    `appleWifiBSSList` processor directly, exact match. But what the
+    coordinates actually REPRESENT — this device's own historical
+    position, vs. a crowd-sourced reference position for the access
+    point (Apple's WiFi-based geolocation database) — is not resolved by
+    iLEAPP, either blog, or Apple's own docs, and a real, on-point
+    Forensic Focus forum thread (`"iOS meaning of 'networkKnownBSSList
+    Key'?"`) shows practitioners actively asking this, unanswered. A
+    directly relevant, adjacent data point from this project's own
+    vendored source — iLEAPP's `threeBars.py`, a DIFFERENT WiFi/location
+    cache — explicitly states ITS coordinates are "the network position
+    ... rather than a device position," but that's a structurally
+    different store (crowd-sourced tiles for every nearby network, not
+    just ones the device joined) and confirmed NOT assumed to transfer.
+    Two claims this different ("this AP sits here" vs. "this device was
+    physically here") are not interchangeable, so this report isn't
+    shipped until that's actually resolved — ideally against a device
+    with its own documented real movements, not another blog citation.

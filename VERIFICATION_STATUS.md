@@ -47,6 +47,7 @@ the most consequential kind in this whole codebase.
 | `ios/whatsapp.py` | 🔴 | | |
 | `ios/sms_messages.py` | 🔴 | | |
 | `ios/photos_metadata.py` | 🔴 | | |
+| `android/settings_secure.py` | 🔴 | | New 2026-09-18 -- android_id/bluetooth name+address/mock_location, from settings_secure.xml. Built to exercise the ABX decoder (incl. this session's own 2 fixes to it) in a shipped parser. Machine-checked on all 3 Android archives; Bluetooth MAC on Android 14 JoshHickman matches documented ground truth exactly. NOT yet human-reviewed |
 | `android/whatsapp.py` | 🔴 | | |
 | `android/google_messages.py` | 🔴 | | |
 | `android/google_messages_deleted_conversations.py` | 🔴 | | |

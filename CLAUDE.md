@@ -5367,3 +5367,30 @@ underneath that verification.
   that ledger, and the raw-browser surface itself is already tracked
   under "FastZipBrowser preview dispatch + tree/table/export" (still
   🔴, untouched by this change).
+
+  **`artifacts/android/settings_secure.py` (2026-09-18)** — a real
+  parser built to prove the ABX decoder above "in anger," same reason
+  `ios/wifi_known_networks.py` exists for `decode_plist_blob`. Modeled
+  on ALEAPP's own `settingsSecure.py`
+  (`android_id`/`bluetooth_name`/`bluetooth_address`/`mock_location`
+  from `data/system/users/0/settings_secure.xml`), reshaped into one
+  row of named columns rather than ALEAPP's own long/melted
+  (User, Name, Value) shape, matching this project's own convention.
+  `settings_secure.xml` is real ABX on all three of this project's own
+  Android archives — and is one of the exact files that failed
+  OUTRIGHT before this session's own multi-root fix (real,
+  demonstrable cause and effect, not a coincidental choice of target
+  file). Checks `ccl_abx.is_abx()` first and falls back to plain
+  `ET.fromstring` otherwise (Android 10 and earlier ship this file as
+  plain XML) — same order `app_intelligence.py`'s existing
+  `packages.xml` handling already uses. Verified via the real
+  `run_artifact()` dispatcher against all three archives, `app_path`
+  resolving correctly for both real formats involved (`zip_extras` and
+  `graykey`) with no per-archive adjustment needed — and the decoded
+  Bluetooth MAC address on Android 14 JoshHickman matches that
+  archive's own documented ground truth `bt_mac` exactly
+  (`94:45:60:1b:98:cc`), a direct ground-truth confirmation, not just
+  "the code ran." Scoped to user 0 (the primary/default Android user)
+  only, stated as a real limitation in the parser's own `description`
+  — every real archive checked only ever has a user 0, but a genuine
+  multi-user/work-profile device's other users would not be covered.

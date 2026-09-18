@@ -214,6 +214,13 @@
       "hash": "468b9ff1e9196aed",
       "version": 1
     },
+    "android:settings_secure": {
+      "changelog": {
+        "1": "New parser -- exercises app/ccl_abx.py's ABX decoder (including this session's own two real correctness fixes) against a real shipped parser, the ABX counterpart to ios/wifi_known_networks.py's bplist demonstration. Modeled on ALEAPP's own settingsSecure.py (android_id/bluetooth_name/bluetooth_address/mock_location), reshaped into named columns matching this project's own convention. settings_secure.xml is real ABX on all three of this project's own Android archives, and is one of the exact files that failed outright before this session's own multi-root fix. Verified: real values on all three archives; the decoded Bluetooth MAC on Android 14 JoshHickman matches that archive's own documented ground truth bt_mac exactly."
+      },
+      "hash": "ae402b221ee5d235",
+      "version": 1
+    },
     "android:viber": {
       "changelog": {
         "2": "Removed local _display_name() in favor of shared first_nonempty(default=...); use shared missing_ref_label() for the no-participant-record fallbacks (no output change)."

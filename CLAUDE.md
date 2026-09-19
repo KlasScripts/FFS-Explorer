@@ -5693,3 +5693,133 @@ underneath that verification.
   Chromium's own engine, so web content storage goes through WebKit's
   own (SQLite-based) mechanism instead; only these apps' own bundled
   account-sync/push-messaging plumbing shows up as LevelDB there.
+
+  **Three more closures, 2026-09-19, same day: META: commit-timestamp
+  decode, a real Content-type column for the generic record view, and a
+  real tag-byte classification bug caught and fixed before it shipped —
+  all aimed at the same explicit goal: "make this generic LevelDB view
+  as clean as possible so an examiner reviewing an unsupported app has
+  it decoded as much as possible, then can work out how best to report
+  it or build an app-specific parser."**
+
+  1. **`chrome_local_storage.py`'s own `META:<origin>` bookkeeping
+     records, previously skipped entirely, now decode.** A small, fixed
+     2-field varint/protobuf (`_decode_meta_value`, a hand-rolled reader
+     — not a generic protobuf library, since this shape is small and
+     known) — field 1 = last-commit timestamp (Chromium's own
+     `base::Time`/webkit_us epoch, reusing this project's own existing
+     `timestamp_fields` unit code rather than hand-converting), field 2
+     = committed data size. `run()` now emits a `record_type` column
+     (`'data'` vs `'commit_metadata'`) with a shared field set across
+     both row kinds (same uniform-keys requirement every parser output
+     already follows) — `commit_metadata` rows leave key/value blank and
+     populate `committed_at`/`committed_data_size` instead. The SAME
+     pass corrected an adjacent, previously-wrong claim: tag=0x01 DOM
+     Storage values were labeled "UTF-8" but are really Latin-1 per CCL
+     Solutions Group's own published research — changed the decode and
+     label, though this project's own real data (335 real tag=0x01
+     values, all pure ASCII) can't actually distinguish the two, stated
+     honestly as inconclusive-but-safer rather than confirmed. Verified:
+     three real META: values decode to plausible real dates (2024-01-28/
+     2024-07-14 UTC, both before this archive's own July 28 2024
+     acquisition) and plausible sizes (166/249/214 bytes); full parser
+     re-run produced 521 rows (440 data + 81 commit_metadata, matching
+     440+81+1(skipped VERSION)=522 raw records exactly); DB round-trip
+     and the full pytest suite both clean; version bumped and
+     changelogged via `parser_versions.record_changelog`.
+
+  2. **A generic Content-type column for every LevelDB record's own
+     virtual file, built to work for ANY app's LevelDB, not just
+     Chrome's own schemas.** New `leveldb_viewer.classify_leveldb_value(raw)`
+     — `'empty'`/`'bplist'`/`'plist'`/`'json'`/`'xml'`/`'text'`/`'bin'`
+     — tries bplist magic, ABX magic (decoded via the same `ccl_abx`
+     already used elsewhere in this project), then real JSON/XML/plist
+     *validation* (`json.loads`/`xml.dom.minidom`, not a leading-byte
+     guess) on the raw bytes AND, when that finds nothing, on the tail
+     after Chromium's own real DOM Storage type-tag byte (0x00=UTF-16LE,
+     0x01=Latin-1 — the exact convention `chrome_local_storage.py`'s own
+     `_decode_value` already uses, reused here rather than re-derived).
+     Wired into `_decode_leveldb_folder`'s existing per-record loop:
+     populates `self._header_type_overrides[vpath]` — the SAME dict that
+     already drives the file browser's real Type column AND its dynamic
+     filter menu (`self.file_model.distinct_values('Type')` builds the
+     checkboxes from whatever's actually present) — so an examiner can
+     filter a decoded LevelDB folder down to just its `json` records, or
+     just its `bin` ones, with **zero new UI code**; this was the single
+     biggest lever for "as decoded as possible" review, confirmed by
+     design review before writing it. `'bin'` is deliberately left
+     unset rather than given its own override — it falls back to the
+     ordinary `'Other'` label every undetected file already gets, no
+     redundant synonym bucket. Also fires automatically on case reopen
+     (`_rescan_decoded_leveldb_folders` calls the same
+     `_decode_leveldb_folder`, so the override population isn't a
+     separate thing to keep in sync) and is unaffected by the raw-files
+     peek toggle (the peeked physical filenames — `CURRENT`/`*.ldb`/
+     `*.log` — live under a completely different vpath space from the
+     decoded record vpaths, confirmed by reading `_peek_leveldb_raw_files`
+     directly rather than assumed safe).
+
+  3. **A real, two-layer classification bug was found and fixed BEFORE
+     shipping, by direct testing against a synthetic tag-prefixed value
+     — not caught by re-reading the code.** First draft: for a
+     tag-prefixed value, tried the RAW bytes' own "does this decode as
+     plain UTF-8 at all" as a blanket text fallback BEFORE the
+     tag-aware JSON/XML check — and that blanket check SUCCEEDS even
+     with the tag byte still attached (a lone 0x00/0x01 byte is itself
+     valid single-byte UTF-8, and UTF-16LE-encoded pure-ASCII content is,
+     byte-for-byte, ALSO valid UTF-8 — every byte is either printable
+     ASCII or a literal 0x00, both valid UTF-8 on their own) — so a real
+     tag-prefixed JSON value classified as plain `'text'`, never reaching
+     the smarter check at all; confirmed directly with a synthetic
+     tag-prefixed JSON value (`classify_leveldb_value(b'\x00' +
+     json_text.encode('utf-16-le'))` returned `'text'`, not `'json'`)
+     before trusting the first draft. Fixed by reordering: try
+     content-shape detection (json/xml/plist) on BOTH the raw bytes and
+     the correctly tag-decoded text (UTF-16LE for 0x00, Latin-1 for
+     0x01 — real per-tag encodings, never a blind UTF-8 retry) FIRST,
+     falling back to a generic "is it text at all" label only once
+     every shape check has already failed. Re-tested the same synthetic
+     case plus 7 others (untagged JSON/XML/plist, plain text, empty,
+     binary, tagged plain text both tags) — all correct after the fix.
+
+  **The whole classifier was then verified against REAL on-disk LevelDB
+  bytes, not just crafted byte strings shaped like the wire format** —
+  directly prompted by the user's own standing caution that the vendored
+  `ccl_*` readers are a trusted source, not an infallible one, so
+  correctness has to be checked against real bytes each time, not
+  assumed from having read the format spec. Hand-wrote a real, minimal
+  `.log` file (32KB-block record framing + WriteBatch encoding, per
+  leveldb's own `db/log_format.h`/`db/write_batch.cc` — `ccl_leveldb.
+  LogFile._get_batches()` was confirmed, by reading its source, to never
+  actually validate the record CRC, only read past it, so a zero CRC in
+  the hand-written file is fine), containing 9 real records — including
+  a genuine tag=0x00 UTF-16LE-tagged JSON value and a genuine tag=0x01
+  Latin-1-tagged JSON value, neither of which occur naturally anywhere
+  in this project's own current archives (see the real-data check just
+  below) — read it back through this project's own vendored
+  `ccl_leveldb.RawLevelDb`, and confirmed the classifier's output on
+  every real round-tripped record matched expectations, including a real
+  deletion tombstone correctly reading back with an empty value and
+  `Deleted` state.
+
+  Then ran the classifier across all **11,739 real records in 92 real,
+  already-extracted LevelDB folders** left over from this project's
+  earlier survey work (`case_data/EXTRACTION_FFS/leveldb_browse/` — real
+  Local Storage/Session Storage/IndexedDB stores from dozens of real
+  apps: Chrome, Brave, Opera, Edge, DuckDuckGo, Viber, LINE, GroupMe,
+  ProtonMail, Reddit, Spotify, Waze, and more): zero exceptions across
+  every single record, and a real, sane distribution (4,229 `bin`,
+  3,911 `text`, 3,334 `empty`, 265 `json`) — the 265 real `json` hits
+  include real tag-prefixed Local Storage values (e.g. a real PubMatic
+  ad-consent-string value on mlb.com, embedded under its own real
+  top-level-site partition) that the pre-fix classifier would have
+  mislabeled as `'text'`. An honest limitation, stated rather than
+  glossed over: NONE of these 92 real folders' 11,739 records happen to
+  contain a `bplist`/`<?xml`/`<plist` byte sequence anywhere in their
+  values (confirmed by a direct substring scan, not assumed) — the
+  `'plist'`/`'bplist'`/`'xml'` classification paths are therefore only
+  verified against the hand-built real on-disk `.log` file above and
+  earlier synthetic cases, not yet against a naturally-occurring real
+  example; worth re-checking if/when one turns up in a future case.
+  Regression-checked afterward: full pytest suite (18/18) and
+  `scripts/check_claude_md.py` both clean.

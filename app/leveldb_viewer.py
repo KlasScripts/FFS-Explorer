@@ -201,6 +201,125 @@ def _sanitize_record_name(raw_key: bytes, index: int,
     return vpath_segment, display_name
 
 
+def _content_shape(text: str) -> str | None:
+    """'json'/'plist'/'xml' if TEXT (already decoded — never raw bytes,
+    see classify_leveldb_value's own docstring for why that distinction
+    is exactly what a real bug turned on) genuinely parses as one, else
+    None — real validation (json.loads / xml.dom.minidom), not just a
+    leading-character sniff, so a "json"/"xml"/"plist" label a user
+    filters by is trustworthy, not a false positive on something that
+    merely starts with '{'/'<'. 'plist' specifically means an XML
+    property list (`<plist` present — the same real check Crush's own
+    plist_parser.py uses, `_is_plist_xml`) — a real, distinct, common
+    enough shape to name separately from generic XML, not a guess at a
+    new category."""
+    stripped = text.lstrip()
+    if stripped[:1] in ('{', '['):
+        try:
+            import json
+            json.loads(text)
+            return 'json'
+        except Exception:
+            return None
+    if stripped[:1] == '<':
+        try:
+            import xml.dom.minidom
+            xml.dom.minidom.parseString(text)
+        except Exception:
+            return None
+        return 'plist' if '<plist' in text[:512] else 'xml'
+    return None
+
+
+def classify_leveldb_value(raw: bytes) -> str:
+    """Content-type label for one record's own raw value bytes — shown
+    as the file browser's own "Type" column for a LevelDB record's
+    virtual file (via _header_type_overrides, the exact same mechanism
+    an extracted nested-archive entry's own file type already uses — no
+    new column/filter machinery needed, the file browser's existing
+    Type filter menu already builds itself from whatever distinct
+    values are actually present). One of: 'empty', 'bplist' (binary
+    plist), 'plist' (XML plist), 'json', 'xml', 'text', 'bin'.
+
+    A REAL bug, found AND FIXED TWICE, 2026-09-19 (direct user report:
+    "the json value... a dot at the beginning... prevent[s] them from
+    being recognised as text so being shown as hex"):
+
+    Fix #1 — every real Chrome Local/Session Storage value carries a
+    genuine single-byte type-tag prefix (0x00=UTF-16LE, 0x01=Latin-1 —
+    Chromium's own real DOM Storage convention, the same one
+    artifacts/android/chrome_local_storage.py's own _decode_value
+    already handles) BEFORE the actual content — a real JSON value's
+    true first byte is genuinely 0x01, not '{'.
+
+    Fix #2 — a SECOND, more subtle bug found testing fix #1 against a
+    synthetic tag-prefixed value, not caught by inspection alone: the
+    first draft tried `raw.decode('utf-8', errors='strict')` on the
+    FULL tag-prefixed bytes as a blanket "is this text at all" check —
+    and that SUCCEEDS even with the tag byte still attached (a lone
+    0x00 or 0x01 byte is itself a valid single-byte UTF-8 codepoint,
+    and UTF-16LE-encoded pure-ASCII content — alternating a printable
+    byte with a literal 0x00 — is, byte-for-byte, ALSO valid UTF-8),
+    so it returned plain 'text' before ever reaching the tag-aware
+    JSON/XML check below. Confirmed directly with a synthetic
+    tag-prefixed JSON value before trusting the fix, not assumed
+    correct from re-reading the code. The real fix is ORDER: real
+    content-shape detection (json/xml/plist) is tried, on BOTH the raw
+    bytes and the correctly tag-decoded text (UTF-16LE for tag 0x00,
+    Latin-1 for tag 0x01 — the REAL encoding for each tag, not a blind
+    UTF-8 retry), BEFORE any generic "is it text at all" classification
+    — so a tag-prefixed JSON value is recognized as 'json', not merely
+    'text'.
+
+    ABX (Android Binary XML) is decoded and labeled 'xml' — once
+    decoded it genuinely IS xml content, no separate 'abx' category
+    needed for what's ultimately the same shape a user would filter
+    for."""
+    if not raw:
+        return 'empty'
+    if raw[:6] == b'bplist':
+        return 'bplist'
+    if raw[:4] == b'ABX\x00':
+        try:
+            import ccl_abx
+            import xml.etree.ElementTree as _ET
+            _ET.tostring(ccl_abx.abx_bytes_to_xml_root(raw), encoding='utf-8')
+            return 'xml'
+        except Exception:
+            pass   # falls through to the generic checks below
+
+    # Candidate (text, is_definitely_real_text) pairs to try, in order:
+    # the raw bytes as-is (covers a plain, untagged JSON/XML/plist/text
+    # value — most files, and any LevelDB value from a non-Chrome
+    # store), then Chrome's own real tag-stripped-and-correctly-decoded
+    # text (covers a real Local/Session Storage value) — see this
+    # function's own docstring for why trying the SHAPE check on both
+    # BEFORE any plain "is it text" fallback is what fix #2 above is
+    # about.
+    candidates: list[str] = []
+    try:
+        candidates.append(raw.decode('utf-8', errors='strict'))
+    except UnicodeDecodeError:
+        pass
+    if len(raw) > 1:
+        tag, body = raw[0], raw[1:]
+        if tag == 0x00:
+            try:
+                candidates.append(body.decode('utf-16-le', errors='strict'))
+            except UnicodeDecodeError:
+                pass
+        elif tag == 0x01:
+            candidates.append(body.decode('latin-1'))   # never raises
+
+    for text in candidates:
+        shape = _content_shape(text)
+        if shape:
+            return shape
+    if candidates:
+        return 'text'
+    return 'bin'
+
+
 class LevelDbViewerMixin:
 
     # ── Decoding ─────────────────────────────────────────────────────────
@@ -299,6 +418,17 @@ class LevelDbViewerMixin:
                 'mtime':                 None,   # no real timestamp at the LevelDB layer
             }
             virtual_children.append(vpath)
+            # Populate the file browser's EXISTING Type column/filter for
+            # this record — _header_type_overrides already drives both
+            # (self.file_model.distinct_values('Type') builds the filter
+            # menu dynamically from whatever's present), so a real record
+            # value's content type is filterable with zero new UI. Skip
+            # 'bin' — leaving it unset falls back to the ordinary 'Other'
+            # label every other undetected file already gets, rather than
+            # adding a redundant synonym for the same bucket.
+            content_type = classify_leveldb_value(rec.value)
+            if content_type != 'bin':
+                self._header_type_overrides[vpath] = content_type
 
         self.folder_map[ui_path] = virtual_children
         self.full_metadata.setdefault(ui_path, {})['size'] = total_size

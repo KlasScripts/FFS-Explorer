@@ -97,10 +97,11 @@
     "android:chrome_local_storage": {
       "changelog": {
         "2": "Refactored to call the new artifact_runner.open_leveldb shared helper instead of its own hand-rolled extract-then-open code -- pure refactor, not a behavior change: verified the original and refactored code produce byte-for-byte identical output (440 rows) against the real Android 14 JoshHickman archive. Also gains open_leveldb's skip-if-already-extracted behavior (the original inline version re-wrote every file on every run).",
-        "3": "_parse_key is now a thin wrapper around artifact_runner.parse_chromium_dom_storage_key -- promoted there 2026-09-19 as a second real caller emerged (leveldb_viewer.py's own record-to-filename decode for the new in-browser LevelDB feature). Pure refactor, not a behavior change: verified byte-identical output (440 rows) against the real Android 14 JoshHickman archive before and after."
+        "3": "_parse_key is now a thin wrapper around artifact_runner.parse_chromium_dom_storage_key -- promoted there 2026-09-19 as a second real caller emerged (leveldb_viewer.py's own record-to-filename decode for the new in-browser LevelDB feature). Pure refactor, not a behavior change: verified byte-identical output (440 rows) against the real Android 14 JoshHickman archive before and after.",
+        "4": "META:<origin> records -- Chrome's own per-origin commit bookkeeping, previously skipped entirely -- are now decoded and reported as their own 'commit_metadata' rows (record_type field distinguishes them from real 'data' rows). A small, fixed 2-field protobuf, decoded with a purpose-built varint reader: field 1 = commit timestamp (Chromium's own base::Time/webkit_us epoch, using this project's existing timestamp_fields unit code), field 2 = committed byte size. Confirmed against CCL Solutions Group's own published research and directly verified byte-by-byte against three real values (dates land in 2024-01/2024-07, before this archive's own July 2024 acquisition; sizes are small and plausible). Also corrected _decode_value's tag=0x01 case from UTF-8 to Latin-1, per the same CCL research -- confirmed zero effect on this archive's own 335 real tag=0x01 values (all pure ASCII, byte-identical under either encoding) but strictly safer (Latin-1 never raises) and matches Chromium's own actual convention."
       },
-      "hash": "b2785e46198f4f40",
-      "version": 3
+      "hash": "313a2c6b4fe33d31",
+      "version": 4
     },
     "android:chrome_login_data": {
       "changelog": {},

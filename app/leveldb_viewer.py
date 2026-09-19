@@ -231,6 +231,67 @@ def _content_shape(text: str) -> str | None:
     return None
 
 
+def _abx_to_xml_text(raw: bytes) -> str | None:
+    """Real, decoded XML text for an ABX-magic value, or None — shared
+    by classify_leveldb_value (label only) and
+    leveldb_value_preview_bytes (the actual text to render), so a
+    record's own Type label and its preview pane can never disagree
+    about whether its ABX content actually decoded."""
+    try:
+        import ccl_abx
+        import xml.etree.ElementTree as _ET
+        return _ET.tostring(ccl_abx.abx_bytes_to_xml_root(raw), encoding='unicode')
+    except Exception:
+        return None
+
+
+def _leveldb_value_candidates(raw: bytes) -> list[tuple[str, bool]]:
+    """[(decoded_text, is_definitely_real_text)] candidates for *raw*,
+    in priority order — shared by classify_leveldb_value (label only)
+    and leveldb_value_preview_bytes (the actual bytes to render), so
+    the two can never disagree about which candidate is real content.
+
+    Candidate 1: the plain UTF-8 decode of raw itself — covers an
+    untagged value from ANY LevelDB store (most real stores; see
+    CLAUDE.md's own 145-distinct-store survey, most of which have no
+    tag-byte convention at all). is_definitely_real_text=True here,
+    matching this project's existing bar for "is this text" everywhere
+    else (header_scan.is_text) — a real file/record's own bytes
+    decoding cleanly as UTF-8 is already the accepted signal.
+
+    Candidate 2, ONLY for Chrome's own real DOM Storage type-tag byte
+    (0x00=UTF-16LE, 0x01=Latin-1 — the same convention
+    artifacts/android/chrome_local_storage.py's own _decode_value
+    already handles): the tag-stripped body, decoded with the CORRECT
+    tag-specific encoding, never a blind UTF-8 retry.
+    is_definitely_real_text=False here — Latin-1 never raises on ANY
+    byte 0-255, so successfully decoding it is, on its own, no evidence
+    the result is genuinely text rather than an unrelated app's own
+    real binary value that merely happens to start with 0x00/0x01 (a
+    real risk for a GENERIC viewer covering every app's own LevelDB
+    store, not just Chrome's — see this module's own docstring for why
+    that distinction matters here). A caller wanting to treat this
+    candidate as real text should additionally require either
+    _content_shape (validated json/xml/plist) or
+    artifact_runner.text_plausible — never accept it on decode success
+    alone."""
+    candidates: list[tuple[str, bool]] = []
+    try:
+        candidates.append((raw.decode('utf-8', errors='strict'), True))
+    except UnicodeDecodeError:
+        pass
+    if len(raw) > 1:
+        tag, body = raw[0], raw[1:]
+        if tag == 0x00:
+            try:
+                candidates.append((body.decode('utf-16-le', errors='strict'), False))
+            except UnicodeDecodeError:
+                pass
+        elif tag == 0x01:
+            candidates.append((body.decode('latin-1'), False))   # never raises
+    return candidates
+
+
 def classify_leveldb_value(raw: bytes) -> str:
     """Content-type label for one record's own raw value bytes — shown
     as the file browser's own "Type" column for a LevelDB record's
@@ -247,10 +308,9 @@ def classify_leveldb_value(raw: bytes) -> str:
 
     Fix #1 — every real Chrome Local/Session Storage value carries a
     genuine single-byte type-tag prefix (0x00=UTF-16LE, 0x01=Latin-1 —
-    Chromium's own real DOM Storage convention, the same one
-    artifacts/android/chrome_local_storage.py's own _decode_value
-    already handles) BEFORE the actual content — a real JSON value's
-    true first byte is genuinely 0x01, not '{'.
+    Chromium's own real DOM Storage convention) BEFORE the actual
+    content — a real JSON value's true first byte is genuinely 0x01,
+    not '{'.
 
     Fix #2 — a SECOND, more subtle bug found testing fix #1 against a
     synthetic tag-prefixed value, not caught by inspection alone: the
@@ -258,18 +318,28 @@ def classify_leveldb_value(raw: bytes) -> str:
     FULL tag-prefixed bytes as a blanket "is this text at all" check —
     and that SUCCEEDS even with the tag byte still attached (a lone
     0x00 or 0x01 byte is itself a valid single-byte UTF-8 codepoint,
-    and UTF-16LE-encoded pure-ASCII content — alternating a printable
-    byte with a literal 0x00 — is, byte-for-byte, ALSO valid UTF-8),
-    so it returned plain 'text' before ever reaching the tag-aware
-    JSON/XML check below. Confirmed directly with a synthetic
-    tag-prefixed JSON value before trusting the fix, not assumed
-    correct from re-reading the code. The real fix is ORDER: real
-    content-shape detection (json/xml/plist) is tried, on BOTH the raw
-    bytes and the correctly tag-decoded text (UTF-16LE for tag 0x00,
-    Latin-1 for tag 0x01 — the REAL encoding for each tag, not a blind
-    UTF-8 retry), BEFORE any generic "is it text at all" classification
-    — so a tag-prefixed JSON value is recognized as 'json', not merely
-    'text'.
+    and UTF-16LE-encoded pure-ASCII content is, byte-for-byte, ALSO
+    valid UTF-8), so it returned plain 'text' before ever reaching the
+    tag-aware JSON/XML check below. Confirmed directly with a synthetic
+    tag-prefixed JSON value before trusting the fix. The real fix is
+    ORDER: real content-shape detection (json/xml/plist) is tried, on
+    every _leveldb_value_candidates() candidate, BEFORE any generic
+    "is it text at all" classification.
+
+    Fix #3 (2026-09-19, same day, the SEPARATE preview-pane bug a
+    direct follow-up user report surfaced — see
+    leveldb_value_preview_bytes for the fix to the actual rendering,
+    this fix is narrower: the generic 'text' fallback below used to
+    accept ANY tag-stripped candidate on decode success alone — but
+    Latin-1 never raises, so that's no real evidence of real text; a
+    genuinely binary value from an unrelated (non-Chrome) LevelDB store
+    that happens to start with byte 0x00/0x01 could be mislabeled
+    'text' instead of 'bin'. Now requires artifact_runner.text_plausible
+    (control-character-fraction check, the same one this project's own
+    SQL carving-confidence gate already uses) for a tag-stripped-only
+    candidate — a plain untagged UTF-8 decode still needs no extra
+    check, matching this project's existing "clean UTF-8 decode is
+    already good enough evidence" bar elsewhere.
 
     ABX (Android Binary XML) is decoded and labeled 'xml' — once
     decoded it genuinely IS xml content, no separate 'abx' category
@@ -279,45 +349,110 @@ def classify_leveldb_value(raw: bytes) -> str:
         return 'empty'
     if raw[:6] == b'bplist':
         return 'bplist'
-    if raw[:4] == b'ABX\x00':
-        try:
-            import ccl_abx
-            import xml.etree.ElementTree as _ET
-            _ET.tostring(ccl_abx.abx_bytes_to_xml_root(raw), encoding='utf-8')
-            return 'xml'
-        except Exception:
-            pass   # falls through to the generic checks below
+    if raw[:4] == b'ABX\x00' and _abx_to_xml_text(raw) is not None:
+        return 'xml'
 
-    # Candidate (text, is_definitely_real_text) pairs to try, in order:
-    # the raw bytes as-is (covers a plain, untagged JSON/XML/plist/text
-    # value — most files, and any LevelDB value from a non-Chrome
-    # store), then Chrome's own real tag-stripped-and-correctly-decoded
-    # text (covers a real Local/Session Storage value) — see this
-    # function's own docstring for why trying the SHAPE check on both
-    # BEFORE any plain "is it text" fallback is what fix #2 above is
-    # about.
-    candidates: list[str] = []
-    try:
-        candidates.append(raw.decode('utf-8', errors='strict'))
-    except UnicodeDecodeError:
-        pass
-    if len(raw) > 1:
-        tag, body = raw[0], raw[1:]
-        if tag == 0x00:
-            try:
-                candidates.append(body.decode('utf-16-le', errors='strict'))
-            except UnicodeDecodeError:
-                pass
-        elif tag == 0x01:
-            candidates.append(body.decode('latin-1'))   # never raises
+    from artifact_runner import text_plausible
 
-    for text in candidates:
+    candidates = _leveldb_value_candidates(raw)
+    for text, _ in candidates:
         shape = _content_shape(text)
         if shape:
             return shape
-    if candidates:
-        return 'text'
+    for text, is_definite in candidates:
+        if is_definite or text_plausible(text):
+            return 'text'
     return 'bin'
+
+
+def leveldb_value_preview_bytes(raw: bytes) -> bytes:
+    """The bytes to hand to the generic file-preview renderer
+    (FastZipBrowser._display_preview_bytes / _render_as_text) for one
+    record's own raw value.
+
+    Real, direct user bug report, 2026-09-19: a real Chrome Local
+    Storage JSON value's preview pane showed hex, not formatted JSON,
+    because of the same leading DOM Storage type-tag byte
+    classify_leveldb_value already accounts for — the Type-column fix
+    above never touched the SEPARATE code path
+    (_load_leveldb_record_preview) that feeds the preview pane, which
+    handed the still-tagged raw bytes straight to the generic renderer
+    untouched.
+
+    Returns raw UNCHANGED whenever it already renders correctly through
+    the generic pipeline: empty, bplist, ABX, or already-valid-UTF-8 —
+    the common case across this project's own 145-distinct-real-store
+    survey, which has NO tag-byte convention at all outside Chrome's
+    own DOM Storage. Only strips+re-encodes the tag-prefixed body when
+    doing so is what makes the value's real content actually
+    renderable — never a blind "any 0x00/0x01 prefix must be a tag"
+    guess, which could corrupt an unrelated app's own genuinely binary
+    value into garbled pseudo-text instead of the honest hex view it
+    should get. Per direct user instruction: this view covers many
+    different apps' own LevelDB stores, most of which will never have
+    this tag byte at all — the fix has to stay scoped to cases it can
+    actually justify, not applied blindly everywhere.
+
+    A REAL bug was found and fixed in THIS function's own first draft,
+    2026-09-19, testing against the exact real PubMatic JSON value that
+    prompted this whole fix — the SAME ordering mistake fix #2 in
+    classify_leveldb_value's own docstring already describes, freshly
+    reintroduced here: the first draft tried `raw.decode('utf-8',
+    errors='strict')` on the FULL tag-prefixed bytes as an early
+    "already fine, nothing to fix" return — and that succeeds even with
+    the tag byte still attached (b'\\x01{"a":1}' decodes as valid UTF-8
+    just fine — the leading 0x01 is a valid single-byte codepoint), so
+    it returned the STILL-TAGGED raw bytes completely unchanged,
+    unverified against real data before this was caught. Confirmed
+    directly: `leveldb_value_preview_bytes` on a real tag-prefixed
+    PubMatic Local Storage value returned bytes still starting with
+    `\\x01{`, which `json.loads` on the decoded text correctly still
+    fails to parse — the exact symptom this function exists to fix,
+    unfixed by the first draft. Rewritten to check real JSON/XML/plist
+    SHAPE (via _content_shape, on every _leveldb_value_candidates()
+    candidate) FIRST, before ever treating "raw already decodes as
+    UTF-8" as a reason to return it unchanged — the identical ordering
+    principle as classify_leveldb_value, now shared via the same
+    _leveldb_value_candidates helper so the two functions can't drift
+    apart on this again."""
+    if not raw or raw[:6] == b'bplist':
+        return raw
+    if raw[:4] == b'ABX\x00':
+        xml_text = _abx_to_xml_text(raw)
+        return xml_text.encode('utf-8') if xml_text is not None else raw
+
+    from artifact_runner import text_plausible
+
+    candidates = _leveldb_value_candidates(raw)
+
+    # Priority 1: real, VALIDATED json/xml/plist shape on any candidate —
+    # checked before anything else, so a tag-prefixed JSON value renders
+    # as JSON even though the still-tagged raw bytes also "decode as
+    # UTF-8" (see this function's own docstring for the real bug this
+    # ordering fixes).
+    for text, _ in candidates:
+        if _content_shape(text):
+            return text.encode('utf-8')
+
+    # Priority 2: raw itself is already valid UTF-8 (is_definite=True,
+    # always candidates[0] when present) — shown completely unchanged,
+    # even if it happens to start with a literal 0x00/0x01 byte with no
+    # real tag meaning, rather than guessing it should be stripped.
+    for text, is_definite in candidates:
+        if is_definite:
+            return raw
+
+    # Priority 3: raw itself did NOT decode as UTF-8 at all — the only
+    # remaining candidate is the tag-stripped one, used only if
+    # text_plausible accepts it (never on decode success alone; see
+    # _leveldb_value_candidates' own docstring for why Latin-1's
+    # never-raises behavior isn't real evidence of real text on its
+    # own).
+    for text, is_definite in candidates:
+        if text_plausible(text):
+            return text.encode('utf-8')
+
+    return raw
 
 
 class LevelDbViewerMixin:
@@ -434,11 +569,41 @@ class LevelDbViewerMixin:
         self.full_metadata.setdefault(ui_path, {})['size'] = total_size
         self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_children)
         self._leveldb_folder_map[ui_path] = {
-            'extract_dir':   extract_dir,
-            'records':       records,
-            'real_children': real_children,
+            'extract_dir':    extract_dir,
+            'records':        records,
+            'real_children':  real_children,
+            'record_vpaths':  virtual_children,  # parallel to 'records', same order —
+                                                  # lets _reapply_leveldb_type_overrides
+                                                  # re-populate without re-deriving names
         }
         return True
+
+    def _reapply_leveldb_type_overrides(self) -> None:
+        """Re-populate self._header_type_overrides for every already-
+        decoded LevelDB folder's records — a real gap found and fixed
+        2026-09-19: a manual header rescan (ProcessDialog._start_header_scan
+        → FastZipBrowser._on_header_types_cleared, ffs-explorer.py)
+        unconditionally clears the WHOLE _header_type_overrides dict
+        (it has no way to know some of those entries came from a
+        decoded LevelDB folder rather than a real file's own magic-byte
+        scan), and _decode_leveldb_folder is deliberately idempotent —
+        it returns True immediately for a folder already in
+        self._leveldb_folder_map, so it never naturally re-runs to
+        repopulate these. Left unfixed, every decoded LevelDB record's
+        Type column would silently go back to 'Other' after any header
+        rescan, with nothing to explain why. _on_header_types_cleared
+        calls this right after clearing.
+
+        Cheap even for a large store: every record is already held in
+        memory (self._leveldb_folder_map[...]['records']), so this is
+        just re-running the same lightweight classify_leveldb_value()
+        per record — no re-extraction, no re-opening ccl_leveldb, no
+        disk I/O at all."""
+        for entry in self._leveldb_folder_map.values():
+            for vpath, rec in zip(entry.get('record_vpaths', ()), entry['records']):
+                content_type = classify_leveldb_value(rec.value)
+                if content_type != 'bin':
+                    self._header_type_overrides[vpath] = content_type
 
     def _maybe_decode_leveldb_on_navigate(self, ui_path: str) -> None:
         """Called from on_folder_selected — the one real interception
@@ -533,7 +698,16 @@ class LevelDbViewerMixin:
         whose value happens to be a binary plist decodes correctly here
         with zero LevelDB-specific special-casing — decode_plist_blob
         neither knows nor cares that these bytes came from a LevelDB
-        record rather than a file on disk."""
+        record rather than a file on disk.
+
+        The raw value is passed through leveldb_value_preview_bytes
+        first (added 2026-09-19, a direct user bug report: a real
+        tag-prefixed JSON value rendered as hex here even after
+        classify_leveldb_value already correctly labeled it 'json' in
+        the Type column — that fix only ever touched the LABEL, never
+        what these bytes actually were; see that function's own
+        docstring for why the fix stays narrowly scoped rather than
+        stripping any 0x00/0x01-prefixed value blindly)."""
         meta = self.full_metadata.get(ui_path, {})
         ldb_path = meta.get('_leveldb_folder')
         idx = meta.get('_leveldb_record_index')
@@ -541,6 +715,6 @@ class LevelDbViewerMixin:
         if not entry or idx is None or idx >= len(entry['records']):
             return
         record = entry['records'][idx]
-        data = record.value or b''
+        data = leveldb_value_preview_bytes(record.value or b'')
         name = meta.get('_display_name') or ui_path.rsplit('/', 1)[-1]
         self._display_preview_bytes(ui_path, data, name)

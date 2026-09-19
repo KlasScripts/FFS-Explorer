@@ -7061,8 +7061,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.status_bar.showMessage(f"Scanning headers: {remaining:,} files remaining…")
 
     def _on_header_types_cleared(self):
-        """Called before a rescan — clear in-memory overrides and refresh."""
+        """Called before a rescan — clear in-memory overrides and refresh.
+
+        Also re-populates any already-decoded LevelDB folder's own
+        record Type overrides (_reapply_leveldb_type_overrides,
+        app/leveldb_viewer.py) — a real gap found 2026-09-19: this
+        clear has no way to distinguish a LevelDB-derived override from
+        a real file's own magic-byte scan result, and a header rescan
+        never touches LevelDB records at all (they're synthetic, not
+        real archive entries), so without this every decoded record's
+        Type would silently revert to 'Other' after any header rescan."""
         self._header_type_overrides.clear()
+        self._reapply_leveldb_type_overrides()
         self._refresh_folder_view()
 
     def _on_header_scan_done(self, results: dict, tier: int | None = None):

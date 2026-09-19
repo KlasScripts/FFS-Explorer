@@ -1692,20 +1692,12 @@ def _confidence_gate(fields: dict, notnull_cols: set[str],
 # of guess this project deliberately avoids elsewhere, e.g. app_intelligence.py's
 # removed known_real_store), it is a mechanical fact about whether the
 # bytes are text at all.
-_TEXT_PLAUSIBLE_MIN_LEN = 8
-_TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION = 0.15
-
-
-def _text_plausible(value: str) -> bool:
-    """False if *value* is long enough to judge and more than
-    _TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION of its characters are control
-    characters (NUL and friends; a lone \\t/\\n/\\r doesn't count -- real
-    text can contain those) -- True for anything shorter (nothing
-    meaningful to judge) or genuinely printable."""
-    if len(value) < _TEXT_PLAUSIBLE_MIN_LEN:
-        return True
-    control = sum(1 for ch in value if ord(ch) < 32 and ch not in '\t\n\r')
-    return control / len(value) <= _TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION
+#
+# Promoted to artifact_runner.text_plausible 2026-09-19 (a second real
+# caller emerged -- leveldb_viewer.py's own record-preview rendering
+# needed the identical check) -- kept as a same-named local alias so
+# every existing call site in this file needed no change.
+from artifact_runner import text_plausible as _text_plausible
 
 
 def carve_wal_history_for_table(wal: bytes, page_size: int, leaf_pages: set[int],

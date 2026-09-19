@@ -5823,3 +5823,111 @@ underneath that verification.
   example; worth re-checking if/when one turns up in a future case.
   Regression-checked afterward: full pytest suite (18/18) and
   `scripts/check_claude_md.py` both clean.
+
+  **Two more real bugs found the SAME day, on direct user follow-up
+  report** ("the 01 at the beginning... is causing the data to be
+  treated as hex and not showing as formatted text in the text pane" +
+  "the type column is currently showing other for all of the rows") —
+  both root-caused and fixed by testing against real data, not
+  reasoned through from re-reading the code:
+
+  1. **The Type-column classifier fix above never touched the SEPARATE
+     preview-pane code path at all.** `_load_leveldb_record_preview`
+     handed `record.value` straight to `_display_preview_bytes`
+     untouched -- `classify_leveldb_value` only ever produced a LABEL
+     for the Type column, nothing about what bytes the preview pane
+     actually rendered. A real tag-prefixed Chrome Local Storage JSON
+     value (confirmed live: a real PubMatic ad-consent record on
+     mlb.com) was correctly LABELED `'json'` in the Type column while
+     its own preview still showed raw hex -- two genuinely different
+     bugs, not one. Fixed with a new `leveldb_value_preview_bytes(raw)`
+     -- the bytes to actually hand to the renderer -- sharing a new
+     `_leveldb_value_candidates(raw)` helper with `classify_leveldb_value`
+     itself (returns `[(decoded_text, is_definitely_real_text)]`
+     candidates in priority order) so the label and the rendered
+     content can never disagree about which candidate is real.
+     `_load_leveldb_record_preview` now calls it before
+     `_display_preview_bytes`.
+
+  2. **`leveldb_value_preview_bytes`'s own FIRST DRAFT reintroduced the
+     identical ordering bug fix #2 above already fixed once, caught by
+     testing against the exact real record that prompted this fix, not
+     assumed correct from having already fixed the same mistake once.**
+     The first draft tried `raw.decode('utf-8', errors='strict')` on
+     the FULL tag-prefixed bytes as an early "already fine, nothing to
+     fix, return raw unchanged" check -- `b'\x01{"a":1}'` decodes as
+     valid UTF-8 (the lone 0x01 byte is itself a valid codepoint), so
+     it returned the STILL-TAGGED bytes unchanged. Confirmed directly:
+     running it against the real PubMatic value produced bytes still
+     starting with the raw tag byte followed by `{` -- `json.loads` on
+     that still correctly fails, the exact reported symptom, unfixed.
+     Rewritten to check real JSON/XML/plist SHAPE (`_content_shape`, on
+     every `_leveldb_value_candidates()` candidate) FIRST, before any
+     "raw already decodes as UTF-8" early return -- re-verified against
+     the same real record: preview bytes now start with `{` (tag byte
+     stripped) and `json.loads` succeeds. Standing lesson, explicit in
+     that function's own docstring now: fixing a bug once doesn't mean
+     a second, structurally similar function written the same session
+     is automatically safe from the same mistake -- each needs its own
+     direct test against real data, not an assumption of correctness
+     by association.
+
+     A THIRD, safety-scoped design point, addressing the user's own
+     explicit caution ("other apps will not have the 01 before the
+     actual payload but I do need it to be dealt with... we need to be
+     careful how we deal with this"): `leveldb_value_preview_bytes`
+     deliberately does NOT strip a leading 0x00/0x01 byte just because
+     it's there -- only when doing so reveals a validated JSON/XML/plist
+     shape, or (when raw itself doesn't decode as UTF-8 at all)
+     produces `artifact_runner.text_plausible` text. A genuinely binary
+     value from an unrelated app's own LevelDB store that happens to
+     start with 0x00/0x01 stays completely untouched, still rendering
+     as honest hex -- verified across the full real 11,739-record
+     dataset: `leveldb_value_preview_bytes` changed output for exactly
+     266 records (265 of the real `'json'`-classified ones, each
+     confirmed to round-trip through `json.loads` after the fix, plus
+     one real plausible tag-stripped `'text'` record) -- every other
+     real record's preview bytes are untouched from the raw value, zero
+     exceptions across the full scan.
+
+  3. **A real, separate architectural gap found while investigating the
+     "Type column shows Other for all rows" report**: a MANUAL header
+     rescan (`ProcessDialog._start_header_scan` ->
+     `FastZipBrowser._on_header_types_cleared`, `ffs-explorer.py`)
+     unconditionally clears the WHOLE `_header_type_overrides` dict --
+     it has no way to distinguish a LevelDB-derived entry from a real
+     file's own magic-byte scan result -- and `_decode_leveldb_folder`
+     is deliberately idempotent (returns immediately for an
+     already-decoded folder), so nothing ever re-populated the
+     LevelDB-specific entries afterward: every decoded record's Type
+     would silently revert to `'Other'` after any header rescan, with
+     no error and no obvious cause. Fixed with
+     `LevelDbViewerMixin._reapply_leveldb_type_overrides()` -- cheap
+     (every record is already held in memory in
+     `_leveldb_folder_map[...]['records']`, no re-extraction/re-parsing,
+     just re-running `classify_leveldb_value` per record) -- called
+     from `_on_header_types_cleared` right after the clear. Required
+     storing a new `'record_vpaths'` list (parallel to `'records'`,
+     same order) in `_leveldb_folder_map[ui_path]` at decode time, so
+     re-population doesn't need to re-derive record names. Direct
+     isolated testing (calling `_decode_leveldb_folder` against the
+     real, already-extracted Chrome Local Storage directory left over
+     from earlier work) confirmed the underlying wiring itself was
+     already correct -- 445 of 522 real records get a real Type
+     override on first decode (the other 77 are `META:`/`VERSION`
+     bookkeeping records correctly classified `'bin'`/skipped) -- so
+     the reported "Other for ALL rows" symptom is explained by this
+     rescan-clear gap (or a stale, not-yet-restarted app process)
+     rather than the core classifier/wiring being broken; worth
+     confirming directly in the live GUI after a restart, not yet
+     verified there.
+
+  `sqlite_carve.py`'s own private `_text_plausible` was promoted to
+  `artifact_runner.text_plausible` (public) as part of fix #2/#3 above,
+  since a second real caller (`leveldb_viewer.py`) needed the identical
+  check -- the standard "promote to artifact_runner.py once a second
+  real caller emerges" convention this project already follows
+  elsewhere; `sqlite_carve.py` now imports it under the same private
+  name so its own existing call site needed no change. Full pytest
+  suite (18/18) and `scripts/check_claude_md.py` re-confirmed clean
+  after all three fixes.

@@ -844,6 +844,33 @@ def resolve_chromium_session_storage_names(records):
     return resolved
 
 
+_TEXT_PLAUSIBLE_MIN_LEN = 8
+_TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION = 0.15
+
+
+def text_plausible(value: str) -> bool:
+    """False if *value* is long enough to judge and more than
+    _TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION of its characters are control
+    characters (NUL and friends -- a lone \\t/\\n/\\r doesn't count, real
+    text can contain those) -- True for anything shorter (nothing
+    meaningful to judge) or genuinely printable.
+
+    Promoted here from sqlite_carve.py's own private `_text_plausible`
+    2026-09-19 (a second real caller emerged: leveldb_viewer.py's own
+    record-preview rendering needed the identical "is this decoded text
+    real, or garbage that happened to decode without raising" check --
+    see the "generic LevelDB view" Conventions entry in CLAUDE.md for
+    why this specific check matters there: Latin-1 never raises on any
+    byte 0-255, so successfully decoding is on its own no evidence the
+    result is real text, the exact gap this closes). sqlite_carve.py's
+    own carving-confidence use is unchanged behaviorally -- it now
+    imports this function rather than keeping a second copy."""
+    if len(value) < _TEXT_PLAUSIBLE_MIN_LEN:
+        return True
+    control = sum(1 for ch in value if ord(ch) < 32 and ch not in '\t\n\r')
+    return control / len(value) <= _TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION
+
+
 # ── Loading ───────────────────────────────────────────────────────────────────
 
 def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[str, str]]]:

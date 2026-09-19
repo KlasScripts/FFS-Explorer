@@ -75,26 +75,16 @@ def _decode_value(raw: bytes) -> tuple[str, str]:
 
 
 def _parse_key(user_key: bytes):
-    """(origin, top_level_site, key) or None if *user_key* doesn't match
-    the real "_<origin>\\x00\\x01<key>" shape (Chrome's own VERSION/
-    META: bookkeeping keys, or anything unrecognized -- returned as None
-    so the caller can skip it explicitly rather than emit a garbled row)."""
-    if not user_key.startswith(b"_") or b"\x00" not in user_key:
-        return None
-    origin_part, _, rest = user_key.partition(b"\x00")
-    if not rest.startswith(b"\x01"):
-        return None
-    origin_raw = origin_part[1:]  # drop the leading "_"
-    key_raw = rest[1:]
-    if b"^0" in origin_raw:
-        embedded, _, top_level = origin_raw.partition(b"^0")
-    else:
-        embedded, top_level = origin_raw, b""
-    return (
-        embedded.decode("utf-8", errors="replace"),
-        top_level.decode("utf-8", errors="replace"),
-        key_raw.decode("utf-8", errors="replace"),
-    )
+    """(origin, top_level_site, key), or None for Chrome's own VERSION/
+    META: bookkeeping keys or anything unrecognized. Now a thin wrapper
+    around artifact_runner.parse_chromium_dom_storage_key (promoted
+    there 2026-09-19 as a second real caller emerged — leveldb_viewer.py's
+    own record-to-filename decode — needing the identical algorithm, not
+    a re-derived one; see that function's own docstring for the full
+    real-data verification behind it). Kept as a same-named local wrapper
+    so every existing call site in this file needed no change."""
+    from artifact_runner import parse_chromium_dom_storage_key
+    return parse_chromium_dom_storage_key(user_key)
 
 
 def run(paths):

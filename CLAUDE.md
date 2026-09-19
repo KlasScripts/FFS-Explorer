@@ -5540,3 +5540,78 @@ underneath that verification.
   empty, file type `'LevelDB'`, and the size column showing the real
   precomputed total (497,245 bytes — the true sum of all 522 real
   record values) rather than 0 or blank.
+
+  **Follow-up, 2026-09-19: real bug found and fixed in how a record's
+  key becomes its filename, via genuine cross-tool research, not
+  guessing.** A real IndexedDB directory's own keys (Chromium's own
+  backing-store format — a compact-integer prefix + type byte, NOT
+  Local Storage's simple scheme) were falling back to a full hex dump
+  of the ENTIRE raw key as the filename — technically not wrong (an
+  honest byte-for-byte representation) but unreadable, and exactly what
+  the user correctly flagged as "the filename seems to not be extracted
+  correctly." Checked both sibling tools directly before designing a
+  fix: Crush has its own dedicated, generic LevelDB parser+viewer
+  (`crush/parsers/leveldb_parser.py`) — its own key-decode is the
+  IDENTICAL UTF-8-or-hex-dump approach, confirming this isn't a solved
+  problem elsewhere either; its viewer sidesteps the issue by showing
+  TWO separate table columns ("User Key (text)" and "User Key (hex)")
+  rather than trying to be clever, since it kept the dedicated-table
+  shape this project deliberately moved away from. ALEAPP has no
+  generic LevelDB browser at all — every real use there is inside an
+  app-specific parser that already knows its own key schema.
+
+  **`artifact_runner.parse_chromium_dom_storage_key`** — a new shared
+  helper (same placement reasoning as `open_leveldb` above: generic,
+  not Chrome-schema-specific despite the name — confirmed by checking,
+  not assumed, that the SAME `_<origin>[^0<top_level_site>]\x00\x01
+  <key>` shape (plus bare `VERSION`/`META:<origin>` bookkeeping keys)
+  appears identically across NINE completely unrelated real apps' own
+  real Local Storage on this project's own Android 14 JoshHickman
+  archive — Chrome, Edge, Brave, DuckDuckGo, Viber, GroupMe, GetTr,
+  BeReal, ProtonMail — zero unclassified real keys anywhere in that
+  sample. This is Chromium's own generic `dom_storage` on-disk
+  encoding, not something specific to the Chrome browser app. Promoted
+  out of `chrome_local_storage.py`'s own private `_parse_key` (first
+  written 2026-08-25) rather than re-derived, so a "clean" filename in
+  the generic viewer reads identically to what that dedicated report
+  already shows for the same record — that parser now calls the shared
+  version instead of keeping a second copy (verified a pure refactor:
+  byte-identical 440-row output before/after). Session Storage is
+  explicitly NOT claimed the same confidence — no real Session Storage
+  LevelDB directory existed anywhere in this project's own test
+  archives to check against; Chromium shares the same underlying
+  `DOMStorageDatabase` implementation between the two, so it's
+  REASONED to likely apply, stated as that explicitly lower tier, not
+  silently treated as verified.
+
+  **`leveldb_viewer._sanitize_record_name` now tries three things in
+  order**, not just UTF-8-or-hex: (1) the shared Chromium dom_storage
+  decoder above — when it matches, shows the real
+  `origin - top_level_site - key` fields dash-joined (per direct user
+  suggestion, and only trusted here because the underlying 3-field
+  split itself is proven, not because dash-joining is a generally safe
+  heuristic — the earlier bplist/ABX work already established that
+  guessing at a compound key's own internal boundaries without a
+  verified format is NOT something this project does); (2) plain UTF-8,
+  unchanged; (3) — the actual fix — a short, honest synthetic label
+  (`record_NNNNNN (N bytes, binary key)`) instead of a long hex dump
+  for a key this function genuinely can't make sense of. IndexedDB's
+  own key format was investigated too (confirmed structurally
+  consistent across TEN real origins — every short key starts with a
+  4-byte compact-integer prefix + type byte, and the one long key
+  checked decodes as two real length-prefixed UTF-16BE strings whose
+  lengths matched their own real string lengths to the byte) but
+  DELIBERATELY not decoded here — meaningfully decoding it needs a real
+  per-record-type parser (database/object-store/index metadata, several
+  distinct `IndexedDBKey` value types), a genuinely bigger feature than
+  a filename fix, not attempted as part of this one.
+
+  Verified against real data: the exact real IndexedDB key that
+  originally surfaced this bug now shows
+  `'record_000004 (83 bytes, binary key)'` instead of an 83-byte hex
+  dump; Chrome's own real Local Storage keys now show e.g.
+  `'https://ads.pubmatic.com/ - https://mlb.com - PubMatic_USP'`
+  instead of the raw `_origin\x00\x01key` bytes; five further
+  completely unrelated real apps (Edge, Brave, DuckDuckGo, Viber,
+  GroupMe) each confirmed showing correctly clean, dash-joined names
+  for their own real records, not just Chrome's own app.

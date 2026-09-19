@@ -135,15 +135,40 @@ def _sanitize_record_name(raw_key: bytes, index: int) -> tuple[str, str]:
     display_name — a best-effort readable rendering of the same key,
     shown as the "filename" in the file browser (meta['_display_name']
     — same convention a nested-archive entry's own relative path
-    already uses there). Not the same string as vpath_segment: this one
-    keeps the real key's own text as intact as decoding allows (UTF-8
-    where valid, hex where not), only a length cap for a sane column
-    width, not the character-safety restriction vpath_segment needs."""
-    if raw_key:
+    already uses there). Tries THREE things in order, not just UTF-8-
+    or-hex: (1) artifact_runner.parse_chromium_dom_storage_key — a
+    PROVEN, generic (not Chrome-the-app-specific) format, confirmed
+    consistent across nine completely unrelated real apps' own real
+    Local Storage on this project's own test data (see that function's
+    own docstring for the full verification) — when it matches, this
+    shows the SAME origin/top_level_site/key fields
+    chrome_local_storage.py's own report already shows, dash-joined,
+    rather than the raw "_origin\\x00\\x01key" bytes; (2) plain UTF-8,
+    unchanged from before; (3) — the real fix for a genuine bug found
+    2026-09-19 (a raw hex dump of the WHOLE key, however long, made an
+    IndexedDB-shaped key's own filename unreadable and looked broken) —
+    a short, honest synthetic label instead of a long hex blob for a
+    key this function genuinely can't make sense of, since a filename's
+    job is to be a clear, non-misleading label, not to carry full
+    fidelity (the record's own raw key bytes are still the real
+    dict/lookup key everywhere else in this project's own convention,
+    nothing is lost, just not crammed into what's shown here). NOT
+    attempted here: decoding IndexedDB's own key format specifically —
+    real, structurally consistent across ten real origins checked, but
+    decoding it MEANINGFULLY needs a real per-record-type decoder (its
+    own database/object-store/index metadata records, several different
+    IndexedDBKey value types), a genuinely bigger feature than a
+    filename tweak, not attempted here."""
+    from artifact_runner import parse_chromium_dom_storage_key
+    parsed = parse_chromium_dom_storage_key(raw_key) if raw_key else None
+    if parsed:
+        origin, top_level_site, key = parsed
+        readable = f"{origin} - {top_level_site} - {key}" if top_level_site else f"{origin} - {key}"
+    elif raw_key:
         try:
             readable = raw_key.decode('utf-8')
         except UnicodeDecodeError:
-            readable = raw_key.hex()
+            readable = f"record_{index:06d} ({len(raw_key)} bytes, binary key)"
     else:
         readable = '(empty key)'
     display_name = readable if len(readable) <= 120 else readable[:120] + '…'

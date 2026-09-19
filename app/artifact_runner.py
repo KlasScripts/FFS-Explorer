@@ -683,6 +683,67 @@ def open_leveldb(paths: dict, relative_dir: str, extract_subdir: str | None = No
     return ccl_leveldb.RawLevelDb(extract_dir)
 
 
+def parse_chromium_dom_storage_key(user_key: bytes):
+    """(origin, top_level_site, key) for a real Chromium `dom_storage`
+    LevelDB record key — the shared library Local Storage (and, by the
+    same underlying C++ implementation, very likely Session Storage —
+    see below) both use — or None for anything that doesn't match this
+    shape: Chrome's own bare `VERSION` key, its `META:<origin>`
+    bookkeeping keys, or a genuinely different LevelDB store's own key
+    format entirely (IndexedDB, say — structurally different, checked
+    directly, not assumed: its own real keys start with 4 NUL bytes, a
+    compact-integer prefix, never a literal `_`).
+
+    First written as `chrome_local_storage.py`'s own private `_parse_key`
+    (2026-09-05); promoted here 2026-09-19 as a second, generic caller
+    emerged — `leveldb_viewer.py`'s own record-to-filename decode for the
+    in-browser "records as files" LevelDB feature — needing the exact
+    same real algorithm, not a re-derived one, so a decoded filename
+    reads identically to what the dedicated report already shows for the
+    same record. That parser's own run() now calls this instead of
+    keeping a second copy.
+
+    Confirmed consistent, not assumed, across NINE completely unrelated
+    real apps' own real Local Storage on this project's own Android 14
+    JoshHickman archive (Chrome, Edge, Brave, DuckDuckGo, Viber,
+    GroupMe, GetTr, BeReal, ProtonMail — a deliberately wide, unrelated
+    sample, not just Chrome-the-browser) — every single real key on
+    every one of them is exactly one of the three shapes this function
+    already distinguishes (bare `VERSION`; `META:<origin>`; the real
+    `_<origin>[^0<top_level_site>]\\x00\\x01<key>` shape decoded here),
+    with zero unclassified keys anywhere in that sample. This is
+    Chromium's own generic `dom_storage` on-disk encoding — confirmed to
+    hold for ANY app embedding Chromium WebView for Local Storage, not
+    something specific to the Chrome browser app itself.
+
+    Session Storage is NOT independently confirmed the same way — no
+    real Session Storage LevelDB directory existed anywhere on this
+    project's own test archives to check against. Chromium's own
+    `content/browser/dom_storage` implementation is shared between the
+    two (the same `DOMStorageDatabase`/`LevelDBWrapperImpl` machinery,
+    just a different on-disk directory), so this is REASONED to likely
+    apply there too, not verified — stated plainly as that lower
+    confidence tier, not silently treated the same as the Local Storage
+    finding above. Harmless either way if wrong: a non-matching key
+    simply returns None, same as any other unrecognized format."""
+    if not user_key.startswith(b"_") or b"\x00" not in user_key:
+        return None
+    origin_part, _, rest = user_key.partition(b"\x00")
+    if not rest.startswith(b"\x01"):
+        return None
+    origin_raw = origin_part[1:]  # drop the leading "_"
+    key_raw = rest[1:]
+    if b"^0" in origin_raw:
+        embedded, _, top_level = origin_raw.partition(b"^0")
+    else:
+        embedded, top_level = origin_raw, b""
+    return (
+        embedded.decode("utf-8", errors="replace"),
+        top_level.decode("utf-8", errors="replace"),
+        key_raw.decode("utf-8", errors="replace"),
+    )
+
+
 # ── Loading ───────────────────────────────────────────────────────────────────
 
 def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[str, str]]]:

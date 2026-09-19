@@ -96,10 +96,11 @@
     },
     "android:chrome_local_storage": {
       "changelog": {
-        "2": "Refactored to call the new artifact_runner.open_leveldb shared helper instead of its own hand-rolled extract-then-open code -- pure refactor, not a behavior change: verified the original and refactored code produce byte-for-byte identical output (440 rows) against the real Android 14 JoshHickman archive. Also gains open_leveldb's skip-if-already-extracted behavior (the original inline version re-wrote every file on every run)."
+        "2": "Refactored to call the new artifact_runner.open_leveldb shared helper instead of its own hand-rolled extract-then-open code -- pure refactor, not a behavior change: verified the original and refactored code produce byte-for-byte identical output (440 rows) against the real Android 14 JoshHickman archive. Also gains open_leveldb's skip-if-already-extracted behavior (the original inline version re-wrote every file on every run).",
+        "3": "_parse_key is now a thin wrapper around artifact_runner.parse_chromium_dom_storage_key -- promoted there 2026-09-19 as a second real caller emerged (leveldb_viewer.py's own record-to-filename decode for the new in-browser LevelDB feature). Pure refactor, not a behavior change: verified byte-identical output (440 rows) against the real Android 14 JoshHickman archive before and after."
       },
-      "hash": "f00faa71d11fbeed",
-      "version": 2
+      "hash": "b2785e46198f4f40",
+      "version": 3
     },
     "android:chrome_login_data": {
       "changelog": {},

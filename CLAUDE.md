@@ -5615,3 +5615,81 @@ underneath that verification.
   completely unrelated real apps (Edge, Brave, DuckDuckGo, Viber,
   GroupMe) each confirmed showing correctly clean, dash-joined names
   for their own real records, not just Chrome's own app.
+
+  **Follow-up, 2026-09-19 (same day): a prior claim found wrong by real
+  data, and a real two-record decoder built to replace it.** Direct
+  user follow-up questions ("is the map-id consistent? what is
+  namespace, what is map-id? do other LevelDB uses have the same
+  structure?") led to surveying every distinct real LevelDB store on
+  this project's own three Android archives — **145 distinct store
+  types** (`shared_proto_db`, dozens of Google Play Services stores —
+  Nearby Share, FCM, SafetyNet, CryptAuth — `Brave Wallet Storage`,
+  and more), confirming there is no universal LevelDB key convention
+  across the ecosystem; a generic decoder can only ever be a growing
+  list of specifically-verified formats. Real Session Storage data
+  (absent from every archive when `parse_chromium_dom_storage_key`'s
+  own docstring first shipped, so its own "likely applies to Session
+  Storage too" line was explicitly marked reasoned-through, not
+  verified) turned up on the other two archives — **1,890 real keys
+  across 9 apps, 0 of them matched.** The earlier reasoning was wrong,
+  caught by real data becoming available to actually check — exactly
+  the reason this project separates "reasoned" from "verified" instead
+  of collapsing them; that function's own docstring is corrected to
+  document this openly rather than quietly ship the fix.
+
+  **New `artifact_runner.resolve_chromium_session_storage_names`** —
+  Session Storage's own real key structure, confirmed both against
+  [CCL Solutions Group's own published write-up](https://www.cclsolutionsgroup.com/post/chromium-session-storage-and-local-storage)
+  (the SAME forensic lineage this project's own vendored
+  `ccl_leveldb.py` comes from) and independently verified against real
+  data on FOUR completely unrelated real apps (Edge, Chrome, Brave,
+  DuckDuckGo): a `namespace-<uuid>-<origin>[^0<top_level_site>]`
+  record's own VALUE (not its key) is a plain ASCII decimal integer —
+  the "map-id" Chromium assigned that (browsing-context UUID, origin)
+  pair the first time it needed real storage (the UUID itself is
+  roughly "one browser tab" — SessionStorage's own spec-level isolation
+  unit, separate per tab even for the same origin, unlike Local
+  Storage which is shared across every tab). Every real
+  `map-<id>-<key>` record's own key only ever carries that already-
+  anonymous integer — pure storage-space shorthand, like a database
+  auto-increment column, confirmed by reading real CONSECUTIVE values
+  (43, 44, 45, 46... assigned to different origins loaded in the same
+  real tab) — meaningless compared across two different Session
+  Storage databases, or even two different runs of the same app. This
+  function does the real two-record join needed to recover origin/key
+  from a `map-` entry, since (unlike Local Storage) it isn't in the
+  same record.
+
+  A `map-<id>-` entry with no matching `namespace-` entry is a real,
+  honest, non-buggy gap, not a bug in this join — confirmed directly:
+  a tab/origin can be assigned a map-id before it ever actually stores
+  anything, so coverage is genuinely partial (41/76 resolved on Edge,
+  15/41 on DuckDuckGo, in the real samples checked) — left for the
+  generic per-key fallback, never guessed at.
+
+  Wired into `leveldb_viewer._decode_leveldb_folder`: the resolver runs
+  once per folder (cheap even when it finds nothing — a non-Session-
+  Storage folder simply has no `namespace-`/`map-` keys), and
+  `_sanitize_record_name` checks its result FIRST, before the Local-
+  Storage-only decoder or any generic fallback. Verified end-to-end
+  through the real production path (not just the resolver standalone):
+  a real Microsoft Edge Session Storage folder — 202 real records —
+  correctly shows 76 with clean `origin - key` names
+  (`'https://edgeservices.bing.com/ - dependencies_refresh_retry'`);
+  Local Storage re-verified unaffected (522 records, same clean names
+  as before this change).
+
+  **iOS has LevelDB too, but for a different purpose than Android** —
+  checked directly across all three iOS test archives: `Sync Data/
+  LevelDB` (Chrome/Edge/Brave's own account-sync engine — real device
+  model strings and even a `sync.demographics` field visible as
+  readable ASCII fragments inside the raw protobuf values, though not
+  meaningfully decoded here), `GCM Store`, `shared_proto_db`, `Brave
+  Wallet Storage`, and unrelated third-party SDKs (Google Maps' own
+  GMU tile/annotation cache). Notably ABSENT on iOS: `Local Storage/
+  leveldb` and `IndexedDB` — the actual web-CONTENT stores — a real,
+  structural iOS/Android difference, not a gap in what was checked:
+  Chrome/Edge/Brave for iOS are required to render through WebKit, not
+  Chromium's own engine, so web content storage goes through WebKit's
+  own (SQLite-based) mechanism instead; only these apps' own bundled
+  account-sync/push-messaging plumbing shows up as LevelDB there.

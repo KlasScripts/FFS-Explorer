@@ -119,8 +119,21 @@ def _looks_like_leveldb_dir(folder_map: dict, folder_ui_path: str) -> bool:
     return False
 
 
-def _sanitize_record_name(raw_key: bytes, index: int) -> tuple[str, str]:
+def _sanitize_record_name(raw_key: bytes, index: int,
+                          session_storage_names: dict | None = None) -> tuple[str, str]:
     """(vpath_segment, display_name) for one real record's own key bytes.
+
+    session_storage_names — the {raw_key: (origin, top_level_site, key)}
+    lookup artifact_runner.resolve_chromium_session_storage_names built
+    for this SAME folder's full record set (see _decode_leveldb_folder,
+    the only real caller — it always passes this, even for a folder
+    that isn't Session Storage-shaped, where it's simply an empty dict).
+    Checked FIRST, before anything else below — Session Storage's own
+    real `map-<id>-<key>` keys would never match
+    parse_chromium_dom_storage_key's Local-Storage-only shape anyway,
+    but checking this dict first keeps the resolution order obvious:
+    the more specific, cross-referenced answer wins over a generic
+    per-key guess whenever it's actually available.
 
     vpath_segment — used as an actual dict key AND a literal path
     component (folder_map/full_metadata/_nested_virtual_paths all key
@@ -152,15 +165,25 @@ def _sanitize_record_name(raw_key: bytes, index: int) -> tuple[str, str]:
     job is to be a clear, non-misleading label, not to carry full
     fidelity (the record's own raw key bytes are still the real
     dict/lookup key everywhere else in this project's own convention,
-    nothing is lost, just not crammed into what's shown here). NOT
-    attempted here: decoding IndexedDB's own key format specifically —
-    real, structurally consistent across ten real origins checked, but
-    decoding it MEANINGFULLY needs a real per-record-type decoder (its
-    own database/object-store/index metadata records, several different
-    IndexedDBKey value types), a genuinely bigger feature than a
-    filename tweak, not attempted here."""
+    nothing is lost, just not crammed into what's shown here).
+
+    A FOURTH thing is now tried too, before any of the above, for a
+    Session Storage record specifically — see the
+    session_storage_names parameter above and
+    artifact_runner.resolve_chromium_session_storage_names' own
+    docstring (added 2026-09-19, directly prompted by a user question
+    about what Session Storage's own "namespace"/"map-id" keys mean).
+
+    Still NOT attempted here: decoding IndexedDB's own key format
+    specifically — real, structurally consistent across ten real
+    origins checked (and independently confirmed against Chromium's own
+    official `leveldb_coding_scheme.md`), but decoding it MEANINGFULLY
+    needs a real per-record-type decoder (its own database/object-
+    store/index metadata records, several distinct IndexedDBKey value
+    types), a genuinely bigger feature than a filename tweak."""
     from artifact_runner import parse_chromium_dom_storage_key
-    parsed = parse_chromium_dom_storage_key(raw_key) if raw_key else None
+    ss_resolved = session_storage_names.get(raw_key) if session_storage_names and raw_key else None
+    parsed = ss_resolved or (parse_chromium_dom_storage_key(raw_key) if raw_key else None)
     if parsed:
         origin, top_level_site, key = parsed
         readable = f"{origin} - {top_level_site} - {key}" if top_level_site else f"{origin} - {key}"
@@ -249,10 +272,22 @@ class LevelDbViewerMixin:
         finally:
             db.close()
 
+        # Chromium Session Storage needs a real two-record join to name
+        # its own 'map-<id>-<key>' entries (see artifact_runner.
+        # resolve_chromium_session_storage_names' own docstring for the
+        # full mechanism and its real-data verification) — cheap to
+        # always attempt: a folder that isn't Session Storage-shaped
+        # simply has no 'namespace-'/'map-' keys at all, so this finds
+        # nothing and costs one harmless pass over records already in
+        # memory.
+        from artifact_runner import resolve_chromium_session_storage_names
+        session_storage_names = resolve_chromium_session_storage_names(records)
+
         virtual_children = []
         total_size = 0
         for idx, rec in enumerate(records):
-            segment, display_name = _sanitize_record_name(rec.user_key, idx)
+            segment, display_name = _sanitize_record_name(
+                rec.user_key, idx, session_storage_names=session_storage_names)
             vpath = f"{ui_path}/{segment}"
             value_size = len(rec.value or b'')
             total_size += value_size

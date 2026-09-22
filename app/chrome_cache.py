@@ -52,8 +52,9 @@ never take down the whole parser run.
 
 import re
 import struct
-import zlib
 from urllib.parse import urljoin, urlparse
+
+from artifact_runner import decompress_http_body as _decompress_body
 
 _HEADER_MAGIC = 0xfcfb6d1ba7725c30
 _EOF_MAGIC = struct.pack('<Q', 0xf4fa6f45970d41d8)
@@ -102,48 +103,6 @@ def _parse_raw_headers(blob: bytes) -> tuple[str, dict[str, str]]:
         value = value.strip()
         headers[name] = f'{headers[name]}; {value}' if name in headers else value
     return status_line, headers
-
-
-def _decompress_body(body: bytes, content_encoding: str) -> tuple[bytes | None, str | None]:
-    """(decompressed_bytes_or_None, error_note_or_None). Never raises —
-    a body that fails to decompress is reported as such, not silently
-    dropped or (worse) shown as if it decompressed to something. gzip and
-    deflate are always available (stdlib zlib); brotli ('br') and zstd
-    need the optional `brotli`/`zstandard` packages — both real, common
-    encodings on real casework, not hypothetical: on this project's own
-    Android 14 JoshHickman cache, 496 of 3,041 entries (16%) were 'br'
-    and 56 were 'zstd' before these packages were added as real
-    dependencies (see requirements.txt) — same lazy-optional-dependency
-    convention as this project's mcp/uvicorn either way, so a build
-    missing one still reports a real, honest gap per-row rather than
-    crashing or silently dropping the row."""
-    enc = (content_encoding or '').strip().lower()
-    if not enc or enc == 'identity':
-        return body, None
-    try:
-        if enc == 'gzip':
-            return zlib.decompress(body, zlib.MAX_WBITS | 16), None
-        if enc == 'deflate':
-            try:
-                return zlib.decompress(body, -zlib.MAX_WBITS), None
-            except zlib.error:
-                return zlib.decompress(body), None
-        if enc == 'br':
-            try:
-                import brotli
-            except ImportError:
-                return None, "brotli-compressed body -- 'brotli' package not installed"
-            return brotli.decompress(body), None
-        if enc == 'zstd':
-            try:
-                import zstandard
-            except ImportError:
-                return None, "zstd-compressed body -- 'zstandard' package not installed"
-            return zstandard.ZstdDecompressor().decompress(
-                body, max_output_size=200 * 1024 * 1024), None
-        return None, f"unrecognized content-encoding '{content_encoding}'"
-    except Exception as exc:
-        return None, f'{enc} decompression failed: {exc}'
 
 
 def parse_simple_cache_entry(raw: bytes) -> dict | None:

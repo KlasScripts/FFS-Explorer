@@ -25,7 +25,7 @@ _SEARCH_ENTRIES_VERSION = '1'
 
 # Bump whenever the schema changes incompatibly.
 # Cache DB is auto-deleted on mismatch; results DB raises OldSchemaError.
-_CACHE_SCHEMA_VERSION   = 16
+_CACHE_SCHEMA_VERSION   = 17
 _RESULTS_SCHEMA_VERSION = 1
 
 
@@ -213,6 +213,47 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
+    # Searchable text for real LevelDB/IndexedDB records — added 2026-09-19
+    # so Keyword Search can reach content that only exists after this
+    # project's own decode step (a real deserialized IndexedDB value, a
+    # UTF-16LE Chrome DOM-Storage value re-encoded to UTF-8 for display —
+    # neither is a literal byte substring of the raw archive file, so the
+    # main archive-wide search can never find it no matter how thoroughly
+    # it scans). Fully re-derivable from the archive (re-opening a
+    # LevelDB folder's own already-extracted local files and re-running
+    # this project's own decode logic), so this is a rebuildable cache
+    # table like every other one in this database, not precious data —
+    # see leveldb_viewer.leveldb_decode_logic_version(), checked via the
+    # blobs table's own generic version-key mechanism (see
+    # 'leveldb_search_index_version' usage in keyword_search.py) so a
+    # future decode-logic improvement invalidates and rebuilds this
+    # automatically, the same "app_intelligence_scan_key" pattern
+    # app_intelligence.py already uses for the identical staleness
+    # problem. record_index is the record's own position in this
+    # folder's deterministic decode order (the same stable identifier
+    # _leveldb_folder_map's own 'record_vpaths' list is already indexed
+    # by) — resolving a hit back to an exact record never needs a second,
+    # separate identifier scheme. Deliberately does NOT store every
+    # record — genuinely binary ('bin'/'empty') or structurally-only-
+    # detected ('protobuf', which has no real decoded text, only a shape
+    # label) records have nothing here that the main archive search
+    # doesn't already cover from the real, still-physically-present raw
+    # bytes; only real, own-decoded TEXT is indexed.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS leveldb_search_index (
+            folder_ui_path  TEXT    NOT NULL,
+            record_index    INTEGER NOT NULL,
+            display_name    TEXT    NOT NULL,
+            searchable_text TEXT    NOT NULL,
+            content_type    TEXT,
+            PRIMARY KEY (folder_ui_path, record_index)
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_leveldb_search_folder
+        ON leveldb_search_index (folder_ui_path)
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_CACHE_SCHEMA_VERSION}')
     conn.commit()
     return conn
@@ -378,6 +419,50 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
             updated      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
         )
     ''')
+
+    # Embedded-media scan results (added 2026-09-22, see
+    # app/embedded_media_scan.py) — treated as precious, examiner-
+    # triggered evidentiary findings, the same category as an artifact
+    # parser's own report rows or a recoverable_tables carved row, never
+    # as a rebuildable cache: a run of this scan (especially the deleted-
+    # content half) can take real, deliberate time, and its own results
+    # are exactly the kind of finding an examiner builds a case around.
+    # Additive (CREATE TABLE IF NOT EXISTS) — no _RESULTS_SCHEMA_VERSION
+    # bump needed, same as every other table added here since version 1.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS embedded_media_hits (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_ui_path    TEXT    NOT NULL,
+            source_kind       TEXT    NOT NULL,
+            location          TEXT    NOT NULL,
+            display_name      TEXT    NOT NULL DEFAULT '',
+            media_kind        TEXT    NOT NULL,
+            extracted_path    TEXT    NOT NULL,
+            sha256            TEXT    NOT NULL,
+            byte_length       INTEGER NOT NULL,
+            recovered         INTEGER NOT NULL DEFAULT 0,
+            recovery_source   TEXT,
+            http_wrapped      INTEGER NOT NULL DEFAULT 0,
+            content_type_hint TEXT,
+            scan_scope        TEXT,
+            found_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now')),
+            UNIQUE(source_ui_path, location, sha256)
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_embedded_media_hits_source
+        ON embedded_media_hits (source_ui_path)
+    ''')
+    # Migration: display_name added 2026-09-22, the same day as the table
+    # itself — a real case_dir could already have this table from before
+    # this column existed (the table was shipped and exercised the same
+    # session), so guard rather than assume every existing row already
+    # has it, same ALTER-TABLE-then-ignore-if-present pattern run_log's
+    # own parser_version/coverage_fingerprint columns already use above.
+    try:
+        conn.execute("ALTER TABLE embedded_media_hits ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
@@ -920,6 +1005,71 @@ def load_nested_archives(conn: 'sqlite3.Connection') -> list:
             for r in rows]
 
 
+# ── LevelDB/IndexedDB search index ─────────────────────────────────────────────
+
+def save_leveldb_search_records(conn: 'sqlite3.Connection', folder_ui_path: str,
+                                 rows: list) -> None:
+    """Persist [(record_index, display_name, searchable_text, content_type)]
+    for one LevelDB/IndexedDB folder's own indexable (real-text) records —
+    see this table's own CREATE TABLE comment above for why not every
+    record gets a row. Delete-then-insert, same convention as
+    save_nested_archive_entries above, keyed on the folder so a folder
+    that's re-indexed (a stale version, or the examiner re-running it)
+    never leaves orphaned rows from a previous decode behind.
+
+    A folder with ZERO indexable rows (confirmed real and common, not an
+    edge case — 147 of 234 real folders in this project's own test
+    archive are protobuf-only, e.g. Chrome Sync Data, with nothing
+    _leveldb_folder_map's own classify_leveldb_value found worth
+    indexing) still gets ONE sentinel row (record_index=-1, empty
+    display_name/searchable_text, content_type=None) — a real bug found
+    testing this exact case: indexed_leveldb_folders' own `SELECT DISTINCT
+    folder_ui_path` can only ever see a folder that has at least one row,
+    so a genuinely-processed-but-empty folder would otherwise look
+    identical to a folder that was NEVER indexed at all, and
+    `_leveldb_search_coverage` would keep re-offering it as "still needs
+    processing" forever. `indexed_leveldb_folders`/the search query both
+    account for this sentinel — see their own docstrings."""
+    conn.execute('DELETE FROM leveldb_search_index WHERE folder_ui_path=?',
+                 (folder_ui_path,))
+    if rows:
+        conn.executemany(
+            'INSERT INTO leveldb_search_index '
+            '(folder_ui_path, record_index, display_name, searchable_text, content_type) '
+            'VALUES (?,?,?,?,?)',
+            [(folder_ui_path, idx, name, text, ctype) for idx, name, text, ctype in rows],
+        )
+    else:
+        conn.execute(
+            'INSERT INTO leveldb_search_index '
+            '(folder_ui_path, record_index, display_name, searchable_text, content_type) '
+            'VALUES (?,-1,?,?,NULL)',
+            (folder_ui_path, '', ''),
+        )
+    conn.commit()
+
+
+def indexed_leveldb_folders(conn: 'sqlite3.Connection') -> set:
+    """Every folder_ui_path with at least one row already indexed — used to
+    skip a folder already covered by the current decode-logic version
+    (see leveldb_viewer.leveldb_decode_logic_version's own blobs-table
+    staleness check, which invalidates the WHOLE table at once on a
+    version change — this set is only meaningful right after that check
+    already confirmed the table is current)."""
+    rows = conn.execute(
+        'SELECT DISTINCT folder_ui_path FROM leveldb_search_index'
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def clear_leveldb_search_index(conn: 'sqlite3.Connection') -> None:
+    """Drop every row — called when the decode-logic version has changed,
+    so a stale folder's old text never lingers alongside newly-indexed
+    folders under the new logic."""
+    conn.execute('DELETE FROM leveldb_search_index')
+    conn.commit()
+
+
 def save_evidence_page_map(conn: 'sqlite3.Connection', ui_path: str,
                          page_map: dict) -> None:
     """Persist one file's page-ownership map (see sqlite_carve.build_page_map)
@@ -953,6 +1103,60 @@ def load_evidence_page_map(conn: 'sqlite3.Connection', ui_path: str) -> dict | N
     return {r[0]: {'kind': r[1], 'name': r[2], 'table': r[3],
                    'is_leaf': None if r[4] is None else bool(r[4])}
             for r in rows}
+
+
+def save_embedded_media_hits(conn: 'sqlite3.Connection', hits: list) -> None:
+    """Insert embedded-media scan hits — see app/embedded_media_scan.py.
+
+    *hits* is a list of dicts with keys matching the embedded_media_hits
+    columns (source_ui_path, source_kind, location, display_name,
+    media_kind, extracted_path, sha256, byte_length, recovered,
+    recovery_source, http_wrapped, content_type_hint, scan_scope).
+    display_name is the naming-scheme name computed once by
+    EmbeddedMediaScanWorker._build_row (ffs-explorer.py) — e.g.
+    "msgstore.db-thumbnail-202.jpg" for a live SQL hit, "msgstore.db-
+    carved.jpg" for a recovered one, or the plist's own embedded field
+    name — stored rather than re-derived later from `location`, since
+    `location`'s own free-text shape (built for human reading, not
+    parsing) isn't a reliable source to parse a name back out of.
+    INSERT OR IGNORE — the table's own UNIQUE(source_ui_path, location,
+    sha256) means a re-run over the same file just silently skips a hit
+    it already recorded, rather than erroring or duplicating it."""
+    conn.executemany(
+        'INSERT OR IGNORE INTO embedded_media_hits '
+        '(source_ui_path, source_kind, location, display_name, media_kind, '
+        'extracted_path, sha256, byte_length, recovered, recovery_source, '
+        'http_wrapped, content_type_hint, scan_scope) '
+        'VALUES (:source_ui_path, :source_kind, :location, :display_name, '
+        ':media_kind, :extracted_path, :sha256, :byte_length, :recovered, '
+        ':recovery_source, :http_wrapped, :content_type_hint, :scan_scope)',
+        hits,
+    )
+    conn.commit()
+
+
+def load_embedded_media_hits(conn: 'sqlite3.Connection') -> list:
+    """Return every recorded embedded-media hit, newest first."""
+    rows = conn.execute(
+        'SELECT id, source_ui_path, source_kind, location, display_name, '
+        'media_kind, extracted_path, sha256, byte_length, recovered, '
+        'recovery_source, http_wrapped, content_type_hint, scan_scope, found_at '
+        'FROM embedded_media_hits ORDER BY id DESC'
+    ).fetchall()
+    cols = ('id', 'source_ui_path', 'source_kind', 'location', 'display_name',
+           'media_kind', 'extracted_path', 'sha256', 'byte_length', 'recovered',
+           'recovery_source', 'http_wrapped', 'content_type_hint',
+           'scan_scope', 'found_at')
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def clear_embedded_media_hits(conn: 'sqlite3.Connection') -> None:
+    """Delete every recorded embedded-media hit — used only when the
+    examiner explicitly asks to redo the scan from scratch, never
+    automatically (this table holds precious, examiner-facing findings,
+    per its own module docstring in _open_results_db)."""
+    conn.execute('DELETE FROM embedded_media_hits')
+    conn.commit()
 
 
 def save_nested_archive_failure(conn: 'sqlite3.Connection',

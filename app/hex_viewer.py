@@ -856,10 +856,24 @@ class HexViewerMixin:
         evidence file.
 
         max_bytes=-1 reads the entire entry.  Returns None on any error.
-        """
+
+        Also checks full_metadata's own `_embedded_media_source` marker
+        (added 2026-09-22) — an embedded-media hit browsed via its
+        container's own File Browser folder has a SYNTHETIC (non-absolute)
+        vpath, unlike the standalone "Embedded Media" button's paths
+        (already absolute, already covered by the isabs() branch above),
+        but full_metadata still names its real local file directly — see
+        _inject_embedded_media (ffs-explorer.py)."""
         if os.path.isabs(ui_path):
             try:
                 with open(ui_path, 'rb') as f:
+                    return f.read(max_bytes) if max_bytes >= 0 else f.read()
+            except OSError:
+                return None
+        embedded_source = self.full_metadata.get(ui_path, {}).get('_embedded_media_source')
+        if embedded_source:
+            try:
+                with open(embedded_source, 'rb') as f:
                     return f.read(max_bytes) if max_bytes >= 0 else f.read()
             except OSError:
                 return None

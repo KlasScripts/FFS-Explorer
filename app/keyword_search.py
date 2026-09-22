@@ -14,7 +14,8 @@ from adapters import FfsAdapter
 from db_utils import (_open_cache_db, _open_results_db, OldSchemaError, save_blob, load_blob,
                       load_bookmark_groups, load_bookmark_entries,
                       save_search_scope_files, load_search_scope_files,
-                      save_evidence_page_map, load_evidence_page_map)
+                      save_evidence_page_map, load_evidence_page_map,
+                      load_case_setting)
 from highlight_delegate import HighlightDelegate
 from zip_cd_cache import CachedZipView, load as _zcd_load, compute_data_offsets as _compute_data_offsets
 from zip_entry import ZipEntry
@@ -403,6 +404,125 @@ class NestedArchiveSearchWorker(QThread):
             _report()
 
         self.finished.emit(hits, done, total)
+
+
+class LevelDbSearchWorker(QThread):
+    """Search casecache.db's leveldb_search_index table (built by
+    FastZipBrowser._index_leveldb_folders_batched, via
+    leveldb_viewer.index_leveldb_folder_for_search) for a keyword — a
+    THIRD, parallel search pass alongside KeywordSearchWorker (the real
+    archive's own physical bytes) and NestedArchiveSearchWorker (extracted
+    nested archives), added 2026-09-19 specifically because Keyword
+    Search otherwise has zero visibility into decoded LevelDB/IndexedDB
+    content — confirmed directly by reading this file before building
+    anything, not assumed: nothing here ever referenced folder_map/
+    _nested_virtual_paths/_leveldb_folder_map. A real deserialized
+    IndexedDB value, or a Chrome DOM-Storage value re-encoded from
+    UTF-16LE for display, is frequently not a literal byte substring of
+    the raw archive file at all — the main archive-wide search can never
+    find it no matter how thoroughly it scans.
+
+    A pure local SQLite read — no zip/network I/O at all — so unlike
+    LevelDB folder INDEXING itself (see FastZipBrowser.
+    _index_leveldb_folders_batched's own docstring for why THAT
+    deliberately runs frame-budgeted on the main thread instead of a
+    worker), running the actual SEARCH QUERY on a background QThread is
+    safe and unremarkable here: a fresh sqlite3 connection, never
+    touching the GUI's own shared zip reader.
+
+    result_found carries (folder_ui_path, record_index, offset_in_text,
+    context, display_name, content_type) — enough for
+    _on_leveldb_search_result to both render the hit (folder/
+    display_name/context, the exact same tree/columns an ordinary hit
+    already uses) and, later, resolve it back to the exact real record
+    for the "Show Record in File Browser" context-menu action —
+    folder_ui_path + record_index is the same stable identifier
+    _leveldb_folder_map's own 'record_vpaths' list is already keyed by,
+    so no second identifier scheme was needed."""
+
+    result_found = Signal(str, int, int, str, str, str)
+    # (folder_ui_path, record_index, offset_in_text, context, display_name, content_type)
+    progress = Signal(int, int)
+    finished = Signal(int)   # total hits
+
+    _CTX_CHARS = 40
+
+    def __init__(self, case_dir: str, keyword: str, path_prefix: str | None = None, parent=None):
+        super().__init__(parent)
+        self._case_dir   = case_dir
+        self._keyword    = keyword
+        self._path_prefix = path_prefix   # e.g. 'data/data/' for the App Data scope
+        self._stop       = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    @staticmethod
+    def _escape_like(term: str) -> str:
+        """Escape SQL LIKE wildcards in a user-typed search term — a
+        literal '%'/'_' the examiner actually searched for must match
+        itself, never act as a wildcard (confirmed necessary: this
+        project's own real Local Storage records include keys like
+        'Mon, 29 Jan 2024 21:10:23 GMT'-style values where a literal
+        search would otherwise silently over-match)."""
+        return term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+    def run(self):
+        if not self._case_dir or not self._keyword:
+            self.finished.emit(0)
+            return
+        try:
+            db = _open_cache_db(self._case_dir)
+        except Exception:
+            self.finished.emit(0)
+            return
+        try:
+            pattern = f'%{self._escape_like(self._keyword)}%'
+            if self._path_prefix:
+                rows = db.execute(
+                    "SELECT folder_ui_path, record_index, display_name, searchable_text, content_type "
+                    "FROM leveldb_search_index "
+                    "WHERE record_index >= 0 AND searchable_text LIKE ? ESCAPE '\\' "
+                    "AND folder_ui_path LIKE ?",
+                    (pattern, self._escape_like(self._path_prefix) + '%'),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT folder_ui_path, record_index, display_name, searchable_text, content_type "
+                    "FROM leveldb_search_index "
+                    "WHERE record_index >= 0 AND searchable_text LIKE ? ESCAPE '\\'",
+                    (pattern,),
+                ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            db.close()
+
+        total = len(rows)
+        self.progress.emit(0, total)
+        term_lower = self._keyword.lower()
+        term_len   = len(self._keyword)
+        hits = 0
+        for done, (folder_ui_path, record_index, display_name, text, content_type) in enumerate(rows, 1):
+            if self._stop.is_set():
+                break
+            text_lower = text.lower()
+            start = 0
+            while True:
+                idx = text_lower.find(term_lower, start)
+                if idx == -1:
+                    break
+                ctx_start = max(0, idx - self._CTX_CHARS)
+                ctx_end   = min(len(text), idx + term_len + self._CTX_CHARS)
+                context = (text[ctx_start:idx] + '[' + text[idx:idx + term_len] + ']'
+                           + text[idx + term_len:ctx_end])
+                hits += 1
+                self.result_found.emit(folder_ui_path, record_index, idx, context,
+                                       display_name, content_type or '')
+                start = idx + term_len
+            if done % 50 == 0 or done == total:
+                self.progress.emit(done, total)
+        self.finished.emit(hits)
 
 
 # ── Bulk SQL/WAL hit discovery ────────────────────────────────────────────────
@@ -1014,12 +1134,33 @@ class SearchProgressDialog(QDialog):
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
 
     def update_progress(self, done: int, total: int, hits: int):
+        self._last_progress = (done, total)
         if self._bar.maximum() != total:
             self._bar.setRange(0, total)
         self._bar.setValue(done)
         self._progress_label.setText(
             f"Checked {done:,} / {total:,} files  |  "
             f"hits in {hits:,} file{'s' if hits != 1 else ''} so far")
+
+    def update_hit_count(self, hits: int):
+        """Refresh just the 'hits so far' portion of the progress label —
+        added 2026-09-20 for the nested-archive/LevelDB search passes,
+        which have their own real progress but not in the same units as
+        the main worker's file-scan count that drives the progress BAR
+        (entries scanned / LevelDB rows checked vs. files scanned) — so
+        this keeps whatever "Checked X / Y files" prefix update_progress
+        last set (self._last_progress, tracked explicitly rather than
+        parsed back out of the label's own text) and only replaces the
+        hit-count suffix."""
+        done_total = getattr(self, '_last_progress', None)
+        if done_total is not None:
+            done, total = done_total
+            self._progress_label.setText(
+                f"Checked {done:,} / {total:,} files  |  "
+                f"hits in {hits:,} file{'s' if hits != 1 else ''} so far")
+        else:
+            self._progress_label.setText(
+                f"hits in {hits:,} file{'s' if hits != 1 else ''} so far")
 
     def mark_finished(self, n_files: int, total_hits: int):
         self._bar.setValue(self._bar.maximum())
@@ -1067,6 +1208,26 @@ class KeywordSearchMixin:
         Returns the tab QWidget to be added to center_tabs."""
         self._search_worker: KeywordSearchWorker | None = None
         self._nested_search_worker: NestedArchiveSearchWorker | None = None
+        self._leveldb_search_worker: LevelDbSearchWorker | None = None
+        # Real bug found and fixed 2026-09-20, by direct user report: the
+        # search-complete message and the "N hits" total shown at the end
+        # used to come ONLY from KeywordSearchWorker's own finished signal
+        # — a real LevelDB hit (often the ONLY place a match exists at
+        # all, since a UTF-16LE-encoded Chrome value re-decoded to UTF-8
+        # for search never matches its own raw on-disk bytes) could finish
+        # arriving AFTER the dialog had already declared "0 hits" and
+        # re-enabled the search button. _search_hit_count is now
+        # incremented by every one of the three result handlers
+        # (_on_search_result/_on_nested_search_result/
+        # _on_leveldb_search_result) — a true combined total, not any one
+        # worker's own count — and _search_pending_workers tracks which
+        # of the (up to three) workers actually started for THIS search,
+        # so the real "search complete" finalization
+        # (_finalize_search_results) only runs once every one of them has
+        # genuinely finished, never just the first (usually fastest) one.
+        self._search_hit_count: int = 0
+        self._search_pending_workers: set[str] = set()
+        self._search_main_finish_stats: tuple | None = None
         self._search_index_worker: SearchIndexWorker | None = None
         self._db_loader: DbSearchLoader | None = None
         self._db_loader_term: str = ""
@@ -1505,13 +1666,29 @@ class KeywordSearchMixin:
         return parent.child(item.row(), 1)
 
     def _search_add_hit(self, filename: str, offset: int, context: str,
-                        stored_path: str | None = None, entry_path: str | None = None):
+                        stored_path: str | None = None, entry_path: str | None = None,
+                        leveldb_folder: str | None = None, leveldb_record_index: int | None = None,
+                        offset_label: str | None = None):
         """Insert one hit into the fully-nested path tree.
 
         stored_path / entry_path are set for nested-archive hits so the
         click handler can reopen the entry from the stored ZIP.
+
+        leveldb_folder / leveldb_record_index (added 2026-09-19) are set
+        for a LevelDB/IndexedDB-sourced hit (see LevelDbSearchWorker) —
+        the real folder ui_path and the record's own stable decode-order
+        index, resolved back to the exact record later by
+        _show_leveldb_hit_in_browser the same way _leveldb_folder_map's
+        own 'record_vpaths' list is already keyed. offset_label, when
+        given, replaces the plain str(offset) shown in the Offset
+        column — used for exactly this same case, since a LevelDB hit's
+        own "offset" is a position within DECODED/RENDERED text, not a
+        real byte offset into the archive, and showing it unlabeled
+        would risk being mistaken for one.
         """
         _PATH_ROLE = Qt.ItemDataRole.UserRole
+        _LEVELDB_FOLDER_ROLE = Qt.ItemDataRole.UserRole + 5
+        _LEVELDB_RECORD_ROLE = Qt.ItemDataRole.UserRole + 6
 
         folder   = filename.rsplit('/', 1)[0] if '/' in filename else ''
         basename = filename.rsplit('/', 1)[-1]
@@ -1566,7 +1743,11 @@ class KeywordSearchMixin:
         if stored_path:
             hit_item.setData(stored_path, Qt.ItemDataRole.UserRole + 3)
             hit_item.setData(entry_path,  Qt.ItemDataRole.UserRole + 4)
-        hit_row = [hit_item, QStandardItem(''), QStandardItem(context), QStandardItem(str(offset))]
+        if leveldb_folder is not None:
+            hit_item.setData(leveldb_folder,       _LEVELDB_FOLDER_ROLE)
+            hit_item.setData(leveldb_record_index, _LEVELDB_RECORD_ROLE)
+        hit_row = [hit_item, QStandardItem(''), QStandardItem(context),
+                  QStandardItem(offset_label if offset_label is not None else str(offset))]
         for cell in hit_row:
             cell.setEditable(False)
         file_item.appendRow(hit_row)
@@ -1639,17 +1820,31 @@ class KeywordSearchMixin:
         if not physical or not full_path or full_path.endswith('/'):
             return
         offset = item.data(Qt.ItemDataRole.UserRole + 1)   # only set on a real hit row, never a file/folder row
+        leveldb_folder = item.data(Qt.ItemDataRole.UserRole + 5)   # set only for a LevelDB/IndexedDB-sourced hit
 
         menu   = QMenu(self)
         action = menu.addAction("Open Parent Folder")
         sql_action = None
-        if offset is not None:
+        leveldb_action = None
+        if leveldb_folder is not None:
+            # "Interpret as SQL Record" doesn't apply here — this hit's
+            # own "offset" is a position within already-decoded/rendered
+            # text, not a real byte offset into a database file, so
+            # there's no SQL row to resolve it against. Added 2026-09-19,
+            # per direct user request ("can we allow the user to right
+            # click result to find the value in the browser?"), mirroring
+            # this same menu's existing "Interpret as SQL Record" ->
+            # "Jump to this row in the report" precedent.
+            leveldb_action = menu.addAction("Show Record in File Browser")
+        elif offset is not None:
             sql_action = menu.addAction("Interpret as SQL Record")
         chosen = menu.exec(self.search_results_view.viewport().mapToGlobal(pos))
         if chosen == action:
             self._open_parent_folder_from_search(full_path)
         elif sql_action is not None and chosen == sql_action:
             self._interpret_search_hit_as_sql(item)
+        elif leveldb_action is not None and chosen == leveldb_action:
+            self._show_leveldb_hit_in_browser(item)
 
     def _interpret_search_hit_as_sql(self, item: QStandardItem, on_done=None):
         """Kick off a background SqlHitInterpretWorker for the hit *item*
@@ -1959,6 +2154,53 @@ class KeywordSearchMixin:
         self.navigate_tree_to_path(folder_path)
         QTimer.singleShot(0, lambda: self._select_file_in_table(full_file_path))
 
+    def _show_leveldb_hit_in_browser(self, item: QStandardItem):
+        """Right-click "Show Record in File Browser" for a LevelDB/
+        IndexedDB-sourced search hit — added 2026-09-19, per direct user
+        request ("can we allow the user to right click result to find the
+        value in the browser?"), mirroring this same menu's existing
+        "Interpret as SQL Record" -> jump-to-report-row precedent.
+
+        Ensures the record's own real folder is decoded
+        (self._decode_leveldb_folder — idempotent, a no-op if it's
+        already decoded from a prior browse-in or a prior click on
+        another hit from the same folder; fast even the first time,
+        since the search-indexing pass already extracted the folder's
+        real files to local disk), then resolves the hit's own stable
+        record_index back to its real vpath via _leveldb_folder_map's
+        own 'record_vpaths' list — the SAME stable identifier
+        leveldb_viewer.index_leveldb_folder_for_search built the search
+        index from, so this can never resolve to the wrong record.
+        Finally reuses the identical navigate+select dance
+        _open_parent_folder_from_search already uses for an ordinary
+        hit."""
+        _LEVELDB_FOLDER_ROLE = Qt.ItemDataRole.UserRole + 5
+        _LEVELDB_RECORD_ROLE = Qt.ItemDataRole.UserRole + 6
+        folder_ui_path = item.data(_LEVELDB_FOLDER_ROLE)
+        record_index   = item.data(_LEVELDB_RECORD_ROLE)
+        if folder_ui_path is None or record_index is None:
+            return
+        if folder_ui_path not in self._leveldb_folder_map:
+            if not self._decode_leveldb_folder(folder_ui_path):
+                QMessageBox.warning(
+                    self, "Could Not Open Record",
+                    "Could not re-decode this LevelDB/IndexedDB folder:\n\n"
+                    f"{folder_ui_path}")
+                return
+        entry = self._leveldb_folder_map.get(folder_ui_path)
+        record_vpaths = entry.get('record_vpaths', []) if entry else []
+        if not entry or record_index >= len(record_vpaths):
+            QMessageBox.warning(
+                self, "Record Not Found",
+                "This record could no longer be found in its own folder — "
+                "it may have changed since being indexed for search. Try "
+                "re-indexing (Search Coverage) and searching again.")
+            return
+        vpath = record_vpaths[record_index]
+        self.center_tabs.setCurrentIndex(0)
+        self.navigate_tree_to_path(folder_ui_path)
+        QTimer.singleShot(0, lambda: self._select_file_in_table(vpath))
+
     def _on_search_tree_expanded(self):
         for col in range(self.search_results_model.columnCount()):
             self.search_results_view.resizeColumnToContents(col)
@@ -2176,6 +2418,31 @@ class KeywordSearchMixin:
     def _on_search_index_ready(self, entries: list):
         self._search_entries = entries or None
 
+    def _current_header_scan_tier(self) -> tuple[int, int]:
+        """(complete_tier, requested_tier) for the current case.
+
+        A LOCAL read of the same two case_settings keys
+        FastZipBrowser._refresh_header_scan_indicator (ffs-explorer.py)
+        already reads, rather than importing that method's own dict —
+        app/ modules never import from ffs-explorer.py (see e.g. the
+        DATABASE_ constant a few lines up in this same file, deliberately
+        kept as its own local copy for the identical reason). The tier
+        LABEL text itself still comes from `self._HEADER_SCAN_TIER_TEXT`
+        (accessed as a plain instance attribute at call time, since this
+        mixin ends up part of the same FastZipBrowser class that defines
+        it) so the wording can never drift from what the blue banner
+        already shows — only this (complete_tier, requested_tier) pair
+        is re-read here, never a second copy of the wording."""
+        if not self._case_dir:
+            return 0, 0
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                complete_tier = int(load_case_setting(db, 'header_scan_complete_tier', '0'))
+                requested_tier = int(load_case_setting(db, 'header_scan_tier', '0'))
+        except Exception:
+            return 0, 0
+        return complete_tier, requested_tier
+
     def _start_keyword_search(self):
         from PySide6.QtWidgets import QMessageBox, QCheckBox
         term = self.search_field.text().strip()
@@ -2183,31 +2450,154 @@ class KeywordSearchMixin:
             return
         skip_once = getattr(self, '_skip_search_reminder_once', False)
         self._skip_search_reminder_once = False
+        unextracted_archives = self._unextracted_archive_count()
+        complete_tier, requested_tier = self._current_header_scan_tier()
+        # LevelDB/IndexedDB indexing is DELIBERATELY NOT asked about here
+        # at all — see _ensure_leveldb_indexed_then_run's own docstring.
+        # This dialog used to also offer an "Index N LevelDB Folder(s)
+        # Now" button alongside the archive one, per direct user
+        # feedback ("if I want to do both it is not clear how... can we
+        # just remove it and just process them without asking? it does
+        # not take long") — two independent "process X first" choices
+        # crammed into one dialog had no clear way to do BOTH in one
+        # pass (picking one button returned immediately without
+        # searching, and picking the other meant the first choice's own
+        # gap was never addressed at all). Archives still get an actual
+        # choice here because decompressing one can be slow and large;
+        # LevelDB indexing measured at ~3-9s of CPU for a real 234-folder
+        # archive doesn't need one.
+        #
+        # The header-scan TIER is a genuinely separate, third gap, added
+        # 2026-09-20 per direct user feedback ("during search there is
+        # now 3 reason to check more: header sql records, leveldb and
+        # archive... without fully typing all the file we cannot pre
+        # process the db or find the archive"): a low tier means an
+        # extensionless/mistyped SQLite database or embedded archive can
+        # be completely UNDISCOVERED, not merely left compressed once
+        # found — _unextracted_archive_count() itself only ever counts
+        # archives the header scan's own overrides already surfaced (see
+        # that method's own `overrides = self._header_type_overrides`
+        # dependency), so a low tier can silently make the archive count
+        # above read as "nothing to do" when there's really more to find.
+        # Shown whenever the tier hasn't reached the exhaustive Tier 3,
+        # not only when a known archive is already waiting — the whole
+        # point is that a low tier can hide the very existence of more to
+        # find, not just leave a known one uncompressed. The default
+        # button now goes to review/upgrade the tier (and select
+        # archives) rather than searching immediately, since a Tier 3
+        # scan can be slow and this is the one moment an examiner is
+        # actively thinking about search completeness.
+        #
+        # Wording reworked 2026-09-22, collaboratively with the user
+        # ("I don't like the text in the dialog... it should indicate
+        # the current header tier and what has not been checked, and
+        # then what that means"): the old text just restated the tier's
+        # own single "Covers: ..." sentence; this version explicitly
+        # states what IS and ISN'T checked at the current tier (from the
+        # shared `self._HEADER_SCAN_TIER_COVERAGE` dict — see
+        # ffs-explorer.py's own module-level definition and comment for
+        # why it's a class attribute rather than a bare import), then a
+        # separate "what this means" consequence line — only shown when
+        # something is actually left unchecked (complete_tier < 3).
+        # LevelDB was directly discussed and confirmed NOT tier-dependent
+        # (its own folder is recognized by literal filenames — CURRENT,
+        # *.ldb, *.log — already present in folder_map from the archive's
+        # own file listing, never by magic-byte content scanning), so it
+        # gets its own flat "always found" line rather than being folded
+        # into the checked/not-checked framing above it.
         if (not skip_once
                 and not getattr(self, '_search_coverage_reminder_muted', False)
-                and self._unextracted_archive_count() > 0):
+                and (unextracted_archives > 0 or complete_tier < 3)):
             box = QMessageBox(self)
             box.setWindowTitle("Search Coverage")
             box.setIcon(QMessageBox.Icon.Information)
-            box.setText(
-                "Keyword search only scans uncompressed files.\n\n"
-                "Do you want to review compressed files to see if you want "
-                "to decompress any?")
-            process_btn = box.addButton("Select Archives to Decompress…",
-                                        QMessageBox.ButtonRole.ActionRole)
+            tier_name = {0: "Off", 1: "Tier 1", 2: "Tier 2", 3: "Tier 3"}.get(
+                complete_tier, "Off")
+            coverage = self._HEADER_SCAN_TIER_COVERAGE.get(
+                complete_tier, self._HEADER_SCAN_TIER_COVERAGE[0])
+            tier_note = ""
+            if requested_tier > complete_tier:
+                tier_note = f"  (a Tier {requested_tier} scan is currently running)"
+            lines = [
+                f"Header scan: {tier_name} (current){tier_note}",
+                f"Checked: {coverage['checked']}",
+                f"Not checked: {coverage['not_checked']}",
+            ]
+            if complete_tier < 3:
+                lines += [
+                    "",
+                    "What this means: a database or compressed archive "
+                    "that falls into the \"Not checked\" area above — for "
+                    "example one with a misleading or missing file "
+                    "extension — won't be discovered at all. It won't "
+                    "appear in search, and won't be offered for "
+                    "decompression.",
+                ]
+            lines += [
+                "",
+                "LevelDB/IndexedDB — always found, regardless of tier "
+                "(its own filenames are unambiguous).",
+                "",
+                "Compressed archives — "
+                + (f"{unextracted_archives:,} not yet decompressed."
+                   if unextracted_archives
+                   else "none currently known to be undecompressed."),
+                "",
+                "Review the header scan tier and select archives to "
+                "decompress before searching?",
+            ]
+            box.setText("\n".join(lines))
+            review_btn = box.addButton("Review Header Scan Tier and Archives…",
+                                       QMessageBox.ButtonRole.ActionRole)
             search_btn = box.addButton("Search Now",
                                        QMessageBox.ButtonRole.AcceptRole)
-            box.setDefaultButton(search_btn)
+            box.setDefaultButton(review_btn)
             mute_chk = QCheckBox("Don't remind me again this session")
             box.setCheckBox(mute_chk)
             box.exec()
             if mute_chk.isChecked():
                 self._search_coverage_reminder_muted = True
-            if box.clickedButton() is process_btn:
+            if box.clickedButton() is review_btn:
                 self._open_process_dialog(preselect_nested=True,
                                           resume_search=True,
                                           auto_archive_selection=True)
                 return
+        self._ensure_leveldb_indexed_then_run(term)
+
+    def _ensure_leveldb_indexed_then_run(self, term: str):
+        """Silently indexes any not-yet-indexed LevelDB/IndexedDB folders
+        (no dialog, no examiner choice — just a brief status-bar message)
+        before actually launching the search, then runs it.
+
+        Deliberately NOT a prompt, unlike the archive-decompression
+        choice above — per direct user feedback, 2026-09-20: LevelDB
+        indexing is fast enough (measured ~3-9s of CPU for a real
+        234-folder/257,804-record archive) that asking first only adds
+        friction, and the two-question dialog this replaced (archives
+        AND LevelDB, each with their own "process now" button) had no
+        clear way to do both in one pass — picking either button
+        returned immediately without running the search at all, leaving
+        the OTHER gap unaddressed until the examiner searched again.
+        Every unindexed folder still gets covered — just automatically,
+        every time, rather than needing a deliberate choice."""
+        _, unindexed_leveldb = self._leveldb_search_coverage()
+        if unindexed_leveldb:
+            self.search_status.setText(
+                f"Indexing {len(unindexed_leveldb):,} LevelDB/IndexedDB "
+                "folder(s) for search…")
+            self._index_leveldb_folders_batched(
+                unindexed_leveldb,
+                on_done=lambda: self._start_keyword_search_run(term))
+        else:
+            self._start_keyword_search_run(term)
+
+    def _start_keyword_search_run(self, term: str):
+        """The actual search launch — split out of _start_keyword_search
+        2026-09-19 so the Search Coverage reminder's own "Index LevelDB
+        Folder(s) Now" button can defer this until
+        _index_leveldb_folders_batched's on_done fires, rather than
+        duplicating everything below it."""
+        from PySide6.QtWidgets import QMessageBox
         self._stop_keyword_search()
         self._set_incomplete_banner()
         self.search_results_model.clear()
@@ -2218,6 +2608,9 @@ class KeywordSearchMixin:
         self._search_file_items.clear()
         self._pending_db_hits.clear()
         self._live_hit_buffer.clear()
+        self._search_hit_count = 0
+        self._search_pending_workers = set()
+        self._search_main_finish_stats = None
 
         scope = self.search_scope_combo.currentData()
         is_restricted = isinstance(scope, dict) or scope == 'selected'
@@ -2271,6 +2664,13 @@ class KeywordSearchMixin:
         self._search_progress_dlg = SearchProgressDialog(term, parent=self)
         self._search_progress_dlg.cancelled.connect(self._cancel_keyword_search)
 
+        # Registered BEFORE any worker starts, so a worker that happens to
+        # finish (and fire its own .finished signal) before the next one
+        # even gets constructed can't be mistaken for "everything's done"
+        # — see _mark_search_subworker_done's own docstring for the real
+        # bug this fixes.
+        self._search_pending_workers = {'main'}
+
         self._search_worker = KeywordSearchWorker(
             self.zip_path, term,
             entries=scoped_entries,
@@ -2281,16 +2681,38 @@ class KeywordSearchMixin:
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
         self._search_worker.result_found.connect(self._on_search_result)
         self._search_worker.progress.connect(self._on_search_progress)
-        self._search_worker.finished.connect(self._on_search_finished)
+        self._search_worker.finished.connect(self._on_main_search_finished)
         self._search_worker.start()
 
         # Start nested archive search in parallel (scoped_nested_map is already
         # filtered for restricted scopes; for unrestricted scopes it equals
         # the full nested_archive_map).
         if scoped_nested_map:
+            self._search_pending_workers.add('nested')
             self._nested_search_worker = NestedArchiveSearchWorker(scoped_nested_map, term)
             self._nested_search_worker.result_found.connect(self._on_nested_search_result)
+            self._nested_search_worker.progress.connect(self._on_search_hits_updated)
+            self._nested_search_worker.finished.connect(self._on_nested_search_finished)
             self._nested_search_worker.start()
+
+        # Start the LevelDB/IndexedDB search index in parallel too — added
+        # 2026-09-19. Scoped to 'all'/'app_data' only for this first version
+        # (a real, disclosed limitation, not silently pretended away):
+        # 'selected'/bookmark scopes are about specific FILES, and mapping
+        # those onto which decoded LevelDB RECORDS fall "inside" them isn't
+        # implemented yet. Since the real archive's own LevelDB stores are
+        # overwhelmingly under data/data/ anyway (measured: 228 of 234 real
+        # folders in this project's own test archive), 'app_data' is scoped
+        # with the same 'data/data/' prefix the main worker's own app_data
+        # filter already uses, via LevelDbSearchWorker's path_prefix.
+        if worker_scope in ('all', 'app_data'):
+            self._search_pending_workers.add('leveldb')
+            path_prefix = 'data/data/' if worker_scope == 'app_data' else None
+            self._leveldb_search_worker = LevelDbSearchWorker(self._case_dir, term, path_prefix)
+            self._leveldb_search_worker.result_found.connect(self._on_leveldb_search_result)
+            self._leveldb_search_worker.progress.connect(self._on_search_hits_updated)
+            self._leveldb_search_worker.finished.connect(self._on_leveldb_search_finished)
+            self._leveldb_search_worker.start()
 
         self._search_progress_dlg.exec()
 
@@ -2299,6 +2721,8 @@ class KeywordSearchMixin:
             self._search_worker.stop()
         if self._nested_search_worker and self._nested_search_worker.isRunning():
             self._nested_search_worker.stop()
+        if self._leveldb_search_worker and self._leveldb_search_worker.isRunning():
+            self._leveldb_search_worker.stop()
 
     def _stop_keyword_search(self):
         if self._search_worker and self._search_worker.isRunning():
@@ -2307,21 +2731,72 @@ class KeywordSearchMixin:
         if self._nested_search_worker and self._nested_search_worker.isRunning():
             self._nested_search_worker.stop()
             self._nested_search_worker.wait()
+        if self._leveldb_search_worker and self._leveldb_search_worker.isRunning():
+            self._leveldb_search_worker.stop()
+            self._leveldb_search_worker.wait()
         self.search_btn.setEnabled(True)
         self.search_stop_btn.setEnabled(False)
 
     def _on_search_result(self, name: str, offset: int, context: str):
         # Buffer hits and insert them into the tree in batches — one tree
         # insert per signal freezes the GUI on terms with many thousands of hits.
+        self._search_hit_count += 1
         self._pending_db_hits.append((name, offset, context))
-        self._live_hit_buffer.append((name, offset, context, None, None))
+        self._live_hit_buffer.append((name, offset, context, None, None, None, None, None))
         self._schedule_live_hit_flush()
 
     def _on_nested_search_result(self, virtual_ui_path: str, offset: int,
                                   context: str, stored_path: str, entry_path: str):
+        self._search_hit_count += 1
         self._live_hit_buffer.append(
-            (virtual_ui_path, offset, context, stored_path, entry_path))
+            (virtual_ui_path, offset, context, stored_path, entry_path, None, None, None))
         self._schedule_live_hit_flush()
+
+    def _on_leveldb_search_result(self, folder_ui_path: str, record_index: int,
+                                   offset: int, context: str, display_name: str,
+                                   content_type: str):
+        """LevelDbSearchWorker's own result_found handler — builds the same
+        (folder -> file -> hit) tree shape every other hit already uses,
+        with the record's own real display name (identical to what
+        browsing that folder would show) as the "file," and an explicit
+        "in decoded text" offset label (added 2026-09-19, direct design
+        decision: this offset is a position within RENDERED/decoded
+        text, never a real byte offset into the archive — labeling it
+        plainly avoids it ever being mistaken for one, the same
+        forensic-honesty bar this project holds every other citation to).
+
+        display_name is sanitized for the '/' -> '∕' (U+2215 DIVISION
+        SLASH) substitution before being combined into the tree's own
+        "filename" path string — a real, confirmed-necessary fix: a
+        genuine record display name routinely contains a literal URL
+        ("https://mlb.com - PubMatic_USP"), and _search_add_hit's own
+        folder/basename split (`filename.rsplit('/', 1)`) would otherwise
+        silently misparse the URL's own slashes as extra, bogus tree
+        nesting levels rather than as part of one file's own name."""
+        safe_name = display_name.replace('/', '∕')
+        filename  = f"{folder_ui_path}/{safe_name}"
+        offset_label = f"{offset:,} (in decoded text)"
+        self._search_hit_count += 1
+        self._live_hit_buffer.append(
+            (filename, offset, context, None, None, folder_ui_path, record_index, offset_label))
+        self._schedule_live_hit_flush()
+
+    def _on_search_hits_updated(self, *_args):
+        """Lightweight progress refresh for the nested-archive/LevelDB
+        search passes — added 2026-09-20 alongside the "0 hits shown at
+        completion" fix. These workers have their own real progress, but
+        not in the same units as the main worker's file-scan count that
+        drives the dialog's progress BAR (entries scanned vs. LevelDB
+        rows checked vs. files scanned) — so this only refreshes the
+        'hits so far' text, via the dialog's own update_hit_count, rather
+        than trying to force an apples-to-oranges done/total into the
+        bar. *_args absorbs whatever (done, total) shape the calling
+        worker's own progress signal happens to carry — this handler
+        only cares that A tick happened, not its specific numbers."""
+        hits = len(self._search_file_items)
+        self._update_search_status_bar()
+        if self._search_progress_dlg:
+            self._search_progress_dlg.update_hit_count(hits)
 
     def _schedule_live_hit_flush(self):
         if not self._live_hit_flush_scheduled:
@@ -2335,9 +2810,13 @@ class KeywordSearchMixin:
         buf, self._live_hit_buffer = self._live_hit_buffer, []
         self.search_results_view.setUpdatesEnabled(False)
         try:
-            for name, offset, context, stored_path, entry_path in buf:
+            for (name, offset, context, stored_path, entry_path,
+                 leveldb_folder, leveldb_record_index, offset_label) in buf:
                 self._search_add_hit(name, offset, context,
-                                     stored_path=stored_path, entry_path=entry_path)
+                                     stored_path=stored_path, entry_path=entry_path,
+                                     leveldb_folder=leveldb_folder,
+                                     leveldb_record_index=leveldb_record_index,
+                                     offset_label=offset_label)
         finally:
             self.search_results_view.setUpdatesEnabled(True)
 
@@ -2349,8 +2828,55 @@ class KeywordSearchMixin:
         if self._search_progress_dlg:
             self._search_progress_dlg.update_progress(done, total, hits)
 
-    def _on_search_finished(self, total_hits: int, files_done: int, files_total: int,
-                            stopped: bool):
+    def _mark_search_subworker_done(self, name: str):
+        """One of the (up to three) parallel search workers for the
+        current search has finished. Only once ALL of them have (main,
+        and whichever of nested/leveldb actually started for this
+        search — see _search_pending_workers' own registration in
+        _start_keyword_search_run) does the search genuinely count as
+        complete.
+
+        Real bug fixed 2026-09-20, by direct user report: the dialog
+        used to declare "0 hits" and re-enable the search button the
+        MOMENT the main archive worker finished — regardless of whether
+        LevelDbSearchWorker/NestedArchiveSearchWorker were still running.
+        Since a real LevelDB hit is very often the ONLY place a match
+        exists at all (a UTF-16LE-encoded Chrome value re-decoded to
+        UTF-8 for search never matches its own raw on-disk bytes), the
+        examiner would see the real hit appear in the results tree a
+        moment AFTER being told the search was already complete with
+        nothing found — confirmed directly against the user's own real
+        report, not assumed."""
+        self._search_pending_workers.discard(name)
+        if not self._search_pending_workers and self._search_main_finish_stats is not None:
+            total_hits, files_done, files_total, stopped = self._search_main_finish_stats
+            self._finalize_search_results(total_hits, files_done, files_total, stopped)
+
+    def _on_main_search_finished(self, total_hits: int, files_done: int, files_total: int,
+                                 stopped: bool):
+        self._search_main_finish_stats = (total_hits, files_done, files_total, stopped)
+        self._mark_search_subworker_done('main')
+
+    def _on_nested_search_finished(self, hits: int, files_done: int, files_total: int):
+        self._mark_search_subworker_done('nested')
+
+    def _on_leveldb_search_finished(self, total_hits: int):
+        self._mark_search_subworker_done('leveldb')
+
+    def _finalize_search_results(self, total_hits: int, files_done: int, files_total: int,
+                                 stopped: bool):
+        """The REAL "declare the search complete" step — runs once every
+        worker started for this search has genuinely finished (see
+        _mark_search_subworker_done), never just the first/fastest one.
+        total_hits/files_done/files_total/stopped are the MAIN worker's
+        own numbers (the only one that tracks "files scanned" and "was
+        this interrupted" at all — nested/leveldb have no equivalent
+        concept of "total files in the archive"); the hit COUNT/FILE
+        COUNT actually shown to the examiner
+        (self._search_hit_count / len(self._search_file_items)) is the
+        TRUE combined total across all three sources, incremented by
+        each one's own result handler as hits arrive — never any single
+        worker's own count alone."""
         self._flush_live_hits()   # drain any buffered hits before counting
         if self._search_entries is None and self._search_worker is not None:
             self._search_entries = self._search_worker.entries or None
@@ -2402,7 +2928,7 @@ class KeywordSearchMixin:
                     f"'{term}'{scope_tag} — partial search, interrupted  "
                     f"({n_files:,} file{'s' if n_files != 1 else ''} with hits)")
             else:
-                dlg.mark_finished(n_files, total_hits)
+                dlg.mark_finished(n_files, self._search_hit_count)
                 self._set_incomplete_banner()
                 self.search_status.setText(
                     f"'{term}'{scope_tag} — hits in {n_files:,} file{'s' if n_files != 1 else ''}")

@@ -45,6 +45,22 @@ _SIGNATURES: list[tuple[bytes, str | None]] = [
 
 _AUDIO_BRANDS = {b'M4A ', b'M4P ', b'f4a ', b'aac '}
 
+# Real still-image ftyp brands (HEIF family — ISO/IEC 23008-12 — plus
+# AVIF), found and fixed 2026-09-22 while building the embedded-media
+# scan feature: classify_magic's ftyp branch used to treat ANY non-audio
+# brand as 'Video', which is wrong for HEIC/HEIF — the single most common
+# real iOS photo format — since it shares the identical ftyp/ISOBMFF
+# container with MP4/MOV. Confirmed directly against real data before
+# fixing: real HEIC photos from this project's own IOS17 JoshHickman
+# archive have brand b'heic'; real videos from the same and the Android
+# 14 JoshHickman archive have b'qt  '/b'M4V '/b'isom'/b'mp42' — genuinely
+# disjoint brand sets, not a guess. This only matters for a file with no
+# reliable extension to fall back on (an ordinary .heic-named photo never
+# reaches this magic-byte path at all) — but that's exactly the case an
+# embedded-media sweep over an unlabeled SQL/plist blob hits every time.
+IMAGE_FTYP_BRANDS = {b'heic', b'heix', b'heim', b'heis', b'hevc', b'hevx',
+                      b'mif1', b'msf1', b'avif', b'avis'}
+
 # Maximum file size for the full-content text check (512 KB).
 TEXT_SIZE_LIMIT = 512 * 1024
 
@@ -68,10 +84,16 @@ def classify_magic(header: bytes) -> str | None:
                     return 'Audio'
                 if form in (b'AVI ', b'AVIX'):
                     return 'Video'
+                if form == b'WEBP':
+                    return 'Picture'
             return None
     if len(header) >= 12 and header[4:8] == b'ftyp':
         brand = header[8:12]
-        return 'Audio' if brand in _AUDIO_BRANDS else 'Video'
+        if brand in _AUDIO_BRANDS:
+            return 'Audio'
+        if brand in IMAGE_FTYP_BRANDS:
+            return 'Picture'
+        return 'Video'
     # JSON heuristic — checked last to minimise false positives.
     first = header.lstrip(b' \t\r\n')
     if first and first[0] in (ord('{'), ord('[')):

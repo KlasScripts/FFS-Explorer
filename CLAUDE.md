@@ -26,7 +26,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 ## Data flow (opening an archive)
 
 1. `FastZipBrowser.start_loading()` → case dir chosen (`_get_or_ask_case_dir`).
-2. `ZipMetadataWorker` (ffs-explorer.py:1405) → `app/ffs_metadata.py
+2. `ZipMetadataWorker` (ffs-explorer.py:1446) → `app/ffs_metadata.py
    parse_archive_metadata()` in a child process: central-directory parse,
    `ui_metadata` build, folder tree/sizes; snapshot persisted to case dir
    (msgpack) so re-opens are instant.
@@ -57,8 +57,15 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
   build_page_map`/the "Interpret as SQL Record" Conventions entry below;
   named to avoid SQLite's own reserved `sqlite_`-prefix table-name
   restriction, confirmed directly after `sqlite_page_map` failed with
-  "object name reserved for internal use"). On schema mismatch it is
-  auto-deleted and rebuilt.
+  "object name reserved for internal use"), `leveldb_search_index` (schema
+  v17, added 2026-09-19/20 — one row per real LevelDB/IndexedDB record
+  whose decoded content is genuine searchable text, keyed
+  `(folder_ui_path, record_index)`; see the "Keyword Search" LevelDB
+  Conventions entry below for the full design — staleness tracked via the
+  `blobs` table's own generic key/version mechanism
+  (`leveldb_search_index_version`), same pattern
+  `app_intelligence_scan_key` already uses, rather than this table's own
+  schema version). On schema mismatch it is auto-deleted and rebuilt.
 - `caseresults.db` — precious results (never auto-deleted): search_index /
   search_results, bookmarks, device_info, run_log (an `artifact_<script_name>`
   row's `parser_version` column records the parser's version — see
@@ -70,8 +77,15 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
   `total_rows`, `chunk_count`, `generated_at`; written by `ai_summary.
   save_summary`, overwritten on each new generate, same as a normal
   `artifact_<name>` table — see the "AI Summary GUI dialog" Conventions
-  entry and the app-group-root paragraph right after it). On schema
-  mismatch raises `OldSchemaError`.
+  entry and the app-group-root paragraph right after it), `embedded_media_hits`
+  (added 2026-09-22 — one row per confirmed image/video found embedded in
+  a SQLite BLOB or plist NSData value, `UNIQUE(source_ui_path, location,
+  sha256)` so a re-run of the scan silently skips what it already found
+  rather than duplicating; see `app/embedded_media_scan.py` and the
+  "Embedded-media sweep" Conventions entry below — treated as precious
+  findings, not a rebuildable cache, since a deleted-content scan can be
+  genuinely slow and its results are exactly what an examiner builds a
+  case around). On schema mismatch raises `OldSchemaError`.
 - (Heads-up: `zip_cd_cache.py`'s docstring still says "casedata.db" — stale
   name, the real file is `caseresults.db`.)
 
@@ -86,7 +100,8 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `db_utils.py` | Case DB open/schema/save-load helpers (see above) |
 | `zip_entry.py` / `zip_reader.py` | Entry read primitives; `ZipEntry` is the universal handle passed to viewers |
 | `zip_cd_cache.py` | .zcd central-directory sidecar cache + integrity hashes for network zips. `load()` memoizes its own PARSED `ZipInfo` list in-memory per `.zcd` file (added 2026-09-15, see Conventions' "Real beach-ball on case load" entry — 17+ call sites across this project were each independently re-paying a real ~1.6–3.9s `zipfile.ZipFile()` re-parse cost on every call before this) |
-| `header_scan.py` | Magic-byte/text file-type detection by direct offset reads |
+| `header_scan.py` | Magic-byte/text file-type detection by direct offset reads. `classify_magic`'s `ftyp` branch fixed 2026-09-22 (see the "Embedded-media sweep" Conventions entry below) — it used to treat ANY non-audio `ftyp` brand as `'Video'`, which is wrong for HEIC/HEIF (the single most common real iOS photo format, sharing the identical ISOBMFF/`ftyp` container MP4/MOV use); confirmed directly against real HEIC/MOV/M4V/MP4 files from this project's own test archives before fixing, not assumed. New public `IMAGE_FTYP_BRANDS` (HEIC/HEIF/AVIF family brands) disambiguates; a `WEBP` RIFF form (previously undetected at all) was added the same day |
+| `embedded_media_scan.py` | Generic, schema-agnostic sweep for image/video content embedded inside SQLite BLOB cells and plist NSData values — see the "Embedded-media sweep" Conventions entry below for the full design, real bugs found during verification, and the GUI wiring (`ProcessDialog`'s checkbox/scope picker, `EmbeddedMediaScanWorker` in `ffs-explorer.py`, and the Media Browser's "Embedded Media" review button) — all shipped and verified end-to-end against real archive data, not a placeholder |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers (2026-08-19, after a survey found 25+ hand-rebuilt Cancel/OK button rows, 24+ wordWrap note labels, and four different ad-hoc warning/error colors): `button_row()` (Cancel/OK, `on_ok`/`on_cancel` default to accept/reject — only fits a plain two-button row in that fixed order, a dialog with a third button or different order keeps its own hand-built row), `note_label()`, `error_label()`, and `WARNING_COLOR`/`ERROR_COLOR` reusing `research_store.py`'s existing `#b8860b`/`#c62828` rather than inventing new ones. No case/business logic — pure widget construction |
 | `timestamp_display.py` | `TimestampDisplayMixin` (extracted from `ffs-explorer.py` 2026-08-19, same treatment as the other mixins below): the shared timestamp-mode banner, `format_ts` (the single entry point every view calls to display an evidence timestamp per the case's UTC/handset/acquisition/manual setting), and the Timestamp Display dialog. Module-level `_format_ts_cached`/`_format_ts_named_zone` do the actual formatting. Tool-provenance formatting (`_format_tool_ts_local`) is a different concern and stays in `ffs-explorer.py` |
 | `device_timezone.py` | Best-effort timezone detection for the opt-in device-local timestamp display: `detect_handset_zone` (iOS `private/var/db/timezone/localtime`), `detect_acquisition_offset`/`guess_acquisition_zones` (the `.ufd`'s recorded UTC offset, Cellebrite-only), `detect_system_zone` (the analysis machine's own current zone — macOS/Linux via `/etc/localtime`, Windows via the registry + a bundled CLDR name mapping since Windows has no IANA-named equivalent). All best-effort, never raise, never applied silently — see the Conventions timestamp section |
@@ -96,7 +111,50 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `sqlite_viewer.py` | Database tab: temp-copy extraction, table browser, **WAL net-change diff view** (`SqliteDiffModel`) |
 | `segb_viewer.py` | SEGB/Biome tab: parses records via vendored `app/ccl_segb`, decodes protobuf with `blackboxprotobuf`; empty-record hiding + deleted-record toggle |
 | `segb_schemas.py` | Built-in per-stream protobuf typedefs + field labels for known Biome streams; user-authored schemas persist to `caseresults.db` via `db_utils.save_segb_schema` and override the built-ins |
-| `leveldb_viewer.py` | `LevelDbViewerMixin` (rearchitected 2026-09-19, no longer a separate tab — see that day's Conventions entry for why): decodes a real LevelDB directory's own records into synthetic per-record leaf paths injected into `folder_map`/`full_metadata`/`_nested_virtual_paths`, the SAME machinery `_inject_nested_archives` already uses for extracted zip archives — so a record shows up as an ordinary "file" (its key, sanitized, as the name) browsable and previewable through the file browser's own existing pipeline, no bespoke UI. Triggered automatically the first time a real LevelDB-shaped folder (`_looks_like_leveldb_dir`) is navigated into (`on_folder_selected`); persists across case reopen by re-detecting already-extracted folders on disk (`_rescan_decoded_leveldb_folders`), no new DB table needed. A record's own value previews via `FastZipBrowser._display_preview_bytes` (the same JSON/XML/bplist/ABX/text/hex rendering a real file gets) — see Conventions |
+| `leveldb_viewer.py` | `LevelDbViewerMixin` (rearchitected 2026-09-19, no longer a separate tab — see that day's Conventions entry for why): decodes a real LevelDB directory's own records into synthetic per-record leaf paths injected into `folder_map`/`full_metadata`/`_nested_virtual_paths`, the SAME machinery `_inject_nested_archives` already uses for extracted zip archives — so a record shows up as an ordinary "file" (its key, sanitized, as the name) browsable and previewable through the file browser's own existing pipeline, no bespoke UI. Triggered automatically the first time a real LevelDB-shaped folder (`_looks_like_leveldb_dir`) is navigated into (`on_folder_selected`); persists across case reopen by re-detecting already-extracted folders on disk (`_rescan_decoded_leveldb_folders`), no new DB table needed. A record's own value previews via `FastZipBrowser._display_preview_bytes` (the same JSON/XML/bplist/ABX/text/hex rendering a real file gets) — see Conventions. **`_decode_indexeddb_folder` — a REAL decoder for IndexedDB specifically, added 2026-09-19** (see the `ccl_chromium_indexeddb.py` module-table entry below for the vendored decoder itself): `_decode_leveldb_folder` now tries this FIRST for any folder matching Chromium's real `<origin>.indexeddb.leveldb` naming convention (`_is_indexeddb_leveldb_dir`), falling back to the generic per-raw-cell decode above on ANY failure — strictly additive, never a regression risk. One virtual file per REAL decoded `IndexedDbRecord` (database → object store → record, via `ccl_chromium_indexeddb.WrappedIndexDB`), not per raw LevelDB cell — a logical IndexedDB record can span several raw cells (an externally-wrapped blob is a separate real LevelDB entry the decoder resolves and merges automatically), so the record COUNT itself is usually much smaller than the generic view's per-cell count, by design. A record's own key (`_format_idb_key_value` — handles every real `IdbKeyType`: str/float/Date/Array/Binary/Null) and database/object-store names become the display name; a successfully deserialized value (dict/list/str/CryptoKey/etc.) is pretty-printed via a hand-written recursive `_jsonify` and typed `'indexeddb'` — NOT a bare `json.dumps(..., default=str)`, per a real bug caught during verification: many of these vendored Blink types (`V8CryptoKeySubType`, `V8CryptoKeyUsage`, etc.) are `enum.IntEnum` subclasses, and json's own encoder special-cases any `int` subclass BEFORE ever consulting `default=` — so a real CryptoKey's `algorithm_type`/`key_usage` fields first rendered as bare integers (`9`, `6`) instead of their real names (`AesGcmTag`, `kEncryptUsage|kDecryptUsage`), confirmed directly against the real npr.org record cited below before switching to `_jsonify`'s own hand-rolled recursive dataclass/Enum/bytes conversion, which handles an Enum BEFORE json's encoder ever sees it; a value that's still genuinely binary (e.g. real AES-GCM ciphertext) is left as raw bytes, honestly typed `'Other'`, never fake-decoded. `_extract_tree` (new, recursive) additionally extracts the real sibling `<origin>.indexeddb.blob` directory when present (Chromium's own external-large-value store — confirmed necessary against real npr.org data, whose Permutive-analytics CryptoKey records reference one) via `_indexeddb_blob_dir_for`. `_reapply_leveldb_type_overrides`/`_load_leveldb_record_preview` both branch on a new `entry['kind']` field (`'raw'` vs `'indexeddb'`) so a real decoded record's already-final content type/preview bytes are never re-derived through the generic heuristic path. Verified end-to-end against real data, not assumed: driving the actual `FastZipBrowser` in-process (no manual state, fresh case dirs) against TWO independent real archives found **10/10 real IndexedDB folders on Android 14 JoshHickman and 83/83 on Android 15 CTF25 Cellebrite decode successfully with zero exceptions and zero fallbacks** (1,215 and 1,548 real records respectively) — including real, CONFIRMED-correct "0 records" results for several real databases (`cellebrite.com`'s AdRoll store, `mlb.com`'s service-worker cache, DuckDuckGo's `theoplayer-cache-database`) that genuinely hold only Chromium's own database/object-store bookkeeping and no actual stored data on this device, independently cross-checked against the vendored decoder called directly (not just through this integration) before trusting the "0" as real rather than a bug. Local Storage/Session Storage folders are completely unaffected (`_is_indexeddb_leveldb_dir` only matches the IndexedDB naming convention) — confirmed by direct regression check (Chrome Local Storage 522 records, Edge Session Storage 202 records, both unchanged). This closes the real gap that prompted it: this project's own schema-less `classify_leveldb_value` heuristic (see below) badly mislabels real IndexedDB values (confirmed: `b'\x05'`/`b'\x15\x00\x00\x00\x0f'`-style short binary blobs shown as garbled `'text'`) — a real decoder sidesteps the guess entirely rather than trying to guess better.
+
+**Generic classifier extended to ALL LevelDB stores, not just Chrome, same day, direct follow-up request** ("this parser is meant for all leveldb ... the whole key and value need to be decoded correctly"). `classify_leveldb_value`/`_leveldb_value_candidates`/`leveldb_value_preview_bytes` gained real protobuf detection and a real bare-UTF-16LE (no tag byte) candidate, closing gaps found reviewing real non-Chrome stores: Google Play Services' own CryptAuth/SafetyNet/semantic-location/usage-reporting databases and Chrome's own Sync Data/Local-Storage-META: records all store real protobuf with NO tag-byte convention, and were mislabeled `'text'` the same way IndexedDB's own short values were (a short/simple protobuf message's bytes routinely happen to all be < 0x80, trivially "valid UTF-8"). New `_protobuf_field_count` — a schema-less structural varint-tag scanner (the same technique `protoc --decode_raw`/PBTK use: walk `(tag varint, wire-type-appropriate payload)*`, wire types restricted to {0,1,2,5}, requiring the WHOLE buffer to consume with zero leftover bytes) — labels a value `'protobuf'` when it finds `>= 2` fields; `_is_length_delimited_protobuf` is the parallel check for Java's real `Message.writeDelimitedTo()` convention (a leading varint LENGTH, not a tag, that must exactly match the remaining buffer — confirmed as the real shape of GMS CryptAuth's own `DEVICE_METADATA_DeviceSync:...` values). `min_fields=2` (not 1) is the single biggest false-positive lever, validated via a dedicated sweep against real `random.randrange(256)` noise across 18 lengths (1-100 bytes, thousands of trials each): `min_fields=1` lets random noise false-positive up to ~7%, `min_fields=2` cuts the bare-protobuf detector's own worst case to ~1.5% and the length-delimited variant's to ~0.04% — re-run against this project's own from-scratch reimplementation (not just trusted from the design pass that proposed it) before shipping. Real, disclosed cost of that safety margin: a genuine but SINGLE-field short protobuf value (e.g. a real Chrome `shared_proto_db` value, `b'\n\x011'`, field 1 = "1") stays unclassified as protobuf — not wrongly `'text'` either way, just not positively identified, a real accepted trade-off rather than something silently glossed over.
+
+The SAME review also tightened `classify_leveldb_value`'s long-standing `is_definite` branch, which used to accept ANY value whose FULL raw bytes happen to decode as UTF-8 as `'text'` with NO further check at all — the one candidate this function ever gave a completely free pass, confirmed as exactly how the original real short IndexedDB binary values (`b'\x05'`, `b'\x15\x00\x00\x00\x0f'`) got mislabeled in the first place. Now gated on `_key_display_plausible` (the same no-length-floor control-character-ratio check already built for the key-naming fix earlier the same day — reused rather than duplicated) rather than `artifact_runner.text_plausible`, whose 8-character floor would let exactly these short values back through; the pre-existing tag-stripped-candidate branch's own `text_plausible` check is completely unchanged. A parallel `_key_display_plausible` gate was added to `leveldb_value_preview_bytes`'s own equivalent Priority 3 branch for the same reason, even though it doesn't change what bytes get shown (a rejected candidate there still falls through to the unconditional `return raw` at the very end) — kept so this function's own notion of "is raw plausible text" never silently drifts from the Type label's.
+
+New Candidate 3 in `_leveldb_value_candidates`: bare UTF-16LE with NO tag byte at all — Chromium's real Session Storage convention, confirmed against 5 completely unrelated real apps' own real Session Storage data (Chrome, Edge, Opera, TikTok, GroupMe — e.g. a real value decoding to "Accounts and settings"), genuinely different from Local Storage's own tag+text scheme. Gated on even length >= 2 (a UTF-16 code unit is always 2 bytes) and >= 50% of odd-position bytes being 0x00 (50%, not a stricter ratio, because a real UI string containing even one non-ASCII BMP character would fail a stricter threshold) — validated at <= 0.7% (mostly 0%) false positives across lengths 2-40 against random noise. A **real bug found by this fix's own full-92-folder regression diff, not by inspection**: this candidate could ALSO misfire on a value that already starts with a recognized Chrome tag byte (0x00/0x01) whose OWN tag-specific decode fails — trying to decode the FULL raw bytes (tag byte included) as UTF-16LE instead misaligns every subsequent byte pair by one, producing a plausible-looking but completely garbled result. Confirmed on a real npr.org IndexedDB value (`tag=0x00`, body = the real Blink MIME string `"application/vnd.blink-idb-value-wrapper"` plus trailing bytes that make the body's own UTF-16LE decode fail) — before the fix, this decoded via the misaligned bare candidate to garbage; after, it correctly falls back to `'bin'`. Fixed by skipping the bare-UTF-16LE candidate outright whenever `raw[0] in (0x00, 0x01)` — a value starting with a real Chrome tag byte already has its own dedicated interpretation path; guessing at a second, different (untagged) reading of the identical bytes when that one fails has no upside and a demonstrated downside. Also fixed the same day: the empty-payload edge case (`b'\x00'`/`b'\x01'` alone) — the original `len(raw) > 1` guard on the tag-stripped candidate silently skipped a bare 1-byte tag with no payload at all, so a genuinely tagged-empty-string value never resolved as `'text'` via that candidate; changed to `len(raw) >= 1` (an empty `body` decodes to `''` under either encoding without raising).
+
+Verified end-to-end against real data, not assumed: a hand-built synthetic ground-truth set (real multi-field protobuf, a real single-field protobuf negative case, the real GMS `shared_proto_db/metadata` byte pattern, a real length-delimited example, plus every previously-fixed real case — tagged JSON, tagged plain text, bare-UTF-16LE Session Storage text, the three original short-binary IndexedDB false positives) all classify correctly. Then re-decoded 6 real non-Chrome stores fresh from the real archive (`shared_proto_db/metadata`: 46/46 now `protobuf`, was `text`; GMS CryptAuth: 5/5 now `protobuf`; Chrome GCM Store/Encryption: 2/2 now `protobuf`; **Chrome Sync Data: 3,518 of 3,546 real records now correctly `protobuf`**, previously shown as garbled text with real embedded content like a device's own `"Pixel 7a"` model string hidden inside binary-looking bytes). A precise before/after transition diff across every real record in `case_data/EXTRACTION_FFS/leveldb_browse/` (264,593 real records across every extracted folder from this whole day's work) found zero exceptions and — after the tag-byte-collision fix above — exactly two remaining `bin -> text` transitions, both real IndexedDB-internal binary values (IEEE-754 doubles wrapped in Blink's own value format) that are irrelevant in production since a real IndexedDB folder is routed through the real decoder (above) rather than this generic classifier at all; every other transition (`bin -> protobuf`: 15,994; `text -> bin`: 3,133; `text -> protobuf`: 1,817; `text -> json`: 53 — the last one Session Storage records whose real JSON shape only became visible once the bare-UTF-16LE candidate existed to decode them at all) is a confirmed improvement, and zero real structured classification (`json`/`xml`/`plist`/`bplist`) was ever downgraded. Full pytest suite (18/18) and `scripts/check_claude_md.py` re-confirmed clean throughout.
+
+**A real, disclosed gap found answering a direct follow-up question the same day: this newly-decoded/reclassified content is NOT currently reachable by Keyword Search.** Checked `app/keyword_search.py` directly rather than assumed either way — `KeywordSearchWorker` builds its entire search index from the real zip archive's own physical entries (`_build_zip_entries`), with zero reference anywhere to `folder_map`/`_nested_virtual_paths`/`_leveldb_folder_map` (the structures every LevelDB/IndexedDB virtual record lives in). A generic (non-IndexedDB) LevelDB record's raw tag-prefixed bytes are still physically present in the real `.ldb`/`.log` file, so a keyword search MIGHT still stumble onto a byte-level match there — but reported against the raw physical filename, not the friendly decoded record name, and with no benefit from tag-stripping/protobuf-labeling. For a REAL DECODED IndexedDB record specifically, the content an examiner actually sees (a deserialized dict, a CryptoKey's real fields, anything that was Snappy-compressed or resolved from an external blob) is frequently NOT present as a literal byte substring anywhere in the raw file at all — searching for a real recovered string like `"AesGcmTag"` would never match. `NestedArchiveSearchWorker` (same file) is the existing precedent for a SEPARATE search pass over non-physical-archive content (it searches inside re-extracted nested ZIPs); extending Keyword Search to also cover LevelDB/IndexedDB virtual records the same way is a real, distinct, not-yet-built follow-on.
+
+**That follow-on shipped the same day, 2026-09-19/20, after a real design discussion working through storage, scale, and UX before any code was written** (per direct user request — "can you wrote up your plans first"). Three real design questions were resolved before implementation, each changed the plan from what was first proposed:
+
+1. **Storage**: NOT a persisted file under case_dir (the user's first idea) and NOT a naive "just search in-memory" design (this session's own first proposal) — a new `casecache.db` table, `leveldb_search_index`. The user's own correction mid-discussion was the deciding factor: `casecache.db` is *already* the established "rebuildable, app-managed, safe to silently rewrite" half of this project's two-database split (vs. `caseresults.db`, which only changes via examiner action) — exactly the right category for derived search text, and the "staleness" concern this session raised against it was really just "needs the same versioned-rebuild mechanism `app_intelligence_scan_key` already has," not a real blocker.
+2. **Scale**: measured, not assumed. A real 15,575-folder archive has 234 real LevelDB-shaped folders; discovery (`_looks_like_leveldb_dir` over folder_map, zero I/O) costs ~23ms; fully decoding and classifying every record in all 234 costs ~3.4-9s of CPU (variance is real-disk-read noise, not a design change) recovering 257,804-real records. The real cost isn't CPU time — it's that turning every one of those into a LIVE virtual file the way ordinary browsing does would bloat `full_metadata` by ~17x for a single search. `index_leveldb_folder_for_search` (leveldb_viewer.py) is a genuinely separate, lightweight decode path from `_decode_indexeddb_folder`/`_decode_leveldb_folder` — same underlying decode logic (shares `_iterate_indexeddb_records`/`classify_leveldb_value`/`leveldb_value_preview_bytes`/`decode_plist_blob`), but returns rows for SQL instead of ever touching `folder_map`/`full_metadata`/`_leveldb_folder_map`. Verified directly, not assumed: before/after size-equality checks on `folder_map`/`full_metadata` across three real folder types (IndexedDB, Local Storage, protobuf-only Sync Data) confirmed byte-for-byte unchanged after indexing.
+3. **Hit UX**: the user asked specifically "what does a hit look like, will it make sense, can I right-click to find it in the browser" — answered by mirroring the *existing* SQL-hit precedent (`Interpret as SQL Record` → `Jump to this row in the report`) rather than inventing a new interaction pattern, then confirmed with "rightclick please" when offered double-click as an alternative.
+
+**Real bugs found during verification, not assumed away:**
+- **Zero-record folders silently never counted as indexed.** `save_leveldb_search_records` originally inserted nothing for a folder with no indexable text (protobuf-only stores like Chrome Sync Data — 147 of 234 real folders in this archive) — `indexed_leveldb_folders`'s own `SELECT DISTINCT folder_ui_path` could then never distinguish "genuinely processed, found nothing" from "never touched," so `_leveldb_search_coverage` kept re-offering all 147 as unindexed forever. Confirmed directly: first full-archive indexing run left "234 total, 147 unindexed" instead of 0. Fixed with a sentinel row (`record_index=-1`, empty text) per empty folder; `LevelDbSearchWorker`'s own query explicitly excludes `record_index < 0`.
+- **A record's own display name can contain '/' and silently corrupt the hit tree.** A real display name like `"https://mlb.com - PubMatic_USP"` contains literal slashes; `_search_add_hit`'s existing `filename.rsplit('/', 1)` folder/basename split (built for real archive paths, which never have this problem) would have carved the URL's own `https:/` prefix off as a bogus extra tree-nesting level. Found before it ever shipped, by tracing the exact string construction, not by observing a broken tree at runtime. Fixed by substituting '/' → '∕' (U+2215 DIVISION SLASH, the same visually-similar substitution macOS Finder uses for a real filename containing '/') in the display portion only — the real vpath used for navigation is carried separately via dedicated data roles, never derived from this display string, so nothing is lost.
+- **A LevelDB hit's own "offset" is not a real archive byte offset** — it's a position within already-decoded/rendered text (UTF-16LE re-encoded to UTF-8, JSON pretty-printed, a plist walked into JSON). Labeled explicitly (`"47 (in decoded text)"`) rather than shown as a bare number, so it can never be mistaken for a forensic citation the way a real hit's Offset column is.
+- **A genuine Qt modal-dialog hang under headless verification**, same failure class already documented elsewhere in this project (`_interpret_search_hit_as_sql`'s own live-GUI verification note): `_start_keyword_search_run`'s `self._search_progress_dlg.exec()` blocks forever with nothing to click it under an offscreen Qt platform. Not a bug in the shipped feature — worked around for testing by neutralizing `SearchProgressDialog.exec` for the duration of the in-process verification run, same workaround this project has already needed once before.
+
+**Architecture, concretely:**
+- `db_utils.py`: `leveldb_search_index` table (schema v17) — `(folder_ui_path, record_index, display_name, searchable_text, content_type)`, indexed on `folder_ui_path`. `save_leveldb_search_records`/`indexed_leveldb_folders`/`clear_leveldb_search_index`.
+- `leveldb_viewer.py`: `leveldb_decode_logic_version()` (blake2b hash of this module's own source — same auto-derived staleness-key technique `app_intelligence.scan_logic_version()` already established, so the NEXT classify_leveldb_value improvement invalidates the cache automatically). `_jsonify`/`_iterate_indexeddb_records` promoted to module level (refactored out of `_decode_indexeddb_folder`, which now just calls them) specifically so `index_leveldb_folder_for_search` shares the identical real-decode logic rather than a second copy that could drift. Only records classified `text`/`json`/`xml`/`plist`/`bplist`/`indexeddb` are indexed — `bin`/`empty` have no text at all, and `protobuf` deliberately gets none either (a structural shape label, not a real decode — nothing new beyond what the main archive search already covers from the record's own still-physically-present raw bytes).
+- `ffs-explorer.py`: `_leveldb_search_coverage()` (shared discovery+staleness predicate, mirrors `_header_candidate_matches`'s own "one predicate, never two that could drift" principle), `_undecoded_leveldb_folder_count()` (mirrors `_unextracted_archive_count`), `_index_leveldb_folders_batched()` — frame-budgeted on the MAIN thread via the same `QTimer.singleShot`/deadline idiom `_populate_tree_children_batched` already uses for tree population, deliberately NOT a QThread: `index_leveldb_folder_for_search` reads archive bytes via `self._read_zip_bytes`, the GUI's own shared reader, and this project's standing convention is that a background worker must own an independent reader (see `KeywordSearchWorker`/`NestedArchiveSearchWorker`, both of which read via their own independent zip access) — giving this a second reader implementation would be real, avoidable complexity given the already-cheap measured cost.
+- `keyword_search.py`: `LevelDbSearchWorker` (a genuine QThread — pure local SQLite reads, no zip/network I/O, so unlike indexing itself this one IS safe as a background worker) queries the SQL index (`LIKE`, wildcards escaped) and finds every match position itself in Python (SQL only proves *that* text matches, not *where*). `_start_keyword_search`'s Search Coverage reminder now also mentions undexed LevelDB folders with its own "Index N LevelDB Folder(s) Now" button, deferring the actual search launch (split into `_start_keyword_search_run`) until indexing's `on_done` fires. `_search_add_hit` gained `leveldb_folder`/`leveldb_record_index`/`offset_label` parameters (new UserRole+5/+6 data roles). Right-click → "Show Record in File Browser" (shown instead of "Interpret as SQL Record" for a LevelDB-sourced hit, never both) calls `_show_leveldb_hit_in_browser`, which ensures the folder is decoded (idempotent, fast — indexing already extracted its raw files), resolves the hit's stable `record_index` via `_leveldb_folder_map`'s own `record_vpaths` list, and reuses the identical navigate+select dance `_open_parent_folder_from_search` already uses for an ordinary hit.
+- Scoped to `'all'`/`'app_data'` search scopes only for this first version (a real, disclosed v1 limitation) — `'selected'`/bookmark scopes are about specific files, and mapping those onto which decoded records fall "inside" them isn't implemented yet.
+
+**Verified end-to-end via the real, running application in-process** (same `importlib.util.spec_from_file_location` + real `QApplication` methodology this project already established for verifying "Interpret as SQL Record"): indexed a real, fresh copy of the Android 14 JoshHickman case (234/234 folders, 179,341 real rows), ran a real search for `"AesGcmTag"` through the actual `_start_keyword_search()` entry point — found the real npr.org IndexedDB CryptoKey hits (readable decoded JSON context, correctly labeled offset) *and* real main-archive hits (a literal `kAesGcmTagLength` BoringSSL symbol inside real `.apk` files) side by side, confirming the two search passes coexist without interference. Right-clicking a real LevelDB hit and invoking "Show Record in File Browser" correctly switched to the File Browser tab, navigated to the exact real folder, and selected record index 6 — verified against the model's own stored ui_path, confirmed byte-for-byte identical to the vpath the hit itself carried, not merely "a row got selected."
+
+**A real, significant bug found the next day, 2026-09-20, by direct user report**: a real Local Storage record the user had found by ordinary browsing (`.../Local Storage/leveldb/000041_https___ads.pubmatic.com_ - https___mlb.com - PubMatic_USP`, real value containing `1720919794105`) produced ZERO search hits despite the folder having been indexed. Root cause, confirmed directly against the user's own real case_dir before fixing anything: `_leveldb_search_coverage`'s own discovery step (`[p for p in self.folder_map if _looks_like_leveldb_dir(...)]`) is a purely STRUCTURAL check — it only recognizes a folder that still has real `CURRENT`/`.ldb` files as its DIRECT children. The moment a folder is decoded for browsing (`_decode_leveldb_folder`, e.g. from an ordinary double-click), `folder_map[ui_path]` permanently switches to virtual per-record children, so `_looks_like_leveldb_dir` stops recognizing it — the folder silently vanishes from discovery FOREVER, regardless of how many times indexing runs afterward. This is exactly backwards from what an examiner would expect: a folder they've already looked at is exactly the one most likely worth searching, not the one search coverage should quietly drop. Confirmed directly against the user's real case: the folder's own local extraction (`case_dir/leveldb_browse/.../.ffs_leveldb_source_ui_path`) showed it had genuinely been decoded, and `leveldb_search_index` had zero rows for it despite 179,000 real rows existing for every OTHER folder in the same case.
+
+Fixed two ways together: (1) `_leveldb_search_coverage`'s own `all_paths` now unions the structural-check results with `self._leveldb_folder_map.keys()` — an already-decoded folder is still a real LevelDB folder regardless of what its own `folder_map` entry currently looks like. (2) `_index_leveldb_folders_batched` — for a folder already in `_leveldb_folder_map`, uses that entry's own `real_children` (the true original raw-file listing, recorded once at the moment it was FIRST decoded) instead of recomputing from `self.folder_map.get(ui_path)`, which would now incorrectly return virtual per-record paths instead of real files to extract from.
+
+Verified against a safe, isolated copy of the user's real case (never against the live one): reproduced the exact bug end-to-end first (decode the folder, confirm it silently disappears from `_leveldb_search_coverage`'s own `all_paths`), then confirmed the fix — the folder now correctly stays discoverable after decode, gets indexed (341 real rows), and a search for `1720919794105` finds exactly the real record (`record_index=41`, a real PubMatic USP consent-string blob: `{"95054":{"t":1720919794105,"c":"1---"},...}`). Regression-checked against a genuinely fresh, never-decoded copy of the same archive (`_leveldb_folder_map` empty) — still finds all 234 real folders exactly as before, confirming the fix is additive, not a behavior change for the already-working case. Separately confirmed non-regressive against the user's own real, already-indexed case_dir directly: of 234 real folders, 233 were already correctly indexed from an earlier real run, and the ONLY one flagged as still needing indexing was precisely this same Local Storage folder — exactly the gap this fix closes, not a new one it introduces.
+
+**A second, related real bug found the same day, by the same user, immediately after the first fix**: with the folder now correctly indexed and the real value found, the examiner reported the results DIALOG never updated to show the hit, and declared "0 hits" once "complete" — even though the real hit visibly appeared in the results tree. Root cause, confirmed directly rather than assumed: `_on_search_finished` (the dialog's own "mark complete" step) was wired ONLY to `KeywordSearchWorker.finished` — the MAIN archive worker's own completion — with no equivalent wait for `NestedArchiveSearchWorker`/`LevelDbSearchWorker`, both of which run as genuinely independent, differently-timed background passes. Worse, the final "N hits" TEXT came from `KeywordSearchWorker.finished`'s own emitted count specifically — never a true combined total — so even a search that DID wait long enough would still have shown only the main worker's own hit count, silently dropping every nested-archive or LevelDB hit from the summary. This is a real, structural gap that predates LevelDB search entirely (nested-archive hits had the identical blind spot from the day that worker was added — `NestedArchiveSearchWorker.finished` was never connected to anything at all), but went unnoticed until LevelDB search made it common for a real hit to exist ONLY outside the main worker's own count: a UTF-16LE-encoded Chrome DOM-Storage value, re-decoded to UTF-8 for the LevelDB search index, never matches its own raw on-disk bytes at all, so the main worker routinely finds ZERO matches for a term the LevelDB pass finds a real hit for — and the main worker, scanning real files, is frequently the SLOWER of the two, meaning the premature "0 hits, complete" message was the common case, not a rare race.
+
+Fixed by tracking genuine multi-worker completion explicitly: `_search_pending_workers` (a set, populated with exactly `{'main'}` plus `'nested'`/`'leveldb'` for whichever of those two actually started for this specific search — scope-dependent, matching each worker's own real start condition) is checked by a new shared `_mark_search_subworker_done(name)`, called from each worker's own `finished` signal (`_on_main_search_finished`/`_on_nested_search_finished`/`_on_leveldb_search_finished` — the latter two newly connected; previously `NestedArchiveSearchWorker.finished` was connected to nothing at all). The real "declare complete" logic (`_on_search_finished`'s old body, renamed `_finalize_search_results`) now runs exactly once, only once every started worker has genuinely finished — cancelling the search still terminates promptly, since every worker's own `run()` unconditionally emits `finished` after honoring `stop()`, so waiting for "all done" also naturally covers "all stopped." A new `_search_hit_count`, incremented by all three of `_on_search_result`/`_on_nested_search_result`/`_on_leveldb_search_result` as hits actually arrive (never any one worker's own emitted total), is what `mark_finished`/the final status text now report — a true combined count regardless of which pass(es) actually found something. Live progress got the same treatment: `NestedArchiveSearchWorker.progress`/`LevelDbSearchWorker.progress` are now connected to a new `_on_search_hits_updated`, which refreshes the dialog's own "hits so far" text (via a new `SearchProgressDialog.update_hit_count`, preserving whatever "Checked X/Y files" prefix the main worker's own progress last set) as soon as a hit arrives from EITHER background pass, rather than only updating on the main worker's own next tick.
+
+Verified end-to-end against a safe, isolated copy of the user's own real case (search index already correctly populated by the first fix above): searched for the user's own real value, `1720919794105`, through the actual `_start_keyword_search()` entry point. Confirmed the exact bug shape mid-search — `_search_pending_workers` still showed `{'main'}` (the main worker, scanning ~97,619 real files, genuinely takes ~30+ seconds) while `_search_hit_count` had ALREADY reached 1 (the LevelDB pass, a fast local SQL query, finished almost immediately) — proving the fix correctly withholds "complete" while a slower sibling worker is still running, exactly the scenario that previously produced a premature "0 hits." Let to run to genuine completion: `_search_pending_workers` correctly reached `set()` and the dialog's own final label read **"Complete — 1 hit across 1 file"** — not "0 hits" — with `search_status` correctly reading `"'1720919794105' — hits in 1 file"`. |
 | `artifact_runner.py` / `artifact_db.py` / `artifact_viewer.py` | Plugin system: parser scripts in `artifacts/ios|android/` (e.g. `photos_metadata.py`, `sms_messages.py`, per-platform `whatsapp.py`) run against the archive, results into `casedata.db`, browsed in Artifacts tab. Third-party iOS apps declare `app_group` instead of `app_path` — their container is GUID-named per install, resolved via the case's `guid_to_bundle` map at run time (`artifact_runner._resolve_app_group_base`); see `artifacts/ios/whatsapp.py`. A THIRD parser shape (added 2026-09-15), `device_wide = True`, is for a parser scanning the whole device rather than one app — see the "App Report parser scripts (device_wide API)" Conventions entry. The `paths` dict `run()` receives also carries a reserved `_app_base_ui_path` key (the container's own ui_path) for a parser that needs to *reference* another file inside the container — e.g. an attachment path stored in a DB column — without extracting it itself; see `media_fields` below. `artifact_runner.py`
 also exposes small importable helpers a parser's own `run()` can reach for
 directly (`from artifact_runner import first_nonempty`, etc.) — see "Parser
@@ -104,7 +162,7 @@ helpers" below, the standard place to add the next one. The `paths` dict
 also carries reserved `_nested_archives`/`_nested_archive_errors` keys
 when a parser declares `requires_nested_extraction` — see Conventions
 and `nested_archive.py` above |
-| `chrome_cache.py` | Qt-free core for Chrome's HTTP disk cache (Simple Cache format) — entry parsing, HTML reference scanning, and synthetic `.mhtml` reconstruction, plus `parse_all_entries(paths)`, the shared full-directory pass both `artifacts/android/chrome_cache_media.py` and `chrome_cache_pages.py` filter/project down to their own content-type rather than each re-implementing the decode loop. See its own module docstring for the reverse-engineered on-disk format and the Conventions entries on the Chrome Cache report split |
+| `chrome_cache.py` | Qt-free core for Chrome's HTTP disk cache (Simple Cache format) — entry parsing, HTML reference scanning, and synthetic `.mhtml` reconstruction, plus `parse_all_entries(paths)`, the shared full-directory pass both `artifacts/android/chrome_cache_media.py` and `chrome_cache_pages.py` filter/project down to their own content-type rather than each re-implementing the decode loop. See its own module docstring for the reverse-engineered on-disk format and the Conventions entries on the Chrome Cache report split. Its own body-decompression logic (`_decompress_body`) was promoted to `artifact_runner.decompress_http_body` 2026-09-22 (a second real caller emerged — `embedded_media_scan.py`'s HTTP-response-unwrap step; see the "Embedded-media sweep" Conventions entry) — nothing in that function's own logic was ever Chrome-specific, only Chrome-named because Chrome's Simple Cache was the first real place it was needed; this file now imports it as `_decompress_body` (same name, so its own 3 call sites needed zero changes) rather than keeping a second copy |
 | `chrome_shared.py` | Small helpers shared across the `artifacts/android/chrome_*.py` parser family (Login Data, Cookies, Network Action Predictor, Top Sites, Shortcuts, Favicons, Autofill, ...) — `url_set` (distinct values of one column, with a real None-vs-empty-set "couldn't check" distinction for an optional cross-reference file) and `history_visits` (Chrome History's own visits/urls joined and webkit_us-converted once) are genuinely Chrome-schema-specific and belong here. `query_rows` (the connect/row_factory/close boilerplate every simple single-table parser needs) is NOT actually Chrome-specific in its own logic — only Chrome-named because that's the batch of parsers where the duplication was first noticed (2026-09-03 gap sweep) — it's now a thin wrapper around the real, universal `artifact_runner.open_db_readonly` (added 2026-09-12, see that Conventions entry), kept here only so its existing Chrome-parser callers needed no changes; a NON-Chrome parser should import `open_db_readonly` directly instead. Same "one Qt-free core module, imported by name" pattern as `chrome_cache.py` above — each consuming parser script stays a thin declaration (its own SQL + per-row shaping), not a place to re-derive this plumbing. See Conventions for the gap-sweep entry this was factored out of, and the `open_db_readonly` entry for the read-only-connect fix |
 | `ai_summary.py` | The AI Summary feature's core logic (added 2026-08-29): reads an already-completed report's rows straight from `caseresults.db` (the same source `query_artifact` reads, so this only ever summarizes what's already been reviewed as a normal Report, never a fresh unreviewed parse), splits them into time-gap-bounded chunks (`_chunk_by_time_gap` — natural session boundaries in the real timestamps, not fixed row counts, so a redirect/sign-in chain never gets cut in half), sends each chunk to a local LLM (`local_llm.py`) for a mini-summary, then combines the mini-summaries into one final narrative via a size-bounded hierarchical reduce (`_reduce_hierarchically`). That last step exists because a flat single reduce call was confirmed by direct testing to hit the exact same context-length ceiling an unchunked report does, once there are enough chunks — a real 75-row/2.5-month case produced 24 chunks whose concatenated mini-summaries (37,505 chars) failed the same way the original unchunked 61-row case did at 32,575 chars; `_reduce_hierarchically` batches under a safe character budget and recurses until one narrative remains. Qt-free; used by both `mcp_server.py`'s AI Summary tools and `artifact_viewer.py`'s `AISummaryDialog`, so there is exactly one implementation of "what gets sent and how" |
 | `ai_summary_store.py` | Global (cross-case) settings for AI Summary (added 2026-08-29): the local LLM connection (endpoint/API key/model — LM Studio by default) plus, per report (keyed by bare `script_name`, matching `query_artifact`'s own `name` parameter), which columns get sent, chunk size, max time-gap-per-chunk, and the editable prompt template (must contain a `{data}` placeholder). `config/ai_summary_settings.json`, same dev/frozen-path convention and mtime+size load cache as `research_store.py` |
@@ -197,6 +255,7 @@ exists there — `build_app_registry` returns `([], {})` immediately.
 
 | `ccl_abx.py` | Vendored Android Binary XML (ABX) decoder (added 2026-08-23) — MIT, CCL Forensics, lifted from ALEAPP's `ilapfuncs.py` `abxread()`, same vendoring convention as `app/ccl_segb/` (original license header kept verbatim in-file). `is_abx`/`abx_bytes_to_xml_root` are this project's own thin additions (not vendored) — the original takes a file path and opens it itself; callers here already have the bytes via `ctx.read_bytes`. Used by `app_intelligence.py` for `packages.xml`/`runtime-permissions.xml`, which are ABX on some Android devices/builds and plain XML on others — see that row for how this was discovered. |
 | `ccl_leveldb.py` / `ccl_simplesnappy.py` | Vendored LevelDB reader + its Snappy decompressor (added 2026-09-05) — MIT, CCL Forensics (Alex Caithness), lifted verbatim from the local iLEAPP checkout's `scripts/ccl_leveldb.py`/`ccl_simplesnappy.py` (same lineage `ccl_abx.py` above is vendored from), unmodified except one import line (`import scripts.ccl_simplesnappy` → `import ccl_simplesnappy`, to match this project's flat `app/` layout — diffed line-for-line to confirm nothing else changed). Found by directly reviewing Hindsight (`/Users/klastveita/script/hindsight-main`, a real, actively-maintained Chrome/Firefox forensics tool) — it depends on `ccl_chromium_reader`, which wraps this same `ccl_leveldb`/`ccl_chromium_cache` lineage rather than hand-rolling a LevelDB parser, confirming this was the right dependency to reach for instead of building one from scratch. `RawLevelDb(dir).iterate_records_raw()` reads real `.ldb`/`.log` files directly (no system LevelDB library) and yields EVERY record including deleted/superseded ones (`Record.state`: `Live`/`Deleted`/`Unknown`, plus its own `origin_file`/`offset`/`seq`/`was_compressed`) — the same "cite the raw bytes, never silently discard a deleted record" philosophy `sqlite_carve.py` already follows for SQLite. First (and so far only) consumer: `artifacts/android/chrome_local_storage.py`, below — needs real on-disk files to open/seek (not archive bytes directly), so its `run()` extracts the profile's `leveldb/` directory to `_parser_files_dir` first, same pattern `chrome_cache.py`'s own parser-generated-file convention already established. **Both listed in `ffs_explorer.spec`'s `hiddenimports`** — reached only via a dynamic `import ccl_leveldb` inside a dynamically-loaded artifact script, the exact same invisible-to-PyInstaller situation already fixed once for `chrome_cache`/`chrome_shared` (see that entry a few lines up) and the same bug class the user had already reported once ("No module named 'chrome_cache'" in a frozen build) — fixed here before shipping rather than repeated. |
+| `ccl_chromium_indexeddb.py` / `ccl_blink_value_deserializer.py` / `ccl_v8_value_deserializer.py` / `ccl_chromium_indexeddb_structures.py` | Vendored REAL (schema-informed, not guessed) Chromium IndexedDB decoder — decodes actual on-disk IndexedDB keys via Chromium's own `indexed_db_leveldb_coding.cc` encoding, and values via a real Blink-envelope-then-V8-ValueSerializer deserialize into genuine Python content (dict/list/str/int/datetime/`CryptoKey`/etc.), snappy-decompressed and external-blob-resolved automatically — never a content-type guess. Added 2026-09-19 — MIT, CCL Forensics (Alex Caithness), pinned to commit `ef840de30221c4d65bc96d2f4d9057e9ef2f526d` of `github.com/cclgroupltd/ccl_chromium_reader` (the SAME pinned commit `ccl_chromium_pickle.py`/`ccl_chromium_snss.py` below already vendor from), fetched fresh via `git clone` — directly prompted by a real user report that this project's own schema-less LevelDB value classifier (`leveldb_viewer.classify_leveldb_value`) badly mislabels real IndexedDB values as `'text'` (short binary blobs trivially "decode as valid UTF-8"), and a parallel research pass finding that NO other tool (Crush, a dedicated forensic LevelDB viewer, or a from-scratch protobuf-shape heuristic) actually solves that false-positive class with a heuristic — the real fix is a real decoder, not a better guess. `ccl_v8_value_deserializer.py` is completely UNMODIFIED (stdlib-only, diffed byte-for-byte against the pinned commit). `ccl_blink_value_deserializer.py` has exactly one import line changed (`from . import ccl_v8_value_deserializer` → flat `import ccl_v8_value_deserializer`). `ccl_chromium_indexeddb.py` has four import lines changed, all mechanical package-layout adjustments — see that file's own docstring for the full line-by-line justification, including WHY it reuses this project's own already-vendored `app/ccl_leveldb.py` (added 2026-09-05, a DIFFERENT but same-lineage checkout via iLEAPP) rather than vendoring a second parallel copy: confirmed the one real behavioral difference between the two copies (WAL/.log record-offset computation) is never read by this decoder at all (`IndexedDbRecord.record_location` always passes `None` for its own offset). `ccl_chromium_indexeddb_structures.py` is a DELIBERATELY TRIMMED extraction (not the whole upstream file) — just the `ArtifactLocation`/`ArtifactLocationProtocol` classes this decoder actually needs, both copied verbatim; see that file's own docstring for why the much larger `profile_folder_protocols.py`/`common.py` dependency chain those two classes originally sat inside was left out rather than vendored wholesale. First (and so far only) consumer: `leveldb_viewer.LevelDbViewerMixin._decode_indexeddb_folder` — see that entry above for the full integration and its real-data verification (10/10 and 83/83 real IndexedDB folders across two independent real archives, zero exceptions, zero fallbacks). Not yet listed in `ffs_explorer.spec`'s `hiddenimports` — needed before the next frozen-build test, same dynamic-`import`-inside-a-mixin-method situation already fixed once for `ccl_leveldb`/`chrome_cache` (see those entries). |
 | `ccl_chromium_pickle.py` / `ccl_chromium_snss.py` | Vendored Chromium `base::Pickle` reader + SNSS (Session/Tab-restore) container reader (added 2026-09-05, for the deferred "tabs" work) — MIT, CCL Forensics (Alex Caithness), pinned to commit `ef840de30221c4d65bc96d2f4d9057e9ef2f526d` of `github.com/cclgroupltd/ccl_chromium_reader` (the exact commit Hindsight's own `requirements.txt` pins — fetched fresh via `git clone`+`checkout` at that commit, not assumed from memory), lifted from `ccl_chromium_reader/serialization_formats/ccl_easy_chromium_pickle.py` and `ccl_chromium_reader/ccl_chromium_snss2.py` respectively. `ccl_chromium_pickle.py` is unmodified (stdlib-only); `ccl_chromium_snss.py` has exactly one line changed (the relative `.serialization_formats.ccl_easy_chromium_pickle` import → a flat `ccl_chromium_pickle` import, matching this project's flat `app/` layout — diffed line-for-line against the pinned-commit source to confirm nothing else changed). Reads Chrome's own SNSS binary format (magic `b"SNSS"`, a stream of length-prefixed command records) used by `app_chrome/Default/Sessions/Session_*`/`Tabs_*` — `SnssFile.iter_session_commands()` yields a real `NavigationEntry` (url/title/transition/referrer/timestamp, decoded via the vendored `EasyPickleIterator`) for every real navigation command, and a bare `UnprocessedEntry` (offset + command id, never silently dropped) for every other real command type. `NavigationEntry.from_pickle` is ALSO reused directly (not just via `SnssFile`) by `app/chrome_tabs.py`'s own `parse_android_tab_state` for a second, structurally different real container — see that entry below — confirmed by direct reverse-engineering against real data that both containers embed the identical per-entry payload. **Both listed in `ffs_explorer.spec`'s `hiddenimports`** — reached only via a dynamic `import` inside `chrome_tabs.py`, the same invisible-to-PyInstaller situation already fixed for `chrome_cache`/`ccl_leveldb` above. |
 | `chrome_page_state.py` | Vendored Chromium Blink PageState binary-format parser (added 2026-09-05) — Apache-2.0, from Hindsight (`pyhindsight/lib/page_state.py`, Ryan Benson, pyhindsight `2026.06`), copied verbatim (stdlib-only, no import to adjust). Decodes the `page_state_raw` blob every real `NavigationEntry`/`SerializedNavigationEntry` carries — both Pickle-encoded (PageState v11-25) and Mojo-encoded (v26-33) real wire formats a real Chrome build can write — into referrer, scroll position, POST body/file-upload details, embedded iframe state, and filled-in form field NAMES/types (`FormElement`, deliberately not necessarily every submitted value). Verified directly against real data: a real npr.org page's embedded PageState correctly yielded its real Google-search referrer and real OneTrust cookie-consent checkbox states; a real Google-search page's own decoded scroll offset (5542px) is real evidence of how far the user actually scrolled results. Used by `app/chrome_tabs.py`'s `_page_state_referrer` as a referrer fallback when a `NavigationEntry`'s own bare `referrer_url` field is empty. |
 | `chrome_tabs.py` | Qt-free core for Chrome's tab/session persistence (added 2026-09-05) — this project's OWN original code (not vendored) wiring together the three vendored modules above across THREE genuinely different real on-disk formats, all reverse-engineered and verified directly against this project's own real Android 14 JoshHickman data: (1) `parse_snss_file` — a thin wrapper around `ccl_chromium_snss.SnssFile` for the desktop-style `Sessions/Session_*`/`Tabs_*` container (see `artifacts/android/chrome_sessions.py`); (2) `parse_android_tab_state` — Chrome-for-Android's own CURRENT per-tab `app_tabs/<id>/tab<N>` file (no underscore), confirmed against real Chromium source fetched directly from `chromium.googlesource.com` while building this (`TabStateFileManager.java`'s `readState()` for the outer, BIG-ENDIAN Java `DataOutputStream`-written wrapper — timestamps, parent/root tab id, tab group id, pinned/sensitive-content flags, all genuinely optional past the first three fields, matching the real Java source's own `try {} catch (EOFException)` tolerance exactly — plus `web_contents_state.cc`/`serialized_navigation_entry.cc` for the embedded, LITTLE-ENDIAN `base::Pickle`-encoded native WebContentsState blob, decoded via the SAME vendored `NavigationEntry.from_pickle` the desktop SNSS format uses); (3) `parse_android_tab_state_legacy` — files literally named `app_tabs/<id>/tab_state<N>` (WITH the underscore), a genuinely simpler, DIFFERENT format found alongside the modern one on this same real device under different (stale) tab ids, reverse-engineered PURELY from real data since no current or historical Chromium source names this exact convention (`chrome/browser/tabpersistence/`'s own file-prefix constant is literally `"tab"`, never `"tab_state"`, in every revision checked) — flagged plainly as unverified-against-source in this file's own docstring, unlike format 2. All three verified end-to-end against real files (not just compiled): the desktop-style container recovered a real navigation sequence matching Joshua Hickman's own independently documented ground-truth for this device exactly (a "mobile phone forensics" Google search immediately followed by the Cellebrite forensics page, with a real referrer chain confirming the click path); the `tab<N>` format decoded 6 independent real files with zero anomalies, including a real 2024-02-08 ad-redirect tab's own real title "Dulcetty" and a real multi-step Wickr/Cognito OAuth sign-in chain; the `tab_state<N>` format decoded 6 independent real files with exact byte-for-byte structural fit (zero leftover/unaccounted bytes every time). See `artifacts/android/chrome_sessions.py`/`chrome_app_tabs.py` below for the two Report-facing consumers. |
@@ -5931,3 +5990,758 @@ underneath that verification.
   name so its own existing call site needed no change. Full pytest
   suite (18/18) and `scripts/check_claude_md.py` re-confirmed clean
   after all three fixes.
+
+  **A fourth instance of the same ordering trap, this time for plain
+  TEXT values, found and fixed 2026-09-19 (direct follow-up report: JSON
+  values now resolve correctly, but a single-text-only value still shows
+  its leading 0x01 tag byte and so isn't recognized as text).**
+  `leveldb_value_preview_bytes`'s own Priority 2 checked "does raw decode
+  as UTF-8 at all" before ever checking the tag-stripped candidate's
+  plausibility — and a real tag byte (0x00/0x01) is itself a valid
+  single-byte UTF-8 codepoint, so `b'\x01Hello World'` decodes as "valid
+  UTF-8" with the tag byte still attached, same as fix #2/#3 already
+  found for JSON, just one branch further down this same function.
+  Fixed by moving the tag-stripped candidate's `text_plausible` check
+  ahead of the "raw already decodes as UTF-8, return unchanged" branch —
+  a value genuinely starting with a real tag byte whose stripped body
+  reads as plausible text is now shown stripped, matching the
+  JSON/XML/plist case; an untagged value (no such candidate exists) is
+  completely unaffected. `classify_leveldb_value`'s own Type-column
+  label needed no change — it already returned `'text'` correctly for
+  this case via its own `is_definite or text_plausible(text)` check;
+  only the PREVIEW PANE's raw bytes were wrong, which is what made the
+  generic renderer fall back to hex. Verified against a synthetic
+  tag=0x01/tag=0x00 plain-text pair (both now strip cleanly), a
+  regression check against tag-prefixed JSON (still strips correctly),
+  an untagged plain string (unaffected), and — critically — a genuinely
+  binary value starting with a stray 0x01 byte (confirmed NOT corrupted
+  into false text, still classified `'bin'`, bytes unchanged). Then
+  verified against all 92 real, already-extracted LevelDB folders left
+  over from the earlier survey work (11,739 real records,
+  `case_data/EXTRACTION_FFS/leveldb_browse/`): 853 real records across
+  real apps (TikTok's WebView Local Storage, DuckDuckGo's WebView Local
+  Storage, ...) now correctly strip their leading tag byte where they
+  previously wouldn't — e.g. a real TikTok value
+  `b'\x01JTdCJTIydXNlcklkJTIy...'` now renders as
+  `b'JTdCJTIydXNlcklkJTIy...'` (a base64-looking JSON fragment, now
+  starting cleanly rather than with a stray `\x01`). Full pytest suite
+  (18/18) and `scripts/check_claude_md.py` re-confirmed clean.
+
+  **The REAL "Type shows Other for every row" bug — a second, bigger gap
+  than the one already documented above under fix 3, found and fixed
+  2026-09-19 by direct user report that ALL rows (not just after a
+  manual rescan) showed 'Other'.** `_reapply_leveldb_type_overrides` was
+  correctly wired into `_on_header_types_cleared` (the MANUAL rescan
+  path), but a second, unconditional wipe happens on EVERY case load,
+  never just a manual rescan: `ffs-explorer.py`'s
+  `_start_case_meta_load()` runs a background job that reads
+  `header_types` from `casecache.db` alone, then its `_poll()` callback
+  does `self._header_type_overrides = overrides` — a full REASSIGNMENT
+  of the attribute, not an `.update()` — discarding whatever
+  `_rescan_decoded_leveldb_folders` had already populated moments
+  earlier in that same case-load sequence (it runs synchronously, well
+  before this background DB read + `QTimer`-polled completion lands).
+  LevelDB records are synthetic, never real archive entries, so they
+  were never in `casecache.db`'s own `header_types` table to begin with
+  — meaning this wipe fired on literally every case load, not an edge
+  case. Confirmed directly by tracing `_header_type_overrides.clear()`
+  calls (none fired) before realizing the actual bug was a bare
+  attribute REASSIGNMENT the same trace couldn't see. Fixed by calling
+  `self._reapply_leveldb_type_overrides()` right after that
+  reassignment, same as the manual-rescan path already does. Verified
+  by driving a real, full `FastZipBrowser.start_loading()` sequence
+  in-process against the real Android 14 JoshHickman archive (no manual
+  decode call, no manual reapply call — the exact ordinary case-load
+  path an examiner actually takes) and letting BOTH the synchronous
+  LevelDB rescan and the async header-type DB load/poll fully complete:
+  before this fix, the Chrome Local Storage folder's own 522 decoded
+  records showed only the 3 real physical files (`CURRENT`/`LOG`/
+  `LOG.old`) with any Type override at all — every one of the 522
+  actual records showed `'Other'`, matching the user's report exactly;
+  after the fix, the same full sequence correctly retains 448 overrides
+  (220 `text`, 121 `json`, 104 `empty`, plus the 3 physical files), and
+  the file table's own `_classify_entry` call for every child confirms
+  the ACTUAL displayed values: 220 `text`, 121 `json`, 104 `empty`, and
+  77 `Other` — that last 77 being the real `META:` bookkeeping records
+  (genuine binary protobuf, correctly classified `'bin'` and
+  intentionally left unset per this file's own established "don't add a
+  redundant synonym for the ordinary 'Other' bucket" convention), not a
+  remaining bug. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` re-confirmed clean.
+
+  **A second, real "not happy with the results" report on
+  `https_cellebrite.com_0.indexeddb.leveldb` specifically surfaced two
+  MORE genuine bugs, both root-caused directly against that real
+  folder's own records, 2026-09-19.** (1) `classify_leveldb_value`'s
+  Type/preview logic — built and verified against Chrome DOM Storage's
+  own tag+text convention — is confirmed NOT to hold up for IndexedDB's
+  own genuinely different binary value encoding (Blink's own
+  structured-clone wrapper format): real values like a bare `b'\x05'`
+  or `b'\x15\x00\x00\x00\x0f'` classify as `'text'` purely because a
+  short binary blob's individual bytes trivially decode as "valid
+  UTF-8," and `text_plausible`'s own control-character-ratio check has
+  an 8-character floor that can't even fire on something this short.
+  Scoped, deliberately NOT fixed this session — the user chose to defer
+  it, since `text_plausible` is shared with `sqlite_carve.py`'s own
+  carving-confidence gate and tightening it needs separately re-verifying
+  that gate isn't affected. (2) WAS fixed the same session, narrower and
+  lower-risk: `_sanitize_record_name`'s plain-UTF-8 filename fallback had
+  the identical blind spot — a real key like 5 raw NUL bytes
+  (`b'\x00\x00\x00\x00\x00'`) decodes as "valid UTF-8" (5 NUL
+  *characters*) and was shown as-is, rendering as an invisible,
+  blank-looking filename in the file browser, rather than the honest
+  `record_NNNNNN (N bytes, binary key)` fallback this same function
+  already has for a key that fails to decode outright. New
+  `_key_display_plausible(text)` — deliberately NOT a call to
+  `artifact_runner.text_plausible` (that function's 8-char floor is
+  wrong for a filename decision: a 5-16 byte binary IndexedDB key is
+  the COMMON real case here, confirmed directly against this exact
+  folder) — applies the same control-character-fraction ratio
+  text_plausible uses, but with no length floor at all: even one or two
+  control bytes already makes a useless filename regardless of length.
+  Wired into the plain-UTF-8 branch of `_sanitize_record_name`; the
+  `UnicodeDecodeError` branch (a key that doesn't even decode) is
+  unaffected and shares the identical fallback label.
+
+  Verified against the exact real records that prompted this: all 6 of
+  the real garbled/blank cellebrite.com IndexedDB keys checked
+  (`b'\x00\x00\x00\x00\x00'` through the 16-byte
+  `b'\x00\x00\x00\x002\x02\x00\x00\x7f\xff\xff\xff\xff\xff\xff\xf5'`)
+  now correctly show `record_NNNNNN (N bytes, binary key)`; a real
+  short readable key (`b'1'`) and a real Local-Storage-shaped key with
+  an embedded NUL separator (mostly-readable, low control-character
+  ratio) both still display normally, confirming the fix doesn't
+  over-reject genuinely readable keys. Then re-ran across ALL 92 real,
+  already-extracted LevelDB folders (11,739 real records total,
+  `case_data/EXTRACTION_FFS/leveldb_browse/`) checking every single
+  display name for a residual control-character-heavy result: 8,004
+  records now correctly use the honest binary-key fallback (up from
+  whatever silently-invisible subset existed before), and zero display
+  names anywhere in the full real dataset remain control-character-heavy
+  after the fix. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` re-confirmed clean.
+
+- **Search Coverage dialog made tier-aware, 2026-09-20, same-day follow-up
+  to the LevelDB-dialog-removal entry above.** Direct user feedback:
+  "during search there is now 3 reason to check more header sql
+  records, leveldb and archive... without fully typing all the file we
+  cannot pre process the db or find the archive" — the dialog's own
+  text (post-removal) only ever mentioned compressed archives, leaving
+  a genuinely separate, real gap unstated: `_unextracted_archive_count`
+  (`ffs-explorer.py`) counts archives via `_discover_all_archives(...,
+  overrides)`, where `overrides = self._header_type_overrides` — the
+  SAME header-scan-tier-derived magic-byte overrides that decide which
+  extensionless/mistyped files get correctly identified at all (see the
+  `_HEADER_SCAN_TIER_LABELS`/`ProcessDialog` tier machinery,
+  `ffs-explorer.py`). At a low tier, an extensionless SQLite database or
+  a mistyped embedded archive can be completely UNDISCOVERED, not
+  merely left uncompressed once found — meaning the archive count the
+  old dialog showed could itself silently read "0, nothing to do" while
+  real, undiscovered content still existed. LevelDB indexing is
+  unaffected by tier (discovered structurally, not by header magic
+  bytes) and already runs automatically per the entry above — restated
+  in the dialog only as a completed, non-actionable item, never asked
+  about.
+
+  `KeywordSearchMixin._current_header_scan_tier()` (`app/keyword_search.py`)
+  reads `header_scan_complete_tier`/`header_scan_tier` from
+  `case_settings` directly — a LOCAL read of the same two keys
+  `FastZipBrowser._refresh_header_scan_indicator` (ffs-explorer.py)
+  already reads for the blue banner, rather than importing that
+  method's own dict: app/ modules never import from `ffs-explorer.py`
+  (confirmed by grepping for any existing case of it — none; this
+  file's own pre-existing "Deliberately a small, LOCAL copy of
+  ffs-explorer.py's own DATABASE_... convention" comment a few lines up
+  in this same file already established the pattern for exactly this
+  reason). Only the two tier-number keys are re-read this way — the
+  tier's own LABEL TEXT still comes from `self._HEADER_SCAN_TIER_TEXT`,
+  read as a plain instance attribute at call time (this mixin ends up
+  part of the same `FastZipBrowser` class that defines it), so the
+  wording itself can never drift from what the banner already shows.
+
+  `_start_keyword_search`'s trigger condition changed from
+  `unextracted_archives > 0` alone to `unextracted_archives > 0 or
+  complete_tier < 3` — the whole point being that a low tier can hide
+  the very existence of more to find, not just leave a known archive
+  uncompressed, so the reminder has to appear even when the (possibly
+  undercounted) archive tally reads zero. The dialog text now
+  explicitly numbers all three coverage factors — current header scan
+  tier (with its real consequence stated only when `complete_tier < 3`,
+  and a "(a Tier N scan is currently running)" note when a higher tier
+  is mid-scan, i.e. `requested_tier > complete_tier`), LevelDB/IndexedDB
+  (stated as already automatic, not actionable), and the real
+  unextracted-archive count. Per direct instruction ("have the defual
+  button to go and change the level and review the zips"), the default
+  button changed from "Search Now" to "Review Header Scan Tier and
+  Archives…" (still `QMessageBox.ButtonRole.ActionRole`, still routing
+  to the existing `_open_process_dialog(preselect_nested=True,
+  resume_search=True, auto_archive_selection=True)` call — `ProcessDialog`
+  already combines the tier-upgrade picker and nested-archive selection
+  in one dialog, so no new dialog was needed, just a clearer entry point
+  into the one that already covers both) — "Search Now" remains
+  available as the explicit non-default choice, and the existing
+  "Don't remind me again this session" mute checkbox is unchanged.
+
+  Verified headlessly (a real `FastZipBrowser` instance, `QMessageBox.exec`
+  monkeypatched to auto-click the default button and capture the shown
+  text/buttons rather than block, `_open_process_dialog`/
+  `_ensure_leveldb_indexed_then_run` stubbed to record which path fired,
+  same "verify the exact code path a real click would take" methodology
+  this feature's own earlier verification already used): at a real Tier 1
+  case with 5 mocked unextracted archives, the dialog text correctly
+  numbered all three reasons, named the real current tier, stated its
+  consequence, showed the real archive count, and defaulted to/routed to
+  the Review button; with tier forced to 3 and 0 unextracted archives,
+  the dialog correctly did not appear at all and the search proceeded
+  directly. Full pytest suite (18/18) and `scripts/check_claude_md.py`
+  re-confirmed clean.
+
+  Incidentally, while investigating this: an earlier, still-running
+  background verification script for the PRIOR entry (the LevelDB-dialog
+  -removal smoke test) was found genuinely hung for 17+ minutes at 0% CPU
+  — root-caused, not just killed blindly, to the exact known hazard this
+  project has already documented once before (`SearchProgressDialog.exec()`
+  under offscreen Qt): that script deliberately ran `_start_keyword_search()`
+  with no skip/mute flag set, to test the real default path, but only
+  ever monkeypatched `SearchProgressDialog.exec`, not `QMessageBox.exec`
+  — so the real Search Coverage `QMessageBox.exec()` call (needed because
+  this real case has genuine unextracted archives) blocked forever with
+  nothing to click under the offscreen platform. Stopped via `TaskStop`
+  rather than left running; its scratchpad case copy removed. Not a
+  product bug — a reminder that EVERY modal a headless verification
+  script's own code path can reach needs its own `exec` neutralized, not
+  just the one the test author happened to expect.
+
+  **Wording reworked again two days later, 2026-09-22, this time built
+  collaboratively with the user rather than drafted and shipped
+  directly** — direct feedback on the entry above's own numbered
+  "1./2./3." text: "I do not like the text in the dialog. Can we work on
+  it together. First it should indicate the current header tier and
+  what has not been checked. And then what that means i.e. may miss
+  archive, level db." Rather than guess at a rewrite, walked through it
+  as a real back-and-forth: proposed a checked/not-checked draft, the
+  user's own phrasing implied LevelDB discovery might be tier-dependent
+  too, and — checked directly against `_looks_like_leveldb_dir`
+  (`app/leveldb_viewer.py`) rather than assumed either way — confirmed
+  it isn't: a LevelDB folder is recognized by literal filenames
+  (`CURRENT`, `MANIFEST-*`, `*.ldb`, `*.log`) already present in
+  `folder_map` from the archive's own file listing at open time, never
+  by header/magic-byte content scanning, so no tier level can affect
+  whether one is found. Confirmed this reasoning with the user before
+  writing a line of the new text, and they picked "always found,
+  regardless of tier" as the LevelDB wording rather than folding it into
+  the checked/not-checked framing.
+
+  Final structure, per the user's own ordering ("indicate the current
+  header tier and what has not been checked... then what that means"):
+  a `Header scan: {tier} (current)` line (plus an in-progress note when
+  a higher tier is still scanning), then explicit `Checked:`/
+  `Not checked:` lines for THIS tier specifically, then a `What this
+  means:` consequence line (shown only when something is genuinely left
+  unchecked, i.e. `complete_tier < 3`), then the flat LevelDB line, then
+  the existing archive count and the review/search question — replacing
+  the prior version's single "Covers: ..." sentence entirely.
+
+  Implemented without inventing a fourth, separately-worded copy of the
+  tier semantics: promoted the "Covers: ..." text `CaseSettingsDialog.
+  _update_tier_coverage_label` (ffs-explorer.py) already had inline into
+  a new module-level `_HEADER_SCAN_TIER_COVERAGE` dict — `{tier: {
+  'checked': ..., 'not_checked': ...}}`, byte-for-byte the SAME
+  "checked" sentences that dialog already showed (verified by direct
+  before/after string comparison, not just eyeballed — a pure refactor
+  of that pre-existing label, not a wording change to it) plus a NEW
+  `not_checked` half for each tier, including a tier-0 ("never scanned")
+  entry that dict never needed before since tier 0 isn't a pickable
+  radio option there. `_update_tier_coverage_label` itself now just
+  reads the `'checked'` half from this shared dict rather than keeping
+  its own copy. Since `app/keyword_search.py` is a different Python
+  module and can't see `ffs-explorer.py`'s bare module globals (a
+  function's free-variable lookup resolves against its OWN defining
+  module, not the caller's), the dict is ALSO re-exposed as a
+  `FastZipBrowser` class attribute (`_HEADER_SCAN_TIER_COVERAGE =
+  _HEADER_SCAN_TIER_COVERAGE` inside the class body — same object, not a
+  copy) right next to the pre-existing `_HEADER_SCAN_TIER_TEXT`
+  class-attribute banner dict, which already uses this exact
+  self-attribute-access technique for the identical cross-module reason.
+  `_start_keyword_search` reads it via `self._HEADER_SCAN_TIER_COVERAGE`.
+
+  Verified headlessly across all four tier states (0/1/2/3, plus a
+  requested-tier-in-progress case) via the same monkeypatched-`QMessageBox
+  .exec` methodology as the entry above: each state's rendered text was
+  printed and checked by eye against the drafted wording — Tier 0 through
+  2 each show their own distinct Checked/Not-checked pair plus the
+  consequence line and the real archive count; Tier 2-with-Tier-3-running
+  correctly appends "(a Tier 3 scan is currently running)"; Tier 3 with 0
+  unextracted archives correctly skips the dialog entirely and proceeds
+  straight to search. Full pytest suite (18/18) re-confirmed clean.
+  `scripts/check_claude_md.py` could NOT be re-run for this specific
+  change — `git` itself is currently broken on this machine ("You have
+  not agreed to the Xcode license agreements"), an unrelated system
+  environment issue needing `sudo xcodebuild -license` run interactively
+  by the user, not something to fix unilaterally; flagged to the user
+  directly rather than silently skipped or worked around.
+
+- **Embedded-media sweep — core engine + storage shipped 2026-09-22, GUI
+  NOT yet wired up (a real, disclosed pending step, not overclaimed as
+  done).** Prompted directly: "one of the main things examiners are
+  looking for is media files that have illegal content... some of them
+  are embedded such as in bplist and plist and blobs in sql db." Designed
+  across several separate conversations before any code was written, per
+  this project's own established "write up your plans first" discipline
+  for a feature this size — the design itself went through real revision
+  more than once as each piece was checked against actual code rather
+  than assumed:
+
+  1. **Enumeration** — schema-agnostic by design, not per-app like
+     `recoverable_tables`: SQLite's own record format is genuinely
+     self-describing per FIELD (a BLOB's own serial type encodes its
+     type AND byte length — see `sqlite_carve.decode_value`), so a real
+     photo/video can be found and extracted without knowing which table
+     or app it belongs to at all. Candidate FILES (which SQLite dbs/
+     plists to even open) are found via the exact same header-scan-tier
+     overrides + extension check the file browser's own Type column
+     already uses (`embedded_media_scan.classify_scan_candidate`), with
+     an optional scope restriction reusing `FfsAdapter.scan_folders()` —
+     the SAME app/user-accessible-vs-everywhere tuple the header-scan
+     tiers already use, so this feature's own "how much to cover" choice
+     means exactly what an examiner already understands that phrase to
+     mean elsewhere in this app. A REAL, DISCLOSED dependency surfaced
+     during design (not just theorized): the header-scan tier decides
+     which extensionless/mistyped files are even discoverable as
+     candidates at all, so a low tier doesn't just risk missing an
+     archive (see the "Search Coverage dialog made tier-aware" entry
+     above) — it can also mean this sweep never sees a renamed database
+     or plist in the first place.
+
+  2. **Live content** — a genuine SQL query (`SELECT rowid, * FROM
+     table`, via the existing `artifact_runner.open_db_readonly`) rather
+     than any raw page-walking, specifically so SQLite's own engine
+     transparently follows a BLOB's overflow-page chain — a full-size
+     photo/video is recovered correctly regardless of how many pages it
+     spans. One query per TABLE (not per column) — every column's value
+     is pulled into Python and filtered by `isinstance(bytes)` there,
+     trading a little extra TEXT-column materialization for one
+     full-table pass instead of N.
+
+  3. **Deleted content — reuses `sqlite_carve.py`'s already-existing,
+     already-verified carving primitives completely unmodified**, rather
+     than writing new low-level page-parsing code: `carve_freed_pages`
+     (whole freelisted pages that still look like an intact table-leaf
+     page), `carve_unallocated_region` (in-page freeblocks/gaps on pages
+     still part of a live table's own b-tree — needs that table's own
+     live leaf-page set, computed via a throwaway read-only temp-file
+     connection + `walk_table_leaf_pages`, the same technique
+     `locate_live_row` already uses for the identical need), and a new,
+     small, GENERIC wrapper around `iter_wal_frames` +
+     `decode_leaf_page_cells` for WAL frame history — deliberately NOT
+     `sqlite_carve.carve_wal_history_for_table`, which is scoped to one
+     already-known table's own leaf-page set; `decode_leaf_page_cells`'s
+     own docstring already states it "works whether the page is
+     currently live, freed-but-intact, or a historical WAL frame image,"
+     so applying it directly to every WAL frame's own page image needs
+     no table identity at all.
+
+  4. **A real, disclosed overflow-page limitation, found by tracing the
+     code rather than assumed away** — see the module's own extensive
+     docstring in `app/embedded_media_scan.py`. `decode_leaf_page_cells`
+     (the primitive every deleted-content path above ultimately calls)
+     does not follow a cell's overflow-page chain at all — a record
+     whose payload needed to spill onto a second page comes back
+     `truncated=True` and is silently `continue`d past by its own
+     caller, exactly as designed for ordinary row-recovery (a partially-
+     decoded row there is untrustworthy). For THIS feature, that means a
+     DELETED photo/video large enough to have needed an overflow page
+     when it was written is not recovered at all in this first version —
+     not partially, not corrupted, simply absent from the results, same
+     as it would be from any other `recoverable_tables`-based recovery
+     in this project today. What DOES get recovered from freed/freeblock
+     /WAL space is real, deleted media small enough to fit entirely
+     within one page's local payload (SQLite's own overflow threshold is
+     roughly `page_size - 35` bytes) — small thumbnails, stickers,
+     highly-compressed tiny images. Following a deleted blob's own
+     overflow-page pointer chain (genuinely possible in principle — the
+     pointer is stored right after the local bytes — but higher-risk
+     since a freed overflow page can already have been reused for
+     something else, breaking the chain partway) was deliberately NOT
+     attempted this pass; flagged here as the concrete next enhancement,
+     not silently undersold as already covered.
+
+  5. **A second real, disclosed gap, CONFIRMED by direct testing, not
+     just reasoned through** — the single most common real deletion
+     shape (an ordinary one-row `DELETE` on a page that otherwise stays
+     live) has its `(payload_len, rowid)` varint pair overwritten by
+     SQLite's own freeblock link header the moment the row is deleted;
+     recovering it needs `sqlite_carve.carve_by_header_signature`, which
+     derives its match signature from live rows OF THE SAME KNOWN TABLE
+     — something a schema-agnostic sweep structurally cannot do (there's
+     no table to sample from). Built a hand-constructed real SQLite db
+     to check this directly rather than trust the reasoning alone:
+     inserted a real JPEG into a BLOB column, deleted that one row,
+     confirmed via a live query that it's genuinely gone, then confirmed
+     the raw freeblock bytes STILL physically contain the real JPEG
+     magic bytes and filename text (`...deleted_photo.jpg\xff\xd8\xff\xe0
+     JFIF...`) while `scan_sqlite_deleted` correctly returns zero hits
+     for it — the gap is real and precisely bounded, not a bug in this
+     module. This exact case IS already covered for every app this
+     project has a declared `recoverable_tables` parser for (WhatsApp,
+     Chrome, Burner, ...) — this sweep's own gap only matters for an app
+     with no existing parser, which is precisely this feature's target
+     audience anyway. Two OTHER deletion shapes were confirmed working
+     end to end on real, hand-built scenarios: a whole-table delete
+     (freed pages, recovered via `page_gap`) and WAL frame history (a
+     photo inserted then deleted while journal_mode=WAL, recovered from
+     an older, not-yet-checkpointed frame — the test itself needed a
+     blocking reader connection to hold the WAL open, since an ordinary
+     `close()` triggers exactly the checkpoint-deletes-the-WAL hazard
+     this project's own `open_db_readonly`/WAL Conventions entry already
+     documents).
+
+  6. **HTTP-response-wrapped media**, per direct follow-up question ("do
+     downloaded media files sometimes have a different head as part of a
+     GET response?") — yes, confirmed as a real, not hypothetical,
+     pattern some apps use for a network-cached blob: a near-literal
+     captured HTTP response (status line + header lines + blank line +
+     body) stored directly rather than as a clean file.
+     `unwrap_http_response` is a new, small, generic parser (genuinely
+     different on-disk shape from `chrome_cache.py`'s own Simple-Cache-
+     specific NUL-separated header serialization, so NOT a reuse of that
+     parser) that locates the header/body boundary and decompresses the
+     body per its own `Content-Encoding` via the newly-promoted
+     `artifact_runner.decompress_http_body` (see that function's own
+     entry above — moved out of `chrome_cache.py`'s private
+     `_decompress_body` since this is the second real caller and nothing
+     in its logic was ever Chrome-specific). `classify_media_blob` tries
+     raw magic bytes first, then this unwrap, before giving up. A real
+     bug was found and fixed here during testing, not shipped on faith:
+     the `MIN_MEDIA_BYTES` floor was originally checked against the
+     WRAPPED blob's own raw length before ever attempting to unwrap it —
+     but a real photo under `Content-Encoding: gzip` can compress to far
+     fewer bytes than the photo itself, so a synthetic (all-zero-padded)
+     test JPEG collapsed to 33 bytes compressed, correctly exposing that
+     the length check would wrongly reject a real hit purely because
+     compression made it small. Fixed by applying the floor to each
+     CANDIDATE representation separately (the raw blob, and — 
+     independently — the decompressed body) rather than to an
+     intermediate wrapper length. One narrower gap remains and is stated
+     directly in the function's own docstring rather than silently
+     glossed over: every SCAN LOOP in this module still pre-filters by
+     `len(value) < min_size` on the wrapper's raw stored length before
+     ever calling the classifier at all (for the ordinary, far more
+     common reason of not running this check against every tiny
+     bookkeeping blob a real database is full of) — so a real photo that
+     compresses to under 256 bytes as a wrapped blob is still missed end
+     to end. Accepted for v1: real HTTP servers essentially never gzip
+     an already-compressed image/video response in the first place, so
+     this narrows to a genuinely rare real-world shape.
+
+  7. **A real bug found and fixed in the SHARED `header_scan.classify_magic`
+     classifier while building this**, benefiting the whole project's
+     ordinary Type-column detection, not just this feature: its `ftyp`
+     branch treated ANY non-audio brand as `'Video'`, which is wrong for
+     HEIC/HEIF — the single most common real iOS photo format, sharing
+     the identical ISOBMFF/`ftyp` container with MP4/MOV. Confirmed
+     directly against real files from this project's own test archives
+     before fixing, not assumed: real HEIC photos (IOS17 JoshHickman)
+     have brand `b'heic'`; real videos (the same archive and Android 14
+     JoshHickman) have `b'qt  '`/`b'M4V '`/`b'isom'`/`b'mp42'` — genuinely
+     disjoint sets. New public `IMAGE_FTYP_BRANDS` (the full registered
+     HEIC/HEIF/AVIF brand family) disambiguates; a `WEBP` RIFF form
+     (previously undetected by this function at all) was added the same
+     pass. Only matters for a file with no extension to fall back on — an
+     ordinary `.heic`-named photo never reaches this magic-byte path —
+     but that's exactly the situation every blob this sweep finds is in.
+     Verified with a synthetic-header battery covering every branch
+     (HEIC/MOV/M4V/isom/mp42/WEBP/WAV/AVI/JPEG) plus the real byte
+     headers pulled from both archives; zero regression to existing
+     video/audio classification.
+
+  8. **Extraction is content-addressed** (`extract_media_bytes`,
+     sha256-named under `case_dir/embedded_media/<hash[:2]>/`) — the
+     SAME image found via two different routes (e.g. present in both a
+     live row and an old WAL frame) is written once, not duplicated; a
+     re-extraction of already-written content is a no-op, same
+     idempotent-extraction convention `nested_archive.py` already
+     established.
+
+  9. **Storage**: a new `embedded_media_hits` table in `caseresults.db`
+     (see that database's own section above) — precious, examiner-
+     triggered findings, not a rebuildable cache, since a deleted-content
+     scan is genuinely slow and its results are exactly what an examiner
+     builds a case around. `UNIQUE(source_ui_path, location, sha256)`
+     means re-running the scan silently skips what it already recorded
+     (`INSERT OR IGNORE`) rather than erroring or duplicating.
+     `save_embedded_media_hits`/`load_embedded_media_hits`/
+     `clear_embedded_media_hits` (`app/db_utils.py`) follow this
+     project's established save/load helper-pair convention.
+
+  **Verified end-to-end at every layer against real or hand-built real
+  data, never assumed correct from the design alone**: candidate
+  enumeration and scoping (synthetic folder-map fixtures, matching the
+  exact semantics of `_header_candidate_matches`); media classification
+  across every real signature this module recognizes, including the two
+  real header_scan.py bugs above; the HTTP-unwrap path with both a plain
+  and a gzip-compressed real body; a real constructed SQLite db proving
+  the LIVE scan finds exactly the one real embedded JPEG among a mix of
+  irrelevant small/random blobs, correctly attributed to its real table/
+  column/rowid; THREE distinct real deletion scenarios (single-row
+  delete — confirmed as the documented gap, not a bug; whole-table
+  delete — recovered via `page_gap`; WAL frame history — recovered from
+  an older frame after a real delete); a real plist with a real embedded
+  JPEG plus a SECOND JPEG nested one level down inside an embedded
+  bplist-within-NSData field (the exact shape this project's own
+  `leveldb_viewer.py` docstring already documented seeing in real
+  `_atsContext` data), both correctly found and correctly attributed to
+  their own dotted paths; and the full engine-to-storage pipeline
+  (extract → sha256 → write local file → save to `caseresults.db` → read
+  back → re-run dedup → `clear_embedded_media_hits`) against real scan
+  output, not synthetic rows. Full pytest suite (18/18) re-confirmed
+  clean after every change in this pass.
+
+  **GUI wiring completed the same day, shipped end-to-end, verified
+  against real data at every layer.** `ProcessDialog` gained a new
+  checkbox ("Scan databases and property lists for embedded media") plus
+  a two-option scope choice (app/user-accessible areas — the default,
+  reusing `FfsAdapter.scan_folders()` — vs. everywhere) with a live
+  coverage label mirroring `_update_tier_coverage_label`'s own
+  checked/not-checked framing, always stating that deleted-content
+  recovery is included regardless of scope. Sequenced to run LAST in the
+  operation chain, after archive extraction, per the user's own explicit
+  design ask ("it runs after the archive check just in case there are
+  archived db and bplist") — `_continue_after_integrity`/`_on_header_done`
+  /`_on_nested_done` all now funnel through one new `_continue_after_nested()`
+  dispatcher instead of calling `_finish_operations()` directly, so a
+  database/plist that only existed inside a nested archive just extracted
+  is already visible to this scan by the time it runs.
+
+  `EmbeddedMediaScanWorker` (`ffs-explorer.py`, same `QThread` pattern as
+  `HeaderScanWorker`/`NestedArchiveWorker`, its own independent
+  `CachedZipView` reader per the standing "a worker owns its own reader"
+  convention) drives the engine: `discovery_done` fires once candidates
+  are enumerated ("Found N database(s) and M property list(s) to scan"),
+  `progress` fires per file with a running live/recovered picture/video
+  tally exactly as the user asked ("list the number of video and picture
+  recovered... tell if a deleted blob has been recovered"), and
+  `finished_scan` persists every hit to `caseresults.db` via
+  `save_embedded_media_hits`. A main-db candidate is written to a real
+  temp file for the LIVE scan (SQLite's own engine needs a real path to
+  follow a BLOB's overflow chain); the DELETED-content scan works
+  directly off the in-memory bytes, matching `embedded_media_scan.py`'s
+  own design.
+
+  Media Browser review surface: a new "Embedded Media (N)" button next
+  to the tab's status label (hidden when N is 0, refreshed on case load
+  and after a scan finishes via a new `ProcessDialog.embedded_media_scan_done`
+  signal) loads every recorded hit's `extracted_path` into the SAME
+  thumbnail grid/`ThumbnailWorker`/`MediaFullViewDialog` pipeline a
+  folder's ordinary media already uses — confirmed needing ZERO changes
+  to that pipeline itself, since it already handles `os.path.isabs()`
+  local files transparently (built earlier for Chrome Cache Media/
+  Favicons' own parser-generated files, and `hex_viewer._read_zip_bytes`
+  — the same method the full-view dialog and hex-panel sync both already
+  call — already reads a local absolute path straight off disk). A new
+  `_media_showing_embedded` flag stops `_on_center_tab_changed`'s own
+  tab-switch reload logic (which compares against the CURRENT FOLDER's
+  media files) from silently reverting this view the next time the
+  examiner switches tabs away and back — cleared only when
+  `_load_media_from_file_model` runs again, i.e. the examiner picks an
+  ordinary folder.
+
+  **Verified end-to-end against the real, already-loaded Android 14
+  JoshHickman case** (a scratch COPY, never the original — the real
+  case_dir was only ever read from, matching this project's standing
+  data-safety discipline), driving the actual running `FastZipBrowser`/
+  `ProcessDialog` in-process, no manual state, no mocked scan logic:
+  checking the checkbox and clicking Run correctly enumerated 1,490 real
+  candidate databases/plists (app/user-accessible scope), ran to
+  completion, and recorded **1,552 real embedded images** — every
+  sampled extracted file independently confirmed as a genuinely valid
+  JPEG/PNG via the system `file` command (a real cross-check, not
+  circular validation against this feature's own classifier). Re-running
+  the identical scan confirmed the `UNIQUE` constraint's dedup works
+  (same 1,552 hits, not duplicated). Real, plausible sources: WhatsApp's
+  own `msgstore.db` thumbnails, Chrome/Brave/Edge favicons, Nexus
+  Launcher's app-icon caches — and, notably, **8 real images recovered
+  from `com.thinkyeah.galleryvault`'s own database**, a hide-and-lock
+  vault app whose whole purpose is keeping its media out of the ordinary
+  file browser — directly on point for the examiner motivation that
+  started this feature. The Media Browser button/flow was separately
+  verified against a fast-seeded real subset (10 real hits extracted
+  from `msgstore.db`): button visibility/count, thumbnail grid population
+  (content-addressed dedup correctly collapsing 10 hits sharing repeated
+  thumbnail bytes down to 3 unique widgets — confirmed as real, correct
+  behavior, not a bug, before trusting it), survival across a tab switch
+  away and back, exit on selecting an ordinary folder, and a real
+  double-click opening the full-size viewer on a real extracted file —
+  all passed. Full pytest suite (18/18) re-confirmed clean after every
+  change in this pass.
+
+  This closes the feature end-to-end: an examiner can now check a box in
+  Process Case, watch live progress with a real live/recovered tally,
+  and review every found item as ordinary thumbnails they can open,
+  export, or otherwise work with exactly like any other Media Browser
+  content.
+
+  **`ProcessDialog` resized, same day, direct follow-up** ("the process
+  case need to be a bit wider and longer to accommodate the new controls
+  and listing of file it is processing"): `setMinimumWidth(620)` → 
+  `setMinimumSize(820, 640)` — the old width wrapped/clipped the scan's
+  own per-file progress line (a real example: `"Embedded-media sweep:
+  1,487 / 1,490 — map_cache.db — found so far: 1,552 picture(s), 0
+  video(s)"`), and the dialog had no reserved height for the embedded-
+  media checkbox/scope-radio/coverage-label block added earlier the same
+  day, relying entirely on auto-sizing. `self._status_label` also gained
+  `setWordWrap(True)` (previously unset) so a still-longer status line
+  wraps onto multiple lines within the wider dialog instead of being
+  clipped. Verified headlessly: a real `ProcessDialog` instance reports
+  `minimumSize() == (820, 640)` and `self._status_label.wordWrap() is
+  True`.
+
+- **Embedded-media hits become real File Browser children of their
+  container, with a confirmed per-source naming scheme — 2026-09-23,
+  direct follow-up.** Prompted by a precise set of questions checking
+  actual behavior against assumption: "in the file browser are the
+  children of the container file? ... does [the filename] relate to
+  their origin? ... for a sqlite result does the filename start
+  db-column-primary key id and if carved then just db name and carved
+  and if a get request does it get the name from the request." Checked
+  the real code before answering, rather than guessing: NEITHER was true
+  — every hit was a flat, hash-named file (`<sha256><ext>`) visible only
+  in the Media Browser's own standalone button, with zero relation to
+  its origin and no File Browser hierarchy at all. Confirmed with the
+  user directly (two questions, both answered "yes/recommended") before
+  building: (1) add hits as real virtual children of their container in
+  the File Browser tree, same mechanism nested archives already use for
+  a FILE that becomes browsable, not a folder — the right precedent
+  here, confirmed by checking `_load_virtual_entry_preview`'s own
+  docstring, which already documents "one shared set, multiple real
+  sources" as the deliberate, established design (LevelDB records
+  already union their own virtual children into the exact same
+  `_nested_virtual_paths` frozenset nested archives use, rather than
+  keeping a separate one) — extended the same way, not a new parallel
+  system; (2) the exact naming scheme: SQLite live →
+  `<dbname>-<column>-<rowid><ext>`; SQLite carved/recovered →
+  `<dbname>-carved<ext>` (deliberately no column/rowid, since a
+  recovered hit's identity is inherently less certain than a live row's,
+  per direct instruction "just db name and carved"); plist → the
+  embedded field's own key name (the plist's dotted key path's last
+  segment, e.g. "photo" from
+  "wrapper.nested_container.<nested-bplist>.photo") plus extension, the
+  plist file as its parent. One real technical correction volunteered
+  rather than forced into the requested scheme: an HTTP-wrapped hit has
+  no "request" to name itself from at all — only the *response* (status
+  line, headers, body) is ever captured — so that specific naming idea
+  doesn't map to what's actually available; `Content-Disposition`
+  (occasionally present, not currently read) was noted as the closer,
+  real alternative if wanted later.
+
+  **`embedded_media_scan.compute_display_name`** (new, Qt-free, kept in
+  the engine module rather than the GUI worker so the naming rules stay
+  independently unit-testable) implements exactly the three rules above
+  from one hit's own fields — schema gained a `display_name` column
+  (`embedded_media_hits`, with an `ALTER TABLE ... ADD COLUMN` migration
+  guard since the table already existed in real case_dirs from the
+  previous day's own shipped work) so the name is computed once, stored,
+  and never re-derived later from `location`'s own free-text shape
+  (built for human reading, not parsing).
+
+  **`FastZipBrowser._inject_embedded_media`** (`ffs-explorer.py`, new,
+  modeled directly on `_inject_nested_archives` immediately above it)
+  groups every recorded hit by `source_ui_path`, and for each container
+  with ≥1 hit: registers `folder_map[container] = [child vpaths]`
+  (turning the file into a navigable folder, exactly like an extracted
+  nested archive), and `full_metadata[vpath]` per child with a new
+  `_embedded_media_source` marker (the hit's own real absolute
+  `extracted_path`) alongside `_display_name` and `size`. Name collisions
+  WITHIN one container (two "carved" hits from the same db, or two plist
+  fields both ending in "photo") are disambiguated here — not in
+  `compute_display_name`, which only ever sees one hit at a time — via a
+  plain `"name (2)"`, `"name (3)"`... suffix before the extension, the
+  same convention any OS's own file manager already uses for a
+  duplicate name. The container's own `full_metadata['size']` is
+  overwritten with the real sum of its hits' byte lengths — mirroring
+  the LevelDB folder precedent ("the precomputed sum of all real record
+  values") exactly, since `_folder_total_size`'s own cache is built at
+  metadata-parse time and has no notion of a folder that didn't exist
+  until this injection ran; without this override the container would
+  incorrectly show byte 0 or its own original (now-irrelevant) real file
+  size instead. Called at case load — right after
+  `_rescan_decoded_leveldb_folders`, before `reload_tree_entirely` so the
+  tree is built correctly from scratch, no live-upgrade dance needed —
+  and again via a new `_on_embedded_media_scan_injected` after
+  `EmbeddedMediaScanWorker` finishes (wired to `ProcessDialog`'s existing
+  `embedded_media_scan_done` signal), which mirrors
+  `_on_nested_extraction_done`'s own tree-item-insertion dance exactly
+  (including that dance's own known, pre-existing limitation: a
+  container whose parent is ALREADY expanded mid-session, with the
+  container's own leaf item already visible, doesn't get retroactively
+  upgraded to show an expand arrow until the case is reopened or that
+  parent is re-expanded — accepted as consistent with the existing
+  nested-archive precedent, not a new gap introduced here).
+
+  **Three genuine dispatch points needed real (not cosmetic) changes,
+  found by tracing exactly what each virtual-path check does, not
+  assumed to "just work" from adding to the shared set alone**:
+  1. `_load_virtual_entry_preview` gained a third branch — checks the
+     new `_embedded_media_source` marker (alongside the pre-existing
+     `_leveldb_folder` one) and routes to a new
+     `_load_embedded_media_entry_preview`, which just reads the real
+     extracted file straight off disk (no archive/adapter resolution at
+     all, since the marker is already a real absolute path) and calls
+     the same shared `_display_preview_bytes` every other source uses.
+  2. `_classify_entry`'s folder branch and `_build_entry_cols`'s
+     size-computation branch both gained a third `or path in
+     self._embedded_media_containers` condition, matching the existing
+     `_nested_archive_map`/`_leveldb_folder_map` pattern exactly — a new
+     `'Embedded Media'` Type label for the container.
+  3. **A real gap found and fixed, not just theorized**: neither
+     `ThumbnailWorker` nor `hex_viewer._read_zip_bytes` knew about the
+     new marker at all — both only ever checked `os.path.isabs(ui_path)`
+     for "this is a local file, not an archive entry," which is FALSE
+     for a synthetic vpath like `".../msgstore.db/msgstore.db-carved.jpg"`
+     even though its real bytes sit in a local file the container's own
+     `full_metadata` entry already names. This only mattered for the NEW
+     File-Browser-hierarchy path — the pre-existing standalone "Embedded
+     Media" button already passes real absolute `extracted_path` values
+     directly as `ui_path` and needed no change. Fixed two ways: (a)
+     `_read_zip_bytes` (the shared reader behind hex-panel sync and the
+     full-view double-click dialog) now checks
+     `full_metadata[ui_path]['_embedded_media_source']` right after its
+     existing `isabs()` check; (b) `ThumbnailWorker` gained an optional
+     `local_path_overrides: dict[ui_path, real_path]` parameter, checked
+     before its own `isabs()` branch, built by
+     `_start_thumbnail_load` from exactly the same marker. Without (b),
+     Media Browser thumbnails for a hit reached via its container's own
+     folder (as opposed to the standalone button) would have silently
+     stayed blank placeholders forever — the broad `except Exception:
+     continue` around the real read would have masked it completely,
+     never surfacing an error.
+
+  **Verified end-to-end against the real archive**, seeding real and
+  deliberately-synthetic hits (3 real live JPEGs extracted fresh from
+  WhatsApp's own `msgstore.db`, 2 synthetic "carved" hits sharing an
+  identical base name to exercise collision disambiguation, 1 synthetic
+  plist hit with a real nested-bplist-style dotted key path) into a
+  scratch copy of the real, already-loaded case, then driving the actual
+  `FastZipBrowser` in-process: both containers correctly appear as
+  folders (`Embedded Media` type) purely from case-load injection, no
+  scan re-run; the db container's 5 children show the exact expected
+  names (`msgstore.db-thumbnail-11/13/41.jpg` for the 3 live hits,
+  `msgstore.db-carved.jpg` + `msgstore.db-carved (2).jpg` — the
+  disambiguation confirmed correct, not just present); the plist child
+  is named `photo.jpg`, not a hash; the container's own folder size
+  (9,245 bytes) is the real sum of its 5 hits, not blank or its original
+  file's real size; navigating into the container populates the file
+  table with exactly its 5 children; double-clicking a child loads the
+  correct file into the hex panel with the correct byte size; and — the
+  specific gap found and fixed in this pass — the Media Browser's own
+  thumbnail grid, reached via ordinary folder navigation into the
+  container (not the standalone button), correctly decoded and displayed
+  a real thumbnail for one of the genuine live hits (the two synthetic
+  "carved"/plist fixtures are fake JPEGs with valid magic bytes but no
+  real image data, correctly rejected by Qt's own decoder — confirmed as
+  a property of this test's own fixtures, not a bug, by checking which
+  specific path failed before concluding either way). A first test run
+  produced a spurious failure (44 rows instead of 5) traced to reusing
+  the same scratch case_dir across two consecutive runs without
+  resetting it — re-confirmed clean on a genuinely fresh copy before
+  trusting the result. Full pytest suite (18/18) clean throughout.

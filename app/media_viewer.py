@@ -9,7 +9,8 @@ from itertools import batched
 
 import av
 
-from db_utils import _open_cache_db
+from contextlib import closing
+from db_utils import _open_cache_db, _open_results_db, load_embedded_media_hits
 from dialog_helpers import note_label
 from zip_cd_cache import CachedZipView, load as _zcd_load
 # MEDIA_EXTENSIONS/VIDEO_THUMB_EXTENSIONS/TEXT_ATTACHMENT_EXTENSIONS/
@@ -440,7 +441,7 @@ class ThumbnailWorker(QThread):
     finished_all    = Signal()
 
     def __init__(self, zip_path, items, path_resolver, thumb_size, zip_info_map,
-                 cache_dir=None):
+                 cache_dir=None, local_path_overrides=None):
         super().__init__()
         self.zip_path        = zip_path
         self.items           = items
@@ -448,6 +449,16 @@ class ThumbnailWorker(QThread):
         self.thumb_size      = thumb_size
         self.zip_info_map    = zip_info_map
         self.cache_dir       = cache_dir
+        # {ui_path: real_local_absolute_path} for a SYNTHETIC vpath that
+        # isn't itself absolute (unlike a parser-generated file's own
+        # ui_path, e.g. chrome_favicons.py's, which already handles the
+        # local case via a bare os.path.isabs(ui_path) check below) but
+        # still has real bytes sitting on local disk rather than inside
+        # the archive — added 2026-09-22 for embedded-media hits browsed
+        # via their container's own File Browser folder (as opposed to
+        # the standalone "Embedded Media" button, which already passes
+        # real absolute paths as ui_path and needed no change here).
+        self.local_path_overrides = local_path_overrides or {}
         self._stop           = False
 
     def stop(self):
@@ -516,14 +527,21 @@ class ThumbnailWorker(QThread):
                         # an archive entry -- path_resolver()/the zip's own
                         # namelist have nothing to resolve it against. Same
                         # os.path.isabs() convention hex_viewer._read_zip_bytes
-                        # already uses for the identical reason.
-                        is_local = os.path.isabs(ui_path)
+                        # already uses for the identical reason. A SYNTHETIC
+                        # vpath (e.g. an embedded-media hit browsed via its
+                        # container's own File Browser folder) isn't itself
+                        # absolute, but local_path_overrides still names its
+                        # real local file — checked first since it's the more
+                        # specific case.
+                        real_path = self.local_path_overrides.get(ui_path)
+                        is_local = real_path is not None or os.path.isabs(ui_path)
                         if is_local:
+                            real_path = real_path or ui_path
                             try:
-                                file_size = os.path.getsize(ui_path)
+                                file_size = os.path.getsize(real_path)
                             except OSError:
                                 continue
-                            physical = ui_path
+                            physical = real_path
                         else:
                             physical  = self.path_resolver(ui_path)
                             file_size = self.zip_info_map.get(physical, 0)
@@ -549,7 +567,7 @@ class ThumbnailWorker(QThread):
 
                         try:
                             if is_local:
-                                with open(ui_path, 'rb') as lf:
+                                with open(real_path, 'rb') as lf:
                                     data = lf.read()
                             else:
                                 # .open(...).read(), not .read(name) -- the
@@ -647,6 +665,25 @@ class MediaViewerMixin:
         self._media_status = QLabel("Select a folder to view media")
         self._media_status.setStyleSheet(status_style)
 
+        # Embedded-media sweep review button (added 2026-09-22 — see
+        # app/embedded_media_scan.py and CLAUDE.md's own "Embedded-media
+        # sweep" Conventions entry). Deliberately reuses this SAME grid/
+        # ThumbnailWorker/MediaFullViewDialog pipeline rather than a
+        # bespoke viewer — every extracted hit's `extracted_path` is a
+        # real local absolute path, and this pipeline already handles
+        # os.path.isabs() paths transparently (built earlier for Chrome
+        # Cache Media/Favicons' own parser-generated local files), so no
+        # changes were needed to the thumbnail/full-view code itself.
+        self._media_showing_embedded = False
+        self._embedded_media_btn = QPushButton("Embedded Media")
+        self._embedded_media_btn.setVisible(False)
+        self._embedded_media_btn.clicked.connect(self._show_embedded_media_hits)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self._media_status, 1)
+        status_row.addWidget(self._embedded_media_btn)
+        status_row_widget = QWidget()
+        status_row_widget.setLayout(status_row)
+
         self._media_grid_widget = QWidget()
         self._media_grid = QGridLayout(self._media_grid_widget)
         self._media_grid.setSpacing(8)
@@ -667,12 +704,86 @@ class MediaViewerMixin:
         media_tab_layout = QVBoxLayout(media_tab)
         media_tab_layout.setContentsMargins(0, 4, 0, 0)
         media_tab_layout.setSpacing(2)
-        media_tab_layout.addWidget(self._media_status)
+        media_tab_layout.addWidget(status_row_widget)
         media_tab_layout.addWidget(self._media_scroll, stretch=1)
         return media_tab
 
+    def _refresh_embedded_media_button(self):
+        """Shows/labels the "Embedded Media" button with the real current
+        hit count, or hides it entirely when there are none — same "never
+        show a choice that doesn't apply yet" convention the ProcessDialog
+        scope controls already follow. Cheap (COUNT query), safe to call
+        on every case load and after a scan finishes."""
+        count = 0
+        if self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    count = db.execute(
+                        'SELECT COUNT(*) FROM embedded_media_hits').fetchone()[0]
+            except Exception:
+                count = 0
+        self._embedded_media_btn.setVisible(count > 0)
+        self._embedded_media_btn.setText(f"Embedded Media ({count:,})")
+
+    def _show_embedded_media_hits(self):
+        """Loads every recorded embedded-media hit into the SAME
+        thumbnail grid a folder's media normally uses — see this
+        method's own module-level Conventions entry for why no new
+        thumbnail/full-view code was needed. Sets _media_showing_embedded
+        so _on_center_tab_changed's own tab-switch reload logic (which
+        compares against the CURRENT FOLDER's media files) leaves this
+        view alone rather than silently reverting to the last-selected
+        folder the next time the examiner switches tabs away and back;
+        cleared by _load_media_from_file_model itself, the moment the
+        examiner picks an ordinary folder again.
+
+        Uses the SAME synthetic vpaths _inject_embedded_media already
+        computed (container/display_name, with per-container name
+        collisions already disambiguated) as the grid's own ui_path for
+        each item — added 2026-09-23, direct follow-up: this used to pass
+        each hit's raw content-hash extracted_path (e.g.
+        ".../embedded_media/95/9535bf70....jpg") straight through as
+        ui_path, so the status bar (_on_thumb_clicked's own
+        `self.status_bar.showMessage(ui_path)`) and every tooltip showed
+        a meaningless hash filename instead of the real
+        "<container>/<display_name>" path an identical click coming from
+        the File Browser hierarchy already shows. Re-injecting here
+        (cheap — a DB read plus dict rebuilding, same cost
+        _refresh_embedded_media_button's own COUNT query already pays
+        every time this button is shown) rather than trusting whatever
+        the last injection happened to leave in place keeps this button
+        correct even if it's clicked in the same session a scan just
+        finished, before any other trigger has re-run it."""
+        if not self._case_dir:
+            return
+        self._inject_embedded_media()
+        media_paths = [
+            vpath
+            for container in sorted(self._embedded_media_containers)
+            for vpath in self.folder_map.get(container, [])
+            if os.path.isfile(self.full_metadata.get(vpath, {}).get(
+                '_embedded_media_source', ''))
+        ]
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                recovered = sum(1 for h in load_embedded_media_hits(db) if h.get('recovered'))
+        except Exception:
+            recovered = 0
+        self._media_showing_embedded = True
+        self._media_context = tuple(media_paths)
+        # _on_thumbnails_done (below) is what actually renders the final
+        # status text ("{count} media file(s) of {total} file(s){sort_desc}")
+        # once loading completes -- passed through here rather than set
+        # directly, since a direct setText() call would just be
+        # overwritten by that later, asynchronous update.
+        sort_desc = (f" from the embedded-media sweep"
+                    + (f" — {recovered:,} recovered from deleted content"
+                       if recovered else ""))
+        self._start_thumbnail_load(media_paths, len(media_paths), sort_desc)
+
     def _load_media_from_file_model(self):
         """Load the media tab using exactly the current visible file model rows."""
+        self._media_showing_embedded = False
         model = self.file_model
 
         total_files = sum(1 for r in model._rows if r[1] not in self.folder_map)
@@ -742,10 +853,19 @@ class MediaViewerMixin:
             self._adapter.resolve(p): self.full_metadata.get(p, {}).get('size', 0)
             for p in media_paths
         }
+        # Embedded-media hits browsed via their container's own File
+        # Browser folder (as opposed to the standalone "Embedded Media"
+        # button, which already passes real absolute paths and needs no
+        # override) — see ThumbnailWorker's own local_path_overrides
+        # docstring.
+        local_path_overrides = {
+            p: src for p in media_paths
+            if (src := self.full_metadata.get(p, {}).get('_embedded_media_source'))
+        }
 
         self._thumb_worker = ThumbnailWorker(
             self.zip_path, media_paths, self._adapter.resolve, THUMB_SIZE, zip_info_map,
-            cache_dir=self._case_dir)
+            cache_dir=self._case_dir, local_path_overrides=local_path_overrides)
         self._thumb_worker.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._thumb_worker.finished_all.connect(self._on_thumbnails_done)
         self._thumb_worker.start()

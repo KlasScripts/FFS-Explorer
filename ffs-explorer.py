@@ -16,6 +16,7 @@ import pathlib
 import subprocess
 import configparser
 import shutil
+import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -44,7 +45,10 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       load_nested_archives, load_nested_archive_entries,
                       load_bookmark_groups, save_bookmark_group,
                       save_bookmark_entries, load_bookmark_entries,
-                      delete_bookmark_group)
+                      delete_bookmark_group,
+                      indexed_leveldb_folders,
+                      save_embedded_media_hits, load_embedded_media_hits,
+                      clear_embedded_media_hits)
 import header_scan
 import nested_archive
 from hex_viewer import HexViewerMixin
@@ -944,6 +948,43 @@ _HEADER_SCAN_TIER_LABELS = {
     1: "Tier 1 — unknown-extension files, app/user-accessible areas",
     2: "Tier 2 — all files, app/user-accessible areas (includes Tier 1)",
     3: "Tier 3 — all files, everywhere (exhaustive — can take a very long time)",
+}
+
+# Per-tier "checked" / "not checked" split, added 2026-09-22 for the
+# Search Coverage dialog's own explicit checked/not-checked framing
+# (built collaboratively with the user, who wanted the dialog to state
+# what the CURRENT tier has and hasn't looked at, then what that
+# omission actually means, rather than a single "Covers: ..." sentence).
+# CaseSettingsDialog._update_tier_coverage_label reads the 'checked'
+# half directly (bare module-global access — same module) instead of
+# keeping its own separately-worded "Covers: ..." text, so this is a
+# pure refactor of that pre-existing label, not a new fourth copy of
+# the same content; re-exposed as a FastZipBrowser class attribute
+# below (same dict object, not a copy) so a mixin method reached via
+# `self` — e.g. KeywordSearchMixin._start_keyword_search, in
+# app/keyword_search.py, which cannot see this module's bare globals
+# since it's defined in a different module — can read the identical
+# text. Tier 0 (never scanned) has no equivalent in
+# _HEADER_SCAN_TIER_LABELS (that dict only covers the three PICKABLE
+# radio options) but does need its own entry here, since the Search
+# Coverage dialog can show BEFORE any scan has ever run.
+_HEADER_SCAN_TIER_COVERAGE = {
+    0: {
+        'checked': "nothing — every file is typed by its extension alone, never checked against its real content.",
+        'not_checked': "every file's actual content.",
+    },
+    1: {
+        'checked': "unknown-extension files inside app/user-accessible areas only.",
+        'not_checked': "files that already have a normal-looking extension (never re-verified against their real content), and anything outside app/user-accessible areas.",
+    },
+    2: {
+        'checked': "every file inside app/user-accessible areas — includes Tier 1's own unknown-extension coverage.",
+        'not_checked': "anything outside app/user-accessible areas (OS/system areas).",
+    },
+    3: {
+        'checked': "every file in the entire archive, including OS/system areas outside the normal app/user-accessible list.",
+        'not_checked': "nothing — this is the exhaustive tier.",
+    },
 }
 
 
@@ -2292,12 +2333,8 @@ class CaseSettingsDialog(QDialog):
 
     def _update_tier_coverage_label(self):
         tier = self._tier_group.checkedId()
-        text = {
-            1: "Covers: unknown-extension files inside app/user-accessible areas only.",
-            2: "Covers: every file inside app/user-accessible areas — includes Tier 1's own unknown-extension coverage.",
-            3: "Covers: every file in the entire archive, including OS/system areas outside the normal app/user-accessible list.",
-        }.get(tier, "")
-        self._tier_coverage_label.setText(text)
+        checked = _HEADER_SCAN_TIER_COVERAGE.get(tier, {}).get('checked', '')
+        self._tier_coverage_label.setText(f"Covers: {checked}" if checked else "")
 
     def _on_show_locations(self):
         self._locations_btn.setEnabled(False)
@@ -2879,12 +2916,154 @@ class IntegrityCheckWorker(QThread):
             self.done.emit('')
 
 
+class EmbeddedMediaScanWorker(QThread):
+    """Drives app/embedded_media_scan.py's schema-agnostic sweep for
+    image/video content embedded in SQLite BLOB cells and plist NSData
+    values — see that module's own docstring and CLAUDE.md's "Embedded-
+    media sweep" Conventions entry for the full design.
+
+    Owns its own independent reader (a fresh CachedZipView per call,
+    never the GUI's shared self._zip_handle) — same standing convention
+    every other background worker in this file already follows
+    (KeywordSearchWorker, NestedArchiveWorker, HeaderScanWorker, ...).
+    A main-db candidate is written to a real temp file for the LIVE scan
+    (open_db_readonly needs a real path — SQLite's own engine, not this
+    project's code, follows a BLOB's overflow-page chain that way); the
+    DELETED-content scan works directly off the in-memory bytes, per
+    embedded_media_scan.py's own design.
+    """
+    discovery_done = Signal(int, int)          # (n_databases, n_plists)
+    progress       = Signal(int, int, str, dict)  # (index, total, ui_path, counts)
+    finished_scan  = Signal(dict)               # summary dict, see run()'s own tail
+
+    def __init__(self, zip_path, case_dir, ui_metadata, header_type_overrides,
+                 ffs_adapter, delta=None, scan_folders=None, parent=None):
+        super().__init__(parent)
+        self._zip_path        = zip_path
+        self._case_dir        = case_dir
+        self._ui_metadata     = ui_metadata
+        self._overrides       = header_type_overrides
+        self._adapter         = ffs_adapter
+        self._delta           = delta
+        self._scan_folders    = scan_folders   # None = everywhere
+
+    def _read_bytes(self, z, ui_path: str) -> bytes | None:
+        try:
+            physical = self._adapter.resolve(ui_path)
+            return z.open(physical).read()
+        except Exception:
+            return None
+
+    def run(self):
+        import embedded_media_scan as ems
+
+        z = _build_cached_zip_view(self._zip_path, self._case_dir)
+        if z is None:
+            self.finished_scan.emit({'error': 'Local .zcd cache not available'})
+            return
+
+        sqlite_paths, plist_paths = ems.enumerate_candidates(
+            self._ui_metadata, self._overrides, self._scan_folders)
+        self.discovery_done.emit(len(sqlite_paths), len(plist_paths))
+
+        scan_dir = os.path.join(self._case_dir, 'embedded_media')
+        os.makedirs(scan_dir, exist_ok=True)
+
+        counts = {'live_pictures': 0, 'live_videos': 0,
+                 'recovered_pictures': 0, 'recovered_videos': 0}
+        rows: list[dict] = []
+        all_candidates = [('plist', p) for p in plist_paths] + \
+                        [('sqlite', p) for p in sqlite_paths]
+        total = len(all_candidates)
+
+        for i, (kind, ui_path) in enumerate(all_candidates):
+            if self.isInterruptionRequested():
+                break
+            self.progress.emit(i, total, ui_path, dict(counts))
+            raw = self._read_bytes(z, ui_path)
+            if raw is None:
+                continue
+
+            if kind == 'plist':
+                for hit in ems.scan_plist_bytes(raw):
+                    rows.append(self._build_row(ems, ui_path, 'plist',
+                                                hit['plist_path'], scan_dir, hit))
+                    counts[f"{'recovered' if hit['recovered'] else 'live'}_"
+                          f"{'pictures' if hit['kind'] == 'image' else 'videos'}"] += 1
+                continue
+
+            # kind == 'sqlite'
+            wal_bytes = self._read_bytes(z, ui_path + '-wal')
+            tmp_path = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(raw)
+                for hit in ems.scan_sqlite_live(tmp_path):
+                    location = f"{hit['table']}.{hit['column']} (rowid={hit['rowid']})"
+                    rows.append(self._build_row(ems, ui_path, 'sqlite',
+                                                location, scan_dir, hit))
+                    counts['live_pictures' if hit['kind'] == 'image' else 'live_videos'] += 1
+            except Exception:
+                pass
+            finally:
+                if tmp_path is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+            try:
+                for hit in ems.scan_sqlite_deleted(raw, wal_bytes=wal_bytes):
+                    location = f"rowid={hit.get('rowid')} (page {hit.get('page')}, " \
+                              f"{hit.get('recovery_source')})"
+                    rows.append(self._build_row(ems, ui_path, 'sqlite',
+                                                location, scan_dir, hit))
+                    counts['recovered_pictures' if hit['kind'] == 'image'
+                          else 'recovered_videos'] += 1
+            except Exception:
+                pass
+
+        self.progress.emit(total, total, '', dict(counts))
+
+        if rows and self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    save_embedded_media_hits(db, rows)
+            except Exception:
+                pass
+
+        self.finished_scan.emit({
+            'total_files': total, 'total_hits': len(rows), **counts,
+        })
+
+    def _build_row(self, ems, ui_path, source_kind, location, scan_dir, hit) -> dict:
+        sha, path = ems.extract_media_bytes(scan_dir, hit['blob'], hit['ext'])
+        headers = hit.get('http_headers') or {}
+        return {
+            'source_ui_path': ui_path,
+            'source_kind': source_kind,
+            'location': location,
+            'display_name': ems.compute_display_name(ui_path, source_kind, location, hit),
+            'media_kind': hit['kind'],
+            'extracted_path': path,
+            'sha256': sha,
+            'byte_length': len(hit['blob']),
+            'recovered': int(bool(hit.get('recovered'))),
+            'recovery_source': hit.get('recovery_source'),
+            'http_wrapped': int(bool(hit.get('http_headers'))),
+            'content_type_hint': headers.get('content-type'),
+            'scan_scope': 'app_user_accessible' if self._scan_folders is not None else 'everywhere',
+        }
+
+
 class ProcessDialog(QDialog):
     """Lets the user view header-scan history and re-run the file header scan."""
     header_scan_done       = Signal(dict)
     header_scan_tier_done  = Signal(int)   # emitted ONLY for an actual tier upgrade run — see _on_header_done
     header_types_cleared   = Signal()   # emitted before a rescan so the main window can reset
     nested_extraction_done = Signal()   # emitted after NestedArchiveWorker finishes
+    embedded_media_scan_done = Signal()   # emitted after EmbeddedMediaScanWorker finishes
 
     _RUN_TYPE           = 'header_scan'
     _RUN_TYPE_INTEGRITY = 'integrity_check'
@@ -2895,7 +3074,14 @@ class ProcessDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Process Case")
         self.setModal(True)
-        self.setMinimumWidth(620)
+        # Widened/heightened 2026-09-22 to accommodate the embedded-media
+        # controls (checkbox + scope radios + coverage label) added the
+        # same day, and the longer per-file progress line that scan emits
+        # (e.g. "Embedded-media sweep: 1,487 / 1,490 — map_cache.db —
+        # found so far: 1,552 picture(s), 0 video(s)") — the previous
+        # 620px width wrapped that onto multiple lines, and the dialog
+        # had no reserved height for the new controls beyond auto-sizing.
+        self.setMinimumSize(820, 640)
         self._zip_path        = zip_path
         self._case_dir        = case_dir
         self._adapter         = ffs_adapter
@@ -2906,6 +3092,7 @@ class ProcessDialog(QDialog):
         self._scan_worker:      HeaderScanWorker     | None = None
         self._nested_worker:    NestedArchiveWorker  | None = None
         self._integrity_worker: IntegrityCheckWorker | None = None
+        self._embedded_media_worker: EmbeddedMediaScanWorker | None = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -2994,13 +3181,61 @@ class ProcessDialog(QDialog):
             "header scan (at least Tier 1 always runs at case creation).")
         layout.addWidget(self._chk_nested)
 
+        # Embedded-media sweep (added 2026-09-22, see app/embedded_media_scan.py
+        # and CLAUDE.md's own "Embedded-media sweep" Conventions entry).
+        # Placed here, right after archive extraction, and run LAST in the
+        # operation chain (_continue_after_nested) per direct instruction —
+        # so a database or plist that only existed inside a nested archive
+        # just extracted above is already visible to this scan by the time
+        # it runs, never missed because it ran first.
+        self._chk_embedded_media = QCheckBox(
+            "Scan databases and property lists for embedded media")
+        self._chk_embedded_media.setChecked(False)
+        self._chk_embedded_media.setToolTip(
+            "Finds image/video content embedded inside SQLite BLOB cells and "
+            "plist NSData values, across every SQLite database and plist file "
+            "in the archive (or just app/user-accessible areas, per the scope "
+            "below) — including content recovered from freed pages, in-page "
+            "freeblocks, and WAL history, not just what's currently live.\n"
+            "Runs AFTER archive extraction above, so a database or plist that "
+            "only existed inside a nested archive is included too.")
+        layout.addWidget(self._chk_embedded_media)
+
+        embedded_scope_row = QHBoxLayout()
+        embedded_scope_row.setContentsMargins(22, 0, 0, 0)
+        self._embedded_scope_group = QButtonGroup(self)
+        self._rb_embedded_scope_app = QRadioButton("App/user-accessible areas only")
+        self._rb_embedded_scope_all = QRadioButton("Everywhere (exhaustive)")
+        self._rb_embedded_scope_app.setChecked(True)
+        self._embedded_scope_group.addButton(self._rb_embedded_scope_app, 0)
+        self._embedded_scope_group.addButton(self._rb_embedded_scope_all, 1)
+        embedded_scope_row.addWidget(self._rb_embedded_scope_app)
+        embedded_scope_row.addWidget(self._rb_embedded_scope_all)
+        embedded_scope_row.addStretch()
+        layout.addLayout(embedded_scope_row)
+
+        self._embedded_scope_label = QLabel()
+        self._embedded_scope_label.setWordWrap(True)
+        self._embedded_scope_label.setStyleSheet("color: grey; padding-left: 22px;")
+        layout.addWidget(self._embedded_scope_label)
+
+        for rb in (self._rb_embedded_scope_app, self._rb_embedded_scope_all):
+            rb.toggled.connect(self._update_embedded_scope_label)
+        self._chk_embedded_media.toggled.connect(self._on_embedded_media_toggled)
+        self._on_embedded_media_toggled(False)   # scope controls start hidden
+
         # Stats block
         self._stats_label = QLabel()
         self._stats_label.setWordWrap(True)
         layout.addWidget(self._stats_label)
 
-        # Progress / status
+        # Progress / status. Word-wrap added 2026-09-22 alongside the
+        # wider/taller dialog above — the embedded-media scan's own
+        # per-file progress line (file name + running picture/video
+        # tally) routinely runs longer than a single line comfortably
+        # fits, and this label previously had no wrap at all.
         self._status_label = QLabel()
+        self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
 
         btn_row = QHBoxLayout()
@@ -3308,11 +3543,42 @@ class ProcessDialog(QDialog):
         self._refresh_stats()
         self._refresh_stats()
 
+    def _on_embedded_media_toggled(self, checked: bool):
+        """Scope radios + coverage label are only meaningful once the
+        scan itself is actually selected — hidden otherwise, same
+        "don't show a choice that doesn't apply yet" convention the
+        header-scan tier's own coverage label already follows."""
+        self._rb_embedded_scope_app.setVisible(checked)
+        self._rb_embedded_scope_all.setVisible(checked)
+        self._embedded_scope_label.setVisible(checked)
+        if checked:
+            self._update_embedded_scope_label()
+
+    def _update_embedded_scope_label(self):
+        """Direct instruction: "clearly indicate the current head tier
+        level and indicate what it means" was about the Search Coverage
+        dialog, but the SAME principle applies here — state plainly what
+        the chosen scope covers and, just as importantly, that deleted-
+        content recovery (freed pages/freeblocks/WAL history) is always
+        included regardless of scope, never a separate silent toggle."""
+        if self._rb_embedded_scope_all.isChecked():
+            text = ("Covers: every SQLite database and plist in the entire "
+                    "archive, including OS/system areas.")
+        else:
+            text = ("Covers: SQLite databases and plists inside app/user-"
+                    "accessible areas only — the same areas the header "
+                    "scan's own Tier 1/2 restrict to.")
+        text += (" Includes content recovered from freed pages, in-page "
+                "freeblocks, and WAL history, not just what's currently live.")
+        self._embedded_scope_label.setText(text)
+
     def _run_operations(self):
         upgrade_tier  = self._selected_upgrade_tier   # 0 if none picked
         run_scan      = upgrade_tier > 0
         run_integrity = self._chk_integrity.isChecked()
-        if not run_integrity and not run_scan and not self._chk_nested.isChecked():
+        if (not run_integrity and not run_scan
+                and not self._chk_nested.isChecked()
+                and not self._chk_embedded_media.isChecked()):
             self._status_label.setText("Nothing to do — no operations selected.")
             return
         self._run_btn.setEnabled(False)
@@ -3334,7 +3600,7 @@ class ProcessDialog(QDialog):
         elif self._chk_nested.isChecked():
             self._show_archive_selection()
         else:
-            self._finish_operations()
+            self._continue_after_nested()
 
     # ── Data integrity check ──────────────────────────────────────────────────
 
@@ -3550,7 +3816,7 @@ class ProcessDialog(QDialog):
                     msg += f", {mismatch:,} mismatched extension{'s' if mismatch != 1 else ''} found"
                 msg += f", from {n_total:,} candidate{'s' if n_total != 1 else ''}."
             self._status_label.setText(msg)
-            self._finish_operations()
+            self._continue_after_nested()
 
     def _show_archive_selection(self):
         """Load header overrides, discover archives, show selection dialog,
@@ -3705,7 +3971,7 @@ class ProcessDialog(QDialog):
         # avoids cross-thread signal chain issues.
         self._apply_gzip_type_overrides()
         self.nested_extraction_done.emit()
-        self._finish_operations()
+        self._continue_after_nested()
 
     def _apply_gzip_type_overrides(self):
         """Read all single-entry gzip-extracted archives from the DB and emit
@@ -3745,6 +4011,93 @@ class ProcessDialog(QDialog):
             self._nested_worker.requestInterruption()
         if self._integrity_worker and self._integrity_worker.isRunning():
             self._integrity_worker.requestInterruption()
+        if self._embedded_media_worker and self._embedded_media_worker.isRunning():
+            self._embedded_media_worker.requestInterruption()
+
+    # ── Embedded-media sweep ────────────────────────────────────────────────
+
+    def _continue_after_nested(self):
+        """The last stage in the operation chain — see the class-level
+        note by the embedded-media checkbox for why this runs LAST,
+        after archive extraction: a database or plist that only existed
+        inside a nested archive just extracted is already visible to
+        this scan by the time it runs."""
+        if self._chk_embedded_media.isChecked():
+            self._start_embedded_media_scan()
+        else:
+            self._finish_operations()
+
+    def _start_embedded_media_scan(self):
+        scan_folders = (tuple(self._adapter.scan_folders())
+                        if self._rb_embedded_scope_app.isChecked() else None)
+        self._status_label.setText("Finding databases and property lists to scan…")
+        self._embedded_media_worker = EmbeddedMediaScanWorker(
+            self._zip_path, self._case_dir, self._ui_metadata,
+            self._header_type_overrides_snapshot(), self._adapter,
+            self._delta, scan_folders,
+        )
+        self._embedded_media_worker.discovery_done.connect(self._on_embedded_media_discovery)
+        self._embedded_media_worker.progress.connect(self._on_embedded_media_progress)
+        self._embedded_media_worker.finished_scan.connect(self._on_embedded_media_finished)
+        self._embedded_media_worker.start()
+
+    def _header_type_overrides_snapshot(self) -> dict:
+        """The candidate enumeration needs the SAME header-scan-derived
+        type overrides the file browser's own Type column uses (see
+        embedded_media_scan.classify_scan_candidate), read fresh from
+        casecache.db rather than threaded through from the GUI — this
+        dialog may itself have just run/upgraded a header scan moments
+        ago in this SAME operation chain, and load_header_types is the
+        one place both sides already agree is current."""
+        if not self._case_dir:
+            return {}
+        try:
+            with closing(_open_cache_db(self._case_dir)) as db:
+                return load_header_types(db)
+        except Exception:
+            return {}
+
+    def _on_embedded_media_discovery(self, n_databases: int, n_plists: int):
+        self._embedded_media_totals = (n_databases, n_plists)
+        if n_databases == 0 and n_plists == 0:
+            self._status_label.setText(
+                "Embedded-media sweep: no SQLite databases or property "
+                "lists found to scan.")
+            return
+        self._status_label.setText(
+            f"Embedded-media sweep: found {n_databases:,} database(s) and "
+            f"{n_plists:,} property list(s) to scan…")
+
+    def _on_embedded_media_progress(self, index: int, total: int,
+                                    ui_path: str, counts: dict):
+        name = ui_path.rsplit('/', 1)[-1] if ui_path else ''
+        suffix = f" — {name}" if name else ""
+        found = (f"found so far: {counts['live_pictures']:,} picture(s), "
+                f"{counts['live_videos']:,} video(s)")
+        recovered = counts['recovered_pictures'] + counts['recovered_videos']
+        if recovered:
+            found += (f" ({counts['recovered_pictures']:,} picture(s) and "
+                      f"{counts['recovered_videos']:,} video(s) recovered "
+                      "from deleted content)")
+        self._status_label.setText(
+            f"Embedded-media sweep: {index:,} / {total:,}{suffix} — {found}")
+
+    def _on_embedded_media_finished(self, summary: dict):
+        if summary.get('error'):
+            self._status_label.setText(
+                f"Embedded-media sweep failed: {summary['error']}")
+        else:
+            total_hits = summary.get('total_hits', 0)
+            recovered = (summary.get('recovered_pictures', 0)
+                        + summary.get('recovered_videos', 0))
+            msg = (f"Embedded-media sweep done — {total_hits:,} item(s) found "
+                  f"across {summary.get('total_files', 0):,} file(s)")
+            if recovered:
+                msg += f", {recovered:,} recovered from deleted content"
+            msg += "."
+            self._status_label.setText(msg)
+        self.embedded_media_scan_done.emit()
+        self._finish_operations()
 
     def _finish_operations(self):
         self._run_btn.setEnabled(True)
@@ -3757,7 +4110,9 @@ class ProcessDialog(QDialog):
         return ((bool(self._scan_worker and self._scan_worker.isRunning())) or
                 (bool(self._nested_worker and self._nested_worker.isRunning())) or
                 (bool(self._integrity_worker and
-                      self._integrity_worker.isRunning())))
+                      self._integrity_worker.isRunning())) or
+                (bool(self._embedded_media_worker and
+                      self._embedded_media_worker.isRunning())))
 
     def closeEvent(self, event):
         if self._is_scanning():
@@ -4257,6 +4612,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # ever used for plain membership testing (never a dict value
         # read), so there's no shape mismatch risk sharing it.
         self._leveldb_folder_map: dict = {}
+        # Container ui_paths (SQLite db / plist file) that have ≥1 recorded
+        # embedded-media hit — see _inject_embedded_media. Record VIRTUAL
+        # LEAF paths still go in the shared _nested_virtual_paths above,
+        # same "one shared set, multiple sources" reasoning as the LevelDB
+        # comment just above; this set is only for the folder-level
+        # Type/size/styling checks (_classify_entry, _build_entry_cols).
+        self._embedded_media_containers: frozenset = frozenset()
         self._hex_worker: QThread | None = None
         self._device_info_worker: QThread | None = None
         self._retired_workers: list = []   # stopped workers awaiting thread exit
@@ -5063,6 +5425,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if self.splitter.sizes()[0] == 0 and self._tree_splitter_sizes:
             self.splitter.setSizes(self._tree_splitter_sizes)
         if index == 1:
+            # Showing the embedded-media sweep's own results — leave it
+            # alone rather than silently reverting to the last-selected
+            # folder, per _show_embedded_media_hits' own docstring. Only
+            # picking an ordinary folder again (_load_media_from_file_model,
+            # which clears this flag) exits this view.
+            if self._media_showing_embedded:
+                self._resync_media_hex_preview()
+                return
             # Determine pending selection from the file browser
             if self._selected_file_path and \
                     os.path.splitext(self._selected_file_path)[1].lower() in MEDIA_EXTENSIONS:
@@ -5565,18 +5935,39 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """Dispatch a virtual-leaf path (member of _nested_virtual_paths)
         to whichever real reader its own full_metadata marker names —
         a nested-archive entry (_archive_path, the original, still the
-        common case) or a LevelDB record's own value
-        (_leveldb_folder — see leveldb_viewer.py). One shared set,
-        two real sources, so every OTHER _nested_virtual_paths check
-        (double-click routing here, display-name/file-type
-        classification elsewhere) needed no change at all — only the
-        two spots that actually READ an entry's bytes needed to learn
-        the new source."""
+        common case), a LevelDB record's own value (_leveldb_folder —
+        see leveldb_viewer.py), or an embedded-media hit's own extracted
+        file (_embedded_media_source — see embedded_media_scan.py /
+        _inject_embedded_media). One shared set, three real sources now,
+        so every OTHER _nested_virtual_paths check (double-click routing
+        here, display-name/file-type classification elsewhere) needed no
+        change at all — only the spots that actually READ an entry's
+        bytes needed to learn each new source."""
         meta = self.full_metadata.get(ui_path, {})
         if meta.get('_leveldb_folder'):
             self._load_leveldb_record_preview(ui_path)
+        elif meta.get('_embedded_media_source'):
+            self._load_embedded_media_entry_preview(ui_path)
         else:
             self._load_nested_entry_preview(ui_path)
+
+    def _load_embedded_media_entry_preview(self, ui_path: str) -> None:
+        """Read an embedded-media hit's own extracted file straight off
+        disk and display it — no archive/adapter resolution involved,
+        since _embedded_media_source is already a real local absolute
+        path (see extract_media_bytes). No sidecar_reader either — a
+        confirmed image/video file has no WAL/SHM-style sidecar concept."""
+        meta = self.full_metadata.get(ui_path, {})
+        source_path = meta.get('_embedded_media_source')
+        if not source_path:
+            return
+        try:
+            with open(source_path, 'rb') as f:
+                data = f.read()
+        except OSError:
+            return
+        name = meta.get('_display_name') or ui_path.rsplit('/', 1)[-1]
+        self._display_preview_bytes(ui_path, data, name)
 
     def _load_nested_entry_preview(self, ui_path: str) -> None:
         """Read an entry from an extracted nested archive and display it."""
@@ -5787,7 +6178,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             else:
                 cols.extend([''] * len(_PHOTO_HEADERS))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
-                path in self._nested_archive_map or path in self._leveldb_folder_map)
+                path in self._nested_archive_map or path in self._leveldb_folder_map
+                or path in self._embedded_media_containers)
 
     def _display_name(self, segment: str) -> str:
         """Return the bundle ID for a GUID segment, otherwise the segment itself."""
@@ -5819,6 +6211,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 return 'Archive', False, False  # extracted archive browseable as folder
             if path in self._leveldb_folder_map:
                 return 'LevelDB', False, False  # decoded LevelDB, records browseable as folder
+            if path in self._embedded_media_containers:
+                return 'Embedded Media', False, False  # db/plist with found media, browseable as folder
             if self._should_hide_folder(path):
                 return None, None, True
             if path in self._metadata_only_folders:
@@ -5856,9 +6250,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         cols: list = [self._display_name(name)]
         for _, key in self._time_cols:
             cols.append(self.format_ts(meta.get(key)))
-        if is_folder and (path in self._nested_archive_map or path in self._leveldb_folder_map):
-            size_val = meta.get('size', 0)   # original archive size, or (LevelDB) the
-                                             # precomputed sum of all real record values
+        if is_folder and (path in self._nested_archive_map or path in self._leveldb_folder_map
+                         or path in self._embedded_media_containers):
+            size_val = meta.get('size', 0)   # original archive size, or (LevelDB/embedded
+                                             # media) the precomputed sum of all real
+                                             # record/hit values
         elif is_folder:
             size_val = self._folder_total_size(path)
         else:
@@ -6487,6 +6883,153 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         extracted = {p for p, r in records.items() if not r.get('error_msg')}
         return sum(1 for a in archives if a['ui_path'] not in extracted)
 
+    def _leveldb_search_coverage(self) -> tuple[list, list]:
+        """(all_leveldb_paths, unindexed_paths) — one shared predicate so
+        the coverage count (below) and the actual indexing action can
+        never drift apart, the same "one shared predicate, never two
+        copies that could disagree" principle _header_candidate_matches
+        already established for the header-scan tiers above. A folder
+        counts as unindexed either because it's never been indexed at
+        all, or because leveldb_viewer.leveldb_decode_logic_version() no
+        longer matches what the cached index was built under — a version
+        mismatch invalidates the WHOLE table at once (simpler and safer
+        than trying to track which specific folders a given code change
+        could have affected), same "app_intelligence_scan_key" pattern
+        app_intelligence.py already uses for the identical staleness
+        problem elsewhere in this project.
+
+        A REAL bug found and fixed 2026-09-20, by direct user report: a
+        folder the examiner had already BROWSED into (double-clicked,
+        triggering _decode_leveldb_folder) before ever running Keyword
+        Search was PERMANENTLY invisible to this discovery step — once
+        decoded, folder_map[ui_path] holds virtual per-record children,
+        not the real CURRENT/.ldb files _looks_like_leveldb_dir's own
+        structural check looks for, so a folder the examiner had already
+        looked at (exactly the ones most likely worth searching) could
+        never be indexed at all, no matter how many times indexing ran.
+        Reproduced directly against the user's own real case before
+        fixing: a genuine Local Storage record
+        ('.../Local Storage/leveldb/000041_...', value
+        '1720919794105') had zero rows in leveldb_search_index — not a
+        stale-version gap, not a missed click, the folder was simply
+        never a candidate at all once decoded. Fixed by also including
+        every key already in self._leveldb_folder_map — decoded or not,
+        a real LevelDB/IndexedDB folder is a real LevelDB/IndexedDB
+        folder either way."""
+        all_paths = list(dict.fromkeys(
+            [p for p in self.folder_map if _looks_like_leveldb_dir(self.folder_map, p)]
+            + list(self._leveldb_folder_map.keys())
+        ))
+        if not all_paths or not self._case_dir:
+            return all_paths, list(all_paths)
+        from leveldb_viewer import leveldb_decode_logic_version
+        current_version = leveldb_decode_logic_version()
+        already_indexed: set = set()
+        try:
+            with closing(_open_cache_db(self._case_dir)) as db:
+                stale = load_blob(db, 'leveldb_search_index_version', '1')
+                if stale is not None and stale.decode() == current_version:
+                    already_indexed = indexed_leveldb_folders(db)
+        except Exception:
+            already_indexed = set()
+        unindexed = [p for p in all_paths if p not in already_indexed]
+        return all_paths, unindexed
+
+    def _undecoded_leveldb_folder_count(self) -> int:
+        """Number of real LevelDB/IndexedDB folders not yet indexed for
+        Keyword Search — used by the Search Coverage reminder exactly the
+        way _unextracted_archive_count already is for nested archives."""
+        _, unindexed = self._leveldb_search_coverage()
+        return len(unindexed)
+
+    def _index_leveldb_folders_batched(self, ui_paths: list, on_progress=None, on_done=None):
+        """Index every path in *ui_paths* for Keyword Search coverage —
+        writes to casecache.db's leveldb_search_index table via
+        index_leveldb_folder_for_search (app/leveldb_viewer.py), which
+        deliberately never touches folder_map/full_metadata (see that
+        method's own docstring for the measured real cost that design
+        choice avoids: a real 234-folder archive would otherwise bloat
+        full_metadata by ~17x for a single search).
+
+        Runs frame-budgeted on the MAIN thread (same
+        _populate_tree_children_batched idiom used for tree population)
+        rather than a background QThread — deliberate, not an oversight:
+        index_leveldb_folder_for_search reads archive bytes via
+        self._read_zip_bytes, the GUI's own shared zip reader, and this
+        project's own standing convention is that a background worker
+        must own an independent reader rather than share that one (see
+        keyword_search.py's KeywordSearchWorker/NestedArchiveSearchWorker,
+        both of which open their own zip access rather than touching
+        self._read_zip_bytes) — giving this indexing pass its own reader
+        too would be real, avoidable extra complexity given the measured
+        cost is already small (~3.4s of CPU for a real 234-folder/257,804-
+        record archive); frame-budgeting keeps the UI responsive for that
+        span the same way tree population already does for a much larger
+        one, without needing a second reader implementation at all.
+
+        *on_progress(done, total)* and *on_done()* are optional callbacks;
+        writes happen incrementally (one save_leveldb_search_records call
+        per folder) so a cancelled/interrupted run still leaves whatever
+        was completed usable rather than losing it all."""
+        from db_utils import save_leveldb_search_records
+        from leveldb_viewer import leveldb_decode_logic_version
+        state = {'idx': 0}
+        total = len(ui_paths)
+        version = leveldb_decode_logic_version()
+
+        def _step(deadline):
+            while state['idx'] < total:
+                ui_path = ui_paths[state['idx']]
+                state['idx'] += 1
+                # An ALREADY-decoded folder's own folder_map[ui_path] holds
+                # virtual per-record children now, not the real raw files —
+                # _leveldb_folder_map's own 'real_children' (recorded once,
+                # at the moment it was first decoded) is the one place that
+                # still has the true original listing. Falls back to
+                # folder_map for a folder that's never been decoded at all,
+                # where folder_map still correctly shows the raw files.
+                existing_entry = self._leveldb_folder_map.get(ui_path)
+                if existing_entry is not None:
+                    real_children = list(existing_entry.get('real_children') or [])
+                else:
+                    real_children = list(self.folder_map.get(ui_path) or [])
+                try:
+                    rows = self.index_leveldb_folder_for_search(ui_path, real_children)
+                except Exception:
+                    rows = []
+                if self._case_dir:
+                    try:
+                        with closing(_open_cache_db(self._case_dir)) as db:
+                            save_leveldb_search_records(db, ui_path, rows)
+                    except Exception:
+                        pass
+                if on_progress:
+                    on_progress(state['idx'], total)
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+            return True
+
+        def _finish():
+            if self._case_dir:
+                try:
+                    with closing(_open_cache_db(self._case_dir)) as db:
+                        save_blob(db, 'leveldb_search_index_version', '1', version.encode())
+                except Exception:
+                    pass
+            if on_done:
+                on_done()
+
+        def _batch():
+            if _step(time.monotonic() + FRAME_BUDGET_SECS):
+                _finish()
+            else:
+                QTimer.singleShot(0, _batch)
+
+        if not ui_paths:
+            _finish()
+        else:
+            QTimer.singleShot(0, _batch)
+
     def _open_process_dialog(self, preselect_nested=False, resume_search=False,
                              auto_archive_selection=False):
         if not self.zip_path:
@@ -6510,6 +7053,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # second persist. See ProcessDialog._on_header_done.
         dlg.header_scan_tier_done.connect(lambda _t: self._refresh_header_scan_indicator())
         dlg.nested_extraction_done.connect(self._on_nested_extraction_done)
+        dlg.embedded_media_scan_done.connect(self._on_embedded_media_scan_injected)
         dlg.exec()
         # Came here from a keyword search — run that search automatically
         # once the dialog closes, whether or not anything was extracted.
@@ -6643,6 +7187,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._selected_media_path = None
         self._pending_media_selection = None
         self._media_context = None
+        self._media_showing_embedded = False
         # Busy/indeterminate (range 0,0) so the bar keeps animating for the whole
         # load — a static bar looked hung.  Hidden only once BOTH the tree has
         # finished populating and the worker thread is done (covers any header
@@ -6746,6 +7291,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # (harmless either order in practice, but this one relies on
         # folder_map already reflecting this case's real archive layout).
         self._rescan_decoded_leveldb_folders()
+        # Must run after both of the above — same "folder_map already
+        # reflects this case's real layout" reasoning as the LevelDB
+        # rescan's own comment just above.
+        self._inject_embedded_media()
         self.reload_tree_entirely()
         self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
         # Fetch device label and populate device_info after archive is loaded.
@@ -6818,13 +7367,32 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 overrides, photos, tz = fut.result()
             except Exception:
                 return
+            # A real, higher-impact instance of the SAME gap
+            # _on_header_types_cleared's own docstring already documents
+            # (found 2026-09-19, direct user report that a decoded
+            # LevelDB folder's Type column showed 'Other' for every
+            # single row, not just after a manual rescan): this
+            # background load reads ONLY the persisted, real-file
+            # magic-byte overrides from casecache.db and then REPLACES
+            # the whole _header_type_overrides object outright — wiping
+            # out any LevelDB-derived per-record override
+            # _rescan_decoded_leveldb_folders already populated moments
+            # earlier during this same case-load sequence (it runs
+            # synchronously, well before this background DB read/poll
+            # ever completes). Since LevelDB records are synthetic, not
+            # real archive entries, they're never in casecache.db's own
+            # header_types table to begin with — so EVERY case load hit
+            # this, not just an explicit rescan. Re-populating here the
+            # same way the manual-rescan path already does closes it.
             self._header_type_overrides = overrides
+            self._reapply_leveldb_type_overrides()
             self._photo_index = photos
             (self._handset_zone_name, self._acquisition_zone_name,
              self._manual_zone_name,
              self._timestamp_display_mode, is_first_load) = tz
             self._refresh_timestamp_mode_indicator()
             self._refresh_header_scan_indicator()
+            self._refresh_embedded_media_button()
             if self._view_is_recursive:
                 self._rebuild_file_view_from_checked(preserve_filter=True)
             else:
@@ -7128,6 +7696,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         3: "Header scan: Tier 3 — all files, everywhere",
     }
 
+    # Same dict object as the module-level _HEADER_SCAN_TIER_COVERAGE
+    # above, re-exposed as a class attribute purely so a mixin method
+    # (defined in a different module, e.g. app/keyword_search.py) can
+    # reach it via `self._HEADER_SCAN_TIER_COVERAGE` — a bare module
+    # global isn't visible from another module's own functions, but an
+    # attribute lookup through `self` always resolves via this class's
+    # MRO regardless of which file the accessing method lives in (the
+    # same technique already used for _HEADER_SCAN_TIER_TEXT above).
+    _HEADER_SCAN_TIER_COVERAGE = _HEADER_SCAN_TIER_COVERAGE
+
     def _refresh_header_scan_indicator(self):
         """Updates the blue header-scan-tier banner — see TODO.md item 20.
         A different colour from the timestamp banner's own orange
@@ -7234,6 +7812,111 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 self.folder_map[ui_path] = children
 
         self._nested_virtual_paths = frozenset(virtual_paths)
+
+    def _inject_embedded_media(self):
+        """Inject recorded embedded-media hits (see app/embedded_media_scan.py
+        and EmbeddedMediaScanWorker above) into folder_map/full_metadata so
+        each container (a SQLite db or plist file that had ≥1 hit) becomes
+        a navigable folder, its found media as children — SAME
+        folder_map/full_metadata/_nested_virtual_paths machinery
+        _inject_nested_archives above and leveldb_viewer.py's own LevelDB
+        injection already share ("one shared set, multiple real sources",
+        per _load_virtual_entry_preview's own docstring) — added
+        2026-09-22, direct follow-up request after shipping the scan
+        itself: "in the file browser are the children of the container
+        file?" (they weren't yet) plus a confirmed per-source-type naming
+        scheme (see embedded_media_scan.compute_display_name).
+
+        Called at case load (right after _rescan_decoded_leveldb_folders,
+        before reload_tree_entirely — so the tree is built correctly from
+        scratch with no live-upgrade dance needed) and again right after
+        EmbeddedMediaScanWorker finishes (see _on_embedded_media_finished's
+        own tree-insertion handling, mirroring _on_nested_extraction_done).
+        Name collisions within one container (e.g. two "carved" hits from
+        the same db, or two plist fields both named "photo") are
+        disambiguated here — not in compute_display_name, which only
+        knows one hit at a time — via a plain "name (2)", "name (3)"...
+        suffix before the extension, the same convention any OS's own
+        file manager already uses for a duplicate name."""
+        self._embedded_media_containers = frozenset()
+        if not self._case_dir:
+            return
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                hits = load_embedded_media_hits(db)
+        except Exception:
+            return
+        if not hits:
+            return
+
+        by_container: dict[str, list] = {}
+        for h in hits:
+            by_container.setdefault(h['source_ui_path'], []).append(h)
+
+        virtual_paths: set[str] = set()
+        containers: set[str] = set()
+        for container, container_hits in by_container.items():
+            used_names: dict[str, int] = {}
+            children = []
+            total_size = 0
+            for h in container_hits:
+                base = h['display_name'] or h['extracted_path'].rsplit('/', 1)[-1]
+                if base in used_names:
+                    used_names[base] += 1
+                    stem, ext = os.path.splitext(base)
+                    name = f"{stem} ({used_names[base]}){ext}"
+                else:
+                    used_names[base] = 1
+                    name = base
+                vpath = f"{container}/{name}"
+                virtual_paths.add(vpath)
+                children.append(vpath)
+                total_size += h['byte_length']
+                self.full_metadata[vpath] = {
+                    'size':                    h['byte_length'],
+                    '_display_name':           name,
+                    '_embedded_media_source':  h['extracted_path'],
+                    'mtime':                   None,
+                }
+            self.folder_map[container] = children
+            containers.add(container)
+            # _folder_total_size() is a precomputed-at-metadata-parse-time
+            # cache with no notion of a synthetic folder like this one —
+            # same reason _classify_entry/_build_entry_cols special-case
+            # this container below, mirroring the LevelDB precedent
+            # ("the precomputed sum of all real record values") rather
+            # than the container's own real on-disk file size, which
+            # would otherwise still be sitting in this same dict unrelated
+            # to what it now displays as a folder.
+            self.full_metadata.setdefault(container, {})['size'] = total_size
+
+        self._embedded_media_containers = frozenset(containers)
+        self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_paths)
+
+    def _on_embedded_media_scan_injected(self):
+        """Runs when ProcessDialog's embedded-media scan finishes (see
+        EmbeddedMediaScanWorker/ProcessDialog.embedded_media_scan_done) —
+        re-injects the (now larger) hit set and, mirroring
+        _on_nested_extraction_done's own exact approach, upgrades any
+        newly-found container's tree item from a plain leaf to an
+        expandable folder wherever its parent happens to already be
+        visible in this session (a container whose parent isn't currently
+        expanded needs no special handling — the next real expansion
+        builds its children from folder_map correctly regardless, and a
+        case reopen always does via _inject_embedded_media's own case-load
+        call site)."""
+        before = self._embedded_media_containers
+        self._inject_embedded_media()
+        self._refresh_embedded_media_button()
+        new_containers = self._embedded_media_containers - before
+        for ui_path in sorted(new_containers):
+            parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ''
+            parent_item = self._find_tree_item(parent_path)
+            if parent_item is None:
+                continue
+            self._insert_tree_folder_item(parent_item, ui_path, Qt.CheckState.Unchecked)
+        if new_containers:
+            self._rebuild_file_view_from_checked(preserve_filter=True)
 
     def _on_nested_extraction_done(self):
         saved_checked = set(self._checked_folders)

@@ -94,6 +94,77 @@ _SOURCE_MARKER_NAME = '.ffs_leveldb_source_ui_path'
 _UNSAFE_SEGMENT_CHARS = re.compile(r'[^A-Za-z0-9 ._\-]')
 
 
+def _is_indexeddb_leveldb_dir(ui_path: str) -> bool:
+    """True if ui_path's own basename matches Chromium's real IndexedDB
+    directory naming convention (`<origin>.indexeddb.leveldb`) — confirmed
+    consistent across every real IndexedDB folder surveyed in this
+    project's own real casework (Local Storage/Session Storage never end
+    this way). A cheap, reliable name-based check — no need to open or
+    read anything before deciding whether the REAL, schema-informed
+    ccl_chromium_indexeddb decoder (see that module's own docstring) is
+    even worth attempting for this folder, added 2026-09-19 directly
+    prompted by a user report that this project's own schema-less
+    content-type GUESS badly mislabels real IndexedDB values (see
+    CLAUDE.md's own "not happy with the results of
+    https_cellebrite.com_0.indexeddb..." review entry)."""
+    return ui_path.rsplit('/', 1)[-1].endswith('.indexeddb.leveldb')
+
+
+def _indexeddb_blob_dir_for(ui_path: str) -> str:
+    """The real sibling directory Chromium writes an IndexedDB store's
+    large/externally-wrapped values into (`<origin>.indexeddb.blob`,
+    alongside its `<origin>.indexeddb.leveldb` directory — same parent,
+    same origin stem, only the trailing component's suffix differs).
+    Confirmed necessary against real data, not theoretical:
+    ccl_chromium_indexeddb.IndexedDb.get_blob raises a bare ValueError
+    with no blob dir supplied, and a real record on this project's own
+    npr.org IndexedDB store genuinely needs one to deserialize at all —
+    see _decode_indexeddb_folder's own docstring for why this is looked
+    up and extracted UP FRONT, alongside the main directory, rather than
+    lazily per-record."""
+    parent, _, leaf = ui_path.rpartition('/')
+    blob_leaf = leaf[:-len('.leveldb')] + '.blob'
+    return f"{parent}/{blob_leaf}" if parent else blob_leaf
+
+
+def _format_idb_key_value(value) -> str:
+    """A short, readable label for an already-decoded
+    ccl_chromium_indexeddb.IdbKey.value — which, per that vendored
+    decoder's own real IdbKeyType handling, can genuinely be a str, a
+    float (IndexedDB's own Number key type), a datetime.datetime (Date
+    key type), a tuple of further IdbKey objects (Array key type,
+    handled here recursively), bytes (Binary key type), or None (Null
+    key type) — every one a real, already-decoded key type this
+    project's own vendored decoder assigns, never guessed at here."""
+    if isinstance(value, tuple):
+        return '[' + ', '.join(
+            _format_idb_key_value(v.value if hasattr(v, 'value') else v) for v in value
+        ) + ']'
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if value is None:
+        return '(null key)'
+    return str(value)
+
+
+class _IdbPreviewRecord:
+    """One already-fully-decoded real IndexedDB record's own display
+    state — parallel to a raw ccl_leveldb.Record, but everything a
+    caller would otherwise compute from raw bytes (content type, preview
+    bytes) is already FINAL here, computed once at decode time from the
+    real deserialized value ccl_chromium_indexeddb's own
+    WrappedObjectStore.iterate_records already produced — never
+    re-derived from raw bytes the way a generic (non-IndexedDB)
+    LevelDB record's preview is. See _load_leveldb_record_preview's and
+    _reapply_leveldb_type_overrides' own `entry.get('kind') ==
+    'indexeddb'` branches, the two real consumers of this."""
+    __slots__ = ('preview_bytes', 'content_type')
+
+    def __init__(self, preview_bytes: bytes, content_type: str | None):
+        self.preview_bytes = preview_bytes
+        self.content_type = content_type
+
+
 def _looks_like_leveldb_dir(folder_map: dict, folder_ui_path: str) -> bool:
     """True if folder_ui_path's own direct children (via folder_map)
     include a real LevelDB CURRENT file and at least one MANIFEST-*/
@@ -117,6 +188,34 @@ def _looks_like_leveldb_dir(folder_map: dict, folder_ui_path: str) -> bool:
         if has_current and has_data:
             return True
     return False
+
+
+def _key_display_plausible(text: str) -> bool:
+    """True if *text* (already a successful UTF-8 decode of a record's
+    raw key) is worth showing AS-IS as a filename, rather than falling
+    back to the honest "record_NNNNNN (N bytes, binary key)" label.
+
+    Deliberately NOT a call to artifact_runner.text_plausible — that
+    function's own 8-character floor ("nothing meaningful to judge" for
+    anything shorter) is the wrong bar for a FILENAME decision
+    specifically, found and fixed 2026-09-19 by a direct user report on
+    real IndexedDB data: an IndexedDB key is very commonly just a few
+    raw bytes (Chromium's own compact-integer key encoding — real
+    examples on this project's own real cellebrite.com IndexedDB store
+    include a bare `b'\\x00\\x00\\x00\\x00\\x00'`, 5 NUL bytes), which
+    decodes as "valid UTF-8" (each byte is individually a valid
+    single-byte codepoint) but renders as literally invisible control
+    characters — under text_plausible's own 8-char floor this would be
+    waved through as "too short to fail," producing a blank-looking
+    filename in the file browser, which is worse than the honest
+    fallback this function exists to provide. A filename with even one
+    or two such bytes is already a bad filename regardless of length,
+    so this checks the SAME control-character-fraction ratio
+    text_plausible uses, just without its length floor."""
+    if not text:
+        return False
+    control = sum(1 for ch in text if ord(ch) < 32 and ch not in '\t\n\r')
+    return control / len(text) <= 0.15
 
 
 def _sanitize_record_name(raw_key: bytes, index: int,
@@ -157,15 +256,26 @@ def _sanitize_record_name(raw_key: bytes, index: int,
     shows the SAME origin/top_level_site/key fields
     chrome_local_storage.py's own report already shows, dash-joined,
     rather than the raw "_origin\\x00\\x01key" bytes; (2) plain UTF-8,
-    unchanged from before; (3) — the real fix for a genuine bug found
-    2026-09-19 (a raw hex dump of the WHOLE key, however long, made an
-    IndexedDB-shaped key's own filename unreadable and looked broken) —
-    a short, honest synthetic label instead of a long hex blob for a
-    key this function genuinely can't make sense of, since a filename's
-    job is to be a clear, non-misleading label, not to carry full
-    fidelity (the record's own raw key bytes are still the real
-    dict/lookup key everywhere else in this project's own convention,
-    nothing is lost, just not crammed into what's shown here).
+    but ONLY when _key_display_plausible accepts the decoded result
+    (added 2026-09-19, a second real bug on the SAME real
+    cellebrite.com IndexedDB store that first prompted fix 3 below,
+    found by direct user report: a genuinely binary key like 5 raw NUL
+    bytes decodes as "valid UTF-8" — each byte is its own valid
+    codepoint — and used to be shown as-is, rendering as an invisible,
+    blank-looking filename in the file browser; see
+    _key_display_plausible's own docstring for why this needed a
+    purpose-built check rather than reusing artifact_runner.
+    text_plausible directly); (3) — the original fix for a related but
+    distinct bug found 2026-09-19 (a raw hex dump of the WHOLE key,
+    however long, made an IndexedDB-shaped key's own filename
+    unreadable and looked broken) — a short, honest synthetic label
+    instead of a long hex blob for a key this function genuinely can't
+    make sense of, since a filename's job is to be a clear,
+    non-misleading label, not to carry full fidelity (the record's own
+    raw key bytes are still the real dict/lookup key everywhere else in
+    this project's own convention, nothing is lost, just not crammed
+    into what's shown here). Both (2)'s implausible-decode case and (3)'s
+    UnicodeDecodeError case share the identical fallback label.
 
     A FOURTH thing is now tried too, before any of the above, for a
     Session Storage record specifically — see the
@@ -189,9 +299,11 @@ def _sanitize_record_name(raw_key: bytes, index: int,
         readable = f"{origin} - {top_level_site} - {key}" if top_level_site else f"{origin} - {key}"
     elif raw_key:
         try:
-            readable = raw_key.decode('utf-8')
+            candidate = raw_key.decode('utf-8')
         except UnicodeDecodeError:
-            readable = f"record_{index:06d} ({len(raw_key)} bytes, binary key)"
+            candidate = None
+        readable = (candidate if candidate is not None and _key_display_plausible(candidate)
+                    else f"record_{index:06d} ({len(raw_key)} bytes, binary key)")
     else:
         readable = '(empty key)'
     display_name = readable if len(readable) <= 120 else readable[:120] + '…'
@@ -229,6 +341,137 @@ def _content_shape(text: str) -> str | None:
             return None
         return 'plist' if '<plist' in text[:512] else 'xml'
     return None
+
+
+def _protobuf_field_count(raw: bytes, *, min_fields: int = 2) -> int | None:
+    """Field count if *raw* parses cleanly as a schema-less protobuf
+    message end-to-end (walking `(tag varint, wire-type-appropriate
+    payload)*` with ZERO leftover bytes), else None — the same
+    structural technique `protoc --decode_raw`/PBTK use for schema-less
+    protobuf inspection (no `.proto` needed, since a valid protobuf
+    WIRE FORMAT is self-describing enough to walk without one). Added
+    2026-09-19, prompted by a real gap found reviewing this project's
+    own real non-Chrome LevelDB stores (Google Play Services' own
+    CryptAuth/SafetyNet/semantic-location/usage-reporting databases,
+    Chrome's own Sync Data and Local Storage META: records): every one
+    of these stores real protobuf with NO tag-byte convention at all,
+    and a short/simple protobuf message's bytes routinely happen to all
+    be < 0x80 — trivially "valid UTF-8" — getting mislabeled 'text' by
+    this module's own existing UTF-8-decode-success bar, the identical
+    failure shape already fixed for IndexedDB elsewhere in this file
+    (see `_decode_indexeddb_folder`), just for a real encoding a generic
+    per-cell LevelDB view can't reach for with a real decoder the way
+    IndexedDB's own on-disk format allows — protobuf has no fixed
+    per-app schema to decode against generically, only a checkable WIRE
+    SHAPE.
+
+    Real, load-bearing tuning, not an arbitrary default: `min_fields=2`
+    is the single biggest lever against false-positiving on genuinely
+    random/unrelated binary — validated via a 20,000-trial-per-length
+    false-positive sweep against real `random.randrange(256)` noise at
+    lengths 1-100 bytes: `min_fields=1` lets real noise false-positive
+    up to ~7%, `min_fields=2` cuts that to roughly 1% peak. The real,
+    disclosed cost of that safety margin: a genuine but SINGLE-field
+    short protobuf value (e.g. a real Chrome `shared_proto_db` value,
+    `b'\\n\\x011'`, field 1 = the string "1") stays unclassified as
+    protobuf (falls through to the ordinary text/bin fallback below) —
+    not wrongly labeled 'text' either way, just not POSITIVELY
+    identified as protobuf; a real, accepted trade-off, not silently
+    glossed over.
+
+    Wire types 3/4 (deprecated START_GROUP/END_GROUP, removed from
+    proto3 entirely) are rejected outright — a real message using them
+    is vanishingly rare in practice and accepting them would only widen
+    the false-positive surface for no real corresponding gain."""
+    pos = 0
+    n = len(raw)
+    fields = 0
+    while pos < n:
+        tag = 0
+        shift = 0
+        while True:
+            if pos >= n or shift > 63:
+                return None  # truncated or runaway varint
+            b = raw[pos]
+            pos += 1
+            tag |= (b & 0x7f) << shift
+            if not (b & 0x80):
+                break
+            shift += 7
+        field_no = tag >> 3
+        wire_type = tag & 0x7
+        if field_no < 1:
+            return None
+        if wire_type == 0:  # varint
+            while True:
+                if pos >= n:
+                    return None
+                b = raw[pos]
+                pos += 1
+                if not (b & 0x80):
+                    break
+        elif wire_type == 1:  # 64-bit (fixed64/double)
+            if pos + 8 > n:
+                return None
+            pos += 8
+        elif wire_type == 2:  # length-delimited (string/bytes/embedded message)
+            length = 0
+            shift2 = 0
+            while True:
+                if pos >= n or shift2 > 63:
+                    return None
+                b = raw[pos]
+                pos += 1
+                length |= (b & 0x7f) << shift2
+                if not (b & 0x80):
+                    break
+                shift2 += 7
+            if pos + length > n:
+                return None
+            pos += length
+        elif wire_type == 5:  # 32-bit (fixed32/float)
+            if pos + 4 > n:
+                return None
+            pos += 4
+        else:
+            return None  # wire type 3/4 (deprecated groups) or 6/7 (invalid)
+        fields += 1
+    return fields if fields >= min_fields else None
+
+
+def _is_length_delimited_protobuf(raw: bytes) -> bool:
+    """True if *raw* is a leading varint BYTE LENGTH followed by exactly
+    that many bytes of a valid schema-less protobuf message — Java's
+    real `Message.writeDelimitedTo()` convention (structurally different
+    from bare protobuf: the outer varint is a LENGTH, not a field tag).
+    Confirmed as a real, distinct on-disk convention in this project's
+    own real casework: Google Play Services' CryptAuth device-sync data
+    (key `DEVICE_METADATA_DeviceSync:BetterTogether@@<account>`) uses
+    exactly this shape. Requiring the outer length to match the
+    remaining buffer EXACTLY is itself a strong constraint — validated
+    via the same false-positive sweep as `_protobuf_field_count`: at
+    most 0.035% of random noise trials matched at any tested length,
+    the safest of the detectors added this session — so the inner
+    message only needs `min_fields=1` here, unlike the bare-protobuf
+    case above."""
+    if not raw:
+        return False
+    pos = 0
+    n = len(raw)
+    length = 0
+    shift = 0
+    while True:
+        if pos >= n or shift > 63:
+            return False
+        b = raw[pos]
+        pos += 1
+        length |= (b & 0x7f) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    if pos + length != n:
+        return False
+    return _protobuf_field_count(raw[pos:pos + length], min_fields=1) is not None
 
 
 def _abx_to_xml_text(raw: bytes) -> str | None:
@@ -274,13 +517,38 @@ def _leveldb_value_candidates(raw: bytes) -> list[tuple[str, bool]]:
     candidate as real text should additionally require either
     _content_shape (validated json/xml/plist) or
     artifact_runner.text_plausible — never accept it on decode success
-    alone."""
+    alone. Generated even for a bare 1-byte tag with an EMPTY payload
+    (`b'\\x00'`/`b'\\x01'` alone — fixed 2026-09-19, found while adding
+    the candidate below: the original `len(raw) > 1` guard silently
+    skipped this, so a genuinely tagged-empty-string value never
+    resolved as 'text' via this candidate at all) — `body` is simply
+    b'', which both `bytes.decode('utf-16-le')`/`bytes.decode('latin-1')`
+    happily decode to `''`.
+
+    Candidate 3, added 2026-09-19: bare UTF-16LE with NO tag byte at
+    all — Chromium's real Session Storage convention, confirmed against
+    5 completely unrelated real apps' own real Session Storage data
+    (Chrome, Edge, Opera, TikTok, GroupMe — e.g. a real value
+    `b'A\\x00c\\x00c\\x00o\\x00u\\x00n\\x00t\\x00s...'` = "Accounts and
+    settings"), genuinely DIFFERENT from Local Storage's own tag+text
+    scheme this module was originally built around. Gated on: even
+    length >= 2 (a UTF-16 code unit is always 2 bytes) AND at least 50%
+    of odd-position bytes being 0x00 — 50%, not a stricter threshold,
+    because a real UI string containing even one non-ASCII BMP
+    character (an em-dash, an accented letter) would push a stricter
+    ratio below what genuine content can realistically satisfy; 50%
+    combined with the caller's OWN downstream plausibility check on the
+    decoded text still keeps random-noise false positives low
+    (validated: <=0.7%, mostly 0%, across lengths 2-40 in a dedicated
+    false-positive sweep). is_definitely_real_text=False here too, same
+    reasoning as candidate 2 — a caller must still apply
+    text_plausible/_content_shape before trusting it."""
     candidates: list[tuple[str, bool]] = []
     try:
         candidates.append((raw.decode('utf-8', errors='strict'), True))
     except UnicodeDecodeError:
         pass
-    if len(raw) > 1:
+    if len(raw) >= 1:
         tag, body = raw[0], raw[1:]
         if tag == 0x00:
             try:
@@ -289,6 +557,29 @@ def _leveldb_value_candidates(raw: bytes) -> list[tuple[str, bool]]:
                 pass
         elif tag == 0x01:
             candidates.append((body.decode('latin-1'), False))   # never raises
+    # Skipped when raw[0] is a recognized Chrome tag byte (0x00/0x01),
+    # even if that tag-specific candidate above failed to decode — a
+    # real bug found during this fix's own full-dataset regression
+    # check, not theoretical: a real npr.org IndexedDB value
+    # (tag=0x00, body = "application/vnd.blink-idb-value-wrapper" plus
+    # trailing bytes that make the BODY's own UTF-16LE decode fail)
+    # would otherwise ALSO try decoding the FULL raw bytes — tag byte
+    # included — as UTF-16LE, misaligning every subsequent byte pair by
+    # one byte and producing a plausible-looking but completely garbled
+    # decode, which is worse than the honest 'bin' this value should
+    # get when its one real, tag-specific interpretation doesn't work
+    # out. A value starting with 0x00/0x01 already has its own dedicated
+    # interpretation path above; guessing at a second, different
+    # (untagged) interpretation of the SAME bytes when that one fails
+    # has no real upside and a demonstrated real downside.
+    if len(raw) >= 2 and len(raw) % 2 == 0 and raw[0] not in (0x00, 0x01):
+        odd_total = len(raw) // 2
+        odd_zero = sum(1 for i in range(1, len(raw), 2) if raw[i] == 0)
+        if odd_zero / odd_total >= 0.5:
+            try:
+                candidates.append((raw.decode('utf-16-le', errors='strict'), False))
+            except UnicodeDecodeError:
+                pass
     return candidates
 
 
@@ -344,7 +635,47 @@ def classify_leveldb_value(raw: bytes) -> str:
     ABX (Android Binary XML) is decoded and labeled 'xml' — once
     decoded it genuinely IS xml content, no separate 'abx' category
     needed for what's ultimately the same shape a user would filter
-    for."""
+    for.
+
+    Fix #4 (2026-09-19, same day, a much broader review beyond Chrome
+    Local Storage specifically — direct user request: "this parser is
+    meant for all leveldb ... the whole key and value need to be
+    decoded correctly"). Surveying real non-Chrome LevelDB stores
+    (Google Play Services' own CryptAuth/SafetyNet/semantic-location/
+    usage-reporting databases, Chrome's own Sync Data and Local Storage
+    META: records) found the SAME "short bytes trivially decode as
+    UTF-8" trap fix #2/#3 already closed for Chrome's own tag+text
+    convention recurring for real PROTOBUF values these other stores
+    use instead, with no tag-byte convention at all — e.g. real GMS
+    `shared_proto_db/metadata` values (`b'\\x08\\x00 \\x00'`, 105/105
+    real records on this project's own test archive) were ALL
+    mislabeled 'text'. Fixed with a new 'protobuf' label — see
+    `_protobuf_field_count`/`_is_length_delimited_protobuf`'s own
+    docstrings for the schema-less detection technique and its real
+    false-positive-rate validation — checked BEFORE the generic
+    text/bin fallback below, same "structural detection before a
+    generic decode-success guess" ordering principle as the JSON/XML/
+    plist content-shape check above.
+
+    The SAME review also tightened the long-standing `is_definite`
+    branch below: it used to accept ANY value whose FULL raw bytes
+    happen to decode as UTF-8 as 'text' with NO further check at all
+    (the one candidate this function ever gave a completely free pass —
+    fix #3 above already added a plausibility gate for the
+    tag-stripped-only candidate, but never for this one) — confirmed
+    this is exactly how real short IndexedDB/protobuf-adjacent binary
+    values (`b'\\x05'`, `b'\\x15\\x00\\x00\\x00\\x0f'`) got mislabeled
+    'text' too: a short binary blob's own bytes are individually valid
+    UTF-8 codepoints by simple coincidence. Now gated on
+    `_key_display_plausible` (the SAME no-length-floor control-
+    character-ratio check already built for the key-naming fix earlier
+    today — reused rather than duplicated, since the same coincidental-
+    short-decode risk applies to both a key AND a value) — deliberately
+    NOT `artifact_runner.text_plausible`, whose 8-character floor would
+    let exactly these short values right back through. The
+    tag-stripped-only branch's own EXISTING `text_plausible` check is
+    completely UNCHANGED — this fix only closes the one branch that
+    previously had no plausibility check at all."""
     if not raw:
         return 'empty'
     if raw[:6] == b'bplist':
@@ -359,8 +690,13 @@ def classify_leveldb_value(raw: bytes) -> str:
         shape = _content_shape(text)
         if shape:
             return shape
+    if _is_length_delimited_protobuf(raw) or _protobuf_field_count(raw) is not None:
+        return 'protobuf'
     for text, is_definite in candidates:
-        if is_definite or text_plausible(text):
+        if is_definite:
+            if _key_display_plausible(text):
+                return 'text'
+        elif text_plausible(text):
             return 'text'
     return 'bin'
 
@@ -414,7 +750,42 @@ def leveldb_value_preview_bytes(raw: bytes) -> bytes:
     UTF-8" as a reason to return it unchanged — the identical ordering
     principle as classify_leveldb_value, now shared via the same
     _leveldb_value_candidates helper so the two functions can't drift
-    apart on this again."""
+    apart on this again.
+
+    Fix #4 (2026-09-19, direct follow-up user report: a tag-prefixed
+    value with no JSON/XML/plist shape — a plain STRING — still rendered
+    with its leading 0x01/0x00 tag byte intact, which made the generic
+    preview renderer show hex instead of text). Same root cause as fix
+    #2/#3, one level further down this function's own priority chain: a
+    real Chrome DOM-Storage tag byte (0x00/0x01) is itself a valid
+    single-byte UTF-8 codepoint, so `raw.decode('utf-8', errors='strict')`
+    on the FULL still-tagged bytes can succeed even for plain text —
+    `b'\\x01Hello'` decodes as valid UTF-8 with the 0x01 control
+    character as its own first "character." The old Priority 2 treated
+    that success as "already fine, return unchanged" without ever
+    checking whether the TAG-STRIPPED candidate was ALSO plausible text
+    — so only a tag-prefixed JSON/XML/plist value ever got stripped (via
+    Priority 1's shape check), never a tag-prefixed plain string. Fixed
+    by moving the tag-stripped candidate's text_plausible check ahead of
+    the "raw already decodes as UTF-8" branch: a value that genuinely
+    starts with a real tag byte and whose stripped body reads as
+    plausible text is now shown stripped, matching the JSON/XML/plist
+    case. A value with no tag byte at all has no such candidate to begin
+    with, so it's unaffected by this reordering.
+
+    Fix #5 (2026-09-19, same broader non-Chrome-store review that added
+    `classify_leveldb_value`'s own Fix #4 — protobuf detection, and its
+    `_key_display_plausible` gate on the is_definite candidate): Priority
+    3 below used to return `raw` unchanged whenever it merely decoded as
+    UTF-8, with NO plausibility check at all — harmless for the PREVIEW
+    bytes specifically (a short binary blob like a real protobuf value
+    still falls through to the unconditional `return raw` at the very
+    end either way, so the actual bytes shown never changed), but kept
+    for the same reason `classify_leveldb_value` was tightened: so this
+    function's own notion of "is raw plausible text" never silently
+    drifts from the Type label's — a record whose Type now correctly
+    reads 'protobuf'/'bin' should never have its own preview logic
+    quietly still believe Priority 3 accepted it as plain text."""
     if not raw or raw[:6] == b'bplist':
         return raw
     if raw[:4] == b'ABX\x00':
@@ -434,30 +805,427 @@ def leveldb_value_preview_bytes(raw: bytes) -> bytes:
         if _content_shape(text):
             return text.encode('utf-8')
 
-    # Priority 2: raw itself is already valid UTF-8 (is_definite=True,
-    # always candidates[0] when present) — shown completely unchanged,
-    # even if it happens to start with a literal 0x00/0x01 byte with no
-    # real tag meaning, rather than guessing it should be stripped.
+    # Priority 2: a genuine tag-stripped candidate whose body is
+    # plausible real text — preferred over the full raw bytes even when
+    # raw ALSO happens to decode as valid UTF-8 (see this function's own
+    # Fix #4 above): a real tag byte is itself a valid single-byte UTF-8
+    # codepoint, so "raw decodes as UTF-8" is no evidence on its own that
+    # there's no tag byte to strip. text_plausible on the STRIPPED body
+    # (never on raw decode success alone) is the actual signal this is
+    # genuinely tag-prefixed text, not raw content that coincidentally
+    # starts with a control byte with no tag meaning.
     for text, is_definite in candidates:
-        if is_definite:
-            return raw
-
-    # Priority 3: raw itself did NOT decode as UTF-8 at all — the only
-    # remaining candidate is the tag-stripped one, used only if
-    # text_plausible accepts it (never on decode success alone; see
-    # _leveldb_value_candidates' own docstring for why Latin-1's
-    # never-raises behavior isn't real evidence of real text on its
-    # own).
-    for text, is_definite in candidates:
-        if text_plausible(text):
+        if not is_definite and text_plausible(text):
             return text.encode('utf-8')
 
+    # Priority 3: raw itself is already valid UTF-8 AND plausible —
+    # shown completely unchanged. _key_display_plausible (no length
+    # floor, see Fix #5 above and classify_leveldb_value's own Fix #4)
+    # rather than a bare decode-success pass-through.
+    for text, is_definite in candidates:
+        if is_definite and _key_display_plausible(text):
+            return raw
+
     return raw
+
+
+def _jsonify(value):
+    """Recursively convert a real deserialized IndexedDB value (which can
+    genuinely be a Blink dataclass like CryptoKey/IndexedDBExternalObject/
+    BlobIndex, an Enum field inside one, raw bytes, or an ordinary
+    dict/list/str/int/datetime) into a plain JSON-safe structure BEFORE
+    ever handing it to json.dumps — done by hand rather than via
+    json.dumps' own `default=` callback, because a real bug was found
+    doing it that way first: many of these vendored Blink enums are
+    `enum.IntEnum` subclasses, and json's own encoder special-cases any
+    `int` subclass (IntEnum passes `isinstance(x, int)`) BEFORE ever
+    consulting `default` — so a CryptoKey's real `algorithm_type`/
+    `key_usage` fields rendered as bare integers (9, 6) instead of their
+    real names (AesGcmTag, kEncryptUsage|kDecryptUsage), confirmed
+    directly against a real npr.org CryptoKey record before switching to
+    this recursive pre-conversion, which handles an Enum BEFORE json's
+    own encoder ever sees it. Anything left over (datetime.datetime, or a
+    genuinely unexpected type) is handled by json.dumps' own `default=str`
+    as a final, simple fallback.
+
+    Module-level (moved out of _decode_indexeddb_folder 2026-09-19) so
+    index_leveldb_folder_for_search's own lightweight search-indexing
+    pass can reuse it too, via the shared _iterate_indexeddb_records
+    below — one real implementation of "how to render a decoded
+    IndexedDB value," not two that could drift apart."""
+    import dataclasses as _dataclasses
+    import enum as _enum
+    if _dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _jsonify(getattr(value, f.name))
+                for f in _dataclasses.fields(value)}
+    if isinstance(value, _enum.Enum):
+        return value.name
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if isinstance(value, dict):
+        return {k: _jsonify(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(v) for v in value]
+    return value
+
+
+def _iterate_indexeddb_records(extract_dir: str, blob_extract_dir: str | None
+                                ) -> tuple[list[tuple[str, bytes, str | None]], int]:
+    """Opens extract_dir via the vendored ccl_chromium_indexeddb.WrappedIndexDB
+    and returns ([(display_name, preview_bytes, content_type), ...], bad_count)
+    for every real record found — the one shared core both
+    _decode_indexeddb_folder (browsing — builds the virtual per-record file
+    browser entries from this) and index_leveldb_folder_for_search
+    (search-indexing — builds SQL rows from this, never touching
+    folder_map/full_metadata at all) walk a real IndexedDB store through,
+    added 2026-09-19 specifically so there's exactly one place that knows
+    how to do this rather than two copies that could silently drift apart
+    on the next real bug fix. Raises on a genuine open/walk failure —
+    callers decide what "give up" means for their own context (fall back
+    to the generic per-raw-cell view, for browsing; skip this folder
+    entirely, for indexing)."""
+    import ccl_chromium_indexeddb
+    import json as _json
+
+    wrapped = ccl_chromium_indexeddb.WrappedIndexDB(extract_dir, blob_extract_dir)
+    results: list[tuple[str, bytes, str | None]] = []
+    bad_count = 0
+
+    def _on_bad_record(key, raw_data):
+        nonlocal bad_count
+        bad_count += 1
+
+    for db_id in wrapped.database_ids:
+        db = wrapped[db_id]
+        for store_name in db.object_store_names:
+            store = db[store_name]
+            for rec in store.iterate_records(bad_deserializer_data_handler=_on_bad_record):
+                key_label = _format_idb_key_value(rec.key.value)
+                live_suffix = '' if rec.is_live else ' [deleted]'
+                display_name = f"{db_id.name} - {store_name} - {key_label}{live_suffix}"
+                if isinstance(rec.value, (bytes, bytearray)):
+                    # Genuinely still binary — an unresolved/raw value
+                    # (e.g. real encrypted content a CryptoKey elsewhere
+                    # in this same store was used to produce) that ISN'T
+                    # a decode failure on this project's own part, just
+                    # honestly reported as bytes rather than fake-decoded
+                    # into something it isn't.
+                    preview_bytes = bytes(rec.value)
+                    content_type = None
+                elif rec.value is None:
+                    preview_bytes = (
+                        b'(record present but its value could not '
+                        b'be deserialized)')
+                    content_type = None
+                else:
+                    try:
+                        rendered = _json.dumps(
+                            _jsonify(rec.value), indent=2, ensure_ascii=False, default=str)
+                    except Exception:
+                        rendered = repr(rec.value)
+                    preview_bytes = rendered.encode('utf-8')
+                    content_type = 'indexeddb'
+                results.append((display_name, preview_bytes, content_type))
+    return results, bad_count
+
+
+def leveldb_decode_logic_version() -> str:
+    """Short content hash of this module's own source — the staleness key
+    for the leveldb_search_index table (db_utils.py), same auto-derived
+    technique app_intelligence.scan_logic_version() already uses for the
+    identical problem (a cached scan silently going stale the moment the
+    underlying logic improves, with no signal anything's wrong). Never
+    hand-authored, so it can't drift from what's actually on disk — the
+    NEXT classify_leveldb_value/decode fix automatically invalidates every
+    already-indexed folder's cached text, rather than needing this bumped
+    by hand and inevitably forgotten once."""
+    import hashlib
+    try:
+        with open(__file__, 'rb') as f:
+            return hashlib.blake2b(f.read(), digest_size=8).hexdigest()
+    except OSError:
+        return 'unknown'
 
 
 class LevelDbViewerMixin:
 
     # ── Decoding ─────────────────────────────────────────────────────────
+
+    def _extract_leveldb_children_flat(self, real_children: list, extract_dir: str) -> None:
+        """Extract a flat LevelDB directory's own real children (no real
+        subfolders — see _looks_like_leveldb_dir's own docstring) to
+        extract_dir. Factored out 2026-09-19 so both the generic
+        raw-record decode below AND _decode_indexeddb_folder's own real
+        decode share the identical extraction logic rather than
+        maintaining two copies."""
+        for child_ui_path in real_children:
+            if child_ui_path in self.folder_map:
+                continue   # a subfolder — a real LevelDB directory is flat
+            name = child_ui_path.rsplit('/', 1)[-1]
+            dest = os.path.join(extract_dir, name)
+            if os.path.exists(dest):
+                continue   # already extracted from a prior open/session
+            data = self._read_zip_bytes(child_ui_path)
+            if data is None:
+                continue
+            with open(dest, 'wb') as f:
+                f.write(data)
+
+    def _extract_tree(self, ui_path: str, extract_dir: str) -> None:
+        """Recursively extract ui_path's own real files/subfolders (via
+        folder_map) to extract_dir — needed for IndexedDB's own external
+        blob directory specifically, which (unlike an ordinary flat
+        LevelDB directory _extract_leveldb_children_flat handles) genuinely
+        nests: Chromium's own real on-disk layout is
+        `<blob-dir>/<db_id>/<blob-number-high-byte-hex>/<blob-number-hex>`
+        (confirmed against ccl_chromium_indexeddb.IndexedDb.get_blob's own
+        `data_path` construction, and against a real blob file on this
+        project's own npr.org IndexedDB store). A no-op if ui_path isn't
+        actually a real folder in this archive."""
+        children = self.folder_map.get(ui_path)
+        if children is None:
+            return
+        os.makedirs(extract_dir, exist_ok=True)
+        for child_ui_path in children:
+            name = child_ui_path.rsplit('/', 1)[-1]
+            dest = os.path.join(extract_dir, name)
+            if child_ui_path in self.folder_map:
+                self._extract_tree(child_ui_path, dest)
+                continue
+            if os.path.exists(dest):
+                continue
+            data = self._read_zip_bytes(child_ui_path)
+            if data is None:
+                continue
+            with open(dest, 'wb') as f:
+                f.write(data)
+
+    def _decode_indexeddb_folder(self, ui_path: str, real_children: list) -> bool:
+        """Real, schema-informed decode of a Chromium IndexedDB directory
+        via the vendored ccl_chromium_indexeddb.WrappedIndexDB (added
+        2026-09-19 — see that module's own docstring for the full "why a
+        real decoder, not a better heuristic" reasoning, prompted
+        directly by a user report that this project's own schema-less
+        classify_leveldb_value guess badly mislabels real IndexedDB
+        values). Tried FIRST, from _decode_leveldb_folder below, for any
+        ui_path matching Chromium's real `<origin>.indexeddb.leveldb`
+        naming convention (_is_indexeddb_leveldb_dir) — returns False on
+        ANY failure (an exception opening/walking the store) so the
+        caller falls back to the existing generic per-raw-cell view
+        instead. Strictly additive: an IndexedDB store this real decoder
+        can't handle behaves exactly as it did before this existed.
+
+        One virtual record-file per REAL decoded IndexedDbRecord
+        (database -> object store -> record), not per raw LevelDB cell
+        the way the generic path works — a single logical IndexedDB
+        record can legitimately span several raw LevelDB cells (an
+        externally-wrapped blob is a separate real LevelDB entry the
+        decoder resolves and merges in automatically), so mapping one raw
+        cell to one virtual file would double-count/mis-split what an
+        examiner actually wants to see: one row per real stored object.
+        A real, CONFIRMED case where this produces genuinely ZERO record
+        rows is not treated as a failure needing fallback — this
+        project's own real cellebrite.com/adroll IndexedDB store has an
+        object store containing ONLY database/object-store bookkeeping,
+        no actual stored records at all (every one of its 44 raw LevelDB
+        cells is Chromium's own metadata, confirmed by their real
+        all-zero-prefixed keys — see CLAUDE.md); reporting that
+        confidently (a real, decoded "0 records" answer) is more useful
+        to an examiner than silently falling back to a confusing pile of
+        44 ambiguous generic metadata pseudo-files.
+
+        Delegates the actual open+walk to module-level
+        _iterate_indexeddb_records (refactored out 2026-09-19 so
+        index_leveldb_folder_for_search's own search-indexing pass can
+        share the identical decode logic rather than a second copy)."""
+        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', ui_path)
+        extract_dir = os.path.join(self._case_dir, 'leveldb_browse', safe_name)
+        os.makedirs(extract_dir, exist_ok=True)
+        self._extract_leveldb_children_flat(real_children, extract_dir)
+
+        blob_ui_path = _indexeddb_blob_dir_for(ui_path)
+        blob_extract_dir = None
+        if blob_ui_path in self.folder_map:
+            blob_extract_dir = os.path.join(
+                self._case_dir, 'leveldb_browse',
+                re.sub(r'[^A-Za-z0-9_.-]', '_', blob_ui_path))
+            self._extract_tree(blob_ui_path, blob_extract_dir)
+
+        try:
+            with open(os.path.join(extract_dir, _SOURCE_MARKER_NAME), 'w',
+                      encoding='utf-8') as f:
+                f.write(ui_path)
+        except OSError:
+            pass
+
+        try:
+            records_raw, bad_count = _iterate_indexeddb_records(extract_dir, blob_extract_dir)
+        except Exception as exc:
+            # Covers both an open failure AND a real decode failure
+            # partway through (a genuinely malformed store this vendored
+            # decoder can't fully walk) — fall back to the generic
+            # per-raw-record view entirely rather than showing a
+            # half-populated folder with no way to see the rest.
+            self.status_bar.showMessage(
+                f"Could not open as IndexedDB, showing generic view instead: {exc}")
+            return False
+
+        records: list = []
+        virtual_children: list = []
+        total_size = 0
+        for idx, (display_name, preview_bytes, content_type) in enumerate(records_raw):
+            segment = _UNSAFE_SEGMENT_CHARS.sub('_', display_name)[:60].strip('_') or 'record'
+            vpath = f"{ui_path}/{idx:06d}_{segment}"
+            value_size = len(preview_bytes)
+            total_size += value_size
+            self.full_metadata[vpath] = {
+                'size':                  value_size,
+                '_display_name':         (display_name if len(display_name) <= 120
+                                           else display_name[:120] + '…'),
+                '_leveldb_folder':       ui_path,
+                '_leveldb_record_index': idx,
+                'mtime':                 None,
+            }
+            virtual_children.append(vpath)
+            records.append(_IdbPreviewRecord(preview_bytes, content_type))
+            if content_type:
+                self._header_type_overrides[vpath] = content_type
+
+        self.folder_map[ui_path] = virtual_children
+        self.full_metadata.setdefault(ui_path, {})['size'] = total_size
+        self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_children)
+        self._leveldb_folder_map[ui_path] = {
+            'extract_dir':    extract_dir,
+            'records':        records,
+            'real_children':  real_children,
+            'record_vpaths':  virtual_children,
+            'kind':           'indexeddb',
+        }
+        message = f"{ui_path}  —  decoded {len(records)} real IndexedDB record(s)"
+        if bad_count:
+            message += f" ({bad_count} could not be deserialized and were skipped)"
+        self.status_bar.showMessage(message)
+        return True
+
+    # ── Search indexing (Keyword Search coverage) ───────────────────────────
+
+    def index_leveldb_folder_for_search(self, ui_path: str, real_children: list
+                                         ) -> list[tuple[int, str, str, str]]:
+        """Lightweight decode pass for Keyword Search coverage ONLY — added
+        2026-09-19, directly prompted by confirming (by reading
+        keyword_search.py directly) that Keyword Search has no visibility
+        at all into decoded LevelDB/IndexedDB content, since it only ever
+        scans the real archive's own physical bytes, and a real deserialized
+        IndexedDB value (or a Chrome DOM-Storage value re-encoded from
+        UTF-16LE for display) is frequently not a literal byte substring of
+        the raw file at all.
+
+        Extracts and decodes ui_path's own real records exactly like
+        _decode_indexeddb_folder/_decode_leveldb_folder do (same shared
+        _iterate_indexeddb_records/classify_leveldb_value/
+        leveldb_value_preview_bytes this project already trusts for
+        browsing), but returns rows to persist to db_utils'
+        leveldb_search_index table instead of touching
+        folder_map/full_metadata/_leveldb_folder_map/_header_type_overrides
+        at all — measured necessary, not just cautious: a real 234-folder/
+        257,804-record archive fully decodes in ~3.4s of CPU time, but
+        turning every one of those records into a LIVE virtual file the way
+        ordinary browsing does would be a real ~17x bloat of full_metadata
+        for a single search. A folder the examiner later actually browses
+        into still goes through the ordinary decode path unchanged and
+        unaffected by this ever having run — this function's own
+        extraction reuses the SAME case_dir/leveldb_browse/ directory
+        _decode_leveldb_folder itself uses, so a later browse-in is never
+        slowed by this having run first, only sped up (no re-extraction
+        needed, same "the extracted file being there simply IS the
+        finished-state signal" convention artifact_runner.run_artifact
+        already uses elsewhere).
+
+        Returns [(record_index, display_name, searchable_text,
+        content_type)] for every record whose real decoded content is
+        genuine TEXT — see leveldb_search_index's own CREATE TABLE comment
+        (db_utils.py) for exactly which classify_leveldb_value labels get a
+        row: 'bin'/'empty' records have no text at all, and 'protobuf'
+        deliberately gets none either — it's a structural SHAPE label, not
+        a real decode, so there is no genuinely NEW text here beyond what
+        the main archive-wide search already covers from the record's own
+        still-physically-present raw bytes."""
+        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', ui_path)
+        extract_dir = os.path.join(self._case_dir, 'leveldb_browse', safe_name)
+        os.makedirs(extract_dir, exist_ok=True)
+        self._extract_leveldb_children_flat(real_children, extract_dir)
+
+        if _is_indexeddb_leveldb_dir(ui_path):
+            blob_ui_path = _indexeddb_blob_dir_for(ui_path)
+            blob_extract_dir = None
+            if blob_ui_path in self.folder_map:
+                blob_extract_dir = os.path.join(
+                    self._case_dir, 'leveldb_browse',
+                    re.sub(r'[^A-Za-z0-9_.-]', '_', blob_ui_path))
+                self._extract_tree(blob_ui_path, blob_extract_dir)
+            try:
+                records_raw, _bad_count = _iterate_indexeddb_records(extract_dir, blob_extract_dir)
+            except Exception:
+                records_raw = None
+            if records_raw is not None:
+                rows = []
+                for idx, (display_name, preview_bytes, content_type) in enumerate(records_raw):
+                    if content_type != 'indexeddb':
+                        continue   # genuinely binary/undeserializable — nothing new to index
+                    try:
+                        text = preview_bytes.decode('utf-8')
+                    except UnicodeDecodeError:
+                        continue
+                    rows.append((idx, display_name, text, content_type))
+                return rows
+            # else: real decode failed — fall through to the generic path
+            # below, the identical fallback _decode_leveldb_folder itself
+            # uses for a store the real decoder can't handle.
+
+        import ccl_leveldb
+        try:
+            db = ccl_leveldb.RawLevelDb(extract_dir)
+        except Exception:
+            return []
+        try:
+            records = list(db.iterate_records_raw())
+        finally:
+            db.close()
+
+        from artifact_runner import resolve_chromium_session_storage_names, decode_plist_blob
+        session_storage_names = resolve_chromium_session_storage_names(records)
+
+        import json as _json
+        rows = []
+        for idx, rec in enumerate(records):
+            content_type = classify_leveldb_value(rec.value)
+            if content_type == 'bplist':
+                # The generic preview pane decodes this via
+                # decode_plist_blob (FastZipBrowser._display_preview_bytes),
+                # NOT via leveldb_value_preview_bytes (which deliberately
+                # returns bplist bytes UNCHANGED — see that function's own
+                # docstring) — mirrored here so a record's real decoded
+                # plist content is searchable the same way it's already
+                # viewable.
+                content = decode_plist_blob(rec.value)
+                if content is None:
+                    continue
+                try:
+                    text = _json.dumps(content, indent=2, ensure_ascii=False, default=str)
+                except Exception:
+                    continue
+            elif content_type in ('text', 'json', 'xml', 'plist'):
+                preview = leveldb_value_preview_bytes(rec.value or b'')
+                try:
+                    text = preview.decode('utf-8')
+                except UnicodeDecodeError:
+                    continue
+            else:
+                continue   # 'bin'/'empty'/'protobuf' — nothing new to index
+            _, display_name = _sanitize_record_name(
+                rec.user_key, idx, session_storage_names=session_storage_names)
+            rows.append((idx, display_name, text, content_type))
+        return rows
 
     def _decode_leveldb_folder(self, ui_path: str) -> bool:
         """Extract *ui_path*'s own real files to a local scratch dir under
@@ -477,7 +1245,16 @@ class LevelDbViewerMixin:
         zip entry name for _read_zip_bytes; this live-GUI path's own
         self._read_zip_bytes takes a UI_PATH and resolves it internally
         instead — a real, already-documented distinction elsewhere in
-        this project)."""
+        this project).
+
+        For a folder matching Chromium's real IndexedDB naming
+        convention, _decode_indexeddb_folder (above) is tried FIRST — a
+        real, schema-informed decode rather than this function's own
+        generic per-raw-cell guess. Everything below this point is the
+        ORIGINAL generic path, unchanged, still used for Local
+        Storage/Session Storage/every other real LevelDB store, and as
+        the fallback for an IndexedDB store the real decoder can't
+        handle."""
         if ui_path in self._leveldb_folder_map:
             return True
         if not self._case_dir:
@@ -487,23 +1264,17 @@ class LevelDbViewerMixin:
         if not _looks_like_leveldb_dir(self.folder_map, ui_path):
             return False
 
+        if _is_indexeddb_leveldb_dir(ui_path):
+            if self._decode_indexeddb_folder(ui_path, real_children):
+                return True
+            # Falls through to the generic decode below on any failure.
+
         import ccl_leveldb
 
         safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', ui_path)
         extract_dir = os.path.join(self._case_dir, 'leveldb_browse', safe_name)
         os.makedirs(extract_dir, exist_ok=True)
-        for child_ui_path in real_children:
-            if child_ui_path in self.folder_map:
-                continue   # a subfolder — a real LevelDB directory is flat
-            name = child_ui_path.rsplit('/', 1)[-1]
-            dest = os.path.join(extract_dir, name)
-            if os.path.exists(dest):
-                continue   # already extracted from a prior open/session
-            data = self._read_zip_bytes(child_ui_path)
-            if data is None:
-                continue
-            with open(dest, 'wb') as f:
-                f.write(data)
+        self._extract_leveldb_children_flat(real_children, extract_dir)
         # Reopen-persistence marker — see this module's own docstring and
         # _SOURCE_MARKER_NAME. Always (re)written, even on an already-
         # extracted folder, so a real ui_path change (a re-run against a
@@ -575,6 +1346,7 @@ class LevelDbViewerMixin:
             'record_vpaths':  virtual_children,  # parallel to 'records', same order —
                                                   # lets _reapply_leveldb_type_overrides
                                                   # re-populate without re-deriving names
+            'kind':           'raw',
         }
         return True
 
@@ -598,8 +1370,22 @@ class LevelDbViewerMixin:
         memory (self._leveldb_folder_map[...]['records']), so this is
         just re-running the same lightweight classify_leveldb_value()
         per record — no re-extraction, no re-opening ccl_leveldb, no
-        disk I/O at all."""
+        disk I/O at all.
+
+        An 'indexeddb'-kind entry (_decode_indexeddb_folder, added
+        2026-09-19) needs no re-classification at all — its own
+        _IdbPreviewRecord.content_type was already computed ONCE, at
+        real-decode time, from the actual deserialized value; this just
+        re-reads that already-final field rather than re-deriving
+        anything from raw bytes (an indexeddb-kind entry's 'records'
+        aren't raw ccl_leveldb.Record objects with a raw .value to feed
+        classify_leveldb_value at all)."""
         for entry in self._leveldb_folder_map.values():
+            if entry.get('kind') == 'indexeddb':
+                for vpath, rec in zip(entry.get('record_vpaths', ()), entry['records']):
+                    if rec.content_type:
+                        self._header_type_overrides[vpath] = rec.content_type
+                continue
             for vpath, rec in zip(entry.get('record_vpaths', ()), entry['records']):
                 content_type = classify_leveldb_value(rec.value)
                 if content_type != 'bin':
@@ -707,7 +1493,15 @@ class LevelDbViewerMixin:
         the Type column — that fix only ever touched the LABEL, never
         what these bytes actually were; see that function's own
         docstring for why the fix stays narrowly scoped rather than
-        stripping any 0x00/0x01-prefixed value blindly)."""
+        stripping any 0x00/0x01-prefixed value blindly).
+
+        An 'indexeddb'-kind entry (_decode_indexeddb_folder, added
+        2026-09-19) skips all of the above — its own _IdbPreviewRecord
+        already carries FINAL preview bytes computed once from the real
+        deserialized value (pretty-printed JSON-ish text for genuinely
+        decoded content, or the honest raw bytes for something still
+        genuinely binary — e.g. real encrypted content), so there's no
+        raw-bytes heuristic left to run."""
         meta = self.full_metadata.get(ui_path, {})
         ldb_path = meta.get('_leveldb_folder')
         idx = meta.get('_leveldb_record_index')
@@ -715,6 +1509,9 @@ class LevelDbViewerMixin:
         if not entry or idx is None or idx >= len(entry['records']):
             return
         record = entry['records'][idx]
-        data = leveldb_value_preview_bytes(record.value or b'')
         name = meta.get('_display_name') or ui_path.rsplit('/', 1)[-1]
+        if entry.get('kind') == 'indexeddb':
+            self._display_preview_bytes(ui_path, record.preview_bytes, name)
+            return
+        data = leveldb_value_preview_bytes(record.value or b'')
         self._display_preview_bytes(ui_path, data, name)

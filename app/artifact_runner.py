@@ -345,6 +345,7 @@ import re
 import sqlite3
 import sys
 import zipfile
+import zlib
 
 import nska_deserialize
 
@@ -869,6 +870,54 @@ def text_plausible(value: str) -> bool:
         return True
     control = sum(1 for ch in value if ord(ch) < 32 and ch not in '\t\n\r')
     return control / len(value) <= _TEXT_PLAUSIBLE_MAX_CONTROL_FRACTION
+
+
+def decompress_http_body(body: bytes, content_encoding: str) -> tuple[bytes | None, str | None]:
+    """(decompressed_bytes_or_None, error_note_or_None). Never raises — a
+    body that fails to decompress is reported as such, not silently
+    dropped or shown as if it decompressed to something.
+
+    Promoted here from chrome_cache.py's own private `_decompress_body`
+    2026-09-22 (a second real caller emerged: embedded_media_scan.py's
+    own HTTP-response-unwrap step, for a media blob some apps cache as a
+    near-raw captured HTTP response rather than a clean file — nothing in
+    this function's own logic was ever Chrome-specific, it was only
+    Chrome-named because Chrome's Simple Cache was the first real place
+    this project needed it; chrome_cache.py now imports this instead of
+    keeping its own copy, same "promote once genuinely shared" pattern
+    text_plausible above already went through). gzip and deflate are
+    always available (stdlib zlib); brotli ('br') and zstd need the
+    optional `brotli`/`zstandard` packages — both real, common encodings
+    on real casework, not hypothetical (see chrome_cache.py's own
+    original docstring for the real counts that justified adding them as
+    dependencies)."""
+    enc = (content_encoding or '').strip().lower()
+    if not enc or enc == 'identity':
+        return body, None
+    try:
+        if enc == 'gzip':
+            return zlib.decompress(body, zlib.MAX_WBITS | 16), None
+        if enc == 'deflate':
+            try:
+                return zlib.decompress(body, -zlib.MAX_WBITS), None
+            except zlib.error:
+                return zlib.decompress(body), None
+        if enc == 'br':
+            try:
+                import brotli
+            except ImportError:
+                return None, "brotli-compressed body -- 'brotli' package not installed"
+            return brotli.decompress(body), None
+        if enc == 'zstd':
+            try:
+                import zstandard
+            except ImportError:
+                return None, "zstd-compressed body -- 'zstandard' package not installed"
+            return zstandard.ZstdDecompressor().decompress(
+                body, max_output_size=200 * 1024 * 1024), None
+        return None, f"unrecognized content-encoding '{content_encoding}'"
+    except Exception as exc:
+        return None, f'{enc} decompression failed: {exc}'
 
 
 # ── Loading ───────────────────────────────────────────────────────────────────

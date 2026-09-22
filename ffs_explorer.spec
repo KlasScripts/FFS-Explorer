@@ -105,6 +105,18 @@ a = Analysis(
         'ccl_chromium_snss',
         'chrome_page_state',
         'chrome_tabs',
+        # app/ccl_chromium_indexeddb.py + its own three sibling files
+        # (vendored 2026-09-19, real Chromium IndexedDB decoder — see
+        # CLAUDE.md's own module-table entry) are only ever reached via a
+        # dynamic `import ccl_chromium_indexeddb` INSIDE
+        # leveldb_viewer.py's own _decode_indexeddb_folder method — same
+        # invisible-to-PyInstaller situation as every other entry in this
+        # list, closed here before it's ever hit in a frozen build rather
+        # than after a reported crash.
+        'ccl_chromium_indexeddb',
+        'ccl_blink_value_deserializer',
+        'ccl_v8_value_deserializer',
+        'ccl_chromium_indexeddb_structures',
         # chrome_cache.py itself lazy-imports these two only inside
         # _decompress_body, for real 'br'/'zstd' Content-Encoding values
         # (confirmed common on real casework — see requirements.txt).

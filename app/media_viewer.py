@@ -10,7 +10,9 @@ from itertools import batched
 import av
 
 from contextlib import closing
-from db_utils import _open_cache_db, _open_results_db, load_embedded_media_hits
+from db_utils import (_open_cache_db, _open_results_db, load_embedded_media_hits,
+                      mark_media_seen, unmark_media_seen, load_seen_media_paths,
+                      load_all_bookmarked_paths, load_bookmark_colors)
 from dialog_helpers import note_label
 from zip_cd_cache import CachedZipView, load as _zcd_load
 # MEDIA_EXTENSIONS/VIDEO_THUMB_EXTENSIONS/TEXT_ATTACHMENT_EXTENSIONS/
@@ -24,16 +26,69 @@ from header_scan import (classify_magic, is_text, TEXT_SIZE_LIMIT,
                          MEDIA_EXTENSIONS, VIDEO_THUMB_EXTENSIONS,
                          TEXT_ATTACHMENT_EXTENSIONS, sniff_media_kind)
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QScrollArea, QGridLayout, QVBoxLayout,
+    QWidget, QLabel, QScrollArea, QVBoxLayout,
     QDialog, QHBoxLayout, QPushButton, QSlider, QTextEdit,
+    QListView, QAbstractItemView, QStyledItemDelegate, QStyle, QMenu,
+    QApplication,
 )
-from PySide6.QtGui import QImage, QPixmap, QFontDatabase
-from PySide6.QtCore import Qt, QThread, Signal, QBuffer, QIODevice, QTimer, QUrl
+from PySide6.QtGui import QImage, QPixmap, QFontDatabase, QColor, QPen
+from PySide6.QtCore import (Qt, QThread, Signal, QBuffer, QIODevice,
+                            QUrl, QAbstractListModel, QModelIndex, QSize, QRect,
+                            QSettings, QItemSelectionModel)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 THUMB_SIZE         = 160   # thumbnail box size in pixels
 _THUMB_BATCH_COMMIT = 20   # inserts to accumulate before a single db.commit()
+_MEDIA_PAGE_SIZE_DEFAULT = 500
+
+# Deliberately a small, LOCAL copy of ffs-explorer.py's own
+# QSettings(_SETTINGS_ORG, _SETTINGS_APP) convention, not an import of it
+# — app/ modules never import from ffs-explorer.py (the top-level script),
+# same standing rule keyword_search.py's own equivalent copy already
+# documents. QSettings itself reads straight from the OS-level store
+# either way, so a second, separately-constructed instance here sees
+# exactly the same persisted value Preferences ▸ Media Browser writes.
+_SETTINGS_ORG = "KlasScripts"
+_SETTINGS_APP = "FFS Explorer"
+
+# Deliberately a small, LOCAL copy of ffs-explorer.py's own module-level
+# _BM_GROUP_PREFIX constant (same "app/ never imports from ffs-explorer.py"
+# rule as above) — used by _load_media_from_file_model to recognize a
+# bookmark-group view as a "selection" worth remembering for the "Last
+# Selection" button, added 2026-09-25.
+_BM_GROUP_PREFIX = "__bm_group_"
+
+
+def _media_page_size_pref() -> int:
+    """The user's own Media Browser page-size preference (global,
+    cross-case) — added 2026-09-24, direct question: "is 500 too small...
+    should it be a software preference the user can change?" Read fresh
+    each time a folder's media is (re)loaded (MediaViewerMixin.
+    _start_thumbnail_load snapshots it into self._media_page_size once
+    per folder, not re-read mid-navigation), so a change in Preferences
+    takes effect the next time a folder is opened without needing a
+    restart."""
+    try:
+        value = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(
+            'media_page_size', _MEDIA_PAGE_SIZE_DEFAULT, type=int)
+        return max(50, int(value))
+    except Exception:
+        return _MEDIA_PAGE_SIZE_DEFAULT
+
+
+def _media_hide_seen_pref() -> bool:
+    """Whether the Media Browser should hide a file already marked
+    "seen" — added 2026-09-24, direct request: "in the setting there
+    should be an option to show or hide seen files." Same LOCAL QSettings
+    reasoning as _media_page_size_pref above. Off by default (show
+    everything) — matches this project's own standing rule against
+    silently hiding anything from review; the examiner opts in."""
+    try:
+        return bool(QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(
+            'media_hide_seen', False, type=bool))
+    except Exception:
+        return False
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -161,40 +216,220 @@ def _load_qimage(data: bytes, ext: str = '') -> QImage | None:
         return None
 
 
-# ── ClickableThumb ────────────────────────────────────────────────────────────
+# ── Media grid model/delegate/view ──────────────────────────────────────────
+#
+# Replaced a one-real-QWidget-per-file grid (ClickableThumb container +
+# QGridLayout, removed 2026-09-24) after a real, reported freeze: with
+# thousands of media files in one folder, building that many QWidgets —
+# even batched via QTimer.singleShot so no single frame blocked — still
+# left QGridLayout holding every one of them, and a QGridLayout has to
+# compute geometry for EVERY child (even ones scrolled far off-screen) to
+# know the scroll area's own total size, so both the initial build and
+# ongoing scrolling degraded badly well before file counts reached the
+# thousands. A QListView in IconMode, backed by a plain QAbstractListModel
+# and a QStyledItemDelegate that PAINTS a thumbnail rather than
+# constructing a widget for it, is genuinely virtualized by Qt itself —
+# only rows that actually intersect the viewport are ever queried/painted,
+# so the widget-count problem disappears regardless of folder size. This
+# is the same delegate-paints-a-thumbnail technique already established in
+# this project for Artifact Report media columns
+# (artifact_media.MediaThumbnailDelegate) — see that class for the
+# original precedent, just applied to a whole grid (QListView) here
+# instead of one column of a QTableView. This part of the design held up
+# and is unchanged.
+#
+# **Loading strategy replaced with pagination, 2026-09-24, direct
+# follow-up** ("the new media viewer does not really work... i want the
+# viewer to be buttery smooth") — the FIRST fix's own loading half
+# (continuous viewport-scroll-triggered fetch/evict, a debounce timer, a
+# ThumbnailWorker restarted on every scroll tick) is what didn't hold up
+# in practice: real scrolling routinely outran the 100ms debounce and the
+# per-tick worker-restart overhead, showing blank cells and visibly
+# lagging behind — "smooth" was never actually achieved by that part of
+# the design, only the widget-count freeze was fixed. Replaced with the
+# user's own proposed design instead: MediaViewerMixin now pages a large
+# folder's media list into fixed-size chunks (_MEDIA_PAGE_SIZE = 500,
+# matching the user's own number) — pagination only kicks in at all once
+# a folder exceeds one page; a smaller folder behaves exactly as before
+# (one page, shown in full, no page-nav UI). The CURRENT page's up-to-500
+# thumbnails are decoded eagerly, all at once (bounded and fast — no
+# viewport tracking needed at that size), while the NEXT page's own
+# thumbnails are prefetched in the background the moment the current
+# page's own decode finishes (_prefetch_next_page) — landing in the SAME
+# MediaGridDelegate pixmap cache a Next click will look in, so paging
+# forward is normally an instant, already-decoded reveal rather than a
+# fresh wait. MediaGridDelegate's own cache is kept to roughly the
+# current page plus its immediate neighbors (evict_except, called on
+# every page load) — bounded regardless of how many thousands of files
+# the folder holds or how many pages the examiner has paged through in
+# one session, the same "smaller amount in memory" goal the first pass
+# already established, just achieved by page boundaries instead of
+# viewport tracking.
 
-class ClickableThumb(QWidget):
-    """A thumbnail container that emits clicked(ui_path) on a single press
-    and doubleClicked(ui_path) on a double-click — Qt delivers a
-    mousePressEvent for both halves of a double-click, so clicked always
-    fires first (the normal select-this-thumbnail behavior) followed by
-    doubleClicked (open the full viewer), never the reverse."""
-    clicked = Signal(str)
-    doubleClicked = Signal(str)
 
-    def __init__(self, ui_path: str, parent=None):
+class MediaFileListModel(QAbstractListModel):
+    """Backs the Media Browser's virtualized thumbnail grid — a plain list
+    of ui_path strings, nothing per-item beyond that. Populating this (a
+    Python list append/dict rebuild) costs nothing worth measuring even
+    for tens of thousands of files, unlike the widget-per-file approach it
+    replaces; the FILE COUNT was never actually the expensive part."""
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._ui_path = ui_path
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._items: list[str] = []
+        self._row_of: dict[str, int] = {}
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self._ui_path)
-        super().mousePressEvent(event)
+    def set_items(self, items: list) -> None:
+        self.beginResetModel()
+        self._items = list(items)
+        self._row_of = {p: i for i, p in enumerate(self._items)}
+        self.endResetModel()
 
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.doubleClicked.emit(self._ui_path)
-        super().mouseDoubleClickEvent(event)
+    def items(self) -> list:
+        return self._items
 
-    def set_selected(self, selected: bool):
+    def row_of(self, ui_path: str) -> int | None:
+        return self._row_of.get(ui_path)
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._items)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._items)):
+            return None
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole,
+                    Qt.ItemDataRole.EditRole):
+            return self._items[index.row()]
+        return None
+
+
+_GRID_CELL_MARGIN = 4
+_GRID_NAME_HEIGHT = 18
+
+
+class MediaGridDelegate(QStyledItemDelegate):
+    """Paints one grid cell (thumbnail + elided filename, selection
+    highlight) with no per-item widget — see the module-level note above
+    for why. `_pixmaps` is a deliberately BOUNDED cache (kept to roughly
+    the current page plus its immediate neighbors by
+    MediaViewerMixin._load_media_page's own evict_except calls), not one
+    entry per file in the folder."""
+
+    def __init__(self, thumb_size: int, parent=None):
+        super().__init__(parent)
+        self._thumb_size = thumb_size
+        self._pixmaps: dict[str, QPixmap] = {}
+        # Which ui_paths are currently marked "seen" (2026-09-24, see the
+        # Media Browser's own "Not Interested"/"Undo" feature) — paints a
+        # small badge on a shown "seen" file. Only ever matters when the
+        # "hide seen files" preference is OFF, since a "seen" file is
+        # simply never in the model at all when it's ON — see
+        # MediaViewerMixin._recompute_media_all_paths.
+        self._seen_paths: set = set()
+        # ui_path -> hex color string for a BOOKMARKED file (added
+        # 2026-09-25, direct request: "make it clear which images are
+        # bookmark[ed]... colour for each bookmark[ed group]") — draws a
+        # colored outline around the thumbnail rather than a corner badge,
+        # so it reads clearly alongside the (different, corner-badge)
+        # "seen" indicator above without the two ever overlapping. See
+        # MediaViewerMixin._recompute_media_all_paths's sibling,
+        # db_utils.load_bookmark_colors, for how a multi-group file's
+        # color is chosen.
+        self._bookmark_colors: dict[str, str] = {}
+
+    def cell_size(self) -> QSize:
+        return QSize(self._thumb_size + _GRID_CELL_MARGIN * 2,
+                     self._thumb_size + _GRID_NAME_HEIGHT + _GRID_CELL_MARGIN * 2)
+
+    def set_pixmap(self, ui_path: str, pixmap: QPixmap) -> None:
+        self._pixmaps[ui_path] = pixmap
+
+    def set_seen_paths(self, seen: set) -> None:
+        self._seen_paths = seen
+
+    def set_bookmark_colors(self, colors: dict) -> None:
+        self._bookmark_colors = colors
+
+    def has_pixmap(self, ui_path: str) -> bool:
+        return ui_path in self._pixmaps
+
+    def cached_count(self) -> int:
+        return len(self._pixmaps)
+
+    def evict_except(self, keep: set) -> None:
+        """Drop every cached pixmap NOT in *keep* (the current page plus
+        its immediate neighbors — see MediaViewerMixin._load_media_page).
+        Safe to call unconditionally on every page load — a still-kept
+        pixmap is never touched, and an evicted one just gets
+        re-requested (and re-read from the fast on-disk cache) if paged
+        back to."""
+        for ui_path in [p for p in self._pixmaps if p not in keep]:
+            del self._pixmaps[ui_path]
+
+    def clear(self) -> None:
+        self._pixmaps.clear()
+
+    def sizeHint(self, option, index):
+        return self.cell_size()
+
+    def paint(self, painter, option, index):
+        ui_path = index.data(Qt.ItemDataRole.DisplayRole) or ''
+        painter.save()
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if selected:
-            self.setStyleSheet(
-                "ClickableThumb { background-color: #1e4080; "
-                "border: 2px solid #4d94ff; border-radius: 4px; }")
-        else:
-            self.setStyleSheet("ClickableThumb { background-color: transparent; }")
+            painter.fillRect(option.rect, QColor('#1e4080'))
+            painter.setPen(QColor('#4d94ff'))
+            painter.drawRect(option.rect.adjusted(0, 0, -1, -1))
+
+        img_rect = QRect(option.rect.x() + _GRID_CELL_MARGIN,
+                         option.rect.y() + _GRID_CELL_MARGIN,
+                         self._thumb_size, self._thumb_size)
+        pix = self._pixmaps.get(ui_path)
+        if pix and not pix.isNull():
+            x = img_rect.x() + (img_rect.width() - pix.width()) // 2
+            y = img_rect.y() + (img_rect.height() - pix.height()) // 2
+            painter.drawPixmap(x, y, pix)
+
+        # Bookmark outline (added 2026-09-25) — a colored border around
+        # the thumbnail area, in the bookmarking group's own color (see
+        # set_bookmark_colors/db_utils.load_bookmark_colors). Drawn
+        # whether or not a pixmap has decoded yet, so a still-loading
+        # bookmarked file is visibly distinguishable too, not just once
+        # its thumbnail appears.
+        bookmark_color = self._bookmark_colors.get(ui_path)
+        if bookmark_color:
+            pen = QPen(QColor(bookmark_color))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(img_rect.adjusted(1, 1, -2, -2))
+
+        # "Seen" badge (added 2026-09-24) — a small translucent green
+        # circle + white checkmark, top-right of the thumbnail area. Only
+        # ever visible at all when "hide seen files" is OFF, since a seen
+        # file is simply absent from the model entirely when it's ON —
+        # see MediaViewerMixin._recompute_media_all_paths.
+        if ui_path in self._seen_paths:
+            badge_size = 18
+            badge_rect = QRect(img_rect.right() - badge_size - 2,
+                               img_rect.top() + 2, badge_size, badge_size)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(46, 160, 67, 220))
+            painter.drawEllipse(badge_rect)
+            painter.setPen(QColor('white'))
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "✓")
+
+        if ui_path:
+            name = ui_path.rsplit('/', 1)[-1]
+            name_rect = QRect(option.rect.x(), img_rect.bottom() + 2,
+                              option.rect.width(), _GRID_NAME_HEIGHT)
+            fm = painter.fontMetrics()
+            elided = fm.elidedText(name, Qt.TextElideMode.ElideMiddle,
+                                   name_rect.width() - 4)
+            painter.setPen(option.palette.highlightedText().color() if selected
+                          else option.palette.text().color())
+            painter.drawText(name_rect, Qt.AlignmentFlag.AlignHCenter, elided)
+        painter.restore()
 
 
 # ── MediaFullViewDialog ────────────────────────────────────────────────────────
@@ -641,26 +876,90 @@ class MediaViewerMixin:
     Accesses instance attributes set by FastZipBrowser.__init__ and _setup_media_tab.
     """
 
+    # How many files make up one page — pagination only kicks in at all
+    # once a folder's media count exceeds this; direct request, 2026-09-24:
+    # "the page[nation] would only kick if there was more th[a]n 500 media
+    # files selected" (the number itself was also the user's own). Now a
+    # user preference (Preferences ▸ Media Browser, _media_page_size_pref
+    # above) rather than a fixed constant — see that function's own
+    # docstring for the direct follow-up that prompted this. self.
+    # _media_page_size (set below in _setup_media_tab, re-snapshotted per
+    # folder load in _start_thumbnail_load) is what every other method in
+    # this class actually reads; _MEDIA_PAGE_SIZE_DEFAULT is only the
+    # fallback used before the first real folder is ever loaded.
+
     def _setup_media_tab(self, status_style: str) -> QWidget:
         """Build the media-browser tab widget and initialise all media instance state.
-        Returns the tab QWidget to be added to center_tabs."""
+        Returns the tab QWidget to be added to center_tabs.
+
+        Uses a virtualized QListView grid (MediaFileListModel/
+        MediaGridDelegate, both above) rather than one real QWidget per
+        file, PLUS pagination (_load_media_page and friends) rather than
+        loading a whole huge folder's thumbnails at once — see the
+        module-level comment block above for the two real, separate
+        fixes this represents (2026-09-24: the initial widget-count
+        freeze fix, then the follow-up "does not really work... i want
+        the viewer to be buttery smooth" replacing this class's own
+        first loading strategy with the user's own proposed page-based
+        one)."""
         self._thumb_worker: ThumbnailWorker | None = None
-        self._thumb_cols       = 1
-        self._thumb_widgets:   dict = {}
-        self._thumb_img_labels: dict = {}
-        self._thumb_positions:  dict = {}
-        # Bumped on every _start_thumbnail_load call; a batched placeholder
-        # pass (_place_thumb_placeholders_batched) checks this before each
-        # chunk and quietly stops if it's gone stale (a new folder loaded
-        # while it was still running) — same guard pattern as the folder
-        # tree's own _tree_gen (see _reset_tree_model).
-        self._thumb_gen = 0
+        self._media_page_prefetch_worker: ThumbnailWorker | None = None
         self._selected_media_path: str | None = None
         self._pending_media_selection: str | None = None
         self._media_full_dialog: MediaFullViewDialog | None = None
         self._media_context    = None
         self._media_total_files: int | None = None
         self._media_sort_desc: str = ""
+        # The FULL folder's own media list (every page), vs. _media_model
+        # which only ever holds the CURRENTLY DISPLAYED page — see
+        # _load_media_page.
+        self._media_all_paths: list = []
+        self._media_page_index: int = 0
+        self._media_page_size: int = _MEDIA_PAGE_SIZE_DEFAULT
+        # The full context's own resolver maps, computed once per folder
+        # load (cheap — no I/O, just dict comprehensions over already-
+        # in-memory metadata) and reused by every page's own
+        # ThumbnailWorker (both the current page's and the next page's
+        # background prefetch) afterward.
+        self._media_zip_info_map: dict = {}
+        self._media_local_overrides: dict = {}
+
+        # "Not Interested"/seen-tracking state (added 2026-09-24 — see
+        # CLAUDE.md's own Media Browser Conventions entry). All four are
+        # (re)populated per folder load in _start_thumbnail_load, never
+        # stale across folders. _media_all_paths_unfiltered is the TRUE
+        # full folder list (every media file); _media_all_paths (above)
+        # is the ACTIVE list after the hide-seen filter, if any, is
+        # applied — see _recompute_media_all_paths.
+        self._media_all_paths_unfiltered: list = []
+        self._media_seen_paths: set = set()
+        self._media_bookmarked_paths: set = set()
+        self._media_hide_seen: bool = False
+        self._media_last_seen_batch: list | None = None
+        self._media_last_seen_batch_page: int = 0
+        # ui_path -> hex color for a bookmarked file's grid outline
+        # (added 2026-09-25) — see MediaGridDelegate.set_bookmark_colors
+        # and db_utils.load_bookmark_colors.
+        self._media_bookmark_colors: dict = {}
+
+        # "Last Selection" state (added 2026-09-25, direct request: "a
+        # button similar to the show selected button in the media
+        # browser that allows the user to go back to the previous
+        # selection"). Snapshotted by _load_media_from_file_model
+        # whenever the CURRENT file-browser view is itself a "selection"
+        # (the checked-folders aggregate view, or a bookmark group — see
+        # that method's own docstring for the exact predicate) rather
+        # than a single plain folder, so the examiner can return to it
+        # later without re-selecting from scratch. _media_showing_selection
+        # protects the restored view from _on_center_tab_changed's own
+        # tab-switch reload logic, same convention _media_showing_embedded
+        # already established for the Embedded Media button.
+        self._media_last_selection_paths: list | None = None
+        self._media_last_selection_label: str = ""
+        self._media_showing_selection: bool = False
+
+        self._media_model = MediaFileListModel()
+        self._media_delegate = MediaGridDelegate(THUMB_SIZE)
 
         self._media_status = QLabel("Select a folder to view media")
         self._media_status.setStyleSheet(status_style)
@@ -678,34 +977,111 @@ class MediaViewerMixin:
         self._embedded_media_btn = QPushButton("Embedded Media")
         self._embedded_media_btn.setVisible(False)
         self._embedded_media_btn.clicked.connect(self._show_embedded_media_hits)
+        # "◀ Last Selection" (added 2026-09-25) — see this class's own
+        # _media_last_selection_paths docstring above for what counts as
+        # a "selection." Hidden until a selection has actually been
+        # snapshotted; clicking it shows only the UNSEEN files from that
+        # selection, regardless of the global "hide seen files"
+        # preference — see _on_media_last_selection_clicked.
+        self._media_last_selection_btn = QPushButton("◀ Last Selection")
+        self._media_last_selection_btn.setVisible(False)
+        self._media_last_selection_btn.setToolTip(
+            "Return to the last file selection (bookmark group or "
+            "checked-folders view) — showing only files not yet seen")
+        self._media_last_selection_btn.clicked.connect(
+            self._on_media_last_selection_clicked)
         status_row = QHBoxLayout()
         status_row.addWidget(self._media_status, 1)
+        status_row.addWidget(self._media_last_selection_btn)
         status_row.addWidget(self._embedded_media_btn)
         status_row_widget = QWidget()
         status_row_widget.setLayout(status_row)
 
-        self._media_grid_widget = QWidget()
-        self._media_grid = QGridLayout(self._media_grid_widget)
-        self._media_grid.setSpacing(8)
-        self._media_grid.setContentsMargins(8, 8, 8, 8)
+        # Page navigation row — hidden entirely for a folder with
+        # <= _MEDIA_PAGE_SIZE media files (see _load_media_page), so a
+        # small folder looks exactly as it always did, no new UI in the
+        # way.
+        self._media_page_prev_btn = QPushButton("◀ Prev")
+        self._media_page_prev_btn.clicked.connect(self._on_media_prev_page)
+        self._media_page_label = QLabel("")
+        self._media_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._media_page_next_btn = QPushButton("Next ▶")
+        self._media_page_next_btn.clicked.connect(self._on_media_next_page)
+        self._media_page_next_btn.setToolTip(
+            "Scroll to the bottom of this page to continue")
+        # "Not Interested ▶" / "↺ Undo" — added 2026-09-24, direct
+        # request: a button that marks every file on the CURRENT page
+        # (except any bookmarked one — a bookmark is itself a statement
+        # that the file IS of interest) as "seen" and moves on, plus an
+        # Undo for the last such batch. Scoped to the page-nav row (only
+        # ever visible when the folder is paginated) per the literal
+        # "next to the next button" framing — a single-page folder has
+        # no page to bulk-dismiss in the first place.
+        self._media_not_interested_btn = QPushButton("Not Interested ▶")
+        self._media_not_interested_btn.setToolTip(
+            "Mark every file on this page as seen (except bookmarked "
+            "ones) and move to the next page")
+        self._media_not_interested_btn.clicked.connect(
+            self._on_media_not_interested)
+        self._media_undo_seen_btn = QPushButton("↺ Undo")
+        self._media_undo_seen_btn.setToolTip(
+            "Undo the last \"Not Interested\" batch")
+        self._media_undo_seen_btn.setEnabled(False)
+        self._media_undo_seen_btn.clicked.connect(self._on_media_undo_seen)
+        page_nav_row = QHBoxLayout()
+        page_nav_row.addWidget(self._media_page_prev_btn)
+        page_nav_row.addWidget(self._media_page_label, 1)
+        page_nav_row.addWidget(self._media_page_next_btn)
+        page_nav_row.addWidget(self._media_not_interested_btn)
+        page_nav_row.addWidget(self._media_undo_seen_btn)
+        self._media_page_nav_widget = QWidget()
+        self._media_page_nav_widget.setLayout(page_nav_row)
+        self._media_page_nav_widget.setVisible(False)
 
-        _media_container = QWidget()
-        _media_container_layout = QVBoxLayout(_media_container)
-        _media_container_layout.setContentsMargins(0, 0, 0, 0)
-        _media_container_layout.setSpacing(0)
-        _media_container_layout.addWidget(self._media_grid_widget)
-        _media_container_layout.addStretch()
-
-        self._media_scroll = QScrollArea()
-        self._media_scroll.setWidgetResizable(True)
-        self._media_scroll.setWidget(_media_container)
+        self._media_view = QListView()
+        self._media_view.setModel(self._media_model)
+        self._media_view.setItemDelegate(self._media_delegate)
+        self._media_view.setViewMode(QListView.ViewMode.IconMode)
+        self._media_view.setResizeMode(QListView.ResizeMode.Adjust)
+        self._media_view.setMovement(QListView.Movement.Static)
+        self._media_view.setFlow(QListView.Flow.LeftToRight)
+        self._media_view.setWrapping(True)
+        self._media_view.setUniformItemSizes(True)
+        self._media_view.setGridSize(self._media_delegate.cell_size())
+        self._media_view.setSpacing(4)
+        # ExtendedSelection (not SingleSelection) — added 2026-09-24 for
+        # bookmarking a multi-file selection ("keyboard shortcuts that
+        # can be used to bookmark a selection of files... this should
+        # work in file browser and media browser"). A plain click still
+        # behaves exactly as before (selects just that one item, clearing
+        # any others) — Qt's own default ExtendedSelection behavior for
+        # an unmodified click; Ctrl/Shift-click add to or range-extend
+        # the selection, same convention as the File Browser's own table.
+        self._media_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._media_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._media_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._media_view.clicked.connect(self._on_media_item_clicked)
+        self._media_view.doubleClicked.connect(self._on_media_item_double_clicked)
+        self._media_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._media_view.customContextMenuRequested.connect(self._show_media_context_menu)
+        # "Next" is gated on having scrolled to the bottom of the current
+        # page — see _update_media_next_button_enabled's own docstring.
+        # valueChanged catches an actual scroll; rangeChanged catches a
+        # resize or the page's own content finishing layout, either of
+        # which can change what "at the bottom" means without the user
+        # having scrolled at all.
+        self._media_view.verticalScrollBar().valueChanged.connect(
+            self._update_media_next_button_enabled)
+        self._media_view.verticalScrollBar().rangeChanged.connect(
+            self._update_media_next_button_enabled)
 
         media_tab = QWidget()
         media_tab_layout = QVBoxLayout(media_tab)
         media_tab_layout.setContentsMargins(0, 4, 0, 0)
         media_tab_layout.setSpacing(2)
         media_tab_layout.addWidget(status_row_widget)
-        media_tab_layout.addWidget(self._media_scroll, stretch=1)
+        media_tab_layout.addWidget(self._media_view, stretch=1)
+        media_tab_layout.addWidget(self._media_page_nav_widget)
         return media_tab
 
     def _refresh_embedded_media_button(self):
@@ -743,7 +1119,7 @@ class MediaViewerMixin:
         each item — added 2026-09-23, direct follow-up: this used to pass
         each hit's raw content-hash extracted_path (e.g.
         ".../embedded_media/95/9535bf70....jpg") straight through as
-        ui_path, so the status bar (_on_thumb_clicked's own
+        ui_path, so the status bar (_select_media_item's own
         `self.status_bar.showMessage(ui_path)`) and every tooltip showed
         a meaningless hash filename instead of the real
         "<container>/<display_name>" path an identical click coming from
@@ -763,6 +1139,11 @@ class MediaViewerMixin:
             for vpath in self.folder_map.get(container, [])
             if os.path.isfile(self.full_metadata.get(vpath, {}).get(
                 '_embedded_media_source', ''))
+            # Excludes a genuinely 0-byte hit — same "don't show it in the
+            # viewer" rule _is_media_file applies to an ordinary folder's
+            # media; a 0-byte extracted file can never decode to a real
+            # thumbnail either way.
+            and self.full_metadata.get(vpath, {}).get('size', 0) > 0
         ]
         try:
             with closing(_open_results_db(self._case_dir)) as db:
@@ -771,29 +1152,103 @@ class MediaViewerMixin:
             recovered = 0
         self._media_showing_embedded = True
         self._media_context = tuple(media_paths)
-        # _on_thumbnails_done (below) is what actually renders the final
-        # status text ("{count} media file(s) of {total} file(s){sort_desc}")
-        # once loading completes -- passed through here rather than set
-        # directly, since a direct setText() call would just be
-        # overwritten by that later, asynchronous update.
+        # _start_thumbnail_load (below) renders the final status text
+        # ("{count} media file(s) of {total} file(s){sort_desc}")
+        # immediately -- model population needs no decode wait, see that
+        # method's own docstring -- so this is passed through rather than
+        # set directly here.
         sort_desc = (f" from the embedded-media sweep"
                     + (f" — {recovered:,} recovered from deleted content"
                        if recovered else ""))
         self._start_thumbnail_load(media_paths, len(media_paths), sort_desc)
 
+    def _is_media_file(self, ui_path: str) -> bool:
+        """True if ui_path counts as media — either by extension (the
+        common, cheap case) or by its header-scan-derived type override
+        (added 2026-09-23, direct report: "the media viewer only uses
+        file ext to determine if the file is a media file... even though
+        we have scanned the headers and labeled them as media files").
+        Confirmed real before fixing: _header_type_overrides is exactly
+        the same magic-byte-derived dict the File Browser's own Type
+        column already reads (_classify_entry), populated by a Tier
+        1/2/3 header scan for a file whose extension is missing or
+        wrong — every MEDIA_EXTENSIONS check in this project used to
+        skip it. The single shared predicate here (not a copy per call
+        site — same "one shared predicate, never two that could drift"
+        principle _header_candidate_matches already established) is
+        used by _load_media_from_file_model below AND by
+        ffs-explorer.py's own _on_center_tab_changed, which computes an
+        equivalent "what does the Media Browser currently show" tuple to
+        decide whether a tab switch needs a reload — those two
+        computations silently disagreeing would either skip a needed
+        reload or force an unneeded one.
+
+        Once a path passes this gate, the actual thumbnail decode
+        already handles it correctly regardless of extension —
+        ThumbnailWorker calls sniff_media_kind(ext, data) with the real
+        bytes already loaded, and that function's own magic-byte
+        fallback needed no change.
+
+        Also excludes a genuinely 0-byte file — direct request,
+        2026-09-24: "if there are 0 byte files do not show them in the
+        viewer." A 0-byte file can never decode to a real thumbnail
+        (nothing for ThumbnailWorker to read), so it would only ever show
+        as a permanent blank cell; checked here, in the one shared
+        predicate, rather than as a separate filter in
+        _load_media_from_file_model alone, so ffs-explorer.py's own
+        _on_center_tab_changed keeps computing the identical "what should
+        the grid show" set this docstring already requires — a size
+        check added in only one of the two places would silently
+        reintroduce exactly the kind of drift this predicate exists to
+        prevent."""
+        if os.path.splitext(ui_path)[1].lower() in MEDIA_EXTENSIONS:
+            is_media = True
+        else:
+            is_media = self._header_type_overrides.get(ui_path) in ('Picture', 'Video')
+        if not is_media:
+            return False
+        return self.full_metadata.get(ui_path, {}).get('size', 0) > 0
+
     def _load_media_from_file_model(self):
-        """Load the media tab using exactly the current visible file model rows."""
+        """Load the media tab using exactly the current visible file model
+        rows. Also exits the "Last Selection"/Embedded Media alternate
+        views — picking an ordinary folder (or an aggregate/bookmark view,
+        see below) is what "picks an ordinary folder again" means in both
+        of those features' own docstrings."""
         self._media_showing_embedded = False
+        self._media_showing_selection = False
         model = self.file_model
 
         total_files = sum(1 for r in model._rows if r[1] not in self.folder_map)
         media_paths = [
             r[1] for r in model._rows
             if r[1] not in self.folder_map
-            and os.path.splitext(r[1])[1].lower() in MEDIA_EXTENSIONS
+            and self._is_media_file(r[1])
         ]
 
         self._media_context = tuple(media_paths)
+
+        # Snapshot this as the "Last Selection" — added 2026-09-25 —
+        # whenever the CURRENT file-browser view is itself an explicit
+        # multi-item SELECTION rather than one plain folder: either the
+        # checked-folders aggregate view (_view_is_recursive is only ever
+        # set True by _rebuild_file_view_from_checked, i.e. "Show Selected
+        # Files") or a bookmark group (_view_path prefixed _BM_GROUP_PREFIX,
+        # set by _show_bookmark_group). An ordinary single-folder
+        # navigation never qualifies, so browsing around afterward doesn't
+        # keep overwriting this with "the last folder I happened to look
+        # at" — only a genuine selection counts.
+        is_selection = bool(media_paths) and (
+            getattr(self, '_view_is_recursive', False)
+            or (getattr(self, '_view_path', '') or '').startswith(_BM_GROUP_PREFIX))
+        if is_selection:
+            self._media_last_selection_paths = list(media_paths)
+            self._media_last_selection_label = self.status_bar.currentMessage() or "Last selection"
+            self._media_last_selection_btn.setToolTip(
+                f"Return to: {self._media_last_selection_label}\n"
+                "(showing only files not yet seen)")
+        self._media_last_selection_btn.setVisible(
+            bool(self._media_last_selection_paths))
 
         if 0 <= model._sort_col < len(model._headers):
             arrow = "↑" if model._sort_order == Qt.SortOrder.AscendingOrder else "↓"
@@ -803,53 +1258,101 @@ class MediaViewerMixin:
 
         self._start_thumbnail_load(media_paths, total_files, sort_desc)
 
+    def _on_media_last_selection_clicked(self) -> None:
+        """"◀ Last Selection" — added 2026-09-25, direct request: "a
+        button... that allows the user to go back to the previous
+        selection[;]... it should show all the files in the last
+        selection that have not been viewed." Filters the snapshotted
+        selection down to files NOT in _media_seen_paths — always, for
+        this button specifically, regardless of the global "hide seen
+        files" preference (_media_hide_seen), since the whole point here
+        is "show me what I haven't looked at yet from that batch," not a
+        display preference. Loads _media_seen_paths fresh first (same
+        query _start_thumbnail_load always runs) so a file marked seen
+        moments ago is correctly excluded even if the preference itself
+        is off."""
+        if not self._case_dir or not self._media_last_selection_paths:
+            return
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                seen = load_seen_media_paths(conn)
+        except Exception:
+            seen = set()
+        unseen = [p for p in self._media_last_selection_paths if p not in seen]
+        self._media_showing_selection = True
+        self._media_context = tuple(unseen)
+        n_total = len(self._media_last_selection_paths)
+        n_seen = n_total - len(unseen)
+        sort_desc = f" from your last selection ({n_seen:,} already seen, hidden)" \
+            if n_seen else " from your last selection"
+        self._start_thumbnail_load(unseen, n_total, sort_desc)
+
     def _start_thumbnail_load(self, media_paths, total_files=None, sort_desc=""):
-        """Stop any running thumb worker, clear the grid, then start the worker.
-        Every file gets its blank-square-plus-filename placeholder container
-        up front (via _place_thumb_placeholders_batched, in small batches
-        so the main thread is never blocked building hundreds/thousands of
-        widgets in one shot) — already clickable, selectable, and hex-
-        previewable before its thumbnail decodes, and permanently so if it
-        never does (an unsupported format, or a video frame extraction that
-        fails — previously such a file got no widget at all, ever).
-        _on_thumbnail_ready fills in the actual pixmap for whichever
-        placeholders succeed; unfilled ones just stay blank squares."""
-        # Retire (don't wait) — the worker may be stuck inside a long video
-        # decode call and wait() would freeze the GUI until it returns.
+        """Records *media_paths* as the folder's own FULL media list
+        (_media_all_paths — not necessarily what's shown, once paginated)
+        and loads the first page (or the page containing a pending File-
+        Browser-driven selection, if one's waiting). See _load_media_page
+        for the actual per-page work; this method's own job is just the
+        once-per-folder-load setup (resolver maps, the overall status
+        text, retiring any stale workers from the previous folder)."""
         self._retire_worker(self._thumb_worker)
         self._thumb_worker = None
-
-        while self._media_grid.count():
-            item = self._media_grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        self._thumb_widgets      = {}
-        self._thumb_img_labels   = {}
-        self._thumb_positions    = {}
+        self._retire_worker(self._media_page_prefetch_worker)
+        self._media_page_prefetch_worker = None
+        self._media_delegate.clear()
         self._selected_media_path = None
-        self._thumb_gen += 1
+        self._media_all_paths_unfiltered = list(media_paths)
+        # A "Not Interested" batch only ever applies to the folder it was
+        # clicked in — a fresh folder load starts with nothing to undo.
+        self._media_last_seen_batch = None
+        self._media_undo_seen_btn.setEnabled(False)
+        # Snapshotted once per folder load, not re-read mid-navigation —
+        # see _media_page_size_pref's own docstring for why.
+        self._media_page_size = _media_page_size_pref()
+        self._media_hide_seen = _media_hide_seen_pref()
 
         if not media_paths or not self.zip_path:
+            self._media_all_paths = []
+            self._media_seen_paths = set()
+            self._media_bookmarked_paths = set()
+            self._media_bookmark_colors = {}
+            self._media_delegate.set_seen_paths(set())
+            self._media_delegate.set_bookmark_colors({})
+            self._media_page_index = 0
+            self._media_model.set_items([])
+            self._media_page_nav_widget.setVisible(False)
             self._media_status.setText(
                 "No media files" if self.zip_path else "Select a folder to view media")
             self._clear_hex_preview()
             return
 
+        # Loaded fresh from caseresults.db on every folder load (not
+        # cached across folders) — cheap (three small SELECTs) and means a
+        # "Not Interested"/bookmark change made elsewhere in the same
+        # session is always picked up correctly here.
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                self._media_seen_paths = load_seen_media_paths(conn)
+                self._media_bookmarked_paths = load_all_bookmarked_paths(conn)
+                self._media_bookmark_colors = load_bookmark_colors(conn)
+        except Exception:
+            self._media_seen_paths = set()
+            self._media_bookmarked_paths = set()
+            self._media_bookmark_colors = {}
+        self._media_delegate.set_seen_paths(self._media_seen_paths)
+        self._media_delegate.set_bookmark_colors(self._media_bookmark_colors)
+
+        self._recompute_media_all_paths()
+
         self._media_total_files = total_files
         self._media_sort_desc   = sort_desc
         of_total = f" of {total_files:,} file(s)" if total_files is not None else ""
-        self._media_status.setText(f"Loading {len(media_paths):,} media file(s){of_total}…")
-        n_cols = max(1, self._media_grid_widget.width() // (THUMB_SIZE + 16))
-        self._thumb_cols = n_cols
+        hidden_count = len(self._media_all_paths_unfiltered) - len(self._media_all_paths)
+        hidden_note = f" ({hidden_count:,} hidden as seen)" if hidden_count else ""
+        self._media_status.setText(
+            f"{len(media_paths):,} media file(s){of_total}{sort_desc}{hidden_note}")
 
-        # Pre-compute grid positions (pure integer arithmetic — no widget creation)
-        for i, ui_path in enumerate(media_paths):
-            self._thumb_positions[ui_path] = divmod(i, n_cols)
-
-        self._place_thumb_placeholders_batched(media_paths, 0, self._thumb_gen)
-
-        zip_info_map = {
+        self._media_zip_info_map = {
             self._adapter.resolve(p): self.full_metadata.get(p, {}).get('size', 0)
             for p in media_paths
         }
@@ -858,102 +1361,455 @@ class MediaViewerMixin:
         # button, which already passes real absolute paths and needs no
         # override) — see ThumbnailWorker's own local_path_overrides
         # docstring.
-        local_path_overrides = {
+        self._media_local_overrides = {
             p: src for p in media_paths
             if (src := self.full_metadata.get(p, {}).get('_embedded_media_source'))
         }
 
-        self._thumb_worker = ThumbnailWorker(
-            self.zip_path, media_paths, self._adapter.resolve, THUMB_SIZE, zip_info_map,
-            cache_dir=self._case_dir, local_path_overrides=local_path_overrides)
-        self._thumb_worker.thumbnail_ready.connect(self._on_thumbnail_ready)
-        self._thumb_worker.finished_all.connect(self._on_thumbnails_done)
-        self._thumb_worker.start()
+        target_page = 0
+        pending = self._pending_media_selection
+        if pending and pending in self._media_all_paths:
+            target_page = self._media_all_paths.index(pending) // self._media_page_size
+        self._load_media_page(target_page)
 
-    def _place_thumb_container(self, ui_path: str):
-        """Create and insert the container widget for *ui_path* into the grid."""
-        name = ui_path.split('/')[-1]
-        row, col = self._thumb_positions[ui_path]
+        if pending and pending in self._media_all_paths:
+            self._select_media_item(pending)
+        self._pending_media_selection = None
 
-        container = ClickableThumb(ui_path)
-        container.setFixedSize(THUMB_SIZE + 8, THUMB_SIZE + 28)
-        container.clicked.connect(self._on_thumb_clicked)
-        container.doubleClicked.connect(self._on_thumb_double_clicked)
+    def _recompute_media_all_paths(self) -> None:
+        """Re-derives the ACTIVE _media_all_paths from the folder's TRUE
+        full list (_media_all_paths_unfiltered) plus the current seen-set
+        and the "hide seen files" preference — added 2026-09-24 for the
+        Media Browser's "Not Interested" feature. Called at folder load
+        and again after any seen-state change (mark/undo) so the hide-seen
+        filter is always LIVE within a browsing session, not just applied
+        once when the folder was first opened."""
+        if self._media_hide_seen:
+            self._media_all_paths = [
+                p for p in self._media_all_paths_unfiltered
+                if p not in self._media_seen_paths]
+        else:
+            self._media_all_paths = list(self._media_all_paths_unfiltered)
 
-        v = QVBoxLayout(container)
-        v.setContentsMargins(2, 2, 2, 2)
-        v.setSpacing(2)
-
-        img_label = QLabel()
-        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        img_label.setFixedSize(THUMB_SIZE, THUMB_SIZE)
-        img_label.setToolTip(ui_path)
-
-        name_label = QLabel()
-        name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        name_label.setFixedWidth(THUMB_SIZE + 4)
-        name_label.setWordWrap(False)
-        name_label.setStyleSheet("font-size: 10px;")
-        fm = name_label.fontMetrics()
-        name_label.setText(
-            fm.elidedText(name, Qt.TextElideMode.ElideMiddle, THUMB_SIZE + 4))
-        name_label.setToolTip(ui_path)
-
-        v.addWidget(img_label)
-        v.addWidget(name_label)
-
-        self._thumb_widgets[ui_path]    = container
-        self._thumb_img_labels[ui_path] = img_label
-        self._media_grid.addWidget(container, row, col)
-
-    _THUMB_PLACEHOLDER_BATCH = 60
-
-    def _place_thumb_placeholders_batched(self, media_paths: list, start: int, gen: int) -> None:
-        """Create every file's blank-square-plus-filename container a
-        chunk at a time via QTimer.singleShot(0, …) instead of all in one
-        pass — same reasoning as the folder tree's own
-        _populate_tree_children_batched: hundreds/thousands of widgets
-        built synchronously would freeze the GUI for the duration. *gen*
-        is this call's _thumb_gen snapshot; if a newer _start_thumbnail_load
-        has since bumped it (a different folder loaded while this batch
-        was still running), stop quietly rather than placing widgets into
-        a grid that's already been cleared and repurposed for different
-        paths/positions."""
-        if gen != self._thumb_gen:
+    def _refresh_media_bookmark_badges(self) -> None:
+        """Re-reads bookmark state from caseresults.db and updates the
+        currently-displayed grid's own outline colors — added 2026-09-25,
+        called from ffs-explorer.py after any bookmark add/delete/color
+        change so the Media Browser reflects it immediately, without
+        needing a full folder reload (which would also needlessly re-run
+        the seen-state query and reset scroll position). A cheap no-op
+        when there's no case open yet, or the tab has never loaded
+        anything."""
+        if not self._case_dir:
             return
-        end = min(start + self._THUMB_PLACEHOLDER_BATCH, len(media_paths))
-        for ui_path in media_paths[start:end]:
-            if ui_path not in self._thumb_widgets:
-                self._place_thumb_container(ui_path)
-        if end < len(media_paths):
-            QTimer.singleShot(
-                0, lambda: self._place_thumb_placeholders_batched(media_paths, end, gen))
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                self._media_bookmarked_paths = load_all_bookmarked_paths(conn)
+                self._media_bookmark_colors = load_bookmark_colors(conn)
+        except Exception:
+            return
+        self._media_delegate.set_bookmark_colors(self._media_bookmark_colors)
+        self._media_view.viewport().update()
+
+    def _load_media_page(self, page_index: int) -> None:
+        """Loads page *page_index* (_MEDIA_PAGE_SIZE files at a time) —
+        the core of the "buttery smooth" redesign, 2026-09-24, direct
+        follow-up to the first (viewport-tracking) loading strategy not
+        actually working well in practice: "the new media viewer does not
+        really work... what do you think about [pagination]... i want the
+        viewer to be buttery smooth." Eagerly decodes the WHOLE current
+        page at once (bounded to _MEDIA_PAGE_SIZE, so this is always a
+        small, fast, predictable batch — no viewport tracking needed at
+        this size) and, once that finishes, starts prefetching the NEXT
+        page's own thumbnails in the background (_prefetch_next_page) so
+        a later Next click is normally an instant, already-decoded
+        reveal. MediaGridDelegate's pixmap cache is trimmed to roughly
+        this page plus its immediate neighbors on every call — bounded
+        regardless of how many pages the examiner has paged through in
+        one session, the same "smaller amount in memory" goal as before,
+        just anchored to page boundaries instead of the viewport."""
+        total = len(self._media_all_paths)
+        if total == 0:
+            self._media_page_index = 0
+            self._media_model.set_items([])
+            self._media_page_nav_widget.setVisible(False)
+            return
+
+        page_size = self._media_page_size
+        n_pages = max(1, -(-total // page_size))   # ceil division
+        page_index = max(0, min(page_index, n_pages - 1))
+        self._media_page_index = page_index
+
+        self._retire_worker(self._thumb_worker)
+        self._thumb_worker = None
+        self._retire_worker(self._media_page_prefetch_worker)
+        self._media_page_prefetch_worker = None
+
+        start = page_index * page_size
+        end = min(total, start + page_size)
+        page_items = self._media_all_paths[start:end]
+
+        # Keep this page, the previous one (a quick Back shouldn't
+        # re-decode), and the next one (already being prefetched below) —
+        # evict everything else so memory stays bounded to roughly 3
+        # pages regardless of how far the examiner has paged.
+        keep = set(page_items)
+        if start > 0:
+            keep |= set(self._media_all_paths[max(0, start - page_size):start])
+        if end < total:
+            keep |= set(self._media_all_paths[end:min(total, end + page_size)])
+        self._media_delegate.evict_except(keep)
+
+        self._media_model.set_items(page_items)
+        self._media_view.scrollToTop()
+
+        paginated = n_pages > 1
+        self._media_page_nav_widget.setVisible(paginated)
+        # "Back" is always available once page_index > 0 — direct
+        # request, 2026-09-24: "they can go back at any time." "Next" is
+        # gated on having scrolled to the bottom of THIS page
+        # (_update_media_next_button_enabled, wired to the scrollbar's
+        # own valueChanged/rangeChanged in _setup_media_tab) — "only let
+        # the user move to next page when they are at the bottom."
+        self._media_page_prev_btn.setEnabled(page_index > 0)
+        self._update_media_next_button_enabled()
+
+        to_fetch = [p for p in page_items if not self._media_delegate.has_pixmap(p)]
+        if paginated:
+            if to_fetch:
+                self._media_page_label.setText(
+                    f"Page {page_index + 1} of {n_pages} — loading "
+                    f"{len(to_fetch):,} thumbnail(s)…")
+            else:
+                self._media_page_label.setText(
+                    f"Page {page_index + 1} of {n_pages} (showing "
+                    f"{start + 1:,}–{end:,} of {total:,})")
+
+        if to_fetch:
+            worker = ThumbnailWorker(
+                self.zip_path, to_fetch, self._adapter.resolve, THUMB_SIZE,
+                self._media_zip_info_map, cache_dir=self._case_dir,
+                local_path_overrides=self._media_local_overrides)
+            worker.thumbnail_ready.connect(self._on_thumbnail_ready)
+            worker.finished_all.connect(self._on_page_decode_finished)
+            self._thumb_worker = worker
+            worker.start()
+        else:
+            self._prefetch_next_page()
+
+    def _on_page_decode_finished(self) -> None:
+        """The current page's own ThumbnailWorker has decoded everything
+        it was asked to (thumbnail_ready already updated the grid as each
+        one finished) — update the page label to its final "showing A-B
+        of N" text and start prefetching the next page. Only ever
+        connected to the CURRENT page's own worker, whose signals
+        _retire_worker already fully disconnects the moment a newer page
+        load supersedes it, so this never fires late for a page the
+        examiner has since navigated away from."""
+        total = len(self._media_all_paths)
+        page_size = self._media_page_size
+        n_pages = max(1, -(-total // page_size))
+        page_index = self._media_page_index
+        start = page_index * page_size
+        end = min(total, start + page_size)
+        if n_pages > 1:
+            self._media_page_label.setText(
+                f"Page {page_index + 1} of {n_pages} (showing "
+                f"{start + 1:,}–{end:,} of {total:,})")
+        self._prefetch_next_page()
+
+    def _prefetch_next_page(self) -> None:
+        """Starts decoding the NEXT page's own thumbnails in the
+        background while the CURRENT page is what's actually on screen —
+        direct request, 2026-09-24: "for the next page it is already
+        cach[e]ing them while you are viewing the first page." Results
+        land in MediaGridDelegate's own pixmap cache
+        (_on_prefetch_thumbnail_ready) but never touch the model (these
+        items aren't the currently displayed page), so a later Next click
+        (_load_media_page) finds them already decoded and reveals near-
+        instantly rather than waiting on a fresh decode."""
+        total = len(self._media_all_paths)
+        page_size = self._media_page_size
+        next_start = (self._media_page_index + 1) * page_size
+        if next_start >= total:
+            return   # already on the last page
+        next_end = min(total, next_start + page_size)
+        next_items = self._media_all_paths[next_start:next_end]
+        to_fetch = [p for p in next_items if not self._media_delegate.has_pixmap(p)]
+        if not to_fetch:
+            return
+
+        self._retire_worker(self._media_page_prefetch_worker)
+        worker = ThumbnailWorker(
+            self.zip_path, to_fetch, self._adapter.resolve, THUMB_SIZE,
+            self._media_zip_info_map, cache_dir=self._case_dir,
+            local_path_overrides=self._media_local_overrides)
+        worker.thumbnail_ready.connect(self._on_prefetch_thumbnail_ready)
+        self._media_page_prefetch_worker = worker
+        worker.start()
+
+    def _on_prefetch_thumbnail_ready(self, ui_path, img) -> None:
+        self._media_delegate.set_pixmap(ui_path, QPixmap.fromImage(img))
+
+    def _update_media_next_button_enabled(self) -> None:
+        """Gates "Next" on having scrolled to the bottom of the CURRENT
+        page — direct request, 2026-09-24: "only let the user move to
+        next page when they are at the bottom[;] they can go back at any
+        time but that mean[s] they are at the top." "Back" has no such
+        gate (see _load_media_page's own unconditional `page_index > 0`
+        check) — it's always available once there IS a previous page, and
+        always lands at the top of it (_load_media_page's own
+        scrollToTop), never mid-scroll, so arriving via Back always looks
+        the same regardless of where the examiner clicked it from.
+
+        "At the bottom" tolerates a couple of pixels of rounding (an
+        exact `value() == maximum()` can be flaky depending on how Qt
+        rounds the last frame's own geometry) and treats a page whose
+        content fits entirely within the viewport (nothing to scroll,
+        `maximum() <= 0`) as already at the bottom — the examiner has
+        necessarily already seen everything on such a page, so there's no
+        real "keep scrolling" gate left to apply."""
+        total = len(self._media_all_paths)
+        if total == 0:
+            self._media_page_next_btn.setEnabled(False)
+            return
+        page_size = self._media_page_size
+        n_pages = max(1, -(-total // page_size))
+        if self._media_page_index >= n_pages - 1:
+            self._media_page_next_btn.setEnabled(False)
+            return
+        sb = self._media_view.verticalScrollBar()
+        at_bottom = sb.maximum() <= 0 or sb.value() >= sb.maximum() - 2
+        self._media_page_next_btn.setEnabled(at_bottom)
+
+    def _on_media_prev_page(self) -> None:
+        if self._media_page_index > 0:
+            self._load_media_page(self._media_page_index - 1)
+
+    def _on_media_next_page(self) -> None:
+        page_size = self._media_page_size
+        n_pages = max(1, -(-len(self._media_all_paths) // page_size))
+        if self._media_page_index < n_pages - 1:
+            self._load_media_page(self._media_page_index + 1)
+
+    def _on_media_not_interested(self) -> None:
+        """"Not Interested ▶" — added 2026-09-24, direct request: marks
+        every file on the CURRENT page as seen, except any bookmarked one
+        (a bookmark is itself a statement that the file IS of interest —
+        it should never become hidden by "hide seen files" as a side
+        effect of a bulk dismissal), then moves on. "Moves on" means: if
+        the hide-seen filter is ON, the newly-seen files simply disappear
+        from the active list and reloading THIS SAME page index naturally
+        reveals whatever now slides into that slot (a deliberate
+        simplification — no special-case "advance" logic needed); if the
+        filter is OFF, the marked files stay visible (now badged) and the
+        view advances to the next page as a plain, literal "move to the
+        next page" action.
+
+        The whole current page, not a partial one — Undo therefore always
+        reverts exactly the batch this one click just marked, matching
+        the literal request as closely as its own wording allows ("undo a
+        hide of the last file they hide" is read here as the last BATCH,
+        since marking only ever happens in whole-page batches, never
+        per-file)."""
+        page_size = self._media_page_size
+        start = self._media_page_index * page_size
+        end = min(len(self._media_all_paths), start + page_size)
+        page_items = self._media_all_paths[start:end]
+        to_mark = [p for p in page_items if p not in self._media_bookmarked_paths]
+        if not to_mark:
+            self.status_bar.showMessage(
+                "Nothing to mark — every file on this page is bookmarked")
+            return
+
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                mark_media_seen(conn, to_mark)
+        except Exception:
+            self.status_bar.showMessage("Could not save — see console for details")
+            return
+
+        self._media_seen_paths.update(to_mark)
+        self._media_delegate.set_seen_paths(self._media_seen_paths)
+        self._media_last_seen_batch = to_mark
+        # Recorded BEFORE navigating away, so Undo can return to the page
+        # this batch actually came from rather than wherever "Not
+        # Interested" left the view afterward (a real bug found during
+        # verification: with hide-seen OFF, marking page N advances to
+        # page N+1, and Undo used to just reload "the current page" —
+        # i.e. N+1 — never actually showing the just-restored files).
+        self._media_last_seen_batch_page = self._media_page_index
+        self._media_undo_seen_btn.setEnabled(True)
+
+        n_skipped = len(page_items) - len(to_mark)
+        skipped_note = f" ({n_skipped} bookmarked file(s) left as-is)" if n_skipped else ""
+        self.status_bar.showMessage(
+            f"Marked {len(to_mark):,} file(s) as seen{skipped_note}")
+
+        if self._media_hide_seen:
+            self._recompute_media_all_paths()
+            self._load_media_page(self._media_page_index)
+        else:
+            self._load_media_page(self._media_page_index + 1)
+
+    def _on_media_undo_seen(self) -> None:
+        """Reverts exactly the last "Not Interested" batch — added
+        2026-09-24, direct request: "a button that allows the user to
+        undo a hide... so error can be undone." Never partial, never more
+        than the one most recent click's own batch."""
+        batch = self._media_last_seen_batch
+        if not batch:
+            return
+
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                unmark_media_seen(conn, batch)
+        except Exception:
+            self.status_bar.showMessage("Could not undo — see console for details")
+            return
+
+        self._media_seen_paths.difference_update(batch)
+        self._media_delegate.set_seen_paths(self._media_seen_paths)
+        self._media_last_seen_batch = None
+        self._media_undo_seen_btn.setEnabled(False)
+        self.status_bar.showMessage(f"Undid — {len(batch):,} file(s) no longer marked seen")
+
+        if self._media_hide_seen:
+            self._recompute_media_all_paths()
+        self._load_media_page(self._media_last_seen_batch_page)
 
     def _on_thumbnail_ready(self, ui_path, img):
-        if ui_path not in self._thumb_img_labels:
-            if ui_path not in self._thumb_positions:
-                return
-            self._place_thumb_container(ui_path)
-        self._thumb_img_labels[ui_path].setPixmap(QPixmap.fromImage(img))
+        row = self._media_model.row_of(ui_path)
+        if row is None:
+            return   # stale -- page/folder changed since this was requested
+        self._media_delegate.set_pixmap(ui_path, QPixmap.fromImage(img))
+        idx = self._media_model.index(row)
+        self._media_model.dataChanged.emit(idx, idx)
 
-    def _on_thumb_clicked(self, ui_path):
-        if self._selected_media_path and self._selected_media_path in self._thumb_widgets:
-            self._thumb_widgets[self._selected_media_path].set_selected(False)
+    def _on_media_item_clicked(self, index) -> None:
+        """A plain click behaves as it always has (select just this one
+        item via _select_media_item). A Ctrl/Shift-click — extending a
+        multi-selection, added 2026-09-24 for bookmarking a selection of
+        files — instead only syncs the shared side panels
+        (_sync_media_side_panels) to whichever item was just clicked,
+        WITHOUT calling _select_media_item's own setCurrentIndex.
+        Confirmed directly, not assumed: setCurrentIndex collapses an
+        already-multi-selected set of items back down to just the one
+        passed to it, even though it's called separately from the
+        selection Qt's own mouse handling has already built by the time
+        this `clicked` signal fires — checking QApplication.
+        keyboardModifiers() here is what actually distinguishes the two
+        cases, since the `clicked` signal itself carries no modifier
+        info of its own."""
+        ui_path = index.data(Qt.ItemDataRole.DisplayRole)
+        if not ui_path:
+            return
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & (Qt.KeyboardModifier.ControlModifier |
+                       Qt.KeyboardModifier.ShiftModifier):
+            self._sync_media_side_panels(ui_path)
+        else:
+            self._select_media_item(ui_path)
+
+    def _sync_media_side_panels(self, ui_path: str) -> None:
+        """The non-selection-model side effects of picking a media item —
+        status bar, File Browser sync, hex preview, following an already-
+        open full-view dialog. Split out of _select_media_item 2026-09-24
+        so a Ctrl/Shift-click (extending a multi-selection) can update
+        these without also calling setCurrentIndex, which would otherwise
+        collapse the multi-selection back down to one item — see
+        _on_media_item_clicked's own docstring for how that was confirmed,
+        not assumed."""
         self._selected_media_path = ui_path
-        if ui_path in self._thumb_widgets:
-            self._thumb_widgets[ui_path].set_selected(True)
         self.status_bar.showMessage(ui_path)
         self._select_file_in_table(ui_path)
         self._load_hex_preview(ui_path)
         self._media_sync_open_dialog(ui_path)
 
-    def _on_thumb_double_clicked(self, ui_path: str) -> None:
+    def _select_media_item(self, ui_path: str) -> None:
+        """Selects *ui_path* in the grid — updates QListView's own
+        selection (so the delegate paints the highlight; no manual
+        set_selected bookkeeping needed the way the old widget-per-item
+        grid required) and scrolls it into view — plus the same side
+        effects a click always had (_sync_media_side_panels). Used both
+        by a direct (unmodified) click and by a pending File-Browser-
+        driven selection landing here with no click ever having happened
+        — both cases WANT a single-item selection, unlike the Ctrl/Shift-
+        click case _on_media_item_clicked handles separately.
+
+        Since pagination (2026-09-24), *ui_path* may belong to the
+        folder's own full media list (_media_all_paths) without being on
+        the CURRENTLY DISPLAYED page — switches to whichever page
+        actually contains it first (_load_media_page) rather than
+        silently no-op'ing the way a bare model lookup would."""
+        row = self._media_model.row_of(ui_path)
+        if row is None:
+            try:
+                global_index = self._media_all_paths.index(ui_path)
+            except ValueError:
+                return
+            self._load_media_page(global_index // self._media_page_size)
+            row = self._media_model.row_of(ui_path)
+            if row is None:
+                return
+        idx = self._media_model.index(row)
+        self._media_view.setCurrentIndex(idx)
+        self._media_view.scrollTo(idx, QAbstractItemView.ScrollHint.EnsureVisible)
+        self._sync_media_side_panels(ui_path)
+
+    def _on_media_item_double_clicked(self, index) -> None:
+        ui_path = index.data(Qt.ItemDataRole.DisplayRole)
+        if ui_path:
+            self._open_media_full_view(ui_path)
+
+    def _get_media_paths_for_bookmark(self) -> list:
+        """[(ui_path, display_name)] for the Media Browser's own current
+        selection — the Media Browser equivalent of ffs-explorer.py's
+        `_get_paths_for_bookmark` (File Browser), added 2026-09-24, direct
+        request: "make it that a user can bookmark media file[s] in the
+        media browser via right click... this should work in file
+        browser and media browser." Scoped to whatever's selected on the
+        CURRENTLY DISPLAYED PAGE only — selection can't span pages in the
+        first place, since paging (2026-09-24) replaces the grid's own
+        model entirely on every page change."""
+        result: list = []
+        seen: set = set()
+        for index in self._media_view.selectionModel().selectedIndexes():
+            ui_path = index.data(Qt.ItemDataRole.DisplayRole)
+            if ui_path and ui_path not in seen:
+                seen.add(ui_path)
+                result.append((ui_path, ui_path.rsplit('/', 1)[-1]))
+        return result
+
+    def _show_media_context_menu(self, pos) -> None:
+        """Right-click "Bookmarks" menu for the Media Browser grid —
+        added 2026-09-24, direct request: "make it that a user can
+        bookmark media file[s] in the media browser via right click."
+        Right-clicking an item that ISN'T already part of the current
+        selection replaces the selection with just that one first —
+        ordinary file-manager convention, so the menu always visibly acts
+        on whatever's actually selected; right-clicking WITHIN an
+        existing multi-selection leaves it untouched, so a multi-file
+        bookmark works via right-click too, not just Ctrl+B."""
+        index = self._media_view.indexAt(pos)
+        if index.isValid() and not self._media_view.selectionModel().isSelected(index):
+            self._media_view.setCurrentIndex(index)
+            self._media_view.selectionModel().select(
+                index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        paths = self._get_media_paths_for_bookmark()
+        if not paths:
+            return
+        menu = QMenu(self._media_view)
+        self._bookmark_submenu(menu, paths)
+        menu.exec(self._media_view.viewport().mapToGlobal(pos))
+
+    def _open_media_full_view(self, ui_path: str) -> None:
         """Open the full-size image/video viewer for *ui_path* — non-modal
         (.show(), not .exec()) and tracked on self so a plain single-click
         selecting a DIFFERENT thumbnail can keep swapping this same open
         dialog's content instead of it blocking the grid (see
-        _media_sync_open_dialog, called from _on_thumb_clicked above), same
-        "open viewer follows selection" convention artifact_viewer.py's
+        _media_sync_open_dialog, called from _select_media_item above),
+        same "open viewer follows selection" convention artifact_viewer.py's
         Report table already established for its own media columns. A
         second double-click while one is already open reuses that same
         window (load_content + raise) rather than stacking another."""
@@ -981,7 +1837,7 @@ class MediaViewerMixin:
         thumbnail selection: swap its content to whatever was just clicked
         instead of leaving it showing the previous file. Silently does
         nothing if no dialog is open — a plain click elsewhere in the app
-        shouldn't pop it open, only a double-click (_on_thumb_double_clicked)
+        shouldn't pop it open, only a double-click (_open_media_full_view)
         or a further single-click while it's already showing."""
         dialog = self._media_full_dialog
         if dialog is None or not dialog.isVisible():
@@ -996,28 +1852,19 @@ class MediaViewerMixin:
         shared bottom panel on switching back to this tab, or clear it if
         nothing has been selected here yet — same reasoning as the other
         three tabs' resyncs (see "Per-tab state on switching" in
-        CLAUDE.md). Needed as its own call, separate from _on_thumb_clicked
+        CLAUDE.md). Needed as its own call, separate from _select_media_item
         above: the existing thumbnail-grid reload logic in
-        _on_center_tab_changed only re-fires _on_thumb_clicked when a
-        FILE BROWSER selection is pending sync into Media Browser — a
-        plain "switch back to Media Browser, nothing changed, no pending
-        File Browser selection" pass touches neither, which would
-        otherwise leave whatever another tab last put in the shared panel
-        showing here instead."""
-        if self._selected_media_path and self._selected_media_path in self._thumb_widgets:
+        _on_center_tab_changed only re-selects when a FILE BROWSER
+        selection is pending sync into Media Browser — a plain "switch
+        back to Media Browser, nothing changed, no pending File Browser
+        selection" pass touches neither, which would otherwise leave
+        whatever another tab last put in the shared panel showing here
+        instead. Checks _media_all_paths (the whole folder), not just the
+        currently displayed page's own model — a selection on a page the
+        examiner has since paged away from is still a real, restorable
+        selection, not a stale one."""
+        if self._selected_media_path and \
+                self._selected_media_path in self._media_all_paths:
             self._load_hex_preview(self._selected_media_path)
         else:
             self._clear_hex_preview()
-
-    def _on_thumbnails_done(self):
-        count    = self._media_grid.count()
-        of_total = (f" of {self._media_total_files:,} file(s)"
-                    if self._media_total_files is not None else "")
-        self._media_status.setText(
-            f"{count:,} media file(s){of_total}{self._media_sort_desc}")
-        if self._pending_media_selection and \
-                self._pending_media_selection in self._thumb_widgets:
-            self._on_thumb_clicked(self._pending_media_selection)
-            self._media_scroll.ensureWidgetVisible(
-                self._thumb_widgets[self._pending_media_selection])
-        self._pending_media_selection = None

@@ -25,7 +25,7 @@ _SEARCH_ENTRIES_VERSION = '1'
 
 # Bump whenever the schema changes incompatibly.
 # Cache DB is auto-deleted on mismatch; results DB raises OldSchemaError.
-_CACHE_SCHEMA_VERSION   = 17
+_CACHE_SCHEMA_VERSION   = 18
 _RESULTS_SCHEMA_VERSION = 1
 
 
@@ -39,7 +39,9 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
     """Open (or create) casecache.db inside *cache_dir*.
 
     Reconstructable cache — auto-deletes and recreates on schema mismatch.
-    Tables: thumbnails, blobs, header_types, guid_bundle.
+    Tables: thumbnails, blobs, header_types, guid_bundle,
+    processing_registry (generic "already processed for capability X"
+    tracker, see its own CREATE TABLE comment below).
 
     Raises ValueError if cache_dir is falsy.
     """
@@ -254,6 +256,51 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         ON leveldb_search_index (folder_ui_path)
     ''')
 
+    # Generic "have we already processed this file for capability X"
+    # registry — added 2026-09-23 for the embedded-media scan's own
+    # "don't redo work already done" need (direct request: "is there a
+    # register that a file has been processed... so that it is not
+    # redone?"), deliberately built generic rather than a one-off table
+    # so a FUTURE similar need can reuse it too, per direct follow-up
+    # design discussion ("should we have a tracker for all processing
+    # i.e. leveldb, sqlite as part of search and the image cache?").
+    # capability + logic_version together answer BOTH "was this done at
+    # all" and "is that result still current" — the same staleness-by-
+    # version-hash pattern leveldb_search_index_version (above) already
+    # established, generalized to a column instead of one bespoke blob
+    # key per feature. result_count (>= 0, including a real, meaningful
+    # 0) is what makes "processed, found nothing" distinguishable from
+    # "never processed" — the exact sentinel-row gap
+    # save_leveldb_search_records had to add a special row for, avoided
+    # here from the start since a plain row always exists once processed,
+    # zero-result or not.
+    #
+    # Deliberately NOT retrofitted onto leveldb_search_index itself right
+    # now (see CLAUDE.md's own writeup of this design discussion for the
+    # full reasoning) — that table already has its own working, shipped
+    # version-tracking mechanism, and migrating it here would mean
+    # touching and re-verifying already-correct, already-shipped
+    # functionality purely for architectural tidiness, with real
+    # regression risk and no functional benefit on its own. This table
+    # is built generic enough to absorb that migration later if a THIRD
+    # real need for the same pattern shows up, without needing a shape
+    # change then.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS processing_registry (
+            ui_path       TEXT    NOT NULL,
+            capability    TEXT    NOT NULL,
+            logic_version TEXT    NOT NULL,
+            processed_at  TEXT    NOT NULL
+                          DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now')),
+            result_count  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (ui_path, capability)
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_processing_registry_capability
+        ON processing_registry (capability)
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_CACHE_SCHEMA_VERSION}')
     conn.commit()
     return conn
@@ -389,6 +436,16 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_bm_entries_group
         ON bookmark_entries (group_id)
     ''')
+    # Migration: color added 2026-09-25, direct request ("make it clear
+    # which images are bookmarked... colour for each bookmark [group]
+    # that is set when the [group] is created") — a real case_dir can
+    # already have this table from before this column existed, same
+    # ALTER-TABLE-then-ignore-if-present pattern as embedded_media_hits'
+    # own display_name column above.
+    try:
+        conn.execute("ALTER TABLE bookmark_groups ADD COLUMN color TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS search_scope_files (
@@ -463,6 +520,29 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE embedded_media_hits ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
     except sqlite3.OperationalError:
         pass  # column already exists
+
+    # Media Browser "seen" tracking (added 2026-09-24, direct request: a
+    # "Not Interested" button marking a whole page of media as reviewed,
+    # plus a "hide seen files" display preference) — an examiner's own
+    # review-progress decision, the same precious/never-auto-deleted
+    # category as bookmarks above, not a rebuildable cache: losing this
+    # silently would mean re-triaging thousands of already-reviewed
+    # images. A file's presence as a row here means "seen"; absence
+    # means "not yet seen" (the default for every file, including one
+    # from before this table existed). Deliberately holds no per-case
+    # reference to WHICH page/action marked it — a file is either seen
+    # or not, full stop; the Media Browser's own in-memory
+    # `_media_last_seen_batch` (not persisted) is what makes a single
+    # "Undo" of the most recent marking possible, by remembering which
+    # paths THAT specific action added, not by anything stored here.
+    # Additive (CREATE TABLE IF NOT EXISTS) — no _RESULTS_SCHEMA_VERSION
+    # bump needed, same as every other table added here since version 1.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS media_seen (
+            ui_path TEXT NOT NULL PRIMARY KEY,
+            seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
+        )
+    ''')
 
     conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
@@ -1070,6 +1150,66 @@ def clear_leveldb_search_index(conn: 'sqlite3.Connection') -> None:
     conn.commit()
 
 
+# ── Generic "already processed" registry (casecache.db) ────────────────
+#
+# See processing_registry's own CREATE TABLE comment in _open_cache_db
+# for the full design reasoning. First real caller: the embedded-media
+# scan (app/embedded_media_scan.py), capability='embedded_media_scan'.
+
+def save_processing_registry_entries(conn: 'sqlite3.Connection',
+                                     capability: str, entries: list) -> None:
+    """Record processing completion for one capability.
+
+    *entries* is a list of (ui_path, logic_version, result_count) tuples.
+    INSERT OR REPLACE, keyed (ui_path, capability) — a re-scan under a
+    NEW logic_version simply overwrites the stale entry; no history is
+    kept, matching every other staleness-tracking mechanism in this
+    project (a version mismatch means "redo it", never "diff against the
+    old result")."""
+    conn.executemany(
+        'INSERT OR REPLACE INTO processing_registry '
+        '(ui_path, capability, logic_version, result_count) '
+        'VALUES (?, ?, ?, ?)',
+        [(ui_path, capability, version, count)
+         for ui_path, version, count in entries],
+    )
+    conn.commit()
+
+
+def processed_ui_paths(conn: 'sqlite3.Connection', capability: str,
+                       current_version: str) -> set:
+    """ui_paths already processed for *capability* under EXACTLY
+    *current_version* — anything recorded under a DIFFERENT (older)
+    version is deliberately excluded, so a logic-version bump makes
+    every previously-processed file eligible for reprocessing again
+    automatically, without needing a separate cache-wide invalidation
+    step the way leveldb_search_index_version's own blob check needs
+    (this table tracks staleness per row already, not per whole table)."""
+    rows = conn.execute(
+        'SELECT ui_path FROM processing_registry '
+        'WHERE capability=? AND logic_version=?',
+        (capability, current_version),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def processing_registry_entry(conn: 'sqlite3.Connection', capability: str,
+                              ui_path: str) -> dict | None:
+    """The full recorded entry for one (capability, ui_path) pair,
+    regardless of whether its logic_version is still current — used by
+    the manual single-file "Search for Embedded Media" action to tell
+    the examiner what a STALE prior result was, not just that one
+    exists. None if never processed at all."""
+    row = conn.execute(
+        'SELECT logic_version, processed_at, result_count '
+        'FROM processing_registry WHERE capability=? AND ui_path=?',
+        (capability, ui_path),
+    ).fetchone()
+    if row is None:
+        return None
+    return {'logic_version': row[0], 'processed_at': row[1], 'result_count': row[2]}
+
+
 def save_evidence_page_map(conn: 'sqlite3.Connection', ui_path: str,
                          page_map: dict) -> None:
     """Persist one file's page-ownership map (see sqlite_carve.build_page_map)
@@ -1192,27 +1332,84 @@ def clear_nested_archives(conn: 'sqlite3.Connection') -> None:
 
 # ── Bookmarks ─────────────────────────────────────────────────────────────────
 
+# A fixed, distinct rotating palette — added 2026-09-25, direct request:
+# "colour for each bookmark[ed group]... set when the [group] is
+# created." Auto-assigned at creation time (see save_bookmark_group)
+# rather than forcing a color choice into the "New Group…" dialog flow;
+# examinable/changeable afterward via update_bookmark_group_color. Eight
+# visually distinct hues (no reds/greens right next to each other) —
+# rotates via COUNT(*) % len(...) so the Nth group created gets the Nth
+# color, wrapping around past 8 groups rather than erroring or repeating
+# early.
+BOOKMARK_COLOR_PALETTE = [
+    '#e6194b',  # red
+    '#3cb44b',  # green
+    '#4363d8',  # blue
+    '#f58231',  # orange
+    '#911eb4',  # purple
+    '#42d4f4',  # cyan
+    '#f032e6',  # magenta
+    '#bfef45',  # lime
+]
+
+
 def load_bookmark_groups(conn: 'sqlite3.Connection') -> list:
-    """Return [{id, name, description, created_at, count}] ordered by creation."""
+    """Return [{id, name, description, created_at, count, color}] ordered
+    by creation."""
     rows = conn.execute(
-        'SELECT g.id, g.name, g.description, g.created_at, COUNT(e.id) '
+        'SELECT g.id, g.name, g.description, g.created_at, COUNT(e.id), g.color '
         'FROM bookmark_groups g '
         'LEFT JOIN bookmark_entries e ON e.group_id = g.id '
         'GROUP BY g.id ORDER BY g.created_at'
     ).fetchall()
     return [{'id': r[0], 'name': r[1], 'description': r[2],
-             'created_at': r[3], 'count': r[4]} for r in rows]
+             'created_at': r[3], 'count': r[4],
+             'color': r[5] or BOOKMARK_COLOR_PALETTE[0]} for r in rows]
 
 
 def save_bookmark_group(conn: 'sqlite3.Connection',
-                        name: str, description: str = '') -> int:
-    """Create a new bookmark group and return its id."""
+                        name: str, description: str = '',
+                        color: str | None = None) -> int:
+    """Create a new bookmark group and return its id. *color* defaults to
+    the next entry in BOOKMARK_COLOR_PALETTE (by current group count) when
+    not given explicitly."""
+    if not color:
+        n = conn.execute('SELECT COUNT(*) FROM bookmark_groups').fetchone()[0]
+        color = BOOKMARK_COLOR_PALETTE[n % len(BOOKMARK_COLOR_PALETTE)]
     cur = conn.execute(
-        'INSERT INTO bookmark_groups (name, description) VALUES (?, ?)',
-        (name, description or None),
+        'INSERT INTO bookmark_groups (name, description, color) VALUES (?, ?, ?)',
+        (name, description or None, color),
     )
     conn.commit()
     return cur.lastrowid
+
+
+def update_bookmark_group_color(conn: 'sqlite3.Connection',
+                                group_id: int, color: str) -> None:
+    """Change an existing group's own badge color (examiner-triggered,
+    via the bookmark panel's "Change Color…" action — never automatic
+    past initial creation)."""
+    conn.execute('UPDATE bookmark_groups SET color=? WHERE id=?', (color, group_id))
+    conn.commit()
+
+
+def load_bookmark_colors(conn: 'sqlite3.Connection') -> dict:
+    """Maps every bookmarked ui_path to its own badge color — the color
+    of the EARLIEST (lowest group id) group containing it, when a file
+    belongs to more than one group. This project doesn't attempt to
+    blend/stack colors for a multi-group file; the first group it was
+    ever added to wins, silently but deterministically (ORDER BY
+    group_id ASC, first occurrence kept)."""
+    rows = conn.execute(
+        'SELECT be.ui_path, g.color FROM bookmark_entries be '
+        'JOIN bookmark_groups g ON g.id = be.group_id '
+        'ORDER BY be.group_id ASC'
+    ).fetchall()
+    result: dict = {}
+    for ui_path, color in rows:
+        if ui_path not in result:
+            result[ui_path] = color or BOOKMARK_COLOR_PALETTE[0]
+    return result
 
 
 def save_bookmark_entries(conn: 'sqlite3.Connection',
@@ -1256,6 +1453,48 @@ def delete_bookmark_entry(conn: 'sqlite3.Connection',
         (group_id, ui_path),
     )
     conn.commit()
+
+
+def load_all_bookmarked_paths(conn: 'sqlite3.Connection') -> set:
+    """Every ui_path bookmarked in ANY group — added 2026-09-24 for the
+    Media Browser's "Not Interested" bulk-marking action, which must
+    never mark a bookmarked file as seen (a bookmark is itself a
+    statement that the file IS of interest)."""
+    return {r[0] for r in conn.execute('SELECT DISTINCT ui_path FROM bookmark_entries')}
+
+
+# ── Media Browser "seen" tracking ───────────────────────────────────────────
+
+def mark_media_seen(conn: 'sqlite3.Connection', ui_paths: list) -> None:
+    """Mark every path in *ui_paths* as seen. INSERT OR IGNORE — a file
+    already marked seen keeps its ORIGINAL seen_at rather than being
+    bumped by a later re-mark (e.g. re-running "Not Interested" after
+    Undo re-added it to the same page's own unseen set)."""
+    if not ui_paths:
+        return
+    conn.executemany(
+        'INSERT OR IGNORE INTO media_seen (ui_path) VALUES (?)',
+        [(p,) for p in ui_paths],
+    )
+    conn.commit()
+
+
+def unmark_media_seen(conn: 'sqlite3.Connection', ui_paths: list) -> None:
+    """Remove *ui_paths* from the seen set — used by the Media Browser's
+    own "Undo" button to revert exactly the batch its last "Not
+    Interested" click marked, never more."""
+    if not ui_paths:
+        return
+    conn.executemany(
+        'DELETE FROM media_seen WHERE ui_path=?',
+        [(p,) for p in ui_paths],
+    )
+    conn.commit()
+
+
+def load_seen_media_paths(conn: 'sqlite3.Connection') -> set:
+    """Every ui_path currently marked seen, for this whole case."""
+    return {r[0] for r in conn.execute('SELECT ui_path FROM media_seen')}
 
 
 def save_search_scope_files(conn: 'sqlite3.Connection',

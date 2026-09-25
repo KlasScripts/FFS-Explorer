@@ -26,7 +26,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 ## Data flow (opening an archive)
 
 1. `FastZipBrowser.start_loading()` → case dir chosen (`_get_or_ask_case_dir`).
-2. `ZipMetadataWorker` (ffs-explorer.py:1446) → `app/ffs_metadata.py
+2. `ZipMetadataWorker` (ffs-explorer.py:1473) → `app/ffs_metadata.py
    parse_archive_metadata()` in a child process: central-directory parse,
    `ui_metadata` build, folder tree/sizes; snapshot persisted to case dir
    (msgpack) so re-opens are instant.
@@ -102,12 +102,13 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `zip_cd_cache.py` | .zcd central-directory sidecar cache + integrity hashes for network zips. `load()` memoizes its own PARSED `ZipInfo` list in-memory per `.zcd` file (added 2026-09-15, see Conventions' "Real beach-ball on case load" entry — 17+ call sites across this project were each independently re-paying a real ~1.6–3.9s `zipfile.ZipFile()` re-parse cost on every call before this) |
 | `header_scan.py` | Magic-byte/text file-type detection by direct offset reads. `classify_magic`'s `ftyp` branch fixed 2026-09-22 (see the "Embedded-media sweep" Conventions entry below) — it used to treat ANY non-audio `ftyp` brand as `'Video'`, which is wrong for HEIC/HEIF (the single most common real iOS photo format, sharing the identical ISOBMFF/`ftyp` container MP4/MOV use); confirmed directly against real HEIC/MOV/M4V/MP4 files from this project's own test archives before fixing, not assumed. New public `IMAGE_FTYP_BRANDS` (HEIC/HEIF/AVIF family brands) disambiguates; a `WEBP` RIFF form (previously undetected at all) was added the same day |
 | `embedded_media_scan.py` | Generic, schema-agnostic sweep for image/video content embedded inside SQLite BLOB cells and plist NSData values — see the "Embedded-media sweep" Conventions entry below for the full design, real bugs found during verification, and the GUI wiring (`ProcessDialog`'s checkbox/scope picker, `EmbeddedMediaScanWorker` in `ffs-explorer.py`, and the Media Browser's "Embedded Media" review button) — all shipped and verified end-to-end against real archive data, not a placeholder |
+| `embedded_media_skip_list.py` | Hand-maintained "known-noise" list of SQLite databases/plists an examiner has confirmed are never worth running the embedded-media sweep against — added 2026-09-24, see that day's Conventions entries below for the full design, a real example found while verifying it (`map_cache.db`, Google Maps' own SDK cache, bundled inside 10 unrelated apps on one real Android archive), and several same-day direct follow-ups: app-scoped entries via `FastZipBrowser._app_scoped_skip_entry` to avoid a cross-app collision risk; `entry_matches_any_path` for the "Add…" dialog's own validation against the currently open archive; wildcard (`*`) entries for a known-variable path segment (an iOS container GUID, an Android per-user-profile id) found and confirmed against real archives to need generalizing beyond the first app-scoping pass; and a full split into TWO separate files, one per platform, so the View/Edit List dialog only ever shows the current case's own platform. Same dev/frozen-path JSON-store convention as `research_store.py`/`photo_flags.json`, cached by mtime+size, `platform` ('android'/'ios') threaded through every function. `load`/`add_entry`/`remove_entry`/`matches`/`find_matching_entries`/`entry_matches_any_path` — an entry with no `/` matches by exact basename anywhere in the archive, one containing `/` but no `*` matches as a path substring, one containing `*` matches as a wildcard substring (each `*` matching any run of characters) |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers (2026-08-19, after a survey found 25+ hand-rebuilt Cancel/OK button rows, 24+ wordWrap note labels, and four different ad-hoc warning/error colors): `button_row()` (Cancel/OK, `on_ok`/`on_cancel` default to accept/reject — only fits a plain two-button row in that fixed order, a dialog with a third button or different order keeps its own hand-built row), `note_label()`, `error_label()`, and `WARNING_COLOR`/`ERROR_COLOR` reusing `research_store.py`'s existing `#b8860b`/`#c62828` rather than inventing new ones. No case/business logic — pure widget construction |
 | `timestamp_display.py` | `TimestampDisplayMixin` (extracted from `ffs-explorer.py` 2026-08-19, same treatment as the other mixins below): the shared timestamp-mode banner, `format_ts` (the single entry point every view calls to display an evidence timestamp per the case's UTC/handset/acquisition/manual setting), and the Timestamp Display dialog. Module-level `_format_ts_cached`/`_format_ts_named_zone` do the actual formatting. Tool-provenance formatting (`_format_tool_ts_local`) is a different concern and stays in `ffs-explorer.py` |
 | `device_timezone.py` | Best-effort timezone detection for the opt-in device-local timestamp display: `detect_handset_zone` (iOS `private/var/db/timezone/localtime`), `detect_acquisition_offset`/`guess_acquisition_zones` (the `.ufd`'s recorded UTC offset, Cellebrite-only), `detect_system_zone` (the analysis machine's own current zone — macOS/Linux via `/etc/localtime`, Windows via the registry + a bundled CLDR name mapping since Windows has no IANA-named equivalent). All best-effort, never raise, never applied silently — see the Conventions timestamp section |
 | `keyword_search.py` | Search workers (live + nested archives), saved-search DB loaders, dialogs, `KeywordSearchMixin`. `SqlHitInterpretWorker` (added 2026-09-12) is the background half of "Interpret as SQL Record" — see Conventions |
 | `hex_viewer.py` | Hex tab (`HexViewerMixin`, `HexLoadWorker`). Also builds the Record/Attachment toggle and the joined-record source combo shown beside "File Preview" — see Conventions — but has no artifact-report knowledge itself, just the checkable buttons, the combo widget, and `_hex_source_is_record()`; `ArtifactViewerMixin` owns what each mode/entry loads |
-| `media_viewer.py` | Thumbnail grid, in-process video-frame decoding via `av`/PyAV (`MediaViewerMixin`; switched from a subprocess `ffmpeg` call 2026-09-14 — see Conventions' "Video thumbnails: PyAV, built from source" entry for the two real bugs that switch fixed). Selecting a thumbnail (`_on_thumb_clicked`) also loads that file into the shared bottom Hex panel — see "Per-tab state on switching". Also owns `MediaFullViewDialog` (added 2026-09-02 in `artifact_media.py`, moved here 2026-09-14) — double-clicking a thumbnail (`_on_thumb_double_clicked`) opens the full-size image/video viewer, non-modal, and single-clicking a DIFFERENT thumbnail while it's open swaps its content to follow selection (`_media_sync_open_dialog`) rather than the examiner needing to close and re-double-click for every file — same "open viewer follows selection" convention `artifact_viewer.py`'s Report table already established for its own media columns, now shared by both real call sites. `_load_qimage(data, ext)` (also added 2026-09-14) is the one shared entry point both `ThumbnailWorker` and `MediaFullViewDialog._build_image` use to decode a QImage — Qt's own decode first, falling back to `pillow_heif` only for HEIC/HEIF once that's already failed (Qt has no native HEIC codec on Windows at all) — see Conventions' "Video thumbnails: PyAV, built from source" entry, whose write-up now also covers this HEIC fallback and a real EXIF-orientation bug found in `pillow_heif` itself along the way |
+| `media_viewer.py` | Virtualized, paginated thumbnail grid (`MediaFileListModel`/`MediaGridDelegate`, a plain `QListView` in IconMode backed by a list model and a paint-only delegate — replaced a one-real-QWidget-per-file `QGridLayout` grid 2026-09-24, see Conventions' "Media Browser freeze on large folders" entry for the real freeze this fixed; its own first loading strategy, continuous viewport-scroll-tracking, was then itself replaced by page-based loading the same day after direct follow-up that it "does not really work" — see that entry's own follow-up paragraph for the current `_load_media_page`/`_prefetch_next_page` design), in-process video-frame decoding via `av`/PyAV (`MediaViewerMixin`; switched from a subprocess `ffmpeg` call 2026-09-14 — see Conventions' "Video thumbnails: PyAV, built from source" entry for the two real bugs that switch fixed). Selecting an item (`_select_media_item`) also loads that file into the shared bottom Hex panel — see "Per-tab state on switching". Also owns `MediaFullViewDialog` (added 2026-09-02 in `artifact_media.py`, moved here 2026-09-14) — double-clicking an item (`_on_media_item_double_clicked`) opens the full-size image/video viewer, non-modal, and single-clicking a DIFFERENT item while it's open swaps its content to follow selection (`_media_sync_open_dialog`) rather than the examiner needing to close and re-double-click for every file — same "open viewer follows selection" convention `artifact_viewer.py`'s Report table already established for its own media columns, now shared by both real call sites. `_load_qimage(data, ext)` (also added 2026-09-14) is the one shared entry point both `ThumbnailWorker` and `MediaFullViewDialog._build_image` use to decode a QImage — Qt's own decode first, falling back to `pillow_heif` only for HEIC/HEIF once that's already failed (Qt has no native HEIC codec on Windows at all) — see Conventions' "Video thumbnails: PyAV, built from source" entry, whose write-up now also covers this HEIC fallback and a real EXIF-orientation bug found in `pillow_heif` itself along the way |
 | `sqlite_viewer.py` | Database tab: temp-copy extraction, table browser, **WAL net-change diff view** (`SqliteDiffModel`) |
 | `segb_viewer.py` | SEGB/Biome tab: parses records via vendored `app/ccl_segb`, decodes protobuf with `blackboxprotobuf`; empty-record hiding + deleted-record toggle |
 | `segb_schemas.py` | Built-in per-stream protobuf typedefs + field labels for known Biome streams; user-authored schemas persist to `caseresults.db` via `db_utils.save_segb_schema` and override the built-ins |
@@ -477,7 +478,7 @@ underneath that verification.
   `_setup_hex_panel`) is the one widget genuinely SHARED across all four
   tabs (File Browser, Media Browser, Keyword Search, Artifact Viewer all
   load into the same physical panel — Media Browser's own thumbnail
-  selection loads the selected file's hex too, `MediaViewerMixin._on_thumb_clicked`),
+  selection loads the selected file's hex too, `MediaViewerMixin._select_media_item`),
   so it needs its own explicit per-tab memory — switching tabs doesn't
   clear it (whichever tab was active last just leaves its content
   sitting there), but switching INTO a tab actively RE-ASSERTS that tab's
@@ -498,9 +499,9 @@ underneath that verification.
     index 1 only on the "nothing changed" path — see below): reloads
     `_selected_media_path` if it's still a currently-loaded thumbnail.
     The "context changed, full grid reload" path needs no separate call —
-    `_on_thumbnails_done` already re-selects the pending file via
-    `_on_thumb_clicked`, which itself now loads that file's hex as part of
-    ordinary thumbnail-click handling (not just the tab-switch case).
+    `_start_thumbnail_load` already re-selects the pending file via
+    `_select_media_item`, which itself now loads that file's hex as part
+    of ordinary item-click handling (not just the tab-switch case).
   - **Keyword Search** (calls its own pre-existing `_on_search_row_selected`,
     entering index 2): re-reads whatever's currently selected in the
     results tree and re-jumps the hex view there — needed no new state at
@@ -4728,6 +4729,501 @@ underneath that verification.
   fallback for real (not just the forced-test condition) — same Parallels
   follow-up as the video work above.
 
+- **Media Browser freeze on large folders — rearchitected onto a
+  virtualized QListView grid, 2026-09-24.** Direct report: "there is an
+  issue if there is 1000s of files that the GUI freezes... can you look
+  at having a smaller amount in memory so that the scroll is still
+  smooth but this loading issue on large amounts does not happen."
+  Investigated the actual design rather than assumed: the pre-existing
+  grid (`ClickableThumb` — a real `QWidget` container with two `QLabel`s
+  — inside a `QGridLayout`) already batched WIDGET CREATION via
+  `QTimer.singleShot` chunks (`_place_thumb_placeholders_batched`, 60 at
+  a time) specifically to avoid a single-frame freeze — but that batching
+  only ever spread the cost of building the widgets across more frames,
+  it never reduced how many widgets ultimately existed. A `QGridLayout`
+  has to compute geometry for EVERY child it holds — even one scrolled
+  far off-screen — to know the scroll area's own total content size, so
+  both the initial build and ongoing scrolling degrade badly well before
+  a folder reaches the thousands; separately, `ThumbnailWorker` was
+  handed the WHOLE folder's file list up front and eagerly decoded every
+  one of them regardless of scroll position, so even a folder never fully
+  scrolled through still paid the full memory/CPU cost of decoding it.
+  Two independent problems, both real, needing two independent fixes —
+  fixing one alone would not have satisfied "smaller amount in memory...
+  scroll stays smooth."
+
+  **Fix 1 — genuine Qt-side view virtualization.** `ClickableThumb` +
+  `QGridLayout` replaced with `MediaGridView` (a `QListView` in
+  `IconMode`) backed by `MediaFileListModel` (a plain
+  `QAbstractListModel` holding nothing but a list of `ui_path` strings —
+  no per-item Qt object at all) and `MediaGridDelegate` (a
+  `QStyledItemDelegate` that PAINTS a thumbnail+filename cell rather than
+  constructing a widget for it). This is the exact same delegate-paints-
+  instead-of-widget technique this project already established for
+  Artifact Report media columns (`artifact_media.MediaThumbnailDelegate`,
+  a `QStyledItemDelegate` on a `QTableView` column) — applied here to a
+  whole grid instead of one table column. `QListView`'s own paint/layout
+  machinery only ever touches rows that intersect the current viewport,
+  so the widget-count problem disappears regardless of folder size —
+  confirmed directly: populating the model for a real 1,383-file folder
+  (`_load_media_from_file_model`) took 6.4ms, and a synthetic 20,000-item
+  model (15× the largest real single folder found across this project's
+  own test archives) took 13.3ms — both essentially instant, with the
+  previous design's own per-widget construction cost eliminated entirely
+  rather than merely spread out.
+
+  **Fix 2 — bounded, viewport-driven thumbnail memory**, the part that
+  directly answers "smaller amount in memory." `ThumbnailWorker` itself
+  (the QThread that actually decodes bytes — used unchanged, its
+  constructor/behavior untouched, since two OTHER call sites in
+  `artifact_viewer.py` depend on its existing "given a fixed list, decode
+  it" contract and there was no reason to put those at risk for this
+  fix) is now driven very differently by Media Browser:
+  `_refresh_visible_thumbnails` computes which grid ROWS currently
+  intersect the viewport (from the vertical scrollbar's own pixel
+  position, `ScrollPerPixel` mode — not `indexAt()` hit-testing, which
+  can return an invalid index for a point landing in inter-item
+  spacing), requests a decode ONLY for those rows plus a small fetch
+  buffer (`_VIEWPORT_FETCH_BUFFER_ROWS = 3`), and evicts any already-
+  decoded pixmap (`MediaGridDelegate.evict_except`) that has scrolled
+  outside a slightly larger keep buffer
+  (`_VIEWPORT_KEEP_BUFFER_ROWS = 8`) — so total decoded-thumbnail memory
+  stays bounded to roughly a screenful regardless of how many thousands
+  of files the folder holds, while the keep buffer means a small scroll
+  back and forth near the current position doesn't force a re-decode.
+  Called on every scroll/resize via a new `MediaGridView.viewport_changed`
+  signal (overriding `scrollContentsBy`/`resizeEvent`), debounced through
+  a 100ms `QTimer` (`_schedule_visible_thumbnail_refresh`) so a fast
+  drag-scroll doesn't itself become a source of main-thread churn.
+  Retires whatever previous viewport-scoped `ThumbnailWorker` was running
+  before starting a new one for the new range — same "retire, don't
+  wait" pattern (`_retire_worker`) every other worker restart in this
+  project already uses; a worker mid-decode for files that just scrolled
+  out of range is simply abandoned (its signals disconnected by
+  `_retire_worker`, so late results are ignored) rather than raced
+  against the new one. An evicted pixmap that's scrolled back to is
+  cheap to re-decode — the on-disk `casecache.db` thumbnails cache
+  (keyed `ui_path`+`file_size`+`thumb_size`, unchanged) already holds the
+  small encoded JPEG, so it's a fast re-read, never a fresh decode from
+  the original media file.
+
+  Confirmed directly against the real Android 14 JoshHickman archive's
+  own largest real single folder (a keyboard-suggestion sticker cache,
+  1,383 real PNGs — the biggest of any single folder across this
+  project's own three Android test archives, found by scanning every
+  real archive folder's own media-file count rather than guessed at):
+  only 30 pixmaps were cached after the initial viewport load (not
+  1,383), 45 after scrolling to the middle of the real scrollbar range,
+  and 50 after scrolling to the bottom — genuinely bounded regardless of
+  scroll position, not merely small on first load. A further synthetic
+  stress run (20,000 items, scrolled through 26 evenly-spaced positions
+  covering the full real scrollbar range) never exceeded a small bound
+  either (0 cached throughout, since the fabricated per-item paths
+  couldn't resolve to real archive bytes — expected and irrelevant to
+  what this run was checking, which was that repeatedly walking a
+  20,000-row viewport range causes no growth, crash, or slowdown).
+
+  **Interaction/selection model rebuilt on QListView's own selection
+  system rather than manual per-widget bookkeeping** — `ClickableThumb.
+  set_selected()`'s hand-rolled highlight stylesheet is gone;
+  `MediaGridDelegate.paint()` reads `option.state &
+  QStyle.StateFlag.State_Selected` (Qt's own selection state, driven by
+  `QListView`'s `setCurrentIndex`) the same way
+  `MediaThumbnailDelegate` already does for its own column. `_on_thumb_
+  clicked`/`_on_thumb_double_clicked` (path-based, called from a real
+  widget's own signal) became `_on_media_item_clicked`/
+  `_on_media_item_double_clicked` (index-based, called from `QListView`'s
+  own `clicked`/`doubleClicked` signals) plus a new shared
+  `_select_media_item(ui_path)` — used by both an ordinary click AND a
+  pending File-Browser-driven selection landing in the Media Browser
+  with no click ever having happened (previously that pending-selection
+  case waited for `ThumbnailWorker.finished_all` — the FULL folder
+  finishing decode — before applying, an artifact of the old design that
+  had nothing to do with selection itself; now applied immediately after
+  model population, since selecting a row was never actually dependent
+  on any thumbnail having decoded). Every other Media Browser behavior
+  this rewrite had to preserve was re-verified end-to-end against the
+  real archive: double-clicking opens `MediaFullViewDialog` with the
+  correct real decoded content; selecting a second item while that
+  dialog is open swaps its content (`_media_sync_open_dialog`); closing
+  the dialog clears `_media_full_dialog`; `ffs-explorer.py`'s
+  `_on_center_tab_changed` "nothing changed, just re-apply the pending
+  File Browser selection" path correctly selects and scrolls to the
+  right item via the new `_media_model.row_of()`/`_select_media_item`
+  (replacing the old `_thumb_widgets`/`_media_scroll.ensureWidgetVisible`
+  pair); and the archive-reset path (opening a different case) correctly
+  empties the model and delegate cache via `_media_model.set_items([])`/
+  `_media_delegate.clear()` rather than manually tearing down a
+  `QGridLayout`.
+
+  **A real, independent bug was found and fixed along the way, made
+  materially more likely to surface BY this change, not merely
+  coincidentally discovered during it**: `ffs-explorer.py`'s
+  `_stop_all_workers` (called from `closeEvent`) has a `_retired_workers`
+  reaping loop that called `_stop(w, has_stop=hasattr(w, 'stop'))` — a
+  keyword `_stop()`'s own signature (`worker, method='quit'`) has never
+  accepted, raising `TypeError` inside a Qt event-filter/close-event call
+  chain on EVERY window close where a retired worker was present at
+  shutdown. This bug predates this session (confirmed via the function's
+  surrounding code, not introduced today), but was rare to actually hit
+  before now, since `_retire_worker` was previously called at most once
+  per folder navigation; `_refresh_visible_thumbnails` calls it on every
+  scroll/resize tick, so `_retired_workers` is populated far more
+  routinely under the new design, making this a realistic near-term
+  regression risk for ordinary use rather than a rare edge case. Fixed
+  to actually pick the intended method name (`method='stop' if
+  hasattr(w, 'stop') else 'quit'`, matching what the bugged keyword's own
+  name suggests it was meant to do) — verified directly: an in-process
+  test that populates a large model, scrolls through it (triggering
+  several real worker retirements), and then calls `window.close()`
+  crashed with exactly this `TypeError` before the fix and closed
+  cleanly after.
+
+  Verified end-to-end via the real, running application in-process (same
+  `importlib.util.spec_from_file_location` + real `QApplication`
+  methodology this project already established), against a scratch copy
+  of the real Android 14 JoshHickman case — never the user's real
+  case_dir. One additional headless-verification hazard was hit and
+  documented, not just worked around silently: the Timestamp Display
+  dialog's own proactive first-open `.exec()` (see the Conventions
+  timestamp section) blocked the test process forever the first time a
+  fresh scratch case_dir was opened, the same known modal-under-offscreen-
+  Qt hazard this project has already documented more than once elsewhere
+  — neutralized for the test only (`window._timestamp_display_dialog =
+  lambda *a, **k: None`), same "neutralize the specific dialog, don't
+  disable Qt event handling generally" approach those earlier fixes used.
+  Full pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout. `VERIFICATION_STATUS.md`'s `media_viewer.py` row is
+  unaffected (already 🔴, unverified by a human) — this rewrite doesn't
+  change that status, a human still needs to walk through the live GUI
+  before it would move to 🟡/🟢.
+
+  **Loading strategy replaced with pagination the same day, direct
+  follow-up: "the new media viewer does not really work... i want the
+  viewer to be buttery smooth."** The widget-count fix above (QListView/
+  MediaFileListModel/MediaGridDelegate) held up — this follow-up only
+  replaced HOW thumbnails got decoded/loaded, not the grid itself. The
+  original loading half (`_refresh_visible_thumbnails`, a
+  100ms-debounced, continuous viewport-scroll-triggered fetch/evict that
+  retired and restarted a `ThumbnailWorker` on every scroll tick) was the
+  part that didn't actually deliver "smooth" in practice: real scrolling
+  routinely outran the debounce and the per-tick worker-restart overhead,
+  showing blank cells and visibly lagging rather than the intended
+  bounded-memory-but-invisible tradeoff. The user proposed a concrete
+  alternative directly — page the folder into fixed chunks (500 files,
+  their own number), eagerly decode the whole current page (small enough
+  to be fast and predictable, no viewport tracking needed at that size),
+  and start caching the NEXT page in the background while the current one
+  is still being viewed, with pagination only appearing at all once a
+  folder exceeds one page. Built exactly that design, replacing the
+  viewport-tracking mechanism entirely rather than layering the two:
+  `MediaGridView`'s `viewport_changed`/`scrollContentsBy`/`resizeEvent`
+  overrides, `_media_refresh_timer`, `_schedule_visible_thumbnail_refresh`,
+  `_refresh_visible_thumbnails`, `_visible_row_range`, and
+  `_media_grid_cols` are all gone — the grid is now a plain `QListView`,
+  since Qt's own IconMode layout already handles resize/column-count
+  changes with no help needed once loading is no longer viewport-driven.
+
+  **New design**: `_media_all_paths` (the WHOLE folder's media list) vs.
+  `_media_model` (only the CURRENTLY DISPLAYED page — at most
+  `_MEDIA_PAGE_SIZE = 500` items) are now two distinct things, where
+  before pagination they were the same list. `_load_media_page(page_index)`
+  is the core: computes the page's slice, evicts `MediaGridDelegate`'s
+  pixmap cache down to roughly this page plus its immediate neighbors
+  (previous + next — bounded regardless of how many pages the examiner
+  has paged through in a session, the same "smaller amount in memory"
+  goal as the first pass, just anchored to page boundaries instead of the
+  viewport), sets the model to the page's items, and starts a
+  `ThumbnailWorker` for whatever isn't already cached. Once that worker's
+  `finished_all` fires (`_on_page_decode_finished`), `_prefetch_next_page`
+  starts a SECOND `ThumbnailWorker` for the next page's own thumbnails,
+  connected to a delegate-cache-only handler (`_on_prefetch_thumbnail_ready`
+  — no model `dataChanged`, since those items aren't the displayed page)
+  — so by the time the examiner clicks Next, the target page's
+  thumbnails are normally already sitting in the pixmap cache and the
+  transition is close to instant, exactly the "already caching them
+  while you are viewing the first page" behavior requested. A small Prev/
+  page-label/Next row (`_media_page_nav_widget`) is shown only when a
+  folder has more than one page — `_on_media_prev_page`/
+  `_on_media_next_page` just call `_load_media_page` with an adjusted
+  index; the label reads "Page N of M — loading K thumbnail(s)…" while
+  the current page's own decode is still running, then "Page N of M
+  (showing A–B of TOTAL)" once done.
+
+  `_select_media_item` and `_resync_media_hex_preview` both had to learn
+  about the model/all-paths distinction: a File-Browser-driven pending
+  selection, or a previously-selected file being restored on tab-switch-
+  back, can legitimately refer to a file on a DIFFERENT page than what's
+  currently displayed — `_select_media_item` now looks the path up in
+  `_media_all_paths` and calls `_load_media_page` to switch there first
+  if the model lookup alone comes back empty, and
+  `_resync_media_hex_preview` checks membership in `_media_all_paths`
+  rather than the current page's own model, so a selection surviving a
+  tab switch is never incorrectly treated as stale just because the
+  examiner had paged away from it. `ffs-explorer.py`'s own
+  `_on_center_tab_changed` "nothing changed, re-apply pending selection"
+  fast path got the identical fix (checks `_media_all_paths`, not the
+  current-page model), and its archive-reset block now also clears
+  `_media_all_paths`/`_media_page_index` and retires the prefetch worker,
+  not just the model/delegate. `FastZipBrowser._stop_all_workers` gained
+  `_media_page_prefetch_worker` alongside the pre-existing `_thumb_worker`
+  entry, for the same shutdown-safety reason every other background
+  worker in this project is listed there.
+
+  **Verified end-to-end against the real Android 14 JoshHickman archive's
+  own largest real single folder** (the same 1,383-file keyboard-sticker
+  cache used to verify the first pass) — a scratch copy, never the
+  original: loading the folder (1.7ms, matching the earlier "no freeze"
+  result) correctly produced 3 pages ("Page 1 of 3 (showing 1–500 of
+  1,383)"), with Prev correctly disabled and Next correctly enabled on
+  page 1. After page 1's own decode completed and its background prefetch
+  of page 2 finished, cached pixmap count matched exactly 500+500=1,000 —
+  confirming the prefetch decoded precisely the next page, nothing more,
+  nothing less. Clicking Next then took **0.3ms** — the prefetch already
+  had page 2 fully decoded, so the transition was genuinely instant, not
+  just fast. Paging to the final page (383 remaining files) correctly
+  showed "Page 3 of 3" with Next correctly disabled. Selecting a real
+  page-1 item while sitting on page 3 correctly switched back to page 0
+  and applied the selection. Across all of this, the delegate's own
+  cached-pixmap count never approached the full 1,383 — it fluctuated
+  in the 800–1,129 range depending on exactly which pages' background
+  decodes had completed at each measurement point (expected, since
+  eviction and prefetch are both genuinely asynchronous), confirming
+  memory stays bounded regardless of how many pages get visited in a
+  session. Separately confirmed: a real small folder (191 files, well
+  under the 500 threshold) correctly shows NO pagination UI at all, and
+  the empty-folder case still shows "No media files" with pagination
+  correctly hidden. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.
+
+  **0-byte files excluded from the grid, same day, direct follow-up**:
+  "in the media viewer if there are 0 byte files do not show th[e]m in
+  the viewer." `_is_media_file` (the one shared predicate both
+  `_load_media_from_file_model` and `ffs-explorer.py`'s own
+  `_on_center_tab_changed` already call — see that method's own
+  docstring on why a size check belongs there and nowhere else, to avoid
+  the two computations silently disagreeing) now also requires
+  `full_metadata[ui_path]['size'] > 0` — a 0-byte file can never decode
+  to a real thumbnail (nothing for `ThumbnailWorker` to read), so it
+  would only ever occupy a permanently blank cell. `_show_embedded_media_hits`
+  got the equivalent check inline (it doesn't route through
+  `_is_media_file` at all, building its own `media_paths` directly from
+  `_embedded_media_containers`). Verified against real data, not assumed
+  rare: this real Android 14 JoshHickman archive has **84 real 0-byte
+  files** with a media extension (`.jpg`/`.mp4`, e.g. Life360's own
+  camera-capture cache, Skype's own recorded video cache — plausibly
+  files whose write was interrupted or cleared) — confirmed
+  `_is_media_file` now returns `False` for one of them while still
+  correctly returning `True` for a real non-zero `.jpg`, and confirmed
+  end-to-end that navigating to that exact real folder in the live app
+  now shows 0 media files (previously 1, the 0-byte one) with every
+  remaining shown path confirmed `size > 0`. Full pytest suite (18/18)
+  and `scripts/check_claude_md.py` clean throughout.
+
+  **Page size made a user preference, and "Next" gated on scrolling to
+  the bottom, same day, direct follow-up**: "do you think that 500 is
+  [too] small... is 1000 better or even more? should it [be] a software
+  preference that the user can change?. can we only let the user move to
+  next page when they are at the bottom and they can go back at any time
+  but that mean[s] they are at the top." Two genuinely separate asks,
+  both built:
+
+  1. **`media_page_size` — a real, global (cross-case) preference**, same
+     `QSettings("KlasScripts", "FFS Explorer")` store `_load_prefs`/
+     `_save_prefs` already use for everything else in `PreferencesDialog`
+     (case data root, AI access, ...) — not a new JSON file, since this
+     is a per-examiner hardware/taste choice like every other setting
+     already there. `_MEDIA_PAGE_SIZE` (the class constant) is gone;
+     `MediaViewerMixin` now has `_media_page_size_pref()` — a small,
+     deliberately LOCAL `QSettings(_SETTINGS_ORG, _SETTINGS_APP)` read
+     (app/ modules never import from `ffs-explorer.py`; same standing
+     rule `keyword_search.py`'s own equivalent copy already documents —
+     `QSettings` itself reads the same OS-level store either way, so a
+     second, separately-constructed instance here sees exactly what
+     Preferences writes) — snapshotted into `self._media_page_size` once
+     per folder load (`_start_thumbnail_load`), not re-read mid-
+     navigation, so changing the preference while already browsing a
+     paginated folder can't shift page boundaries out from under an
+     in-progress prefetch; it takes effect the next time a folder (or the
+     Embedded Media button) is loaded. `PreferencesDialog` gained a
+     "Media Browser" section (a `QSpinBox`, range 50–5000, step 50,
+     default 500 — matching the value already field-tested) with a note
+     explaining the real tradeoff (fewer pages to click through vs. a
+     longer wait for the LAST thumbnail on a page, and more memory held
+     at once — earlier thumbnails on the page still appear as soon as
+     they're individually ready either way, this only affects when the
+     WHOLE page finishes). No opinion was forced on the user about
+     whether 500 is "right" — 500 remains the default (it's already
+     real, tested, and fast), but the actual right number depends on the
+     examiner's own hardware and how video-heavy their content is
+     (video-frame decode via PyAV is markedly slower per item than a
+     plain image decode), which only the preference can actually answer.
+
+  2. **"Next" gated on scrolling to the bottom of the current page;
+     "Back" always available and always lands at the top.** New
+     `_update_media_next_button_enabled` — checks the grid's own vertical
+     scrollbar (`value() >= maximum() - 2`, a couple of pixels of
+     rounding tolerance; a page whose content fits with nothing to
+     scroll, `maximum() <= 0`, counts as already "at the bottom," since
+     there's nothing left to require scrolling through) and disables
+     "Next" whenever the examiner hasn't reached it yet — even though a
+     next page genuinely exists. Wired to the scrollbar's own
+     `valueChanged` (an actual scroll) AND `rangeChanged` (a resize, or
+     the page's own content finishing layout, can change what "at the
+     bottom" means with no scrolling at all) in `_setup_media_tab`, and
+     called once directly from `_load_media_page` itself after each page
+     loads (right after `scrollToTop()`, so a fresh page correctly starts
+     with "Next" disabled rather than carrying over the previous page's
+     enabled state). "Back" (`_media_page_prev_btn`) keeps its
+     unconditional `page_index > 0` check — no scroll gate at all,
+     exactly "they can go back at any time" — and always lands at the
+     top of the target page via `_load_media_page`'s own existing
+     `scrollToTop()`, which was already unconditional and needed no
+     change to satisfy "that means they are at the top." The Next
+     button's own tooltip ("Scroll to the bottom of this page to
+     continue") states the gate directly rather than leaving a disabled
+     button unexplained.
+
+     Verified end-to-end against the real 1,383-file folder used
+     throughout this feature's own testing: the preference round-tripped
+     correctly (default 500, changed to 1000 via the real `QSettings`
+     key, read back correctly, and a real `PreferencesDialog` instance's
+     own spinbox correctly saved/reloaded a value via the real
+     `_load_prefs`/`_save_prefs` functions — all against an isolated
+     test-only settings store, never the examiner's real one). The
+     scroll gate: "Next" starts disabled immediately after a fresh page
+     loads; scrolling the real scrollbar to its maximum enables it;
+     scrolling back to the top disables it again (confirming the gate is
+     genuinely LIVE, re-evaluated on every scroll, not a one-time check
+     at page-load); advancing to page 2 while at the bottom of page 1
+     correctly leaves "Back" enabled immediately with no scroll needed;
+     and clicking "Back" from a deliberately mid-scrolled position on
+     page 2 correctly landed back on page 1 with the scrollbar at
+     exactly 0 (the top), not wherever page 2 happened to be scrolled to.
+     Full pytest suite (18/18) and `scripts/check_claude_md.py` clean
+     throughout.
+
+- **Bookmarking extended to the Media Browser, plus a Ctrl+B keyboard
+  shortcut for a multi-file selection in either browser** (2026-09-24).
+  Direct request: "can you make that a user can bookmark media file[s]
+  in the media browser via right click and can we make it that there
+  are keyboard shortcuts that can be used to bookmark a selection of
+  files[;] this should work in file browser and media browser." Reused
+  the File Browser's own pre-existing bookmark system in full (`db_utils
+  .save_bookmark_group`/`save_bookmark_entries`/`load_bookmark_groups`,
+  the "existing groups + New Group…" menu shape) rather than building a
+  second one — the only genuinely new plumbing needed was a Media
+  Browser equivalent of `_get_paths_for_bookmark` and a keyboard-
+  shortcut entry point that didn't exist for either browser before.
+
+  **`_bookmark_submenu` gained `as_submenu` (default `True`)** — when
+  `False`, the "existing groups + New Group…" items populate the given
+  menu DIRECTLY instead of nesting under a "Bookmarks ▶" label, for a
+  standalone popup that's already entirely about bookmarking (a nested
+  label there would just be a redundant extra click). New
+  `_show_bookmark_menu_for_paths(paths)` — resolves a lazy callable
+  itself and shows a friendly status-bar message for an empty selection
+  rather than silently popping an empty menu, then pops a standalone
+  menu (via `_bookmark_submenu(..., as_submenu=False)`) at the current
+  cursor position (`QCursor.pos()`). New `_on_bookmark_shortcut` reads
+  `center_tabs.currentIndex()` to decide which selection to use —
+  `_get_paths_for_bookmark()` (File Browser, pre-existing) or the new
+  `_get_media_paths_for_bookmark()` (Media Browser) — and quietly does
+  nothing on Keyword Search/Artifact Viewer, which were never part of
+  this request. **Ctrl+B** (`QShortcut`, default `WindowShortcut`
+  context — fires regardless of which child widget has focus, since
+  `_on_bookmark_shortcut` itself already decides the right selection
+  from the active tab rather than needing per-widget shortcut scoping)
+  is wired once, at `FastZipBrowser.__init__`, right after `center_tabs`
+  exists.
+
+  **Media Browser right-click**: `_show_media_context_menu` (wired via
+  `setContextMenuPolicy(CustomContextMenu)`) — right-clicking an item
+  NOT already part of the current selection replaces the selection with
+  just that one first (ordinary file-manager convention, so the popped
+  menu always visibly matches what it's about to act on); right-
+  clicking WITHIN an existing multi-selection leaves it untouched, so a
+  multi-file bookmark works via right-click too, not only Ctrl+B. New
+  `_get_media_paths_for_bookmark()` reads `self._media_view.
+  selectionModel().selectedIndexes()` — scoped to whatever's selected on
+  the CURRENTLY DISPLAYED PAGE only, since pagination (2026-09-24, see
+  the entries above) replaces the grid's own model entirely on every
+  page change, so a selection could never span pages in the first place.
+
+  **Multi-select had to be added to the Media Browser grid at all** —
+  it was `SingleSelection` before this (never needed more, since nothing
+  previously acted on more than one thumbnail at once). Changed to
+  `ExtendedSelection` (Ctrl/Shift-click, same convention the File
+  Browser's own table already uses).
+
+  **A real bug was found and fixed while verifying this, not assumed
+  safe from the Qt API's own name**: `_select_media_item` (the existing
+  single-click handler) unconditionally calls `setCurrentIndex()` —
+  confirmed DIRECTLY, by driving the real selection model rather than
+  trusting recalled Qt behavior, that in this PySide6/Qt6 build
+  `QAbstractItemView.setCurrentIndex()` collapses an existing multi-
+  selection back down to just the one index passed in, even when called
+  from a slot connected to `clicked` — meaning a real Ctrl/Shift-click
+  would have silently undone its own multi-select the instant this
+  project's existing click handler ran, making the whole point of
+  `ExtendedSelection` moot without this fix. `_on_media_item_clicked`
+  now checks `QApplication.keyboardModifiers()` (the `clicked` signal
+  itself carries no modifier information) — an unmodified click still
+  calls `_select_media_item` exactly as before (select just this one,
+  scroll it into view, sync the shared side panels); a Ctrl/Shift-click
+  instead calls a new, narrower `_sync_media_side_panels(ui_path)` —
+  split out of `_select_media_item` — which updates the status bar/File
+  Browser sync/hex preview/open-dialog-follow side effects for the
+  just-clicked item WITHOUT touching `setCurrentIndex` at all, leaving
+  Qt's own already-correct selection-model state alone.
+
+  Verified end-to-end against the real 1,383-file Android 14
+  JoshHickman archive folder used throughout this feature's own testing,
+  not assumed from the Qt documentation: simulating a real Ctrl-click
+  (extending a 1-item selection to 2 items, then firing the exact
+  `clicked` handler Qt would for that same click with
+  `QApplication.keyboardModifiers()` patched to report `Ctrl` held)
+  confirmed the multi-selection is preserved — this is the exact bug
+  above, caught and fixed BEFORE shipping by testing the real mechanism
+  rather than trusting recollection of how `setCurrentIndex` behaves; a
+  subsequent plain click still correctly collapsed back to a single
+  selection (no regression). `_get_media_paths_for_bookmark()` correctly
+  reflected the real 2-file selection; a right-click-style selection
+  replacement on an unselected item correctly reduced the selection to
+  just that one. The full real save path was exercised end-to-end
+  against the case's own real `caseresults.db` (a scratch copy, never
+  the user's real case): a real 3-file Media Browser multi-selection
+  saved via the actual `save_bookmark_group`/`save_bookmark_entries`
+  functions produced a real group with the correct count and the correct
+  three real ui_paths as entries, and calling the REAL
+  `_add_to_bookmark_group` a second time against the same group and
+  files confirmed no duplicate entries. The Ctrl+B shortcut's own
+  routing was verified directly too (patching this project's OWN
+  `_show_bookmark_menu_for_paths` method, not Qt's `QMenu.exec` itself —
+  see the note below on why): File Browser tab correctly routed through
+  `_get_paths_for_bookmark` with a real selected file; Media Browser tab
+  correctly routed through `_get_media_paths_for_bookmark` with a real
+  selected media file; Keyword Search tab correctly made no call at all.
+
+  **A real headless-testing hazard was hit and diagnosed, not just
+  worked around blindly**: an early version of this verification tried
+  to neutralize the actual popup by monkeypatching `QMenu.exec` at the
+  class level — confirmed DIRECTLY, via an isolated check, that this
+  silently does NOT take effect for PySide6's own Qt binding (the patched
+  function is simply never called), so the real `QMenu.exec()` call
+  still ran and blocked the test process forever under the offscreen
+  platform with nothing to click — the same category of hazard this
+  project has already documented for `QMessageBox`/`QDialog.exec()`
+  elsewhere, now confirmed to apply to `QMenu.exec()` too, and confirmed
+  that a *class-level* monkeypatch is specifically NOT a viable
+  workaround for it (unlike a plain Python method, which patches
+  normally). Fixed by patching this project's OWN
+  `_show_bookmark_menu_for_paths` method instead — which is what
+  actually needed testing (the routing logic), not Qt's real modal menu
+  machinery, which correctly SHOULD block in the real, running app.
+  Full pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
 - **Real beach-ball on case load, found and fixed by direct profiling —
   not the folder tree** (2026-09-15). Direct report: "is there no way to
   stop the spinning ball when loading a ffs... it seems to relate to
@@ -6745,3 +7241,955 @@ underneath that verification.
   the same scratch case_dir across two consecutive runs without
   resetting it — re-confirmed clean on a genuinely fresh copy before
   trusting the result. Full pytest suite (18/18) clean throughout.
+
+  **The standalone "Embedded Media" button's own status bar/tooltip text
+  fixed the same way, 2026-09-23, direct follow-up** ("can we have the
+  path with the new filename in the status bar"): `_show_embedded_media_hits`
+  used to pass each hit's raw content-hash `extracted_path` straight
+  through as the thumbnail grid's own `ui_path`
+  (`.../embedded_media/95/9535bf70....jpg`), so the click handler's
+  existing `self.status_bar.showMessage(ui_path)` (`_select_media_item`
+  since the 2026-09-24 virtualized-grid rewrite, `_on_thumb_clicked`
+  before it) — unchanged code, shared by every Media Browser click —
+  showed a meaningless hash
+  filename instead of the real `container/display_name` path an
+  identical click reached via the File Browser hierarchy already showed.
+  Fixed by having this method reuse the EXACT SAME synthetic vpaths
+  `_inject_embedded_media` already computes (re-injecting first, cheap,
+  so the button is correct even in the same session a scan just
+  finished) rather than the raw extracted paths — unifying both access
+  routes onto one shared naming scheme, not a second, targeted "fix the
+  status bar specifically" patch. Verified against real data: clicking a
+  real WhatsApp hit via the button now shows
+  `data/data/com.whatsapp/databases/msgstore.db/msgstore.db-thumbnail-202.jpg`
+  in the status bar, not a hash.
+
+- **Media Browser only recognized a file as media by its EXTENSION, never
+  by its own header-scan-derived type — a real, disclosed gap found by
+  direct user observation, fixed 2026-09-23.** ("the media viewer only
+  uses file ext to determine if the file is a media file that can be
+  displayed. even though we have scanned the headers and labeled them as
+  media files.") Confirmed by reading the code before fixing, not
+  assumed: `_load_media_from_file_model`'s only test was
+  `os.path.splitext(ui_path)[1].lower() in MEDIA_EXTENSIONS` — it never
+  consulted `_header_type_overrides`, the exact same magic-byte-derived
+  dict the File Browser's own Type column (`_classify_entry`) already
+  reads for the identical purpose. A real photo/video correctly
+  identified as `'Picture'`/`'Video'` everywhere ELSE in the app (Type
+  column, right-click menus) still never appeared in the Media Browser
+  at all if its extension was missing or wrong.
+
+  New shared `MediaViewerMixin._is_media_file(ui_path)` — extension
+  first (the cheap, common case), falling back to
+  `self._header_type_overrides.get(ui_path) in ('Picture', 'Video')` —
+  same "one shared predicate, never two copies that could drift"
+  principle `_header_candidate_matches` already established. Used by
+  THREE call sites that each used to have their own bare
+  `MEDIA_EXTENSIONS` check: `_load_media_from_file_model` itself, and
+  two in `ffs-explorer.py`'s `_on_center_tab_changed` (the pending-
+  selection check, and the `new_context` tuple computation that decides
+  whether switching back into the Media Browser tab needs a reload) —
+  the latter two HAD to move to the same shared predicate, not just the
+  first one fixed in isolation, since a mismatch between what
+  `_load_media_from_file_model` now shows and what `new_context` computes
+  would make the tab-switch "did anything change" comparison wrong in
+  either direction. `ffs-explorer.py`'s now-unused `MEDIA_EXTENSIONS`
+  import was removed rather than left dangling.
+
+  Confirmed the downstream decode needed no change before treating this
+  as a complete fix, not just a partial one: `ThumbnailWorker` already
+  calls `header_scan.sniff_media_kind(ext, data)` with the real bytes
+  once a path passes the entry gate, and that function's own magic-byte
+  fallback already handles an extensionless/mistyped file correctly —
+  the bug was ONLY ever the entry gate deciding whether to try at all.
+
+  Verified two ways: an isolated unit test of `_is_media_file` against
+  synthetic overrides (Picture/Video/Database/unscanned-extensionless,
+  each behaving correctly); then end-to-end against a REAL, confirmed
+  case of exactly this pattern in this project's own test archive —
+  Google Messages' own MMS cache convention (`conversation_<id>_message_
+  <id>_part_<id>_.bin`, confirmed already documented in
+  `sniff_media_kind`'s own docstring as a real, previously-known case).
+  Found a real file matching this pattern whose actual magic bytes are a
+  genuine JPEG (`\xff\xd8\xff\xe0`), injected the header-scan override a
+  real Tier 2/3 scan would have produced, and confirmed end-to-end
+  through the real running app: the file is now included in
+  `_load_media_from_file_model`'s own output, gets a real thumbnail
+  widget, and Qt successfully decodes a real, non-blank thumbnail image
+  for it — not just that the entry gate let it through. Full pytest
+  suite (18/18) and `scripts/check_claude_md.py` clean throughout.
+
+- **A real signal-to-noise problem in the embedded-media sweep's own
+  results, raised directly and deliberately DEFERRED** ("lets keep this
+  in our back pocket") — see TODO.md item 29 for the full writeup: a
+  real scan finds far more app icons/UI graphics/streaming-service
+  artwork than genuinely evidentiary user content, and the examiner
+  needs a way to focus. Two candidate signals (real pixel-dimension/
+  shape extraction; a small explicit noise-source denylist for Favicons/
+  launcher-icon databases) were discussed and agreed as the right
+  starting point, as a sortable/filterable relevance column — never a
+  silent exclusion — but deliberately not built yet, pending the user's
+  own priority call.
+
+- **Embedded-media scan progress now shows the current file's real size,
+  2026-09-23, direct request** ("when you are looking for embedded media
+  file it can take a while can you include the size so the user knows
+  why it is taking a while to process"). `EmbeddedMediaScanWorker.progress`
+  gained a `file_size` field (read from `self._ui_metadata` — the
+  archive's own already-cached metadata, zero extra I/O — BEFORE that
+  file's actual read/scan starts, so the size is visible while the slow
+  part is still running, not only after). `_on_embedded_media_progress`
+  now renders it inline, e.g. `"Embedded-media sweep: 0 / 1,531 — Cookies
+  (24.0 KB)"`, so a large database taking visibly longer reads as
+  "expected, it's just big" rather than "did this hang?". New module-
+  level `keyword_search.format_byte_size` (promoted from
+  `_show_search_scope_files_dialog`'s own private closure — a second
+  real caller emerged, nothing in the logic was ever search-specific).
+  Verified against real data: connected a real `EmbeddedMediaScanWorker`
+  to a real, already-loaded case and captured its first 10 real progress
+  events — every emitted `file_size` matched `full_metadata`'s own real
+  size for that exact file exactly, zero mismatches.
+
+  **Two direct questions answered by reading the actual code, not
+  asserted from memory** ("tell me you are not zipfile... are you
+  checking every row or [just] the first few to work out if it's bin or
+  text?"): confirmed `EmbeddedMediaScanWorker` and `embedded_media_scan.py`
+  contain zero references to `zipfile` anywhere — the worker reads the
+  main archive exclusively via `_build_cached_zip_view` (the `.zcd`-backed
+  `CachedZipView`) and `z.open(physical).read()`, the same sanctioned
+  pattern every other worker in this project already uses; and
+  `scan_sqlite_live`/`scan_sqlite_deleted` check EVERY row and EVERY
+  column of every table via a real Python `isinstance(value, (bytes,
+  bytearray))` runtime type check per value — there is no sampling
+  shortcut anywhere (no "check the first N rows to guess a column's
+  type" step), matching SQLite's own genuinely per-VALUE (not per-
+  column) dynamic typing rather than approximating it.
+
+- **Manual, single-file "Search for Embedded Media" — a right-click
+  context-menu action, added 2026-09-23, direct request.** ("can we make
+  it that for the 3 file types that we are looking for embedded that we
+  can manually look for embedded files right click any file search for
+  embedded media. if will check the header even if typed just in case
+  wrong ext then if supported will look for media... a dialog box will
+  come up to tell the user what is happening.") The "3 file types"
+  interpreted as SQLite database / binary plist / XML plist — the three
+  real magic-byte signatures this feature recognizes — confirmed
+  reasonable rather than assumed silently: flagged the interpretation to
+  the user while building, no correction came back.
+
+  **A real, closed gap versus the bulk scan's own candidate enumeration,
+  found while designing this**: `classify_scan_candidate`'s bulk
+  enumeration deliberately avoids reading file content at all (checking
+  thousands of candidates cheaply), so it only ever recognizes a binary
+  plist via a header-scan override (`bplist00` magic) or the `.plist`
+  extension — genuinely missing a real XML-format plist with no `.plist`
+  extension, a gap that function's own docstring already disclosed but
+  left unfixed. New `embedded_media_scan.classify_container_type(raw)`
+  closes it for THIS feature specifically (reading real bytes for one
+  file, which the bulk scan's own cost model can't afford to do for
+  every candidate): checks the real `SQLite format 3\x00` /
+  `bplist` / (`<?xml` + a real `<plist` element, not just any XML file)
+  signatures directly, ignoring any pre-existing extension or Type label
+  entirely — the whole point of a manual per-file check being "just in
+  case wrong ext."
+
+  **Refactored the bulk scan's own per-candidate logic into a new shared
+  `embedded_media_scan.scan_container(kind, ui_path, raw, scan_dir,
+  scan_scope, wal_bytes=None)` first**, rather than let the new single-
+  file path duplicate it: this function now holds what used to be
+  `EmbeddedMediaScanWorker`'s own inline plist/sqlite-live/sqlite-deleted
+  dispatch plus its `_build_row` method (removed, replaced by a module-
+  level `_build_hit_row`) — `EmbeddedMediaScanWorker.run()` and the new
+  `SingleFileEmbeddedMediaWorker` both call this one function now.
+  Verified the refactor was behavior-preserving BEFORE building anything
+  new on top of it: re-ran `scan_container` directly against the real
+  WhatsApp `msgstore.db` bytes and got the exact same 22 live hits (same
+  count, same `msgstore.db-thumbnail-<rowid>.jpg` names) this project's
+  own earlier bulk-scan testing already established.
+
+  **`SingleFileEmbeddedMediaWorker`** (own independent `CachedZipView`
+  reader, same convention as `EmbeddedMediaScanWorker` and every other
+  worker in this file) reads the ONE file's real bytes, classifies via
+  `classify_container_type`, and either emits `unsupported` (with the
+  real detected type via the shared `header_scan.classify_magic` — never
+  a bare "not supported," since naming what the file actually IS is more
+  useful than just declining) or scans it via `scan_container` and saves
+  any hits into the SAME `embedded_media_hits` table the bulk scan uses
+  (`scan_scope='manual_single_file'`, distinguishing it from a bulk
+  run's own `app_user_accessible`/`everywhere` scopes for anyone later
+  auditing where a hit came from).
+
+  **`SingleFileEmbeddedMediaDialog`** — a small, dedicated dialog
+  (deliberately NOT `ProcessDialog`, whose scope/checkbox controls make
+  no sense for "just this one file"): shows "Checking..." immediately,
+  then either the honest unsupported message above or a scanning/result
+  message reusing the same `format_byte_size` helper the bulk scan's own
+  progress display already uses. Its own `closeEvent`/`reject` guard
+  (same pattern `ProcessDialog` already established) stops the window's
+  `[x]` button from closing out from under a still-running worker — the
+  in-dialog Close button is separately disabled until a result arrives,
+  but that alone doesn't stop the OS-level close button. The context-
+  menu action itself is shown for any real file NOT already an embedded-
+  media container (re-scanning a synthetic child of one makes no sense)
+  — deliberately unconditional on the file's CURRENT Type label, since
+  gating it on a label that might be wrong would defeat the feature's
+  entire purpose. On a real hit, reuses the exact same
+  `_on_embedded_media_scan_injected` the bulk ProcessDialog scan already
+  calls on its own completion — container becomes a real File Browser
+  folder, "Embedded Media" button count refreshed — one shared
+  completion path for both triggers, not two.
+
+  **Verified end-to-end against real data**: right-clicking the real
+  `msgstore.db` correctly found the same 22 real hits, correctly
+  registered it as a browsable container; a second manual re-scan of the
+  same file mid-run confirmed the close-guard actually blocks the window
+  close while the worker is genuinely still running (checked directly,
+  not assumed); right-clicking a real `.jpg` photo correctly rejected it
+  with `"identified as: Picture"` — the real magic-byte classification,
+  not a generic refusal. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.
+
+- **`processing_registry` — a generic "already processed" tracker,
+  wired up for the embedded-media sweep, 2026-09-23.** Direct request
+  ("is there a register that a file has been processed? so that it is
+  not redone?"), refined across a short follow-up discussion into its
+  final scope: "for the tracker should we have a tracker for all
+  processing i.e. leveldb, sqlite as part of search and the image
+  cache? what do you think" → "ok lets have it if it is cheaper and
+  clearer." The table itself is deliberately generic — one row per
+  `(ui_path, capability)` — but this pass only actually WIRES it up for
+  `capability='embedded_media_scan'`; the already-working
+  `leveldb_search_index` tracker (see its own extensive Conventions
+  entry above) was deliberately left untouched rather than migrated
+  onto this new table, per explicit reasoning: migration risk to
+  shipped, working code outweighs the architectural-tidiness benefit of
+  having only one tracker design. The new table is built generically
+  enough to absorb that migration later if a third real need for it
+  emerges, rather than being embedded-media-specific by name.
+
+  **`db_utils.py`**: `_CACHE_SCHEMA_VERSION` bumped 17→18 (auto-deletes/
+  rebuilds `casecache.db` for every existing case on next open, same as
+  every prior schema bump). New `processing_registry` table —
+  `(ui_path, capability, logic_version, processed_at, result_count)`,
+  `PRIMARY KEY (ui_path, capability)`, indexed on `capability`.
+  `result_count` (including a real `0`) is what lets a genuinely clean
+  file be told apart from a never-checked one — the identical ambiguity
+  `leveldb_search_index` already had to fix once for its own
+  zero-record folders (see that entry's own "Real bugs found during
+  verification" paragraph) is designed out of this table from the
+  start rather than discovered as a bug later. Three new helpers,
+  placed right after `clear_leveldb_search_index`:
+  `save_processing_registry_entries(conn, capability, entries)` (bulk
+  `INSERT OR REPLACE`, `entries` a list of `(ui_path, logic_version,
+  result_count)` tuples), `processed_ui_paths(conn, capability,
+  current_version) -> set` (every ui_path already covered under THIS
+  version — a version bump makes every prior entry invisible to this
+  query automatically, no manual invalidation), and
+  `processing_registry_entry(conn, capability, ui_path) -> dict | None`
+  (one file's own prior result, for a check-first UI).
+
+  **`embedded_media_scan.scan_logic_version()`** — a blake2b hash of
+  this module's own source (digest_size=8, `'unknown'` fallback on
+  `OSError`), the exact same auto-derived staleness-key technique
+  `leveldb_decode_logic_version()`/`app_intelligence.scan_logic_version()`
+  already established for the identical problem: the NEXT
+  `classify_media_blob`/`scan_sqlite_deleted` improvement automatically
+  makes every previously-scanned file eligible for reprocessing again,
+  with no version number to remember to bump by hand.
+
+  **Bulk sweep (`EmbeddedMediaScanWorker`)**: `discovery_done` gained a
+  third field, `n_already_scanned` — candidates already covered under
+  the current logic version are filtered out of the scan loop entirely
+  (never re-read, never re-scanned), and the discovery/finished status
+  text both say how many were skipped. Every candidate that DOES get
+  scanned this run — hit or not, a genuine 0-hit result included — is
+  recorded via one batched `save_processing_registry_entries()` call at
+  the end; a candidate whose bytes couldn't even be READ (a transient
+  archive-read failure, not "genuinely nothing here") is deliberately
+  NOT recorded, so it's retried next run rather than permanently
+  skipped.
+
+  **Manual single-file scan (`SingleFileEmbeddedMediaWorker`/
+  `SingleFileEmbeddedMediaDialog`)**: after confirming a file's real
+  magic bytes ARE a supported container (the classification step is
+  never skipped — an unsupported file still gets the honest "identified
+  as: X" message regardless of registry state), the worker checks
+  `processing_registry_entry` for a matching entry at the CURRENT logic
+  version; if found, emits a new `already_processed` signal instead of
+  silently either redoing the work or refusing it. The dialog's new
+  `show_already_processed(entry)` states when it was last checked and
+  what was found, and reveals a "Scan Anyway" button
+  (`scan_anyway_requested` signal) — `ffs-explorer.py`'s
+  `_search_embedded_media_for_file` wires that button, once, at dialog
+  creation, to restart the identical search on the SAME dialog with a
+  new `force_rescan=True` constructor parameter that bypasses the
+  registry check outright. A `force_rescan` run still records its own
+  fresh registry entry afterward, same as an ordinary first-time scan.
+
+  Verified end-to-end against a real scratch copy of the Android 14
+  JoshHickman case (never the original — copied fresh, `embedded_media`
+  cache excluded so candidates were genuinely unscanned going in), not
+  simulated: a first bulk run (app/user-accessible scope) scanned all
+  811 real candidate databases, found 538 real live pictures, and
+  recorded 811 registry entries; a second, identical bulk run correctly
+  reported `already_scanned=811` and scanned/found nothing further — the
+  registry entries from the first run were genuinely honored, not
+  ignored. For the manual path: a file the bulk run had ALREADY covered
+  (Google Maps' own `map_cache.db`) correctly short-circuited on the
+  very first manual attempt with the real prior entry's info
+  (`result_count: 0`, a real timestamp), and stayed short-circuited on a
+  second attempt; `force_rescan=True` correctly bypassed it and produced
+  a real fresh scan result. Separately, a real file only reachable under
+  the "everywhere" scope (`vendor/firmware/carrierconfig/cfg.db`, never
+  touched by the app-scope bulk run above) correctly scanned fresh on
+  its first manual attempt, then correctly short-circuited on a second
+  attempt with the entry the first attempt had just written — confirming
+  the manual path's own registry writes are honored by a LATER manual
+  check, not just by the bulk worker's own writes. Full pytest suite
+  (18/18) and `scripts/check_claude_md.py` clean throughout.
+
+- **`embedded_media_skip_list.py` — a hand-maintained "known-noise"
+  database list, added 2026-09-24.** Direct request: "we are reviewing
+  some big db and it can take a while to check them but there are some
+  db that either have no media file and are unlikely to ever have any
+  and there will be some that do have images/video but they are always
+  going to be icon or some such thing that will never be of use... i
+  would like a [list] of sqlite db that are not worth looking at. can
+  you make it that the user can [switch] this feature and be able to
+  view the list. probably via a button." A genuinely different answer
+  from the deferred icon/UI-noise filtering idea a few entries above
+  (TODO.md item 29, still deliberately not built — pixel-dimension/shape
+  heuristics on individual FOUND images) — this one skips the WHOLE
+  FILE before ever reading it, which is what actually saves the time the
+  report described, and it's examiner-curated rather than a heuristic
+  guess, matching this project's standing "escalate/curate, never
+  silently guess" rule (see `app_intelligence.py`'s own removed
+  `known_real_store`/kept `_DB_NOISE_*` lists for the closest existing
+  precedent — a hardcoded, developer-maintained version of the same
+  idea; this one is runtime-editable by the examiner instead, since it's
+  case-specific real-world knowledge an examiner accumulates, not
+  something this project's own authors could pre-populate).
+
+  **Storage**: `app/embedded_media_skip_list.py` — a single hand-editable
+  JSON file, GLOBAL (cross-case, same dev/frozen-path convention as
+  `research_store.py`/`photo_flags.json`/`parser_versions.json`), cached
+  by mtime+size. Deliberately NEVER auto-populated from content or
+  scan results — an entry only ever exists because an examiner looked at
+  a specific real database and decided it's not worth scanning again.
+  Each entry is a plain string matched two ways: no `/` → exact
+  case-insensitive BASENAME match anywhere in the archive (the common
+  case — the same cache filename is usually the same across every
+  install of an app, in every case); contains `/` → case-insensitive
+  SUBSTRING match against the full ui_path, for disambiguating a generic
+  filename (`cache.db`) that's only confirmed noise under one specific
+  app. `find_matching_entries` (as opposed to the boolean `matches`)
+  returns every entry that applies to a given file, since a bare-
+  basename entry and a longer disambiguating fragment could both match
+  the same real file — used by the context-menu "Remove" action so it
+  removes everything that applies, not a single guessed entry.
+
+  **Wired into the bulk sweep only, not the manual single-file
+  check** — a deliberate scope decision: the manual "Search for Embedded
+  Media" right-click action is already a single, deliberate per-file
+  examiner action ("just in case wrong ext" — see that feature's own
+  entry above), so silently skipping it because the file happens to be
+  on the list would defeat the whole point of asking for that one file
+  specifically; the skip list only ever prunes the AUTOMATIC bulk
+  enumeration, which is the one the report described taking a while.
+  `EmbeddedMediaScanWorker` gained an optional `skip_entries` constructor
+  parameter (`None` = feature off for this run, never re-read from disk
+  inside the worker — `ProcessDialog` loads it once, only when its own
+  checkbox is checked) and excludes a match BEFORE the
+  `processing_registry` "already scanned" check, so the two counts
+  (`n_skip_listed`/`n_already_scanned`) never double-count the same
+  file; both are reported separately in the discovery and final status
+  text (`"found N database(s)... (M on the known-noise skip list, K
+  already scanned, skipped)"`).
+
+  **GUI**: `ProcessDialog` gained a checkbox ("Skip databases/property
+  lists on the known-noise list", checked by default — the whole point
+  is to save time on a database already confirmed not worth scanning)
+  plus a "View/Edit List…" button, both shown/hidden together with the
+  existing scope radios via `_on_embedded_media_toggled` (the same
+  "don't show a choice that doesn't apply yet" convention that method
+  already followed for the scope controls). The button opens
+  `EmbeddedMediaSkipListDialog` — a plain `QListWidget` of the current
+  entries plus Add…/Remove Selected/Close, no new dialog-construction
+  pattern needed beyond what `dialog_helpers.note_label` already
+  provides for the explanatory text. Per direct instruction that this
+  should be genuinely *usable*, not just viewable, a second, more
+  natural entry point was added beyond the request's own literal
+  wording: a file's right-click menu gained a toggling "🗑️ Add to" /
+  "🗑️ Remove from Embedded-Media Skip List" action (gated on the SAME
+  cheap, no-I/O `embedded_media_scan.classify_scan_candidate` check the
+  bulk sweep's own enumeration already uses, so the action never appears
+  for a file the sweep would never have looked at anyway) — this is the
+  actual workflow the request described ("we are reviewing some big
+  db... i would like a list of sqlite db that are not worth looking
+  at"): an examiner reviewing a database right there decides it's not
+  worth ever scanning again, rather than having to open Process Case and
+  retype the filename from memory. Adds by BASENAME (not the full
+  ui_path) — the broadly useful common case; a narrower path-fragment
+  entry is still available via the dialog's own "Add…" button for the
+  rarer disambiguation case.
+
+  **Verified end-to-end against the real Android 14 JoshHickman archive
+  (a scratch copy, skip-list store pointed at a scratch path throughout
+  — the real, global `config/embedded_media_skip_list.json` was never
+  touched by any of this testing)**, not simulated: the store's own
+  add/remove/matches/find_matching_entries round-tripped correctly,
+  including case-insensitivity and the bare-basename-vs-path-fragment
+  distinction. A genuinely instructive real find while testing the
+  worker-level filtering: adding ONE entry, the basename `map_cache.db`,
+  correctly excluded **10 real files** from the scan — Google Maps' own
+  SDK cache, independently bundled inside WhatsApp, Telegram, Signal,
+  Wickr, Skype, Viber, GroupMe, Google Messages, and Garmin Connect on
+  this one real device — exactly the "an icon/UI-chrome cache that will
+  never be of use, and it recurs across many apps" scenario the original
+  request described, confirming the bare-basename matching design
+  earns its keep on real data rather than being a theoretical
+  convenience. `discovery_done`'s own signal correctly reported both
+  raw counts (811 databases found, unaffected by filtering) and the
+  filtered-out counts (10 skip-listed) side by side. The GUI wiring was
+  verified directly too: the checkbox defaults to checked, the scope/
+  skip-list controls correctly stay hidden until the embedded-media
+  checkbox itself is checked, the View/Edit dialog correctly reflects
+  entries added via either its own "Add…" button or a simulated
+  right-click toggle, and toggling the context-menu action twice on the
+  same real file correctly flips it onto and back off the list. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean throughout
+  — the latter caught a real, genuine gap on the first pass (the new
+  module wasn't yet listed in the `## app/ modules` table), fixed before
+  this entry was written, not after.
+
+  **Cross-app collision risk fixed the same day, direct follow-up**: "do
+  you not think there is a risk in doing filename only[?] my original
+  idea was to [do] partial for apps and full for other[s]... there
+  should not be a risk of a user accidentally doing a db that for one
+  app is irrelevant but for another has useful stuff." Correct — the
+  right-click action's own default (adding a bare basename) was exactly
+  this risk: a real database confirmed noise under one app would
+  silently also exclude a same-named file under a completely different,
+  unrelated app. New `FastZipBrowser._app_scoped_skip_entry(ui_path)`
+  resolves the OWNING APP's bundle id / package name whenever the file
+  lives inside a real app container and adds a SCOPED entry (e.g.
+  `com.whatsapp/cache/diskcache/map_cache.db`) instead of a bare
+  filename — reusing `FfsAdapter.container_parents`/`container_bundle_id`,
+  the SAME app-identity resolution `app_intelligence.py`/the App Report
+  parsers already rely on, so this doesn't re-derive that logic a second,
+  possibly-drifting way. A real, additional gap found and fixed while
+  building this, not assumed correct from the shared function alone:
+  `container_parents()` only recognizes Android's `data/data/<package>/`
+  (internal storage) convention — but this feature's own motivating real
+  example, `map_cache.db`, actually lives under
+  `data/media/<user>/Android/data/<package>/` (EXTERNAL storage), a
+  second, equally common real Android per-app directory that function
+  doesn't cover at all. Rather than extend the shared, more broadly-used
+  `container_parents()` (real ripple-effect risk to `app_intelligence.py`'s
+  own scoring for a change scoped to this one feature), added a small,
+  local `FastZipBrowser._ANDROID_EXTERNAL_APP_RE` regex checked first —
+  confirmed directly this was necessary, not just defensive: without it,
+  `_app_scoped_skip_entry` fell back to a bare basename for every one of
+  the 10 real `map_cache.db` instances found earlier, silently defeating
+  the whole point of the fix for its own motivating example.
+
+  A second, further direct correction the same day: "i do not want
+  basename for non-app i want full path since for [paths] outside of the
+  app the file path [is] consistent." The non-app fallback was changed
+  from a bare basename to the FULL `ui_path` — a general OS/system path
+  is stable across cases on its own (same device/OS build layout), so
+  there's no real tradeoff being made using the full path there, unlike
+  the app-scoped case above, which genuinely needs to drop the
+  case-specific GUID/full-path prefix down to just the app-relative
+  portion to generalize across cases at all.
+
+  Verified against the real Android 14 JoshHickman archive: WhatsApp's
+  own real `map_cache.db` now scopes to
+  `com.whatsapp/cache/diskcache/map_cache.db`, Google Maps' own copy of
+  the identical filename scopes to a DIFFERENT entry
+  (`com.google.android.apps.maps/cache/diskcache/map_cache.db`), and
+  adding WhatsApp's own entry confirmed does NOT also match Maps' copy —
+  the exact cross-app leak the report was concerned about, closed. A
+  real non-app-container file (`vendor/firmware/carrierconfig/cfg.db`)
+  correctly falls back to its own full path, not a bare `cfg.db`.
+
+  **"Add…" validation against the currently open archive, same day**:
+  direct follow-up, "when adding a new path can you validate it against
+  the current ffs and warn the user if it is not there" — a free-form
+  typed entry could previously be saved with a typo, or meant for a
+  different case's own layout, and would then silently never match
+  anything, giving false confidence a database was being excluded when
+  it never actually was. New `embedded_media_skip_list.entry_matches_any_path
+  (entry, ui_paths)` — the reverse of `matches()`/`find_matching_entries()`
+  (one candidate entry checked against MANY real paths, rather than one
+  real path checked against many stored entries), sharing the exact same
+  bare-basename-vs-`/`-fragment matching rule so the two can never
+  silently drift apart. `EmbeddedMediaSkipListDialog` now takes an
+  optional `ui_metadata` (the currently open archive's own, passed
+  through from `ProcessDialog._ui_metadata` — `None` when no archive
+  context is available, which simply skips the check rather than
+  blocking); `_on_add` checks it before saving and, on no match, asks
+  "doesn't match any file in the currently open archive... add it
+  anyway?" (Yes/No, defaulting to No) rather than either silently
+  refusing or silently accepting — a global list can legitimately hold
+  an entry for a DIFFERENT case's own layout, so this is a warning with
+  an override, never a hard block. The right-click "Add to Skip List"
+  action needed no equivalent check — it's always derived from a real
+  file the examiner just right-clicked, so it can never fail this
+  validation by construction. Verified directly: a real entry
+  (`map_cache.db`) added with no warning shown at all; a fabricated one
+  (`totally_made_up.db`) triggered the warning, was correctly rejected
+  when declined, and correctly saved when the examiner confirmed anyway.
+
+  Full pytest suite (18/18) and `scripts/check_claude_md.py` re-confirmed
+  clean after both follow-ups, and the real, global
+  `config/embedded_media_skip_list.json` was never touched by any of
+  this testing — every verification pointed the store at a scratch path
+  instead.
+
+  **A further direct question the same day, checked against real data
+  rather than assumed either way: "is this true for other location[s]...
+  on both android and ios?"** — i.e., beyond the one Android per-user
+  directory (`data/media/<n>/Android/data/`) already handled, are there
+  OTHER real path locations on either platform whose per-case-variable
+  segment `_app_scoped_skip_entry` doesn't yet generalize? Investigated
+  directly across three independent real Android archives (14
+  JoshHickman, 15 CTF25 Cellebrite, 14 CTF26 Magnet) and one real iOS
+  archive (17 JoshHickman), not guessed at:
+
+  - **Android**: nine real OS-level multi-user directories beyond
+    `data/media/`
+    (`data/system/users`, `data/system_ce`, `data/system_de`,
+    `data/misc_ce`, `data/misc_de`, `data/user`, `data/user_de`,
+    `data/misc/vold/user_keys/ce`, `data/misc/vold/user_keys/de`) — every
+    one showed user id `0` on all three real devices. No real evidence
+    of a different value has actually been observed in this project's
+    own test data, but Android's genuine multi-user mechanism (a work
+    profile or secondary user) can assign a different one, so this is a
+    real, just-not-yet-observed risk — closed anyway, at negligible cost,
+    rather than left open because it hasn't bitten anyone yet. New
+    `FastZipBrowser._ANDROID_MULTIUSER_RE` recognizes all nine and
+    generalizes the numeric id to `*` in the generated entry.
+  - **iOS**: a genuinely different, real, CONFIRMED gap (not just
+    theoretical) — an app has a SECOND, separate GUID-named container
+    beyond the Data container `container_parents()`/`container_bundle_id`
+    already resolve: `Containers/Bundle/Application/<GUID>/<AppName>.app/...`
+    (see the "iOS app registry (LaunchServices)" Conventions entry above
+    — this Bundle GUID is already documented there as different
+    per-install from the Data container's own GUID, and there's no
+    equivalent bundle-id map for it built at metadata-parse time to
+    resolve it the same clean way `container_bundle_id` does for Data/
+    PluginKitPlugin/Shared-AppGroup). Rather than build a second full
+    identity-resolution path just for this, `FastZipBrowser._GUID_ANYWHERE_RE`
+    finds and wildcards ANY leftover 36-char hyphenated-hex GUID segment
+    the earlier, more specific tiers didn't already resolve — the real
+    app-identifying part of the path (`<AppName>.app`, e.g. `Signal.app`,
+    `Telegram.app` — a stable, literal folder name, not GUID-based) stays
+    intact either way, so this still generalizes usefully across cases
+    without needing a formal bundle-id lookup for this specific
+    container type.
+
+  **`embedded_media_skip_list.py` gained a third matching mode, `*`
+  wildcard entries**, to make the above possible at all — each `*` in a
+  stored entry matches any run of characters (case-insensitive), sharing
+  one central `_entry_matches()` helper with the existing bare-basename
+  and plain-substring rules so all three can never silently drift apart.
+  An examiner can also type a `*` by hand via the "Add…" dialog for a
+  path they already know has a variable segment.
+
+  Verified against real data, not just the regex patterns in isolation:
+  a real Android `data/system/users/0/app_idle_stats.xml` generalizes to
+  `data/system/users/*/app_idle_stats.xml`, which correctly still
+  matches a hypothetical different real user id (`.../10/...`) and
+  correctly does NOT match an unrelated file under the same directory. A
+  real iOS Bundle-container file
+  (`containers/Bundle/Application/00369DA2-.../…mobile_container_manager.metadata.plist`)
+  generalizes to
+  `containers/Bundle/Application/*/…mobile_container_manager.metadata.plist`,
+  which correctly matches the identical file under a hypothetical
+  different case's own GUID. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` re-confirmed clean.
+
+  **Split into two separate lists, one per platform, same day** — direct
+  follow-up: "i want to split for the user as when they view the skip
+  list it will confuse them if there [are] ios [entries] when looking at
+  android." Confirmed with the user first that this was purely a REVIEW-
+  clarity request, not a correctness concern (an Android package name
+  and an iOS bundle id can never collide even sharing one file, and a
+  case is always one platform or the other) — the split was built
+  anyway, since confusing an examiner during review is itself a real
+  cost worth avoiding regardless of whether it could cause a mismatch.
+  Every function in `embedded_media_skip_list.py` now takes a required
+  `platform` ('android'/'ios') argument and reads/writes
+  `embedded_media_skip_list_android.json`/`embedded_media_skip_list_ios.json`
+  independently (own mtime+size cache per platform, keyed in one shared
+  `_cache` dict rather than two separate module-level variables — a
+  clean way to keep the existing single-file caching pattern without
+  duplicating it by hand). `ProcessDialog` gained an `is_android`
+  constructor parameter (`FastZipBrowser._open_process_dialog` passes
+  `self._is_android_archive()`, the same canonical check
+  `_skip_list_platform()` — new, small, reused by both the context-menu
+  builder and the toggle action — wraps for direct FastZipBrowser
+  callers) and derives `self._skip_list_platform` once at construction;
+  every embedded-media-skip-list call site in `ffs-explorer.py`
+  (`ProcessDialog._start_embedded_media_scan`/
+  `_show_embedded_media_skip_list_dialog`, the context-menu builder, and
+  `FastZipBrowser._toggle_embedded_media_skip_list`) now passes the
+  correct platform through rather than a single unscoped store.
+  `EmbeddedMediaSkipListDialog`'s own window title states which platform
+  it's showing (`"Embedded-Media Skip List (Android)"`) and its
+  explanatory note says so too, so there's never any ambiguity about
+  which list is on screen.
+
+  Verified end-to-end against a real Android archive AND a real iOS
+  archive in the same run, not assumed symmetric from one side alone: a
+  module-level round-trip confirmed an entry added under `'android'`
+  never appears when loading `'ios'` and vice versa; `FastZipBrowser.
+  _skip_list_platform()` correctly returned `'android'` for the real
+  Android 14 JoshHickman archive and `'ios'` for the real IOS17
+  JoshHickman archive; `ProcessDialog._skip_list_platform` correctly
+  inherited the same value via its own `is_android` parameter; the
+  View/Edit dialog's window title correctly read "(Android)"; and a real
+  right-click toggle on a real Android file correctly wrote only to the
+  Android store, leaving the iOS store untouched (still empty). Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean throughout
+  — the real, global config directory was never touched by any of this
+  testing, every check pointed both stores at scratch paths instead.
+
+- **Media Browser "seen" tracking: "Not Interested ▶" bulk-dismiss +
+  "↺ Undo" + a "hide seen files" preference, 2026-09-24.** Direct
+  request: "next to the next button there should be a button called
+  'not of interest'... this button move[s] to the next page[] and marks
+  all the image[s] on that page bar the bookmark[ed] ones as seen...
+  each file will need to be track[ed] if seen or not[;] in the setting
+  there should be an option to show or hide seen files[;] there needs to
+  also be a button tha[t] allows the user to undo a hide of the last
+  file they hide so error[s] can be undone." Several genuinely ambiguous
+  points in the request were resolved by reasoned default rather than
+  blocking on a question, each stated here plainly so a wrong assumption
+  can be corrected directly: (1) marking is ONLY ever the explicit "Not
+  Interested" click — nothing is marked seen automatically just by being
+  viewed/scrolled past; (2) "undo... the last file they hide" is read as
+  the last BATCH (a whole page), since marking only ever happens a page
+  at a time, never per-file; (3) "hide seen files" defaults to OFF —
+  never silently hide evidence by default, matching this project's own
+  standing escalate-don't-discard rule; (4) the two buttons live in the
+  existing page-nav row (`_media_page_nav_widget`), so — like Prev/Next —
+  they only ever appear once a folder is genuinely paginated, matching
+  the literal "next to the next button" framing.
+
+  **Storage** (`app/db_utils.py`): a new `media_seen` table in
+  `caseresults.db` (see that database's own section above) —
+  `(ui_path TEXT PRIMARY KEY, seen_at TEXT)` — an examiner's own review-
+  progress decision, the same precious/never-auto-deleted category as
+  bookmarks, not a rebuildable cache. Additive (`CREATE TABLE IF NOT
+  EXISTS`) — no `_RESULTS_SCHEMA_VERSION` bump needed, same as every
+  other table added here since version 1. `mark_media_seen`/
+  `unmark_media_seen`/`load_seen_media_paths` follow this project's
+  established save/load helper-pair convention; `mark_media_seen` uses
+  `INSERT OR IGNORE` so a file already marked seen keeps its ORIGINAL
+  `seen_at` rather than being bumped by a later re-mark. A fourth new
+  helper, `load_all_bookmarked_paths` (every `ui_path` bookmarked in ANY
+  group, `SELECT DISTINCT`), exists specifically so the bulk-marking
+  action can exclude a bookmarked file — a bookmark is itself a
+  statement that the file IS of interest, so it must never be silently
+  marked seen (and therefore never silently hidden by the hide-seen
+  filter) as a side effect of dismissing the rest of a page.
+
+  **Preference** (`ffs-explorer.py`'s `_load_prefs`/`_save_prefs`/
+  `PreferencesDialog`, `app/media_viewer.py`'s `_media_hide_seen_pref`):
+  `media_hide_seen`, same `QSettings("KlasScripts", "FFS Explorer")`
+  store and same LOCAL-copy-of-the-org/app-constants convention
+  `_media_page_size_pref` already established (`app/` modules never
+  import from `ffs-explorer.py`). A "Hide files already marked as seen"
+  checkbox in `PreferencesDialog`'s existing "Media Browser" section,
+  off by default, with a note explaining exactly how a file becomes
+  "seen" (the button, never automatic) and that the change takes effect
+  on the next folder load — snapshotted once per folder load
+  (`_start_thumbnail_load`, into `self._media_hide_seen`), not re-read
+  mid-navigation, same reasoning `_media_page_size_pref`'s own snapshot
+  already documents.
+
+  **Live filtering** (`MediaViewerMixin`): `_media_all_paths` (the
+  ACTIVE, currently-paginated list) and a new `_media_all_paths_unfiltered`
+  (the folder's TRUE full list, every media file, filter or no filter)
+  are now two distinct things — `_start_thumbnail_load` sets the latter
+  from the incoming file-model rows and derives the former via a new
+  `_recompute_media_all_paths()` (drops any path in `_media_seen_paths`
+  when `_media_hide_seen` is on, otherwise a plain copy). The filter is
+  LIVE within a browsing session, not just applied once at folder load —
+  `_recompute_media_all_paths()` is called again after any seen-state
+  change (a "Not Interested" click or an Undo), so toggling the
+  preference or marking/unmarking files immediately changes what's
+  visible without needing to leave and re-enter the folder. `_media_seen_paths`/
+  `_media_bookmarked_paths` are (re)loaded fresh from `caseresults.db`
+  on every folder load (two small `SELECT`s, cheap) rather than cached
+  across folders, so a change made elsewhere in the same session is
+  always picked up. The status text gains a "(N hidden as seen)" note
+  whenever the filter is actually hiding something
+  (`len(_media_all_paths_unfiltered) - len(_media_all_paths)`).
+
+  A deliberately simple page-index handling decision, made during
+  design rather than discovered as a bug: when hide-seen is ON, marking
+  a batch and then reloading the SAME `page_index` naturally reveals
+  whatever now slides into that now-shorter list's slot — no special
+  "advance to the next unseen content" logic needed. When hide-seen is
+  OFF, the marked files simply stay visible (now badged) and the view
+  advances to `page_index + 1` as a plain, literal "move to the next
+  page."
+
+  **Visual "seen" badge** (`MediaGridDelegate`): a new `_seen_paths: set`
+  instance attribute (`set_seen_paths()`, kept in sync by
+  `_start_thumbnail_load` and both mark/undo handlers) drives a small
+  translucent green circle + white checkmark painted in the top-right
+  corner of a seen file's thumbnail, in `paint()` right after the
+  pixmap itself is drawn. Only ever visible at all when "hide seen
+  files" is OFF — when it's ON, a seen file is simply absent from the
+  model entirely, so there's nothing left to badge.
+
+  **`_on_media_not_interested`/`_on_media_undo_seen`**: the "Not
+  Interested" handler computes the current page's own slice of
+  `_media_all_paths` (same start/end math `_load_media_page` already
+  uses), excludes any bookmarked path, and — if nothing is left to mark
+  (every file on the page happens to be bookmarked) — shows a status
+  message and does nothing further, rather than a confusing no-op click.
+  Otherwise it writes via `mark_media_seen`, updates the in-memory
+  `_media_seen_paths`/delegate, records the marked batch into
+  `_media_last_seen_batch` for Undo, shows a status message (naming how
+  many bookmarked files were left as-is, if any), and then either
+  recomputes+reloads the same page (hide-seen on) or advances to the
+  next page (hide-seen off). `_on_media_undo_seen` reverts exactly that
+  batch via `unmark_media_seen`, clears it, and disables itself again —
+  a second click with nothing to undo is a no-op, and marking a NEW
+  batch always overwrites whatever the previous one was (single-level
+  undo only, matching the literal "undo... the last file they hide").
+
+  **A real bug found and fixed during verification, not assumed correct
+  from the design alone**: the first implementation had `_on_media_undo_seen`
+  reload "the current page" — but with hide-seen OFF, "Not Interested"
+  had already advanced the current page to `N + 1` by the time Undo was
+  clicked, so Undo silently reverted the right DATA (the seen-marks) while
+  leaving the view sitting on page `N + 1`, never actually showing the
+  just-restored files on page `N`. Caught by direct testing (marking
+  page 0, confirming the view had moved to page 1, then calling Undo and
+  checking which page was actually displayed), not by re-reading the
+  code. Fixed with a new `_media_last_seen_batch_page` — the page index
+  is recorded at the moment of marking, BEFORE any navigation happens,
+  and Undo reloads that recorded page rather than "whatever's current."
+  Re-verified after the fix: marking page 0 → advances to page 1 →
+  Undo → correctly returns to page 0 with the batch's seen-marks
+  reverted.
+
+  **A real testing-methodology hazard found and fixed the same session,
+  not a product bug, but serious enough to record here so the next
+  verification script doesn't repeat it**: an early version of this
+  feature's own verification script tried to isolate `QSettings` from
+  the real preference store via `QSettings.setDefaultFormat(IniFormat)`
+  + `QSettings.setPath(IniFormat, UserScope, <scratch dir>)`, called
+  before constructing any `QSettings` object. Confirmed, the hard way,
+  that this does NOT reliably redirect `QSettings(org, app)` away from
+  the real macOS NativeFormat CFPreferences domain — the script actually
+  wrote `media_hide_seen=1` into the examiner's own real
+  `com.klasscripts.FFS Explorer` preference domain (confirmed via
+  `defaults read`), exactly the kind of real-config contamination this
+  project's own standing testing discipline exists to prevent. Caught
+  immediately by checking the real domain directly after the run rather
+  than trusting the isolation call to have worked, and fixed by
+  `defaults delete com.klasscripts.FFS\ Explorer media_hide_seen`
+  right away (safe — the key's mere absence is the correct default
+  behavior, `s.value('media_hide_seen', False, type=bool)`). The
+  verification script itself was rewritten to isolate by NAME instead —
+  monkeypatching `media_viewer`'s own local `_SETTINGS_ORG`/
+  `_SETTINGS_APP` module attributes (reachable via `sys.modules
+  ['media_viewer']`, since `ffs-explorer.py` imports it as `from
+  media_viewer import MediaViewerMixin`, never binding a module-level
+  name of its own) to a throwaway `KlasScriptsTEST-mediaseen`/`FFS
+  Explorer TEST-mediaseen` pair before constructing the window — the
+  same test-domain convention this machine already had precedent for
+  (`com.klasscriptstest2.FFS Explorer TEST2`, from an earlier session's
+  own page-size preference testing). Re-verified afterward that the real
+  domain was untouched throughout the corrected run. **Standing lesson
+  for any future test needing to touch `QSettings("KlasScripts", "FFS
+  Explorer")`: redirect by patching the org/app NAME to a throwaway
+  value, never try to redirect the NativeFormat backend's own storage
+  path — the latter does not reliably work on macOS.**
+
+  **Verified end-to-end against the real Android 14 JoshHickman
+  archive's own 1,383-file sticker folder** (a scratch case_dir, never
+  the user's real one; QSettings isolated per the lesson above) via the
+  established in-process `FastZipBrowser` methodology: bookmarking one
+  page-1 file and confirming it's excluded from a "Not Interested"
+  click (499 of the page's 500 files marked seen, the bookmark
+  correctly left alone); the Undo button's enabled state tracking
+  correctly (disabled → enabled after marking → disabled again after
+  undo, with a real page-index round-trip back to page 0); re-marking
+  the same page, then flipping the "hide seen files" preference and
+  reloading the folder — the unfiltered total stayed the true 1,383
+  throughout while the active/displayed total correctly dropped by
+  exactly the 499 non-bookmarked marked-seen files (884, matching the
+  computed expectation exactly), with the status text correctly stating
+  "(499 hidden as seen)"; and the delegate's own `_seen_paths` set size
+  tracking `_media_seen_paths` exactly at every step. Full pytest suite
+  (18/18) and `scripts/check_claude_md.py` clean throughout.
+
+- **Bookmark group colors + outline in the Media Browser grid; selecting
+  a bookmark group loads its media; a "Last Selection" button showing
+  only unseen files — 2026-09-25.** Direct request: "can we make it
+  clear which images are bookmark[ed]... colour for each bookmark[ed
+  group] that is set when the [group] is created[;] also when the
+  bookmark is selected and you are in media browser if any of the
+  bookmark file[s] they should show here[;] there should be a button
+  similar to the show selected button in the media browser that allows
+  the user to go back to the previous selection... it should show all
+  the files in the last selection that have not been viewed." Three
+  related but distinct pieces, each scoped by a reasoned interpretation
+  stated here plainly: (1) a color is auto-ASSIGNED per group at creation
+  (a rotating fixed palette), not chosen via a picker in the "New
+  Group…" flow — with a "Change Color…" override added afterward for
+  examiner control, since forcing a color decision into group creation
+  would add friction to a flow this project already keeps deliberately
+  quick (just a name); (2) "when the bookmark is selected" is the
+  EXISTING left-panel bookmark-group list (`_on_bookmark_item_clicked` →
+  `_show_bookmark_group`), not a new UI element; (3) "the show selected
+  button" (File Browser's pre-existing "Show Selected Files", for the
+  checked-folders aggregate view) is referenced only for the general
+  shape of the idea — a button that recalls an ad hoc multi-item
+  selection — not literally wired to it; "the previous selection" is
+  defined as the last time the Media Browser was populated from a
+  genuine multi-item SELECTION (a bookmark group, or that same checked-
+  folders aggregate view) rather than one plain folder, since an
+  ordinary single-folder browse isn't really "a selection" the way
+  either of those is.
+
+  **Storage** (`app/db_utils.py`): a `color` column added to the
+  existing `bookmark_groups` table (`ALTER TABLE ... ADD COLUMN`, same
+  migration-guard pattern as `embedded_media_hits.display_name` above —
+  a real case_dir can already have this table from before this column
+  existed). `BOOKMARK_COLOR_PALETTE` — eight fixed, visually distinct
+  hex colors (no two adjacent hues) — `save_bookmark_group` auto-assigns
+  `palette[COUNT(*) % 8]` when no color is given explicitly, so the Nth
+  group created gets the Nth color, wrapping past 8 rather than erroring
+  or repeating early. `load_bookmark_groups` now returns each group's
+  `color` (falling back to the palette's first entry for a group saved
+  before this column existed — the ALTER TABLE guard leaves existing
+  rows' `color` NULL). New `update_bookmark_group_color` (the "Change
+  Color…" action's own write) and `load_bookmark_colors` — maps every
+  bookmarked `ui_path` to its own badge color, resolving a file that
+  belongs to MORE THAN ONE group to the EARLIEST (lowest `group_id`)
+  group's color; this project deliberately doesn't attempt to blend or
+  stack colors for a multi-group file, and says so directly rather than
+  silently picking one with no stated rule — confirmed via direct testing
+  (a file added to a second, later-created group still resolves to its
+  FIRST group's color, not the second's).
+
+  **Grid rendering** (`app/media_viewer.py`): `MediaGridDelegate` gained
+  `_bookmark_colors: dict[ui_path, hex]` / `set_bookmark_colors()`,
+  populated in `_start_thumbnail_load` (a third small `SELECT` alongside
+  the existing seen/bookmarked-paths queries — all three loaded fresh
+  per folder, same reasoning as the seen-tracking feature above) and
+  drawn in `paint()` as a 3px colored rectangle OUTLINE around the
+  thumbnail area — deliberately a border, not a corner badge, so it
+  never collides with or is confused for the (different, corner-badge)
+  "seen" checkmark from the entry above; both can be visible on the same
+  cell at once (a bookmarked file that's ALSO been marked seen — a real,
+  legitimate combination, e.g. "I looked at this and it's exactly the
+  evidence I bookmarked it for"). Drawn whether or not a thumbnail has
+  actually decoded yet, so a still-loading bookmarked file is visibly
+  distinguishable immediately, not just once its pixmap appears. The
+  bookmark PANEL's own list (`_apply_bookmark_groups`, `ffs-explorer.py`)
+  gained a matching small solid-color swatch icon per group
+  (`_bookmark_color_swatch`) — the SAME color the Media Browser outlines
+  with, one color shown in two places, never two independently-tracked
+  ones that could silently drift apart.
+
+  A new `_refresh_media_bookmark_badges()` (`MediaViewerMixin`) re-reads
+  bookmark state and updates the delegate + forces a repaint WITHOUT a
+  full folder reload (which would also needlessly re-run the seen-state
+  query and reset scroll position) — called from every bookmark-
+  mutating action in `ffs-explorer.py` (`_add_to_bookmark_group`,
+  `_new_bookmark_group_dialog`'s own create step, `_delete_bookmark_group`,
+  the new `_change_bookmark_group_color`) so a color change or a newly
+  bookmarked file shows up in an already-open Media Browser immediately,
+  not only after navigating away and back.
+
+  **Selecting a bookmark group loads it into the Media Browser**
+  (`_show_bookmark_group`, `ffs-explorer.py`): gained the same "refresh
+  media tab if it's currently visible" check `on_folder_selected` already
+  uses for an ordinary folder click (`if self.center_tabs.currentIndex()
+  == 1: self._load_media_from_file_model()`) — `_show_bookmark_group`
+  already populates `self.file_model` with the group's entries before
+  this check runs, so `_load_media_from_file_model` (which reads from
+  `self.file_model._rows`, unchanged) picks up exactly the group's own
+  media files with no further plumbing needed.
+
+  **"◀ Last Selection" button** (`MediaViewerMixin`): a new button next
+  to "Embedded Media" in the status row, hidden until a selection has
+  been snapshotted. `_load_media_from_file_model` detects whether the
+  CURRENT file-browser view counts as "a selection" via
+  `self._view_is_recursive` (set `True` ONLY by
+  `_rebuild_file_view_from_checked`, i.e. "Show Selected Files" — checked
+  directly by grepping every `_view_is_recursive = ` assignment in the
+  file rather than assumed, since a false positive here would mean an
+  unrelated recursive-view feature silently overwriting the snapshot) OR
+  `self._view_path` starting with `_BM_GROUP_PREFIX` (a bookmark group,
+  set by `_show_bookmark_group`) — a small LOCAL copy of that literal
+  string constant lives in `media_viewer.py` (same "app/ never imports
+  from ffs-explorer.py" convention as `_SETTINGS_ORG`/`_SETTINGS_APP`
+  above). An ordinary single-folder navigation never qualifies, so
+  browsing around afterward doesn't keep silently overwriting the
+  snapshot with "whatever folder I last happened to look at" — only a
+  genuine multi-item selection counts, and once snapshotted it survives
+  browsing elsewhere (confirmed directly: navigating to a plain folder
+  after viewing a bookmark group leaves `_media_last_selection_paths`
+  intact — the button stays available).
+
+  Clicking it (`_on_media_last_selection_clicked`) loads fresh seen-state
+  from `caseresults.db` and filters the snapshotted path list down to
+  files NOT YET marked seen — UNCONDITIONALLY for this button, regardless
+  of the global "hide seen files" preference (`_media_hide_seen`), since
+  the whole point here is "show me what I haven't looked at yet from that
+  batch," a request specific to this action rather than a display
+  setting. Sets a new `_media_showing_selection` flag (parallel to the
+  pre-existing `_media_showing_embedded`) so `_on_center_tab_changed`'s
+  own tab-switch reload logic in `ffs-explorer.py` leaves the restored
+  view alone rather than silently reverting it — the exact same
+  protection the Embedded Media button already has, now checked as
+  `if self._media_showing_embedded or self._media_showing_selection:`
+  in one place rather than duplicated. Both flags, and the whole "Last
+  Selection" snapshot, are cleared on opening a new archive (the
+  existing archive-reset block in `ffs-explorer.py`) — a snapshot from
+  one case's own bookmark groups obviously has no meaning in a different
+  one.
+
+  **Verified end-to-end against the real Android 14 JoshHickman
+  archive's own 1,383-file sticker folder** (a scratch case_dir, QSettings
+  isolated by the org/app-name-patching technique the entry above
+  documents, never the examiner's real preference domain): two new
+  bookmark groups correctly received distinct, rotating palette colors
+  (accounting for the two default "Evidence"/"Interesting" groups this
+  project already auto-creates for a brand-new case, confirmed as the
+  reason the raw palette-index expectation in an early draft of this
+  test didn't match — not a bug, an artifact of the pre-existing
+  default-group behavior); three real files bookmarked across the two
+  groups resolved to their own group's exact color, a non-bookmarked
+  file correctly had no color entry at all, and the delegate picked up
+  every color correctly on reload; changing a group's color via
+  `update_bookmark_group_color` + `_refresh_media_bookmark_badges` was
+  reflected in the delegate immediately, with no folder reload; a
+  dedicated follow-up check confirmed the "earliest group wins" rule
+  directly (adding an already-bookmarked file to a SECOND, later-created
+  group left its resolved color unchanged, still the first group's).
+  Selecting a bookmark group while the Media Browser tab was active
+  correctly populated the grid with exactly that group's own files, with
+  `_view_path` correctly bookmark-group-prefixed. The "Last Selection"
+  button correctly became visible after viewing a bookmark group, with
+  the snapshot matching its files exactly; browsing to an ordinary folder
+  afterward correctly left the snapshot intact and `_media_showing_selection`
+  correctly `False` while on that ordinary folder; marking one of the two
+  snapshotted files as seen and then clicking the button correctly showed
+  only the remaining unseen file — with the global hide-seen preference
+  confirmed still OFF throughout, proving this button's own unseen-filter
+  is unconditional rather than riding on that preference; and the
+  restored view correctly survived a tab switch away to File Browser and
+  back, never silently reverting. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.

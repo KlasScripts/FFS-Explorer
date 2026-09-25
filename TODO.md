@@ -2015,6 +2015,44 @@ headers — even though nothing here is a vendored copy the way those files are.
     prompted verifying all four real combinations rather than stopping
     at two.*
 
+29. **[DEFERRED, 2026-09-23, direct request: "lets keep this in our back
+    pocket"] Focus the embedded-media sweep's results on likely USER
+    content (device photos, downloaded/received media) instead of the
+    huge volume of app icons, UI graphics, and streaming-service artwork
+    (BBC iPlayer, Netflix, ...) that dominates a real scan.** Real
+    problem, confirmed on real data: a real run against this project's
+    own Android 14 JoshHickman case found 1,552 embedded images, and the
+    large majority are non-evidentiary noise (app icon caches, browser
+    favicons) rather than anything an examiner actually needs to review.
+
+    Design discussed, not yet built — two generalizable signals agreed
+    as the strongest starting point, deliberately NOT a silent filter
+    (matching this project's own standing "escalate, don't discard"
+    principle already established for the SQLite carving confidence
+    gate/`embedded_archives`/`known_real_store`'s removal): a
+    sortable/filterable relevance column (e.g. "Likely icon/UI" vs
+    "Likely user content"), never an outright exclusion from the results.
+    1. **Real pixel dimensions + shape** — extract width/height from the
+       image header itself (cheap, no full decode — JPEG/PNG/HEIC all
+       carry this near the start) and flag small, square images (the
+       48-192px range covers the real icon/favicon/thumbnail size
+       family) as likely-UI. Generalizes across every app/database
+       without needing per-app knowledge.
+    2. **A small, explicit "known noise source" list** for the
+       unambiguous worst offenders — Chrome/Brave/Edge's own `Favicons`
+       database, launcher icon-cache tables (`app_icons.db`,
+       `launcher_*.db`) — same targeted-denylist approach
+       `app_intelligence.py` already uses for evidence-database ranking,
+       not a broad guess.
+
+    Real, disclosed tradeoff either way: a genuinely evidentiary small
+    image (e.g. a WhatsApp chat thumbnail — confirmed real content in
+    this project's own `msgstore.db` findings) could get flagged as
+    icon-like by signal 1, and someone deliberately resizing a real photo
+    to icon dimensions would evade it — an adversarial case, not the
+    primary target, but worth remembering before treating either signal
+    as a hard filter rather than a triage aid.
+
 ## Considered and NOT recommended (kept here so they aren't silently lost)
 
 - **A full Cellebrite-style single-unified-table rewrite of the four

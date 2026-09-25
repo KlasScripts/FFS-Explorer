@@ -16,7 +16,6 @@ import pathlib
 import subprocess
 import configparser
 import shutil
-import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -45,15 +44,21 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       load_nested_archives, load_nested_archive_entries,
                       load_bookmark_groups, save_bookmark_group,
                       save_bookmark_entries, load_bookmark_entries,
-                      delete_bookmark_group,
+                      delete_bookmark_group, load_all_bookmarked_paths,
+                      update_bookmark_group_color, load_bookmark_colors,
+                      BOOKMARK_COLOR_PALETTE,
+                      mark_media_seen, unmark_media_seen, load_seen_media_paths,
                       indexed_leveldb_folders,
                       save_embedded_media_hits, load_embedded_media_hits,
-                      clear_embedded_media_hits)
+                      clear_embedded_media_hits,
+                      save_processing_registry_entries, processed_ui_paths,
+                      processing_registry_entry)
 import header_scan
 import nested_archive
+import embedded_media_skip_list
 from hex_viewer import HexViewerMixin
-from media_viewer import MediaViewerMixin, MEDIA_EXTENSIONS
-from keyword_search import KeywordSearchMixin
+from media_viewer import MediaViewerMixin
+from keyword_search import KeywordSearchMixin, format_byte_size
 from artifact_viewer import ArtifactViewerMixin
 from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
@@ -86,9 +91,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QMessageBox, QCheckBox, QAbstractItemView,
                               QTreeWidget, QTreeWidgetItem, QTextEdit,
                               QListWidget, QListWidgetItem, QDateEdit,
-                              QRadioButton, QButtonGroup)
+                              QRadioButton, QButtonGroup, QInputDialog, QSpinBox,
+                              QColorDialog)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
-                           QColor, QIcon)
+                           QColor, QIcon, QShortcut, QKeySequence, QCursor, QPixmap)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QDate,
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
                              qInstallMessageHandler, QtMsgType)
@@ -161,6 +167,25 @@ def _load_prefs() -> dict:
         'ai_backend':      s.value('ai_backend', 'local', type=str),
         'ai_dev_persist_credentials':
             s.value('ai_dev_persist_credentials', False, type=bool),
+        # Media Browser pagination page size — added 2026-09-24, direct
+        # question: "is 500 [too] small... should it be a software
+        # preference the user can change?" A global (cross-case)
+        # preference, same as everything else here, since it's a
+        # per-examiner hardware/taste choice, not a per-case one.
+        # Snapshotted once per folder load by MediaViewerMixin — read
+        # directly via its own QSettings("KlasScripts", "FFS Explorer")
+        # instance (app/ modules never import from ffs-explorer.py), not
+        # through this function.
+        'media_page_size': s.value('media_page_size', 500, type=int),
+        # Whether the Media Browser hides a file already marked "seen"
+        # (the "Not Interested" button's own bulk-marking target) —
+        # added 2026-09-24, direct request: "in the setting there should
+        # be an option to show or hide seen files." Off by default —
+        # showing everything unless the examiner deliberately opts into
+        # hiding, matching this project's own standing "escalate, never
+        # silently discard" rule for anything that could hide real
+        # content from review.
+        'media_hide_seen': s.value('media_hide_seen', False, type=bool),
     }
 
 
@@ -174,6 +199,8 @@ def _save_prefs(prefs: dict):
     s.setValue('ai_backend', prefs.get('ai_backend', 'local'))
     s.setValue('ai_dev_persist_credentials',
               bool(prefs.get('ai_dev_persist_credentials', False)))
+    s.setValue('media_page_size', int(prefs.get('media_page_size', 500)))
+    s.setValue('media_hide_seen', bool(prefs.get('media_hide_seen', False)))
 
 
 # Formatted archive sizes, keyed by path.  Stat-ing every archive on each
@@ -2485,6 +2512,47 @@ class PreferencesDialog(QDialog):
         layout.addWidget(self._preview_label)
         self._update_preview()
 
+        # ── Media Browser ────────────────────────────────────────────────────
+        sep_media = QFrame()
+        sep_media.setFrameShape(QFrame.Shape.HLine)
+        sep_media.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep_media)
+        layout.addWidget(QLabel("<b>Media Browser</b>"))
+        page_size_row = QHBoxLayout()
+        page_size_row.addWidget(QLabel("Thumbnails per page:"))
+        self._media_page_size_spin = QSpinBox()
+        self._media_page_size_spin.setRange(50, 5000)
+        self._media_page_size_spin.setSingleStep(50)
+        self._media_page_size_spin.setValue(
+            int(prefs.get('media_page_size', 500)))
+        page_size_row.addWidget(self._media_page_size_spin)
+        page_size_row.addStretch()
+        layout.addLayout(page_size_row)
+        layout.addWidget(note_label(
+            "A folder with more media files than this is split into "
+            "pages — the current page decodes eagerly, and the next "
+            "page's own thumbnails are already being prepared in the "
+            "background while you look at this one. A larger number "
+            "means fewer pages to click through, at the cost of a "
+            "longer wait for the LAST thumbnail on each page to "
+            "finish (earlier ones still appear as soon as they're "
+            "ready) and more memory held at once. Takes effect the "
+            "next time a folder (or the Embedded Media button) is "
+            "loaded — not for a page already open."))
+
+        self._media_hide_seen_check = QCheckBox(
+            "Hide files already marked as seen")
+        self._media_hide_seen_check.setChecked(
+            bool(prefs.get('media_hide_seen', False)))
+        layout.addWidget(self._media_hide_seen_check)
+        layout.addWidget(note_label(
+            "A file becomes \"seen\" via the Media Browser's own \"Not "
+            "Interested ▶\" button (marks a whole page at once, except "
+            "any bookmarked file — a bookmark is itself a statement "
+            "that the file IS of interest). Off by default: showing "
+            "everything unless you choose to hide it. Takes effect the "
+            "next time a folder is loaded."))
+
         # ── AI Access ─────────────────────────────────────────────────────────
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -2554,6 +2622,8 @@ class PreferencesDialog(QDialog):
             'ai_enabled':      self._ai_check.isChecked(),
             'ai_backend':      self._ai_backend_combo.currentData(),
             'ai_dev_persist_credentials': self._ai_dev_check.isChecked(),
+            'media_page_size': self._media_page_size_spin.value(),
+            'media_hide_seen': self._media_hide_seen_check.isChecked(),
         })
         self.accept()
 
@@ -2931,13 +3001,44 @@ class EmbeddedMediaScanWorker(QThread):
     project's code, follows a BLOB's overflow-page chain that way); the
     DELETED-content scan works directly off the in-memory bytes, per
     embedded_media_scan.py's own design.
+
+    **`processing_registry` skip/record — added 2026-09-23**, per direct
+    request ("is there a register that a file has been processed? so
+    that it is not redone?"). Every candidate already scanned under the
+    CURRENT embedded_media_scan.py logic version (db_utils.py's generic
+    processing_registry table, capability='embedded_media_scan' — see
+    that table's own CREATE TABLE comment for why this wasn't retrofitted
+    onto leveldb_search_index instead) is skipped outright rather than
+    re-read/re-scanned; a version bump (the module's own source changed)
+    makes every entry stale automatically, no manual invalidation needed
+    — the exact same staleness technique leveldb_decode_logic_version()
+    already established. Every candidate that DOES get scanned this run
+    — hit or not, including a genuine 0-hit result — is recorded via one
+    batched save_processing_registry_entries() call at the end, so a
+    clean file is never silently indistinguishable from "never checked"
+    (the same ambiguity leveldb_search_index already once had to be
+    fixed for — see that entry's own "zero-record folders" bug above).
+
+    **Known-noise skip list — added 2026-09-24**, per direct request
+    ("we are reviewing some big db and it can take a while to check
+    them but there are some db that either have no media file and are
+    unlikely to ever have any... [or] will never be of use... i would
+    like a list of sqlite db that are not worth looking at"). See
+    app/embedded_media_skip_list.py for the store itself; *skip_entries*
+    here is that list ALREADY LOADED by the caller (ProcessDialog, only
+    when its own "Skip databases/property lists on the known-noise list"
+    checkbox is checked) — `None` means the feature is off for this run,
+    never re-read from disk here. A skip-listed candidate is excluded
+    BEFORE the processing_registry check above, so its own count and
+    this one never double-count the same file.
     """
-    discovery_done = Signal(int, int)          # (n_databases, n_plists)
-    progress       = Signal(int, int, str, dict)  # (index, total, ui_path, counts)
+    discovery_done = Signal(int, int, int, int)   # (n_databases, n_plists, n_already_scanned, n_skip_listed)
+    progress       = Signal(int, int, str, int, dict)  # (index, total, ui_path, file_size, counts)
     finished_scan  = Signal(dict)               # summary dict, see run()'s own tail
 
     def __init__(self, zip_path, case_dir, ui_metadata, header_type_overrides,
-                 ffs_adapter, delta=None, scan_folders=None, parent=None):
+                 ffs_adapter, delta=None, scan_folders=None, skip_entries=None,
+                 parent=None):
         super().__init__(parent)
         self._zip_path        = zip_path
         self._case_dir        = case_dir
@@ -2946,6 +3047,7 @@ class EmbeddedMediaScanWorker(QThread):
         self._adapter         = ffs_adapter
         self._delta           = delta
         self._scan_folders    = scan_folders   # None = everywhere
+        self._skip_entries    = skip_entries   # None = skip-list feature off
 
     def _read_bytes(self, z, ui_path: str) -> bytes | None:
         try:
@@ -2964,67 +3066,73 @@ class EmbeddedMediaScanWorker(QThread):
 
         sqlite_paths, plist_paths = ems.enumerate_candidates(
             self._ui_metadata, self._overrides, self._scan_folders)
-        self.discovery_done.emit(len(sqlite_paths), len(plist_paths))
+        n_databases, n_plists = len(sqlite_paths), len(plist_paths)
+
+        n_skip_listed = 0
+        if self._skip_entries:
+            before = len(sqlite_paths) + len(plist_paths)
+            sqlite_paths = [p for p in sqlite_paths
+                           if not embedded_media_skip_list.matches(p, self._skip_entries)]
+            plist_paths = [p for p in plist_paths
+                          if not embedded_media_skip_list.matches(p, self._skip_entries)]
+            n_skip_listed = before - (len(sqlite_paths) + len(plist_paths))
+
+        current_version = ems.scan_logic_version()
+        already_scanned: set[str] = set()
+        if self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    already_scanned = processed_ui_paths(
+                        db, 'embedded_media_scan', current_version)
+            except Exception:
+                already_scanned = set()
+
+        self.discovery_done.emit(n_databases, n_plists,
+                                 len(already_scanned), n_skip_listed)
 
         scan_dir = os.path.join(self._case_dir, 'embedded_media')
         os.makedirs(scan_dir, exist_ok=True)
+        scan_scope = 'app_user_accessible' if self._scan_folders is not None else 'everywhere'
 
         counts = {'live_pictures': 0, 'live_videos': 0,
                  'recovered_pictures': 0, 'recovered_videos': 0}
         rows: list[dict] = []
-        all_candidates = [('plist', p) for p in plist_paths] + \
-                        [('sqlite', p) for p in sqlite_paths]
+        registry_entries: list[tuple[str, str, int]] = []
+        all_candidates = [('plist', p) for p in plist_paths if p not in already_scanned] + \
+                        [('sqlite', p) for p in sqlite_paths if p not in already_scanned]
         total = len(all_candidates)
 
         for i, (kind, ui_path) in enumerate(all_candidates):
             if self.isInterruptionRequested():
                 break
-            self.progress.emit(i, total, ui_path, dict(counts))
+            # Read straight from the archive's OWN already-cached metadata
+            # (self._ui_metadata) rather than from `raw` -- emitted BEFORE
+            # the actual read/scan starts, so the size is what tells the
+            # examiner "this one's just big" while the slow part is still
+            # running, not only after it finishes. Direct request,
+            # 2026-09-23: "when you are looking for embedded media file it
+            # can take a while can you include the size so the user knows
+            # why it is taking a while to process."
+            file_size = self._ui_metadata.get(ui_path, {}).get('size', 0)
+            self.progress.emit(i, total, ui_path, file_size, dict(counts))
             raw = self._read_bytes(z, ui_path)
             if raw is None:
+                # A transient read failure (not "genuinely nothing here")
+                # -- deliberately NOT recorded in the registry, so it's
+                # retried next run rather than permanently skipped.
                 continue
 
-            if kind == 'plist':
-                for hit in ems.scan_plist_bytes(raw):
-                    rows.append(self._build_row(ems, ui_path, 'plist',
-                                                hit['plist_path'], scan_dir, hit))
-                    counts[f"{'recovered' if hit['recovered'] else 'live'}_"
-                          f"{'pictures' if hit['kind'] == 'image' else 'videos'}"] += 1
-                continue
+            wal_bytes = self._read_bytes(z, ui_path + '-wal') if kind == 'sqlite' else None
+            new_rows = ems.scan_container(kind, ui_path, raw, scan_dir, scan_scope,
+                                          wal_bytes=wal_bytes)
+            rows.extend(new_rows)
+            registry_entries.append((ui_path, current_version, len(new_rows)))
+            for hit_row in new_rows:
+                bucket = ('recovered' if hit_row['recovered'] else 'live') + '_' + \
+                        ('pictures' if hit_row['media_kind'] == 'image' else 'videos')
+                counts[bucket] += 1
 
-            # kind == 'sqlite'
-            wal_bytes = self._read_bytes(z, ui_path + '-wal')
-            tmp_path = None
-            try:
-                fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
-                with os.fdopen(fd, 'wb') as f:
-                    f.write(raw)
-                for hit in ems.scan_sqlite_live(tmp_path):
-                    location = f"{hit['table']}.{hit['column']} (rowid={hit['rowid']})"
-                    rows.append(self._build_row(ems, ui_path, 'sqlite',
-                                                location, scan_dir, hit))
-                    counts['live_pictures' if hit['kind'] == 'image' else 'live_videos'] += 1
-            except Exception:
-                pass
-            finally:
-                if tmp_path is not None:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-
-            try:
-                for hit in ems.scan_sqlite_deleted(raw, wal_bytes=wal_bytes):
-                    location = f"rowid={hit.get('rowid')} (page {hit.get('page')}, " \
-                              f"{hit.get('recovery_source')})"
-                    rows.append(self._build_row(ems, ui_path, 'sqlite',
-                                                location, scan_dir, hit))
-                    counts['recovered_pictures' if hit['kind'] == 'image'
-                          else 'recovered_videos'] += 1
-            except Exception:
-                pass
-
-        self.progress.emit(total, total, '', dict(counts))
+        self.progress.emit(total, total, '', 0, dict(counts))
 
         if rows and self._case_dir:
             try:
@@ -3033,28 +3141,360 @@ class EmbeddedMediaScanWorker(QThread):
             except Exception:
                 pass
 
+        if registry_entries and self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    save_processing_registry_entries(
+                        db, 'embedded_media_scan', registry_entries)
+            except Exception:
+                pass
+
         self.finished_scan.emit({
-            'total_files': total, 'total_hits': len(rows), **counts,
+            'total_files': total, 'total_hits': len(rows),
+            'already_scanned': len(already_scanned),
+            'skip_listed': n_skip_listed, **counts,
         })
 
-    def _build_row(self, ems, ui_path, source_kind, location, scan_dir, hit) -> dict:
-        sha, path = ems.extract_media_bytes(scan_dir, hit['blob'], hit['ext'])
-        headers = hit.get('http_headers') or {}
-        return {
-            'source_ui_path': ui_path,
-            'source_kind': source_kind,
-            'location': location,
-            'display_name': ems.compute_display_name(ui_path, source_kind, location, hit),
-            'media_kind': hit['kind'],
-            'extracted_path': path,
-            'sha256': sha,
-            'byte_length': len(hit['blob']),
-            'recovered': int(bool(hit.get('recovered'))),
-            'recovery_source': hit.get('recovery_source'),
-            'http_wrapped': int(bool(hit.get('http_headers'))),
-            'content_type_hint': headers.get('content-type'),
-            'scan_scope': 'app_user_accessible' if self._scan_folders is not None else 'everywhere',
-        }
+
+class SingleFileEmbeddedMediaWorker(QThread):
+    """Manual, single-file "Search for Embedded Media" context-menu
+    action — added 2026-09-23, direct request: "can we make it that for
+    the 3 file types that we are looking for embedded that we can
+    manually look for embedded files right click any file search for
+    embedded media. it will check the header even if typed just in case
+    wrong ext then if supported will look for media."
+
+    Always re-checks the file's REAL magic bytes via
+    embedded_media_scan.classify_container_type, regardless of its
+    current Type label — the whole point of a manual per-file check is
+    not trusting the label. Owns its own independent CachedZipView
+    reader, same convention as EmbeddedMediaScanWorker (and every other
+    worker in this file).
+
+    **`processing_registry` check-first, added 2026-09-23** — same
+    generic tracker EmbeddedMediaScanWorker's bulk sweep now uses (see
+    its own docstring). Unless `force_rescan=True`, a file already
+    scanned under the current embedded_media_scan.py logic version
+    emits `already_processed` (with the prior entry's info) instead of
+    silently redoing the work — the dialog offers a "Scan Anyway" button
+    rather than deciding for the examiner."""
+    unsupported       = Signal(str)   # the real detected type, for the message
+    already_processed = Signal(dict) # prior processing_registry entry
+    started_scan      = Signal(int)   # file_size, once classified as supported
+    finished_scan     = Signal(dict)  # {'total_hits':, 'live_pictures':, ...} or {'error':}
+
+    def __init__(self, zip_path, case_dir, ui_path, ffs_adapter,
+                 force_rescan=False, parent=None):
+        super().__init__(parent)
+        self._zip_path     = zip_path
+        self._case_dir     = case_dir
+        self._ui_path      = ui_path
+        self._adapter      = ffs_adapter
+        self._force_rescan = force_rescan
+
+    def run(self):
+        import embedded_media_scan as ems
+
+        z = _build_cached_zip_view(self._zip_path, self._case_dir)
+        if z is None:
+            self.finished_scan.emit({'error': 'Local .zcd cache not available'})
+            return
+        try:
+            physical = self._adapter.resolve(self._ui_path)
+            raw = z.open(physical).read()
+        except Exception:
+            self.finished_scan.emit({'error': 'Could not read this file from the archive'})
+            return
+
+        kind = ems.classify_container_type(raw)
+        if kind is None:
+            # A best-effort, honest label for what this file's real
+            # content actually is (reusing the same magic-byte
+            # classifier the Type column itself uses) — "not supported"
+            # alone doesn't tell the examiner anything they didn't
+            # already suspect; naming what WAS found does.
+            detected = header_scan.classify_magic(raw[:16]) or 'Unrecognized content'
+            self.unsupported.emit(detected)
+            return
+
+        current_version = ems.scan_logic_version()
+        if not self._force_rescan and self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    entry = processing_registry_entry(
+                        db, 'embedded_media_scan', self._ui_path)
+            except Exception:
+                entry = None
+            if entry and entry['logic_version'] == current_version:
+                self.already_processed.emit(entry)
+                return
+
+        self.started_scan.emit(len(raw))
+
+        wal_bytes = None
+        if kind == 'sqlite':
+            try:
+                wal_bytes = z.open(self._adapter.resolve(self._ui_path + '-wal')).read()
+            except Exception:
+                wal_bytes = None
+
+        scan_dir = os.path.join(self._case_dir, 'embedded_media')
+        os.makedirs(scan_dir, exist_ok=True)
+        rows = ems.scan_container(kind, self._ui_path, raw, scan_dir,
+                                  'manual_single_file', wal_bytes=wal_bytes)
+
+        counts = {'live_pictures': 0, 'live_videos': 0,
+                 'recovered_pictures': 0, 'recovered_videos': 0}
+        for r in rows:
+            bucket = ('recovered' if r['recovered'] else 'live') + '_' + \
+                    ('pictures' if r['media_kind'] == 'image' else 'videos')
+            counts[bucket] += 1
+
+        if rows and self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    save_embedded_media_hits(db, rows)
+            except Exception:
+                pass
+
+        if self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    save_processing_registry_entries(
+                        db, 'embedded_media_scan',
+                        [(self._ui_path, current_version, len(rows))])
+            except Exception:
+                pass
+
+        self.finished_scan.emit({
+            'container_type': kind, 'total_hits': len(rows), **counts,
+        })
+
+
+class SingleFileEmbeddedMediaDialog(QDialog):
+    """Progress/result dialog for the manual, single-file "Search for
+    Embedded Media" context-menu action — a small, dedicated dialog,
+    deliberately NOT ProcessDialog (that one is for the bulk, whole-
+    archive sweep with its own scope/checkbox controls that make no
+    sense for "just this one file"). All actual work happens in
+    SingleFileEmbeddedMediaWorker; this dialog only ever reflects its
+    signals.
+
+    **"Scan Anyway" — added 2026-09-23** alongside the worker's own
+    processing_registry check-first behavior: `show_already_processed`
+    surfaces the prior result and offers `scan_anyway_requested` rather
+    than silently either redoing or refusing the work — the caller
+    (ffs-explorer.py's `_search_embedded_media_for_file`) reconnects to
+    it and restarts with `force_rescan=True`."""
+    scan_anyway_requested = Signal()
+
+    def __init__(self, ui_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Search for Embedded Media")
+        self.setMinimumWidth(480)
+        self._ui_path = ui_path
+        self._worker: 'SingleFileEmbeddedMediaWorker | None' = None
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        self._label = QLabel(f"Checking {ui_path.rsplit('/', 1)[-1]}…")
+        self._label.setWordWrap(True)
+        layout.addWidget(self._label)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._scan_anyway_btn = QPushButton("Scan Anyway")
+        self._scan_anyway_btn.setVisible(False)
+        self._scan_anyway_btn.clicked.connect(self.scan_anyway_requested.emit)
+        btn_row.addWidget(self._scan_anyway_btn)
+        self._close_btn = QPushButton("Close")
+        self._close_btn.setEnabled(False)
+        self._close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self._close_btn)
+        layout.addLayout(btn_row)
+
+    def _is_running(self) -> bool:
+        return bool(self._worker and self._worker.isRunning())
+
+    def closeEvent(self, event):
+        # Same "can't close mid-scan" guard ProcessDialog already uses —
+        # the Close button is itself disabled while running (see
+        # show_unsupported/show_result, the only two places that enable
+        # it), but the window's own [x] button reaches closeEvent
+        # directly, bypassing that.
+        if self._is_running():
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+    def reject(self):
+        if self._is_running():
+            return
+        super().reject()
+
+    def show_unsupported(self, detected_type: str):
+        self._scan_anyway_btn.setVisible(False)
+        name = self._ui_path.rsplit('/', 1)[-1]
+        self._label.setText(
+            f"\"{name}\" is not a supported file type for embedded media "
+            f"recovery.\n\n"
+            f"Its real content was checked directly (not just its name or "
+            f"extension) and identified as: {detected_type}.\n\n"
+            f"Embedded media recovery only supports SQLite databases and "
+            f"property lists (binary or XML).")
+        self._close_btn.setEnabled(True)
+
+    def show_already_processed(self, entry: dict):
+        name = self._ui_path.rsplit('/', 1)[-1]
+        count = entry.get('result_count', 0)
+        found_msg = (f"found {count:,} item(s)" if count
+                    else "found nothing")
+        self._label.setText(
+            f"\"{name}\" was already scanned for embedded media on "
+            f"{entry.get('processed_at', 'an earlier date')} "
+            f"({found_msg}), using the current recovery logic — "
+            f"nothing has changed since, so it was not scanned again.\n\n"
+            f"Choose \"Scan Anyway\" to run it again regardless.")
+        self._scan_anyway_btn.setVisible(True)
+        self._close_btn.setEnabled(True)
+
+    def show_scanning(self, file_size: int):
+        self._scan_anyway_btn.setVisible(False)
+        self._label.setText(
+            f"Scanning {self._ui_path.rsplit('/', 1)[-1]} "
+            f"({format_byte_size(file_size)}) for embedded media…\n\n"
+            f"This includes checking for content recovered from deleted "
+            f"rows, which can take longer for a larger file.")
+
+    def show_result(self, summary: dict):
+        self._scan_anyway_btn.setVisible(False)
+        if summary.get('error'):
+            self._label.setText(f"Search failed: {summary['error']}")
+            self._close_btn.setEnabled(True)
+            return
+        total = summary.get('total_hits', 0)
+        pictures = summary.get('live_pictures', 0) + summary.get('recovered_pictures', 0)
+        videos = summary.get('live_videos', 0) + summary.get('recovered_videos', 0)
+        recovered = summary.get('recovered_pictures', 0) + summary.get('recovered_videos', 0)
+        if total == 0:
+            msg = f"No embedded media found in {self._ui_path.rsplit('/', 1)[-1]}."
+        else:
+            msg = (f"Found {total:,} item(s) in "
+                  f"{self._ui_path.rsplit('/', 1)[-1]}: "
+                  f"{pictures:,} picture(s), {videos:,} video(s).")
+            if recovered:
+                msg += f"\n{recovered:,} recovered from deleted content."
+            msg += ("\n\nThis file now appears as a folder in the File "
+                   "Browser, with the found media as its contents.")
+        self._label.setText(msg)
+        self._close_btn.setEnabled(True)
+
+
+class EmbeddedMediaSkipListDialog(QDialog):
+    """View/edit the known-noise skip list (app/embedded_media_skip_list.py)
+    — added 2026-09-24, direct request: "make it that the user can [use]
+    this feature and be able to view the list. probably via a button."
+
+    A global (cross-case), hand-maintained list — nothing here is ever
+    added automatically. Two ways an entry gets added: this dialog's own
+    "Add…" button (a free-form entry, for a fragment the examiner already
+    knows), or a file's right-click "Add to Embedded-Media Skip List"
+    context-menu action (see FastZipBrowser._toggle_embedded_media_skip_list),
+    which is the more natural workflow this feature was actually built
+    for — an examiner reviewing a big database decides right there that
+    it's not worth ever scanning again. Both write to the SAME store, so
+    either path is immediately reflected in the other.
+
+    **One list per platform — added 2026-09-24**, direct follow-up: "i
+    want to split for the user as when they view the skip list it will
+    confuse them if there [are] ios [entries] when looking at android."
+    This dialog always shows/edits exactly ONE platform's own store
+    (`platform`, 'android' or 'ios') — never both at once — so opening it
+    from an Android case never shows an iOS entry and vice versa."""
+
+    def __init__(self, platform: str, ui_metadata: dict | None = None, parent=None):
+        super().__init__(parent)
+        self._platform = platform
+        self.setWindowTitle(f"Embedded-Media Skip List ({platform.capitalize()})")
+        self.setMinimumSize(520, 420)
+        # For "Add…"'s own validation, below — the currently open
+        # archive's real ui_paths, so a typo or wrong path gets caught
+        # immediately rather than silently matching nothing forever.
+        # None (no archive open, or this dialog opened from a context
+        # with no metadata handy) simply skips that check.
+        self._ui_metadata = ui_metadata
+        layout = QVBoxLayout(self)
+        layout.addWidget(note_label(
+            f"Showing the {platform.capitalize()} list only — a separate, "
+            f"independent list exists for the other platform, so an "
+            f"entry from one never shows or applies while working on a "
+            f"case for the other.\n\n"
+            "Files matching an entry here are excluded from the "
+            "embedded-media sweep (when its own \"Skip databases/property "
+            "lists on the known-noise list\" box is checked) — a database "
+            "confirmed to hold no embedded media at all, or only ever "
+            "app/UI graphics with no evidentiary value.\n\n"
+            "A right-click \"Add to Skip List\" on a file inside an app's "
+            "own container adds an entry scoped to that ONE app (e.g. "
+            "\"com.example.app/cache/icons.db\") — a same-named file in a "
+            "different app is never accidentally excluded too. For a "
+            "file OUTSIDE any app (a general OS/system path), the full "
+            "path is added instead — those paths are consistent across "
+            "cases on their own, so no scoping is needed.\n\n"
+            "Typing a plain filename here yourself instead (e.g. "
+            "\"map_cache.db\", with no '/') matches that name in EVERY "
+            "app — only do this once you've confirmed the file is "
+            "equally irrelevant everywhere it appears (a bundled "
+            "third-party SDK cache, say)."))
+
+        self._list = QListWidget()
+        self._list.addItems(embedded_media_skip_list.load(self._platform))
+        layout.addWidget(self._list, 1)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add…")
+        add_btn.clicked.connect(self._on_add)
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(self._on_remove)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _on_add(self):
+        text, ok = QInputDialog.getText(
+            self, "Add to Skip List",
+            "Filename (e.g. map_cache.db) or path fragment "
+            "(e.g. com.example.app/cache/icons.db):")
+        if not ok or not text.strip():
+            return
+        text = text.strip()
+        if self._ui_metadata is not None and not embedded_media_skip_list.entry_matches_any_path(
+                text, self._ui_metadata):
+            proceed = QMessageBox.question(
+                self, "No Match in Current Archive",
+                f"\"{text}\" doesn't match any file in the currently open "
+                f"archive — check for a typo, or that it's really meant "
+                f"to apply to a different case's own layout.\n\n"
+                f"Add it to the skip list anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if proceed != QMessageBox.StandardButton.Yes:
+                return
+        embedded_media_skip_list.add_entry(text, self._platform)
+        self._refresh_list()
+
+    def _on_remove(self):
+        item = self._list.currentItem()
+        if item is None:
+            return
+        embedded_media_skip_list.remove_entry(item.text(), self._platform)
+        self._refresh_list()
+
+    def _refresh_list(self):
+        self._list.clear()
+        self._list.addItems(embedded_media_skip_list.load(self._platform))
 
 
 class ProcessDialog(QDialog):
@@ -3070,8 +3510,12 @@ class ProcessDialog(QDialog):
 
     def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
                  delta=None, preselect_nested=False,
-                 auto_archive_selection=False, parent=None):
+                 auto_archive_selection=False, is_android=False, parent=None):
         super().__init__(parent)
+        # Which platform's own embedded-media skip list applies to this
+        # case — see embedded_media_skip_list.py's own "one list per
+        # platform" entry, 2026-09-24.
+        self._skip_list_platform = 'android' if is_android else 'ios'
         self.setWindowTitle("Process Case")
         self.setModal(True)
         # Widened/heightened 2026-09-22 to accommodate the embedded-media
@@ -3218,6 +3662,34 @@ class ProcessDialog(QDialog):
         self._embedded_scope_label.setWordWrap(True)
         self._embedded_scope_label.setStyleSheet("color: grey; padding-left: 22px;")
         layout.addWidget(self._embedded_scope_label)
+
+        # Known-noise skip list — added 2026-09-24, direct request: "we
+        # are reviewing some big db and it can take a while to check
+        # them but there are some db that either have no media file and
+        # are unlikely to ever have any... [or] will never be of use...
+        # i would like a list of sqlite db that are not worth looking
+        # at." See app/embedded_media_skip_list.py for the store itself
+        # (a global, hand-editable list — an examiner builds it up over
+        # time from real casework, it's never auto-populated). Checked
+        # by default since the whole point is to save time on a database
+        # already confirmed not worth scanning.
+        embedded_skip_row = QHBoxLayout()
+        embedded_skip_row.setContentsMargins(22, 0, 0, 0)
+        self._chk_embedded_media_skip_list = QCheckBox(
+            "Skip databases/property lists on the known-noise list")
+        self._chk_embedded_media_skip_list.setChecked(True)
+        self._chk_embedded_media_skip_list.setToolTip(
+            "Excludes any file matching an entry you've added to the "
+            "known-noise list — a database confirmed to either hold no "
+            "embedded media at all, or only ever app/UI graphics (icons, "
+            "launcher art) with no evidentiary value. Uncheck to scan "
+            "everything regardless of this list.")
+        embedded_skip_row.addWidget(self._chk_embedded_media_skip_list)
+        self._embedded_skip_list_btn = QPushButton("View/Edit List…")
+        self._embedded_skip_list_btn.clicked.connect(self._show_embedded_media_skip_list_dialog)
+        embedded_skip_row.addWidget(self._embedded_skip_list_btn)
+        embedded_skip_row.addStretch()
+        layout.addLayout(embedded_skip_row)
 
         for rb in (self._rb_embedded_scope_app, self._rb_embedded_scope_all):
             rb.toggled.connect(self._update_embedded_scope_label)
@@ -3544,13 +4016,16 @@ class ProcessDialog(QDialog):
         self._refresh_stats()
 
     def _on_embedded_media_toggled(self, checked: bool):
-        """Scope radios + coverage label are only meaningful once the
-        scan itself is actually selected — hidden otherwise, same
-        "don't show a choice that doesn't apply yet" convention the
-        header-scan tier's own coverage label already follows."""
+        """Scope radios + coverage label + skip-list controls are only
+        meaningful once the scan itself is actually selected — hidden
+        otherwise, same "don't show a choice that doesn't apply yet"
+        convention the header-scan tier's own coverage label already
+        follows."""
         self._rb_embedded_scope_app.setVisible(checked)
         self._rb_embedded_scope_all.setVisible(checked)
         self._embedded_scope_label.setVisible(checked)
+        self._chk_embedded_media_skip_list.setVisible(checked)
+        self._embedded_skip_list_btn.setVisible(checked)
         if checked:
             self._update_embedded_scope_label()
 
@@ -4030,11 +4505,13 @@ class ProcessDialog(QDialog):
     def _start_embedded_media_scan(self):
         scan_folders = (tuple(self._adapter.scan_folders())
                         if self._rb_embedded_scope_app.isChecked() else None)
+        skip_entries = (embedded_media_skip_list.load(self._skip_list_platform)
+                       if self._chk_embedded_media_skip_list.isChecked() else None)
         self._status_label.setText("Finding databases and property lists to scan…")
         self._embedded_media_worker = EmbeddedMediaScanWorker(
             self._zip_path, self._case_dir, self._ui_metadata,
             self._header_type_overrides_snapshot(), self._adapter,
-            self._delta, scan_folders,
+            self._delta, scan_folders, skip_entries,
         )
         self._embedded_media_worker.discovery_done.connect(self._on_embedded_media_discovery)
         self._embedded_media_worker.progress.connect(self._on_embedded_media_progress)
@@ -4057,21 +4534,44 @@ class ProcessDialog(QDialog):
         except Exception:
             return {}
 
-    def _on_embedded_media_discovery(self, n_databases: int, n_plists: int):
+    def _show_embedded_media_skip_list_dialog(self):
+        EmbeddedMediaSkipListDialog(
+            platform=self._skip_list_platform, ui_metadata=self._ui_metadata,
+            parent=self).exec()
+
+    def _on_embedded_media_discovery(self, n_databases: int, n_plists: int,
+                                     n_already_scanned: int, n_skip_listed: int):
         self._embedded_media_totals = (n_databases, n_plists)
         if n_databases == 0 and n_plists == 0:
             self._status_label.setText(
                 "Embedded-media sweep: no SQLite databases or property "
                 "lists found to scan.")
             return
-        self._status_label.setText(
-            f"Embedded-media sweep: found {n_databases:,} database(s) and "
-            f"{n_plists:,} property list(s) to scan…")
+        msg = (f"Embedded-media sweep: found {n_databases:,} database(s) and "
+              f"{n_plists:,} property list(s) to scan…")
+        notes = []
+        if n_skip_listed:
+            # embedded_media_skip_list.py -- an examiner-maintained "not
+            # worth scanning" list, excluded before anything else so its
+            # own count never overlaps processing_registry's below.
+            notes.append(f"{n_skip_listed:,} on the known-noise skip list")
+        if n_already_scanned:
+            # processing_registry (db_utils.py) already covers these under
+            # the current scan logic version -- skipped, not re-read.
+            notes.append(f"{n_already_scanned:,} already scanned")
+        if notes:
+            msg += f" ({', '.join(notes)}, skipped)"
+        self._status_label.setText(msg)
 
     def _on_embedded_media_progress(self, index: int, total: int,
-                                    ui_path: str, counts: dict):
+                                    ui_path: str, file_size: int, counts: dict):
         name = ui_path.rsplit('/', 1)[-1] if ui_path else ''
-        suffix = f" — {name}" if name else ""
+        # Size shown right alongside the file name -- direct request, so a
+        # large database taking visibly longer reads as "expected, it's
+        # just big" rather than "did this hang?" (format_byte_size, same
+        # helper the Search-scope-files dialog already used, promoted to
+        # module level for this second real caller).
+        suffix = f" — {name} ({format_byte_size(file_size)})" if name else ""
         found = (f"found so far: {counts['live_pictures']:,} picture(s), "
                 f"{counts['live_videos']:,} video(s)")
         recovered = counts['recovered_pictures'] + counts['recovered_videos']
@@ -4094,6 +4594,15 @@ class ProcessDialog(QDialog):
                   f"across {summary.get('total_files', 0):,} file(s)")
             if recovered:
                 msg += f", {recovered:,} recovered from deleted content"
+            skip_notes = []
+            skip_listed = summary.get('skip_listed', 0)
+            if skip_listed:
+                skip_notes.append(f"{skip_listed:,} on the known-noise skip list")
+            already_scanned = summary.get('already_scanned', 0)
+            if already_scanned:
+                skip_notes.append(f"{already_scanned:,} already scanned")
+            if skip_notes:
+                msg += f" ({', '.join(skip_notes)}, skipped)"
             msg += "."
             self._status_label.setText(msg)
         self.embedded_media_scan_done.emit()
@@ -4693,7 +5202,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # see "Per-tab state on switching" in CLAUDE.md.
         self._fb_last_preview_path: str | None = None
         self._selected_media_path: str | None = None
-        self._thumb_widgets: dict = {}
         self._pending_media_selection: str | None = None
         self._media_context = None   # tracks what is currently loaded in the media grid
         self._tree_splitter_sizes: list | None = None  # saved when search tab is active
@@ -4989,6 +5497,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.center_tabs.addTab(search_tab,  "Keyword Search")     # 2
         self.center_tabs.addTab(artifact_tab,"Artifact Viewer")    # 3
         self.center_tabs.currentChanged.connect(self._on_center_tab_changed)
+
+        # Ctrl+B — bookmark the current selection, in whichever of File
+        # Browser / Media Browser is active — added 2026-09-24, direct
+        # request: "keyboard shortcuts that can be used to bookmark a
+        # selection of files." WindowShortcut context (the default) fires
+        # regardless of which child widget currently has focus, as long
+        # as this window is active — deliberately not scoped to one
+        # specific child widget, since _on_bookmark_shortcut itself
+        # already decides which selection to use from center_tabs'
+        # current index.
+        self._bookmark_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
+        self._bookmark_shortcut.activated.connect(self._on_bookmark_shortcut)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -5425,17 +5945,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if self.splitter.sizes()[0] == 0 and self._tree_splitter_sizes:
             self.splitter.setSizes(self._tree_splitter_sizes)
         if index == 1:
-            # Showing the embedded-media sweep's own results — leave it
-            # alone rather than silently reverting to the last-selected
-            # folder, per _show_embedded_media_hits' own docstring. Only
+            # Showing the embedded-media sweep's own results, OR a
+            # restored "Last Selection" view (added 2026-09-25) — leave
+            # either alone rather than silently reverting to the last-
+            # selected folder, per _show_embedded_media_hits'/
+            # _on_media_last_selection_clicked's own docstrings. Only
             # picking an ordinary folder again (_load_media_from_file_model,
-            # which clears this flag) exits this view.
-            if self._media_showing_embedded:
+            # which clears both flags) exits either view.
+            if self._media_showing_embedded or self._media_showing_selection:
                 self._resync_media_hex_preview()
                 return
             # Determine pending selection from the file browser
-            if self._selected_file_path and \
-                    os.path.splitext(self._selected_file_path)[1].lower() in MEDIA_EXTENSIONS:
+            if self._selected_file_path and self._is_media_file(self._selected_file_path):
                 self._pending_media_selection = self._selected_file_path
             else:
                 self._pending_media_selection = None
@@ -5443,21 +5964,27 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # Context is the exact ordered tuple of media paths currently visible.
             # Any change — folder, selection, filter, sort — produces a different tuple
             # and triggers a reload. Same paths in same order means no reload needed.
+            # _is_media_file (not a bare MEDIA_EXTENSIONS check) so this stays
+            # consistent with _load_media_from_file_model's own definition of
+            # "media" — see that shared method's own docstring.
             new_context = tuple(
                 r[1] for r in self.file_model._rows
                 if r[1] not in self.folder_map
-                and os.path.splitext(r[1])[1].lower() in MEDIA_EXTENSIONS
+                and self._is_media_file(r[1])
             )
 
             if new_context == self._media_context:
-                # Nothing changed — thumbnails already loaded, just re-apply selection
+                # Nothing changed — grid model already loaded, just re-apply selection.
+                # Checked against _media_all_paths (the whole folder), not
+                # just the currently displayed page's own model — since
+                # pagination (2026-09-24) a pending selection may be on a
+                # DIFFERENT page than what's shown right now;
+                # _select_media_item itself switches pages if needed.
                 if self._pending_media_selection and \
-                        self._pending_media_selection in self._thumb_widgets:
-                    self._on_thumb_clicked(self._pending_media_selection)
-                    self._media_scroll.ensureWidgetVisible(
-                        self._thumb_widgets[self._pending_media_selection])
+                        self._pending_media_selection in self._media_all_paths:
+                    self._select_media_item(self._pending_media_selection)
                 else:
-                    # No File Browser selection pending sync — _on_thumb_clicked
+                    # No File Browser selection pending sync — _select_media_item
                     # above (which also resyncs hex) won't fire, so the shared
                     # hex panel needs its own explicit resync here instead;
                     # see _resync_media_hex_preview's own docstring.
@@ -6651,6 +7178,38 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     partial(self._extract_from_context_menu, ui_path))
                 menu.addAction(extract_act)
 
+        # Manual, single-file "Search for Embedded Media" — added
+        # 2026-09-23, direct request. Shown for ANY real file, regardless
+        # of its current Type label — the whole point is a manual re-check
+        # of the real header ("just in case wrong ext"), so gating this on
+        # the current (possibly wrong) Type would defeat it. Not shown for
+        # an already-decoded embedded-media container itself (re-scanning
+        # a synthetic child of one makes no sense) or a folder.
+        if (ui_path and ui_path not in self.folder_map and self._in_zip(ui_path)
+                and ui_path not in self._embedded_media_containers and self._case_dir):
+            menu.addSeparator()
+            search_media_act = QAction("🔎 Search for Embedded Media", self)
+            search_media_act.triggered.connect(
+                partial(self._search_embedded_media_for_file, ui_path))
+            menu.addAction(search_media_act)
+
+            # Known-noise skip list — added 2026-09-24, direct request.
+            # Gated on the SAME cheap (no I/O) candidate check the bulk
+            # sweep's own enumeration uses, unlike the action above —
+            # adding a plain image/text file to a list that only the
+            # embedded-media sweep ever consults would just be noise in
+            # the menu, not a real choice.
+            import embedded_media_scan as _ems
+            if _ems.classify_scan_candidate(ui_path, self._header_type_overrides):
+                on_list = embedded_media_skip_list.matches(
+                    ui_path, platform=self._skip_list_platform())
+                skip_act = QAction(
+                    "🗑️ Remove from Embedded-Media Skip List" if on_list
+                    else "🗑️ Add to Embedded-Media Skip List", self)
+                skip_act.triggered.connect(
+                    partial(self._toggle_embedded_media_skip_list, ui_path, on_list))
+                menu.addAction(skip_act)
+
         # Bookmarks submenu
         bm_paths = self._get_paths_for_bookmark()
         if bm_paths:
@@ -6755,6 +7314,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _is_android_archive(self) -> bool:
         return self._adapter.is_android(self.folder_map)
+
+    def _skip_list_platform(self) -> str:
+        """Which of embedded_media_skip_list.py's two per-platform stores
+        applies to the currently open archive — see that module's own
+        "one list per platform" docstring entry, 2026-09-24."""
+        return 'android' if self._is_android_archive() else 'ios'
 
     def _android_shortcuts(self) -> list:
         user_data = self._android_user_data_path or 'data/media/0'
@@ -7043,6 +7608,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             delta=self._local_extra_delta,
             preselect_nested=preselect_nested,
             auto_archive_selection=auto_archive_selection,
+            is_android=self._is_android_archive(),
             parent=self,
         )
         dlg.header_types_cleared.connect(self._on_header_types_cleared)
@@ -7170,11 +7736,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # (no blocking wait — it may be inside a long ffmpeg call)
         self._retire_worker(self._thumb_worker)
         self._thumb_worker = None
-        while self._media_grid.count():
-            item = self._media_grid.takeAt(0)
-            w = item.widget() if item else None
-            if w:
-                w.deleteLater()
+        self._retire_worker(self._media_page_prefetch_worker)
+        self._media_page_prefetch_worker = None
+        self._media_model.set_items([])
+        self._media_delegate.clear()
+        self._media_delegate.set_seen_paths(set())
+        self._media_delegate.set_bookmark_colors({})
+        self._media_all_paths = []
+        self._media_page_index = 0
+        self._media_page_nav_widget.setVisible(False)
         self._media_status.setText("Select a folder to view media")
         # Clear the file browser immediately so the previous archive's
         # content is not shown while the new one is loading.
@@ -7188,6 +7758,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._pending_media_selection = None
         self._media_context = None
         self._media_showing_embedded = False
+        self._media_showing_selection = False
+        self._media_last_selection_paths = None
+        self._media_last_selection_label = ""
+        self._media_bookmarked_paths = set()
+        self._media_bookmark_colors = {}
+        self._media_last_selection_btn.setVisible(False)
         # Busy/indeterminate (range 0,0) so the bar keeps animating for the whole
         # load — a static bar looked hung.  Hidden only once BOTH the tree has
         # finished populating and the worker thread is done (covers any header
@@ -7955,6 +8531,176 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if new_archives:
             self._rebuild_file_view_from_checked(preserve_filter=True)
 
+    # Android apps' own EXTERNAL-storage per-app directory
+    # (data/media/<user>/Android/data/<package>/...) — confirmed via
+    # this project's own real archive as the actual location of exactly
+    # the recurring-across-many-apps cache pattern this feature was built
+    # for (Google Maps' own map_cache.db, bundled inside WhatsApp,
+    # Telegram, Signal, ... under THIS prefix, not data/data/<package>/).
+    # NOT folded into FfsAdapter.container_parents() itself (used more
+    # broadly by app_intelligence.py/App Report for a different purpose)
+    # — a real, deliberate scope decision to avoid risking a ripple
+    # effect on that shared, more sensitive function for a need specific
+    # to this one feature.
+    _ANDROID_EXTERNAL_APP_RE = re.compile(r'^data/media/\d+/Android/data/([^/]+)/(.*)$')
+
+    # Android's OTHER real OS-level multi-user directories, checked
+    # 2026-09-24 against three independent real Android archives (14
+    # JoshHickman, 15 CTF25 Cellebrite, 14 CTF26 Magnet) after the user
+    # asked directly whether "other locations... are not consistent
+    # between handset[s]" the way data/media/<user>/ is. All nine showed
+    # user id "0" on all three real devices — no real evidence of a
+    # different value has actually been observed in this project's own
+    # test data, but Android's real multi-user mechanism (a work profile
+    # or secondary user) genuinely can assign a different one, so this is
+    # a real, just-not-yet-observed risk, closed here at negligible cost
+    # rather than left open because it hasn't bitten anyone yet.
+    _ANDROID_MULTIUSER_RE = re.compile(
+        r'^(data/(?:system/users|system_ce|system_de|misc_ce|misc_de|'
+        r'user|user_de)|data/misc/vold/user_keys/(?:ce|de))/\d+(/.*)?$')
+
+    # A real GUID (36-char hyphenated hex) ANYWHERE else in a path —
+    # confirmed 2026-09-24 against a real iOS archive that an app has a
+    # SECOND, separate GUID-named container beyond the Data container
+    # container_parents()/container_bundle_id already resolve:
+    # Containers/Bundle/Application/<GUID>/<AppName>.app/... (see
+    # CLAUDE.md's own "iOS app registry (LaunchServices)" entry — this
+    # Bundle GUID is confirmed different per-install from the Data
+    # container's own GUID, and there's no equivalent bundle-id map for
+    # it built at metadata-parse time to resolve it the same clean way).
+    # Wildcarding just the GUID segment (not resolving it to a bundle id)
+    # still generalizes usefully in practice: everything AROUND it,
+    # including the real app-identifying "<AppName>.app" folder name
+    # (Signal.app, Telegram.app, ...), stays literal.
+    _GUID_ANYWHERE_RE = re.compile(
+        r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}')
+
+    def _app_scoped_skip_entry(self, ui_path: str) -> str:
+        """The skip-list entry to add for *ui_path*, in priority order:
+        (1) Android external-storage per-app dir → package/relative;
+        (2) a FfsAdapter.container_parents()-recognized app container
+        (Android internal storage, every iOS container shape
+        container_bundle_id can resolve) → bundle-or-package-id/relative;
+        (3) a real Android OS-level multi-user directory → the same path
+        with the per-user numeric id wildcarded; (4) any OTHER real GUID
+        segment found anywhere in the path → the same path with just that
+        segment wildcarded; (5) otherwise, the full literal path, for a
+        genuinely stable system path with no known-variable segment at
+        all. Added 2026-09-24, direct follow-up concern: "there should
+        not be a risk of a user accidentally doing a db that for one app
+        is irrelevant but for another has useful stuff" (tiers 1-2), then
+        "is this true for other location[s]... on both android and ios?"
+        (tiers 3-4, after checking real data rather than assuming either
+        way — see this method's own tier comments above for what was
+        actually confirmed on real archives)."""
+        m = self._ANDROID_EXTERNAL_APP_RE.match(ui_path)
+        if m:
+            return f"{m.group(1)}/{m.group(2)}"
+        for parent in self._adapter.container_parents(self.folder_map):
+            prefix = parent + '/'
+            if ui_path.startswith(prefix):
+                rest = ui_path[len(prefix):]
+                child_name, _, relative = rest.partition('/')
+                bundle_id = self._adapter.container_bundle_id(
+                    f'{parent}/{child_name}', self.guid_to_bundle)
+                if bundle_id and relative:
+                    return f"{bundle_id}/{relative}"
+                break
+        m = self._ANDROID_MULTIUSER_RE.match(ui_path)
+        if m:
+            return f"{m.group(1)}/*{m.group(2) or ''}"
+        g = self._GUID_ANYWHERE_RE.search(ui_path)
+        if g:
+            return ui_path[:g.start()] + '*' + ui_path[g.end():]
+        return ui_path
+
+    def _toggle_embedded_media_skip_list(self, ui_path: str, was_on_list: bool) -> None:
+        """Right-click "Add to"/"Remove from Embedded-Media Skip List" —
+        added 2026-09-24, the natural workflow this feature was actually
+        built for: an examiner reviewing a big database decides right
+        there that it's not worth ever scanning again, rather than
+        having to open the Process Case dialog and type the filename in
+        by hand. Adds via _app_scoped_skip_entry — app-scoped whenever
+        possible, a bare basename only for a file outside any app
+        container — rather than always adding a bare, unscoped filename;
+        a deliberately BROADER entry (matching a filename across every
+        app, e.g. a bundled third-party SDK cache confirmed identical
+        everywhere it appears) is still possible, just only via the
+        "View/Edit List…" dialog's own "Add…" button, where typing a
+        bare filename is a conscious choice rather than this action's
+        own default. Removing targets every entry that currently matches
+        this file (embedded_media_skip_list.find_matching_entries), not
+        a single guessed one, since a scoped entry added here and a
+        broader one added separately via the dialog could both apply to
+        the same file. Shows the ACTUAL entry text added/removed in the
+        status bar, not just the bare filename, so the examiner can see
+        exactly what scope was applied. Reads/writes whichever platform's
+        own store applies to the currently open archive
+        (_skip_list_platform) — never the other platform's list."""
+        platform = self._skip_list_platform()
+        if was_on_list:
+            entries = embedded_media_skip_list.find_matching_entries(
+                ui_path, platform=platform)
+            for entry in entries:
+                embedded_media_skip_list.remove_entry(entry, platform)
+            self.status_bar.showMessage(
+                f"Removed from embedded-media skip list: {', '.join(entries)}", 6000)
+        else:
+            entry = self._app_scoped_skip_entry(ui_path)
+            embedded_media_skip_list.add_entry(entry, platform)
+            self.status_bar.showMessage(
+                f"Added to embedded-media skip list: {entry}", 6000)
+
+    def _search_embedded_media_for_file(self, ui_path: str) -> None:
+        """Manual, single-file "Search for Embedded Media" context-menu
+        action — see SingleFileEmbeddedMediaWorker/Dialog's own
+        docstrings for the full design. Non-modal (.show(), not .exec())
+        so the examiner can keep browsing while it runs, same
+        "don't block the GUI thread" reasoning every other worker in
+        this file already follows — the dialog's own closeEvent/reject
+        guard stop it being closed out from under a still-running
+        worker."""
+        if not self.zip_path or not self._case_dir:
+            return
+        dlg = SingleFileEmbeddedMediaDialog(ui_path, parent=self)
+        # "Scan Anyway" (processing_registry check-first, 2026-09-23):
+        # wired once, here, at dialog creation — restarts the same
+        # search on the same dialog with force_rescan=True, rather than
+        # popping a second window.
+        dlg.scan_anyway_requested.connect(
+            partial(self._run_single_file_embedded_media_search, dlg,
+                    ui_path, True))
+        self._run_single_file_embedded_media_search(dlg, ui_path, False)
+        dlg.show()
+
+    def _run_single_file_embedded_media_search(self, dlg: 'SingleFileEmbeddedMediaDialog',
+                                               ui_path: str, force_rescan: bool) -> None:
+        worker = SingleFileEmbeddedMediaWorker(
+            self.zip_path, self._case_dir, ui_path, self._adapter,
+            force_rescan=force_rescan)
+        dlg._worker = worker
+        self._single_file_embedded_worker = worker
+
+        worker.unsupported.connect(dlg.show_unsupported)
+        worker.already_processed.connect(dlg.show_already_processed)
+        worker.started_scan.connect(dlg.show_scanning)
+        worker.finished_scan.connect(
+            partial(self._on_single_file_embedded_media_finished, dlg))
+
+        worker.start()
+
+    def _on_single_file_embedded_media_finished(self, dlg: 'SingleFileEmbeddedMediaDialog',
+                                                 summary: dict) -> None:
+        dlg.show_result(summary)
+        if summary.get('total_hits', 0) > 0:
+            # Reuses the exact same injection + tree-update logic the
+            # bulk ProcessDialog scan already triggers on its own
+            # completion — a single-file hit needs the identical
+            # treatment (container becomes a real folder, "Embedded
+            # Media" button count refreshed), just reached from a
+            # different trigger.
+            self._on_embedded_media_scan_injected()
+
     def _extract_from_context_menu(self, ui_path: str) -> None:
         """Extract a single archive right-click entry without opening ProcessDialog."""
         if not self.zip_path or not self._case_dir:
@@ -8379,6 +9125,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         for g in groups:
             item = QListWidgetItem(f"{g['name']}  ({g['count']:,})")
             item.setData(Qt.ItemDataRole.UserRole, g['id'])
+            # A small solid-color swatch icon, added 2026-09-25 — direct
+            # request: "make it clear which images are bookmarked... colour
+            # for each bookmark[ed group]." Same color this group's own
+            # files are outlined with in the Media Browser grid (see
+            # MediaGridDelegate.paint's own bookmark-color branch) — one
+            # color, shown in both places, never two independently-chosen
+            # ones that could drift apart.
+            item.setIcon(QIcon(self._bookmark_color_swatch(g.get('color'))))
             if g.get('description'):
                 item.setToolTip(g['description'])
             self._bookmark_list.addItem(item)
@@ -8394,6 +9148,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Pass the already-loaded groups so it doesn't reopen the results DB.
         if hasattr(self, 'search_scope_combo'):
             self._refresh_search_scope_combo(groups)
+
+    def _bookmark_color_swatch(self, color: str | None) -> QPixmap:
+        """A small solid-color square QPixmap for a bookmark group's own
+        list-panel icon (added 2026-09-25) — falls back to the palette's
+        own first color for a group saved before this feature existed
+        (color is None/empty in that case, same as load_bookmark_groups'
+        own fallback)."""
+        pix = QPixmap(12, 12)
+        pix.fill(QColor(color or BOOKMARK_COLOR_PALETTE[0]))
+        return pix
 
     def _fit_bookmark_panel_size(self):
         """Shrink the left splitter's bookmark panel to exactly fit its content."""
@@ -8417,10 +9181,42 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if item is not None:
             group_id = item.data(Qt.ItemDataRole.UserRole)
             menu.addSeparator()
+            color_act = QAction("Change Color…", self)
+            color_act.triggered.connect(partial(self._change_bookmark_group_color, group_id))
+            menu.addAction(color_act)
             del_act = QAction(f"Delete '{item.text().split('  (')[0]}'", self)
             del_act.triggered.connect(partial(self._delete_bookmark_group, group_id))
             menu.addAction(del_act)
         menu.exec(self._bookmark_list.viewport().mapToGlobal(point))
+
+    def _change_bookmark_group_color(self, group_id: int) -> None:
+        """"Change Color…" — added 2026-09-25, the examiner-triggered
+        override for a group's own auto-assigned palette color (see
+        save_bookmark_group's own docstring). Refreshes both the
+        bookmark panel's own swatch icons AND, if a bookmarked file from
+        this group happens to be showing right now, the Media Browser's
+        own outline color for it — one color, two displays, kept in sync
+        rather than needing the examiner to reload anything by hand."""
+        if not self._case_dir:
+            return
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                groups = load_bookmark_groups(db)
+        except Exception:
+            groups = []
+        group = next((g for g in groups if g['id'] == group_id), None)
+        initial = QColor(group['color']) if group and group.get('color') else QColor(BOOKMARK_COLOR_PALETTE[0])
+        color = QColorDialog.getColor(initial, self, "Bookmark Group Color")
+        if not color.isValid():
+            return
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                update_bookmark_group_color(db, group_id, color.name())
+        except Exception as e:
+            QMessageBox.warning(self, "Bookmark Error", str(e))
+            return
+        self._refresh_bookmark_panel()
+        self._refresh_media_bookmark_badges()
 
     def _delete_bookmark_group(self, group_id: int):
         try:
@@ -8430,6 +9226,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             QMessageBox.warning(self, "Bookmark Error", str(e))
             return
         self._refresh_bookmark_panel()
+        self._refresh_media_bookmark_badges()
 
     def _show_bookmark_group(self, group_id: int):
         """Populate the file browser with entries from a bookmark group."""
@@ -8478,6 +9275,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.status_bar.showMessage(
             f"Bookmarks: {group_name}  —  {n:,} entr{'y' if n == 1 else 'ies'}")
 
+        # Refresh the Media tab if it's currently visible — added
+        # 2026-09-25, direct request: "when the bookmark is selected and
+        # you are in media browser if any of the bookmark file[s] they
+        # should show here." Same "refresh media tab if it's currently
+        # visible" convention on_folder_selected already uses for an
+        # ordinary folder click.
+        if self.center_tabs.currentIndex() == 1:
+            self._load_media_from_file_model()
+
     def _is_folder_path(self, ui_path: str) -> bool:
         """True if ui_path is a folder (real or empty directory entry)."""
         return ui_path in self.folder_map or self._is_empty_folder_entry(ui_path)
@@ -8521,12 +9327,24 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 result.append((ui_path, ui_path.rsplit('/', 1)[-1]))
         return result
 
-    def _bookmark_submenu(self, menu: 'QMenu', paths) -> None:
-        """Append a populated Bookmarks submenu to *menu*.
+    def _bookmark_submenu(self, menu: 'QMenu', paths, as_submenu: bool = True) -> None:
+        """Append bookmark actions (existing groups + "New Group…") to
+        *menu*.
 
         *paths* is either a list of (ui_path, display_name) pairs or a
         zero-arg callable returning one — the callable form defers an
         expensive recursive collection until an action is actually clicked.
+
+        *as_submenu* (default True) nests the items under a "Bookmarks"
+        submenu, the shape every right-click context menu here already
+        uses. Pass False to add the SAME items directly onto *menu*
+        instead — added 2026-09-24 for `_show_bookmark_menu_for_paths`'s
+        own standalone popup (the Ctrl+B keyboard-shortcut path, and the
+        Media Browser's own right-click menu), where the whole popup IS
+        already about bookmarking and a nested "Bookmarks ▶" label on it
+        would just be a redundant extra click — reusing this one method
+        either way, so there's exactly one implementation of "what
+        happens when you pick a bookmark target."
         """
         if not self._case_dir or (not callable(paths) and not paths):
             return
@@ -8535,16 +9353,53 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 groups = load_bookmark_groups(db)
         except Exception:
             groups = []
-        bm_menu = menu.addMenu("Bookmarks")
+        target = menu.addMenu("Bookmarks") if as_submenu else menu
         for g in groups:
             act = QAction(f"{g['name']}  ({g['count']:,})", self)
             act.triggered.connect(partial(self._add_to_bookmark_group, paths, g['id']))
-            bm_menu.addAction(act)
+            target.addAction(act)
         if groups:
-            bm_menu.addSeparator()
+            target.addSeparator()
         new_act = QAction("New Group…", self)
         new_act.triggered.connect(partial(self._new_bookmark_group_dialog, paths))
-        bm_menu.addAction(new_act)
+        target.addAction(new_act)
+
+    def _show_bookmark_menu_for_paths(self, paths) -> None:
+        """Pops a small standalone menu (existing groups + "New Group…")
+        at the current cursor position for *paths* — the Ctrl+B keyboard-
+        shortcut's own equivalent of the right-click "Bookmarks"
+        submenu, added 2026-09-24, direct request: "keyboard shortcuts
+        that can be used to bookmark a selection of files." Resolves a
+        lazy callable itself (rather than passing it straight through to
+        `_bookmark_submenu`) purely so an empty selection can show an
+        honest status-bar message instead of silently popping an empty
+        menu."""
+        if not self._case_dir:
+            return
+        resolved = paths() if callable(paths) else paths
+        if not resolved:
+            self.status_bar.showMessage("No files selected to bookmark.", 3000)
+            return
+        menu = QMenu(self)
+        self._bookmark_submenu(menu, resolved, as_submenu=False)
+        menu.exec(QCursor.pos())
+
+    def _on_bookmark_shortcut(self) -> None:
+        """Ctrl+B — bookmark the current selection in whichever of File
+        Browser / Media Browser is currently the active center tab.
+        Added 2026-09-24, direct request: "this should work in file
+        browser and media browser." Quietly does nothing on any other
+        tab (Keyword Search/Artifact Viewer results aren't "a file
+        selection" in the same sense, and were never part of this
+        request)."""
+        idx = self.center_tabs.currentIndex()
+        if idx == 0:
+            paths = self._get_paths_for_bookmark()
+        elif idx == 1:
+            paths = self._get_media_paths_for_bookmark()
+        else:
+            return
+        self._show_bookmark_menu_for_paths(paths)
 
     def _add_to_bookmark_group(self, paths, group_id: int):
         """Save *paths* (list or lazy callable) into an existing bookmark group."""
@@ -8565,6 +9420,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.status_bar.showMessage(
             f"Added {n:,} file{'s' if n != 1 else ''} to '{name}'", 4000)
         self._refresh_bookmark_panel()
+        self._refresh_media_bookmark_badges()
 
     def _new_bookmark_group_dialog(self, paths):
         """Show a dialog to name and describe a new bookmark group, then save."""
@@ -8616,6 +9472,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.status_bar.showMessage(
                 f"Created '{name}' with {n:,} file{'s' if n != 1 else ''}", 4000)
             self._refresh_bookmark_panel()
+            self._refresh_media_bookmark_badges()
 
         ok_btn.clicked.connect(_try_create)
         dlg.exec()
@@ -9367,12 +10224,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _stop(getattr(self, '_hex_worker', None))
         _stop(getattr(self, '_device_info_worker', None))
         _stop(getattr(self, '_thumb_worker', None), method='stop')
+        _stop(getattr(self, '_media_page_prefetch_worker', None), method='stop')
         _stop(getattr(self, '_art_media_thumb_worker', None), method='stop')
         _stop(getattr(self, '_search_index_worker', None), method='stop')
         _stop(getattr(self, 'ex_worker', None), method='cancel')
         _stop(getattr(self, '_sql_preview_worker', None), method='requestInterruption')
+        _stop(getattr(self, '_single_file_embedded_worker', None))
         for w in list(getattr(self, '_retired_workers', [])):
-            _stop(w, has_stop=hasattr(w, 'stop'))
+            # Real, pre-existing bug found 2026-09-24 while verifying the
+            # Media Browser's own worker restarts (a page load, or its
+            # own next-page background prefetch, each retires/restarts a
+            # ThumbnailWorker — see MediaViewerMixin._load_media_page/
+            # _prefetch_next_page — so _retired_workers is populated far
+            # more often than before this feature existed, making this
+            # loop run on close far more routinely than it used to):
+            # `_stop(w, has_stop=hasattr(w, 'stop'))` passed a keyword
+            # `_stop()`'s own signature (`worker, method='quit'`) doesn't
+            # accept at all, raising TypeError inside a Qt eventFilter/
+            # closeEvent call chain on EVERY close where a retired worker
+            # was present. Fixed to actually pick the right method name,
+            # which the variable name (`has_stop`) suggests was the
+            # original intent.
+            _stop(w, method='stop' if hasattr(w, 'stop') else 'quit')
         # SqlHitInterpretWorker instances (app/keyword_search.py) — kept in
         # a dict, not a single attribute, since more than one "Interpret as
         # SQL Record" click can be in flight at once. Each normally finishes

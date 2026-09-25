@@ -52,6 +52,26 @@ def _iter_pattern_hits(data_lower: bytes, patterns: list):
 _SCOPE_SEP = '\x00'
 
 
+def format_byte_size(sz) -> str:
+    """Human-readable "N unit" for a byte count (B/KB/MB/GB/TB), or an
+    em-dash for None/negative. Promoted here from
+    _show_search_scope_files_dialog's own private closure 2026-09-23 (a
+    second real caller emerged: EmbeddedMediaScanWorker's own per-file
+    progress display, ffs-explorer.py — direct request that a slow scan
+    show the size of what it's currently working on, so an examiner can
+    tell "this is just a big file" from "this looks stuck"). Nothing in
+    this function's own logic was ever search-specific."""
+    if sz is None or sz < 0:
+        return "—"
+    if sz == 0:
+        return "0 B"
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if sz < 1024:
+            return f"{sz:,.0f} {unit}" if unit == 'B' else f"{sz:,.1f} {unit}"
+        sz /= 1024
+    return f"{sz:,.1f} TB"
+
+
 def _encode_search_key(term: str, scope_label: str) -> str:
     """Return the DB key for (term, scope_label).  'all files' scope uses just term."""
     if scope_label == 'all files':
@@ -1517,17 +1537,7 @@ class KeywordSearchMixin:
         ui_paths = self._current_scope_ui_paths or []
         full_meta = getattr(self, 'full_metadata', {})
         _zero_colour = QColor(160, 160, 160)
-
-        def _fmt_size(sz):
-            if sz is None or sz < 0:
-                return "—"
-            if sz == 0:
-                return "0 B"
-            for unit in ('B', 'KB', 'MB', 'GB'):
-                if sz < 1024:
-                    return f"{sz:,.0f} {unit}" if unit == 'B' else f"{sz:,.1f} {unit}"
-                sz /= 1024
-            return f"{sz:,.1f} TB"
+        _fmt_size = format_byte_size
 
         dlg = QDialog(self)
         n = len(ui_paths)

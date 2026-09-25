@@ -88,6 +88,27 @@ _MEDIA_MAGIC_KIND = {'Picture': 'image', 'Video': 'video'}
 _HTTP_STATUS_RE = re.compile(rb'^HTTP/\d\.\d \d{3}')
 
 
+def scan_logic_version() -> str:
+    """Short content hash of this module's own source — the staleness
+    key for the generic processing_registry table (db_utils.py,
+    capability='embedded_media_scan'), same auto-derived technique
+    leveldb_decode_logic_version()/app_intelligence.scan_logic_version()
+    already use for the identical problem (a cached "already processed"
+    marker silently going stale the moment the underlying scan logic
+    improves, with no signal anything's wrong). Never hand-authored, so
+    it can't drift from what's actually on disk — the NEXT
+    classify_media_blob/scan_sqlite_deleted improvement automatically
+    makes every previously-scanned file eligible for reprocessing again,
+    rather than needing this bumped by hand and inevitably forgotten
+    once."""
+    import hashlib
+    try:
+        with open(__file__, 'rb') as f:
+            return hashlib.blake2b(f.read(), digest_size=8).hexdigest()
+    except OSError:
+        return 'unknown'
+
+
 # ── candidate discovery (no I/O — mirrors _count_header_candidates' own
 #    "count before touching bytes" idiom in ffs-explorer.py) ───────────
 
@@ -532,3 +553,113 @@ def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES):
             'kind': kind, 'ext': ext, 'http_headers': http_headers,
             'recovered': False, 'recovery_source': 'plist',
         }
+
+
+# ── manual, single-file entry point ("Search for Embedded Media" ──────
+#    context-menu action) plus the shared per-container orchestration
+#    both that and the bulk EmbeddedMediaScanWorker use ──────────────
+
+def classify_container_type(raw: bytes) -> str | None:
+    """'sqlite' | 'plist' | None, from the file's OWN real magic bytes —
+    ignoring any pre-existing extension/Type label entirely. Added
+    2026-09-23 for the manual, single-file "Search for Embedded Media"
+    context-menu action (ffs-explorer.py), which deliberately re-checks
+    the real header even for a file already confidently typed some other
+    way — "just in case wrong ext" was the direct request.
+
+    A real, closed gap versus classify_scan_candidate's own BULK
+    enumeration (see that function's own docstring for why it's scoped
+    the way it is): a bulk scan deliberately avoids reading file content
+    at all for cost reasons (checking thousands of candidates cheaply),
+    so it only ever recognizes a binary plist via a header-scan override
+    (bplist00 magic) or the '.plist' extension — genuinely missing a real
+    XML-format plist with no '.plist' extension. This function reads the
+    real bytes already in hand for the ONE file a manual check is run
+    against, so it can also recognize a genuine XML plist directly (a
+    real '<?xml' declaration followed by a real '<plist' element, not
+    just any XML file) — the third of the three real container types
+    this feature looks for, alongside SQLite and binary plist."""
+    if raw[:16] == b'SQLite format 3\x00':
+        return 'sqlite'
+    if raw[:6] == b'bplist':
+        return 'plist'
+    head = raw[:512].lstrip()
+    if head[:5] == b'<?xml' and b'<plist' in head:
+        return 'plist'
+    return None
+
+
+def _build_hit_row(ui_path: str, source_kind: str, location: str,
+                   scan_dir: str, hit: dict, scan_scope: str) -> dict:
+    """One embedded_media_hits row dict, ready for db_utils.
+    save_embedded_media_hits — shared by scan_container below and (until
+    2026-09-23) duplicated inline in EmbeddedMediaScanWorker._build_row."""
+    sha, path = extract_media_bytes(scan_dir, hit['blob'], hit['ext'])
+    headers = hit.get('http_headers') or {}
+    return {
+        'source_ui_path': ui_path,
+        'source_kind': source_kind,
+        'location': location,
+        'display_name': compute_display_name(ui_path, source_kind, location, hit),
+        'media_kind': hit['kind'],
+        'extracted_path': path,
+        'sha256': sha,
+        'byte_length': len(hit['blob']),
+        'recovered': int(bool(hit.get('recovered'))),
+        'recovery_source': hit.get('recovery_source'),
+        'http_wrapped': int(bool(hit.get('http_headers'))),
+        'content_type_hint': headers.get('content-type'),
+        'scan_scope': scan_scope,
+    }
+
+
+def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
+                   scan_scope: str, wal_bytes: bytes | None = None) -> list[dict]:
+    """Scan one already-classified container's raw bytes for embedded
+    media and return ready-to-save embedded_media_hits row dicts. Moved
+    here 2026-09-23 out of EmbeddedMediaScanWorker's own per-candidate
+    loop (ffs-explorer.py) so a second real caller — the manual single-
+    file "Search for Embedded Media" action — doesn't duplicate it;
+    that worker now calls this too.
+
+    *kind* is 'sqlite' or 'plist' (from either classify_scan_candidate's
+    bulk, extension/override-based check, or classify_container_type's
+    real-header check above — this function only cares which one was
+    decided, not how). For 'sqlite', *raw* is written to a real temp
+    file for the LIVE scan (SQLite's own engine needs a real path to
+    follow a BLOB's overflow chain — see scan_sqlite_live's own
+    docstring), then scanned again directly off *raw* (+ *wal_bytes*, if
+    given) for deleted content via scan_sqlite_deleted."""
+    rows: list[dict] = []
+    if kind == 'plist':
+        for hit in scan_plist_bytes(raw):
+            rows.append(_build_hit_row(ui_path, 'plist', hit['plist_path'],
+                                       scan_dir, hit, scan_scope))
+        return rows
+
+    # kind == 'sqlite'
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+        for hit in scan_sqlite_live(tmp_path):
+            location = f"{hit['table']}.{hit['column']} (rowid={hit['rowid']})"
+            rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
+    except Exception:
+        pass
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    try:
+        for hit in scan_sqlite_deleted(raw, wal_bytes=wal_bytes):
+            location = (f"rowid={hit.get('rowid')} (page {hit.get('page')}, "
+                       f"{hit.get('recovery_source')})")
+            rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
+    except Exception:
+        pass
+    return rows

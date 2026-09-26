@@ -92,7 +92,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QTreeWidget, QTreeWidgetItem, QTextEdit,
                               QListWidget, QListWidgetItem, QDateEdit,
                               QRadioButton, QButtonGroup, QInputDialog, QSpinBox,
-                              QColorDialog)
+                              QColorDialog, QStyleFactory)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QColor, QIcon, QShortcut, QKeySequence, QCursor, QPixmap)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QDate,
@@ -136,6 +136,7 @@ def _build_cached_zip_view(zip_path: str, case_dir: str) -> "CachedZipView | Non
 _TREE_PLACEHOLDER  = "__placeholder__"
 _BM_ROOT           = "__bookmarks__"
 _BM_GROUP_PREFIX   = "__bm_group_"
+_SELECTED_ROOT_MARKER = "__selected_only_root__"   # UserRole data for the "Selected Only" synthetic tree root
 
 _SETTINGS_ORG = "KlasScripts"
 _SETTINGS_APP = "FFS Explorer"
@@ -178,14 +179,16 @@ def _load_prefs() -> dict:
         # through this function.
         'media_page_size': s.value('media_page_size', 500, type=int),
         # Whether the Media Browser hides a file already marked "seen"
-        # (the "Not Interested" button's own bulk-marking target) —
-        # added 2026-09-24, direct request: "in the setting there should
-        # be an option to show or hide seen files." Off by default —
-        # showing everything unless the examiner deliberately opts into
-        # hiding, matching this project's own standing "escalate, never
-        # silently discard" rule for anything that could hide real
-        # content from review.
-        'media_hide_seen': s.value('media_hide_seen', False, type=bool),
+        # (the "Not Relevant" button's own bulk-marking target) — added
+        # 2026-09-24, direct request: "in the setting there should be an
+        # option to show or hide seen files." Defaulted True 2026-09-25
+        # per direct follow-up: marking a file "Not Relevant" is a
+        # deliberate dismissal, so leaving it visible read as broken, not
+        # cautious — see _media_hide_seen_pref's own docstring
+        # (media_viewer.py) for the full reasoning. A bookmarked file is
+        # never hidden by this regardless, see
+        # MediaViewerMixin._recompute_media_all_paths.
+        'media_hide_seen': s.value('media_hide_seen', True, type=bool),
     }
 
 
@@ -200,7 +203,7 @@ def _save_prefs(prefs: dict):
     s.setValue('ai_dev_persist_credentials',
               bool(prefs.get('ai_dev_persist_credentials', False)))
     s.setValue('media_page_size', int(prefs.get('media_page_size', 500)))
-    s.setValue('media_hide_seen', bool(prefs.get('media_hide_seen', False)))
+    s.setValue('media_hide_seen', bool(prefs.get('media_hide_seen', True)))
 
 
 # Formatted archive sizes, keyed by path.  Stat-ing every archive on each
@@ -1083,9 +1086,9 @@ def _show_scan_folders_dialog(parent, adapter) -> None:
     self.format), not a generic combined list, so the examiner can judge
     the real boundary rather than trust a description of it. Shared by
     ProcessDialog's own pre-existing "Scanned Folders…" button (format
-    already known there) and CaseSettingsDialog's new one (format detected
-    on demand — see _DetectFormatWorker, since this dialog runs before the
-    archive is otherwise opened at all)."""
+    already known there) and, formerly, CaseSettingsDialog's own "Show
+    scan locations…" button (removed 2026-09-26 along with its whole
+    tier picker — see CaseSettingsDialog's own docstring)."""
     dlg = QDialog(parent)
     dlg.setWindowTitle("Header Scan Coverage")
     dlg.setMinimumSize(520, 300)
@@ -1110,49 +1113,6 @@ def _show_scan_folders_dialog(parent, adapter) -> None:
     btn_row.addWidget(close_btn)
     lay.addLayout(btn_row)
     dlg.exec()
-
-
-class _DetectFormatWorker(QThread):
-    """One-off, on-demand format detection for CaseSettingsDialog's own
-    "Show scan locations…" button — this dialog runs BEFORE any case
-    folder exists at all (the whole point of it is to CHOOSE one), so
-    there is structurally no .zcd possible yet (it lives inside the case
-    folder). Genuinely different from every other site in this project
-    fixed the same day for the same underlying issue — those all had a
-    real .zcd available and simply weren't using it; this one has no
-    case_dir to build one from at all.
-
-    Still never opens the main archive via raw zipfile.ZipFile, per this
-    project's own standing Convention having no exception for that either
-    way: uses zip_cd_cache._extract_cd_payload directly (the exact same
-    raw-seek EOCD/CD read zip_cd_cache.save() itself uses to build a real
-    .zcd — no case_dir needed, since it only returns bytes rather than
-    writing them anywhere), then parses that small in-memory payload via
-    zipfile.ZipFile(io.BytesIO(...)) — the identical sanctioned pattern
-    zip_cd_cache.load() already uses for its own cached-payload parse,
-    never a raw open of the main archive. Confirmed safe: FfsAdapter.
-    detect()'s own internal checks (_is_graykey/_has_ut_extras) only ever
-    read each ZipInfo's `.extra` field and `.infolist()` — pure central-
-    directory metadata, never actual entry content — so a CD-only payload
-    is sufficient, not a partial/incorrect substitute."""
-    done  = Signal(object)   # FfsAdapter, or None on failure
-    error = Signal(str)
-
-    def __init__(self, zip_path: str, parent=None):
-        super().__init__(parent)
-        self._zip_path = zip_path
-
-    def run(self):
-        try:
-            import io
-            from zip_cd_cache import _extract_cd_payload
-            payload = _extract_cd_payload(self._zip_path)
-            with zipfile.ZipFile(io.BytesIO(payload)) as z:
-                names = frozenset(z.namelist())
-                adapter = FfsAdapter.detect(z, names)
-            self.done.emit(adapter)
-        except Exception as e:
-            self.error.emit(str(e))
 
 
 def _count_header_candidates(ui_metadata: dict, ffs_adapter, tier: int = 1) -> int:
@@ -1946,6 +1906,11 @@ class FileTableModel(QAbstractTableModel):
 
     filter_progress = Signal(int, int)   # (visible, total)
     filter_done     = Signal(int, int)   # (visible, total)
+    # (ui_path, is_folder, checked) — the new far-left tickbox column's own
+    # checkbox toggle, added 2026-09-26 (see the class-level _checked_paths
+    # docstring below); FastZipBrowser._on_file_row_check_toggled is the
+    # one connected slot, in _set_file_model.
+    check_toggled   = Signal(str, bool, bool)
 
     _GREY_COLOR        = QColor(Qt.GlobalColor.darkGray)
     _BOLD_FONT         = QFont("Arial", weight=QFont.Weight.ExtraBold)
@@ -1955,6 +1920,20 @@ class FileTableModel(QAbstractTableModel):
     # injected by _set_file_model so every model construction site gets them.
     _research_fg  = None
     _research_tip = None
+
+    # {ui_path: "#rrggbb"} for the Name column's own background tint — the
+    # bookmark group a file belongs to (earliest group on a multi-group
+    # file, matching db_utils.load_bookmark_colors' own rule), injected by
+    # _set_file_model the same way as the research callbacks above. Added
+    # 2026-09-26, direct request: "can the filename cell for the bookmarked
+    # file in backgroud be the colour of the bookmark[?] so when you look
+    # at the files in the folder you can see the bookmark against the
+    # other files" — the right-click "Select Bookmarked Files" action
+    # (see that method's own docstring) selects a bookmark's CONTAINING
+    # folder(s), not the individual files, so browsing into one of those
+    # folders shows the bookmarked file mixed in with every other real
+    # file there; this is what lets it still stand out.
+    _bookmark_colors: dict = {}
 
     def __init__(self, headers, parent=None):
         super().__init__(parent)
@@ -1968,6 +1947,32 @@ class FileTableModel(QAbstractTableModel):
         self._sort_order: Qt.SortOrder = Qt.SortOrder.AscendingOrder
         self._show_files   = True
         self._show_folders = True
+        # {ui_path} currently ticked in the new far-left tickbox column —
+        # added 2026-09-26, direct request: "is it possible that the
+        # folder[s] are shown in the selected view because a single file
+        # is selected[?] lets have a column at the far left that is a
+        # tick box so a single file can be selected." Deliberately a
+        # SYNTHETIC column (columnCount() = len(_headers) + 1, real
+        # headers shifted +1) rather than a real entry in self._headers —
+        # keeps it permanently pinned at the far left, unhideable and
+        # unhidden-from the Columns dialog, with no special-case exclusion
+        # logic needed in every column-management method. Pushed here by
+        # FastZipBrowser._refresh_file_checked_paths (set_checked_paths)
+        # any time self._checked_folders/_checked_files changes, and once
+        # on every model swap — this set is display-only, never the
+        # authoritative selection state itself.
+        self._checked_paths: set = set()
+
+    def set_checked_paths(self, paths) -> None:
+        """Update which rows render their far-left checkbox as ticked and
+        repaint that column. paths is display-only state — the real
+        selection lives in FastZipBrowser._checked_folders/_checked_files;
+        this only controls what CheckStateRole returns."""
+        self._checked_paths = set(paths)
+        if self._rows:
+            top = self.index(0, 0)
+            bottom = self.index(len(self._rows) - 1, 0)
+            self.dataChanged.emit(top, bottom, [Qt.ItemDataRole.CheckStateRole])
 
     # ── required overrides ──────────────────────────────────────────────────
 
@@ -1975,26 +1980,58 @@ class FileTableModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self._rows)
 
     def columnCount(self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()):
-        return 0 if parent.isValid() else len(self._headers)
+        # +1 for the synthetic far-left tickbox column — see _checked_paths.
+        return 0 if parent.isValid() else len(self._headers) + 1
+
+    def flags(self, index: QModelIndex | QPersistentModelIndex):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if index.column() == 0:
+            return base | Qt.ItemFlag.ItemIsUserCheckable
+        return base
 
     def data(self, index: QModelIndex | QPersistentModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or index.row() >= len(self._rows):
             return None
         row = self._rows[index.row()]
         col = index.column()
-        if role == Qt.ItemDataRole.DisplayRole:
-            cols = row[0]
-            return cols[col] if col < len(cols) else None
+        # UserRole/UserRole+1 are column-independent by design (many call
+        # sites read them via .index(row, 0) regardless of which column is
+        # actually visible/checked) — resolved before the col==0 branch so
+        # the new checkbox column doesn't break any of them.
         if role == Qt.ItemDataRole.UserRole:
             return row[1]
         if role == Qt.ItemDataRole.UserRole + 1:
             return row[2]
+        if col == 0:
+            if role == Qt.ItemDataRole.CheckStateRole:
+                return (Qt.CheckState.Checked if row[1] in self._checked_paths
+                        else Qt.CheckState.Unchecked)
+            return None
+        real_col = col - 1
+        if role == Qt.ItemDataRole.DisplayRole:
+            cols = row[0]
+            return cols[real_col] if real_col < len(cols) else None
         if role == Qt.ItemDataRole.ForegroundRole:
             if self._research_fg is not None:
                 c = self._research_fg(row[1])
                 if c is not None:
                     return c
             return self._GREY_COLOR if row[4] else None
+        if role == Qt.ItemDataRole.BackgroundRole and real_col == 0 and self._bookmark_colors:
+            color_hex = self._bookmark_colors.get(row[1])
+            if color_hex:
+                # Translucent, not the group's own full-saturation color —
+                # same "tint, don't paint over" convention this project's
+                # own sqlite_viewer.py WAL-diff/segb_viewer.py deleted-
+                # record highlighting already use, so filenames stay
+                # readable in both light and dark mode regardless of
+                # which bookmark color a group happens to use.
+                c = QColor(color_hex)
+                c.setAlpha(70)
+                return c
+            return None
         if role == Qt.ItemDataRole.ToolTipRole:
             return self._research_tip(row[1]) if self._research_tip else None
         if role == Qt.ItemDataRole.FontRole:
@@ -2003,15 +2040,40 @@ class FileTableModel(QAbstractTableModel):
             return None
         return None
 
+    def setData(self, index: QModelIndex | QPersistentModelIndex, value, role: int = Qt.ItemDataRole.EditRole) -> bool:
+        if (not index.isValid() or role != Qt.ItemDataRole.CheckStateRole
+                or index.column() != 0 or index.row() >= len(self._rows)):
+            return False
+        row = self._rows[index.row()]
+        try:
+            state = Qt.CheckState(value)
+        except (TypeError, ValueError):
+            state = value
+        checked = state == Qt.CheckState.Checked
+        if checked:
+            self._checked_paths.add(row[1])
+        else:
+            self._checked_paths.discard(row[1])
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        self.check_toggled.emit(row[1], row[2] >= 0, checked)
+        return True
+
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
-        if orientation == Qt.Orientation.Horizontal and 0 <= section < len(self._headers):
+        if orientation != Qt.Orientation.Horizontal:
+            return None
+        if section == 0:
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return 'Tick to select this file (or folder) for "Selected only"'
+            return None
+        real_section = section - 1
+        if 0 <= real_section < len(self._headers):
             if role == Qt.ItemDataRole.DisplayRole:
-                return self._headers[section]
+                return self._headers[real_section]
             if role == Qt.ItemDataRole.ToolTipRole:
                 # Modified/Changed can carry a " (handset: ...)"-style
                 # suffix when a non-UTC timestamp-display mode is active —
                 # strip it so the lookup still matches the bare key.
-                header = self._headers[section].split(' (', 1)[0]
+                header = self._headers[real_section].split(' (', 1)[0]
                 return _HEADER_TOOLTIPS.get(header)
         return None
 
@@ -2135,17 +2197,22 @@ class FileTableModel(QAbstractTableModel):
     # ── sorting ──────────────────────────────────────────────────────────────
 
     def sort(self, column, order=Qt.SortOrder.AscendingOrder):
-        """Sort both _all_rows and _rows so sort survives re-filtering."""
+        """Sort both _all_rows and _rows so sort survives re-filtering.
+        column is the real QTableView/model column (checkbox column 0
+        included) — shifted back down to _headers/cols space below."""
+        if column == 0:
+            return  # the tickbox column isn't sortable
+        real_column = column - 1
         self.layoutAboutToBeChanged.emit()
         self._sort_col = column
         self._sort_order = order
         reverse = (order == Qt.SortOrder.DescendingOrder)
-        if column == self._files_col:
+        if real_column == self._files_col:
             key = itemgetter(2)   # C-level accessor — faster than a lambda on large row lists
-        elif column == self._size_col:
-            key = lambda r: int(r[0][column].replace(',', '')) if column < len(r[0]) and r[0][column] else 0
+        elif real_column == self._size_col:
+            key = lambda r: int(r[0][real_column].replace(',', '')) if real_column < len(r[0]) and r[0][real_column] else 0
         else:
-            key = lambda r: r[0][column].lower() if column < len(r[0]) and r[0][column] else ''
+            key = lambda r: r[0][real_column].lower() if real_column < len(r[0]) and r[0][real_column] else ''
         self._all_rows.sort(key=key, reverse=reverse)
         self._rows.sort(key=key, reverse=reverse)
         self.layoutChanged.emit()
@@ -2256,7 +2323,25 @@ class CaseSettingsDialog(QDialog):
     The case folder is created as  <base>/<zip_stem>/  and stores:
       • casedata.db    — thumbnails and search results
       • Export/        — extracted files
-    """
+
+    SUPERSEDED DESIGN, 2026-09-25/26 (kept as history, not a current API to
+    call into): this dialog used to also offer a header-scan tier picker
+    and a "Look for zip archives to extract" checkbox, running a real
+    background header scan the moment this dialog was accepted and
+    auto-opening archive selection once it finished. Per direct follow-up
+    instruction the SAME day ("instead of doing the head[er] scan in the
+    background can we instead just[,] after the user has selected how
+    they want to deal with the time and date[,] the ok should be tied to
+    opening process case and the hash check should be checked[,] the
+    tier one should be ticked, zip and embedded media[?]"), that whole
+    background-scan mechanism was replaced: this dialog now asks ONLY for
+    the case folder name, and the case-creation flow instead hands off
+    entirely to Process Case (opened, pre-ticked but NOT auto-run, right
+    after the first-load Timestamp Display dialog's OK — see
+    FastZipBrowser._open_process_dialog_for_new_case and
+    app/timestamp_display.py's _timestamp_display_dialog). See
+    ProcessDialog's own tier-upgrade/embedded-media/nested-archive
+    controls for where those choices now live."""
 
     def __init__(self, zip_path: str, base_folder: str, parent=None):
         super().__init__(parent)
@@ -2292,43 +2377,6 @@ class CaseSettingsDialog(QDialog):
         self._name_edit.textChanged.connect(self._on_name_changed)
         layout.addWidget(self._name_edit)
 
-        # Header scan tier — always at least Tier 1, per direct instruction
-        # ("I want to have only the 3 options available so unknown files
-        # are always typed") — there is deliberately no "don't scan"
-        # choice; unknown-extension files always get a real type. See
-        # TODO.md item 20 for the full three-tier design, and
-        # _header_candidate_matches for the shared predicate every tier
-        # ultimately runs through.
-        layout.addWidget(QLabel("<b>Header scan (file type recognition)</b>"))
-        self._detect_worker: '_DetectFormatWorker | None' = None
-        self._tier_group = QButtonGroup(self)
-        self._rb_tier1 = QRadioButton(_HEADER_SCAN_TIER_LABELS[1])
-        self._rb_tier2 = QRadioButton(_HEADER_SCAN_TIER_LABELS[2])
-        self._rb_tier3 = QRadioButton(_HEADER_SCAN_TIER_LABELS[3])
-        for t, rb in ((1, self._rb_tier1), (2, self._rb_tier2), (3, self._rb_tier3)):
-            self._tier_group.addButton(rb, t)
-            layout.addWidget(rb)
-        self._rb_tier1.setChecked(True)
-        self._prev_tier_id = 1
-        self._tier_group.idClicked.connect(self._on_tier_clicked)
-
-        self._tier_coverage_label = QLabel()
-        self._tier_coverage_label.setWordWrap(True)
-        self._tier_coverage_label.setStyleSheet("color: grey; padding-left: 4px;")
-        layout.addWidget(self._tier_coverage_label)
-
-        locations_row = QHBoxLayout()
-        locations_row.addStretch()
-        self._locations_btn = QPushButton("Show scan locations…")
-        self._locations_btn.setToolTip(
-            "Show the real app/user-accessible folders Tier 1/2 restrict "
-            "to for this archive's own detected format.")
-        self._locations_btn.clicked.connect(self._on_show_locations)
-        locations_row.addWidget(self._locations_btn)
-        layout.addLayout(locations_row)
-
-        self._update_tier_coverage_label()
-
         layout.addStretch()
 
         # Buttons
@@ -2340,47 +2388,6 @@ class CaseSettingsDialog(QDialog):
 
     def _on_name_changed(self):
         self._save_btn.setEnabled(bool(self._name_edit.text().strip()))
-
-    def _on_tier_clicked(self, tier_id: int):
-        """Tier 3 gets its own confirm gate, per direct instruction — it's
-        the exhaustive, no-folder-restriction tier, real cost for usually
-        little gain (see TODO.md item 20). Declining reverts the
-        selection to whatever was previously chosen and leaves THIS
-        dialog open — never closes/cancels it — so the examiner can
-        immediately pick a different tier instead of starting over."""
-        if tier_id == 3 and not _confirm_tier3(self):
-            prev_btn = self._tier_group.button(self._prev_tier_id)
-            self._tier_group.blockSignals(True)
-            prev_btn.setChecked(True)
-            self._tier_group.blockSignals(False)
-            self._update_tier_coverage_label()
-            return
-        self._prev_tier_id = tier_id
-        self._update_tier_coverage_label()
-
-    def _update_tier_coverage_label(self):
-        tier = self._tier_group.checkedId()
-        checked = _HEADER_SCAN_TIER_COVERAGE.get(tier, {}).get('checked', '')
-        self._tier_coverage_label.setText(f"Covers: {checked}" if checked else "")
-
-    def _on_show_locations(self):
-        self._locations_btn.setEnabled(False)
-        self._locations_btn.setText("Detecting…")
-        self._detect_worker = _DetectFormatWorker(self._zip_path, self)
-        self._detect_worker.done.connect(self._on_format_detected)
-        self._detect_worker.error.connect(self._on_format_detect_error)
-        self._detect_worker.start()
-
-    def _on_format_detected(self, adapter):
-        self._locations_btn.setEnabled(True)
-        self._locations_btn.setText("Show scan locations…")
-        _show_scan_folders_dialog(self, adapter)
-
-    def _on_format_detect_error(self, message: str):
-        self._locations_btn.setEnabled(True)
-        self._locations_btn.setText("Show scan locations…")
-        QMessageBox.warning(self, "Could Not Detect Format",
-                            f"Could not read this archive to detect its format:\n\n{message}")
 
     def _on_save(self):
         base = self._base_folder
@@ -2415,10 +2422,6 @@ class CaseSettingsDialog(QDialog):
     @property
     def case_dir(self) -> str | None:
         return self._accepted_dir
-
-    @property
-    def header_scan_tier(self) -> int:
-        return self._tier_group.checkedId()
 
 
 class PreferencesDialog(QDialog):
@@ -2543,15 +2546,16 @@ class PreferencesDialog(QDialog):
         self._media_hide_seen_check = QCheckBox(
             "Hide files already marked as seen")
         self._media_hide_seen_check.setChecked(
-            bool(prefs.get('media_hide_seen', False)))
+            bool(prefs.get('media_hide_seen', True)))
         layout.addWidget(self._media_hide_seen_check)
         layout.addWidget(note_label(
             "A file becomes \"seen\" via the Media Browser's own \"Not "
-            "Interested ▶\" button (marks a whole page at once, except "
+            "Relevant ▶\" button (marks a whole page at once, except "
             "any bookmarked file — a bookmark is itself a statement "
-            "that the file IS of interest). Off by default: showing "
-            "everything unless you choose to hide it. Takes effect the "
-            "next time a folder is loaded."))
+            "that the file IS of interest, and is never hidden by this "
+            "regardless). On by default, since marking something \"Not "
+            "Relevant\" is meant to get it out of the way. Takes effect "
+            "the next time a folder is loaded."))
 
         # ── AI Access ─────────────────────────────────────────────────────────
         sep2 = QFrame()
@@ -3510,8 +3514,15 @@ class ProcessDialog(QDialog):
 
     def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
                  delta=None, preselect_nested=False,
-                 auto_archive_selection=False, is_android=False, parent=None):
+                 auto_archive_selection=False,
+                 preselect_tier1=False, preselect_embedded_media=False,
+                 is_android=False, parent=None):
         super().__init__(parent)
+        # preselect_tier1/preselect_embedded_media (added 2026-09-26) are
+        # for FastZipBrowser._open_process_dialog_for_new_case — the
+        # first-load flow that hands off from the Timestamp Display
+        # dialog straight to here with sensible defaults pre-ticked
+        # (never auto-run — see that method's own docstring for why).
         # Which platform's own embedded-media skip list applies to this
         # case — see embedded_media_skip_list.py's own "one list per
         # platform" entry, 2026-09-24.
@@ -3579,11 +3590,13 @@ class ProcessDialog(QDialog):
 
         layout.addWidget(QLabel("<hr><b>Operations</b>"))
 
-        # Header scan: UPGRADE-ONLY, per direct instruction — every case now
-        # gets at least Tier 1 automatically at creation (CaseSettingsDialog
-        # no longer offers "don't scan"), so this dialog only ever offers
-        # tiers STRICTLY HIGHER than whatever already ran; there is no
-        # downgrade and no re-running the same tier. See TODO.md item 20.
+        # Header scan: UPGRADE-ONLY — no downgrade and no re-running an
+        # already-done tier (a fresh case may genuinely sit at Tier 0,
+        # never scanned at all — case creation no longer auto-runs a scan
+        # of its own; this dialog is opened pre-ticked to Tier 1 instead,
+        # see FastZipBrowser._open_process_dialog_for_new_case — so Tier 0
+        # is an ordinary starting state here, not just a legacy-case
+        # edge case). See TODO.md item 20.
         layout.addWidget(QLabel("<b>Header scan</b>"))
         header_status_row = QHBoxLayout()
         self._header_status_label = QLabel()
@@ -3597,21 +3610,32 @@ class ProcessDialog(QDialog):
         header_status_row.addWidget(scan_folders_btn)
         layout.addLayout(header_status_row)
 
-        # Plain checkboxes, manually kept mutually exclusive, NOT a
-        # QRadioButton/QButtonGroup — a real Qt quirk found and worked
-        # around directly: an exclusive-group radio button cannot be
-        # reliably programmatically unchecked back to "nothing selected"
-        # from within its own click handler (confirmed by direct testing,
-        # even deferred via QTimer.singleShot — QButtonGroup.checkedId()
-        # kept reporting the just-clicked id regardless). This dialog
-        # genuinely needs a "nothing chosen yet" state (unlike
-        # CaseSettingsDialog's picker, which always starts on Tier 1), so
-        # checkboxes with hand-rolled exclusivity (confirmed reliable —
-        # setChecked(False) from within a checkbox's own toggled handler
-        # works exactly as expected) are used instead.
+        # A real QButtonGroup/QRadioButton set — added 2026-09-26, direct
+        # request: "the process case dialog should have a radiobutton
+        # group for the 3 tiers and default to tier 1 if not already
+        # run[;] a user can then decide to upgrade." Previously this was
+        # a set of manually-exclusive QCheckBoxes with NO default
+        # selection, per a real Qt quirk found and worked around at the
+        # time: an exclusive-group radio button couldn't be reliably
+        # programmatically unchecked back to "nothing selected" from
+        # within its own click handler (confirmed by direct testing —
+        # QButtonGroup.checkedId() kept reporting the just-clicked id
+        # regardless, even deferred via QTimer.singleShot). That quirk
+        # only mattered because the old design needed a genuine "nothing
+        # chosen yet" state; this new design never does — there is
+        # ALWAYS a default selection (the lowest tier not yet run, Tier 1
+        # for a fresh case), so a real radio group works cleanly:
+        # switching the checked button to a DIFFERENT valid tier (as
+        # opposed to unchecking to nothing) is a normal, reliable
+        # QButtonGroup operation. All three tiers are always shown, not
+        # just the remaining upgrades — one already run is disabled and
+        # labeled "(already run)" for context, rather than disappearing,
+        # so the group reads as the case's whole progression at a glance.
         self._tier_radios_container = QVBoxLayout()
         layout.addLayout(self._tier_radios_container)
-        self._tier_upgrade_cbs: dict[int, QCheckBox] = {}
+        self._tier_button_group = QButtonGroup(self)
+        self._tier_button_group.setExclusive(True)
+        self._tier_radios: dict[int, QRadioButton] = {}
         self._selected_upgrade_tier = 0
         self._current_tier = 0
         self._rebuild_tier_upgrade_ui()
@@ -3733,6 +3757,14 @@ class ProcessDialog(QDialog):
             self._chk_integrity.setChecked(False)
             self._chk_nested.setChecked(True)
             QTimer.singleShot(0, self._run_operations)
+        # preselect_tier1/preselect_embedded_media — the new-case flow's
+        # own defaults (see FastZipBrowser._open_process_dialog_for_new_case)
+        # — tick the boxes but deliberately never auto-run; the examiner
+        # reviews and clicks Run themselves.
+        if preselect_tier1 and 1 in self._tier_radios:
+            self._tier_radios[1].setChecked(True)
+        if preselect_embedded_media:
+            self._chk_embedded_media.setChecked(True)
 
     # ── Stats display ─────────────────────────────────────────────────────────
 
@@ -3828,6 +3860,15 @@ class ProcessDialog(QDialog):
             return []
 
     def _refresh_stats(self):
+        if not hasattr(self, '_stats_label'):
+            # _rebuild_tier_upgrade_ui's own initial call (from __init__)
+            # now programmatically selects a default tier radio — added
+            # 2026-09-26 — which fires _on_process_tier_toggled ->
+            # _refresh_stats before _stats_label exists yet (it's built
+            # later in __init__). Harmless no-op here: __init__'s own
+            # final _refresh_stats() call, after every widget exists,
+            # renders the correct state either way.
+            return
         last = self._load_last_run()
 
         lines = []
@@ -3925,27 +3966,62 @@ class ProcessDialog(QDialog):
             return 0
 
     def _rebuild_tier_upgrade_ui(self):
-        """(Re)builds the upgrade-only tier checkboxes for whatever tier
-        is currently persisted for self._case_dir — called once from
-        __init__ and again from _browse_case, since switching case
-        folders can genuinely switch which tiers are still available to
-        upgrade to (a different case may already be further along)."""
-        for cb in self._tier_upgrade_cbs.values():
-            cb.deleteLater()
+        """(Re)builds the tier radio group for whatever tier is currently
+        persisted for self._case_dir — called once from __init__ and
+        again from _browse_case, since switching case folders can
+        genuinely switch which tiers are still available to upgrade to
+        (a different case may already be further along).
+
+        All three tiers are always shown; a tier already run is disabled
+        and labeled "(already run)" rather than omitted, so the group
+        reads as the case's whole progression, not just a menu of
+        upgrades. Direct follow-up, 2026-09-26: "if teir 1 has already
+        been run it should be greyed out but also selected[;] this
+        should also be tru[e] if te[i]r 2 is run both 1 and 2 grey out
+        and 2 selected and if all then all 3 grey out and tier 3
+        selected." — the HIGHEST already-run tier is both disabled AND
+        checked, reflecting current status at a glance, not just left
+        unchecked; the user then moves the selection to a higher,
+        enabled tier to actually request an upgrade. For a never-scanned
+        case (current_tier 0), Tier 1 is the default instead — enabled
+        and checked, a real actionable choice, not just status."""
+        for rb in self._tier_radios.values():
+            self._tier_button_group.removeButton(rb)
+            rb.deleteLater()
         while self._tier_radios_container.count():
-            self._tier_radios_container.takeAt(0)   # only ever holds these checkboxes
+            self._tier_radios_container.takeAt(0)   # only ever holds these radio buttons
 
         self._current_tier = self._load_current_header_tier()
         self._selected_upgrade_tier = 0
-        self._tier_upgrade_cbs = {}
+        self._checked_tier_radio_id = 0
+        self._tier_radios = {}
         for t in (1, 2, 3):
-            if t <= self._current_tier:
-                continue   # no downgrade, no re-running an already-done tier
-            cb = QCheckBox(f"Upgrade to {_HEADER_SCAN_TIER_LABELS[t]}")
-            cb.toggled.connect(lambda checked, t=t: self._on_process_tier_toggled(t, checked))
-            self._tier_upgrade_cbs[t] = cb
-            self._tier_radios_container.addWidget(cb)
+            already_done = t <= self._current_tier
+            label = _HEADER_SCAN_TIER_LABELS[t]
+            rb = QRadioButton(f"{label} (already run)" if already_done else label)
+            rb.setEnabled(not already_done)
+            self._tier_button_group.addButton(rb, t)
+            self._tier_radios[t] = rb
+            self._tier_radios_container.addWidget(rb)
+        # Connect AFTER every radio exists, so the default selection below
+        # (and any later real click) fires the handler with the full
+        # dict/button-group already populated.
+        for t, rb in self._tier_radios.items():
+            rb.toggled.connect(lambda checked, t=t: self._on_process_tier_toggled(t, checked))
         self._candidate_count = 0
+        # The highest already-run tier (status only, disabled) — or Tier 1
+        # as a real, actionable default when nothing has run yet.
+        default_tier = min(max(self._current_tier, 1), 3)
+        # Tier 3 never needs its own confirm gate for this programmatic
+        # default selection — only a deliberate user click should ever
+        # show that dialog. _tier_building_default is checked (via
+        # getattr, so it's safe even before this attribute has ever been
+        # set) inside _on_process_tier_toggled.
+        self._tier_building_default = True
+        try:
+            self._tier_radios[default_tier].setChecked(True)
+        finally:
+            self._tier_building_default = False
         self._update_header_status_label()
 
     def _load_requested_header_tier(self) -> int:
@@ -3977,31 +4053,44 @@ class ProcessDialog(QDialog):
         self._header_status_label.setText(text)
 
     def _on_process_tier_toggled(self, tier_id: int, checked: bool):
-        """Upgrade-only, no going back — see the __init__ comment above
-        this picker. Manually-exclusive checkboxes, not a QButtonGroup —
-        see that same comment for the real Qt quirk this works around.
-        Tier 3 gets the same shared confirm gate as CaseSettingsDialog's
-        own picker (_confirm_tier3)."""
+        """The tier radio group's one connected slot — see
+        _rebuild_tier_upgrade_ui's own docstring for the design (a real
+        QButtonGroup/QRadioButton set, replacing the earlier manually-
+        exclusive checkboxes). QButtonGroup's own exclusivity means the
+        previously-checked radio fires toggled(False) and the new one
+        fires toggled(True) — only the latter matters here. Tier 3 gets
+        the same shared confirm gate as CaseSettingsDialog's own picker
+        (_confirm_tier3), but only for a deliberate user click — never
+        for the programmatic default selection _rebuild_tier_upgrade_ui
+        makes on open (see its own _tier_building_default flag).
+
+        tier_id <= self._current_tier means this is the highest
+        ALREADY-RUN tier's own radio, checked only to show current status
+        at a glance (see _rebuild_tier_upgrade_ui) — never a real upgrade
+        request, so self._selected_upgrade_tier stays/becomes 0 and no
+        candidate count is computed for it."""
         if not checked:
-            if self._selected_upgrade_tier == tier_id:
-                self._selected_upgrade_tier = 0
-                self._candidate_count = 0
-                self._refresh_stats()
             return
-        if tier_id == 3 and not _confirm_tier3(self):
-            cb = self._tier_upgrade_cbs[3]
-            cb.blockSignals(True)
-            cb.setChecked(False)
-            cb.blockSignals(False)
+        if (tier_id == 3 and not getattr(self, '_tier_building_default', False)
+                and not _confirm_tier3(self)):
+            # Revert to whichever radio was actually checked before this
+            # click — a normal "select a different valid button"
+            # operation, not the unreliable "uncheck back to nothing"
+            # case a plain QRadioButton can't do. Tracked separately from
+            # self._selected_upgrade_tier (below), since that's 0 both
+            # "nothing chosen" and "the checked radio is just status" —
+            # a real, previously-checked radio always exists by the time
+            # a user can click Tier 3 here.
+            prev = self._checked_tier_radio_id
+            if prev and prev in self._tier_radios:
+                self._tier_radios[prev].setChecked(True)
             return
-        # Hand-rolled exclusivity: unchecking any other currently-checked
-        # box (confirmed reliable from within a checkbox's own toggled
-        # handler, unlike the radio-button case above).
-        for t, other in self._tier_upgrade_cbs.items():
-            if t != tier_id and other.isChecked():
-                other.blockSignals(True)
-                other.setChecked(False)
-                other.blockSignals(False)
+        self._checked_tier_radio_id = tier_id
+        if tier_id <= self._current_tier:
+            self._selected_upgrade_tier = 0
+            self._candidate_count = 0
+            self._refresh_stats()
+            return
         self._selected_upgrade_tier = tier_id
         # Deliberately just a COUNT here, not a file-path list — matching
         # Tier 1's own always-been-count-only display (see _refresh_stats'
@@ -4012,7 +4101,6 @@ class ProcessDialog(QDialog):
         # not gain an extra widget Tier 1 never had.
         self._candidate_count = _count_header_candidates(
             self._ui_metadata, self._adapter, tier=tier_id)
-        self._refresh_stats()
         self._refresh_stats()
 
     def _on_embedded_media_toggled(self, checked: bool):
@@ -4701,6 +4789,24 @@ class ArchiveSelectionDialog(QDialog):
         self._tree.setColumnWidth(0, 620)
         self._tree.setAlternatingRowColors(True)
         self._tree.setSortingEnabled(False)
+        # Forced to Fusion, not the native macOS style — direct report,
+        # 2026-09-25: "i cannot see the checkboxs in this dialog." A real
+        # bug, confirmed with an actual screenshot of this exact dialog
+        # (dark mode, macOS 27, PySide6 6.11): QMacStyle draws NO checkbox
+        # indicator at all here — not faint, not wrong-colored, genuinely
+        # absent — for every item at every state (unchecked/checked/
+        # partially-checked). Fusion draws its own checkbox glyphs rather
+        # than delegating to native NSCell rendering, so it isn't
+        # susceptible to this; confirmed, again via a real screenshot, all
+        # three states (empty box / checkmark / solid grey partial-check
+        # square) render clearly and distinctly once applied. Scoped to
+        # just this tree (not QApplication.setStyle, which would reskin
+        # the entire app) — self._tree_style keeps the created QStyle
+        # object alive for the tree's own lifetime, since QWidget.setStyle
+        # does NOT take ownership the way QApplication.setStyle does.
+        self._tree_style = QStyleFactory.create("Fusion")
+        if self._tree_style is not None:
+            self._tree.setStyle(self._tree_style)
         layout.addWidget(self._tree)
 
         self._count_label = QLabel()
@@ -5185,11 +5291,51 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._apply_ai_pref_visibility()
         self._timestamp_display_act = QAction("Timestamp Display...", self)
         self._timestamp_display_act.setEnabled(False)   # needs an open case
-        self._timestamp_display_act.triggered.connect(self._timestamp_display_dialog)
+        # Explicit lambda, not a bare method reference — QAction's own
+        # triggered(bool) signal would otherwise pass its checked-state
+        # bool positionally into is_first_load (harmlessly False for a
+        # non-checkable QAction today, but explicit avoids relying on
+        # that coincidence).
+        self._timestamp_display_act.triggered.connect(lambda: self._timestamp_display_dialog())
         self._tools_menu.addAction(self._timestamp_display_act)
         self._view_path = ""
         self._view_is_recursive = False
         self._checked_folders: set = set()
+        # Individual FILES ticked via the File Browser table's own far-left
+        # tickbox column — added 2026-09-26, direct follow-up: "is it
+        # possible that the folder[s] are shown in the selected view
+        # because a single file is selected[?] lets have a column at the
+        # far left that is a tick box so a single file can be selected."
+        # Deliberately SEPARATE from _checked_folders (which recursively
+        # aggregates a whole folder's files into "Show Selected Files") —
+        # ticking one file here only ever feeds "Selected only" tree scope
+        # (via _compute_selected_only_scope), the same "select bookmarked
+        # files" mechanism but for an ad hoc pick instead of a saved
+        # bookmark; it never adds to the recursive aggregate view.
+        self._checked_files: set = set()
+        # "Selected only" tree filtering — added 2026-09-26, direct
+        # request: "i rec[u]rsively look at one folder and then another
+        # but forget to de[s]elect the previous one and then i do not
+        # rea[l]ise i am looking at both[,] this is [especially] a
+        # problem when looking at the gallery." See
+        # _apply_selected_only/_sync_selected_only_after_scope_change for
+        # the full design. _selected_only_scope is deliberately its own
+        # tracked set, not derived live from _checked_folders every time
+        # — it's explicitly updated at exactly three points (a checkbox
+        # change, Deselect All, a bookmark click) so a plain single-folder
+        # tree click never disturbs it.
+        self._selected_only_mode = False
+        self._selected_only_scope: set = set()
+        # The real folder path selected right before the last "Selected
+        # only" transition, carried over into the newly-shown branch if
+        # it exists there (else nothing is selected) — see
+        # _carry_over_tree_selection's own docstring for the full design
+        # and its own direct-request history.
+        self._tree_last_selected_path: str | None = None
+        # The two always-present top-level tree roots (built by
+        # reload_tree_entirely) — None until the first archive load.
+        self._fs_root_item = None
+        self._selected_root_item = None
         self._rebuild_pending = False
         self._selected_file_path: str | None = None
         # The file actually LOADED into the bottom preview panel (hex/text/
@@ -5286,6 +5432,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._reset_tree_model()
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.tree_model)
+        # Forced to Fusion, not the native macOS style — direct report,
+        # 2026-09-26: "the checkboxes are not visable on the folder
+        # structure on mac os[,] both in dark and light mode[;] there is
+        # a gap but the checkbox is not visable." The SAME real QMacStyle
+        # bug already confirmed (with an actual screenshot) for
+        # ArchiveSelectionDialog's own QTreeWidget above — this report
+        # additionally confirms it's not dark-mode-specific, unlike that
+        # first case — QMacStyle draws no checkbox indicator at all for a
+        # QTreeView/QTreeWidget item's checkbox in this environment,
+        # regardless of theme. Fusion draws its own checkbox glyphs
+        # rather than delegating to native NSCell rendering, so it isn't
+        # susceptible. Scoped to just this tree, not QApplication.
+        # setStyle (which would reskin the entire app) — self._tree_view_style
+        # keeps the created QStyle object alive for the tree's own
+        # lifetime, since QWidget.setStyle does NOT take ownership the
+        # way QApplication.setStyle does.
+        self._tree_view_style = QStyleFactory.create("Fusion")
+        if self._tree_view_style is not None:
+            self.tree_view.setStyle(self._tree_view_style)
         # All tree rows are plain single-line text; telling Qt so replaces its
         # O(n) per-item layout passes with O(1) math — without this, appending
         # rows to a folder with tens of thousands of children triggers
@@ -5311,6 +5476,22 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         tree_header = QLabel("Folder Tree")
         tree_header.setStyleSheet(_section_style)
+        # "Selected only" toggle — added 2026-09-26, direct request. See
+        # _apply_selected_only's own docstring for the full design;
+        # switches on automatically entering the Media Browser (when
+        # there's something in scope) and off in the File Browser, but
+        # stays a plain manual checkbox the user can flip at any time.
+        self._selected_only_chk = QCheckBox("Selected")
+        self._selected_only_chk.setToolTip(
+            "Show only the folder(s) currently selected to show in the "
+            "viewer — checked folders, or ones explicitly chosen via "
+            "\"Select Bookmarked Files\" — hiding everything else in the "
+            "tree, so it's always clear what's in scope (especially in "
+            "the Media Browser). Unchecked shows the full tree.\n\n"
+            "Switches on automatically when you open the Media Browser "
+            "(if anything is currently selected) and off in the File "
+            "Browser — you can still switch it manually at any time.")
+        self._selected_only_chk.toggled.connect(self._on_selected_only_toggled)
         self.jump_btn = QPushButton("Jump to ▾")
         self.jump_btn.clicked.connect(self._show_jump_menu)
         self.collapse_btn = QPushButton("Collapse")
@@ -5318,6 +5499,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         tree_top = QHBoxLayout()
         tree_top.addWidget(tree_header)
         tree_top.addStretch()
+        tree_top.addWidget(self._selected_only_chk)
+        tree_top.addSpacing(12)   # keep Jump/Collapse from crowding the checkbox
         tree_top.addWidget(self.jump_btn)
         tree_top.addWidget(self.collapse_btn)
 
@@ -5367,6 +5550,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.file_view.setModel(self.proxy_model)
         self.file_view.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.file_view.setSortingEnabled(True)
+        # Forced to Fusion, not the native macOS style — the SAME real
+        # QMacStyle checkbox-invisibility bug already confirmed (with real
+        # screenshots) for tree_view and ArchiveSelectionDialog's own
+        # QTreeWidget, found here too while adding the new far-left
+        # tickbox column (2026-09-26): a ticked row's checkbox rendered
+        # completely blank — no checkmark glyph at all, confirmed via a
+        # real screenshot before applying this fix. See tree_view's own
+        # comment a few lines up for the full bug writeup; identical fix,
+        # scoped to just this one view.
+        self._file_view_style = QStyleFactory.create("Fusion")
+        if self._file_view_style is not None:
+            self.file_view.setStyle(self._file_view_style)
         # User-defined column order, persisted across views and sessions.
         _s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         saved_order = _s.value('file_column_order', []) or []
@@ -5383,6 +5578,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _hdr = self.file_view.horizontalHeader()
         _hdr.setSectionsMovable(True)
         _hdr.sectionMoved.connect(self._on_section_moved)
+        # The synthetic far-left tickbox column (see
+        # FileTableModel._checked_paths) — narrow and fixed-width, not
+        # user-resizable, so it always reads as a checkbox gutter rather
+        # than an ordinary data column.
+        _hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.file_view.setColumnWidth(0, 24)
         self.file_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_view.customContextMenuRequested.connect(self.show_table_context_menu)
         self.file_view.doubleClicked.connect(self.handle_table_double_click)
@@ -5557,10 +5758,47 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.file_model = model
         model._research_fg  = self._research_fg_for_row
         model._research_tip = self._research_tip_for_row
+        # Loaded fresh on every model swap (folder navigation, aggregate
+        # rebuild, bookmark view) — same "read straight from
+        # caseresults.db every time, never cached across folders" cost
+        # tradeoff the Media Browser's own load_bookmark_colors call
+        # already makes (one small SELECT), so a bookmark added/removed/
+        # recolored elsewhere in the same session is always reflected
+        # without a stale cache.
+        model._bookmark_colors = self._load_file_bookmark_colors()
+        # Far-left tickbox column's own display state — added 2026-09-26,
+        # see FileTableModel._checked_paths' own docstring. Pushed fresh on
+        # every model swap so a newly-navigated folder's rows immediately
+        # reflect whatever is already ticked via the tree/bookmarks/this
+        # same column elsewhere.
+        model.set_checked_paths(self._checked_folders | self._checked_files)
+        model.check_toggled.connect(self._on_file_row_check_toggled)
         model.filter_progress.connect(self._on_filter_progress)
         model.filter_done.connect(self._on_filter_done)
         self._apply_column_visibility()
         self._apply_column_order()
+
+    def _load_file_bookmark_colors(self) -> dict:
+        if not self._case_dir:
+            return {}
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                return load_bookmark_colors(conn)
+        except Exception:
+            return {}
+
+    def _refresh_file_bookmark_colors(self) -> None:
+        """Re-reads bookmark state and updates the CURRENTLY-displayed
+        file table's own Name-column background tints — added 2026-09-26,
+        called from every bookmark add/delete/color-change alongside the
+        Media Browser's own _refresh_media_bookmark_badges, so the File
+        Browser reflects it immediately without needing to leave and
+        re-enter the folder (which would also needlessly reset scroll
+        position / any active filter)."""
+        if not hasattr(self, 'file_model'):
+            return
+        self.file_model._bookmark_colors = self._load_file_bookmark_colors()
+        self.file_view.viewport().update()
 
     def _apply_column_visibility(self):
         """Apply per-view column hiding.  A single folder with a saved layout
@@ -5576,8 +5814,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             hidden = getattr(self, '_agg_hidden_columns', set())
         else:
             hidden = set()
+        # Column 0 is the synthetic far-left tickbox column (see
+        # FileTableModel._checked_paths) — permanently visible, real
+        # headers shifted +1 in the view/model's own column space.
+        self.file_view.setColumnHidden(0, False)
         for i, h in enumerate(headers):
-            self.file_view.setColumnHidden(i, h in hidden)
+            self.file_view.setColumnHidden(i + 1, h in hidden)
         self._update_columns_indicator()
 
     # ── Column ordering & per-folder layouts (persisted) ──────────────────────
@@ -5618,7 +5860,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _apply_column_order(self):
         """Rearrange header sections to match the saved order (the folder's
-        layout if present, otherwise the global default)."""
+        layout if present, otherwise the global default). Column 0 (the
+        tickbox column) is always pinned at visual position 0 — real
+        headers occupy visual_pos + 1 / logical index + 1."""
         if not hasattr(self, 'file_view'):
             return
         cfg = self._current_folder_config()
@@ -5632,22 +5876,40 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         order += [h for h in headers if h not in order]
         self._applying_column_order = True
         try:
+            if header.visualIndex(0) != 0:
+                header.moveSection(header.visualIndex(0), 0)
             for visual_pos, name in enumerate(order):
-                logical = headers.index(name)
+                logical = headers.index(name) + 1
                 cur = header.visualIndex(logical)
-                if cur != visual_pos:
-                    header.moveSection(cur, visual_pos)
+                target = visual_pos + 1
+                if cur != target:
+                    header.moveSection(cur, target)
         finally:
             self._applying_column_order = False
 
     def _on_section_moved(self, *_):
-        """User dragged a column header — record the new order."""
+        """User dragged a column header — record the new order. Also
+        self-corrects the tickbox column (logical 0) back to visual
+        position 0 if a drag moved it away — Qt has no per-section
+        "immovable" flag, so this is done after the fact rather than
+        prevented outright."""
         if self._applying_column_order:
             return
         header  = self.file_view.horizontalHeader()
         headers = self.file_model._headers
-        self._commit_order(
-            [headers[header.logicalIndex(v)] for v in range(len(headers))])
+        if header.visualIndex(0) != 0:
+            self._applying_column_order = True
+            try:
+                header.moveSection(header.visualIndex(0), 0)
+            finally:
+                self._applying_column_order = False
+        order = []
+        for v in range(header.count()):
+            logical = header.logicalIndex(v)
+            if logical == 0:
+                continue
+            order.append(headers[logical - 1])
+        self._commit_order(order)
 
     def _update_columns_indicator(self):
         """Reflect hidden-column count and any saved-folder layout on the
@@ -5656,7 +5918,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return
         headers = self.file_model._headers
         hidden_names = [headers[i] for i in range(len(headers))
-                        if self.file_view.isColumnHidden(i)]
+                        if self.file_view.isColumnHidden(i + 1)]
         saved = self._current_folder_config() is not None
         if hidden_names:
             self.columns_btn.setText(f"Columns ⊘{len(hidden_names)}")
@@ -5688,10 +5950,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         lst = QListWidget()
         lst.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         lst.setDefaultDropAction(Qt.DropAction.MoveAction)
-        # List in the on-screen (visual) order
-        for v in range(len(headers)):
+        # List in the on-screen (visual) order — the tickbox column
+        # (logical 0) is never listed here: it's permanently
+        # shown/pinned, not one of the dialog's own manageable columns.
+        for v in range(header_view.count()):
             logical = header_view.logicalIndex(v)
-            item = QListWidgetItem(headers[logical])
+            if logical == 0:
+                continue
+            item = QListWidgetItem(headers[logical - 1])
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
                 Qt.CheckState.Unchecked
@@ -5703,7 +5969,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             name = item.text()
             if name not in headers:
                 return
-            logical = headers.index(name)
+            logical = headers.index(name) + 1
             hide = item.checkState() != Qt.CheckState.Checked
             self.file_view.setColumnHidden(logical, hide)
             cfg = self._current_folder_config()
@@ -5913,6 +6179,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _on_center_tab_changed(self, index):
         self._hex_source_toggle.setVisible(index == 3)
+        # "Selected only" tree auto-switch — added 2026-09-26, direct
+        # request: "when you go to the gallery it switches to this view
+        # automatically and switch back in file browser." Media Browser
+        # only auto-switches ON when there's actually something in scope
+        # (nothing to disambiguate otherwise — forcing it on for an
+        # ordinary single-folder gallery view would just show an empty
+        # tree); File Browser always switches back to the full tree.
+        # Keyword Search/Artifact Viewer (2/3) are untouched — the tree
+        # is hidden on those tabs anyway (see the splitter-collapse logic
+        # right below).
+        if index == 0:
+            self._apply_selected_only(False)
+        elif index == 1 and self._selected_only_scope:
+            self._apply_selected_only(True)
         if index in (2, 3):
             # Save current tree width and collapse it for full-width tabs
             sizes = self.splitter.sizes()
@@ -6190,15 +6470,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         parent, stem = self._zip_stem()
         return str(parent / f"{stem}_Export")
 
-    def _get_or_ask_case_dir(self, zip_path: str) -> tuple[str | None, int]:
-        """Return (case_dir, header_scan_tier) for zip_path, showing dialog
-        if needed. header_scan_tier is 0-3 — see TODO.md item 20 and
-        CaseSettingsDialog.header_scan_tier for the three-tier design."""
+    def _get_or_ask_case_dir(self, zip_path: str) -> str | None:
+        """Return the case_dir for zip_path, showing CaseSettingsDialog if
+        needed (name only — see that class's own docstring for the
+        header-scan-tier/find-archives picker this used to also have,
+        replaced 2026-09-26 by Process Case owning all of that instead,
+        triggered once by _open_process_dialog_for_new_case right after
+        the first-load Timestamp Display dialog's OK)."""
         existing = self._archive_entry(zip_path)
         if existing and existing.get('case_dir'):
             stored = existing['case_dir']
             if os.path.isdir(stored):
-                return stored, 0   # valid — no auto-scan for known archives
+                return stored
             # Case folder has moved or been deleted
             btn = QMessageBox.question(
                 self, "Case Folder Not Found",
@@ -6223,7 +6506,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                         )
                     elif _do_path_change_check(self, zip_path, new_case):
                         self._upsert_archive(zip_path, new_case)
-                        return new_case, 0
+                        return new_case
                     # else: mismatch error shown by _do_path_change_check
             # User declined or didn't pick — fall through to CaseSettingsDialog
 
@@ -6237,22 +6520,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     break
         dlg = CaseSettingsDialog(zip_path, base_folder, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            return None, 0
+            return None
         case_dir = dlg.case_dir
-        tier = dlg.header_scan_tier
         self._upsert_archive(zip_path, case_dir)
-        # Persisted immediately (not only after the scan finishes) so the
-        # banner reflects the examiner's own choice even if the scan is
-        # still running or gets interrupted — _on_header_scan_done below
-        # re-persists once results actually land, in case a later manual
-        # rescan (still tier-1-only today, see TODO.md item 20's own
-        # "share this exact same tier-selection UI" follow-up) changes it.
-        try:
-            with closing(_open_results_db(case_dir)) as _db:
-                save_case_setting(_db, 'header_scan_tier', str(tier))
-        except Exception:
-            pass
-        return case_dir, tier
+        return case_dir
 
     def _get_log_path(self):
         parent, stem = self._zip_stem()
@@ -6560,12 +6831,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         QTimer.singleShot(0, lambda: self.tree_view.scrollTo(
             idx, self.tree_view.ScrollHint.PositionAtTop))
 
-    def navigate_tree_to_path(self, target_path):
-        # The visible root "/ [Full Filesystem]" sits under the invisible root
-        invisible_root = self.tree_model.invisibleRootItem()
-        if invisible_root.rowCount() == 0:
-            return
-        current = invisible_root.child(0)  # "/ [Full Filesystem]"
+    def _expand_walk_to_path(self, target_path: str, root_item=None):
+        """Expand (and lazily populate) the tree from root_item down to
+        target_path, returning the final QStandardItem actually reached —
+        an ANCESTOR of target_path if the walk can't go all the way (e.g.
+        target_path doesn't exist, or 'hide empty folders' currently
+        hides part of the path). None if root_item is None (the default)
+        and the tree hasn't been populated at all yet. Factored out
+        2026-09-26, originally to also share with a since-superseded
+        'Selected only' implementation (see the "Selected only" tree
+        Conventions entry for the dual-root design that replaced it) —
+        kept as its own function regardless, since navigate_tree_to_path's
+        own select+scroll+navigate tail is a distinct concern from this
+        walk. root_item defaults to "/ [Full Filesystem]" (every existing
+        caller's own expectation, unchanged); pass self._selected_root_item
+        to walk the "Selected Only" branch instead — added the same day
+        for the tree-position carry-over feature (_carry_over_tree_
+        selection) and reused by navigate_tree_to_path's own "Jump to"
+        branch-awareness, see each method's own docstring."""
+        if root_item is None:
+            invisible_root = self.tree_model.invisibleRootItem()
+            if invisible_root.rowCount() == 0:
+                return None
+            root_item = invisible_root.child(0)  # "/ [Full Filesystem]"
+        current = root_item
         self._ensure_children_loaded(current)
         self.tree_view.expand(self.tree_model.indexFromItem(current))
         parts = [p for p in target_path.split('/') if p]
@@ -6582,8 +6871,40 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     found = True
                     break
             if not found: break
+        return current
 
-        new_idx = self.tree_model.indexFromItem(current)
+    def navigate_tree_to_path(self, target_path):
+        """Used by "Jump to ▾" and every other programmatic tree jump.
+
+        Added 2026-09-26, direct request: "if the user select[s] the
+        jump to and the selected view is present then the folder tree
+        will hi[gh]light the folder in the selected list[;] but if it is
+        not present then it will switch to the full tree." While
+        "Selected only" is showing, tries the jump target there FIRST —
+        staying on that branch if it's genuinely part of the current
+        scope — and only falls back to "Full Filesystem" (switching the
+        view there) when the target isn't reachable in "Selected only" at
+        all. When "Selected only" isn't active to begin with, this is
+        unchanged from before — a plain jump on the full tree."""
+        if self._selected_only_mode:
+            item = self._expand_walk_to_path(target_path, root_item=self._selected_root_item)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == target_path:
+                self._navigate_tree_select_and_open(item)
+                return
+            # Not part of the current "Selected only" scope -- fall back
+            # to the full tree instead of jumping nowhere.
+            self._apply_selected_only(False)
+        current = self._expand_walk_to_path(target_path)
+        if current is None:
+            return
+        self._navigate_tree_select_and_open(current)
+
+    def _navigate_tree_select_and_open(self, item) -> None:
+        """The shared select+scroll+open tail navigate_tree_to_path uses
+        for either branch — factored out 2026-09-26 so both the
+        "Selected only" and "Full Filesystem" jump paths share exactly
+        one implementation of it."""
+        new_idx = self.tree_model.indexFromItem(item)
         self.tree_view.setCurrentIndex(new_idx)
         # For programmatic navigation, only scroll when the target is not already visible.
         rect = self.tree_view.visualRect(new_idx)
@@ -6598,7 +6919,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not ui_path:
             return
         self._selected_file_path = ui_path
-        self.status_bar.showMessage(ui_path)
+        # Display only — self._display_path substitutes an iOS container
+        # GUID segment with its resolved bundle ID (e.g. "net.whatsapp.
+        # WhatsApp" instead of "00369DA2-..."), added 2026-09-25, direct
+        # request: "so a user can easily see which app it is from." The
+        # real ui_path (GUID intact) is what actually gets stored/logged/
+        # looked up everywhere else — this only changes what's SHOWN.
+        self.status_bar.showMessage(self._display_path(ui_path))
         is_folder = ui_path in self.folder_map
         self._log(f"{'Folder' if is_folder else 'File'} selected: {ui_path}")
 
@@ -6635,7 +6962,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not item: return
         folder_path = item.data(Qt.ItemDataRole.UserRole)
 
-        self.status_bar.showMessage(f"{folder_path}    |    Tip: Right-click to export")
+        # Display only -- see on_file_selected's own comment on
+        # _display_path; folder_path itself (GUID intact) is what's
+        # actually used below and logged.
+        self.status_bar.showMessage(
+            f"{self._display_path(folder_path)}    |    Tip: Right-click to export")
         self._log(f"Folder viewed: {folder_path}")
 
         # Single interception point for every real navigation path into a
@@ -7595,8 +7926,69 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         else:
             QTimer.singleShot(0, _batch)
 
+    _SEARCH_TAB_INDEX = 2   # matches center_tabs.addTab(search_tab, "Keyword Search")
+
+    def _start_leveldb_auto_indexing(self) -> None:
+        """Indexes every not-yet-indexed LevelDB/IndexedDB folder for
+        Keyword Search as part of ordinary case loading, rather than
+        lazily the first time a search runs — direct follow-up request,
+        2026-09-26: "for the leveldb instead of on your first search can
+        we just do that during the initial processing? where the header
+        search was before i ask you to move to the dialog[;] can you
+        make it show its progress like it did for headers." Mirrors
+        _on_header_scan_progress's own "N remaining…" status-bar phrasing
+        for exactly that reason.
+
+        The lazy search-time fallback this used to have
+        (_ensure_leveldb_indexed_then_run, app/keyword_search.py) was
+        REMOVED the same day, direct follow-up: "can you remove the code
+        from the sea[r]ch[,] and make that the sea[r]ch tab is grayed out
+        until the index[e]dDB work is finished." The Keyword Search tab
+        itself (center_tabs index _SEARCH_TAB_INDEX) is disabled here —
+        greyed out, unclickable, per Qt's own default QTabBar rendering
+        for a disabled tab — the MOMENT indexing work is found (start_loading
+        disables it unconditionally up front, before metadata even
+        finishes loading, so there's no gap where it's clickable but not
+        yet actually indexed), and re-enabled the instant this method's
+        own _done() fires. A case with nothing left to index (every real
+        LevelDB folder already covered — the common case on a re-open)
+        re-enables essentially immediately, so the grey-out is only ever
+        as long as real indexing work actually takes.
+
+        Called from on_metadata_ready on a short delay so it doesn't
+        compete with the very first tree-population frames."""
+        if not self._case_dir:
+            self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
+            return
+        _, unindexed = self._leveldb_search_coverage()
+        if not unindexed:
+            self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
+            self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, "")
+            return
+        total = len(unindexed)
+        self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, False)
+        self.center_tabs.setTabToolTip(
+            self._SEARCH_TAB_INDEX,
+            f"Indexing {total:,} LevelDB/IndexedDB folder(s) for search…")
+
+        def _progress(done, total_):
+            remaining = total_ - done
+            if remaining > 0:
+                msg = f"Indexing LevelDB folders for search: {remaining:,} remaining…"
+                self.status_bar.showMessage(msg)
+                self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, msg)
+
+        def _done():
+            self.status_bar.showMessage(
+                f"Indexed {total:,} LevelDB/IndexedDB folder(s) for search.", 5000)
+            self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, "")
+            self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
+
+        self._index_leveldb_folders_batched(unindexed, on_progress=_progress, on_done=_done)
+
     def _open_process_dialog(self, preselect_nested=False, resume_search=False,
-                             auto_archive_selection=False):
+                             auto_archive_selection=False,
+                             preselect_tier1=False, preselect_embedded_media=False):
         if not self.zip_path:
             QMessageBox.information(self, "No Archive", "Open an FFS archive first.")
             return
@@ -7608,6 +8000,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             delta=self._local_extra_delta,
             preselect_nested=preselect_nested,
             auto_archive_selection=auto_archive_selection,
+            preselect_tier1=preselect_tier1,
+            preselect_embedded_media=preselect_embedded_media,
             is_android=self._is_android_archive(),
             parent=self,
         )
@@ -7686,7 +8080,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.start_loading(path)
 
     def start_loading(self, zip_path):
-        case_dir, header_scan_tier = self._get_or_ask_case_dir(zip_path)
+        case_dir = self._get_or_ask_case_dir(zip_path)
         if case_dir is None:
             return   # user cancelled the dialog
         self._shutdown_mcp_server("archive changed")
@@ -7705,6 +8099,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._pending_db_hits.clear()
         self.search_status.setText("No search running")
         self.center_tabs.setCurrentIndex(0)
+        # Greyed out (unclickable) until _start_leveldb_auto_indexing
+        # confirms LevelDB/IndexedDB indexing is actually finished for
+        # this case — added 2026-09-26, direct request, replacing the
+        # lazy search-time indexing this tab used to fall back on. Set
+        # here, up front, rather than only once indexing is found to be
+        # needed, so there's no window where the tab is clickable before
+        # this case's own coverage has even been checked.
+        self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, False)
+        self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, "Loading archive…")
         self._load_recent_searches_from_db()
         # Stop the old index worker before replacing the tree model — a running
         # worker thread can trigger Python GC which traverses freed Qt wrappers.
@@ -7753,6 +8156,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.table_status_label.setText("")
         self._view_path = ""
         self._checked_folders = set()
+        self._checked_files = set()
+        self._selected_only_mode = False
+        self._selected_only_scope = set()
+        self._tree_last_selected_path = None
+        self._selected_only_chk.blockSignals(True)
+        self._selected_only_chk.setChecked(False)
+        self._selected_only_chk.blockSignals(False)
         self._selected_file_path = None
         self._selected_media_path = None
         self._pending_media_selection = None
@@ -7778,15 +8188,61 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # non-blocking pattern as _thumb_worker above, so a stale worker can
         # never clobber this load's state or crash on GC while running.
         self._retire_worker(getattr(self, 'worker', None))
-        self.worker = ZipMetadataWorker(zip_path, header_scan_tier=header_scan_tier,
+        # header_scan_tier is always 0 here (no automatic scan) — the
+        # examiner picks tiers explicitly via Process Case, opened
+        # (pre-ticked, not auto-run) right after the first-load
+        # Timestamp Display dialog's OK; see
+        # _open_process_dialog_for_new_case. This SUPERSEDES a design
+        # from earlier the same day (2026-09-25) where CaseSettingsDialog
+        # itself chose a tier and triggered a real background scan here —
+        # see that class's own docstring and CLAUDE.md for the full
+        # history of what replaced it and why (direct instruction:
+        # "instead of doing the head[er] scan in the background can we
+        # instead just... after the user has selected how they want to
+        # deal with the time and date[,] the ok should be tied to opening
+        # process case").
+        self.worker = ZipMetadataWorker(zip_path, header_scan_tier=0,
                                         case_dir=self._case_dir)
         self.worker.status_update.connect(self.status_bar.showMessage)
         self.worker.metadata_ready.connect(self.on_metadata_ready)
         self.worker.header_scan_progress.connect(self._on_header_scan_progress)
-        self.worker.header_scan_done.connect(
-            lambda results, _tier=header_scan_tier: self._on_header_scan_done(results, tier=_tier))
+        # header_scan_tier=0 above means scan_headers is False and this
+        # signal never actually fires for a fresh load any more (see
+        # ZipMetadataWorker.scan_headers) — connected anyway, generic
+        # tier=None form, matching ProcessDialog's own reuse of this same
+        # signal for its unrelated tier-upgrade/nested-archive/gzip-
+        # detection events.
+        self.worker.header_scan_done.connect(self._on_header_scan_done)
         self.worker.finished.connect(self._on_load_worker_finished)
         self.worker.start()
+
+    def _open_process_dialog_for_new_case(self) -> None:
+        """Opens Process Case with sensible defaults pre-ticked for a
+        brand-new case, right after the first-load Timestamp Display
+        dialog's OK — added 2026-09-26, direct request replacing the
+        earlier automatic-background-header-scan design (see
+        CaseSettingsDialog's own docstring, and start_loading's comment
+        above, for the superseded mechanism this replaces): "instead of
+        doing the head[er] scan in the background can we instead just[,]
+        after the user has selected how they want to deal with the time
+        and date[,] the ok should be tied to opening process case and the
+        hash check should be checked[,] the tier one should be ticked,
+        zip and embedded media." Integrity defaults to checked already
+        for any fresh case (ProcessDialog.__init__'s own
+        self._load_last_integrity_run() is None check) — nothing extra
+        needed for that one.
+
+        Deliberately does NOT auto-run (unlike auto_archive_selection's
+        own Search-Coverage-reminder use, or the design this replaces) —
+        the examiner reviews these pre-ticked defaults and clicks Run
+        themselves. This now bundles a full header scan + archive
+        extraction + embedded-media sweep, a real combined cost worth a
+        deliberate confirmation rather than firing unattended the moment
+        a case is created."""
+        if not self.zip_path:
+            return
+        self._open_process_dialog(preselect_nested=True, preselect_tier1=True,
+                                  preselect_embedded_media=True)
 
     def on_metadata_ready(self, data, folder_map, guid_map, zip_names, ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None, metadata_only_folders=None):
         self._metadata_ready_fired = True
@@ -7897,6 +8353,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Start background precomputation of folder counts if not already cached.
         if len(self._file_count_cache) < len(self.folder_map):
             QTimer.singleShot(300, self._start_precompute_folder_counts)
+        # Index any not-yet-indexed LevelDB/IndexedDB folders for Keyword
+        # Search as part of ordinary case loading — direct request,
+        # 2026-09-26: "instead of on your first search can we just do
+        # that during the initial processing? where the header search
+        # was before i ask you to move to the dialog." Delayed past the
+        # folder-count precompute above so it doesn't compete with the
+        # very first tree-population frames right at case open.
+        QTimer.singleShot(500, self._start_leveldb_auto_indexing)
 
         if missing_plist_paths:
             # Only warn about UUID folders that actually have content in the zip.
@@ -8018,7 +8482,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if QApplication.activeModalWidget() is not None:
             QTimer.singleShot(50, lambda: self._show_timestamp_dialog_when_ready(seq))
             return
-        self._timestamp_display_dialog()
+        self._timestamp_display_dialog(is_first_load=True)
 
     # ── AI access (embedded MCP server) ───────────────────────────────────────
 
@@ -8907,6 +9371,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_view.viewport().update()
         self._update_selected_btn()
         self._rebuild_file_view_from_checked()
+        # Keep "Selected only" in sync — added 2026-09-26 alongside
+        # _select_bookmark_group_files, but applies to every caller
+        # (including the pre-existing missing-bundle-ID warning flow):
+        # any direct _checked_folders mutation should update the
+        # "Selected Only" tree branch the same way an ordinary checkbox
+        # click already does via _deferred_rebuild.
+        self._selected_only_scope = self._compute_selected_only_scope()
+        self._sync_selected_only_after_scope_change()
+        self._refresh_file_checked_paths()
 
     def _tick_single_path(self, target_path):
         """Navigate to target_path in the tree, loading lazily, and tick the item."""
@@ -8951,6 +9424,35 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         root_item.setCheckState(Qt.CheckState.Checked if "" in self._checked_folders
                                 else Qt.CheckState.Unchecked)
         self.tree_model.invisibleRootItem().appendRow(root_item)
+        self._fs_root_item = root_item
+
+        # "Selected Only" — a SECOND, always-present top-level root next
+        # to "/ [Full Filesystem]", holding just the checked/bookmarked
+        # folder(s) — added 2026-09-26, replacing an earlier same-day
+        # design that filtered/rebuilt the real tree itself on every
+        # toggle, per direct follow-up: "there is a pregnant pause as the
+        # filter happens[;] can we instead have two list[s] and as the
+        # files are s[e]lected they are added to the other list and
+        # therefore it is just a qu[i]ck switch? ... a common root and
+        # when the file[s] are s[e]lected... they are copied there and...
+        # [switching] is [just] hiding and showing that branch of the
+        # tree." Built directly from self._selected_only_scope's own path
+        # COMPONENTS (_rebuild_selected_only_children) rather than by
+        # enumerating and rejecting every sibling at each ancestor level
+        # the way filtering the generic population loop used to — cheap
+        # regardless of archive size. Switching between the two is a
+        # plain QTreeView.setRowHidden flip (_apply_selected_only_visibility)
+        # — instant, never a rebuild of either tree.
+        self._selected_root_item = QStandardItem("Selected Only")
+        self._selected_root_item.setData(_SELECTED_ROOT_MARKER, Qt.ItemDataRole.UserRole)
+        self._selected_root_item.setEditable(False)
+        self._selected_root_item.setFont(QFont("Arial", weight=QFont.Weight.Bold))
+        self._selected_root_item.setFlags(
+            self._selected_root_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        self.tree_model.invisibleRootItem().appendRow(self._selected_root_item)
+        self._rebuild_selected_only_children()
+        self._apply_selected_only_visibility()
+
         self._populate_tree_children_batched(root_item, "", on_done=lambda: self._on_tree_loaded(root_item))
 
     def _on_load_worker_finished(self):
@@ -8964,6 +9466,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # except clause) — there is no tree population to wait for, so
             # don't leave the bar spinning on a load that already failed.
             self._tree_done = True
+            # Nor is there anything for _start_leveldb_auto_indexing to
+            # ever run against (it's only ever scheduled from within
+            # on_metadata_ready) — re-enable the Keyword Search tab
+            # start_loading disabled up front, rather than leaving it
+            # permanently greyed out after a failed load.
+            self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
+            self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, "")
         self._maybe_hide_load_progress()
 
     def _maybe_hide_load_progress(self):
@@ -9181,6 +9690,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if item is not None:
             group_id = item.data(Qt.ItemDataRole.UserRole)
             menu.addSeparator()
+            select_act = QAction("Select Bookmarked Files", self)
+            select_act.triggered.connect(partial(self._select_bookmark_group_files, group_id))
+            menu.addAction(select_act)
             color_act = QAction("Change Color…", self)
             color_act.triggered.connect(partial(self._change_bookmark_group_color, group_id))
             menu.addAction(color_act)
@@ -9188,6 +9700,85 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             del_act.triggered.connect(partial(self._delete_bookmark_group, group_id))
             menu.addAction(del_act)
         menu.exec(self._bookmark_list.viewport().mapToGlobal(point))
+
+    def _select_bookmark_group_files(self, group_id: int) -> None:
+        """"Select Bookmarked Files" — added 2026-09-26, direct request:
+        ties a bookmark group into the CHECKBOX-based multi-folder
+        selection mechanism (self._checked_folders), distinct from an
+        ordinary bookmark click (_show_bookmark_group), which only ever
+        VIEWS a group's files and never touches checkbox state at all
+        (see that method's own docstring — deliberate, so viewing a
+        bookmark on the side never silently alters what "Show Selected
+        Files" would aggregate). This action is the explicit bridge for
+        when the examiner actually wants that: check the folder(s) a
+        bookmark's own files live in, exactly the way clicking a folder's
+        own checkbox in the tree already does.
+
+        Per direct instruction, asks first if anything is already
+        checked — "if there are already a dialog box you have already
+        go[t] selected files[,] do you want to pro[ce]ed with
+        dese[l]ecting them and instead select the bookmarks?" — since
+        silently replacing an existing checked-folder selection would be
+        exactly the same "forgot what was still checked" liability the
+        whole 'Selected only' feature above exists to guard against, just
+        approached from a different direction (a silent REPLACE instead
+        of a silent ADD). Reuses _bookmark_scope_folders (the identical
+        containing-folder logic _show_bookmark_group's own 'Selected
+        only' scope already uses) and _tick_items_by_path (the existing,
+        already-correct "add these to _checked_folders, tick whatever's
+        reachable in the tree, rebuild the aggregate view" mechanism —
+        see its own docstring; originally built for the missing-bundle-ID
+        warning flow, reused here rather than duplicated).
+
+        Used to also force-activate 'Selected only' unconditionally —
+        added 2026-09-26, then REMOVED THE SAME DAY per direct follow-up:
+        "when you are in the full tree and you right click select[ed]
+        all[,] it switches you to selected view[;] when it should just
+        select[] the [folders] but leave you in the full tree[,] and if
+        you want to see the selected folder only then you can manually
+        switch." Ticking folders while stuck in "Selected only" is a real
+        problem, not just a preference — that view only ever shows
+        already-scoped paths, so once forced into it there's no way to
+        browse to and tick a NEW, not-yet-scoped folder without first
+        manually flipping back to "Full" — exactly the friction this
+        removal fixes. This action now leaves the current view (whichever
+        it is) completely alone; ticking is all it does.
+
+        Also ticks each bookmarked FILE's own far-left checkbox in the
+        File Browser table (self._checked_files) — added 2026-09-26,
+        direct follow-up clarifying the folder-level check alone doesn't
+        visually distinguish the bookmarked files from ordinary
+        neighbors once browsing that folder: "also tick the individual
+        bookmarked files." A bookmarked FOLDER entry is excluded from
+        this (it's already folder-level ticked via scope/_checked_folders
+        above — there's no separate file-level concept for it)."""
+        if not self._case_dir:
+            return
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                entries = load_bookmark_entries(db, group_id)
+        except Exception:
+            return
+        if not entries:
+            self.status_bar.showMessage("This bookmark group has no files to select.")
+            return
+        scope = self._bookmark_scope_folders(entries)
+        file_paths = {e['ui_path'] for e in entries
+                      if e['ui_path'] not in self.folder_map}
+        if self._checked_folders:
+            ans = QMessageBox.question(
+                self, "Replace Selected Folders?",
+                f"You already have {len(self._checked_folders):,} folder(s) selected.\n\n"
+                "Deselect them and select this bookmark's folder(s) instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            self._deselect_all_files()
+        self._tick_items_by_path(scope)
+        self._checked_files.update(file_paths)
+        self._refresh_file_checked_paths()
 
     def _change_bookmark_group_color(self, group_id: int) -> None:
         """"Change Color…" — added 2026-09-25, the examiner-triggered
@@ -9217,6 +9808,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return
         self._refresh_bookmark_panel()
         self._refresh_media_bookmark_badges()
+        self._refresh_file_bookmark_colors()
 
     def _delete_bookmark_group(self, group_id: int):
         try:
@@ -9227,6 +9819,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return
         self._refresh_bookmark_panel()
         self._refresh_media_bookmark_badges()
+        self._refresh_file_bookmark_colors()
 
     def _show_bookmark_group(self, group_id: int):
         """Populate the file browser with entries from a bookmark group."""
@@ -9283,6 +9876,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # ordinary folder click.
         if self.center_tabs.currentIndex() == 1:
             self._load_media_from_file_model()
+
+        # NOTE: a left-click bookmark view deliberately does NOT touch
+        # "Selected only" mode/scope — added 2026-09-26, then REMOVED the
+        # same day per direct follow-up: "when the bookmarks are left
+        # click it should not check to selected only." An ordinary click
+        # here only ever VIEWS a group's files (matching
+        # _select_bookmark_group_files' own docstring on this exact
+        # distinction) — switching the tree to "Selected only" is left to
+        # the right-click "Select Bookmarked Files" action, or the
+        # examiner's own manual checkbox, never a side effect of browsing.
 
     def _is_folder_path(self, ui_path: str) -> bool:
         """True if ui_path is a folder (real or empty directory entry)."""
@@ -9421,6 +10024,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             f"Added {n:,} file{'s' if n != 1 else ''} to '{name}'", 4000)
         self._refresh_bookmark_panel()
         self._refresh_media_bookmark_badges()
+        self._refresh_file_bookmark_colors()
 
     def _new_bookmark_group_dialog(self, paths):
         """Show a dialog to name and describe a new bookmark group, then save."""
@@ -9473,6 +10077,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 f"Created '{name}' with {n:,} file{'s' if n != 1 else ''}", 4000)
             self._refresh_bookmark_panel()
             self._refresh_media_bookmark_badges()
+            self._refresh_file_bookmark_colors()
 
         ok_btn.clicked.connect(_try_create)
         dlg.exec()
@@ -9868,6 +10473,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _deselect_all_files(self):
         """Untick all folders in the tree and clear the file browser."""
         self._checked_folders.clear()
+        self._checked_files.clear()
         self.tree_model.blockSignals(True)
         root = self.tree_model.invisibleRootItem()
         self._cascade_check(root, Qt.CheckState.Unchecked)
@@ -9883,11 +10489,344 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._set_file_model(FileTableModel(self.file_headers))
             self._update_filter_columns(self.file_headers)
             self._refresh_table_status()
+        self._selected_only_scope = set()
+        self._sync_selected_only_after_scope_change()
+        self._refresh_file_checked_paths()
 
     def _deferred_rebuild(self):
         self._rebuild_pending = False
         self._update_selected_btn()
         self._rebuild_file_view_from_checked()
+        self._selected_only_scope = self._compute_selected_only_scope()
+        self._sync_selected_only_after_scope_change()
+        self._refresh_file_checked_paths()
+
+    def _compute_selected_only_scope(self) -> set:
+        """The full 'Selected only' scope: every checked folder, plus the
+        containing folder of every individually-ticked FILE (see
+        _checked_files' own docstring) — added 2026-09-26 alongside the
+        File Browser table's new far-left tickbox column."""
+        scope = set(self._checked_folders)
+        for path in self._checked_files:
+            scope.add(path.rsplit('/', 1)[0] if '/' in path else '')
+        return scope
+
+    def _refresh_file_checked_paths(self) -> None:
+        """Push the current folder+file selection state into the File
+        Browser table model's own checkbox rendering — added 2026-09-26
+        alongside the new far-left tickbox column. Call any time
+        _checked_folders/_checked_files changes (a tree click, Deselect
+        All, "Select Bookmarked Files", or the table's own checkbox) so a
+        row's tick always matches the live selection regardless of which
+        mechanism last changed it."""
+        if hasattr(self, 'file_model'):
+            self.file_model.set_checked_paths(self._checked_folders | self._checked_files)
+
+    def _set_folder_checked_from_table(self, path: str, checked: bool) -> None:
+        """Tick/untick a FOLDER row's checkbox from the File Browser
+        table's own new far-left tickbox column — added 2026-09-26.
+        Reuses the tree's own checkbox machinery when the folder is
+        already materialized there (so the tree's visual state, the
+        debounced aggregate rebuild, and "Selected only" scope sync all
+        happen exactly as an ordinary tree click would), falling back to
+        the same lazy-materializing walk _tick_items_by_path already uses
+        for a folder not yet expanded/visible in the tree."""
+        item = self._find_tree_item(path)
+        if item is not None and item.isCheckable():
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            return  # on_tree_item_changed -> _deferred_rebuild does the rest
+        if checked:
+            self._checked_folders.add(path)
+            self._tick_single_path(path)
+        else:
+            self._checked_folders.discard(path)
+        self.tree_view.viewport().update()
+        self._update_selected_btn()
+        self._rebuild_file_view_from_checked()
+        self._selected_only_scope = self._compute_selected_only_scope()
+        self._sync_selected_only_after_scope_change()
+        self._refresh_file_checked_paths()
+
+    def _on_file_row_check_toggled(self, ui_path: str, is_folder: bool, checked: bool) -> None:
+        """FileTableModel.check_toggled's one connected slot (see
+        _set_file_model) — added 2026-09-26. A FOLDER row's tick reuses
+        the existing tree-checkbox mechanism (_checked_folders, the same
+        as ticking it in the tree); a FILE row's tick is tracked
+        separately (_checked_files) and only ever feeds "Selected only"
+        tree scope, mirroring "Select Bookmarked Files" but for an ad hoc
+        pick instead of a saved bookmark."""
+        if is_folder:
+            self._set_folder_checked_from_table(ui_path, checked)
+            return
+        if checked:
+            self._checked_files.add(ui_path)
+        else:
+            self._checked_files.discard(ui_path)
+        self._selected_only_scope = self._compute_selected_only_scope()
+        self._sync_selected_only_after_scope_change()
+        self._refresh_file_checked_paths()
+
+    # ── "Selected only" tree — dual-root, instant-switch design ─────────── #
+    # Added 2026-09-26, direct request: "i rec[u]rsively look at one folder
+    # and then another but forget to de[s]elect the previous one and then i
+    # do not rea[l]ise i am looking at both[,] this is [especially] a
+    # problem when looking at the gallery. how about an option to show
+    # only the folder tree that you have got file[s] selected to show in
+    # the viewer?"
+    #
+    # REDESIGNED the same day, direct follow-up, after the first version
+    # (which filtered/rebuilt the real "/ [Full Filesystem]" tree itself on
+    # every toggle via reload_tree_entirely) turned out to have a real,
+    # noticeable delay: "there is a pregnant pause as the filter happens[.]
+    # can we instead have two list[s] and as the files are s[e]lected they
+    # are added to the other list and therefore it is just a qu[i]ck
+    # switch? maybe there is a common root and when the file[s] are
+    # s[e]lected from the main full filesystem[,] then in the selected
+    # file[s] root they are copied there and... [switching] is [just]
+    # hiding and showing that branch of the tree?" — exactly what's built
+    # below. The real cost in the first version was walking down to each
+    # scope path through the SAME lazy population every ordinary folder
+    # expand uses — synchronously checking and rejecting every OTHER
+    # sibling at each ancestor level (a real folder can have thousands of
+    # children — iOS's mobile/Containers/Data/Application/ especially) —
+    # repeated once per scope path with no event-loop yield in between,
+    # AND destroying/losing whatever the examiner had already expanded in
+    # the real tree on every single toggle.
+    #
+    # Now: "/ [Full Filesystem]" (self._fs_root_item) and "Selected Only"
+    # (self._selected_root_item) are TWO permanent, always-present
+    # top-level items built once by reload_tree_entirely — the real tree
+    # is NEVER rebuilt or filtered by this feature at all any more, so its
+    # own expansion state survives every toggle untouched. "Selected Only"
+    # is rebuilt (cheaply — see _rebuild_selected_only_children) only when
+    # the SCOPE itself changes; switching which one is visible
+    # (_apply_selected_only_visibility) is a plain QTreeView.setRowHidden
+    # flip — no rebuild, no walk, no per-candidate filtering, genuinely
+    # instant regardless of overall archive size.
+
+    def _on_selected_only_toggled(self, checked: bool) -> None:
+        """The manual checkbox — always available, at any time, per direct
+        request ('the user can switch at any time'), overriding whatever
+        the automatic Gallery/File-Browser tab-switch behavior last set."""
+        self._apply_selected_only(checked)
+
+    def _sync_selected_only_after_scope_change(self) -> None:
+        """Call right after self._selected_only_scope has just been
+        updated (a checkbox ticked/unticked, or Deselect All) — rebuilds
+        the (cheap, small) 'Selected Only' tree to match, regardless of
+        whether it's currently the visible one, then keeps the mode
+        itself honest:
+          - turns it OFF automatically the moment the scope becomes empty
+            (an empty 'Selected only' view is never useful — nothing left
+            to disambiguate);
+          - turns it ON automatically while the Media Browser tab is
+            already active and the scope just became non-empty — the
+            same 'switches to this view automatically' behavior
+            _on_center_tab_changed applies on an actual tab switch, here
+            covering ticking the FIRST checkbox while already sitting on
+            that tab;
+          - otherwise leaves the mode as it currently is (just refreshed,
+            if it's already on — a plain instant visibility flip either
+            way, never a rebuild of the real tree)."""
+        self._rebuild_selected_only_children()
+        if not self._selected_only_scope:
+            if self._selected_only_mode:
+                self._apply_selected_only(False)
+            return
+        if self.center_tabs.currentIndex() == 1 or self._selected_only_mode:
+            self._apply_selected_only(True)
+
+    def _bookmark_scope_folders(self, entries: list) -> set:
+        """The set of folders a bookmark group's own entries live in —
+        the entry itself if it's a bookmarked FOLDER, otherwise its
+        containing folder. Used by _show_bookmark_group to switch
+        'Selected only' mode to show exactly where those files are."""
+        scope: set = set()
+        for entry in entries:
+            ui_path = entry['ui_path']
+            if ui_path in self.folder_map:
+                scope.add(ui_path)
+            else:
+                scope.add(ui_path.rsplit('/', 1)[0] if '/' in ui_path else '')
+        return scope
+
+    def _rebuild_selected_only_children(self) -> None:
+        """Rebuilds the 'Selected Only' root's own children directly from
+        self._selected_only_scope's own path COMPONENTS — never
+        enumerates folder_map's other children at ancestor levels (see
+        this section's own header comment for the real, measured cost
+        that avoids). Cost is proportional only to the scope's own total
+        path depth, never overall archive size. Called whenever the
+        scope changes, regardless of whether 'Selected Only' is currently
+        the visible root, so it's always ready the instant the mode is
+        switched on — never touches or rebuilds "/ [Full Filesystem]" at
+        all.
+
+        Each ancestor segment on the way to a scope folder gets a bare
+        item with only the ONE child continuing toward that folder — no
+        placeholder, so it can't be expanded to reveal unrelated real
+        siblings (that would defeat the whole point of this view). The
+        scope folder itself DOES get a real, ordinary lazy-placeholder,
+        so its own actual subtree stays fully browsable — matching
+        _rebuild_file_view_from_checked's own recursive aggregation. A
+        scope folder that happens to be an ANCESTOR of another (rare —
+        both explicitly checked independently, checking doesn't cascade
+        to descendants by default) gets the real placeholder instead of a
+        synthetic child for the deeper one, since it's already reachable
+        by ordinary expansion once that placeholder is opened."""
+        root = self._selected_root_item
+        if root is None:
+            return
+        self.tree_model.blockSignals(True)
+        try:
+            root.removeRows(0, root.rowCount())
+            created: dict[str, QStandardItem] = {'': root}
+            full_expand: set[str] = set()
+            for scope_path in sorted(self._selected_only_scope,
+                                     key=lambda p: p.count('/')):
+                parts = [p for p in scope_path.split('/') if p]
+                cur_path = ''
+                skip_rest = False
+                for part in parts:
+                    parent_path = cur_path
+                    cur_path = f"{cur_path}/{part}" if cur_path else part
+                    if parent_path in full_expand:
+                        # An ancestor already has a real placeholder —
+                        # this and everything below it is already
+                        # reachable by ordinary expansion.
+                        skip_rest = True
+                        break
+                    if cur_path not in created:
+                        parent_item = created[parent_path]
+                        item = QStandardItem(self._display_name(part))
+                        item.setData(cur_path, Qt.ItemDataRole.UserRole)
+                        item.setEditable(False)
+                        if cur_path in self.folder_map:
+                            item.setCheckable(True)
+                            item.setCheckState(
+                                Qt.CheckState.Checked
+                                if cur_path in self._checked_folders
+                                else Qt.CheckState.Unchecked)
+                            self._research_tree_style(item, cur_path)
+                        parent_item.appendRow(item)
+                        created[cur_path] = item
+                if skip_rest:
+                    continue
+                leaf_item = created.get(scope_path)
+                if leaf_item is not None and self.folder_map.get(scope_path):
+                    placeholder = QStandardItem()
+                    placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
+                    placeholder.setEditable(False)
+                    leaf_item.appendRow(placeholder)
+                    full_expand.add(scope_path)
+        finally:
+            self.tree_model.blockSignals(False)
+        self.tree_view.expand(self.tree_model.indexFromItem(root))
+        for path in created:
+            if not path or path in full_expand:
+                # A scope folder's own leaf item (full_expand) still
+                # carries a REAL, ordinary lazy placeholder — expanding
+                # it here would fire Qt's own `expanded` signal straight
+                # into _on_tree_item_expanded, which schedules an ASYNC
+                # _populate_tree_children_batched call for THIS item. A
+                # real, confirmed crash risk: if the scope changes again
+                # (a further checkbox click) before that async job runs,
+                # this whole 'Selected Only' subtree gets torn down by
+                # this same method's own root.removeRows() above, and the
+                # stale job then tries to append a row to an
+                # already-deleted QStandardItem. Left collapsed instead —
+                # expanding it later by an ordinary user click is
+                # completely safe, since _on_tree_item_expanded only ever
+                # fires then from a live item, never a since-destroyed
+                # one. Confirmed via direct reproduction before this fix:
+                # checking two folders, declining a replace-confirmation,
+                # then confirming a second one crashed with exactly
+                # "Internal C++ object (QStandardItem) already deleted".
+                continue
+            self.tree_view.expand(self.tree_model.indexFromItem(created[path]))
+
+    def _apply_selected_only_visibility(self) -> None:
+        """Instantly switches which of the two top-level tree roots is
+        shown — via QTreeView.setRowHidden, never a rebuild of either
+        one. Both rows always exist in the model once an archive is
+        loaded (see reload_tree_entirely/_rebuild_selected_only_children)
+        — this only ever changes which is VISIBLE."""
+        if self._fs_root_item is None or self._selected_root_item is None:
+            return
+        self.tree_view.setRowHidden(self._fs_root_item.row(), QModelIndex(),
+                                    self._selected_only_mode)
+        self.tree_view.setRowHidden(self._selected_root_item.row(), QModelIndex(),
+                                    not self._selected_only_mode)
+
+    def _apply_selected_only(self, enabled: bool) -> None:
+        """Flips 'Selected only' mode and instantly swaps which tree root
+        is visible — the one place every trigger (the manual checkbox,
+        automatic tab-switch behavior, and scope changes while already
+        on) funnels through, so the checkbox's own visual state and
+        what's actually shown can never drift apart.
+
+        Carries the currently-selected item across every REAL transition
+        — see _carry_over_tree_selection's own docstring for the exact
+        "same path if it exists there, else nothing" rule. Not a
+        transition (enabled already matches the current mode, e.g.
+        _sync_selected_only_after_scope_change's own "just refresh"
+        calls) skips this entirely, so a redundant call never disturbs
+        whatever's already correctly selected."""
+        transitioning = enabled != self._selected_only_mode
+        if transitioning:
+            self._save_tree_selection_for_carryover()
+        self._selected_only_mode = enabled
+        self._selected_only_chk.blockSignals(True)
+        self._selected_only_chk.setChecked(enabled)
+        self._selected_only_chk.blockSignals(False)
+        self._apply_selected_only_visibility()
+        if transitioning:
+            self._carry_over_tree_selection(enabled)
+
+    def _save_tree_selection_for_carryover(self) -> None:
+        """Records whichever real folder path is currently selected (if
+        any — filtering out the placeholder/root-marker sentinels), right
+        BEFORE a real 'Selected only' transition — the first half of the
+        carry-over rule described in _carry_over_tree_selection's own
+        docstring, added 2026-09-26 as a direct simplification of an
+        earlier same-day design (remembering each branch's own
+        INDEPENDENT last position) per direct follow-up: "when switch
+        between the view[s] which ever item is selected sh[oul]d be
+        selected in the other if it exist[s][;] if not then nothing
+        should be selected" — a single shared "what was just selected"
+        value, not two separately-remembered histories."""
+        idx = self.tree_view.currentIndex()
+        path = None
+        if idx.isValid():
+            item = self.tree_model.itemFromIndex(idx)
+            if item is not None:
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if data is not None and data not in (_TREE_PLACEHOLDER, _SELECTED_ROOT_MARKER):
+                    path = data
+        self._tree_last_selected_path = path
+
+    def _carry_over_tree_selection(self, now_selected_only: bool) -> None:
+        """Called right after the OTHER branch becomes visible. Tries to
+        select the SAME path that was selected just before the switch
+        (self._tree_last_selected_path) in the branch that's now shown —
+        if that path doesn't exist there (e.g. switching into 'Selected
+        only' with a folder that isn't part of the current scope),
+        selects NOTHING instead of leaving a stale or unrelated item
+        highlighted. Deliberately does NOT call on_folder_selected/
+        navigate_tree_to_path's own tail: this only restores the TREE's
+        own selection, it never re-triggers a file-table reload —
+        self._view_path (and what the File Browser actually shows) was
+        never changed by this toggle in the first place."""
+        path = self._tree_last_selected_path
+        if path:
+            root_item = self._selected_root_item if now_selected_only else None
+            item = self._expand_walk_to_path(path, root_item=root_item)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == path:
+                idx = self.tree_model.indexFromItem(item)
+                self.tree_view.setCurrentIndex(idx)
+                self.tree_view.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+                return
+        self.tree_view.setCurrentIndex(QModelIndex())
 
     def _on_recent_context_menu(self, point):
         view = self.archive_dropdown.view()

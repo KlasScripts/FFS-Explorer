@@ -1832,10 +1832,24 @@ class ArtifactViewerMixin:
         try:
             row = self._art_table_model._rowids.index(report_rowid)
         except ValueError:
-            self.status_bar.showMessage(
-                "That report row is no longer present, or is excluded by "
-                "the current filter (the parser may have been re-run "
-                "since this hit was interpreted).")
+            # Real bug found 2026-09-25, direct report: this used to only
+            # post to the status bar and return -- leaving the Hex panel
+            # showing whatever it had before (often nothing at all, i.e.
+            # Qt's own generic "Double-click a file to preview it here..."
+            # placeholder text), with zero explanation there. A status-bar
+            # message is easy to miss mid-workflow, and a bare, context-
+            # free placeholder reads as "nothing happened" rather than "the
+            # jump specifically failed, here's why" -- exactly the report:
+            # "it just said double-click a file to preview it here... no
+            # info what happened." Now shows the same explanation in BOTH
+            # places, matching the message every OTHER failure branch in
+            # this hex-jump code already writes to the panel itself, not
+            # just the status bar.
+            msg = ("That report row is no longer present, or is excluded "
+                  "by the current filter (the parser may have been "
+                  "re-run since this hit was interpreted).")
+            self.status_bar.showMessage(msg)
+            self._show_art_hex_message(msg)
             return
         self._art_report_view.selectRow(row)
         self._art_report_view.scrollTo(self._art_table_model.index(row, 0))

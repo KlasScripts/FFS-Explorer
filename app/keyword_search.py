@@ -919,9 +919,7 @@ class SqlHitInterpretWorker(QThread):
         materially different, riskier claim than the base-file "live row
         covered by this report" case, so a WAL hit always reports as its
         own `wal_row` kind, never silently folded into `report`/`live`."""
-        import os
         import struct
-        import tempfile
         import sqlite_carve
 
         # Scoped to main-archive WAL hits only, matching hit_ui_path's
@@ -959,37 +957,41 @@ class SqlHitInterpretWorker(QThread):
                                 'message': "Could not read the base database's schema"})
             return
 
-        fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
-        base_conn = None
+        # Reuses sqlite_carve's own shared _readonly_connection (added
+        # 2026-09-25) instead of this function's former hand-rolled
+        # write-a-temp-file/connect/remove block -- the identical pattern
+        # that helper replaced at six call sites inside sqlite_carve.py
+        # itself, for the identical reason: base_raw here is, BY
+        # DEFINITION, a WAL-mode-flagged database (that's what having a
+        # real -wal sidecar to interpret at all means), so this was
+        # writing a full copy of it to disk on every single "Interpret as
+        # SQL Record" click on a WAL hit -- see that helper's own
+        # docstring for the real AV-interception/disk-I/O reasoning, and
+        # its own real WAL-mode fix (deserialize() alone silently fails
+        # on a WAL-mode header) which applies here for exactly the same
+        # reason it does inside sqlite_carve.py.
         try:
-            with os.fdopen(fd, 'wb') as f:
-                f.write(base_raw)
-            base_conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
+            with sqlite_carve._readonly_connection(base_raw) as base_conn:
+                loc = sqlite_carve.locate_wal_offset(
+                    wal_raw, self.offset, wal_page_size, base_page_map, base_conn,
+                    reserved_bytes=reserved_bytes)
+                if loc is None:
+                    structure = sqlite_carve.identify_wal_structure(
+                        wal_raw, self.offset, wal_page_size, base_page_map, base_conn=base_conn)
+                    self.finished.emit({'kind': 'unresolved', 'structure': structure})
+                    return
 
-            loc = sqlite_carve.locate_wal_offset(
-                wal_raw, self.offset, wal_page_size, base_page_map, base_conn,
-                reserved_bytes=reserved_bytes)
-            if loc is None:
-                structure = sqlite_carve.identify_wal_structure(
-                    wal_raw, self.offset, wal_page_size, base_page_map, base_conn=base_conn)
-                self.finished.emit({'kind': 'unresolved', 'structure': structure})
-                return
-
-            self.finished.emit({
-                'kind':             'wal_row',
-                'table':            loc['table'],
-                'rowid':            loc['rowid'],
-                'row':              loc.get('row_values') or {},
-                'column_name':      loc.get('column_name'),
-                'wal_frame_index':  loc.get('wal_frame_index'),
-            })
-        finally:
-            if base_conn is not None:
-                base_conn.close()
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+                self.finished.emit({
+                    'kind':             'wal_row',
+                    'table':            loc['table'],
+                    'rowid':            loc['rowid'],
+                    'row':              loc.get('row_values') or {},
+                    'column_name':      loc.get('column_name'),
+                    'wal_frame_index':  loc.get('wal_frame_index'),
+                })
+        except Exception:
+            self.finished.emit({'kind': 'error',
+                                'message': "Could not open this WAL file's sibling base database"})
 
     def run(self):
         raw = self._read_raw_bytes()
@@ -2463,8 +2465,11 @@ class KeywordSearchMixin:
         unextracted_archives = self._unextracted_archive_count()
         complete_tier, requested_tier = self._current_header_scan_tier()
         # LevelDB/IndexedDB indexing is DELIBERATELY NOT asked about here
-        # at all — see _ensure_leveldb_indexed_then_run's own docstring.
-        # This dialog used to also offer an "Index N LevelDB Folder(s)
+        # at all — indexing itself is no longer even a search-time concern
+        # (see FastZipBrowser._start_leveldb_auto_indexing, ffs-explorer.py,
+        # which runs it automatically during ordinary case loading and
+        # greys out this whole tab until it finishes). This dialog used
+        # to also offer an "Index N LevelDB Folder(s)
         # Now" button alongside the archive one, per direct user
         # feedback ("if I want to do both it is not clear how... can we
         # just remove it and just process them without asking? it does
@@ -2572,34 +2577,17 @@ class KeywordSearchMixin:
                                           resume_search=True,
                                           auto_archive_selection=True)
                 return
-        self._ensure_leveldb_indexed_then_run(term)
-
-    def _ensure_leveldb_indexed_then_run(self, term: str):
-        """Silently indexes any not-yet-indexed LevelDB/IndexedDB folders
-        (no dialog, no examiner choice — just a brief status-bar message)
-        before actually launching the search, then runs it.
-
-        Deliberately NOT a prompt, unlike the archive-decompression
-        choice above — per direct user feedback, 2026-09-20: LevelDB
-        indexing is fast enough (measured ~3-9s of CPU for a real
-        234-folder/257,804-record archive) that asking first only adds
-        friction, and the two-question dialog this replaced (archives
-        AND LevelDB, each with their own "process now" button) had no
-        clear way to do both in one pass — picking either button
-        returned immediately without running the search at all, leaving
-        the OTHER gap unaddressed until the examiner searched again.
-        Every unindexed folder still gets covered — just automatically,
-        every time, rather than needing a deliberate choice."""
-        _, unindexed_leveldb = self._leveldb_search_coverage()
-        if unindexed_leveldb:
-            self.search_status.setText(
-                f"Indexing {len(unindexed_leveldb):,} LevelDB/IndexedDB "
-                "folder(s) for search…")
-            self._index_leveldb_folders_batched(
-                unindexed_leveldb,
-                on_done=lambda: self._start_keyword_search_run(term))
-        else:
-            self._start_keyword_search_run(term)
+        # LevelDB/IndexedDB indexing is no longer done lazily here at
+        # all — removed 2026-09-26, direct request, once
+        # FastZipBrowser._start_leveldb_auto_indexing (ffs-explorer.py)
+        # took over running it automatically during ordinary case
+        # loading, with the Keyword Search tab itself greyed out
+        # (center_tabs.setTabEnabled) until that indexing finishes — see
+        # that method's own docstring. By the time this tab is even
+        # reachable, indexing is guaranteed already done, so the
+        # search-time fallback this used to need (a case where indexing
+        # hadn't finished yet) can no longer occur.
+        self._start_keyword_search_run(term)
 
     def _start_keyword_search_run(self, term: str):
         """The actual search launch — split out of _start_keyword_search

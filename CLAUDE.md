@@ -26,7 +26,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 ## Data flow (opening an archive)
 
 1. `FastZipBrowser.start_loading()` → case dir chosen (`_get_or_ask_case_dir`).
-2. `ZipMetadataWorker` (ffs-explorer.py:1473) → `app/ffs_metadata.py
+2. `ZipMetadataWorker` (ffs-explorer.py:1433) → `app/ffs_metadata.py
    parse_archive_metadata()` in a child process: central-directory parse,
    `ui_metadata` build, folder tree/sizes; snapshot persisted to case dir
    (msgpack) so re-opens are instant.
@@ -8193,3 +8193,1893 @@ underneath that verification.
   restored view correctly survived a tab switch away to File Browser and
   back, never silently reverting. Full pytest suite (18/18) and
   `scripts/check_claude_md.py` clean throughout.
+
+- **"Not Interested" renamed to "Not Relevant"; hide-seen defaulted to
+  ON; button greyed out until scrolled to the bottom, same as "Next";
+  page-nav row reordered — 2026-09-25, direct follow-up.** Prompted by
+  direct feedback that the earlier design's own OFF-by-default hide-seen
+  preference (see that entry's own stated reasoning: "never silently
+  hide evidence by default") read as broken in practice: "you are not
+  hiding the file mark[ed] as not [relevant] after they are marked[;] if
+  i was to go back i should only see unmarked and bookmarked files."
+  Rather than add a second, competing mechanism, the fix is a direct
+  reversal of the earlier default, since the examiner's stated intent
+  for THIS specific button is now explicit: marking a file "Not
+  Relevant" is a deliberate dismissal, and leaving it visible afterward
+  defeats the point of dismissing it.
+
+  `_media_hide_seen_pref()` (`app/media_viewer.py`) and `_load_prefs`/
+  `_save_prefs`/`PreferencesDialog`'s checkbox default (`ffs-explorer.py`)
+  all flipped from `False` to `True` — the Preferences checkbox, and the
+  ability to turn hiding back off, are both unchanged; only which state
+  a fresh, never-touched install starts in changed. A bookmarked file is
+  still NEVER hidden by this regardless of the preference (unchanged —
+  `_on_media_not_relevant`'s own exclusion, and `_recompute_media_all_paths`'s
+  filter only ever removes paths in `_media_seen_paths`, which a
+  bookmarked file is never added to via this button) — this is exactly
+  what makes "if i was to go back i should only see unmarked and
+  bookmarked files" true: `_media_all_paths` is filtered globally, for
+  the whole folder, not just "the page you just left," so Prev/Next both
+  only ever show what's left in that same filtered list.
+
+  Renamed throughout (`_media_not_interested_btn`/`_on_media_not_interested`
+  → `_media_not_relevant_btn`/`_on_media_not_relevant`, button text "Not
+  Interested ▶" → "Not Relevant ▶") — a plain text/identifier rename, no
+  behavior change from the rename itself.
+
+  **Greyed out until scrolled to the bottom, same as "Next"** — direct
+  request: "make it grey out until the end like next." `_update_media_next_button_enabled`
+  (despite its now slightly stale name — kept rather than renamed a
+  second time in the same pass, since it's still primarily "the Next
+  button's own gate," just shared) now also drives `_media_not_relevant_btn`'s
+  enabled state, computing the shared `at_bottom` check once. Deliberately
+  NOT also gated on "is there a next page" the way "Next" itself is — the
+  LAST page still has real content worth dismissing even with nowhere
+  further to advance to, so "Not Relevant" only ever needs the
+  scroll-to-bottom condition, confirmed to stay enabled on the last page
+  once scrolled there (a real, direct test of this exact case, not
+  assumed to follow from sharing the other check).
+
+  **Page-nav row reordered** — direct request: "i would like it to be
+  undo 'Not Relevant' Next." New order, left to right:
+  Prev | (page label) | Undo | Not Relevant | Next — only the three
+  right-hand buttons' relative order changed; Prev and the page label
+  stay where they were.
+
+  **Verified end-to-end against the real Android 14 JoshHickman
+  archive's own 1,383-file sticker folder** (a scratch case_dir,
+  QSettings isolated by the org/app-name-patching technique documented
+  above): button text and page-nav row order both confirmed exactly as
+  requested; a fresh settings store confirmed `_media_hide_seen_pref()`
+  now returns `True` by default; both "Not Relevant" and "Next" start
+  disabled on a freshly loaded page and become enabled together once
+  scrolled to the bottom; marking a page's files as "Not Relevant"
+  (hide-seen now on by default) made the non-bookmarked files
+  IMMEDIATELY disappear from `_media_all_paths` while the bookmarked one
+  stayed, with no separate preference toggle needed; navigating forward
+  then back (Prev) confirmed none of the marked files ever reappeared
+  and the bookmarked one remained visible throughout; and a dedicated
+  check on the folder's actual LAST page confirmed "Not Relevant" stays
+  enabled there once scrolled to the bottom while "Next" correctly stays
+  disabled (nowhere further to go). Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.
+
+- **Bookmarked files hidden from freshly-advanced pages (still visible
+  going back); "Next" no longer needs a scroll-to-bottom gate — 2026-09-25,
+  same-day follow-up.** Direct report: "when you go not relevant or next
+  the bookmark files should not be visable in the new screen of content
+  they should be viewable if you go back and you would only see the[m]
+  if there are more [than] the size of the bat[c]h[,] then you could page
+  back thro[ugh] them. make it that the next button w[o]rks all the time
+  it is only the not relevant that require you to see all the files."
+  Two independent changes, both scoped to `_load_media_page`/
+  `_update_media_next_button_enabled` (`app/media_viewer.py`) alone:
+
+  1. **`_load_media_page` gained an `include_bookmarks: bool = True`
+     parameter — a DISPLAY-only filter, applied nowhere else.** The
+     page's own slice boundaries (`start`/`end`), its prefetch/eviction
+     set, and its "showing A–B of N" label are all still computed from
+     the TRUE, unfiltered `page_items` — only what actually lands in
+     `self._media_model` is optionally narrowed (`display_items`) to
+     exclude anything in `_media_bookmarked_paths`. This is why "page
+     back through them if there are more than the batch size" needs no
+     special bookmark-only view: a bookmarked file simply sits at
+     whatever position it naturally falls in `_media_all_paths`, same as
+     before — it's just skipped from the DISPLAYED set on a forward
+     advance, and shown again the moment that exact page index is
+     revisited with `include_bookmarks=True`. If there happen to be more
+     bookmarked files than fit on one page, they're already spread
+     across however many ordinary pages they land on, so paging Back
+     repeatedly naturally surfaces all of them, one page at a time — no
+     new pagination concept needed, this falls out of the existing
+     page-index math for free.
+
+     Only the two FORWARD-advancing call sites pass `include_bookmarks=
+     False`: `_on_media_next_page`, and both branches of
+     `_on_media_not_relevant` (the hide-seen-on "reload same index" path
+     and the hide-seen-off "advance to next index" path — both are
+     "moving into new content" regardless of whether the page NUMBER
+     changes). Every other caller keeps the default `True`: the initial
+     page load in `_start_thumbnail_load` (arriving at a folder isn't
+     "advancing past" anything), `_on_media_prev_page` (going back is
+     the whole point), `_select_media_item`'s own page-jump for a
+     pending selection (deliberately not filtered — a pending selection
+     can itself BE a bookmarked file, e.g. one picked from the bookmark
+     panel, and it must be reachable), and `_on_media_undo_seen` (undoing
+     a batch is conceptually "going back," not advancing).
+
+     A useful side effect, not separately engineered: if a bookmarked
+     file was hidden by a forward advance and the examiner later selects
+     it some OTHER way (e.g. from the bookmark panel) while sitting on a
+     DIFFERENT page, `_select_media_item`'s existing fallback (look up
+     the file's row, and if not found — which it won't be, since it was
+     never in that forward-filtered display — recompute which page it's
+     on and reload THAT page) reloads with the default `include_bookmarks=
+     True`, so explicit navigation to a bookmarked file always works
+     regardless of how the page it lives on was last displayed.
+
+  2. **"Next" no longer requires scrolling to the bottom — a direct
+     reversal of the very check this same method implemented the day
+     before** ("only let the user move to next page when they are at the
+     bottom"), per explicit follow-up instruction: "make it that the next
+     button works all the time[;] it is only the not relevant that
+     require you to see all the files." `_update_media_next_button_enabled`
+     now enables "Next" purely on whether a further page exists
+     (`page_index < n_pages - 1`), with no scroll check at all; "Not
+     Relevant" keeps the scroll-to-bottom gate exactly as it was. The
+     "Next" button's own tooltip (previously "Scroll to the bottom of
+     this page to continue," now inaccurate) was updated to state the
+     current, actual behavior — that a bookmarked file appears on Back,
+     not on Next.
+
+  **Verified end-to-end against the real Android 14 JoshHickman
+  archive's own 1,383-file sticker folder** (a scratch case_dir,
+  QSettings isolated by org/app-name patching): a bookmarked file placed
+  within page 1's own range was confirmed visible on the folder's
+  initial arrival at page 0 (not an advance); "Next" was confirmed
+  enabled even with the scrollbar deliberately left at the top (not
+  scrolled to the bottom), while "Not Relevant" stayed correctly
+  disabled in that same state; clicking "Next" correctly removed the
+  bookmarked file from the resulting page's own displayed model while
+  confirming it was still present in the underlying `_media_all_paths`
+  (never deleted, just not displayed); clicking "Prev" back to that same
+  page index correctly restored the bookmarked file to the display;
+  scrolling to the bottom and clicking "Not Relevant" correctly hid the
+  bookmark from its resulting page too, while leaving it in the
+  underlying folder list; and Undo correctly restored it to view again.
+  Full pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
+- **Real bug report from a frozen-exe field test: "Jump to this row in
+  the report" (the fast-follow to "Interpret as SQL Record") could leave
+  the Hex panel showing Qt's own generic, context-free placeholder text
+  with zero explanation of what happened — 2026-09-25.** Direct report:
+  "the link to the hex editor worked fine but then it stopped[;] the
+  list of table[s] were still present but it did not open the file in
+  the hex editor... it just said 'double-click a file to preview it
+  here'[,] no info what happened." Diagnosed by code review and a real
+  Qt behavior test (not guessed), then confirmed as a genuine gap, not
+  necessarily the ONLY possible cause of that exact report but a real
+  one regardless: `_art_jump_to_report_row` (`app/artifact_viewer.py`)
+  switches to the Artifact Viewer, reloads the target report, and — if
+  the target `report_rowid` isn't found in the just-reloaded table
+  (`ValueError` from `self._art_table_model._rowids.index(...)`, e.g.
+  the parser was re-run since the hit was interpreted) — used to post an
+  explanation ONLY to the status bar and return, never touching the Hex
+  panel at all. Since `_art_show_report` (called a few lines earlier)
+  never clears or populates the Hex panel itself, it's left showing
+  whatever was there before — commonly nothing, which is exactly when
+  `QPlainTextEdit.setPlaceholderText`'s own generic "Double-click a file
+  to preview it here, or right-click and choose 'Preview in Hex
+  Viewer'." becomes visible (`app/hex_viewer.py`'s `_setup_hex_panel`) —
+  a message that reads as "you haven't done anything yet," not "this
+  specific jump failed, here's why." A status-bar message is also easy
+  to miss entirely mid-triage, compounding the confusion. Fixed by also
+  calling `self._show_art_hex_message(msg)` with the same explanation —
+  matching every OTHER failure branch in this hex-jump code (see the
+  "Artifact Report parser scripts" / hex-panel Conventions entries
+  above), which already write their explanation directly into the panel,
+  not just the status bar.
+
+  Verified Qt's own actual selection-signal behavior directly rather
+  than assumed from memory, since a stale/duplicate `currentRowChanged`
+  not firing was a live hypothesis before elimination: confirmed via a
+  small headless PySide6 script that `QTableView.selectRow()` DOES move
+  `currentIndex()` and DOES fire `currentRowChanged` — including
+  correctly, after a model reset via `beginResetModel()`/`endResetModel()`
+  on the SAME reused model object (`_art_show_report`'s own pattern,
+  confirmed to always invalidate `currentIndex()` back to -1 first, so a
+  same-numbered-row edge case can't suppress the signal) — ruling that
+  mechanism out as a contributing cause; the row-not-found early return
+  was the one confirmed, fixable gap.
+
+- **`sqlite_carve.py`'s six near-identical "write a temp file, connect
+  read-only, delete it" blocks replaced with an in-memory
+  `sqlite3.Connection.deserialize()`-based helper — 2026-09-25, prompted
+  directly by a design question raised while investigating the report
+  above** ("is this the best approach[?] cop[ies] the entire source
+  database's bytes to a brand-new temp file on every single row click,
+  then opens it with only a 5-second SQLite timeout, then deletes the
+  temp file"). `locate_live_row`, `locate_offset` (two internal call
+  sites), `read_live_row`, `build_page_map`, and `identify_structure`
+  each used to write the WHOLE database's bytes to a fresh temp file on
+  EVERY call — needed only so `sqlite3`'s own engine can correctly read
+  `sqlite_master`'s rootpage/schema (a real reader follows overflow
+  pages for a long `CREATE TABLE` statement, which this module's own raw
+  cell-decoder deliberately doesn't attempt) — then deleted it
+  immediately after. For a large evidence database (a real WhatsApp
+  `msgstore.db` is 2.8MB in this project's own Android 14 JoshHickman
+  test archive; a real Chrome `History` or WhatsApp on a heavily-used
+  device can be far larger), this is real, repeated disk I/O on every
+  single row click with no caching — and a real, disclosed risk on a
+  locked-down work machine specifically: antivirus/endpoint-security
+  software commonly intercepts and scans a newly-created file before
+  it can be opened, which for a large file can plausibly exceed the
+  hardcoded 5-second connect timeout, especially since these six sites
+  never shared a page/schema cache with each other at all (see
+  `build_page_map`'s own existing `casecache.db`-backed caching for the
+  DIFFERENT, larger problem of caching ACROSS clicks — this was about
+  the redundant COST WITHIN a single call).
+
+  New `_readonly_connection(raw)` (a `contextlib.contextmanager`) tries
+  `sqlite3.Connection.deserialize()` first (stdlib, Python 3.11+, backed
+  by SQLite's own `sqlite3_deserialize()` C API) — a genuinely in-memory
+  copy, zero disk I/O, confirmed available on every Python version this
+  project actually ships (this project's own CI builds on 3.12) via a
+  direct test before writing any of this. Falls back to the original
+  write-temp-file-then-`mode=ro`-connect approach only if the deserialize
+  path fails.
+
+  **A real, second failure mode was found the same session by this
+  project's own EXISTING test suite (`tests/test_wal.py`), not assumed
+  safe from a synthetic check alone**: `sqlite3.Connection.deserialize()`
+  silently accepts a database whose header declares WAL journal mode
+  (bytes 18/19 = `2, 2` — the common case for a real, actively-used app
+  database, not an edge case: this project's own real WhatsApp
+  `msgstore.db` is WAL-mode) with NO exception at all, but the FIRST real
+  query against the resulting connection then fails with "unable to open
+  database file" — confirmed directly, not inferred: WAL mode needs real
+  shared-memory reader/writer coordination a deserialized in-memory copy
+  has no way to provide. Since this module never reads or replays a live
+  WAL through `sqlite3` itself anyway (a real WAL's own frames are read
+  directly as raw bytes by `locate_wal_offset`/`identify_wal_structure`
+  elsewhere in this file — `_readonly_connection` only ever serves the
+  ALREADY-CHECKPOINTED base file's own schema/b-tree content), the fix
+  patches just those two journal-mode-declaration bytes to `1` (legacy
+  rollback-journal) on a COPY before deserializing — confirmed directly
+  that this doesn't affect the schema/page content the helper actually
+  needs, and the original bytes (and the real file on disk) are never
+  touched. `_readonly_connection` also now runs a real verification
+  query (`PRAGMA schema_version`) before trusting the deserialized
+  connection at all, specifically because this failure mode proved that
+  `deserialize()` not raising is not sufficient evidence the connection
+  actually works — a lesson worth keeping in mind for any FUTURE
+  extension of this helper. `PRAGMA query_only = ON` is also set on
+  either connection, enforcing this project's own standing "read-only
+  towards evidence" rule explicitly for the deserialize path, which has
+  no file-level `mode=ro` to lean on the way the fallback does.
+
+  **Verified at three levels, not just "tests pass"**: (1) the full
+  pytest suite, including `test_wal.py`, which is what actually caught
+  the WAL-mode regression before this was ever considered done — a
+  synthetic non-WAL check alone would have missed it entirely; (2)
+  directly against the real, WAL-mode WhatsApp `msgstore.db` from this
+  project's own Android 14 JoshHickman archive: `locate_live_row`
+  correctly found a real live row (ground-truth-checked against an
+  ordinary file-based query first), `read_live_row` correctly returned
+  all 21 real columns, `build_page_map` correctly attributed real pages
+  to the real `message` table, and `identify_structure` correctly
+  resolved both a real index page (`sqlite_autoindex_props_1`, with its
+  real column list) and a real table page against it; (3) confirmed zero
+  temp files are created or left behind across 20 consecutive real calls
+  against that same real database (`~1.4ms/call`, down from a full
+  2.8MB disk write+connect+delete every time). Full pytest suite (18/18)
+  and `scripts/check_claude_md.py` clean throughout.
+
+  **Does a RECOVERED/deleted row still work through this? Direct
+  question, answered by tracing all three real paths rather than
+  assumed** — deleted-record recovery turned out to be almost entirely
+  UNAFFECTED by the above, for a reassuring reason: it mostly never went
+  through the six sites that changed at all.
+  1. **Carving itself** (`recover_deleted_rows`, run once when a parser
+     with `recoverable_tables` executes) opens its OWN, separate
+     `sqlite3.connect()` directly against the already-extracted real
+     file on disk in `case_dir/artifact_parser_files/<name>/` — never a
+     fresh per-call temp copy of in-memory bytes, so it was never part
+     of the problem this fix addressed, and is completely untouched by
+     it.
+  2. **Viewing an already-recovered row's hex citation** (the Artifact
+     Viewer's `_art_load_record_hex`, `row.get('recovered')` branch)
+     uses the row's OWN `raw_offset`/`raw_length`, computed once at
+     carving time and stored on the row — it never calls
+     `locate_live_row`/`locate_offset`/`read_live_row`/`build_page_map`/
+     `identify_structure` at all, so it's also completely unaffected.
+  3. **The one path that DOES matter**: a Keyword Search hit landing
+     inside a `-wal` sidecar, interpreted via "Interpret as SQL Record"
+     (`SqlHitInterpretWorker._run_wal`, `app/keyword_search.py`) — this
+     is real WAL-frame deleted-record recovery (the same shape as the
+     already-documented real LINE `fts_message_content` docid=27 case).
+     This function had its OWN separate, not-yet-touched copy of the
+     exact same write-a-temp-file pattern, needed for a `base_conn`
+     passed into `sqlite_carve.locate_wal_offset`/`identify_wal_structure`
+     — and since a WAL hit's own sibling BASE file is, BY DEFINITION,
+     always WAL-mode-flagged (that's what having a real `-wal` sidecar
+     to interpret at all means), this was writing a full copy of that
+     base file to disk on every single such click, the identical
+     avoidable cost and AV-interception risk as the six sites already
+     fixed. Replaced with `sqlite_carve._readonly_connection(base_raw)`
+     — the same shared helper, reused across the module boundary the
+     same way this project already reuses other "private"-by-convention
+     helpers (e.g. `db_utils._open_results_db`) — plus a new outer
+     `except Exception:` around the whole block: the ORIGINAL code had
+     no such guard at all, so any exception here (before today, from the
+     temp-file/connect calls; a real, if remote, possibility if the
+     fallback path itself ever needed to run) would have propagated
+     uncaught out of a QThread's `run()`, `self.finished` never firing,
+     and the "⏳ Computing…" placeholder sitting forever — the exact same
+     silent-failure shape as this whole session's other real findings,
+     closed here as a direct consequence of touching this code, not
+     separately gone looking for.
+
+     Verified end-to-end through the REAL, modified `SqlHitInterpretWorker
+     ._run_wal` method itself, not just `sqlite_carve` in isolation:
+     built a real WAL-mode database, inserted a real row, deleted it
+     while a blocking reader held the WAL open (the identical technique
+     `tests/conftest.py`'s own `wal_db` fixture already uses), then
+     drove the actual worker method (with `_read_raw_bytes` swapped for
+     a direct byte-return, since this test has no real archive to read
+     from) — it correctly emitted `{'kind': 'wal_row', 'table': 'notes',
+     'rowid': <real id>, 'row': {'id': <real id>, 'text': 'this note
+     gets deleted, real recovery test'}, ...}`, matching the real
+     deleted row exactly, confirming the deserialize-based
+     `_readonly_connection` correctly handles a real WAL-mode base file
+     through this specific call site too, not just the six inside
+     `sqlite_carve.py` itself.
+
+- **Status bar shows the resolved bundle ID instead of the raw container
+  GUID when a file/folder is selected in File Browser, or a file is
+  selected in Media Browser — 2026-09-25.** Direct request: "can the path
+  that is show[n] on the status bar when a file is selected in media
+  browser and file browser show the path with the bundle id rather th[a]n
+  the app[lication] GUID so a user can easily see which app it is from."
+  This project already had exactly the right tool for this —
+  `FastZipBrowser._display_path` (substitutes an iOS container GUID
+  segment with its resolved bundle ID via `guid_to_bundle`, e.g.
+  `com.garmin.connect.mobile` instead of
+  `00369DA2-40C4-48F4-81D3-2E0B7A86C0BC`) was already used for the file
+  table's own display rows, but three selection-driven status-bar
+  messages had never been routed through it: `on_file_selected` and
+  `on_folder_selected` (`ffs-explorer.py`), and the Media Browser's
+  `_sync_media_side_panels` (`app/media_viewer.py`, itself callable
+  cross-mixin the same way every other `self.<method>` call already is
+  in this codebase — mixins share one `self`, no import needed).
+
+  Display-only in all three cases — confirmed directly, not just
+  asserted: `_selected_file_path`/`_selected_media_path` (and everything
+  `on_file_selected` logs via `self._log(...)`) still store/log the REAL
+  ui_path with the GUID intact, since those feed lookups against
+  `folder_map`/`full_metadata` (keyed by the true archive path) and the
+  audit-log's own evidentiary trail — only the string actually passed to
+  `status_bar.showMessage(...)` changed.
+
+  Verified against the real IOS17 JoshHickman archive, not a synthetic
+  path: a real Garmin Connect file under
+  `containers/Bundle/Application/00369DA2-.../` correctly showed
+  `containers/Bundle/Application/com.garmin.connect.mobile/...` in the
+  status bar for all three call sites (File Browser file selection,
+  File Browser folder selection, Media Browser item selection — the
+  last confirmed via a real media file, an Alipay SDK icon bundled
+  inside Garmin's own app), with the real GUID confirmed absent from
+  every one of them and `_selected_file_path`/`_selected_media_path`
+  confirmed to still hold the real, GUID-intact path underneath. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout. Not yet extended to the Artifact Viewer's own few
+  path-showing status messages (`_art_load_record_hex`/
+  `_art_load_attachment_hex`) — same idea would apply there, left
+  out since the request named File Browser and Media Browser
+  specifically.
+
+- **Media Browser thumbnail hover tooltip removed, 2026-09-25.** Direct
+  request: "remove the text that appear[s] if you hover over the media
+  file." `MediaFileListModel.data()` (`app/media_viewer.py`) returned the
+  full `ui_path` for `Qt.ItemDataRole.ToolTipRole` as well as
+  `DisplayRole` — Qt's own `QListView` shows whatever `ToolTipRole`
+  returns as a hover popup automatically, no custom `helpEvent`/
+  `QToolTip` code involved (confirmed there was none to also remove).
+  `ToolTipRole` dropped from the role tuple; `DisplayRole`/`EditRole`
+  unchanged, since `DisplayRole` is still what `MediaGridDelegate.paint`
+  reads for the filename shown under each thumbnail and what every
+  click/selection handler reads via `index.data(Qt.ItemDataRole.
+  DisplayRole)` — only the hover popup itself is gone. Verified directly:
+  `ToolTipRole` now returns `None` while `DisplayRole` and `row_of()`
+  both still work exactly as before. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.
+
+- **`ArchiveSelectionDialog` ("Select Archives for Extraction") individual
+  checkbox selection investigated, a click-anywhere-on-row fix tried and
+  then reverted the same day, 2026-09-25.** Direct report: "i was just
+  reviewing the dialog wer[e] you select the zip you want to decompress
+  and there was no way to select individ[u]al ones." Investigated rather
+  than assumed broken: confirmed directly that `QTreeWidgetItem`'s own
+  DEFAULT flags already include `ItemIsUserCheckable` (a real headless
+  check, not recalled from memory), and every leaf archive already had
+  its own genuinely independent, correctly-cascading checkbox
+  (`_on_item_changed` already propagates a check DOWN to children and
+  syncs a tri-state UP to parents without forcing siblings to match) —
+  individual selection technically already worked; the checkbox glyph
+  itself was always genuinely clickable.
+
+  First fix tried: a click ANYWHERE on the row (not just the tiny
+  checkbox glyph) toggled that item's checkbox, on the theory that
+  clicking the archive's own path text — the natural place to click —
+  doing nothing was the real source of "no way to select individual
+  ones." Built, verified working exactly as designed (a text-area click
+  toggled only that one archive, a real checkbox-glyph click still
+  applied exactly once, siblings unaffected) — then explicitly REJECTED
+  by direct follow-up before shipping: "i do not want it that if you
+  click the row it will be included in the selection[;] i want a check
+  box so it is clear when they are check[ed] and not[,] and i do want
+  the parent to check and uncheck the children." Reverted in full
+  (`_on_tree_item_clicked` and its `itemClicked` connection removed, the
+  now-unused `QStyle` import taken back out) — the standing design is
+  deliberately click-the-checkbox-only: a row click that also toggled
+  selection risked conflating "I clicked to look at this row" with "I
+  clicked to include it," which is exactly the ambiguity a dedicated,
+  explicit checkbox is meant to avoid. The parent-checks/unchecks-
+  children cascade (`_on_item_changed`/`_set_children`/`_sync_parent`)
+  was never touched by either the fix or the revert — confirmed still
+  intact after reverting: checking a whole "App Data" group still checks
+  every archive under it, unchecking it still clears them all, and the
+  individual per-archive checkbox (click the glyph itself) still works
+  precisely as it always did. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout, both before and after
+  the revert.
+
+- **A real, confirmed Qt-on-macOS bug: `ArchiveSelectionDialog`'s
+  checkboxes were completely INVISIBLE in dark mode — 2026-09-25, direct
+  follow-up the same day.** Direct report: "is there an issue with qt on
+  mac os? i cannot see the checkboxs in this dialog." Confirmed directly
+  with a real screenshot (`QWidget.grab()`, the real `cocoa` platform —
+  not the offscreen QPA platform used for the rest of this project's
+  headless verification, which wouldn't reflect real native rendering at
+  all) rather than assumed from the report alone: on this machine (macOS
+  27, PySide6 6.11, dark mode, the app's own native `macos` Qt style),
+  every single checkbox in the tree — every state, every level — renders
+  as bare, blank space. Not faint, not a color-contrast issue: no
+  checkbox indicator glyph is drawn at all. A known category of Qt bug —
+  `QMacStyle` failing to paint `QTreeWidgetItem` checkbox indicators,
+  most commonly reported in combination with `setAlternatingRowColors
+  (True)` (already set on this tree) and/or dark mode — confirmed real
+  on this exact build rather than assumed from that reputation alone.
+
+  Fixed by forcing this ONE tree widget to the `Fusion` style
+  (`QStyleFactory.create("Fusion")`) instead of the platform's native
+  style — Fusion paints its own checkbox glyphs directly rather than
+  delegating to native `NSCell` rendering, so it isn't exposed to this
+  bug at all. Deliberately scoped to just `self._tree`
+  (`self._tree.setStyle(...)`), not `QApplication.setStyle(...)`, which
+  would reskin the entire application's look for one dialog's own
+  narrow problem. The created `QStyle` object is kept alive as
+  `self._tree_style` for the dialog's own lifetime — confirmed via Qt's
+  own docs that `QWidget.setStyle()`, unlike `QApplication.setStyle()`,
+  does NOT take ownership of the style object, so letting it fall out of
+  scope would risk it being garbage-collected out from under the widget.
+
+  Verified with real screenshots at every step, not assumed fixed from
+  applying the standard workaround alone: (1) the ORIGINAL bug, captured
+  before any fix — confirmed zero checkbox glyphs anywhere in the real
+  tree; (2) the Fusion-style fix applied ad hoc to a real dialog
+  instance — confirmed all three checkbox states (empty/unchecked, a
+  checkmark, and a distinct solid-grey partially-checked square for a
+  parent group with a mix of checked/unchecked children) now render
+  clearly, a zoomed crop specifically double-checking the tri-state
+  glyph is genuinely distinguishable from plain unchecked rather than
+  assumed correct just because the underlying `checkState()` value was
+  right; (3) the FIX AS ACTUALLY SHIPPED (a real `ArchiveSelectionDialog`
+  instance built exactly as the application constructs it, no manual
+  per-test style override) — confirmed `dlg._tree.style().objectName()
+  == "fusion"` and the rendered screenshot matches the ad hoc fix
+  exactly. Full pytest suite (18/18) and `scripts/check_claude_md.py`
+  clean throughout.
+
+- **`CaseSettingsDialog` gains "Look for zip archives to extract"; a new
+  case auto-advances straight into archive selection once its own header
+  scan completes — 2026-09-25.** Direct request: "when the case is first
+  created it has the case folder settings[,] and it ask[s] the user do
+  they want to look for headers[;] but i would at this point also like
+  to ask the user if they want to look for zips... which should be
+  ticked on by default. when you press ok... and when the zip is loaded
+  then the dialog will show the head[ers] been checked just like in the
+  other dialog and then... the select zip to expand dialog will open."
+
+  New `self._chk_find_archives` checkbox in `CaseSettingsDialog`
+  (checked by default), exposed via a new `find_archives` property —
+  sits right below the existing header-scan tier picker, under its own
+  "Nested archives" label. `_get_or_ask_case_dir` now returns a 3-tuple,
+  `(case_dir, header_scan_tier, find_archives)` — `find_archives` is
+  `False` for every early-return path (a known/existing archive never
+  re-asks), `True` only when a genuinely NEW case's own dialog was shown
+  and the box was left checked. `start_loading`'s own `ZipMetadataWorker
+  .header_scan_done` connection was changed from a bare re-emit lambda
+  into a small combined slot (`_on_creation_header_scan_done`) that
+  calls the existing `_on_header_scan_done` FIRST (which persists
+  `header_scan_complete_tier` for this case) and only THEN, if
+  `find_archives` was requested, calls a new `_auto_show_archive_
+  selection()` — deliberately one slot doing both in order, not two
+  separate connections relying on Qt's own same-signal connection-order
+  guarantee.
+
+  Reuses, rather than reinvents, the EXACT mechanism already built for
+  the Search Coverage reminder's own "Review Header Scan Tier and
+  Archives…" button: `ProcessDialog`'s existing `auto_archive_selection`
+  constructor flag, which (when the scan is already done) force-checks
+  "Find and select archives for extraction," unchecks the integrity
+  check, and fires `_run_operations()` via a zero-delay `QTimer` —
+  landing on `_show_archive_selection()` with no further click needed.
+  Opening `ProcessDialog` at all is also what satisfies "the dialog will
+  show the headers been checked" — its own pre-existing `_header_status_
+  label` already reads `_load_current_header_tier()` (which is exactly
+  `header_scan_complete_tier`, just persisted a moment earlier by
+  `_on_header_scan_done` above), so it shows "Current: Tier N — ..." the
+  instant the dialog is constructed, using the SAME label/wording this
+  dialog already shows for every other case — "just like in the other
+  dialog" was already true by construction, once the tier is persisted
+  before this dialog opens.
+
+  **One real gap found and closed while wiring this up**: `auto_archive_
+  selection`'s existing gate (`self._scan_complete()`) checks `run_log`
+  for a `header_scan`-type entry — written only when a scan runs THROUGH
+  `ProcessDialog`'s own `_start_header_scan`/`_on_header_done`. The
+  creation-time scan runs directly inside `ZipMetadataWorker`, which
+  never touches that bookkeeping at all — confirmed directly (grepped
+  every `start_run_log`/`complete_run_log` call site in the file) rather
+  than assumed compatible. Constructing `ProcessDialog(auto_archive_
+  selection=True)` right after case creation would therefore have opened
+  the dialog but NOT auto-advanced, silently requiring a manual "Run"
+  click and defeating the whole point. Fixed with a new constructor
+  parameter, `force_auto_archive_selection` (plumbed through `_open_
+  process_dialog` too), which bypasses `_scan_complete()` — safe
+  specifically because `_auto_show_archive_selection()` only ever calls
+  it in direct response to that exact scan's own completion signal, so
+  there's no ambiguity about whether the scan actually finished; every
+  OTHER existing caller (`auto_archive_selection=True` alone, from
+  Search Coverage) is completely unaffected, still gated on the real
+  `_scan_complete()` check.
+
+  Verified against the real Android 14 JoshHickman archive, driving the
+  actual running app in-process, not just the new methods in isolation:
+  (1) `CaseSettingsDialog.find_archives` defaults `True` and can be
+  unchecked; (2) a full real `start_loading()` run (case-creation path,
+  `_get_or_ask_case_dir` returning `find_archives=True`) correctly called
+  the new `_auto_show_archive_selection()` exactly once, at a moment
+  where `self.folder_map` was already populated and
+  `header_scan_complete_tier` was already persisted as `'1'` in the
+  case's own `caseresults.db` — confirming the ordering guarantee holds
+  on real data, not just in theory; (3) driving that method for real
+  (patching only this project's own `ProcessDialog._show_archive_
+  selection`, never a native Qt `.exec()`, per this project's own
+  established headless-testing convention) confirmed the full chain —
+  `_open_process_dialog` → real `ProcessDialog.__init__` → the
+  `force_auto_archive_selection` bypass → the zero-delay `QTimer` →
+  `_run_operations` → `_continue_after_integrity` → `_show_archive_
+  selection` — genuinely fires end to end; (4) a separate real
+  `ProcessDialog` instance constructed directly against that same
+  already-scanned case confirmed `_header_status_label.text()` reads
+  `"Current: Tier 1 — unknown-extension files, app/user-accessible
+  areas"` both at construction and at the exact moment the archive-
+  selection step fires. Full pytest suite (18/18) and `scripts/
+  check_claude_md.py` clean throughout.
+
+- **Timestamp Display dialog can no longer be dismissed without choosing —
+  Cancel/[x]/Escape all removed, 2026-09-25, direct instruction while the
+  bigger redesign below was mid-investigation: "can you remove the
+  cancle for the time and date? they need to choose."**
+  `app/timestamp_display.py`'s `_timestamp_display_dialog` — a real
+  decision with real evidentiary consequences (UTC vs. handset vs.
+  acquisition vs. manual zone for every displayed timestamp in the
+  case) previously had an ordinary Cancel/OK row via
+  `dialog_helpers.button_row`, so an examiner could dismiss it having
+  chosen nothing, silently defaulting to UTC without ever having been
+  asked to confirm that. Now: `dlg.setWindowFlags(dlg.windowFlags() &
+  ~Qt.WindowType.WindowCloseButtonHint)` removes the title-bar close
+  button (not guaranteed on every platform's native chrome — confirmed a
+  real, known Qt/macOS limitation, so NOT relied on alone), plus explicit
+  `closeEvent`/`keyPressEvent` overrides (`event.ignore()` on close, and
+  on Escape specifically, falling through to the real `QDialog.keyPressEvent`
+  for every other key) as the actual belt-and-suspenders enforcement. The
+  button row is now OK-only (`ok_btn.setDefault(True)`, `dlg.exec()` called
+  unconditionally rather than the old `if not dlg.exec(): return`) — UTC
+  is always a safe, harmless default to accept as-is, so this only ever
+  costs one extra click on a dialog the examiner would otherwise have
+  dismissed without deciding anything.
+
+  Verified via an isolated headless PySide6 script reproducing the exact
+  same close-button-hint-removal + closeEvent/keyPressEvent-override
+  pattern (not the full dialog, which needs more setup to drive headlessly
+  in isolation): confirmed a real Escape keypress does not close the
+  dialog, a real `.close()` call does not close it, and only clicking the
+  OK button closes it with `Accepted`. Full pytest suite (18/18) clean.
+
+- **Case creation redesigned again the same day, 2026-09-25/26 — the
+  automatic-background-header-scan mechanism from the entry above was
+  itself REPLACED within hours by direct follow-up instruction: "instead
+  of doing the head[er] scan in the background can we instead just[,]
+  after the user has selected how they want to deal with the time and
+  date[,] the ok should be tied to opening process case and the hash
+  check should be checked[,] the tier one should be ticked, zip and
+  embedded media."** `CaseSettingsDialog` (see its own docstring, which
+  documents this same history) is stripped back to name-only — the
+  header-scan tier picker (`_tier_group`/`_rb_tier1/2/3`/
+  `_tier_coverage_label`/`_locations_btn`/`_on_tier_clicked`/
+  `_update_tier_coverage_label`/`_on_show_locations`/`_on_format_detected`/
+  `_on_format_detect_error`, plus the `header_scan_tier` property) and
+  the "Look for zip archives to extract" checkbox/property added just
+  hours earlier are ALL gone, along with `_DetectFormatWorker` (its one
+  and only caller). `_get_or_ask_case_dir` now returns a bare `case_dir`
+  (not a 3-tuple), and `start_loading` always constructs
+  `ZipMetadataWorker(..., header_scan_tier=0, ...)` — no automatic scan
+  of any kind runs at case creation any more. `_auto_show_archive_selection`/
+  `force_auto_archive_selection` (both from the entry above) are removed
+  outright, not left dormant — dead the instant the automatic scan they
+  existed to chain off of stopped running.
+
+  In their place: `FastZipBrowser._open_process_dialog_for_new_case()`,
+  called from `app/timestamp_display.py`'s `_timestamp_display_dialog`
+  (which gained an `is_first_load: bool = False` parameter) right after
+  that dialog is accepted and its settings saved — i.e. the exact moment
+  named in the instruction, "after the user has selected how they want
+  to deal with the time and date." Opens `ProcessDialog` with the
+  archive/hash check already defaulting to checked (unchanged —
+  `self._load_last_integrity_run() is None` on a fresh case), plus two
+  NEW `ProcessDialog.__init__` parameters — `preselect_tier1` (ticks
+  `self._tier_upgrade_cbs[1]` once `_rebuild_tier_upgrade_ui()` has built
+  it — always present for a fresh case, since `_current_tier` starts at
+  0) and `preselect_embedded_media` (ticks `self._chk_embedded_media`) —
+  alongside the pre-existing `preselect_nested`. Deliberately does **not**
+  auto-run (unlike `auto_archive_selection`'s own Search-Coverage-reminder
+  use, and unlike the design it replaces): the instruction's own wording
+  only asks for boxes to be "ticked," not run automatically, and this now
+  bundles a full header scan + archive extraction + embedded-media sweep
+  in one Run click — a real combined cost worth a deliberate confirmation
+  rather than firing unattended the moment a case is created. This
+  design interpretation was stated as such rather than assumed silently
+  correct, per this project's own standing practice.
+
+  `_show_timestamp_dialog_when_ready` (the proactive first-load trigger,
+  fired from `_start_case_meta_load`'s own background poll once
+  `is_first_load` comes back `True` from `_load_or_detect_timezone_settings`)
+  now calls `self._timestamp_display_dialog(is_first_load=True)`; the
+  Tools-menu `QAction` connection was changed to an explicit
+  `lambda: self._timestamp_display_dialog()` to avoid any ambiguity from
+  Qt's own `triggered(bool)` signal passing its checked-state positionally
+  into the new parameter (harmless today for a non-checkable QAction, but
+  explicit is safer than relying on that coincidence).
+
+  Verified end-to-end against a real archive (Android 14 JoshHickman, a
+  scratch case_dir — never touching the real `config/ffs_archives.json`
+  or `case_data/` this time, having caught and cleaned up a real
+  self-inflicted pollution of both during an earlier draft of this same
+  verification, see the note immediately below) by driving the actual,
+  unmodified first-load chain through the real running app in-process:
+  `start_loading()` → a class-level `exec()` override on
+  `CaseSettingsDialog` (name-only, accepted) → the real background
+  metadata parse (a genuine subprocess spawn, ~100k real archive entries)
+  → `on_metadata_ready` → `_start_case_meta_load`'s poll → the real
+  proactive Timestamp Display dialog genuinely appearing on its own
+  (caught live via a recurring `QTimer` scanning `QApplication.
+  topLevelWidgets()` for it, since it's a plain ad hoc `QDialog`, not a
+  distinct subclass a class-level override could intercept) → accepted →
+  `ProcessDialog` opening AUTOMATICALLY, with `_chk_integrity`/
+  `_chk_nested`/`_chk_embedded_media` all `True`, `_tier_upgrade_cbs[1]`
+  checked, `_selected_upgrade_tier == 1`, and its Run button genuinely
+  visible+enabled (not auto-triggered) — confirmed by the SAME real chain
+  a real click would take, not a reimplementation of it. Separately
+  confirmed no `header_scan_complete_tier` was ever persisted for the new
+  case (the automatic scan genuinely never ran), and that the plain
+  Tools-menu `_timestamp_display_dialog()` call (no `is_first_load`) does
+  NOT reopen Process Case. Full pytest suite (18/18) and `scripts/
+  check_claude_md.py` clean throughout.
+
+  **A real test-methodology mistake, caught and fixed before it could do
+  lasting damage, worth recording as its own lesson**: an early draft of
+  this verification constructed a real `FastZipBrowser()` without first
+  isolating `case_data_root` — `_load_prefs()`'s own QSettings domain WAS
+  correctly isolated by patching `_SETTINGS_ORG`/`_SETTINGS_APP` (this
+  project's own established technique), but `_get_or_ask_case_dir`'s
+  base-folder fallback, when no `case_data_root` preference is set, scans
+  `self._ffs_archives` (loaded from the real, dev-mode
+  `config/ffs_archives.json`) for an existing case_dir to derive a base
+  folder from — a completely different, NON-QSettings mechanism the org/
+  app isolation technique doesn't touch at all. This silently created a
+  real `case_data/iteml_case` folder alongside this project's own real
+  test cases, and `_upsert_archive` wrote a real entry pointing at the
+  scratch zip into the real `config/ffs_archives.json`. Caught immediately
+  by checking `git status`/`git diff` after the run rather than assumed
+  clean, and fixed two ways: the stray `case_data/iteml_case` folder was
+  deleted, and the one polluting JSON entry was removed by hand, byte-for-
+  byte restoring every other real entry untouched (confirmed via a clean
+  `git diff` on that file afterward). The verification was then re-run
+  with `_save_prefs({'case_data_root': <scratch dir>})` set BEFORE
+  constructing the window — confirmed via `window._archives_file_path()`
+  that this correctly redirects `_load_ffs_archives()`/`_upsert_archive`
+  to a scratch `ffs_archives.json` instead, closing the gap for any
+  future headless test of case creation, not just this one.
+
+- **LevelDB/IndexedDB search indexing moved from "on your first search"
+  to ordinary case loading, 2026-09-26, direct request**: "for the
+  level[]db instead of on your first search can we just do that during
+  the inish[i]al processing? where the head[er] search was before i ask
+  you to move to the dialog. can you make it show its progress like it
+  did for headers." Previously, every unindexed LevelDB/IndexedDB folder
+  was indexed lazily the moment a keyword search actually launched
+  (`_ensure_leveldb_indexed_then_run`, `app/keyword_search.py`) — real
+  work (confirmed elsewhere in this file at ~3-9s of CPU for a real
+  234-folder/257,804-record archive) that a search launched right after
+  opening a case would otherwise have to wait through before its own
+  results could even start arriving.
+
+  New `FastZipBrowser._start_leveldb_auto_indexing()` — called from
+  `on_metadata_ready` via `QTimer.singleShot(500, ...)` (placed right
+  after the pre-existing folder-count precompute's own 300ms delay, so
+  it doesn't compete with the very first tree-population frames at case
+  open) — reuses the SAME `_leveldb_search_coverage()`/
+  `_index_leveldb_folders_batched()` machinery the lazy path already
+  used, with no new indexing logic: `_leveldb_search_coverage()` finds
+  every not-yet-indexed folder, and if any exist, `_index_leveldb_
+  folders_batched` runs its own frame-budgeted `QTimer.singleShot` chunks
+  on the main thread exactly as before. Progress mirrors
+  `_on_header_scan_progress`'s own "N remaining…" status-bar phrasing
+  directly, per the "show its progress like it did for headers" request
+  — `"Indexing LevelDB folders for search: {remaining:,} remaining…"` —
+  with a brief "Indexed N LevelDB/IndexedDB folder(s) for search." message
+  on completion (5-second status-bar timeout).
+
+  The lazy `_ensure_leveldb_indexed_then_run` call in `app/keyword_search.py`
+  is deliberately left in place, not removed — a real fallback, not dead
+  code: on a very large case a search could still be launched before this
+  new background pass finishes, and `save_leveldb_search_records`'s own
+  delete-then-insert-PER-FOLDER design (see that function's own docstring)
+  means even a genuine overlap between the two passes is redundant work
+  at worst, never a correctness problem — each `_index_leveldb_folders_
+  batched` call is self-contained, with no shared mutable state between
+  two separate invocations.
+
+  Verified via the full pytest suite (18/18, `ast.parse` syntax check
+  clean). **Re-verified with a direct follow-up check the same session**:
+  captured every `status_bar.showMessage` call during a real first-load
+  run against the real Android 14 JoshHickman archive (234 real LevelDB
+  folders) and confirmed the real wording live —
+  `['Indexing LevelDB folders for search: 233 remaining…', '...232
+  remaining…', ...]`, 234 messages total, exactly matching the intended
+  "N remaining…" phrasing.
+
+- **The lazy search-time LevelDB indexing fallback removed outright; the
+  Keyword Search tab itself greyed out until indexing genuinely finishes
+  — 2026-09-26, same-day direct follow-up**: "can we remove the code
+  from the sea[r]ch[,] and make that the sea[r]ch tab is grayed out
+  until the index[e]dDB work is finished." `_ensure_leveldb_indexed_
+  then_run` (`app/keyword_search.py`) — the "index whatever's still
+  missing right before running a search" fallback the entry above
+  deliberately kept as a safety net — is now genuinely dead code once
+  case loading *guarantees* indexing finishes before the tab is even
+  reachable, so it was deleted rather than left dormant; `_start_keyword_
+  search` now calls `_start_keyword_search_run(term)` directly.
+
+  New `FastZipBrowser._SEARCH_TAB_INDEX = 2` (matches `center_tabs.
+  addTab(search_tab, "Keyword Search")`). `start_loading` disables that
+  tab (`center_tabs.setTabEnabled(idx, False)`, tooltip "Loading
+  archive…") unconditionally, up front, before metadata even starts
+  loading — so there's no window where it's clickable before this case's
+  own LevelDB coverage has even been checked. `_start_leveldb_auto_
+  indexing` re-enables it immediately when there's nothing to index (the
+  common case on a re-open), or keeps it disabled — tooltip updated
+  alongside the existing status-bar progress text — until its own
+  `_done()` fires. `_on_load_worker_finished` re-enables it as a safety
+  net if metadata_ready never fires at all (a failed load) — since
+  `_start_leveldb_auto_indexing` is only ever scheduled FROM
+  `on_metadata_ready`, a load that never gets there would otherwise
+  leave the tab permanently disabled with nothing left to ever re-enable
+  it.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the actual first-load chain in-process (case creation → real
+  metadata parse → real LevelDB auto-indexing): the tab was confirmed
+  `False` immediately after `start_loading()` returns (before metadata
+  had even loaded), still `False` right as `on_metadata_ready` fired,
+  and became `True` again — with its tooltip cleared — only once
+  indexing genuinely completed; `KeywordSearchMixin` confirmed to no
+  longer have `_ensure_leveldb_indexed_then_run` at all. Full pytest
+  suite (18/18) and `scripts/check_claude_md.py` clean.
+
+- **LevelDB extraction parallelized across multiple threads, 2026-09-26,
+  direct follow-up: "i want the application to be quick as it can[;]
+  computer[s] now have lots of core[s,] it is silly not to use them
+  when you can."** Investigated first, not assumed: `app/leveldb_
+  viewer.py`'s two extraction functions (`_extract_leveldb_children_
+  flat`/`_extract_tree`) read every child file ONE AT A TIME, via
+  `FastZipBrowser._read_zip_bytes` — genuinely serial, unlike
+  `header_scan.scan_entries` (`app/header_scan.py`, via `zip_reader.
+  ZipReader`) and `adapters/ffs.py`'s `_build_guid_bundle_map`, both of
+  which already read many small files concurrently via a
+  `ThreadPoolExecutor`. The reason for the difference, confirmed by
+  reading the code rather than assumed: `self._read_zip_bytes` touches
+  GUI-owned mutable state (`self.full_metadata`, `self._get_zip_handle()`)
+  that the main thread can still be mutating concurrently — genuinely
+  unsafe to call from multiple background threads at once. `ZipReader`
+  and `_build_guid_bundle_map`'s own worker function instead take only a
+  bare `zip_path` string and open their own file handle per call, with
+  zero dependency on any GUI object — safe by construction.
+
+  Fixed by applying the exact same "resolve on the main thread first,
+  then hand plain self-contained objects to a thread pool" pattern,
+  rather than inventing a new one. New `LevelDbViewerMixin._resolve_
+  archive_entry(ui_path)` — the metadata-lookup half of `_read_zip_
+  bytes` (`self._adapter.resolve()` + `self._get_zip_handle().getinfo()`),
+  called only on the main thread — returns a `ZipEntry` (see `zip_
+  entry.py`'s own `__slots__`: just a `zip_path` string plus a `ZipInfo`,
+  no GUI dependency at all, and `.read()` opens its own file handle per
+  call). New module-level `_parallel_extract(to_fetch)` takes a list of
+  `(ZipEntry, dest_path)` pairs and reads+writes them concurrently via a
+  `ThreadPoolExecutor(max_workers=min(zip_reader.THREAD_WORKERS,
+  len(to_fetch)))` — reusing the SAME `min(8, cpu_count)` shared constant
+  `header_scan.py` already uses, rather than a new tunable, so the
+  "don't hammer a network share" ceiling stays consistent project-wide.
+
+  `_extract_leveldb_children_flat` now just resolves each child (cheap,
+  main-thread-only) and decides what needs fetching, then calls
+  `_parallel_extract` once for the whole batch. `_extract_tree`
+  (recursive, for IndexedDB's own external blob directory) was split
+  into a new synchronous `_collect_extract_tree` — walks `folder_map`,
+  creates real subdirectories, and resolves every LEAF file to a
+  `ZipEntry` — so the whole tree's own file reads happen in ONE batched
+  parallel pass at the end, rather than spinning up a separate thread
+  pool per directory level. Both `_decode_leveldb_folder` (triggered by
+  ordinary navigation) and `index_leveldb_folder_for_search` (the batch
+  indexing pass) call these same two functions unchanged, so every
+  existing LevelDB extraction call site benefits automatically — no
+  separate opt-in needed.
+
+  Verified against the real Android 14 JoshHickman archive, not just
+  compiled: instrumented `ThreadPoolExecutor.submit` to record which
+  thread actually ran each read, wiped a real, already-decoded LevelDB
+  folder's local extracted copy (a real ProtonMail WebView Local Storage
+  store, 7 real files) and forced a fresh re-decode — confirmed 6
+  distinct worker threads genuinely did the reads (not 1), the
+  re-extracted file set was identical to the original, and every one of
+  the folder's 4 decoded records (`user_key`/`value`) came back
+  byte-for-byte identical to the pre-wipe decode — proving the
+  parallelization is a pure speed change with zero effect on decoded
+  content. Full pytest suite (18/18) and `scripts/check_claude_md.py`
+  clean.
+
+  **A real test-methodology mistake repeated, then fixed, from the
+  earlier LevelDB entry above**: an early version of this verification
+  used the real `test data/Android 14 JoshHickman/EXTRACTION_FFS.zip`
+  and isolated `case_data_root` the same way as before, but forgot the
+  SAME `FFS_ARCHIVES_FILE` merge-in gap that earlier caused a real,
+  accidental open of the user's own persistent case folder — caught
+  BEFORE running this time (not after) by also patching `mod.
+  FFS_ARCHIVES_FILE` to a scratch path up front, and confirming via
+  `window._case_dir.startswith(CASE_ROOT)` that the new case genuinely
+  landed in scratch; `git diff --stat config/` confirmed clean
+  afterward. Worth restating as a standing rule for this project's own
+  test scripts: isolating `case_data_root` alone is NOT sufficient —
+  `FFS_ARCHIVES_FILE` must be redirected too, every time a test opens a
+  zip whose real path might already have a real entry in the real,
+  hardcoded `config/ffs_archives.json`.
+
+- **"Selected only" tree filtering — a toggle on the shared folder-tree
+  panel that shows only the folder(s) currently checked or bookmarked,
+  hiding everything else, 2026-09-26.** Direct request, prompted by a
+  real, recurring workflow problem: "i am finding the hol[e] select
+  multiple folder and the application remembering it to be somewhat of a
+  liability. i rec[u]rsively look at one folder and then another but
+  forget to de[s]elect the previous one and then i do not rea[l]ise i am
+  looking at both[,] this is [especially] a problem when looking at the
+  gallery." The tree panel (`tree_view`, shared across the File Browser
+  and Media Browser tabs — confirmed by reading the layout code before
+  designing this, not assumed: `_on_center_tab_changed` only collapses
+  it to width 0 for the Keyword Search/Artifact Viewer tabs, so it's
+  genuinely visible on both of the tabs this feature actually matters
+  for) previously had no way to tell, at a glance, which folder(s) were
+  actually contributing to a "Show Selected Files" aggregate — the
+  literal, recurring mistake the request describes.
+
+  New `QCheckBox("Selected only")` in the tree panel's own header row
+  (`tree_top`, next to "Jump to ▾"/"Collapse"). Two new pieces of state:
+  `self._selected_only_mode` (bool) and `self._selected_only_scope`
+  (a set of folder paths) — deliberately a SEPARATELY tracked set, not
+  derived live from `self._checked_folders` on every read, updated at
+  exactly three trigger points (a checkbox change via `_deferred_rebuild`,
+  `_deselect_all_files`, and a bookmark click via `_show_bookmark_group`)
+  so an ordinary single-folder tree click — the common case of just
+  browsing around — never disturbs it. Both reset to empty/off on every
+  new archive load (`start_loading`), matching `_checked_folders`' own
+  existing per-archive reset — deliberately session-only, not persisted
+  across app restarts, the same "don't let a display/scope toggle
+  silently persist forever and surprise a later session" caution this
+  project already applies to Report-table column visibility.
+
+  `_populate_tree_children_batched` gained one more independent filter
+  condition alongside the pre-existing `_should_hide_folder`/`hide empty
+  folders` checks: `_selected_only_path_visible(path)` — True when
+  *path* IS a scope folder, an ANCESTOR of one (so the path down to it
+  stays reachable — sibling folders at each level are hidden, only the
+  one branch continuing toward a scope folder survives), or a DESCENDANT
+  of one (so a checked folder's own recursively-aggregated subtree — see
+  `_rebuild_file_view_from_checked`'s existing recursive gathering —
+  stays fully browsable, not just the checked folder's own top level).
+  Deliberately a plain per-candidate scan over the (always small) scope
+  set rather than a precomputed descendant set, which could be
+  arbitrarily large for a checked folder high up the tree. `base == ''`
+  (the whole-filesystem root checked) is special-cased to mean
+  "everything is in scope" — a path can never literally start with
+  `'' + '/'`, since this project's own ui_paths never have a leading
+  slash.
+
+  `_apply_selected_only(enabled)` is the one place every trigger funnels
+  through — syncs the checkbox's own visual state, then calls
+  `reload_tree_entirely` (which gained an optional `on_done` parameter,
+  called once the root's own top-level children are ACTUALLY populated —
+  population is scheduled via `QTimer`, not synchronous, so expanding to
+  a scope path immediately after `reload_tree_entirely()` merely
+  *returns* would find an empty tree; every pre-existing caller omits
+  the parameter and is unaffected) to rebuild the tree under the new
+  filter, then — only when turning ON — expands down to each scope path
+  via a new `_expand_tree_to_path`, so a checked/bookmarked folder is
+  actually visible, not just present-but-collapsed. Shares its own walk
+  logic with the pre-existing `navigate_tree_to_path` (refactored into a
+  new shared `_expand_walk_to_path`, which returns the final item
+  reached rather than assuming full success) rather than a second,
+  independently-drifting copy — `navigate_tree_to_path` itself is
+  completely unchanged in behavior, just factored.
+
+  **Automatic switching, per direct request** ("when you go to the
+  gallery it switches to this view automatically and switch back in
+  file browser. the user can switch at anytime"): `_on_center_tab_changed`
+  calls `_apply_selected_only(False)` on switching to File Browser
+  (index 0, unconditionally — "coming back to File Browser always shows
+  everything" is the simple, predictable rule), and
+  `_apply_selected_only(True)` on switching to Media Browser (index 1)
+  ONLY when `_selected_only_scope` is non-empty — forcing it on for an
+  ordinary single-folder Gallery view (nothing checked, no bookmark
+  loaded) would just show a confusingly empty tree with nothing to
+  disambiguate. The SAME "auto-on while scope becomes non-empty and
+  Gallery is already the active tab" behavior additionally fires from
+  `_sync_selected_only_after_scope_change` (called after every checkbox
+  change) — covers ticking the FIRST checkbox while already sitting on
+  the Gallery tab, not just an actual tab-switch event. That same
+  function also auto-turns the mode OFF the instant scope becomes empty
+  (Deselect All, or unchecking down to nothing) — an empty "Selected
+  only" tree is never useful. None of this fights the checkbox itself:
+  "the user can switch at any time" is honored literally — a manual
+  toggle click always takes immediate effect and is never silently
+  reverted except by the next real tab-switch or scope-change event.
+
+  **Bookmarks, per direct request** ("when you click on a bookmark the
+  files are selected and it switches to show only the folder str[u]cture
+  folder[s] were they are"): `_show_bookmark_group` computes
+  `_bookmark_scope_folders(entries)` — the entry itself if it's a
+  bookmarked FOLDER, otherwise its containing folder — and calls
+  `_apply_selected_only(True)` UNCONDITIONALLY (not gated on the
+  currently active tab, unlike the Gallery/File-Browser tab-switch
+  behavior above — a bookmark click is itself a deliberate "show me
+  exactly this" action, so it takes effect regardless of which tab
+  happens to be active at the time), REPLACING whatever scope was there
+  before rather than merging with it — deliberately mirroring this
+  project's own already-established "replace, don't compound" fix for
+  the identical class of problem (see the entry above about the
+  checked-folders liability this whole feature exists to solve — merging
+  a bookmark's scope into stale prior checked folders would just
+  reproduce the same confusion one level up). A genuinely empty bookmark
+  group is a no-op (nothing to show, so the tree is left as-is rather
+  than forcing an empty view). Deliberately does NOT check/uncheck any
+  tree checkboxes itself — `_checked_folders` and the bookmark-derived
+  scope are two independent sources feeding the SAME `_selected_only_scope`/
+  `_apply_selected_only` mechanism, so a bookmark click's own scope
+  doesn't silently alter what "Show Selected Files" would later
+  aggregate.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive
+  (scratch case_dir, `FFS_ARCHIVES_FILE` also redirected per the
+  standing test-isolation rule above), driving the real running app
+  in-process, not simulated: checked two real, unrelated app folders
+  (`ch.protonmail.android`, `com.alltrails.alltrails`) under the real
+  `data/data/` (185 real app folders total on this archive) and
+  confirmed `_checked_folders`/`_selected_only_scope` updated correctly;
+  toggling the real checkbox correctly filtered the tree down to exactly
+  those two folders plus their real ancestor path (`data`, `data/data`),
+  hiding all 183 other real unrelated app folders; toggling back off
+  correctly restored full-tree reachability (confirmed by expanding into
+  a previously-hidden folder and finding it there again); switching to
+  the real Media Browser tab correctly auto-enabled the mode (scope
+  non-empty), switching back to File Browser correctly auto-disabled it;
+  `_deselect_all_files` correctly emptied the scope and auto-disabled
+  the mode; and bookmarking a real folder while on the Keyword Search
+  tab (where the tree itself is hidden) correctly replaced the scope
+  with just that bookmarked folder and force-enabled the mode regardless
+  of the active tab, confirmed by re-showing the tree afterward and
+  finding only the bookmarked folder's own path present, with the
+  earlier checked-folder scope correctly gone (not merged in). Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean throughout;
+  the real `config/ffs_archives.json` confirmed untouched (clean `git
+  diff`) after the run.
+
+- **"Selected only" tree REDESIGNED the same day into a dual-root,
+  instant-switch structure — the filter-and-rebuild design above had a
+  real, noticeable delay.** Direct follow-up: "there is a pregnant pause
+  as the filter happens[.] can we instead have two list[s] and as the
+  files are s[e]lected they are added to the other list and therefore it
+  is just a qu[i]ck switch? maybe there is a common root and when the
+  file[s] are s[e]lected from the main full filesystem[,] then in the
+  selected file[s] root they are copied there and... [switching] is
+  [just] hiding and showing that branch of the tree? is that possib[le]?"
+  Answered yes, and built exactly that.
+
+  Root cause of the pause, confirmed by reasoning through the code
+  rather than assumed: `_apply_selected_only` used to call
+  `reload_tree_entirely()` (destroying and rebuilding the WHOLE
+  `QStandardItemModel` from scratch, discarding whatever the examiner had
+  already expanded while browsing normally) and then walk down to each
+  scope path via `navigate_tree_to_path`'s own `_ensure_children_loaded`
+  mechanism — which populates an ancestor level the SAME way any ordinary
+  expand does: iterating and rejecting EVERY sibling at that level
+  synchronously (`_populate_tree_children_batched(..., synchronous=True)`,
+  no frame budget). A real folder can have thousands of children — iOS's
+  `mobile/Containers/Data/Application/` especially — and this ran once
+  per ancestor level of EVERY scope path, back to back, with no
+  event-loop yield in between. Fine for one ordinary expand; genuinely
+  slow when repeated several times in a row on every single toggle,
+  compounded by the full model rebuild's own cost and the lost expansion
+  state.
+
+  **New design**: `reload_tree_entirely()` now builds TWO permanent
+  top-level items under the tree's own invisible root, both existing for
+  the whole life of the loaded case — `self._fs_root_item`
+  ("/ [Full Filesystem]", completely unchanged in how it lazily
+  populates) and a new `self._selected_root_item` ("Selected Only",
+  `UserRole` data `_SELECTED_ROOT_MARKER`, not selectable, not
+  checkable — a pure synthetic container). "/ [Full Filesystem]" is
+  **never again destroyed or filtered by this feature** — checked
+  directly: toggling the mode now calls neither `reload_tree_entirely`
+  nor `_reset_tree_model` at all, confirmed via instrumented call
+  counts in real verification, not just reasoned through.
+
+  New `_rebuild_selected_only_children()` builds "Selected Only"'s own
+  children DIRECTLY from `self._selected_only_scope`'s own path
+  COMPONENTS — for each scope path, split on `/` and walk the segments,
+  creating one bare `QStandardItem` per ancestor segment (checkable only
+  if it's a real folder, so an ancestor that happens to ALSO be
+  independently checked still shows correctly) with no placeholder (so
+  it can't be expanded to reveal unrelated real siblings — the ancestor
+  chain only ever shows the ONE path continuing toward a scope folder),
+  and a REAL, ordinary lazy placeholder on the scope folder's own leaf
+  item (so its actual subtree — matching `_rebuild_file_view_from_checked`'s
+  own recursive aggregation — stays fully browsable). Cost is
+  proportional only to the scope's own total path depth — genuinely
+  never touches `folder_map`'s other children at any ancestor level, the
+  exact enumeration the old design paid for repeatedly. A rare edge case
+  (both a folder AND one of its own descendants checked independently —
+  checking doesn't cascade to descendants by default, see the tier-1
+  checkbox Convention above) is handled by processing scope paths
+  shortest-first and tracking which ones already got a real placeholder
+  (`full_expand`) — a deeper scope path whose own ancestor already has
+  one is skipped entirely, since it's already reachable through ordinary
+  expansion once that placeholder opens, avoiding a duplicate-child risk.
+
+  New `_apply_selected_only_visibility()` — a plain
+  `QTreeView.setRowHidden(row, QModelIndex(), bool)` flip between the two
+  root rows, literally "hiding and showing that branch of the tree" per
+  the request's own words. `_apply_selected_only(enabled)` now only sets
+  the mode, syncs the checkbox, and calls this — no rebuild, no walk, no
+  per-candidate filtering, genuinely instant regardless of archive size.
+  `_rebuild_selected_only_children()` is called only when the underlying
+  scope actually changes (from `_sync_selected_only_after_scope_change`,
+  unchanged in when it fires from the entry above), REGARDLESS of
+  whether "Selected Only" happens to be the currently-visible root — so
+  it's always immediately ready the instant the mode is switched on.
+
+  A real consequence worth noting, not a bug: the SAME logical folder can
+  now exist as two SEPARATE `QStandardItem` objects — one under
+  "/ [Full Filesystem]" (if that branch has ever been expanded) and one
+  under "Selected Only" — since Qt items can't belong to two parents at
+  once. `on_tree_item_changed` already worked purely from
+  `item.data(UserRole)` (the ui_path), never the item's own tree
+  identity, so a checkbox click on EITHER copy correctly updates
+  `_checked_folders` regardless of which one was clicked; the OTHER
+  copy's own visual checkbox state only needs to "catch up" if it's ever
+  looked at directly, and it always does, because `_rebuild_selected_only_
+  children` fully discards and reconstructs "Selected Only"'s children
+  (setting each one's checkbox fresh from `_checked_folders`) on every
+  scope change — never incrementally patched — deliberately avoiding a
+  whole class of "did I remember to sync this one field across two
+  independent objects" bugs a true incremental dual-tree-sync design
+  would risk. Confirmed directly: unchecking a folder via the "Selected
+  Only" tree's OWN checkbox correctly updates `_checked_folders` AND
+  removes that folder from the "Selected Only" branch in the same pass.
+
+  `navigate_tree_to_path`'s own walk logic (`_expand_walk_to_path`,
+  factored out earlier the same day) is now used ONLY for its original
+  "Jump to ▾" purpose — the now-unused `_expand_tree_to_path` wrapper
+  built for the superseded design was removed outright, not left dormant.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive
+  (scratch case_dir, `FFS_ARCHIVES_FILE` also redirected per the standing
+  test-isolation rule), driving the real running app in-process: both
+  root items confirmed present with correct `UserRole` markers and
+  default visibility (Full shown, Selected Only hidden); checked two
+  real, unrelated app folders via the Full tree's own checkboxes;
+  instrumented `reload_tree_entirely`/`_reset_tree_model` call counts and
+  confirmed BOTH toggle directions call neither, ever (0 calls, ~60ms
+  wall-clock per toggle — dominated entirely by the test harness's own
+  event-loop pumping, not by any real tree work); confirmed the Full
+  tree's own previously-expanded item for one of the checked folders
+  survived every single toggle with IDENTICAL Python object identity
+  (`id()` unchanged) — direct proof the real tree is never rebuilt;
+  confirmed "Selected Only" contains exactly the 2 checked folders plus
+  their real ancestor path (`data`, `data/data`), with all 183 other real
+  unrelated app folders on this archive correctly absent; and confirmed
+  unchecking a folder via the "Selected Only" tree's own checkbox
+  correctly updates `_checked_folders` and removes it from that branch.
+  Full pytest suite (18/18) clean throughout; the real
+  `config/ffs_archives.json` confirmed untouched afterward.
+
+- **"Select Bookmarked Files" — a right-click bookmark-panel action
+  bridging a bookmark group into the CHECKBOX-based multi-folder
+  selection mechanism, 2026-09-26.** Direct request: "for the bookmarks
+  can you add a right click option selected bookmarked files[.] if there
+  are already [files checked, show] a dialog box[:] you have already
+  go[t] selected files[,] do you want to pro[ce]ed with dese[l]ecting
+  the[m] and instead select the bookmarks?" Deliberately a SEPARATE
+  action from an ordinary bookmark click (`_show_bookmark_group`), which
+  only ever VIEWS a group's files and never touches `_checked_folders` at
+  all (see that method's own docstring — a click viewing a bookmark on
+  the side must never silently alter what "Show Selected Files" would
+  later aggregate). This new action is the explicit bridge for when the
+  examiner actually wants that.
+
+  New `_select_bookmark_group_files(group_id)`, wired into
+  `_show_bookmark_panel_menu`'s existing context menu (right-click a
+  bookmark group → "Select Bookmarked Files", above "Change Color…"/
+  "Delete"). Reuses `_bookmark_scope_folders(entries)` — the identical
+  containing-folder logic the "Selected only" tree feature above already
+  established for the SAME "where does this bookmark's content live"
+  question — and `_tick_items_by_path` (a pre-existing helper, originally
+  built for the missing-bundle-ID warning flow: adds to
+  `_checked_folders`, ticks whatever's reachable in the tree via
+  `_tick_single_path`, and rebuilds the aggregate file view). Per direct
+  instruction, asks first if anything is already checked
+  (`QMessageBox.question`, default Yes) before replacing — declining
+  leaves the existing selection completely untouched; confirming (or
+  nothing was checked to begin with) calls `_deselect_all_files()` then
+  `_tick_items_by_path(scope)`, then explicitly `_apply_selected_only(True)`.
+
+  That last call was a same-day direct follow-up ("when you select the
+  files using the right click on bookmarks can you make it that the
+  switch to selected files is activated"): `_tick_items_by_path`'s own
+  `_sync_selected_only_after_scope_change` only turns "Selected only" ON
+  automatically while the Media Browser tab is already active (see that
+  method's own docstring) — triggering this action from File Browser
+  left the tree in "All" mode, with the newly-checked folder(s) visually
+  buried among everything else rather than immediately obvious. The
+  explicit, unconditional `_apply_selected_only(True)` at the end of
+  `_select_bookmark_group_files` matches `_show_bookmark_group`'s own
+  identical reasoning for its VIEW-only bookmark click — a bookmark
+  action is itself a deliberate "show me exactly this" moment, regardless
+  of which tab happens to be active. Verified directly: with the File
+  Browser tab active, nothing checked, and "Selected only" off
+  beforehand, invoking this action correctly left `_checked_folders`
+  set to the bookmark's folder, `_selected_only_mode` `True`, and the
+  tree's own row-visibility flipped to show the "Selected Only" branch
+  — confirming it activates immediately rather than only on a
+  subsequent tab switch.
+
+  `_tick_items_by_path` itself gained a small but universally-applicable
+  fix alongside this: it now also updates `_selected_only_scope`/calls
+  `_sync_selected_only_after_scope_change()` — every OTHER direct
+  `_checked_folders` mutator already does this (a checkbox click, Deselect
+  All, an ordinary bookmark click's own view-only scope) except this one,
+  which predates the "Selected only" feature. Fixed once, at the shared
+  helper, rather than only in the new caller — the pre-existing
+  missing-bundle-ID warning flow benefits too, not just this new action.
+
+  **A real, genuine crash was found and fixed while verifying this — not
+  caused by the bookmark feature itself, but exposed by it being the
+  first caller to rapidly rebuild the "Selected Only" tree branch several
+  times in quick succession** (check → decline-replace → confirm-replace,
+  each mutating `_checked_folders` and triggering
+  `_rebuild_selected_only_children`). Root cause, confirmed by
+  instrumenting `_populate_tree_children_batched`'s own scheduling before
+  guessing: `_rebuild_selected_only_children`'s own auto-expand step
+  called `self.tree_view.expand(...)` on a scope folder's leaf item —
+  which still carries a REAL, ordinary lazy placeholder (deliberately, so
+  its own subtree stays browsable — see that method's own docstring
+  above). Expanding an item with a real placeholder fires Qt's `expanded`
+  signal straight into `_on_tree_item_expanded`, which schedules an
+  ASYNC `_populate_tree_children_batched` call for THAT SPECIFIC
+  `QStandardItem` — but if the scope changes again (a further checkbox
+  click) before that async job runs, `_rebuild_selected_only_children`'s
+  own `root.removeRows(0, ...)` on its NEXT invocation already destroyed
+  that exact item, and the stale job then crashes trying to
+  `parent_item.appendRow(item)` on an already-deleted C++ object
+  (`RuntimeError: ... QStandardItem already deleted`) — reproduced
+  directly via instrumented call tracing before writing the fix, not
+  assumed from reading the code alone.
+
+  Fixed by never auto-expanding a scope leaf's own item in
+  `_rebuild_selected_only_children` — only its ANCESTOR segments (which
+  have no placeholder at all, so expanding them is always a safe no-op
+  for the lazy-load mechanism) get auto-expanded. A checked/bookmarked
+  folder itself now starts collapsed in "Selected Only" — expanding it
+  by hand afterward is completely safe, since `_on_tree_item_expanded`
+  only ever fires then from a live, currently-existing item, never a
+  since-destroyed one.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive:
+  reproduced the exact crash first (check two real folders → decline a
+  replace-confirmation for a second bookmark → confirm a THIRD action —
+  crashed exactly as described, on the real archive, not a synthetic
+  repro), then confirmed the fix resolves it — the same three-step
+  sequence now completes cleanly: selecting a bookmark's files with
+  nothing previously checked (no dialog), declining a replace when
+  something is already checked (selection untouched), and confirming a
+  replace (checked folders correctly swapped to the bookmark's own).
+  Full pytest suite (18/18) clean throughout; the real
+  `config/ffs_archives.json` confirmed untouched afterward.
+
+- **A second real, confirmed Qt-on-macOS checkbox bug — this time on the
+  main folder tree itself, and NOT limited to dark mode, 2026-09-26.**
+  Direct report: "the checkboxes are not visable on the folder structure
+  on mac os both in dark and light mode[;] there is a gap but the
+  checkbox is not visable." The exact same underlying QMacStyle defect
+  already confirmed (via a real screenshot) for `ArchiveSelectionDialog`'s
+  own `QTreeWidget` — see that entry above — now confirmed on
+  `self.tree_view` (the main `QTreeView`/`QStandardItemModel` folder
+  tree) too, and this report additionally establishes it's not
+  dark-mode-specific: QMacStyle simply never draws a checkbox indicator
+  for a tree item's checkbox in this environment, regardless of theme.
+
+  Fixed identically: `self.tree_view.setStyle(QStyleFactory.create
+  ("Fusion"))`, the created style object kept alive as
+  `self._tree_view_style` for the tree's own lifetime (`QWidget.setStyle`
+  does not take ownership, unlike `QApplication.setStyle` — confirmed
+  necessary the first time this fix was made, restated here since it's
+  the same real risk). Scoped to just this one tree, not
+  `QApplication.setStyle`, which would reskin the entire app.
+
+  Verified with a REAL screenshot (`window.grab()`, real `cocoa`
+  platform, not the offscreen QPA platform used for this project's other
+  headless verification — visual bugs need real rendering, not a
+  mechanical style-name check alone) of the actual running app with a
+  real archive loaded: every folder row (`/ [Full Filesystem]`, `apex`,
+  `data`, `linkerconfig`, `metadata`, `mnt`, `product`, `system`,
+  `system_dlkm`, `system_ext`, `vendor`, `vendor_dlkm`) shows a clearly
+  visible, distinct empty checkbox square — including the new "Selected
+  only" toggle checkbox at the top of the panel — confirmed by directly
+  viewing the saved screenshot, not just checking `tree_view.style()
+  .objectName() == "fusion"` (which was ALSO confirmed, but a style name
+  matching doesn't by itself prove pixels are actually being drawn).
+  Full pytest suite (18/18) clean throughout.
+
+- **Bookmarked files get a colored Name-cell background in the ordinary
+  File Browser table, matching their own bookmark group's color,
+  2026-09-26.** Direct request, describing the real workflow the
+  "Select Bookmarked Files" feature above enables: "when you click the
+  bookmark it just show[s] the bookmarks in the file browser window[.]
+  it['s] when you right click that it show[s] the selected folders and
+  only select[s] the individual files[,] not all the files in the
+  folder[,] but because the file[s] are selected all the folders are
+  shown and the user can then click the s[e]lected folder to see the
+  bookmark file next to other files in that folder. can the filename
+  cell for the bookmarked file in backg[r]ound be the colo[u]r of the
+  bookmark so when you look at the files in the folder you can see the
+  bookmark against the other files." Confirms the design already
+  documented above was understood correctly: "Select Bookmarked Files"
+  checks the bookmark's own CONTAINING folder(s), not the individual
+  files, so browsing into one afterward shows the bookmarked file mixed
+  in among every other real file there — this feature is what lets it
+  still stand out at a glance.
+
+  New `FileTableModel._bookmark_colors: dict` (`{ui_path: "#rrggbb"}`,
+  class-level default `{}`) — injected by `_set_file_model` the exact
+  same way the pre-existing `_research_fg`/`_research_tip` callbacks
+  already are, via a new `_load_file_bookmark_colors()` (one small
+  `db_utils.load_bookmark_colors` read, wrapped in the same
+  no-case-dir/exception-safe pattern every other bookmark read in this
+  file already uses) — so EVERY table-populating call site (ordinary
+  folder navigation, the checked-folders aggregate, and
+  `_show_bookmark_group`'s own bookmark-only view) gets this for free,
+  loaded fresh on every model swap, with zero separate wiring needed at
+  each call site. `load_bookmark_colors` itself already existed — added
+  2026-09-25 for the Media Browser's own thumbnail-outline coloring — and
+  already implements exactly the right semantics for a file bookmarked
+  in more than one group: the EARLIEST (lowest group id) group's color
+  wins, deterministically, matching what the Media Browser and the
+  bookmark panel's own swatch icons already show for the same file.
+
+  `FileTableModel.data()` gained a `BackgroundRole` branch, scoped to
+  column 0 (Name — always index 0 per `file_headers`'s own construction,
+  confirmed rather than assumed) only: looks up the row's `ui_path` in
+  `_bookmark_colors`, and if present, returns that color with its alpha
+  reduced to 70 rather than the group's own full-saturation value — the
+  same "tint, don't paint over" convention this project's own
+  `sqlite_viewer.py` WAL-diff highlighting and `segb_viewer.py` deleted-
+  record highlighting already established, so a filename stays fully
+  readable in both light and dark mode regardless of which bookmark
+  color a group happens to use. A non-bookmarked file's cell, and every
+  OTHER column of a bookmarked file's own row, correctly return `None` —
+  the tint is deliberately narrow, not a whole-row highlight, so it
+  reads as "this specific name is bookmarked" rather than competing with
+  the existing grey (already-seen-elsewhere) row styling or research-
+  status foreground coloring.
+
+  Since a bookmark can be added/deleted/recolored while a folder is
+  already being viewed, a new `_refresh_file_bookmark_colors()` (re-reads
+  `load_bookmark_colors` into the CURRENTLY-displayed `file_model` and
+  repaints the viewport, mirroring `_refresh_media_bookmark_badges`'s own
+  identical shape exactly) is called from all four of that method's own
+  call sites (`_change_bookmark_group_color`, `_delete_bookmark_group`,
+  `_add_to_bookmark_group`, `_new_bookmark_group_dialog`'s create step) —
+  so a bookmark change made anywhere is reflected immediately in an
+  already-open folder view, without needing to leave and re-enter it
+  (which would also needlessly reset scroll position and any active
+  filter).
+
+  Verified against the real Android 14 JoshHickman archive with a REAL
+  screenshot (`window.grab()`, real `cocoa` platform), not just
+  programmatic assertions: bookmarked one real file
+  (`apex/.bootstrap-apex-info-list.xml`) in the real "Evidence" group,
+  navigated to its real containing folder (79 real items), and confirmed
+  both mechanically (`file_model._bookmark_colors` correctly populated;
+  `data(..., BackgroundRole)` for the bookmarked file's Name cell
+  returned the exact group color `#e6194b` at `alpha=70`; the SAME query
+  for a different, non-bookmarked real file in the identical folder
+  correctly returned `None`; a non-Name column of the bookmarked file's
+  own row also correctly returned `None`) AND visually — the saved
+  screenshot shows the bookmarked file's row clearly tinted pink/red
+  while every other real file and folder in the same listing (including
+  two other real XML files with near-identical names) shows no tint at
+  all, with the filename text fully legible against it. Full pytest
+  suite (18/18) clean throughout; the real `config/ffs_archives.json`
+  confirmed untouched afterward.
+
+- **File Browser table gains its own far-left tickbox column, for
+  selecting an individual FILE (not just a whole folder via the tree) —
+  2026-09-26.** Direct request: "is it possib[le] that the folder are
+  shown in the selected view because a single file is selected[?] lets
+  have a column at the far left that is a tick box so a single file can
+  be selected." Confirms the exact design intent already established for
+  "Select Bookmarked Files" (`_bookmark_scope_folders`): checking a
+  folder only ever means "show me where this lives," via that folder's
+  own containing path — this new column is the manual, ad hoc equivalent
+  for one arbitrary file, with no bookmark needed first.
+
+  `FileTableModel` gained a SYNTHETIC checkbox column at logical/model
+  index 0 — `self._headers`/`cols` (the model's own internal per-row
+  data list) are completely UNCHANGED; `columnCount()` returns
+  `len(self._headers) + 1`, and every real column shifts +1 in the
+  view/model's own column space. This was the deliberate design choice
+  over prepending a real entry to `self._headers`: it keeps the tickbox
+  permanently pinned, unhideable, and absent from the Columns dialog's
+  own list with no special-case exclusion logic scattered through
+  `_apply_column_visibility`/`_apply_column_order`/`_show_columns_dialog`/
+  `_update_columns_indicator`/`_on_section_moved` — each of those instead
+  needed a uniform `+1` offset (real header index → real view/model
+  column) at their own `setColumnHidden`/`visualIndex`/`moveSection`/
+  `logicalIndex` call sites, confirmed as the ONLY code needing this
+  offset by first auditing every column-index-dependent path in the
+  file: `UserRole`/`UserRole+1` reads (the many `.index(row, 0).data(
+  UserRole)` call sites throughout this file) are resolved BEFORE the
+  `col == 0` branch in `data()` and stay column-independent by design, so
+  none of them needed touching; `set_filter`/`_current_filter_args`/
+  `_autofill_date_range`/`distinct_values` all resolve column indices via
+  `self._headers.index(name)` and read directly into `cols` (`row[0]`),
+  never through the view's own column numbering, so they needed zero
+  changes either. `sort(column, order)` gained a `column == 0: return`
+  no-op (the tickbox isn't sortable) plus a `real_column = column - 1`
+  shift for everything else. New `flags()`/`setData()` overrides (this
+  model previously had neither) grant `ItemIsUserCheckable` only for
+  column 0 and handle a `CheckStateRole` write by updating a new
+  `self._checked_paths` set (display-only — see below) and emitting a
+  new `check_toggled(ui_path, is_folder, checked)` Signal.
+
+  `FastZipBrowser` gained a new `self._checked_files: set` — deliberately
+  SEPARATE from the existing `self._checked_folders` (the tree checkbox's
+  own state, which recursively aggregates a whole folder into "Show
+  Selected Files"): ticking one file here never adds to that recursive
+  aggregate, it only ever feeds "Selected only" tree scope (via a new
+  `_compute_selected_only_scope()` — `_checked_folders` UNIONED with
+  each `_checked_files` entry's own containing folder, `rsplit('/', 1)`)
+  — the same mechanism "Select Bookmarked Files" already established,
+  just triggered by a manual per-file tick instead of a saved bookmark.
+  A FOLDER row's tickbox instead reuses the tree's own checkbox
+  machinery directly (`_set_folder_checked_from_table` — `item.
+  setCheckState(...)` on the tree item if it's already materialized
+  there, so `on_tree_item_changed`'s existing debounced-rebuild/scope-
+  sync does the rest exactly as an ordinary tree click would; falling
+  back to the same lazy-materializing walk `_tick_items_by_path` already
+  uses for a folder not yet expanded in the tree) — checking a folder
+  via the table is exactly equivalent to checking it in the tree, not a
+  second, parallel concept. `FileTableModel.check_toggled`'s one
+  connected slot, `_on_file_row_check_toggled` (wired in
+  `_set_file_model`, alongside pushing the model's own initial
+  `set_checked_paths(self._checked_folders | self._checked_files)` on
+  every model swap via a new `_refresh_file_checked_paths()`), branches
+  on `is_folder` (`row[2] >= 0`, the same convention `_row_ok`/every
+  other file-vs-folder check in this file already uses) to route to
+  whichever of the two paths applies. Every existing `_checked_folders`
+  mutator (`on_tree_item_changed`'s own deferred rebuild, `_tick_items_
+  by_path`, `_deselect_all_files`) was updated to compute scope via
+  `_compute_selected_only_scope()` instead of the old bare `set(self.
+  _checked_folders)`, and to call `_refresh_file_checked_paths()`, so a
+  file ticked via the table stays correctly reflected regardless of
+  which OTHER mechanism last touched the folder-level selection.
+
+  A real, confirmed Qt-on-macOS bug was found while taking the real
+  screenshot required to verify this (not caught by the headless
+  functional tests, which only check `CheckStateRole`/`flags()` values,
+  never actual pixels) — the SAME QMacStyle checkbox-indicator-invisible
+  defect already fixed twice elsewhere in this project (`tree_view`,
+  `ArchiveSelectionDialog`'s own `QTreeWidget`) was present a third time
+  here: a real ticked row's checkbox rendered as a completely blank cell,
+  no checkmark glyph at all, confirmed via `window.grab()` on the real
+  `cocoa` platform before fixing anything. Fixed identically — `self.
+  file_view.setStyle(QStyleFactory.create("Fusion"))`, the created style
+  object kept alive as `self._file_view_style` for the view's own
+  lifetime (`QWidget.setStyle` does not take ownership, unlike
+  `QApplication.setStyle`) — since Fusion paints its own checkbox glyphs
+  rather than delegating to native `NSCell` rendering, it isn't exposed
+  to this bug at all. Re-screenshotted afterward to confirm: a real
+  ticked file (`init.environ.rc`) now shows a clear black checkmark in a
+  clean square outline, and two real unticked folders (`apex`, `data`)
+  show empty, clearly-bordered squares — not the prior blank space.
+
+  Verified end-to-end against a scratch copy of the real Android 14
+  JoshHickman archive (case_data_root AND FFS_ARCHIVES_FILE both
+  redirected per this project's own standing test-isolation rule, and
+  QSettings isolated by org/app-NAME patching — NativeFormat QSettings on
+  macOS does not reliably honor a redirected storage path, only a
+  different name, the same lesson already learned once for `media_hide_
+  seen` testing), driving the real running `FastZipBrowser` in-process:
+  `columnCount()`/`headerData()` confirmed correctly offset for every
+  real header; `flags()` confirmed checkable only on column 0; `data()`
+  confirmed `UserRole` is column-independent (matches `row[1]` from
+  either column 0 or column 1) while `DisplayRole` on column 0 is `None`
+  and on a shifted real column matches the row's own `cols` value
+  exactly; ticking a real file (`init.environ.rc`) correctly populated
+  `_checked_files` and added its parent to `_selected_only_scope`, and
+  unticking correctly reversed both; ticking a real folder (`apex`) via
+  the table correctly populated `_checked_folders`/scope the same way
+  ticking it in the tree would (confirmed this swaps in the recursive
+  aggregate view exactly as ticking in the tree already does — a real
+  behavior, not a test artifact, discovered when a naive test re-used a
+  stale model reference across that swap and had to be fixed to
+  re-navigate and refetch `window.file_model` afterward); sorting by a
+  real shifted column still correctly reordered rows both ascending and
+  descending, while sorting on the checkbox column (0) was confirmed a
+  true no-op (row order unchanged); hiding a real column and reading back
+  the Columns-button indicator text worked correctly through the new
+  offset; and the checkbox column was confirmed to always start pinned
+  at visual position 0. Full pytest suite (18/18) and `scripts/
+  check_claude_md.py` clean throughout; the real `config/ffs_archives.
+  json` confirmed untouched afterward.
+
+- **`ProcessDialog`'s header-scan tier picker converted from manually-
+  exclusive checkboxes to a real `QButtonGroup`/`QRadioButton` set,
+  defaulting to the lowest not-yet-run tier — 2026-09-26.** Direct
+  request: "the process case dialog should have a radiobutton group for
+  the 3 tiers and defalt to teir 1 if not already run[;] a user then can
+  desided to upgraded." The picker was checkboxes specifically because
+  of a real, previously-documented Qt quirk: an exclusive-group radio
+  button couldn't be reliably programmatically unchecked back to
+  "nothing selected" from within its own click handler, and that design
+  genuinely needed a "nothing chosen yet" starting state. This request
+  removes that exact precondition — there is now ALWAYS a default
+  selection — so a true radio group is the right widget after all:
+  switching the checked button to a DIFFERENT valid tier (never "back to
+  nothing") is a normal, reliable `QButtonGroup` operation.
+
+  `_rebuild_tier_upgrade_ui` now always builds all three tiers (renamed
+  `_tier_upgrade_cbs` → `_tier_radios`, `QCheckBox` → `QRadioButton`,
+  added `self._tier_button_group = QButtonGroup(self)`) rather than
+  omitting ones already run — a tier `t <= self._current_tier` is
+  disabled and labeled `"(already run)"` instead of disappearing, so the
+  group reads as the case's whole progression at a glance, not just a
+  menu of remaining upgrades. The lowest tier NOT yet run is selected by
+  default (`default_tier`, computed as the first `t` in `(1, 2, 3)` that
+  isn't `<= self._current_tier`) — Tier 1 for a never-scanned case (a
+  real, ordinary starting state now, not just a legacy-case edge case:
+  case creation no longer auto-runs a scan of its own, see the
+  `CaseSettingsDialog` history above), Tier 2 if Tier 1 is already done,
+  Tier 3 if Tier 1+2 are both done, and no default at all (nothing
+  enabled or checked) once already at the maximum tier — matching the
+  pre-existing "already at the maximum tier" status-label wording, which
+  needed no change.
+
+  Selecting Tier 3 still gets the same shared confirm gate
+  (`_confirm_tier3`) as `CaseSettingsDialog`'s own historical picker —
+  but ONLY for a real user click, never for the programmatic default
+  selection: a new `self._tier_building_default` flag (set around the
+  one `setChecked(True)` call that applies the computed default, checked
+  via `getattr(self, '_tier_building_default', False)` inside
+  `_on_process_tier_toggled` so it's safe even before ever being set)
+  skips the confirm dialog specifically for that call — confirmed
+  necessary by direct testing: without it, simply OPENING Process Case
+  on a case already at Tier 2 would immediately pop the Tier 3 warning
+  dialog, with no click from the examiner at all. Declining a real
+  Tier-3 click now reverts the CHECKED STATE back to whatever was
+  selected before (`self._tier_radios[prev].setChecked(True)`) rather
+  than the old blockSignals-wrapped `setChecked(False)` — a normal
+  "select a different valid button" operation, not the unreliable
+  "uncheck to nothing" case a plain radio button can't do; some tier is
+  always already selected by the time a user can reach Tier 3 here
+  (either the programmatic default or an earlier manual choice), so
+  there's always a valid revert target.
+
+  `_selected_upgrade_tier`'s own contract (`0` = no scan will run,
+  `1`/`2`/`3` = run up through that tier) is completely UNCHANGED, so
+  every downstream consumer (`_run_operations`'s `run_scan = upgrade_tier
+  > 0` gate, `_show_archive_selection`'s `effective_tier` calculation,
+  `_refresh_stats`'s "Files this upgrade will scan" line) needed zero
+  changes — only how that value gets SET changed. `preselect_tier1`
+  (the new-case flow's own default-tick, from
+  `_open_process_dialog_for_new_case`) still works unmodified against
+  the renamed `self._tier_radios` dict — now largely redundant with the
+  new default-selection logic in the common case it was built for
+  (Tier 1 on a fresh case), but kept for explicitness and any edge case
+  where it's passed against a case that isn't at tier 0.
+
+  **A real bug was found and fixed before this shipped, not assumed
+  safe from the design alone**: the new default-selection call
+  (`self._tier_radios[default_tier].setChecked(True)`, inside
+  `_rebuild_tier_upgrade_ui`'s own initial call from `__init__`) fires
+  `_on_process_tier_toggled` → `_refresh_stats()` synchronously — but
+  `_rebuild_tier_upgrade_ui()` runs early in `__init__`, well BEFORE
+  `self._stats_label` is constructed later in the same method. Caught
+  directly by running the real dialog headlessly and reading its own
+  traceback (PySide6 doesn't crash the process on an exception inside a
+  Qt signal handler — it prints and continues, so this could easily have
+  shipped silently spamming a real `AttributeError` traceback to the
+  console every time Process Case opens for any never-yet-scanned case,
+  the single most common real case-load moment this dialog exists for).
+  Fixed with a plain `if not hasattr(self, '_stats_label'): return`
+  guard at the top of `_refresh_stats()` — the same "not yet constructed
+  this call" convention `_apply_column_visibility`
+  (`if not hasattr(self, 'file_view'): return`) already established
+  elsewhere in this file — harmless, since `__init__`'s own final
+  unconditional `_refresh_stats()` call (after every widget exists)
+  already renders the correct final state regardless.
+
+  Verified end-to-end against the real `ProcessDialog` class (a real
+  `FfsAdapter`, no mocked Qt objects) driving through every real state
+  transition, not just constructed plausibly: a never-scanned case
+  (Tier 0) correctly shows all three tiers enabled with Tier 1 checked
+  by default, and confirmed the programmatic default never triggers the
+  Tier 3 confirm gate; manually selecting Tier 2 then Tier 3 correctly
+  updates `_selected_upgrade_tier` and the checked radio each time, with
+  the REAL confirm gate genuinely firing only for the manual Tier 3
+  click; declining that confirm correctly reverts both
+  `_selected_upgrade_tier` and the radio's own checked state back to
+  Tier 2, with Tier 3 confirmed NOT left checked; a case already at
+  Tier 1 correctly shows Tier 1 disabled+labeled "(already run)" with
+  Tier 2 defaulted and checked; a case already at Tier 1+2 correctly
+  defaults to Tier 3; a case already at the maximum Tier 3 correctly
+  shows all three disabled with NONE checked, `_selected_upgrade_tier ==
+  0`, and the pre-existing "already at the maximum tier" status text
+  intact; and `_run_operations`'s own `run_scan` gate was confirmed to
+  correctly see the default Tier 1 selection as a real, actionable
+  choice with no other operation checked. Two REAL screenshots
+  (`QWidget.grab()`, real `cocoa` platform) confirm the group renders
+  correctly end to end — a never-scanned case shows Tier 1 clearly
+  filled-in and Tiers 2/3 clearly empty, all three legible and
+  interactive-looking; a Tier-1-already-run case shows Tier 1 visibly
+  greyed with its "(already run)" suffix and Tier 2 clearly the filled-
+  in default. (An earlier screenshot attempt that called
+  `_rebuild_tier_upgrade_ui()` a SECOND time in-process, simulating what
+  `_browse_case` does, produced a real-looking but ultimately spurious
+  overlapping-text artifact under `grab()` — confirmed, by isolating the
+  same tier state to a single build with no in-process rebuild, to be a
+  `grab()`-timing artifact specific to that test script's own tight
+  teardown-then-capture sequence, not a rendering defect in the dialog
+  itself; the equivalent LOGICAL state after a real second rebuild was
+  already independently confirmed correct via the non-visual assertions
+  above.) Full pytest suite (18/18) and `scripts/check_claude_md.py`
+  clean throughout.
+
+  **Same-day direct follow-up: the highest already-run tier is now
+  BOTH greyed out AND selected, not just greyed out.** "if teir 1 has
+  already been run it should be greyed out but also selected[;] this
+  should also be tru[e] if te[i]r 2 is run both 1 and 2 grey out and 2
+  selected and if all then all 3 grey out and tier 3 selected." Changed
+  `_rebuild_tier_upgrade_ui`'s own default-selection formula from "the
+  lowest tier NOT yet run" to `min(max(self._current_tier, 1), 3)` — the
+  HIGHEST already-run tier (Tier 1 for a fresh case, since `max(0, 1) =
+  1` and that one IS real/actionable, not status-only). `_on_process_
+  tier_toggled` now branches on `tier_id <= self._current_tier`: true
+  means this radio is checked purely to show current status (disabled,
+  can only ever become checked via this same programmatic default —
+  never a real click, since it's disabled) — `self._selected_upgrade_
+  tier` stays/becomes `0` and no candidate count is computed, so opening
+  Process Case on an already-scanned case with nothing else ticked
+  correctly shows "Nothing to do" rather than implying a re-scan.
+
+  A real, second bug was caught and fixed while building this: the
+  Tier-3-decline revert logic used to read `self._selected_upgrade_tier`
+  as "whatever was checked before" — but that value is now `0` both when
+  NOTHING is checked and when the CURRENT tier's own status-only radio is
+  checked, so declining Tier 3 from a status-only starting point (e.g.
+  current_tier=2, clicking Tier 3 directly) would have left Tier 3
+  checked with nothing to revert to. Fixed with a separate `self.
+  _checked_tier_radio_id` (tracked on every successful check, status-only
+  or not) as the actual revert target, distinct from `_selected_upgrade_
+  tier`'s "is this a real upgrade request" meaning.
+
+  Verified against the real `ProcessDialog` class end-to-end: a
+  never-scanned case still defaults to Tier 1 checked+enabled+actionable
+  (`_selected_upgrade_tier == 1`); a case at Tier 1 shows Tier 1
+  greyed+checked with `_selected_upgrade_tier == 0`, and manually
+  selecting Tier 2 correctly unchecks Tier 1 and sets `_selected_upgrade_
+  tier == 2`; a case at Tier 1+2 shows both greyed with Tier 2
+  checked; a case already at Tier 3 shows all three greyed with Tier 3
+  checked and the pre-existing "already at the maximum tier" text intact;
+  declining a real Tier 3 click made directly from a Tier-2 status-only
+  starting point correctly reverts to Tier 2 checked (not left on Tier 3,
+  and not stranded with nothing checked); and `_run_operations`'s own
+  "nothing to do" gate correctly fires when opening a case already at
+  Tier 1 with every other checkbox left unticked, while a fresh case
+  correctly still has a real actionable default. A real screenshot
+  (`QWidget.grab()`, real `cocoa` platform) of a Tier-1-already-run case
+  confirms Tier 1 renders visibly greyed out with its radio dot still
+  filled in, and the "Files this upgrade will scan" stats line correctly
+  absent (status-only, not an upgrade). Full pytest suite (18/18) clean
+  throughout.
+
+- **The shared folder tree now remembers its own selection/scroll
+  position per branch across a "Selected only" toggle — 2026-09-26.**
+  Direct request: "can you make it that the position that you were in
+  in the browser tree before switching to the s[e]lected folder tree is
+  remembered and when you go back there[,] like when you switch between
+  gal[l]ery and file browser[,] so you do not lo[s]e were you were."
+  Root cause, confirmed by reasoning through the dual-root design rather
+  than assumed: "/ [Full Filesystem]" and "Selected Only" are two
+  top-level rows in ONE `QStandardItemModel`, shown/hidden via a plain
+  `QTreeView.setRowHidden` flip (see the "Selected only" tree
+  Conventions entry above) — sharing ONE `QTreeView` and therefore ONE
+  vertical scrollbar. Qt doesn't reset `currentIndex`/selection just
+  because a row becomes hidden, so the SELECTED item itself already
+  survived a toggle — the real problem was the scrollbar's own raw
+  value: "Selected Only" is typically small (a handful of checked
+  folders' own ancestor chains), so scrolling there leaves the shared
+  scrollbar at a small value; flipping back to "/ [Full Filesystem]"
+  (a much taller branch) left that same raw value in place, corresponding
+  to a effectively arbitrary, usually near-top position in the FS
+  branch's own real content — not where the examiner actually was.
+
+  New `self._tree_branch_positions: dict` — `{'fs': (path|None, scroll),
+  'selected': (...)}` — and two new methods,
+  `_save_tree_branch_position(branch)`/`_restore_tree_branch_position
+  (branch)`, called from `_apply_selected_only` around the existing
+  visibility flip, but ONLY on a REAL transition (`enabled !=
+  self._selected_only_mode`) — a redundant "just refresh" call (the kind
+  `_sync_selected_only_after_scope_change` already makes while the mode
+  doesn't actually change) skips both, so it can never clobber a good
+  saved position with the branch's own already-current state. Saving
+  reads `self.tree_view.currentIndex()`'s own `UserRole` data (a real
+  folder path, filtering out the `_TREE_PLACEHOLDER`/
+  `_SELECTED_ROOT_MARKER` sentinels) plus the raw scrollbar value, keyed
+  by whichever branch was visible before the flip. Restoring re-locates
+  that saved path — via `_expand_walk_to_path` (generalized with a new
+  optional `root_item` parameter, defaulting to "/ [Full Filesystem]" for
+  every existing caller unchanged, so it can also walk from
+  `self._selected_root_item` for the "Selected Only" branch — the
+  Selected Only tree's own ancestor segments are built synchronously, so
+  no lazy-loading concern there beyond the scope leaf's own placeholder,
+  handled identically to the FS branch) — and calls `setCurrentIndex` +
+  `scrollTo(..., PositionAtCenter)` directly, deliberately NOT
+  `navigate_tree_to_path`'s full tail: that also calls
+  `on_folder_selected`, which would re-trigger a File Browser/Media
+  Browser reload on every tab switch for no reason — `self._view_path`
+  (and what's actually shown) was never changed by this toggle in the
+  first place, so there's nothing to re-sync, only the tree's own
+  selection/scroll to restore. A path that's no longer reachable (rare —
+  the scope changed in between) falls back to the raw scrollbar value as
+  a best-effort approximation rather than restoring nothing at all.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process: navigated to and selected a
+  real folder (`data/data`) via `navigate_tree_to_path`, scrolled the
+  shared tree to a real non-zero position, checked two real unrelated
+  folders to give "Selected Only" a real non-empty scope, then toggled
+  the mode on — confirmed the FS branch's own position was saved exactly
+  (`('data/data', 37)`) and the FS root row genuinely hidden. Selected a
+  different real item (`apex`) inside "Selected Only", then toggled back
+  off — confirmed the FS branch's own selection was correctly restored
+  to `data/data` (not left on whatever "Selected Only" happened to leave
+  selected, and not reset to nothing), and that a "selected"-branch
+  position was itself now recorded for `apex`. Toggling on again
+  confirmed `apex` correctly re-selected in "Selected Only", and a final
+  toggle back off confirmed the FS branch's own restore is a genuine
+  round trip, not a one-shot fluke. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout; the real
+  `config/ffs_archives.json` confirmed untouched afterward.
+
+- **Left-clicking a bookmark no longer switches on "Selected only";
+  right-clicking "Select Bookmarked Files" now also ticks each
+  bookmarked FILE's own far-left checkbox; the checkbox itself renamed
+  "Selected only" → "Selected", with real spacing before Jump/Collapse —
+  2026-09-26.** Direct request: "when the bookmarks are left click it
+  wshould not check to selected only. also can you change the selected
+  only lable to just slected but leve a space so the button are not
+  right next to it." `_show_bookmark_group` (the plain left-click VIEW
+  path) had gained an unconditional `_apply_selected_only(True)` +
+  scope-overwrite on 2026-09-26 earlier the same day — removed outright:
+  an ordinary click now only ever populates the File Browser table, never
+  touches `_selected_only_mode`/`_selected_only_scope` at all, matching
+  `_select_bookmark_group_files`'s own docstring distinction (a VIEW
+  should never silently alter checkbox/scope state) that the removed
+  block had quietly violated. The right-click "Select Bookmarked Files"
+  action is unaffected — it's the one deliberate, explicit action meant
+  to switch modes.
+
+  Direct follow-up the same conversation, after confirming this was a
+  real, wanted change rather than just a description of current
+  behavior: "Select Bookmarked Files" now ALSO ticks each bookmarked
+  FILE's own new far-left tickbox-column checkbox (`self._checked_files`,
+  see the "File Browser table gains its own far-left tickbox column"
+  entry above) — previously it only checked the bookmark's own
+  CONTAINING folder(s), which correctly brought the examiner to the
+  right folder via "Selected only" but gave no visual way to tell the
+  bookmarked file(s) apart from the folder's other, unrelated contents
+  once there. `_select_bookmark_group_files` now also computes
+  `file_paths = {e['ui_path'] for e in entries if e['ui_path'] not in
+  self.folder_map}` (excluding a bookmarked FOLDER entry, which is
+  already folder-level ticked via scope/`_checked_folders` — there's no
+  separate file-level concept for it) and merges it into
+  `self._checked_files`, then calls the existing
+  `_refresh_file_checked_paths()` so the table's own checkbox rendering
+  picks it up immediately.
+
+  The checkbox's own on-screen label changed from "Selected only" to
+  "Selected" (the tooltip/every internal comment/variable name keeps the
+  fuller "Selected only" name — a UI-label change only, not a rename of
+  the feature itself), and `tree_top.addSpacing(12)` was inserted between
+  it and the "Jump to ▾" button so shortening the label doesn't leave the
+  buttons crowding it.
+
+  **A real, if narrow, test-methodology hang was hit and root-caused
+  while verifying this — not a product bug.** An early verification
+  script called `_add_to_bookmark_group([real_file], group_id)` — but
+  `_add_to_bookmark_group`/`save_bookmark_entries` (`db_utils.py`) expect
+  a list of `(ui_path, display_name)` PAIRS, not bare path strings (every
+  real call site, `_bookmark_submenu`'s own `partial(self.
+  _add_to_bookmark_group, paths, g['id'])`, already passes pairs — see
+  that method's own docstring). Passing bare strings made `save_bookmark_
+  entries`'s own `for ui_path, display_name in entries:` unpacking raise
+  `ValueError: too many values to unpack` on the very first real path
+  string tried, which `_add_to_bookmark_group`'s own `except Exception as
+  e: QMessageBox.warning(self, "Bookmark Error", str(e))` then displayed
+  as a REAL modal dialog — which, like every other real modal this
+  project has documented hanging under the offscreen QPA platform,
+  blocked the test process forever with nothing to click. Diagnosed by
+  adding `flush=True` prints around each step (not guessed) and
+  confirming CPU time had genuinely flatlined for minutes at a time
+  (`ps -o etime=,cputime=`, unchanging), ruling out "just a slow real
+  archive parse" before concluding it was a genuine hang. Fixed the test
+  script itself, not the product, to pass real `(ui_path, display_name)`
+  pairs.
+
+  Verified end-to-end against a real archive (Android 15 CTF25
+  Cellebrite, deliberately NOT the Android 14 JoshHickman archive used
+  throughout this session's other verifications, since the user had a
+  real interactive instance of the app open against that exact archive
+  at the time — avoided to rule out any real file-lock contention on its
+  `.zcd` sidecar, though the actual hang turned out to be the test-script
+  bug above, unrelated to which archive was used): bookmarked a real
+  file into the case's own real "Evidence" group; confirmed left-clicking
+  the group (`_show_bookmark_group`) left `_selected_only_mode` `False`
+  and `_selected_only_scope` empty, with the file's own content still
+  correctly shown in the File Browser; confirmed the right-click "Select
+  Bookmarked Files" action still switches `_selected_only_mode` to `True`
+  as before, AND now also adds the real bookmarked file's own ui_path to
+  `_checked_files`; navigated to that file's real containing folder and
+  confirmed its own far-left table checkbox renders `Qt.CheckState.
+  Checked`, not just present in the underlying set. A real screenshot
+  (`QWidget.grab()`, real `cocoa` platform) confirms the checkbox reads
+  "Selected" with clear, deliberate spacing before "Jump to ▾"/"Collapse",
+  not crowded. Full pytest suite (18/18) and `scripts/check_claude_md.py`
+  clean throughout; the real `config/ffs_archives.json` confirmed
+  untouched afterward.
+
+- **"Select Bookmarked Files" no longer force-switches to "Selected
+  only"; "Jump to" is now branch-aware; the tree's own position-memory
+  feature (added a few hours earlier the same day) simplified from
+  "remember two independent per-branch histories" to "carry the current
+  selection across if it exists in the other branch, else select
+  nothing" — 2026-09-26.** Direct report, initially read (incorrectly)
+  as describing a MISSING auto-switch before the user corrected that
+  assumption: "when you are in the full tree and you right click
+  select[ed] all[,] it switches you to selected view[;] when it should
+  just select[] the [folders] but leave you in the full tree[,] and if
+  you want to see the selected folder only then you can manually
+  switch." The real, concrete problem this names: once force-switched
+  into "Selected only" (added earlier the same day, at direct request,
+  by `_select_bookmark_group_files`'s own unconditional closing
+  `_apply_selected_only(True)` call), there is no way to browse to and
+  tick a NEW, not-yet-scoped folder next — "Selected only" only ever
+  shows already-scoped paths — so the examiner had to manually flip
+  back to "Full" before continuing to build up a selection. Fixed by
+  simply removing that closing call; `_select_bookmark_group_files` now
+  only ever ticks folders/files, never touches which branch is visible.
+  `_show_bookmark_group` (the plain left-click VIEW path) had its own,
+  separate identical removal earlier the same day — see that entry
+  above; this is the second, narrower half of the same underlying
+  complaint, for the right-click action specifically.
+
+  The same conversation then extended two more pieces of tree-view
+  synchronization, both from the original combined request:
+
+  1. **"Jump to ▾" is now aware of which branch is showing.**
+     `navigate_tree_to_path` — used by every "Jump to" menu entry —
+     previously always walked "/ [Full Filesystem]" unconditionally,
+     even while "Selected only" was active, silently switching the view
+     away from "Selected only" on every single jump. Direct request:
+     "if the user select[s] the jump to and the selected view is
+     present then the folder tree will hi[gh]light the folder in the
+     selected list[;] but if it is not present then it will switch to
+     the full tree." Now tries the jump target inside "Selected only"
+     FIRST whenever that mode is active (`_expand_walk_to_path(target,
+     root_item=self._selected_root_item)`, confirming a FULL match, not
+     just an ancestor) — staying there and just selecting/scrolling to
+     it if found; only falling through to the ordinary "Full Filesystem"
+     walk (and switching the view there via `_apply_selected_only(False)`)
+     when the target genuinely isn't part of the current scope. The
+     shared select+scroll+`on_folder_selected` tail was factored into a
+     new `_navigate_tree_select_and_open(item)` so both branches share
+     one implementation of it rather than two copies.
+
+  2. **The tree's own cross-branch selection memory was simplified from
+     "two independent remembered histories" to "carry the current
+     selection across by identity."** The feature added earlier the
+     same day (`_tree_branch_positions`, `_save_tree_branch_position`/
+     `_restore_tree_branch_position` — see that entry above) restored
+     WHATEVER was last selected independently in each branch, regardless
+     of any relationship between the two items. Direct follow-up named a
+     materially different, simpler rule instead: "when switch between
+     the view[s] which ever item is selected sh[oul]d be selected in the
+     other if it exist[s][;] is not then nothing should be selected."
+     Replaced wholesale: `self._tree_branch_positions: dict` →
+     `self._tree_last_selected_path: str | None` (a single value, not
+     one per branch); `_save_tree_branch_position`/
+     `_restore_tree_branch_position` → `_save_tree_selection_for_
+     carryover`/`_carry_over_tree_selection`, called from the exact same
+     place in `_apply_selected_only` (only on a REAL mode transition, so
+     a redundant "just refresh" call never disturbs anything). The
+     carry-over walks the SAME path into whichever branch is now
+     visible (`_expand_walk_to_path` with the appropriate `root_item`,
+     confirming a full match, exactly the same technique the "Jump to"
+     fix above now shares); when the path isn't found there at all
+     (checking a folder that ticking then cleared the tree's own
+     selection for, or genuinely selecting something outside the
+     current scope), the tree's `currentIndex` is explicitly cleared
+     (`setCurrentIndex(QModelIndex())`) rather than left showing a
+     stale, unrelated item from some earlier session.
+
+  Verified end-to-end against the real Android 15 CTF25 Cellebrite
+  archive (deliberately not JoshHickman — see the entry above for why),
+  driving the real running app in-process: bookmarking a real file and
+  invoking "Select Bookmarked Files" correctly left `_selected_only_mode`
+  `False` while still ticking the file; selecting a real folder
+  (`apex`), ticking it (confirming the tree's own selection gets cleared
+  by the pre-existing, unrelated aggregate-view swap — re-selecting it
+  afterward, simulating the examiner clicking back on it, to test the
+  actually-relevant case), then toggling to "Selected only" correctly
+  carried that same selection over; selecting a second, genuinely
+  unrelated real folder (`bootstrap-apex`, not part of the checked
+  scope) and toggling to "Selected only" correctly left NOTHING
+  selected there, rather than falling back to a stale remembered
+  position; jumping to the scoped `apex` folder while already in
+  "Selected only" correctly stayed there and selected it; jumping to the
+  unrelated `bootstrap-apex` folder correctly switched the view back to
+  "Full Filesystem" and selected it there. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout; the real
+  `config/ffs_archives.json` confirmed untouched afterward.

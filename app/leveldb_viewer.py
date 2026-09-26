@@ -69,6 +69,10 @@ Interaction model, per direct user request:
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
+
+from zip_entry import ZipEntry
+from zip_reader import THREAD_WORKERS
 
 # See ccl_leveldb.RawLevelDb.__init__/DATA_FILE_PATTERN and
 # ManifestFile.MANIFEST_FILENAME_PATTERN — the real on-disk shape a
@@ -929,6 +933,58 @@ def _iterate_indexeddb_records(extract_dir: str, blob_extract_dir: str | None
     return results, bad_count
 
 
+def _parallel_extract(to_fetch: list) -> None:
+    """Reads and writes every (ZipEntry, dest_path) pair in *to_fetch*
+    concurrently — added 2026-09-26, direct request ("i want the
+    application to be quick as it can[;] computers now have lots of
+    core[s,] it is silly not to use them when you can"). Every LevelDB
+    extraction path in this module used to read its own children one at
+    a time via FastZipBrowser._read_zip_bytes — fine on local disk, but a
+    real, avoidable cost on a network/SMB-hosted archive (per-read
+    latency, not bandwidth, dominates there), and needlessly serial on
+    any machine regardless.
+
+    Deliberately does NOT call self._read_zip_bytes from a worker thread —
+    that method touches GUI-owned mutable state (self.full_metadata,
+    self._get_zip_handle()) the main thread can still be mutating
+    concurrently, genuinely unsafe to call from a background thread. The
+    fix is the SAME "resolve on the main thread first, then hand plain,
+    self-contained objects to a thread pool" pattern already established
+    twice elsewhere in this project — header_scan.scan_entries
+    (app/header_scan.py, via ZipReader) and adapters/ffs.py's
+    _build_guid_bundle_map — never invented fresh here: every caller
+    resolves each child to a ZipEntry (FastZipBrowser._resolve_archive_entry)
+    on the main thread BEFORE calling this function; a ZipEntry itself
+    holds only a zip_path string plus a ZipInfo (see zip_entry.py's own
+    __slots__) and opens its own file handle per .read() call — no
+    dependency on any FastZipBrowser/GUI state at all, so concurrent reads
+    of the SAME underlying zip_path from multiple threads are safe.
+
+    Reuses zip_reader.THREAD_WORKERS (min(8, cpu_count)) as the pool
+    size — the same deliberately-bounded worker count already used
+    elsewhere in this project specifically so a network-hosted archive
+    doesn't get hammered with an unbounded number of concurrent reads."""
+    if not to_fetch:
+        return
+
+    def _fetch_one(item) -> None:
+        entry, dest = item
+        try:
+            data = entry.read()
+        except Exception:
+            return
+        if data is None:
+            return
+        try:
+            with open(dest, 'wb') as f:
+                f.write(data)
+        except OSError:
+            pass
+
+    with ThreadPoolExecutor(max_workers=min(THREAD_WORKERS, len(to_fetch))) as pool:
+        list(pool.map(_fetch_one, to_fetch))
+
+
 def leveldb_decode_logic_version() -> str:
     """Short content hash of this module's own source — the staleness key
     for the leveldb_search_index table (db_utils.py), same auto-derived
@@ -951,13 +1007,37 @@ class LevelDbViewerMixin:
 
     # ── Decoding ─────────────────────────────────────────────────────────
 
+    def _resolve_archive_entry(self, ui_path: str) -> "ZipEntry | None":
+        """Resolve ui_path to a self-contained ZipEntry — the metadata-
+        lookup half of hex_viewer._read_zip_bytes (touches
+        self._adapter/self._get_zip_handle(), so this MUST be called from
+        the main/GUI thread), split out so a caller reading MANY entries
+        can do this cheap resolve step up front and hand the resulting
+        ZipEntry objects to _parallel_extract's thread pool for the
+        actual (potentially slow, especially over a network share) file
+        I/O. Returns None for anything _read_zip_bytes' own local-file/
+        embedded-media-source branches would have handled instead — never
+        expected for a real LevelDB folder's own children, which are
+        always genuine archive entries, so this is a plain resolve, not a
+        reimplementation of those other branches."""
+        physical = self._adapter.resolve(ui_path)
+        try:
+            zinfo = self._get_zip_handle().getinfo(physical)
+        except Exception:
+            return None
+        return ZipEntry(self.zip_path, physical, zinfo)
+
     def _extract_leveldb_children_flat(self, real_children: list, extract_dir: str) -> None:
         """Extract a flat LevelDB directory's own real children (no real
         subfolders — see _looks_like_leveldb_dir's own docstring) to
         extract_dir. Factored out 2026-09-19 so both the generic
         raw-record decode below AND _decode_indexeddb_folder's own real
         decode share the identical extraction logic rather than
-        maintaining two copies."""
+        maintaining two copies. Parallelized 2026-09-26 (see
+        _parallel_extract's own docstring) — this loop now only resolves
+        each child (cheap, main-thread-only metadata lookups) and decides
+        what needs fetching; the actual reads run concurrently."""
+        to_fetch: list[tuple[ZipEntry, str]] = []
         for child_ui_path in real_children:
             if child_ui_path in self.folder_map:
                 continue   # a subfolder — a real LevelDB directory is flat
@@ -965,11 +1045,11 @@ class LevelDbViewerMixin:
             dest = os.path.join(extract_dir, name)
             if os.path.exists(dest):
                 continue   # already extracted from a prior open/session
-            data = self._read_zip_bytes(child_ui_path)
-            if data is None:
+            entry = self._resolve_archive_entry(child_ui_path)
+            if entry is None:
                 continue
-            with open(dest, 'wb') as f:
-                f.write(data)
+            to_fetch.append((entry, dest))
+        _parallel_extract(to_fetch)
 
     def _extract_tree(self, ui_path: str, extract_dir: str) -> None:
         """Recursively extract ui_path's own real files/subfolders (via
@@ -981,7 +1061,24 @@ class LevelDbViewerMixin:
         (confirmed against ccl_chromium_indexeddb.IndexedDb.get_blob's own
         `data_path` construction, and against a real blob file on this
         project's own npr.org IndexedDB store). A no-op if ui_path isn't
-        actually a real folder in this archive."""
+        actually a real folder in this archive.
+
+        Parallelized 2026-09-26 — the recursive walk (_collect_extract_tree)
+        only creates directories and resolves entries, synchronously, on
+        the main thread; every leaf file across the WHOLE tree is then
+        fetched in ONE batched parallel pass via _parallel_extract, rather
+        than spinning up a separate thread pool per directory level."""
+        to_fetch: list[tuple[ZipEntry, str]] = []
+        self._collect_extract_tree(ui_path, extract_dir, to_fetch)
+        _parallel_extract(to_fetch)
+
+    def _collect_extract_tree(self, ui_path: str, extract_dir: str,
+                              to_fetch: list) -> None:
+        """The synchronous half of _extract_tree — walks folder_map,
+        creates directories, and resolves each leaf file to a ZipEntry,
+        appending (entry, dest) to *to_fetch* for _extract_tree's own
+        single parallel pass. Never touches the filesystem for a leaf's
+        actual content — only os.makedirs for real subfolders."""
         children = self.folder_map.get(ui_path)
         if children is None:
             return
@@ -990,15 +1087,14 @@ class LevelDbViewerMixin:
             name = child_ui_path.rsplit('/', 1)[-1]
             dest = os.path.join(extract_dir, name)
             if child_ui_path in self.folder_map:
-                self._extract_tree(child_ui_path, dest)
+                self._collect_extract_tree(child_ui_path, dest, to_fetch)
                 continue
             if os.path.exists(dest):
                 continue
-            data = self._read_zip_bytes(child_ui_path)
-            if data is None:
+            entry = self._resolve_archive_entry(child_ui_path)
+            if entry is None:
                 continue
-            with open(dest, 'wb') as f:
-                f.write(data)
+            to_fetch.append((entry, dest))
 
     def _decode_indexeddb_folder(self, ui_path: str, real_children: list) -> bool:
         """Real, schema-informed decode of a Chromium IndexedDB directory

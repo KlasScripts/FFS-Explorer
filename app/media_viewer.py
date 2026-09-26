@@ -81,14 +81,25 @@ def _media_hide_seen_pref() -> bool:
     """Whether the Media Browser should hide a file already marked
     "seen" — added 2026-09-24, direct request: "in the setting there
     should be an option to show or hide seen files." Same LOCAL QSettings
-    reasoning as _media_page_size_pref above. Off by default (show
-    everything) — matches this project's own standing rule against
-    silently hiding anything from review; the examiner opts in."""
+    reasoning as _media_page_size_pref above.
+
+    Defaulted to False (show everything) when first built — matching this
+    project's general standing rule against silently hiding anything from
+    review. Flipped to True 2026-09-25, direct follow-up report that the
+    default made "Not Relevant" look broken: "you are not hiding the file
+    mark[ed] as not [relevant] after they are marked[;] if i was to go
+    back i should only see unmarked and bookmarked files." A file marked
+    "Not Relevant" is a deliberate dismissal (unlike, say, an unread
+    email), so hiding it — while always leaving a bookmarked file
+    visible regardless, see _recompute_media_all_paths and
+    _on_media_not_relevant's own exclusion — is the examiner's clearly
+    stated intent here, not a silent-hide risk. Still a real, visible
+    Preferences checkbox either way, so it can be turned back off."""
     try:
         return bool(QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(
-            'media_hide_seen', False, type=bool))
+            'media_hide_seen', True, type=bool))
     except Exception:
-        return False
+        return True
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -297,8 +308,13 @@ class MediaFileListModel(QAbstractListModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or not (0 <= index.row() < len(self._items)):
             return None
-        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole,
-                    Qt.ItemDataRole.EditRole):
+        # ToolTipRole deliberately excluded (removed 2026-09-25, direct
+        # request: "remove the text that appear[s] if you hover over the
+        # media file") -- DisplayRole still carries the full ui_path,
+        # used internally (row lookups, click handling) and for the
+        # filename shown under each thumbnail (MediaGridDelegate.paint);
+        # only the hover POPUP is gone, nothing else reads this role.
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             return self._items[index.row()]
         return None
 
@@ -320,7 +336,7 @@ class MediaGridDelegate(QStyledItemDelegate):
         self._thumb_size = thumb_size
         self._pixmaps: dict[str, QPixmap] = {}
         # Which ui_paths are currently marked "seen" (2026-09-24, see the
-        # Media Browser's own "Not Interested"/"Undo" feature) — paints a
+        # Media Browser's own "Not Relevant"/"Undo" feature) — paints a
         # small badge on a shown "seen" file. Only ever matters when the
         # "hide seen files" preference is OFF, since a "seen" file is
         # simply never in the model at all when it's ON — see
@@ -924,7 +940,7 @@ class MediaViewerMixin:
         self._media_zip_info_map: dict = {}
         self._media_local_overrides: dict = {}
 
-        # "Not Interested"/seen-tracking state (added 2026-09-24 — see
+        # "Not Relevant"/seen-tracking state (added 2026-09-24 — see
         # CLAUDE.md's own Media Browser Conventions entry). All four are
         # (re)populated per folder load in _start_thumbnail_load, never
         # stale across folders. _media_all_paths_unfiltered is the TRUE
@@ -1007,33 +1023,44 @@ class MediaViewerMixin:
         self._media_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._media_page_next_btn = QPushButton("Next ▶")
         self._media_page_next_btn.clicked.connect(self._on_media_next_page)
+        # No scroll-to-bottom requirement (removed 2026-09-25, direct
+        # request: "make it that the next button works all the time") —
+        # see _update_media_next_button_enabled's own docstring.
         self._media_page_next_btn.setToolTip(
-            "Scroll to the bottom of this page to continue")
-        # "Not Interested ▶" / "↺ Undo" — added 2026-09-24, direct
-        # request: a button that marks every file on the CURRENT page
-        # (except any bookmarked one — a bookmark is itself a statement
-        # that the file IS of interest) as "seen" and moves on, plus an
-        # Undo for the last such batch. Scoped to the page-nav row (only
-        # ever visible when the folder is paginated) per the literal
-        # "next to the next button" framing — a single-page folder has
-        # no page to bulk-dismiss in the first place.
-        self._media_not_interested_btn = QPushButton("Not Interested ▶")
-        self._media_not_interested_btn.setToolTip(
+            "Go to the next page (a bookmarked file is shown when you go "
+            "back, not here)")
+        # "Not Relevant ▶" / "↺ Undo" — added 2026-09-24 (as "Not
+        # Interested"), renamed 2026-09-25 direct request: a button that
+        # marks every file on the CURRENT page (except any bookmarked one
+        # — a bookmark is itself a statement that the file IS of
+        # interest) as "seen" and moves on, plus an Undo for the last such
+        # batch. Scoped to the page-nav row (only ever visible when the
+        # folder is paginated) per the literal "next to the next button"
+        # framing — a single-page folder has no page to bulk-dismiss in
+        # the first place. Greyed out until scrolled to the bottom of the
+        # page, same as "Next" — see _update_media_next_button_enabled,
+        # which now drives both.
+        self._media_not_relevant_btn = QPushButton("Not Relevant ▶")
+        self._media_not_relevant_btn.setToolTip(
             "Mark every file on this page as seen (except bookmarked "
-            "ones) and move to the next page")
-        self._media_not_interested_btn.clicked.connect(
-            self._on_media_not_interested)
+            "ones) and move to the next page — scroll to the bottom of "
+            "this page to enable")
+        self._media_not_relevant_btn.clicked.connect(
+            self._on_media_not_relevant)
         self._media_undo_seen_btn = QPushButton("↺ Undo")
         self._media_undo_seen_btn.setToolTip(
-            "Undo the last \"Not Interested\" batch")
+            "Undo the last \"Not Relevant\" batch")
         self._media_undo_seen_btn.setEnabled(False)
         self._media_undo_seen_btn.clicked.connect(self._on_media_undo_seen)
+        # Order: Prev | (label) | Undo | Not Relevant | Next — direct
+        # request, 2026-09-25 ("i would like it to be undo 'Not Relevant'
+        # Next").
         page_nav_row = QHBoxLayout()
         page_nav_row.addWidget(self._media_page_prev_btn)
         page_nav_row.addWidget(self._media_page_label, 1)
-        page_nav_row.addWidget(self._media_page_next_btn)
-        page_nav_row.addWidget(self._media_not_interested_btn)
         page_nav_row.addWidget(self._media_undo_seen_btn)
+        page_nav_row.addWidget(self._media_not_relevant_btn)
+        page_nav_row.addWidget(self._media_page_next_btn)
         self._media_page_nav_widget = QWidget()
         self._media_page_nav_widget.setLayout(page_nav_row)
         self._media_page_nav_widget.setVisible(False)
@@ -1302,7 +1329,7 @@ class MediaViewerMixin:
         self._media_delegate.clear()
         self._selected_media_path = None
         self._media_all_paths_unfiltered = list(media_paths)
-        # A "Not Interested" batch only ever applies to the folder it was
+        # A "Not Relevant" batch only ever applies to the folder it was
         # clicked in — a fresh folder load starts with nothing to undo.
         self._media_last_seen_batch = None
         self._media_undo_seen_btn.setEnabled(False)
@@ -1328,7 +1355,7 @@ class MediaViewerMixin:
 
         # Loaded fresh from caseresults.db on every folder load (not
         # cached across folders) — cheap (three small SELECTs) and means a
-        # "Not Interested"/bookmark change made elsewhere in the same
+        # "Not Relevant"/bookmark change made elsewhere in the same
         # session is always picked up correctly here.
         try:
             with closing(_open_results_db(self._case_dir)) as conn:
@@ -1380,7 +1407,7 @@ class MediaViewerMixin:
         """Re-derives the ACTIVE _media_all_paths from the folder's TRUE
         full list (_media_all_paths_unfiltered) plus the current seen-set
         and the "hide seen files" preference — added 2026-09-24 for the
-        Media Browser's "Not Interested" feature. Called at folder load
+        Media Browser's "Not Relevant" feature. Called at folder load
         and again after any seen-state change (mark/undo) so the hide-seen
         filter is always LIVE within a browsing session, not just applied
         once when the folder was first opened."""
@@ -1411,7 +1438,7 @@ class MediaViewerMixin:
         self._media_delegate.set_bookmark_colors(self._media_bookmark_colors)
         self._media_view.viewport().update()
 
-    def _load_media_page(self, page_index: int) -> None:
+    def _load_media_page(self, page_index: int, include_bookmarks: bool = True) -> None:
         """Loads page *page_index* (_MEDIA_PAGE_SIZE files at a time) —
         the core of the "buttery smooth" redesign, 2026-09-24, direct
         follow-up to the first (viewport-tracking) loading strategy not
@@ -1427,7 +1454,30 @@ class MediaViewerMixin:
         this page plus its immediate neighbors on every call — bounded
         regardless of how many pages the examiner has paged through in
         one session, the same "smaller amount in memory" goal as before,
-        just anchored to page boundaries instead of the viewport."""
+        just anchored to page boundaries instead of the viewport.
+
+        *include_bookmarks* (added 2026-09-25, direct request: "when you
+        go not relevant or next the bookmark files should not be visable
+        in the new screen of content[;] they should be viewable if you
+        go back") — False for the two FORWARD-advancing actions only
+        (_on_media_next_page, and both branches of _on_media_not_relevant)
+        strips any bookmarked path out of what's actually DISPLAYED on
+        this load, so a bookmarked file never shows up mixed into freshly
+        -advanced content. Every other caller (the initial folder-load
+        page, _on_media_prev_page, _select_media_item jumping to a
+        pending selection's own page) passes True, the default — "going
+        back" (or simply arriving, not advancing) always shows the FULL
+        page, bookmarks included, since neither of those is "new content"
+        being skipped past. This is a DISPLAY-only filter: the page's own
+        slice boundaries (start/end), its prefetch/eviction set, and its
+        "showing A–B of N" label are all still computed from the true,
+        unfiltered page_items — only what actually lands in
+        self._media_model changes — so paging BACK to this exact page
+        index later still finds every bookmarked file exactly where it
+        naturally sits, no separate bookmark-only view needed: if there
+        are more bookmarked files than fit on one page, they're simply
+        spread across however many of the ordinary pages they naturally
+        fall on, each one revealed the same way once visited via Back."""
         total = len(self._media_all_paths)
         if total == 0:
             self._media_page_index = 0
@@ -1460,7 +1510,13 @@ class MediaViewerMixin:
             keep |= set(self._media_all_paths[end:min(total, end + page_size)])
         self._media_delegate.evict_except(keep)
 
-        self._media_model.set_items(page_items)
+        # DISPLAY-only bookmark filter — see include_bookmarks' own
+        # docstring paragraph above. page_items itself (used below for
+        # to_fetch/the "showing A–B of N" label, and above for
+        # eviction/prefetch) is deliberately left untouched.
+        display_items = page_items if include_bookmarks else [
+            p for p in page_items if p not in self._media_bookmarked_paths]
+        self._media_model.set_items(display_items)
         self._media_view.scrollToTop()
 
         paginated = n_pages > 1
@@ -1552,35 +1608,45 @@ class MediaViewerMixin:
         self._media_delegate.set_pixmap(ui_path, QPixmap.fromImage(img))
 
     def _update_media_next_button_enabled(self) -> None:
-        """Gates "Next" on having scrolled to the bottom of the CURRENT
-        page — direct request, 2026-09-24: "only let the user move to
-        next page when they are at the bottom[;] they can go back at any
-        time but that mean[s] they are at the top." "Back" has no such
-        gate (see _load_media_page's own unconditional `page_index > 0`
-        check) — it's always available once there IS a previous page, and
-        always lands at the top of it (_load_media_page's own
-        scrollToTop), never mid-scroll, so arriving via Back always looks
-        the same regardless of where the examiner clicked it from.
+        """Gates "Not Relevant" on having scrolled to the bottom of the
+        CURRENT page. "Next" itself is NOT gated on scroll position —
+        direct follow-up, 2026-09-25, reversing the 2026-09-24 design
+        this method originally implemented ("only let the user move to
+        next page when they are at the bottom"): "make it that the next
+        button works all the time[;] it is only the not relevant that
+        require you to see all the files." "Next" is now enabled
+        whenever there IS a further page to go to, full stop — the only
+        thing it still shares with "Not Relevant" is being driven from
+        this one method (kept name aside — this is still fundamentally
+        the page-nav enabled-state update, not renamed a second time in
+        the same session for a name that's now slightly stale).
 
-        "At the bottom" tolerates a couple of pixels of rounding (an
-        exact `value() == maximum()` can be flaky depending on how Qt
-        rounds the last frame's own geometry) and treats a page whose
-        content fits entirely within the viewport (nothing to scroll,
-        `maximum() <= 0`) as already at the bottom — the examiner has
-        necessarily already seen everything on such a page, so there's no
-        real "keep scrolling" gate left to apply."""
+        "Back" has no gate at all (see _load_media_page's own
+        unconditional `page_index > 0` check) — always available once
+        there IS a previous page, and always lands at the top of it
+        (_load_media_page's own scrollToTop).
+
+        "At the bottom" (for "Not Relevant") tolerates a couple of pixels
+        of rounding (an exact `value() == maximum()` can be flaky
+        depending on how Qt rounds the last frame's own geometry) and
+        treats a page whose content fits entirely within the viewport
+        (nothing to scroll, `maximum() <= 0`) as already at the bottom —
+        the examiner has necessarily already seen everything on such a
+        page, so there's no real "keep scrolling" gate left to apply.
+        "Not Relevant" is deliberately NOT also gated on "is there a next
+        page" — the LAST page still has real content worth dismissing
+        even though there's nowhere further to advance to."""
         total = len(self._media_all_paths)
         if total == 0:
             self._media_page_next_btn.setEnabled(False)
+            self._media_not_relevant_btn.setEnabled(False)
             return
         page_size = self._media_page_size
         n_pages = max(1, -(-total // page_size))
-        if self._media_page_index >= n_pages - 1:
-            self._media_page_next_btn.setEnabled(False)
-            return
+        self._media_page_next_btn.setEnabled(self._media_page_index < n_pages - 1)
         sb = self._media_view.verticalScrollBar()
         at_bottom = sb.maximum() <= 0 or sb.value() >= sb.maximum() - 2
-        self._media_page_next_btn.setEnabled(at_bottom)
+        self._media_not_relevant_btn.setEnabled(at_bottom)
 
     def _on_media_prev_page(self) -> None:
         if self._media_page_index > 0:
@@ -1590,21 +1656,32 @@ class MediaViewerMixin:
         page_size = self._media_page_size
         n_pages = max(1, -(-len(self._media_all_paths) // page_size))
         if self._media_page_index < n_pages - 1:
-            self._load_media_page(self._media_page_index + 1)
+            # include_bookmarks=False — advancing into new content should
+            # never surface a bookmarked file; see _load_media_page's own
+            # docstring. Going back (_on_media_prev_page, above) always
+            # shows them.
+            self._load_media_page(self._media_page_index + 1, include_bookmarks=False)
 
-    def _on_media_not_interested(self) -> None:
-        """"Not Interested ▶" — added 2026-09-24, direct request: marks
-        every file on the CURRENT page as seen, except any bookmarked one
-        (a bookmark is itself a statement that the file IS of interest —
-        it should never become hidden by "hide seen files" as a side
-        effect of a bulk dismissal), then moves on. "Moves on" means: if
-        the hide-seen filter is ON, the newly-seen files simply disappear
-        from the active list and reloading THIS SAME page index naturally
-        reveals whatever now slides into that slot (a deliberate
-        simplification — no special-case "advance" logic needed); if the
-        filter is OFF, the marked files stay visible (now badged) and the
-        view advances to the next page as a plain, literal "move to the
-        next page" action.
+    def _on_media_not_relevant(self) -> None:
+        """"Not Relevant ▶" (named "Not Interested" until 2026-09-25,
+        renamed by direct request) — added 2026-09-24: marks every file
+        on the CURRENT page as seen, except any bookmarked one (a
+        bookmark is itself a statement that the file IS of interest — it
+        should never become hidden by "hide seen files" as a side effect
+        of a bulk dismissal), then moves on. Greyed out until scrolled to
+        the bottom of the page — see _update_media_next_button_enabled,
+        which drives this button's own enabled state too, same condition
+        as "Next".
+
+        "Moves on" means: if the hide-seen filter is ON (the default
+        since 2026-09-25 — see _media_hide_seen_pref's own docstring),
+        the newly-seen files simply disappear from the active list and
+        reloading THIS SAME page index naturally reveals whatever now
+        slides into that slot (a deliberate simplification — no
+        special-case "advance" logic needed); if the filter is OFF (the
+        examiner has turned the preference back off), the marked files
+        stay visible (now badged) and the view advances to the next page
+        as a plain, literal "move to the next page" action.
 
         The whole current page, not a partial one — Undo therefore always
         reverts exactly the batch this one click just marked, matching
@@ -1634,7 +1711,7 @@ class MediaViewerMixin:
         self._media_last_seen_batch = to_mark
         # Recorded BEFORE navigating away, so Undo can return to the page
         # this batch actually came from rather than wherever "Not
-        # Interested" left the view afterward (a real bug found during
+        # Relevant" left the view afterward (a real bug found during
         # verification: with hide-seen OFF, marking page N advances to
         # page N+1, and Undo used to just reload "the current page" —
         # i.e. N+1 — never actually showing the just-restored files).
@@ -1646,14 +1723,18 @@ class MediaViewerMixin:
         self.status_bar.showMessage(
             f"Marked {len(to_mark):,} file(s) as seen{skipped_note}")
 
+        # include_bookmarks=False in both branches — this button always
+        # advances into new/next content, so a bookmarked file should
+        # never appear on the resulting page either way; see
+        # _load_media_page's own docstring.
         if self._media_hide_seen:
             self._recompute_media_all_paths()
-            self._load_media_page(self._media_page_index)
+            self._load_media_page(self._media_page_index, include_bookmarks=False)
         else:
-            self._load_media_page(self._media_page_index + 1)
+            self._load_media_page(self._media_page_index + 1, include_bookmarks=False)
 
     def _on_media_undo_seen(self) -> None:
-        """Reverts exactly the last "Not Interested" batch — added
+        """Reverts exactly the last "Not Relevant" batch — added
         2026-09-24, direct request: "a button that allows the user to
         undo a hide... so error can be undone." Never partial, never more
         than the one most recent click's own batch."""
@@ -1721,7 +1802,12 @@ class MediaViewerMixin:
         _on_media_item_clicked's own docstring for how that was confirmed,
         not assumed."""
         self._selected_media_path = ui_path
-        self.status_bar.showMessage(ui_path)
+        # Display only -- self._display_path (ffs-explorer.py) substitutes
+        # an iOS container GUID segment with its resolved bundle ID, added
+        # 2026-09-25, direct request: "so a user can easily see which app
+        # it is from." Every call below still gets the real ui_path (GUID
+        # intact) -- this only changes what's shown in the status bar.
+        self.status_bar.showMessage(self._display_path(ui_path))
         self._select_file_in_table(ui_path)
         self._load_hex_preview(ui_path)
         self._media_sync_open_dialog(ui_path)

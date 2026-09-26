@@ -21,12 +21,13 @@ from zoneinfo import ZoneInfo, available_timezones
 
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel,
-    QRadioButton, QVBoxLayout,
+    QPushButton, QRadioButton, QVBoxLayout,
 )
+from PySide6.QtCore import Qt
 
 import device_timezone as _device_timezone
 from db_utils import _open_results_db, load_case_setting, save_case_setting
-from dialog_helpers import button_row, note_label, WARNING_STYLE
+from dialog_helpers import note_label, WARNING_STYLE
 
 # ── Module-level formatting helpers (pure — no FastZipBrowser state) ───────────
 
@@ -221,7 +222,7 @@ class TimestampDisplayMixin:
             pass
         return handset_zone, acquisition_zone, manual_zone, mode, is_first_load
 
-    def _timestamp_display_dialog(self):
+    def _timestamp_display_dialog(self, is_first_load: bool = False):
         """Per-case choice of how evidence timestamps are displayed in the
         main file browser's Modified/Created columns: UTC (default), the
         device's own detected zone, a zone guessed from the acquisition
@@ -233,9 +234,22 @@ class TimestampDisplayMixin:
         unlike the two detected/guessed options, which need a handset file
         (iOS only) or a .ufd (Cellebrite only; GrayKey extractions have
         neither, so manual selection can be the only non-UTC option at
-        all). Reachable from the Tools menu at any time; also shown
-        proactively the first time a case is opened (see
-        _start_case_meta_load)."""
+        all). Reachable from the Tools menu at any time (is_first_load
+        stays False there — see the explicit lambda at that connection
+        site, which avoids Qt's own triggered(bool) signal ambiguity);
+        also shown proactively the first time a case is opened (see
+        _start_case_meta_load / _show_timestamp_dialog_when_ready, which
+        passes is_first_load=True).
+
+        is_first_load=True additionally hands off to Process Case once
+        this dialog is accepted — added 2026-09-26, direct request
+        replacing the earlier CaseSettingsDialog-triggered automatic
+        background header scan ("instead of doing the head[er] scan in
+        the background can we instead just[,] after the user has
+        selected how they want to deal with the time and date[,] the ok
+        should be tied to opening process case and the hash check
+        should be checked[,] the tier one should be ticked, zip and
+        embedded media"). See FastZipBrowser._open_process_dialog_for_new_case."""
         case_dir = self._case_dir
         if not case_dir:
             return
@@ -263,6 +277,27 @@ class TimestampDisplayMixin:
         dlg.setWindowTitle("Timestamp Display")
         dlg.setModal(True)
         dlg.setMinimumWidth(600)
+        # No Cancel, no [x], no Escape — direct request, 2026-09-25: "can
+        # you remove the cancel for the time and date? they need to
+        # choose." UTC is always a safe, harmless default to just accept
+        # (nothing here can be "wrong"), so this only ever costs an extra
+        # OK click on a dialog the examiner would otherwise dismiss
+        # without deciding anything. The close-button removal
+        # (WindowCloseButtonHint) isn't guaranteed on every platform's own
+        # native title bar (confirmed a real, known Qt limitation on
+        # macOS in particular), so closeEvent/keyPressEvent are ALSO
+        # overridden below as the actual enforcement — belt and suspenders,
+        # not relying on the hint alone.
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
+        def _dlg_close_event(event):
+            event.ignore()
+        dlg.closeEvent = _dlg_close_event
+        def _dlg_key_press_event(event, _orig=QDialog.keyPressEvent):
+            if event.key() == Qt.Key.Key_Escape:
+                event.ignore()
+                return
+            _orig(dlg, event)
+        dlg.keyPressEvent = _dlg_key_press_event
         v = QVBoxLayout(dlg)
 
         v.addWidget(note_label(
@@ -390,11 +425,16 @@ class TimestampDisplayMixin:
             "before citing a time in a report.",
             style=WARNING_STYLE))
 
-        btns, _cancel_btn, _ok_btn = button_row(dlg)
+        # OK only -- no Cancel (see the dlg construction above for why).
+        btns = QHBoxLayout()
+        btns.addStretch()
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(dlg.accept)
+        btns.addWidget(ok_btn)
         v.addLayout(btns)
 
-        if not dlg.exec():
-            return
+        dlg.exec()
 
         if handset_radio and handset_radio.isChecked():
             mode = 'handset'
@@ -426,3 +466,6 @@ class TimestampDisplayMixin:
             self._rebuild_file_view_from_checked(preserve_filter=True)
         else:
             self._refresh_folder_view(preserve_filter=True)
+
+        if is_first_load:
+            self._open_process_dialog_for_new_case()

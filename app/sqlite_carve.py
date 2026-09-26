@@ -27,6 +27,7 @@ performs a `sqlite3.connect()` on anything — the whole point is to look
 below/around what that API can see.
 """
 
+import contextlib
 import os
 import sqlite3
 import struct
@@ -43,6 +44,87 @@ _PAGE_TYPE_NAMES = {
     _LEAF_INDEX_PAGE: 'index_leaf',
     _INTERIOR_INDEX_PAGE: 'index_interior',
 }
+
+
+# ── Read-only sqlite3 connection over in-memory bytes ───────────────────────
+
+@contextlib.contextmanager
+def _readonly_connection(raw: bytes):
+    """Yields a read-only sqlite3.Connection over *raw*'s own bytes,
+    without ever writing them to disk when possible — added 2026-09-25,
+    replacing six near-identical write-a-temp-file/connect/remove blocks
+    scattered across this module (locate_live_row, locate_offset x2,
+    read_live_row, build_page_map, identify_structure), each of which
+    used to write the ENTIRE database's bytes to a brand-new temp file on
+    every single call, just to get sqlite3's own engine to read
+    sqlite_master (needed because a real SQLite reader correctly follows
+    overflow pages for a long CREATE TABLE statement, which this module's
+    own raw cell-decoder deliberately doesn't attempt).
+
+    Prefers sqlite3.Connection.deserialize() (stdlib, Python 3.11+, backed
+    by SQLite's own sqlite3_deserialize() C API) — a genuinely in-memory
+    copy: no temp file, no per-call disk write+delete of a potentially
+    large evidence database, and no exposure to a real, documented
+    failure mode a temp-file approach has that this doesn't: an
+    antivirus/endpoint-security product intercepting and scanning a
+    newly-created file before it can be opened, which for a large
+    database can easily exceed a short connect timeout on a locked-down
+    machine. Falls back to the original write-to-a-real-temp-file-then-
+    connect-mode=ro approach if deserialize() fails, OR if the resulting
+    connection can't actually be queried — confirmed a REAL, not
+    theoretical, second case, not just defensive paranoia: a WAL-mode
+    database (bytes 18/19 of the header = 2, the common case for real
+    app evidence databases, not an edge case) deserializes without
+    raising at all, but then fails on the FIRST real query with "unable
+    to open database file" — WAL mode needs real shared-memory reader/
+    writer coordination a deserialized in-memory copy has no way to
+    provide. Caught by this project's own test suite (test_wal.py) the
+    same day this helper was written, not assumed safe. Since this
+    module never reads or replays a live WAL itself anyway (a real WAL's
+    own frames are read directly as raw bytes by locate_wal_offset/
+    identify_wal_structure elsewhere in this file — this helper only
+    ever serves the ALREADY-CHECKPOINTED base file's own schema/b-tree
+    content), the fix is to patch just those two journal-mode-declaration
+    bytes to 1 (legacy rollback-journal) on a COPY before deserializing —
+    the page content and schema this helper actually needs are
+    unaffected either way, and the original *raw* bytes (and the real
+    file on disk) are never touched.
+
+    `PRAGMA query_only = ON` is set on either connection, matching this
+    project's own standing "read-only towards evidence" rule — the
+    deserialize() path has no file-level `mode=ro` to lean on the way the
+    temp-file fallback does, so the pragma is what actually enforces it
+    there; harmless, redundant belt-and-suspenders on the fallback path,
+    which already had `mode=ro`."""
+    conn = None
+    tmp_path = None
+    try:
+        conn = sqlite3.connect(':memory:')
+        if len(raw) >= 20 and raw[18:20] != b'\x01\x01':
+            patched = bytearray(raw)
+            patched[18] = 1
+            patched[19] = 1
+            conn.deserialize(bytes(patched))
+        else:
+            conn.deserialize(raw)
+        conn.execute('PRAGMA query_only = ON')
+        conn.execute('PRAGMA schema_version').fetchone()   # verify it's actually queryable
+    except Exception:
+        if conn is not None:
+            conn.close()
+        fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
+    try:
+        yield conn
+    finally:
+        conn.close()
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 # ── varint / record decoding (SQLite's own on-disk format) ─────────────────
@@ -352,26 +434,15 @@ def locate_live_row(raw: bytes, table: str, rowid: int) -> dict | None:
     except Exception:
         return None
 
-    fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
     root_page = None
     try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(raw)
-        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
-        try:
+        with _readonly_connection(raw) as conn:
             row = conn.execute(
                 "SELECT rootpage FROM sqlite_master WHERE type='table' AND name=?",
                 (table,)).fetchone()
             root_page = row[0] if row else None
-        finally:
-            conn.close()
     except Exception:
         return None
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
 
     if root_page is None:
         return None
@@ -528,32 +599,20 @@ def locate_offset(raw: bytes, offset: int, page_map: dict | None = None) -> dict
         return _scan_leaf_page_for_offset(
             raw, page, page_no, page_size, usable_size, offset, entry.get('name'), None)
 
-    fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
-    conn = None
     try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(raw)
-        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
-
-        table = None
-        for name, rootpage in conn.execute(
-                "SELECT name, rootpage FROM sqlite_master WHERE type='table'").fetchall():
-            if page_no in walk_table_leaf_pages(raw, page_size, rootpage):
-                table = name
-                break
-        if table is None:
-            return None
-        return _scan_leaf_page_for_offset(
-            raw, page, page_no, page_size, usable_size, offset, table, conn)
+        with _readonly_connection(raw) as conn:
+            table = None
+            for name, rootpage in conn.execute(
+                    "SELECT name, rootpage FROM sqlite_master WHERE type='table'").fetchall():
+                if page_no in walk_table_leaf_pages(raw, page_size, rootpage):
+                    table = name
+                    break
+            if table is None:
+                return None
+            return _scan_leaf_page_for_offset(
+                raw, page, page_no, page_size, usable_size, offset, table, conn)
     except Exception:
         return None
-    finally:
-        if conn is not None:
-            conn.close()
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
 
 
 def _scan_leaf_page_for_offset(raw: bytes, page: bytes, page_no: int, page_size: int,
@@ -638,23 +697,12 @@ def _scan_leaf_page_for_offset(raw: bytes, page: bytes, page_no: int, page_size:
                 except Exception:
                     pass
             else:
-                fd2, tmp_path2 = tempfile.mkstemp(suffix='.sqlite')
-                tmp_conn = None
                 try:
-                    with os.fdopen(fd2, 'wb') as f2:
-                        f2.write(raw)
-                    tmp_conn = sqlite3.connect(f'file:{tmp_path2}?mode=ro', uri=True, timeout=5)
-                    column_names = record_column_names(tmp_conn, table)
-                    alias_col = rowid_alias_column(tmp_conn, table)
+                    with _readonly_connection(raw) as tmp_conn:
+                        column_names = record_column_names(tmp_conn, table)
+                        alias_col = rowid_alias_column(tmp_conn, table)
                 except Exception:
                     pass
-                finally:
-                    if tmp_conn is not None:
-                        tmp_conn.close()
-                    try:
-                        os.remove(tmp_path2)
-                    except OSError:
-                        pass
             if column_names:
                 if column_index is not None and column_index < len(column_names):
                     column_name = column_names[column_index]
@@ -838,27 +886,16 @@ def read_live_row(raw: bytes, table: str, rowid: int) -> tuple[list[str], list] 
 
     Returns (column_names, values) in `PRAGMA table_info` order, or None
     if the table/rowid doesn't resolve (never raises)."""
-    fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
-    conn = None
     try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(raw)
-        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
-        cursor = conn.execute(f'SELECT * FROM "{table}" WHERE rowid = ?', (rowid,))
-        row = cursor.fetchone()
-        if row is None:
-            return None
-        columns = [d[0] for d in cursor.description]
-        return columns, list(row)
+        with _readonly_connection(raw) as conn:
+            cursor = conn.execute(f'SELECT * FROM "{table}" WHERE rowid = ?', (rowid,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            columns = [d[0] for d in cursor.description]
+            return columns, list(row)
     except Exception:
         return None
-    finally:
-        if conn is not None:
-            conn.close()
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
 
 
 def _walk_all_btree_pages(raw: bytes, page_size: int, root_page: int) -> set[int]:
@@ -961,43 +998,32 @@ def build_page_map(raw: bytes) -> dict[int, dict] | None:
     for pn in iter_freelist_pages(raw, page_size, header):
         page_map[pn] = {'kind': 'freelist', 'name': None, 'table': None, 'is_leaf': None}
 
-    fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
-    conn = None
     try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(raw)
-        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
-        # sqlite_master's own rootpage is ALWAYS page 1 (never stored
-        # anywhere, since it can't list itself as one of its own rows) —
-        # prepended as a synthetic first candidate so its own interior/
-        # leaf pages get attributed the same as any other object's, not
-        # just literal page 1. Checks BOTH schema types for every real
-        # object regardless of the page's own byte shape (a `WITHOUT
-        # ROWID` table is physically index-shaped despite
-        # sqlite_master.type saying 'table' — see identify_structure's
-        # own docstring for the confirmed-real Chromium example this
-        # covers).
-        candidates = [('sqlite_master', 'table', 'sqlite_master', 1)] + conn.execute(
-            "SELECT name, type, tbl_name, rootpage FROM sqlite_master "
-            "WHERE type IN ('table','index') AND rootpage IS NOT NULL").fetchall()
-        for name, obj_type, tbl_name, rootpage in candidates:
-            for pn in _walk_all_btree_pages(raw, page_size, rootpage):
-                if pn in page_map:
-                    continue   # freelist already claimed it -- real freed space wins
-                header_offset = 100 if pn == 1 else 0
-                pg = _page_bytes(raw, page_size, pn)
-                is_leaf = len(pg) > header_offset and pg[header_offset] in (
-                    _LEAF_TABLE_PAGE, _LEAF_INDEX_PAGE)
-                page_map[pn] = {'kind': obj_type, 'name': name, 'table': tbl_name, 'is_leaf': is_leaf}
+        with _readonly_connection(raw) as conn:
+            # sqlite_master's own rootpage is ALWAYS page 1 (never stored
+            # anywhere, since it can't list itself as one of its own rows) —
+            # prepended as a synthetic first candidate so its own interior/
+            # leaf pages get attributed the same as any other object's, not
+            # just literal page 1. Checks BOTH schema types for every real
+            # object regardless of the page's own byte shape (a `WITHOUT
+            # ROWID` table is physically index-shaped despite
+            # sqlite_master.type saying 'table' — see identify_structure's
+            # own docstring for the confirmed-real Chromium example this
+            # covers).
+            candidates = [('sqlite_master', 'table', 'sqlite_master', 1)] + conn.execute(
+                "SELECT name, type, tbl_name, rootpage FROM sqlite_master "
+                "WHERE type IN ('table','index') AND rootpage IS NOT NULL").fetchall()
+            for name, obj_type, tbl_name, rootpage in candidates:
+                for pn in _walk_all_btree_pages(raw, page_size, rootpage):
+                    if pn in page_map:
+                        continue   # freelist already claimed it -- real freed space wins
+                    header_offset = 100 if pn == 1 else 0
+                    pg = _page_bytes(raw, page_size, pn)
+                    is_leaf = len(pg) > header_offset and pg[header_offset] in (
+                        _LEAF_TABLE_PAGE, _LEAF_INDEX_PAGE)
+                    page_map[pn] = {'kind': obj_type, 'name': name, 'table': tbl_name, 'is_leaf': is_leaf}
     except Exception:
         pass
-    finally:
-        if conn is not None:
-            conn.close()
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
 
     for pn in range(1, page_count + 1):
         if pn in page_map:
@@ -1147,23 +1173,12 @@ def identify_structure(raw: bytes, offset: int, page_map: dict | None = None) ->
             # (would mean repeating the same list on every one of that
             # index's own pages for no benefit) -- one small extra lookup
             # here instead, only when an index match actually happens.
-            fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
-            conn = None
             try:
-                with os.fdopen(fd, 'wb') as f:
-                    f.write(raw)
-                conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True, timeout=5)
-                columns = [r[2] for r in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
-                result['columns'] = [c for c in columns if c is not None]
+                with _readonly_connection(raw) as conn:
+                    columns = [r[2] for r in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
+                    result['columns'] = [c for c in columns if c is not None]
             except sqlite3.Error:
                 pass
-            finally:
-                if conn is not None:
-                    conn.close()
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
         return result
 
     # entry['kind'] is 'unattached_btree_page' or 'unidentified' --

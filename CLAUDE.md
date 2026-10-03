@@ -26,7 +26,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 ## Data flow (opening an archive)
 
 1. `FastZipBrowser.start_loading()` → case dir chosen (`_get_or_ask_case_dir`).
-2. `ZipMetadataWorker` (ffs-explorer.py:1433) → `app/ffs_metadata.py
+2. `ZipMetadataWorker` (ffs-explorer.py:1462) → `app/ffs_metadata.py
    parse_archive_metadata()` in a child process: central-directory parse,
    `ui_metadata` build, folder tree/sizes; snapshot persisted to case dir
    (msgpack) so re-opens are instant.
@@ -103,6 +103,7 @@ first-open metadata parsing runs in a separate *process* (`ffs_metadata.py`).
 | `header_scan.py` | Magic-byte/text file-type detection by direct offset reads. `classify_magic`'s `ftyp` branch fixed 2026-09-22 (see the "Embedded-media sweep" Conventions entry below) — it used to treat ANY non-audio `ftyp` brand as `'Video'`, which is wrong for HEIC/HEIF (the single most common real iOS photo format, sharing the identical ISOBMFF/`ftyp` container MP4/MOV use); confirmed directly against real HEIC/MOV/M4V/MP4 files from this project's own test archives before fixing, not assumed. New public `IMAGE_FTYP_BRANDS` (HEIC/HEIF/AVIF family brands) disambiguates; a `WEBP` RIFF form (previously undetected at all) was added the same day |
 | `embedded_media_scan.py` | Generic, schema-agnostic sweep for image/video content embedded inside SQLite BLOB cells and plist NSData values — see the "Embedded-media sweep" Conventions entry below for the full design, real bugs found during verification, and the GUI wiring (`ProcessDialog`'s checkbox/scope picker, `EmbeddedMediaScanWorker` in `ffs-explorer.py`, and the Media Browser's "Embedded Media" review button) — all shipped and verified end-to-end against real archive data, not a placeholder |
 | `embedded_media_skip_list.py` | Hand-maintained "known-noise" list of SQLite databases/plists an examiner has confirmed are never worth running the embedded-media sweep against — added 2026-09-24, see that day's Conventions entries below for the full design, a real example found while verifying it (`map_cache.db`, Google Maps' own SDK cache, bundled inside 10 unrelated apps on one real Android archive), and several same-day direct follow-ups: app-scoped entries via `FastZipBrowser._app_scoped_skip_entry` to avoid a cross-app collision risk; `entry_matches_any_path` for the "Add…" dialog's own validation against the currently open archive; wildcard (`*`) entries for a known-variable path segment (an iOS container GUID, an Android per-user-profile id) found and confirmed against real archives to need generalizing beyond the first app-scoping pass; and a full split into TWO separate files, one per platform, so the View/Edit List dialog only ever shows the current case's own platform. Same dev/frozen-path JSON-store convention as `research_store.py`/`photo_flags.json`, cached by mtime+size, `platform` ('android'/'ios') threaded through every function. `load`/`add_entry`/`remove_entry`/`matches`/`find_matching_entries`/`entry_matches_any_path` — an entry with no `/` matches by exact basename anywhere in the archive, one containing `/` but no `*` matches as a path substring, one containing `*` matches as a wildcard substring (each `*` matching any run of characters) |
+| `user_media_ignore_list.py` | Hand-maintained, GLOBAL (cross-case), FLAT list of folders/files excluded from the Media Browser's own "User Media" filter (added 2026-09-27 — see that day's Conventions entry for the full design). Same dev/frozen-path JSON-store convention as `research_store.py`/`embedded_media_skip_list.py`, cached by mtime+size, but deliberately NOT split per platform (a real ui_path can never collide across iOS/Android the way a bare database filename could) and deliberately checked into the repo, not gitignored — direct request: "i want these selected to be shared to github." `load`/`add_entries`/`remove_entry`/`is_ignored` — an entry excludes an exact path match, or any real path starting with `entry + '/'` (so a folder entry excludes its whole real subtree) |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers (2026-08-19, after a survey found 25+ hand-rebuilt Cancel/OK button rows, 24+ wordWrap note labels, and four different ad-hoc warning/error colors): `button_row()` (Cancel/OK, `on_ok`/`on_cancel` default to accept/reject — only fits a plain two-button row in that fixed order, a dialog with a third button or different order keeps its own hand-built row), `note_label()`, `error_label()`, and `WARNING_COLOR`/`ERROR_COLOR` reusing `research_store.py`'s existing `#b8860b`/`#c62828` rather than inventing new ones. No case/business logic — pure widget construction |
 | `timestamp_display.py` | `TimestampDisplayMixin` (extracted from `ffs-explorer.py` 2026-08-19, same treatment as the other mixins below): the shared timestamp-mode banner, `format_ts` (the single entry point every view calls to display an evidence timestamp per the case's UTC/handset/acquisition/manual setting), and the Timestamp Display dialog. Module-level `_format_ts_cached`/`_format_ts_named_zone` do the actual formatting. Tool-provenance formatting (`_format_tool_ts_local`) is a different concern and stays in `ffs-explorer.py` |
 | `device_timezone.py` | Best-effort timezone detection for the opt-in device-local timestamp display: `detect_handset_zone` (iOS `private/var/db/timezone/localtime`), `detect_acquisition_offset`/`guess_acquisition_zones` (the `.ufd`'s recorded UTC offset, Cellebrite-only), `detect_system_zone` (the analysis machine's own current zone — macOS/Linux via `/etc/localtime`, Windows via the registry + a bundled CLDR name mapping since Windows has no IANA-named equivalent). All best-effort, never raise, never applied silently — see the Conventions timestamp section |
@@ -10083,3 +10084,1985 @@ underneath that verification.
   "Full Filesystem" and selected it there. Full pytest suite (18/18) and
   `scripts/check_claude_md.py` clean throughout; the real
   `config/ffs_archives.json` confirmed untouched afterward.
+
+- **Media Browser's "◀ Last Selection" button removed, 2026-09-27.**
+  Direct request: "can you remove the last selection buton from the
+  media browser[.] now that we have change[d] the selection window i
+  think there is no value in it." That button (added 2026-09-25) existed
+  to let the examiner return to a previously-viewed bookmark group or
+  checked-folders aggregate and see only its unseen files — but the same
+  day's later "Selected only" tree redesign (see the several entries
+  above, especially the branch-aware "Jump to" and carry-over-selection
+  work) already gives a more general, always-available way to get back
+  to exactly that same content, making this narrower, single-slot,
+  bookmark/aggregate-only button redundant.
+
+  Removed completely, not just hidden: the button itself and its status-
+  row placement, `_media_last_selection_paths`/`_media_last_selection_
+  label`/`_media_showing_selection` state, `_on_media_last_selection_
+  clicked`, the "Last Selection" snapshot block inside
+  `_load_media_from_file_model` (including the local `_BM_GROUP_PREFIX`
+  copy that block was the only user of, in `app/media_viewer.py` — the
+  real, ffs-explorer.py-side constant of the same name is untouched,
+  still used by `_show_bookmark_group`), and the `_media_showing_
+  selection` half of `_on_center_tab_changed`'s "leave this alternate
+  view alone" check (`ffs-explorer.py`) — that check now only guards the
+  Embedded Media view, which is unaffected.
+
+  Verified against the real Android 15 CTF25 Cellebrite archive, driving
+  the real running app in-process: confirmed `_media_last_selection_btn`/
+  `_media_last_selection_paths`/`_media_showing_selection`/
+  `_on_media_last_selection_clicked` no longer exist as attributes at
+  all (not just hidden/empty), and that the Media Browser still loads
+  and displays a real folder's content normally afterward. Full pytest
+  suite (18/18) and `scripts/check_claude_md.py` clean throughout; the
+  real `config/ffs_archives.json` confirmed untouched afterward.
+
+- **"User Media" filter added to the Media Browser, in the exact status-
+  row slot the just-removed "◀ Last Selection" button vacated —
+  2026-09-27.** Direct request: "i would like to make a filter for media
+  files that shows all media files in location[s] that are user
+  created[.] so for ios that is jump to 'app data', 'app dat[a]
+  plugins', 'app data shared', DCIM & PhotoData[.] this button should be
+  where the selected button we just got rid of was." Shows real
+  pictures/videos found ANYWHERE in the archive under a small, fixed set
+  of default locations known to hold user-created content rather than
+  app/OS chrome — archive-wide, not scoped to the current folder, the
+  same "replaces the folder view until an ordinary folder is picked
+  again" shape `_show_embedded_media_hits`/the Embedded Media button
+  right next to it already established (new `_media_showing_user_only`
+  flag, guarded in `_on_center_tab_changed` and cleared by
+  `_load_media_from_file_model` alongside the existing embedded-media
+  flag).
+
+  `FastZipBrowser._user_media_include_prefixes()` returns the default
+  list — for iOS, exactly the same three paths `FfsAdapter.
+  container_parents()` already resolves for "every app's own data" (App
+  Data/App Data Plugins/App Data Shared) plus the same two real Photos-
+  library paths `FORENSIC_SHORTCUTS`' own "Media" jump-to submenu already
+  uses (DCIM, Photo Library Data) — reused rather than re-derived, so
+  this filter and "Jump to" can never silently drift onto two different
+  ideas of "where DCIM is." Each path goes through the existing
+  `_adapt_shortcut_path` (the same GrayKey `private/var/` prefix
+  handling every other jump-to shortcut already needs). Android has no
+  equivalent in the original request — `data/data/`/`data/media/` are
+  used as a reasoned default, matching this project's own pre-existing
+  "app/user-accessible areas" convention (`FfsAdapter.scan_folders()`'s
+  own identical two prefixes for the same platform distinction
+  elsewhere). `_show_user_created_media` (`app/media_viewer.py`) is a
+  plain in-memory scan of `self.full_metadata` — no I/O, so re-running it
+  on every click costs nothing worth caching.
+
+  **A separate, examiner-editable EXCLUSION layer on top of the default
+  locations** — direct follow-up in the same request: "i also wa[n]t to
+  be able to select a folder and file [and] be able to remove via [a]
+  right click. i want these selected to be shared to github. i also
+  wa[n]t the option to add new files and folder[s] to ignore to not
+  [be] on by default[;] there is an option in the app dialog to switch
+  it on or off and it is off by default and when switch[ed] on tell the
+  user the risk [of] hid[ing] a folder... you should only add if you
+  know what you're doing." New `app/user_media_ignore_list.py` — see its
+  own module-table entry and docstring for the full design (a flat,
+  GLOBAL, git-tracked list; exact-path or folder-subtree matching).
+
+  Three ways to use it, all sharing the one store:
+  1. **File Browser right-click**, on the current row selection (files
+     AND folders both — collected via a new inline loop in
+     `show_table_context_menu`, deliberately NOT recursing a folder into
+     its own children first, since excluding the folder itself already
+     excludes its whole subtree via the module's own prefix match):
+     "🚫 Add to User Media Ignore List (N)" (shown only when the
+     preference below is on) and "✅ Remove from User Media Ignore List
+     (N)" (shown whenever at least one selected path is an EXACT
+     existing entry — always available, regardless of the preference).
+  2. **Preferences ▸ Media Browser**'s own "Manage Ignore List…" button
+     opens a new `UserMediaIgnoreListDialog` (modeled directly on
+     `EmbeddedMediaSkipListDialog`) — view/remove always available, its
+     own "Add…" button disabled (with an explanatory note) while the
+     preference is off.
+  3. The preference itself, **`user_media_ignore_editable`** (new
+     `_load_prefs`/`_save_prefs` key, default `False`) — a checkbox right
+     above the "Manage Ignore List…" button. Checking it shows a real
+     confirm dialog stating the risk directly (excluding something here
+     means it silently stops appearing in this ONE filter, which can
+     hide genuine evidence if used carelessly — including an entry
+     someone else already added via a shared repo); declining reverts
+     the checkbox back to unchecked (a normal, reliable `QCheckBox`
+     operation — unlike the exclusive-`QButtonGroup` radio-button
+     "revert" case documented elsewhere in this file, a plain checkbox
+     has no such quirk to work around). `_add_to_user_media_ignore_list`
+     re-checks this preference itself too, defensively, rather than
+     trusting the menu's own gating alone — a real exclusion feature
+     with real evidentiary risk gets checked at the point of action, not
+     just where the menu item happens to be built.
+
+  Verified end-to-end against two real, independent archives (Android 15
+  CTF25 Cellebrite AND IOS17 JoshHickman — deliberately both platforms,
+  not just one), driving the real running app in-process: confirmed the
+  Android include-prefix list is exactly `['data/data/', 'data/media/']`
+  and the iOS list is exactly the five paths named above, byte-for-byte;
+  found and confirmed a REAL user-media file on each platform is
+  included by the filter (a real SimpleX Chat photo under Android's own
+  `data/data/`, and the real `IMG_0001.HEIC` under iOS's own
+  `mobile/Media/DCIM/100APPLE/`, plus a real app-data image inside an
+  iOS app's own container) while a real OUT-OF-SCOPE file on each
+  platform (an Android system theme-magic PNG, an iOS system app's own
+  `AppIcon60x60@2x.png`) is correctly excluded; confirmed adding an
+  ignore entry is refused while the preference is off and succeeds once
+  it's on, that the newly-ignored file is then excluded from a
+  re-run of the filter, that removing it always works regardless of the
+  preference and brings the file back; confirmed a FOLDER-level ignore
+  entry excludes every real file in its own subtree; and confirmed the
+  view survives a tab switch away and back (not silently reverted) while
+  correctly exiting the moment an ordinary folder is picked. The real,
+  git-tracked `config/user_media_ignore_list.json` was never created or
+  touched by any of this testing — every check redirected `user_media_
+  ignore_list.store_path()` to a scratch file first. Full pytest suite
+  (18/18) clean throughout; `scripts/check_claude_md.py` initially
+  flagged the new module missing from the `## app/ modules` table (a
+  real, correct catch — fixed by adding that row before this entry was
+  written) and is clean now.
+
+  **Same-day direct follow-up: clicking "User Media" now also ticks
+  every containing folder and each individual media file itself** —
+  "the folder[s] that are selected should all be ticked and if there
+  are individual file[s] excluded it should not be selected[;] this
+  mean[s] in the file browser all the same files will be selected and
+  the selected folder tree will show the selected folders." Mirrors
+  "Select Bookmarked Files"' own dual folder+file ticking exactly (same
+  reasoning: a folder-only tick doesn't visually distinguish the files
+  themselves once browsing that folder) — an excluded file is already
+  absent from the filtered set, so it was never a candidate to tick in
+  the first place.
+
+  New `FastZipBrowser._select_user_media_files_and_folders(folders,
+  files)` deliberately does NOT reuse "Select Bookmarked Files"' own
+  `_tick_items_by_path`, which walks and lazily materializes/expands the
+  tree for EVERY path — fine for a small bookmark group, a real,
+  measured cost for something archive-wide: verified against a real
+  archive, this filter routinely spans **642 distinct folders** (10,342
+  real files). Instead updates `self._checked_folders` directly (a plain
+  set op) and only opportunistically re-ticks whatever tree item is
+  ALREADY materialized (`_find_tree_item`, which never triggers lazy
+  loading) — any folder expanded into LATER still gets the correct
+  checked state at creation time
+  (`_populate_tree_children_batched`'s own existing "Checked if p in
+  self._checked_folders" logic), so nothing is actually lost, only the
+  eager walk-and-expand step is skipped. `_show_user_created_media` only
+  prompts before replacing an existing checked-folder selection when
+  that selection would genuinely lose something (`self._checked_folders
+  - folders`, i.e. a folder NOT already part of this filter's own set)
+  — re-clicking the same button repeatedly (the common case, e.g. right
+  after adding an ignore entry) never re-prompts, since nothing would
+  actually be lost either way.
+
+  Verified against the real Android 15 CTF25 Cellebrite archive, driving
+  the real running app in-process: confirmed all 642 real containing
+  folders end up in `_checked_folders` and all 10,342 real media files
+  end up in `_checked_files`; confirmed `_selected_only_scope` includes
+  the same folders; navigated into a real sample folder and confirmed
+  the exact media file's own far-left checkbox renders `Qt.CheckState.
+  Checked` in the table while a real NON-media sibling in that SAME
+  folder correctly renders `Unchecked` (only the same files end up
+  selected, not the whole folder's contents); and confirmed adding a
+  real file to the ignore list and re-running the filter leaves it
+  correctly un-ticked (never added to `_checked_files` at all). Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean throughout;
+  the real `config/ffs_archives.json`/`config/user_media_ignore_list.json`
+  confirmed untouched afterward.
+
+- **Selection/bookmark system audit and redesign, 2026-10-01** — prompted
+  directly by the user's own standing discomfort with the checkbox-
+  selection mechanism after watching it evolve across several days of
+  rapid, often-reversed changes ("i feel/test show that it is a little
+  bugging... i want you to really look hard at who it is currently
+  implement[ed] and make sure that it is done cleanly"). Investigated
+  the full existing architecture before proposing anything: three
+  loosely-bridged mechanisms — `_checked_folders`/`_checked_files`
+  (transient, in-memory, reset on every case reopen), the "Selected
+  only" tree view filter (added days earlier, a pure display filter
+  over the first), and bookmarks (`bookmark_groups`/`bookmark_entries`
+  in `caseresults.db`, always a FLAT file list — a bookmarked folder is
+  never stored as a folder, only as a frozen snapshot of its files at
+  save time). A real, confirmed bug matching the user's own "feels
+  buggy" report: the old "Show N Selected Items" button
+  (`_update_selected_btn`) only ever counted `_checked_folders` — a file
+  ticked individually via the File Browser's own far-left checkbox
+  column (`_checked_files`) was completely invisible to it.
+
+  **Design, worked out with the user before any code was written** (per
+  this project's own standing "write up your plans first" discipline):
+  make the live tick-based selection recallable the same way a bookmark
+  group already is, without inventing a second persistence mechanism.
+  Landed on a LIVE, synthetic "Selected Files" entry in the bookmark
+  panel — never its own row in `bookmark_groups` — that simply mirrors
+  `_checked_folders`/`_checked_files` directly; no schema change was
+  needed once the user pointed out the archive itself is static (an
+  earlier draft of this design worried about a ticked folder needing to
+  stay "dynamically" tracked against future content — unnecessary,
+  since the archive's own real bytes never change; the only thing that
+  CAN still change mid-session is content THIS APP discovers later —
+  nested-archive extraction, the embedded-media sweep, a LevelDB folder
+  decode — handled separately below, not by making bookmark storage
+  itself dynamic).
+
+  Every bookmark-group LEFT-CLICK now always adopts that group's own
+  folders/files as the live selection AND shows its contents — per
+  direct instruction ("i want to change it that you do not right click
+  to select file[s;] that this is always the behaviour"), replacing the
+  former split between a view-only left-click and a separate right-click
+  "Select Bookmarked Files" action (removed outright, not left dormant).
+  Guarded by a new dirty flag (`self._selection_dirty`, cleared the
+  instant a selection is freshly loaded from a saved group, set by any
+  subsequent tick) and `_selection_at_risk()` (dirty AND non-empty) —
+  clicking a DIFFERENT group while there's a real, unsaved working
+  selection shows a warning (`_warn_before_losing_selection`) with
+  exactly three choices, per direct instruction: Cancel / "Save as New
+  Group…" (`_save_current_selection_as_new_group`, reusing
+  `_new_bookmark_group_dialog`'s own layout but blocking so the caller
+  knows whether it actually saved) / "Continue Without Saving" (discard
+  outright). Switching groups with nothing dirty (the common case —
+  browsing around, or just having loaded a group moments ago) never
+  shows the dialog at all, per direct instruction: "we only need to warn
+  a user if they are going to lose the selected file group if they are
+  going to lose it."
+
+  **A new `_auto_tick_new_tree_entries(parent_path, new_children)`**
+  closes a real, related gap, per direct follow-up question: if a
+  folder is already ticked and the examiner later extracts a nested
+  archive, runs the embedded-media sweep, or decodes a LevelDB folder
+  UNDER it, the newly-discovered children now get auto-ticked too —
+  hooked into all four of the real injection points that ever grow
+  `folder_map` mid-session (`_inject_nested_archives`,
+  `_inject_embedded_media`, and both of `app/leveldb_viewer.py`'s own
+  `folder_map[ui_path] = virtual_children` decode sites). A no-op the
+  vast majority of the time (called at ordinary case-load injection
+  time too, when nothing is ticked yet) — the live aggregate view
+  already picks up a ticked folder's new children for free at render
+  time regardless (`_rebuild_file_view_from_checked` reads `folder_map`
+  live), so this only matters for the new child's own checkbox reading
+  correctly once browsed into, and for a later "Save as New Group"
+  snapshot actually including it.
+
+  **Two real, pre-existing bugs were found and fixed while building and
+  testing this, neither caused by the redesign itself but both newly
+  consequential once a dirty flag existed to get it wrong:**
+
+  1. **`on_tree_item_changed` reacted to ANY data change on ANY tree
+     item, not just a real checkbox tick.** `QStandardItemModel
+     .itemChanged` fires for every data-role change, not just
+     `CheckStateRole` — `_refresh_research_styling` (restyling every
+     tree item's foreground color/tooltip after a research-status mark
+     is saved, a completely unrelated action) touches the SYNTHETIC
+     "Selected Only" root item too (a real oversight in that function's
+     own walk, which never excluded the two synthetic root markers), and
+     setting that non-checkable item's `ForegroundRole` fired
+     `itemChanged` — which `on_tree_item_changed` then treated as a
+     real tick, unconditionally scheduling a `_deferred_rebuild` and
+     (once the dirty flag existed) silently marking a perfectly clean
+     selection as dirty purely from an unrelated research-status save.
+     Fixed with a real-change guard, not a special case for this one
+     caller: bail immediately if `not item.isCheckable()`, and compare
+     the new `checkState()` against actual presence in `_checked_folders`
+     — if they already agree (including the half-tick case, where
+     neither is "Checked"), nothing about the selection changed, so
+     there's nothing to do. This also makes `_refresh_tree_check_states`'
+     own visual-only echo safe without needing `blockSignals` there, and
+     was found and fixed by direct tracing (patching
+     `on_tree_item_changed` to print its own call stack the first time
+     it fired after a fresh case load), not guessed at.
+  2. **A real race between an explicit "mark the selection clean" and a
+     scheduled async rebuild.** `_replace_selection_from_bookmark_entries`
+     explicitly sets `_selection_dirty = False` right after adopting a
+     group's own scope — but `_tick_items_by_path`'s own per-path
+     `setCheckState(Checked)` legitimately fires `on_tree_item_changed`
+     for each GENUINELY new tick (bug 1's guard correctly lets a real
+     tick through), which schedules `QTimer.singleShot(0, self.
+     _deferred_rebuild)` exactly as an ordinary user click would — and
+     that queued callback fires moments AFTER this method returns,
+     calling `_refresh_file_checked_paths()` with its own default
+     `mark_dirty=True`, silently flipping the just-cleared flag back to
+     `True`. Fixed by wrapping just the `_tick_items_by_path(scope)`
+     call in `self.tree_model.blockSignals(True)`/`blockSignals(False)`
+     — `_checked_folders` is already updated directly (not via the
+     signal) by that method's own first line, and `setCheckState` still
+     sets the real checkbox state regardless of whether the signal
+     fires, so the tree renders identically either way; only the
+     redundant async rebuild-and-re-dirty is suppressed. Found by
+     tracing a real, reproducible end-to-end test failure (not assumed
+     from reading the code) — a naive "did the crash reproduce with
+     full event-loop draining between actions" check initially looked
+     clean, until a FULL integration test of the warning/save/discard
+     flow caught the flag silently flipping back moments after being
+     explicitly cleared.
+
+  **A third, separate, pre-existing crash was found and fixed
+  BEFORE any of the above**, while smoke-testing the button removal
+  below with two rapid successive ticks: `_populate_tree_children_batched`'s
+  own async `_step`/`_batch` closures (scheduled by
+  `_on_tree_item_expanded` via `QTimer.singleShot(0, _batch)`) can fire
+  against a `parent_item` whose underlying C++ `QStandardItem` has
+  since been deleted by a LATER tick's own tree rebuild — confirmed as
+  a genuine Qt reentrancy case, not a test-pacing artifact: Qt can
+  synchronously re-enter the event queue from inside an unrelated
+  widget-geometry read (`_fit_bookmark_panel_size`'s own `self.
+  left_splitter.height()`, itself scheduled from the ordinary post-
+  load bookmark-panel-refresh chain) and fire a queued `_batch` callback
+  from a nested call, well before the test's own `app.processEvents()`
+  loop would otherwise have reached it. The SAME failure class this
+  project already fixed once for `_rebuild_selected_only_children`'s own
+  auto-expand (see that entry above) and for `SqlHitInterpretWorker`'s
+  own generation-counter + try/except backstop — fixed here the same
+  way: `_step`'s `parent_item.appendRow(item)` (and the placeholder
+  append right after) is now wrapped in `try/except RuntimeError`,
+  stopping that one stale job for good rather than crashing the whole
+  app. Reproduced directly (two real folders ticked via the File
+  Browser table's own checkbox path, against the real Android 14
+  JoshHickman archive, with the event loop fully drained between each)
+  before writing the fix, and re-confirmed clean after.
+
+  **"Show N Selected Items"/"Deselect All" buttons removed outright**
+  (`show_selected_btn`/`deselect_all_btn`/`_update_selected_btn`), per
+  direct instruction, once the "Selected Files" panel entry made the
+  first one redundant — `_deselect_all_files` itself (the real
+  selection-clearing logic, still used internally by the new replace
+  flow) was kept, only its dedicated button is gone. The "Selected
+  Files" panel row's own displayed count is kept live by a new
+  `_refresh_selected_files_panel_label`, called from
+  `_refresh_file_checked_paths` (the one shared choke point every tick
+  already funnels through) rather than a full `_refresh_bookmark_panel`
+  DB round-trip, which would be pure waste just to update one label.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive
+  (a scratch case_dir, `FFS_ARCHIVES_FILE`/`QSettings` org-name both
+  isolated per this project's own standing test-isolation rules —
+  confirmed via a clean `git diff` on `config/` afterward), driving the
+  real running app in-process through the full warning/save/discard
+  flow, not simulated: the dirty flag starts `False` and stays `False`
+  through ordinary case load (confirming bug 1's fix); ticking sets it
+  `True` and `_selection_at_risk()` agrees; clicking the live "Selected
+  Files" entry never warns and never disturbs the ticks; clicking a
+  real, different group with a dirty selection warns exactly once,
+  `Cancel` leaves everything untouched, `Continue Without Saving`
+  replaces the selection and clears dirty (confirming bug 2's fix);
+  switching groups again immediately afterward — nothing dirty — warns
+  correctly not at all; re-ticking makes it dirty again, and `Save as
+  New Group…` persists a real new bookmark group whose own saved
+  entries exactly match what was actually checked at that moment
+  (including a real subfolder scope left over from an earlier group
+  adoption, not a guessed top-level path) before proceeding to adopt
+  the newly-clicked group; and the auto-tick hook correctly ticks a
+  synthetic new child under an already-checked folder while correctly
+  leaving an unrelated, un-checked folder's own new child alone. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
+  **Same-day direct follow-up: a real "Deselect" button next to the
+  "Selected Files" row itself**, so clearing the live selection no
+  longer requires finding a folder/file to untick by hand. The row's
+  plain `QListWidgetItem` text was replaced with a real inline widget
+  (`QListWidget.setItemWidget`) holding two flat `QPushButton`s side by
+  side: "Selected Files (N)" (clicking it calls
+  `_rebuild_file_view_from_checked` directly — the same action the
+  list's own `clicked` signal already provides as a redundant fallback
+  via `_on_bookmark_item_clicked`'s existing sentinel branch) and
+  "Deselect" (calls the pre-existing `_deselect_all_files`, disabled
+  whenever nothing's selected so there's nothing to click for no
+  reason). Deliberately two buttons, not a `QLabel` + a button — a bare
+  label inside `setItemWidget` doesn't reliably forward clicks from the
+  list view (a known Qt itemWidget quirk), so the count side needed to
+  be natively clickable too, not just the Deselect side.
+  `_refresh_selected_files_panel_label` (the existing live-count
+  updater, already wired into `_refresh_file_checked_paths`) now calls
+  a new `_update_selected_files_row_display(n)`, which sets both the
+  button text and the Deselect button's enabled state from one place —
+  "change the value to zero" falls out of this for free, since
+  `_deselect_all_files` already funnels through the same choke point.
+
+  Verified against the real Android 14 JoshHickman archive with real
+  screenshots (`window.grab()`, real `cocoa`-equivalent offscreen
+  render), not just assertions: confirmed the row renders as "Selected
+  Files (0)    Deselect" with the button visibly greyed out before
+  anything is ticked; ticking a real folder updates the count live (7)
+  and enables the button; clicking it immediately clears
+  `_checked_folders`/`_checked_files`, the File Browser table drops to
+  0 items, the tree's own checkboxes visibly uncheck, the row's own
+  text resets to "(0)", and the Deselect button greys out again. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
+  **Same-day direct follow-up: clicking an EMPTY bookmark group (no
+  entries) is now a complete no-op**, per direct instruction: "if the
+  bookmark groups have no content then nothing should happen[,] i.e.
+  do not uncheck the selected file[s] or open the dialog." Previously,
+  an empty group (freshly created via "New Group…", or every entry
+  since removed) still ran the full `_show_bookmark_group` flow — it
+  could show the at-risk warning dialog for no reason, then silently
+  wipe a real working selection down to nothing by adopting the empty
+  group's own (empty) scope. `_show_bookmark_group` now checks
+  `if not entries:` immediately after loading them — BEFORE
+  `_selection_at_risk()` is ever consulted — and, if empty, shows a
+  status-bar message naming the group and returns, touching neither
+  `_checked_folders`/`_checked_files` nor the File Browser view at all.
+
+  Verified against the real Android 14 JoshHickman archive, driving the
+  real running app in-process: created a real, genuinely empty bookmark
+  group, ticked a real folder first (dirty=True, something at risk),
+  then clicked the empty group — confirmed the warning dialog never
+  fired, the ticked folder stayed ticked, the dirty flag was unaffected,
+  and the status bar correctly named the empty group ("'Totally Empty
+  Group' has no bookmarked files."). A real, non-empty group clicked
+  right afterward correctly still triggered the warning as before — the
+  empty-group guard doesn't suppress the real mechanism for a group
+  that genuinely has content. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.
+
+- **Folder-checkbox 2/3-click tick cycle, 2026-10-02** — direct request:
+  "when you click a folder in browser view it half ticks and select[s]
+  only the files of the folder and if you click again it ticks all the
+  folder and files." Three explicit design questions were confirmed
+  with the user before writing any code, since each materially changes
+  the implementation: applies to BOTH the tree's own checkbox and the
+  File Browser table's own checkbox column (not just one); the second
+  ("full") click recurses into every descendant, not just the clicked
+  folder's own direct level; a third click on an already-fully-ticked
+  folder clears it back to Unchecked (a real 3-state cycle, not a
+  one-way ratchet).
+
+  **`_advance_folder_tick_state(path)`** is the one shared place both
+  surfaces now funnel through: `none -> half` ticks ONLY the folder's
+  own direct FILE children into `_checked_files` (never the folder
+  itself) — `_partial_folders`' own pre-existing ancestor walk
+  (`_recompute_partial_folders`, unchanged) already renders a folder
+  half-ticked purely from having checked files as direct children, so
+  no new state/flag was needed for the half-tick VISUAL, only for
+  deciding what a click should DO. `half -> full` promotes to the
+  folder plus every descendant folder via `_descendant_folders` — the
+  SAME mechanism the pre-existing right-click "Tick folder and all
+  descendants" (`_set_branch_checked`) already used, now reachable by
+  plain clicking too — clearing the half step's own `_checked_files`
+  leftovers at every level under the folder. `full -> none` clears the
+  whole branch both ways. `_set_branch_checked` itself was also updated
+  to clear any stray `_checked_files` entries under its own branch
+  either way, for the same consistency reason.
+
+  `on_tree_item_changed`'s own guard (added 2026-10-01 for an unrelated
+  bug — see that entry above) was generalized rather than replaced: it
+  now compares Qt's reported `checkState()` against
+  `_tree_check_state_for(path)` (the full 3-way authoritative value,
+  not a binary `Checked` read) — any disagreement, in ANY direction,
+  means a real click landed and the cycle should advance; the SPECIFIC
+  raw 2-state value Qt's own non-tristate delegate computed is never
+  trusted for anything beyond "something happened," since only
+  `_advance_folder_tick_state`'s own reasoning from `_checked_folders`/
+  `_partial_folders` can correctly decide the real next state (Qt alone
+  has no way to express "go to half" with a plain binary toggle).
+  `_set_folder_checked_from_table` (the File Browser table's own
+  checkbox handler) uses the identical reasoning — a materialized tree
+  item just forwards to it (any binary value reliably disagrees with
+  whatever the correct 3-way state currently is, so the tree's own
+  guard always picks it up), a not-yet-materialized one calls
+  `_advance_folder_tick_state` directly. `_tick_single_path` (shared by
+  both the table's lazy-materialize fallback and the pre-existing bulk
+  `_tick_items_by_path`) was fixed to sync a path's checkbox to its
+  real `_tree_check_state_for` result instead of a hardcoded `Checked`,
+  since it can now legitimately need to land on half.
+
+  **Two real, necessary fixes to code that predates this feature, found
+  by testing rather than assumed safe:**
+  1. `_rebuild_file_view_from_checked` (the "Show Selected Files"/
+     "Selected Files" aggregate) only ever walked `_checked_folders` —
+     a shallow-ticked folder's own files, which now live ONLY in
+     `_checked_files`, would have been silently invisible in the one
+     view meant to show the whole selection. Fixed to also render
+     every `_checked_files` entry whose own containing folder isn't
+     itself a checked folder (avoiding a duplicate row once that
+     folder gets promoted to full), processed as a second, still
+     frame-budgeted phase once the folders phase finishes within its
+     own deadline (Python's `while/else` naturally defers the files
+     phase to the next batch if the folders phase got cut off
+     mid-deadline, rather than needing a second generation counter).
+  2. `FileTableModel` never had a `PartiallyChecked` concept at all —
+     `_set_file_model` (the ONE shared chokepoint that pushes checked-
+     state into every freshly-built table model, including plain
+     folder navigation, not just tick mutations) only ever passed the
+     fully-checked set, never `_partial_folders`. Found directly by
+     this feature's own end-to-end test: a half-ticked folder rendered
+     correctly the instant it was clicked, then silently reverted to
+     looking fully Unchecked the moment the examiner navigated to a
+     different folder and back — the freshly-built model for the new
+     view had simply never been told about partial state. Fixed with a
+     new `FileTableModel.set_checked_paths(paths, partial=())`
+     parameter, wired through `_set_file_model` and
+     `_refresh_file_checked_paths` alike, plus a `PartiallyChecked`
+     branch in `data()`'s own `CheckStateRole` handling (same three-way
+     check `_tree_check_state_for` already does for the tree).
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process through the full 3-click
+  cycle on BOTH surfaces — a real folder
+  (`data/data/ch.protonmail.android/app_webview`, 7 direct files, one
+  real populated subfolder) confirmed: click 1 leaves the folder itself
+  out of `_checked_folders`, puts exactly its 7 direct files into
+  `_checked_files`, and leaves the subfolder and ITS OWN files
+  completely untouched; click 2 promotes the folder AND the subfolder
+  into `_checked_folders` and clears the now-redundant direct-file
+  entries; click 3 clears everything back to empty with no leftovers.
+  The SAME three transitions were independently re-verified driving
+  `FileTableModel.setData` directly (the real code path a File Browser
+  table click takes), including re-navigating to a fresh listing after
+  each click to confirm the table's own `CheckStateRole` rendering
+  (not just the underlying `_checked_folders`/`_checked_files` state)
+  is correct at every step — this is what caught fix 2 above. The
+  aggregate view was confirmed to include the shallow-ticked files
+  (fix 1), and the "Selected Files" panel count matched exactly. Two
+  real screenshots (`window.grab()`) confirm the half-tick glyph
+  renders as a clearly distinct grey-filled square (not merely a
+  different enum value asserted in code) in both the tree, correctly
+  propagated up two ancestor levels, and the File Browser table. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
+- **Folder-tick cycle refined after direct user testing found it didn't
+  match what they'd actually asked for, 2026-10-02.** Direct correction:
+  "if a folder only has files then it can only be ticked and unticked
+  from the folder tree and the half tick is only obtain[ed] by removing
+  one of the files from the selection in the file browser[;] if a file
+  in one of the subfolder is deticked in the file browser view then all
+  the folder[s] in that branch going up the tree will be half ticked[;]
+  this would also go if one of the folders [is deselected]." Three real
+  gaps closed, two of them only found by testing against the real
+  archive, not from the request's own wording alone:
+
+  1. **A LEAF folder (only files, no subfolders) now gets a plain
+     none<->full toggle, not the 3-state cycle.** New
+     `_folder_has_direct_files(path)` alongside the pre-existing
+     `_folder_has_subfolders` — the 3-state cycle (`_advance_folder_
+     tick_state`) now only applies when a folder has BOTH, since "half"
+     only means anything where there's a real difference between "my
+     own files" and "my own files PLUS my subfolders." A folder with
+     neither distinction (a leaf, OR — a real gap found testing against
+     the archive, not anticipated from the request alone — a pure
+     CONTAINER folder whose every direct child is itself a subfolder,
+     e.g. a real app's bare `data/` directory) goes straight to a
+     binary `_tick_folder_full`/`_untick_folder_entirely` toggle. The
+     container-only case was a genuine silent no-op before this fix:
+     the 'half' step had nothing to add to `_checked_files` (no direct
+     files to tick), so `_tree_check_state_for` never left 'none' —
+     meaning a SECOND click never reached 'full' either, confirmed via
+     direct reproduction (clicking a real two-click sequence on
+     `data/data/ch.protonmail.android` left it fully unticked both
+     times) before writing the fix.
+  2. **New `_exclude_from_full_ancestor(target_path)`** — unticking an
+     individual FILE or FOLDER that's only "included" via some
+     ANCESTOR's full-tick (not itself a direct member of
+     `_checked_folders`/`_checked_files`) now surgically demotes that
+     ancestor — and every intermediate folder between it and
+     target_path's own parent — from a compact 'full' entry into an
+     expanded per-child representation that excludes ONLY target_path,
+     leaving every sibling exactly as selected as before.
+     `_recompute_partial_folders`'s own pre-existing ancestor walk
+     (unchanged) then correctly renders every demoted folder as half,
+     all the way up the tree, with no further code needed. Wired into
+     `_on_file_row_check_toggled` (a file unticked via its own File
+     Browser row — falls back to this when the file isn't directly in
+     `_checked_files`), `_untick_folder_entirely` (clicking a
+     folder's own checkbox back to 'none'), and `_set_branch_checked`
+     (the pre-existing right-click "Untick folder and all descendants",
+     for the same consistency reason).
+
+     **A real bug was found and fixed in this function itself before it
+     shipped**, by direct testing against a real three-level hierarchy
+     (app folder -> subfolder -> file), not assumed correct from the
+     single-level case alone: the first draft searched for the
+     NEAREST fully-checked ancestor and stopped there — but
+     `_tick_folder_full` cascades EVERY descendant folder individually
+     into `_checked_folders` (not just the top node), so a file's
+     immediate parent AND its grandparent can both independently be
+     "full" members at once. Scanning from the nearest ancestor only
+     ever demoted the immediate parent, silently leaving the
+     grandparent falsely showing FULL — confirmed via direct
+     reproduction (excluding one file correctly demoted the subfolder
+     but left the app-level parent still fully checked) before fixing
+     it to find the TOPMOST checked ancestor instead, which correctly
+     demotes the whole chain.
+  3. **The File Browser table never showed a file as "checked" at all
+     if it was only included via an ancestor's full-tick** — a real,
+     load-bearing gap found by the SAME testing pass: `_checked_folders`
+     only ever stores FOLDER paths, so a file covered purely by its
+     parent being fully ticked had no checkbox state of its own,
+     rendering Unchecked despite genuinely being part of the selection
+     — leaving nothing visibly checked for the examiner to click in
+     order to exclude it (the whole point of fix 2). New
+     `FileTableModel._ancestor_check_fn` (a callback, matching this
+     project's own pre-existing `_research_fg`/`_research_tip` pattern
+     for per-row callbacks rather than a precomputed whole-archive set)
+     and `FastZipBrowser._ancestor_checked_state(path)` — checked only
+     as a fallback, after the existing flat-set checks, so the common
+     case stays a cheap O(1) lookup. Wired through both call sites that
+     push checked-state into a table model (`_set_file_model`,
+     `_refresh_file_checked_paths`).
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process — all three gaps confirmed
+  fixed via real transitions, not reasoned through: a real leaf folder
+  (`.../cache/http_cache`) correctly toggles none<->full directly in
+  one click each way, with half reachable ONLY by excluding one of its
+  files via `_on_file_row_check_toggled` (the real File Browser
+  checkbox slot), which correctly left every OTHER file in that folder
+  still individually checked; a real three-level hierarchy
+  (`ch.protonmail.android` -> a real subfolder -> one of its own files)
+  confirmed that excluding the file correctly demoted BOTH the
+  subfolder AND the parent out of `_checked_folders` and into
+  `_partial_folders` (the authoritative half-state, confirmed
+  independent of whether either one's own tree item happened to be
+  materialized at the time — a real, separate test-methodology
+  discovery along the way: `navigate_tree_to_path` has its own
+  pre-existing materialization quirk for a few specific real folder
+  names, unrelated to this feature, worth a later look but not chased
+  further here), while the PARENT's own other real direct children
+  (both files and subfolders untouched by the exclusion) stayed exactly
+  as fully selected as before; and excluding a whole SUBFOLDER directly
+  (rather than one of its files) correctly demoted the parent the same
+  way, confirmed via the real `_set_folder_checked_from_table` code
+  path a File Browser checkbox click actually takes. Full pytest suite
+  (18/18) and `scripts/check_claude_md.py` clean throughout.
+
+- **Folder-checkbox ticking preserves the File Browser's own current
+  view — but only for a TABLE-originated click, not a tree one,
+  2026-10-02.** Direct report, after the tick-cycle work above: "if
+  you click on a specific folder to see the files in that folder in
+  the file browser and you decide to remove one of the folders from
+  the selection[,] the code change[s] what is show[n] in the file
+  br[o]ser to show the selected file[s]. i wish the code to remove the
+  file from the selection but not change the view[;] if the user want
+  to go to the selected files [view] they can click the selected
+  files [bookmark entry]." The scenario described is a folder ROW,
+  shown as part of some OTHER folder's own listing in the File Browser
+  table, whose far-left tickbox column is unchecked — previously this
+  always force-switched the File Browser to the aggregate "Selected
+  Files" view via `_rebuild_file_view_from_checked()`, discarding
+  whatever the examiner was actually looking at.
+
+  **First draft, direction-only, confirmed wrong by direct follow-up.**
+  The first fix gated purely on add vs. remove (`_last_tick_was_removal`,
+  set inside `_advance_folder_tick_state`/`_set_branch_checked`): only
+  an UNTICK skipped the rebuild, applied uniformly regardless of which
+  UI surface triggered the click. Corrected immediately, before this
+  ever shipped to CLAUDE.md: "i do not want the add yanking you away
+  either[;] this is only [a concern within] the file browser [table;]
+  in the tree view i am happy for the file browser table to be updated
+  with the contents of the select[ion]." The real distinction is WHICH
+  SURFACE triggered the click, not which direction it moved: a TREE
+  checkbox click — tick or untick — is still allowed (and meant) to
+  jump the File Browser to the aggregate view, exactly the original,
+  explicitly-requested "show what I just selected" behaviour from
+  earlier in this same day's work; a FILE BROWSER TABLE tickbox click —
+  tick or untick — must never change what's currently displayed.
+
+  Replaced the direction-only flag with `self._tick_triggered_by_table`
+  (`bool`, reset per case load in `start_loading`). `_set_folder_checked_
+  from_table`'s materialized-tree-item branch sets it `True` right
+  before forwarding to `item.setCheckState(...)` — which fires
+  `on_tree_item_changed` and schedules the SAME async `_deferred_rebuild`
+  a genuine direct tree click would, so the two cases (a real tree
+  click vs. a table click that happens to delegate through the tree's
+  own item) are otherwise indistinguishable at that point. `_deferred_
+  rebuild` checks the flag: `True` means this particular rebuild
+  originated from the table, so it's skipped (and the flag consumed/
+  reset) rather than swapping the view; `False` (the default — a
+  genuine direct tree click never sets it) means the rebuild proceeds
+  exactly as it always did. `_set_folder_checked_from_table`'s OTHER
+  branch (a folder not yet materialized in the tree — the lazy-
+  expanding fallback, which bypasses `on_tree_item_changed`/
+  `_deferred_rebuild` entirely and mutates state + rebuilds directly)
+  is unambiguously table-sourced by construction, so it was simply
+  changed to never call `_rebuild_file_view_from_checked()` at all,
+  regardless of direction — no flag needed there. `_set_branch_checked`
+  (the right-click "Tick/Untick folder and all descendants" context-
+  menu action) is itself a TREE action, so it needed no flag either —
+  its own pre-existing `QTimer.singleShot(0, self._deferred_rebuild)`
+  call is left to behave exactly like an ordinary tree click, correctly
+  always allowed to update the view now that the gating is surface-
+  based rather than direction-based. The now-meaningless direction
+  flag (`_last_tick_was_removal`) was removed outright, not left
+  dormant alongside the new one.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process through all four real
+  combinations (tree tick, tree untick, table tick, table untick), each
+  checked against a SECOND, non-nested folder kept checked throughout
+  so the aggregate view genuinely has real content to switch to or
+  wrongly stay on — not a coincidental "nothing selected, so nothing to
+  show either way" case: a tree tick on one folder correctly switches
+  the File Browser to the aggregate view; a tree untick (on a folder
+  demoted out of an otherwise-still-non-empty selection) correctly ALSO
+  switches to the aggregate view, now correctly reflecting the
+  remaining selection; a table tick on a folder (while a different,
+  unrelated folder is the one actually shown) correctly leaves the
+  displayed view completely unchanged through both the half and the
+  full promotion click; and a table untick (with real content still
+  selected elsewhere) correctly leaves the view unchanged too. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
+- **Re-ticking an excluded child now correctly collapses its ancestors
+  back to 'full' — 2026-10-02, direct bug report.** "there is an issue
+  that when a sub tick is removed the parent will behave correctly and
+  become half ticked[,] but if it is then ticked again the parent does
+  not become ticked. it does work if all the children are unticked
+  then nothing is ticked." Confirmed as a real, one-directional gap in
+  `_exclude_from_full_ancestor` (the entry above): excluding one child
+  of a fully-checked folder correctly "explodes" it into individually-
+  checked siblings plus a demoted half state, but nothing ever
+  reversed that explosion — re-adding the one missing child back left
+  every sibling still individually checked, with no code path that
+  noticed they once again added up to "the whole folder" and should
+  collapse back into one compact `_checked_folders` entry. The "untick
+  ALL children" case the report describes as already working is
+  unrelated to this gap — that's just the natural emptiness of
+  `_checked_folders`/`_checked_files` for that branch once nothing
+  touches it, not something this collapse logic is involved in either
+  way.
+
+  New `_try_collapse_full_ancestors(path)` — the reverse of
+  `_exclude_from_full_ancestor`'s own explode: starting at *path*'s
+  parent, checks whether EVERY direct child of that folder is now
+  fully selected (a subfolder in `_checked_folders`, or a file in
+  `_checked_files`); if so, discards the direct file children
+  (redundant the instant the folder itself becomes the compact "full"
+  record — same convention `_tick_folder_full` already follows) and
+  adds the folder itself into `_checked_folders`, then keeps bubbling
+  to the NEXT ancestor up, since completing one level can in turn
+  complete its own parent. A subfolder child is left exactly as-is in
+  `_checked_folders` — every descendant folder of a full folder is
+  always separately present there too, by this project's own standing
+  convention, so there's nothing to remove for it. A no-op whenever
+  some sibling is still missing, which is the ordinary case for every
+  real call site.
+
+  Wired into every place something becomes fully re-included: `_tick_
+  folder_full` (covers both the tree/table-shared 'half'->'full' cycle
+  step and the leaf-folder 'none'->'full' direct jump, and therefore
+  every surface — tree checkbox, File Browser table checkbox — that
+  reaches it), the file-row re-tick branch of `_on_file_row_check_
+  toggled`, and the right-click "Tick folder and all descendants"
+  action (`_set_branch_checked`'s own `checked=True` branch) for the
+  same consistency reason every other tick-cycle fix in this session
+  has applied to that action too.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process through both real shapes the
+  report could mean: (1) excluding one FILE from a fully-checked
+  subfolder (demoting it, and its own parent, to half — confirmed
+  every OTHER sibling file stayed individually checked throughout),
+  then re-ticking that SAME file via the real `_on_file_row_check_
+  toggled` slot — confirmed the subfolder AND its parent both correctly
+  collapsed back to `_checked_folders` membership, with the individual
+  per-file entries gone (collapsed, not merely redundant) and neither
+  folder left in `_partial_folders`; (2) excluding a whole SUBFOLDER
+  entirely (via the real `_set_folder_checked_from_table` code path),
+  demoting its parent to half, then re-ticking that same subfolder back
+  to full via its own real tick cycle — confirmed the parent correctly
+  collapsed back to full too. A third check confirmed the pre-existing,
+  already-working "untick every child" case is still clean after this
+  change (no false half/full state left behind). Full pytest suite
+  (18/18) and `scripts/check_claude_md.py` clean throughout.
+
+- **"User Media" moved from a Media Browser status-row button to a
+  live, synthetic bookmark-panel entry, 2026-10-03.** Direct request:
+  "can we take the user media button away from the media br[o]wser and
+  have it as a bookmark[,] have it above evidence like selected
+  files." New `_USER_MEDIA_SENTINEL` (`ffs-explorer.py`, alongside the
+  pre-existing `_SELECTED_FILES_SENTINEL`) — `_apply_bookmark_groups`
+  now inserts a second always-present synthetic row, "User Media (N)",
+  directly below "Selected Files" and above every real saved group
+  (including the two default "Evidence"/"Interesting" groups this
+  project auto-creates for a new case) — the exact ordering requested.
+  Its own "(N)" count is real, computed via a new
+  `MediaViewerMixin._user_media_paths()` (factored out of
+  `_show_user_created_media`, which now just calls it) — the SAME
+  matching logic the real click action uses, never a second,
+  possibly-drifting copy; cheap enough to re-run on every panel
+  refresh (bookmark add/delete/color-change, case load — never on
+  every tick, the same cost boundary "Selected Files" own count
+  already respects). `_on_bookmark_item_clicked` routes the new
+  sentinel to `self.center_tabs.setCurrentIndex(1)` (switch to Media
+  Browser — this entry is now reachable from ANY tab, unlike the old
+  button which only ever existed while already on that tab) followed
+  by the existing `_show_user_created_media()`. `_show_bookmark_panel_menu`'s
+  "no Change Color/Delete for a synthetic row" check was generalized
+  from a single sentinel comparison to a tuple membership test covering
+  both. `app/media_viewer.py`'s own `_user_media_btn`/its status-row
+  slot were removed outright, not left dormant — `_media_showing_user_only`
+  and every other piece of the underlying filter/ticking logic is
+  completely unmoved, only the UI entry point relocated.
+
+  **A real, pre-existing race was found and fixed along the way, not
+  caused by the move itself but newly, reliably exposed by it**: the
+  bookmark-click handler calls `setCurrentIndex(1)` BEFORE
+  `_show_user_created_media()` runs, so `_on_center_tab_changed`'s own
+  tab-switch handling fires first, while `_media_showing_user_only` is
+  still `False` — falling through to its ordinary "load whatever
+  folder was last selected" path (`_load_media_from_file_model()`,
+  which unconditionally resets both alternate-view flags) before
+  `_show_user_created_media()` gets to set the flag back to `True` and
+  populate the real filtered grid. That part alone was harmless (my
+  code's own flag-set runs after and wins) — the REAL bug was
+  downstream: `_select_user_media_files_and_folders` (called at the end
+  of `_show_user_created_media`) ticks each matched folder via
+  `item.setCheckState(Checked)` on whatever's already materialized in
+  the tree, which fires `on_tree_item_changed` and schedules an ASYNC
+  `QTimer.singleShot(0, self._deferred_rebuild)` exactly as a genuine
+  interactive click would — and `_rebuild_file_view_from_checked()`
+  (called both by that deferred rebuild AND, redundantly, directly by
+  `_select_user_media_files_and_folders` itself right after the tick
+  loop) has its own frame-batched completion branch,
+  `if self.center_tabs.currentIndex() == 1: self._load_media_from_file_model()`
+  — which, once its own async batching finishes a moment later, fires
+  all over again and silently reverts the just-shown "User Media" grid
+  back to the plain current-folder one, resetting the flag right back
+  to `False`. Confirmed directly, not assumed: a real headless test
+  showed the flag reading `True` immediately after the click handler
+  returns, then `False` again moments later during an event-loop drain
+  — proving the stomp was genuinely asynchronous, not a simple
+  ordering mistake in the click handler itself. This bug was not
+  actually new — the identical tick-triggered deferred-rebuild
+  mechanism already existed before this move (clicking the old button,
+  always already on the Media Browser tab, would have raced against
+  its own tick-triggered rebuild the same way) — it just took this
+  move's own explicit tab-switch, and a real end-to-end async-drain
+  test, to surface it clearly.
+
+  Fixed two ways together: (1) `_select_user_media_files_and_folders`'s
+  own per-folder tick loop is now wrapped in
+  `self.tree_model.blockSignals(True)`/`blockSignals(False)` — the
+  SAME established fix `_replace_selection_from_bookmark_entries`
+  already uses for the identical class of problem (see that method's
+  own docstring) — suppressing the redundant tick-triggered deferred
+  rebuild entirely (the underlying `_checked_folders`/`_checked_files`
+  state is already updated directly beforehand, unaffected by
+  blockSignals). (2) The ROOT cause, covering this method's own
+  INTENTIONAL, explicit `_rebuild_file_view_from_checked()` call too
+  (fix 1 alone doesn't touch that one): the completion branch's own
+  guard now also checks `not (self._media_showing_embedded or
+  self._media_showing_user_only)` before calling
+  `_load_media_from_file_model()` — since that function's own job is
+  precisely to EXIT either alternate view (per its own docstring), it
+  should never fire as a silent side effect of an aggregate-view
+  rebuild finishing while one is deliberately showing; genuinely
+  picking an ordinary folder (`on_folder_selected`'s own direct call)
+  is unaffected and still exits either view exactly as before.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process: the old button attribute is
+  confirmed gone entirely; the bookmark panel's row 0/row 1 are
+  confirmed to be the Selected-Files/User-Media sentinels respectively,
+  with a real saved "Evidence" group confirmed further down the list;
+  the row's own displayed count (8,610 on this archive) matches
+  `_user_media_paths()` exactly; clicking the row correctly switches to
+  the Media Browser tab and populates `_media_context` with exactly
+  that real filtered set; and — the specific race — `_media_showing_user_only`
+  now reads `True` both immediately after the click AND after a full
+  event-loop drain, never silently flipping back. A separate regression
+  check confirmed the guard didn't break the pre-existing, WANTED
+  behavior: ticking a folder ordinarily (no alternate view active)
+  while already on the Media Browser tab still correctly updates the
+  gallery to the aggregate selection's own real media content. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
+- **"User Media" redefined as "not yet viewed"; "Not Relevant" now also
+  deselects; a new "Reset" button fully reverses every "Not Relevant"
+  mark on the case — 2026-10-03.** Direct request/clarification: "this
+  button is me[a]nt to show all the files that are in the locations
+  that are designated as user media that the user has not yet
+  viewed." `MediaViewerMixin._user_media_paths()` now ALSO excludes
+  anything in `db_utils.load_seen_media_paths()` (read fresh from
+  `caseresults.db` on every call, never the in-memory
+  `self._media_seen_paths` cache — that attribute is only populated
+  once some folder has actually been loaded in the Media Browser this
+  session, so it can be stale/empty when this is called from the
+  bookmark panel before the examiner has ever visited that tab, or
+  right after reopening a case with files already marked seen from an
+  earlier session). Deliberately UNCONDITIONAL — never gated by the
+  separate "hide seen files" Media Browser preference the way an
+  ordinary folder's own grid is: this entry's whole purpose is "what's
+  left to review," so it always excludes seen content regardless of
+  that general display toggle.
+
+  **"Not Relevant" now also deselects — direct follow-up: "can you
+  also make it that they become not selected so in [e]ffect the
+  selected files number decreases."** New `FastZipBrowser._deselect_path
+  (path)` — handles a file currently selected EITHER way (a direct
+  `_checked_files` entry, as "User Media"'s own `_select_user_media_
+  files_and_folders` adds, or implicitly via a fully-checked ANCESTOR
+  folder, as that same method ALSO adds) by discarding the direct
+  entry and unconditionally calling the pre-existing
+  `_exclude_from_full_ancestor` (a safe no-op when neither applies),
+  returning whether the path was genuinely selected beforehand.
+  `_on_media_not_relevant` calls this for every file in the batch
+  (skipping bookmarked ones, same as the seen-marking itself already
+  does) and records which ones were ACTUALLY deselected
+  (`_media_last_seen_batch_deselected`) so `_on_media_undo_seen` can
+  restore exactly that subset — most of a batch was often never
+  selected at all (e.g. browsing an ordinary folder with nothing
+  ticked), and re-adding those too would be a real, if harmless,
+  overreach.
+
+  **A real, surprising consequence of the pre-existing "Selected
+  Files" counting convention was found and fixed the same day, by
+  direct testing against the real archive, not assumed correct.**
+  `_current_selection_item_count()` used to mirror
+  `_rebuild_file_view_from_checked`'s own SHALLOW, direct-children-only
+  aggregation (a folder counts as however many direct children it has,
+  a subfolder counted as a single item). `_exclude_from_full_ancestor`
+  demotes a fully-checked folder by "exploding" it into one individual
+  entry per OTHER sibling — and a sibling that's itself a SUBFOLDER,
+  once re-expanded into its own `_checked_folders` entry, then
+  contributes ITS OWN full direct-children count to the grand total
+  instead of counting as a single item the way it did as part of the
+  parent's one compact entry. Confirmed directly: deselecting a real
+  500-file "Not Relevant" batch left this count net **+77** instead of
+  decreasing, purely from that re-expansion, even though every one of
+  the 500 files individually, correctly, stopped reading as selected.
+  Flagged to the user directly rather than silently patched, since
+  fixing it meant choosing between two real designs (switch to a deep
+  recursive file count vs. accept the existing shallow quirk) —
+  confirmed: switch to deep. `_current_selection_item_count()` now
+  counts every real FILE at any depth under each checked folder
+  (`_collect_files_recursive`, which already excludes folders from its
+  own output) rather than direct children — a file is the atomic unit
+  this number is named for, so excluding one now always reduces it by
+  exactly one regardless of subfolder structure. Deliberately scoped
+  to just this one counting function — `_rebuild_file_view_from_checked`'s
+  own VIEW (which still lists a subfolder as a single row, matching
+  ordinary folder browsing) is unchanged; only the number needed
+  fixing, not the listing it sits beside.
+
+  **New "Reset" button, direct follow-up**: "i would also like a
+  button[,] like deselect for selected files[,] call[ed] reset[,] so
+  that the file[s] that have been marked as not relevant are
+  [re-]added to the [Selected Files] group." Added right next to the
+  existing "Deselect" button in the "Selected Files" bookmark-panel
+  row. `FastZipBrowser._reset_not_relevant_marks()` is a full, CASE-WIDE
+  reversal — not scoped to just the last batch, which is "Undo"'s own
+  narrower job: reads every path in `load_seen_media_paths()` (the
+  entire persisted seen-set for this case — "Not Relevant" is the ONLY
+  way a file ever gets marked seen at all, confirmed by checking every
+  caller of `mark_media_seen`, so this set IS, exactly, "every file
+  ever marked Not Relevant"), un-marks all of them as seen via
+  `unmark_media_seen`, and re-adds them all to the tick-based
+  selection — reversing BOTH halves of what "Not Relevant" did, not
+  just the selection half, since a partial reset (re-selected but
+  still excluded from "User Media"'s own not-yet-viewed count) would
+  have been a confusing in-between state. Also clears
+  `_media_last_seen_batch`/`_media_last_seen_batch_deselected` and
+  disables "Undo" — nothing scoped survives a full reset for it to
+  partially re-apply afterward. A no-op (status-bar message, no DB
+  write) when nothing is currently marked seen at all.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process: a real file's seen-status
+  round-tripped correctly through `_user_media_paths()` (marking it
+  removed it from the count, unmarking restored it); the full "User
+  Media" → "Not Relevant" flow correctly deselected a real sample page
+  item (confirmed absent from both direct `_checked_files` AND ancestor
+  coverage) and the Selected Files count correctly DECREASED by
+  exactly 500 (18,414 → 17,914, after the counting fix — previously
+  net +77 with the shallow count); Undo correctly restored both the
+  selection and the count exactly. For "Reset" specifically: marked
+  TWO separate 500-file batches (so Undo's own "last batch" scope
+  would have only covered the second), confirmed both were genuinely
+  absent from the real persisted seen-set check beforehand, then
+  confirmed Reset correctly emptied the real seen-set to zero, restored
+  samples from BOTH batches to the selection, restored the "User
+  Media" label back to its exact original count, and left "Undo"
+  disabled afterward. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.
+
+  **"Reset" moved to the "User Media" row, same day, direct
+  correction**: "the reset button needs to be on the user media row"
+  — it was first built next to "Deselect" on the "Selected Files" row
+  above, the wrong conceptual home: "Reset" is specifically about
+  reversing "Not Relevant" marks, the mechanism behind the "User
+  Media" row's OWN "not yet viewed" count, not about the tick-based
+  selection in general (Deselect's own job). The "User Media" row
+  changed from a plain `QListWidgetItem` with bare text to the SAME
+  two-button inline-widget shape "Selected Files" already uses —
+  `_user_media_row_btn` ("User Media (N)", flat, left-aligned,
+  clicking it switches to the Media Browser tab and runs the filter)
+  plus `_reset_not_relevant_btn` moved here unchanged. New
+  `FastZipBrowser._show_user_media_row()` factors out the tab-switch-
+  then-filter action so BOTH real click paths — the list item itself
+  via `_on_bookmark_item_clicked` (reachable from a stray margin pixel
+  the inline widget doesn't cover, same fallback role "Selected
+  Files"' own sentinel branch already plays) and the row's own inline
+  button — call the exact same code, never two copies that could
+  drift. `_reset_not_relevant_marks()` itself is completely unchanged;
+  only its own button's parent row moved.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive:
+  confirmed the Reset button's own parent widget is now the SAME as
+  the User Media row button's (and different from Deselect's own
+  parent, ruling out a stale reference); confirmed clicking the User
+  Media row's own inline button still switches tabs and sets
+  `_media_showing_user_only`; and confirmed clicking Reset from its
+  new home still correctly clears a real seen-mark from
+  `caseresults.db` and re-selects the file. Full pytest suite (18/18)
+  and `scripts/check_claude_md.py` clean throughout.
+
+- **A real, confirmed bug: a bookmarked file appeared TWICE in its own
+  bookmark group's table when the group also bookmarked its containing
+  folder — fixed 2026-10-03.** Direct report: "when you select the
+  bookmark[,] the folder[,] when the bookmark item[s] are also
+  bookmarked[,] and the bookmarked item appears twice."
+
+  Root cause, confirmed by direct tracing before writing a fix, not
+  assumed: `_show_bookmark_group` calls
+  `_replace_selection_from_bookmark_entries(entries)` — which adopts
+  the group's entries as the live tick-based selection via
+  `_tick_items_by_path` — BEFORE building its own per-entry File
+  Browser table. `_tick_items_by_path` calls
+  `_rebuild_file_view_from_checked()` as a side effect of ticking a
+  folder — that method swaps in an EMPTY model immediately (synchronous)
+  but populates it via `QTimer.singleShot(0, ...)` frame-budgeted
+  batches (asynchronous), guarded only against being superseded by
+  ANOTHER call to itself (`_load_gen`, bumped and captured only inside
+  that same method). `_set_file_model` — the chokepoint EVERY model
+  swap goes through, including `_show_bookmark_group`'s own later,
+  different per-entry table — never bumped that guard at all. So when
+  `_show_bookmark_group` swapped in its own correct table moments
+  later (still within the same synchronous call, well before the
+  queued timer could fire), the EARLIER, now-stale aggregate rebuild's
+  batch had no way to know it had been superseded — it fired on the
+  next event-loop tick and unconditionally read `self.file_model`
+  FRESH (not a captured alias), appending the checked folder's own
+  direct children — including the very file just bookmarked — straight
+  onto the bookmark group's already-correct, already-displayed table.
+
+  Fixed at the root, not with a narrow bookmark-specific patch:
+  `_set_file_model` now bumps `_load_gen` unconditionally on every
+  call — the one chokepoint every model swap already goes through, so
+  ANY newer swap (regardless of which code path caused it) correctly
+  invalidates any still-pending batch from an earlier
+  `_rebuild_file_view_from_checked` call. `_rebuild_file_view_from_checked`
+  itself had its own `my_gen = self._load_gen` capture moved to right
+  AFTER its own call to `_set_file_model` (previously captured before)
+  — capturing it there means this rebuild's own in-flight batches
+  correctly survive the bump caused by its OWN model swap, while a
+  genuinely LATER swap from anywhere else (the bookmark case, but also
+  ordinary folder navigation interrupting an in-flight aggregate
+  rebuild, which had the identical latent risk) still correctly
+  invalidates them.
+
+  Verified both ways against the real Android 14 JoshHickman archive,
+  driving the real running app in-process, not simulated: (1) with the
+  fix TEMPORARILY monkeypatched back out (restoring `_set_file_model`'s
+  pre-fix body, with no `_load_gen` bump) — a real bookmark group
+  containing both a real folder and one of its own direct files
+  reproduced the EXACT reported symptom: the bookmarked file appeared
+  TWICE in the resulting table, which ballooned from the correct 2 rows
+  to 10 (the stale rebuild's own appended direct-children batch); (2)
+  with the real, shipped fix in place, the identical real group/file
+  pair produced exactly 2 rows with the bookmarked file appearing
+  exactly once. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.
+
+- **"You cannot bookmark a folder per se — it bookmarks its content" —
+  a real choice offered when that content is ambiguous, 2026-10-03.**
+  Direct request: "if you bookmark a folder you are in fact
+  bookmarking its content[;] so if the folder has sub-folder[s] a
+  dialog should appear ask[ing] the user do they want to only
+  bookmark the files in the current folder or do they want to
+  bookmark [files] in sub folders."
+
+  Investigated the existing code before building anything: EVERY real
+  GUI pathway that bookmarks a folder (`show_tree_context_menu`'s own
+  right-click "Bookmarks" submenu via `_collect_bookmark_paths`, the
+  File Browser table's own multi-row selection via
+  `_get_paths_for_bookmark`) already expanded a folder row into its
+  own FILES before saving — `bookmark_entries` never stored a literal
+  folder `ui_path` through any real path, confirmed by reading all
+  three `save_bookmark_entries` call sites. What was missing wasn't
+  "never bookmark the folder itself" (already true) — it was that the
+  expansion was SILENTLY, UNCONDITIONALLY recursive, with no choice
+  ever offered between "just this folder's own files" and "include
+  every subfolder too."
+
+  New `FastZipBrowser._resolve_bookmark_file_paths(folder_paths: set)`
+  is the one place this choice now lives — real only when at least one
+  folder in the batch has a subfolder of its own
+  (`_folder_has_subfolders`): a LEAF folder has nothing genuinely
+  ambiguous to ask about ("just this folder" and "include subfolders"
+  resolve to the identical real file set), so no dialog fires for a
+  batch where every folder is a leaf, matching this feature's own
+  pre-existing always-recursive behavior for that case exactly — no
+  regression for the common case. When shown, the `QMessageBox` asks
+  ONCE for the WHOLE batch (three buttons: "Include Subfolders" /
+  "Just This Folder" / Cancel) and applies that single answer
+  uniformly to every folder in it — picking "Bookmarks" on a multi-row
+  selection containing several folders at once is one real action, not
+  several independent ones that should each interrupt the examiner
+  separately. Cancel returns `None`, which both callers
+  (`_collect_bookmark_paths`, `_get_paths_for_bookmark`) treat as
+  "abort the WHOLE bookmark action" — never "bookmark zero files" or,
+  worse, silently bookmark only the non-folder rows from a mixed
+  selection while quietly dropping what the folder(s) would have
+  contributed with no confirmation that was acceptable.
+
+  New `_collect_direct_files(folder_path)` (direct FILE children only,
+  no subfolder descent) is the "Just This Folder" half;
+  `_collect_files_recursive` (pre-existing) is the "Include Subfolders"
+  half. `_collect_bookmark_paths` (the tree's own single-folder case)
+  and `_get_paths_for_bookmark` (the File Browser table's own
+  multi-row case — separates plain file rows from folder rows first,
+  then resolves every selected folder's content through ONE shared
+  call) both route through the new resolver; `_get_media_paths_for_
+  bookmark` (Media Browser) needed no change at all — that grid only
+  ever lists real media files, never folder rows, confirmed directly
+  before concluding it was out of scope. `_get_paths_for_current_
+  selection` (the "Save as New Group…" flattening of the LIVE
+  tick-based selection) was deliberately left untouched — a folder
+  already in `_checked_folders` got there via the tick-cycle's own
+  already-explicit two-click recursive-select action (established
+  earlier this session), so asking the SAME question again at save
+  time would just re-litigate a decision already made through that UI.
+
+  `_add_to_bookmark_group`/`_new_bookmark_group_dialog` (both resolve
+  a lazy callable at the point an action is actually clicked, per this
+  project's own existing "defer the expensive walk until needed"
+  convention) both gained a plain cancellation check — a callable
+  resolving to `[]` now shows "Bookmarking cancelled." and returns,
+  rather than falling through to a confusing "Added 0 files to 'X'"
+  status message or a "Creating bookmark group for 0 files" naming
+  dialog.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process, `QMessageBox.exec`
+  monkeypatched to auto-click a chosen button by text (this project's
+  own established methodology for every real modal under the
+  offscreen platform): a real LEAF folder correctly skipped the dialog
+  entirely and returned exactly its direct files; a real folder with a
+  real subfolder correctly showed the dialog exactly once, with
+  "Include Subfolders" producing the full recursive set and "Just This
+  Folder" producing only its own direct files (confirmed strictly
+  smaller); Cancel correctly returned an empty result. A real MIXED
+  selection (one plain file + one branching folder, selected together
+  in the File Browser table) correctly triggered exactly ONE dialog
+  for the whole batch (not one per folder), correctly included both
+  the plain file and the folder's full recursive content when
+  confirmed, and Cancel correctly discarded the ENTIRE batch — not
+  just the folder's own contribution. Finally, the complete real save
+  path (`_add_to_bookmark_group` with a lazy callable, exactly what
+  the tree's own right-click wires up) confirmed against a real,
+  freshly-created bookmark group: a cancelled add wrote NOTHING to
+  `caseresults.db` and showed the plain cancellation message; a
+  confirmed add wrote exactly the recursive file set, with the
+  folder's OWN `ui_path` confirmed absent from the saved rows. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
+- **A real, confirmed bug: clicking "User Media" or a real bookmark
+  group inflated "Selected Files (N)" with every OTHER file sharing a
+  folder with a matched/bookmarked one — fixed 2026-10-03.** Direct
+  report, after testing the bookmark-folder-dialog fix above: "I want
+  the user media group to behave like other bookmark group[,] that it
+  is the files that are recorded in the group[,] and it should
+  behave the same way when click[ed] in regard [to] the selected
+  files group. my expectation is that they will be the same value."
+
+  Root cause, confirmed by direct tracing, the SAME shape as the
+  duplicate-row bug fixed earlier the same day, just in a different
+  function: `_replace_selection_from_bookmark_entries` (every real
+  bookmark-group click) computed `scope = self._bookmark_scope_folders
+  (entries)` — every entry's own CONTAINING folder — then called
+  `_tick_items_by_path(scope)`, whose FIRST line is
+  `self._checked_folders.update(p for p in path_set if p in self.
+  folder_map)`. `_bookmark_scope_folders`'s own docstring already
+  states its real purpose plainly: "switch 'Selected only' mode to
+  show exactly where those files are" — pure TREE-NAVIGATION scope,
+  never meant as "these folders are part of the selection." But
+  `_tick_items_by_path` is a dual-purpose function (tree-sync AND
+  selection-membership at once, correctly so for its OTHER caller,
+  `_warn_and_select_missing`, which genuinely does mean "mark these
+  FOLDERS as selected"), and this caller fed it the wrong kind of set.
+  Concretely: bookmarking 2 of a folder's 7 real files marked that
+  WHOLE folder fully checked, so "Selected Files" — especially after
+  the 2026-10-02 fix making that count a deep recursive FILE count —
+  silently counted all 7, not just the 2 actually bookmarked.
+  `_select_user_media_files_and_folders` ("User Media"'s own
+  selection-adoption) had the IDENTICAL bug, just via its own
+  `folders` parameter (every matched media file's own containing
+  folder) instead of `_bookmark_scope_folders` — same root cause,
+  different call site, confirmed by reading both functions side by
+  side rather than assumed to be unrelated just because the user
+  reported them as two separate symptoms.
+
+  Fixed at the root in both places, not independently patched: (1)
+  `_replace_selection_from_bookmark_entries` now marks `_checked_
+  folders` ONLY from LITERAL folder entries (a real, if now rare,
+  case — a bookmark group saved before "you cannot bookmark a folder
+  per se" shipped earlier the same day can still have one) —
+  `_tick_single_path` is called only for those, never for a plain
+  file entry (which has no tree node to sync in the first place, so
+  the walk would be pure waste); `_bookmark_scope_folders` itself is
+  deleted outright, not left dormant, once its own one real caller no
+  longer needed it. (2) `_select_user_media_files_and_folders` was
+  reduced to a single-parameter function (`files` only, the `folders`
+  parameter removed from both it and its one caller) that ticks ONLY
+  the literal matched files — no folder is ever marked fully checked
+  there either, and the whole per-folder tree-walk loop (previously
+  needed only to sync up the now-removed folder-ticking) is gone
+  entirely, making this version both correct AND cheaper than before
+  (zero tree-walk cost, down from one opportunistic `_find_tree_item`
+  pass per matched folder). Both fixes lean on the SAME already-
+  correct machinery to still show the right thing: `_compute_selected_
+  only_scope()` already derives the "Selected Only" tree's own branch
+  structure straight from `_checked_files` (a file's own containing
+  folder, computed fresh, same as `_bookmark_scope_folders` used to
+  compute it — just never fed into `_checked_folders` as if it were
+  selection membership), and `_refresh_file_checked_paths`'s own
+  `_recompute_partial_folders`/`_refresh_tree_check_states` already
+  correctly half-tick whichever ancestor folders happen to be
+  materialized in the tree, with no explicit per-path walk needed to
+  make that work for a plain file.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process: clicking "User Media"
+  (8,610 real matched files on this archive) now leaves
+  `_current_selection_item_count()` reading EXACTLY 8,610 — matching
+  "User Media"'s own displayed count precisely — with `_checked_
+  folders` confirmed completely EMPTY afterward (no folder-level
+  over-selection at all) and `_checked_files` confirmed to be exactly
+  the matched set, no more, no less. A real bookmark group created
+  with only 2 of a real folder's 7 real direct files (simulating a
+  genuine partial multi-row "Bookmarks" selection) correctly left
+  `_current_selection_item_count()` reading exactly 2 — not 7 — with
+  `_checked_folders` again confirmed empty and the File Browser table
+  itself still showing exactly the group's own 2 entries (confirming
+  the earlier duplicate-row fix and this one coexist correctly). Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout.
+
+- **Two new "User Media" right-click review actions — "Show Media
+  Marked 'Not Relevant'" and "Show Media Excluded by Ignore List" —
+  added 2026-10-03.** Direct request: "add right[-]click option[s] to
+  user [media] files[.] first[,] show hidden media files... select
+  all the media files that were classed as user media files but the
+  user has indicated are [ir]relevant. an[other] option... show...
+  all the media files that are in the location[s] tracked as user
+  folder[s] but have been removed via the exclu[de] option[,] either
+  because they are in[cluded in] the file[s] to ignore or in a folder
+  that was deemed to not be relevant. this will give the user the
+  option to both ch[e]ck the file[s] they have ignored and check that
+  the location that [they] decided will never have user data is in
+  fact correct."
+
+  `MediaViewerMixin._user_media_candidate_paths()` — the raw
+  location+type match (every real media file under
+  `FastZipBrowser._user_media_include_prefixes()`'s own locations),
+  BEFORE either exclusion is applied — was factored out of
+  `_user_media_paths` (which now just filters it down by ignore-list
+  and seen-status) so all three real file-set definitions share
+  exactly one notion of "a User Media location candidate," never
+  three copies that could quietly drift apart on what that means. Two
+  new sibling functions read the SAME candidate set from the opposite
+  direction: `_user_media_seen_paths()` (candidates currently marked
+  seen — "Not Relevant") and `_user_media_ignored_paths()` (candidates
+  excluded by `user_media_ignore_list.is_ignored`, which already
+  covers both real exclusion shapes — a direct file entry or a
+  folder-level entry covering it — with no extra logic needed here).
+  `_load_seen_media_paths_fresh()` is a small shared helper (the exact
+  "read `caseresults.db`'s own current seen-set directly, never the
+  possibly-stale `self._media_seen_paths`" logic `_user_media_paths`
+  already needed) promoted out once `_user_media_seen_paths` became a
+  second real caller.
+
+  `_show_user_media_seen_files()`/`_show_user_media_ignored_files()`
+  load each set into the Media Browser grid via the same
+  `_start_thumbnail_load` pipeline every other media view uses, but
+  deliberately **never tick or select anything** — unlike "User
+  Media" itself, these are pure review actions: looking at content
+  already dismissed (seen) or excluded (ignored) shouldn't build a
+  selection out of it. Reachable via two new right-click actions on
+  the "User Media" bookmark-panel row specifically
+  (`_show_bookmark_panel_menu`'s existing `elif group_id ==
+  _USER_MEDIA_SENTINEL:` branch, parallel to the real-group-only
+  "Change Color…"/"Delete" branch right above it) — each via a thin
+  `_show_user_media_seen_row`/`_show_user_media_ignored_row` wrapper
+  that switches to the Media Browser tab first, the same
+  tab-switch-then-action shape `_show_user_media_row` (the row's own
+  left-click action) already established.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive
+  (the real global `config/user_media_ignore_list.json` redirected to
+  a scratch path for the duration of the test, per this project's own
+  standing rule, and confirmed untouched via `git status` afterward):
+  the three-way partition (`active` / `seen` / `ignored`, derived from
+  one shared 8,610-file candidate set) held exactly before and after
+  marking 3 real files "Not Relevant" (confirmed to leave `active` and
+  land in the real seen-review set, shrinking `active` by exactly 3)
+  and adding 1 real file to the ignore list (confirmed to leave
+  `active` and land in the real ignored-review set) — `active | seen |
+  ignored` covered every real candidate throughout, with `active`
+  confirmed disjoint from both. The real right-click dispatch was
+  verified too, not just the underlying methods called directly:
+  `bl.itemAt()` on the User Media row's own real visual center
+  correctly resolves back to that row (confirming the menu is
+  genuinely reachable via a real right-click, even though the row has
+  an inline button widget, not plain text), and invoking each wrapper
+  correctly switched tabs, populated the grid with exactly the right
+  real file set, and left `_checked_files`/`_checked_folders`
+  completely unchanged — confirming neither review action has any
+  selection side effect. Full pytest suite (18/18) and
+  `scripts/check_claude_md.py` clean throughout.
+
+- **"User Media" now shares the SAME at-risk selection-replacement
+  dialog every real bookmark group already uses, instead of its own
+  narrower "Replace Selected Folders?" check — 2026-10-03.** Direct
+  request: "since the 'User Media' is the same as the other bookmark
+  groups[,] i.e. when selected it overwrites the selected files with
+  the selected files[,] the same dialog should be used[,] ask[ing]
+  the user if they want to save the current selected files if
+  they['re] not s[ou]rced from the other bookmark groups which are
+  saved. when you switch to another bookmark group from user media[,]
+  remember there is no need for a dialog unless a user has
+  [made a] change from what is described by user media."
+
+  `_show_user_created_media` now routes through
+  `_selection_at_risk()`/`_warn_before_losing_selection()` — the exact
+  Cancel / Save as New Group… / Continue Without Saving mechanism
+  every real bookmark-group click already used — in place of the old
+  bespoke `QMessageBox.question` "Replace Selected Folders?" Yes/No
+  check, which only ever compared against pre-existing FOLDER-level
+  ticks and never offered to save anything. An empty
+  `_user_media_paths()` result is a complete no-op (status-bar
+  message only, no dialog, no tab switch, selection left untouched),
+  checked BEFORE the at-risk warning — mirroring
+  `_show_bookmark_group`'s own identical empty-group guard exactly.
+  Once adopted, the method explicitly sets `_selection_dirty = False`
+  — the SAME convention `_replace_selection_from_bookmark_entries`
+  already uses for a real group — which is what makes the SECOND half
+  of the request fall out for free: `_show_bookmark_group`'s own
+  pre-existing `_selection_at_risk()` check (`_selection_dirty and
+  bool(_checked_folders or _checked_files)`) already skips the
+  warning whenever dirty is `False`, so switching FROM a just-loaded,
+  unchanged "User Media" selection to a different real bookmark group
+  correctly shows no dialog, while switching after the examiner has
+  manually ticked/unticked anything since (genuinely dirty again)
+  correctly still warns — no separate code needed for that direction
+  at all, it was already there once "User Media" started playing by
+  the same dirty-tracking rule everything else does.
+
+  The method now also owns its own Media Browser tab-switch
+  (previously done eagerly by a separate `_show_user_media_row`
+  wrapper BEFORE this ran) so a genuine Cancel does nothing at all —
+  not even a tab change. That wrapper was removed outright, not left
+  dormant: both real click paths (the bookmark-panel list item itself,
+  via `_on_bookmark_item_clicked`, and the row's own inline "User
+  Media (N)" button) now call `_show_user_created_media` directly.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  driving the real running app in-process, `QMessageBox.exec`/
+  `clickedButton` monkeypatched per this project's own established
+  methodology: ticking a real, unrelated folder (dirty) then clicking
+  "User Media" and choosing **Cancel** left the tab, the selection,
+  and the User-Media-view flag completely untouched; choosing
+  **Continue Without Saving** correctly cleared the unrelated folder,
+  adopted the real 8,610-file User Media selection, switched tabs, and
+  left `_selection_dirty` `False`; re-clicking "User Media" again
+  immediately afterward (still clean) correctly showed **zero**
+  dialogs; switching to a real, freshly-created bookmark group right
+  after that same clean User Media adoption also correctly showed
+  **zero** dialogs; manually re-ticking the same unrelated folder
+  (making the selection dirty again) and THEN switching to that same
+  real group correctly DID show the warning exactly once; and marking
+  every real User Media candidate on the archive as seen (so the
+  active result becomes genuinely empty) confirmed clicking "User
+  Media" then correctly produced no dialog, no tab switch, and left a
+  separately-ticked real selection completely untouched. Full pytest
+  suite (18/18) and `scripts/check_claude_md.py` clean throughout.
+
+- **A real, confirmed bug: both new "User Media" review actions
+  (added just above) showed a completely EMPTY gallery — fixed
+  2026-10-03.** Direct report: "when i [click the] not relevant
+  option[,] noting was displayed in the media gall[e]ry[,] and the
+  same for the ignore list." Investigated directly rather than
+  assumed working from the earlier verification pass, which (in
+  hindsight) had checked the wrong piece of state.
+
+  Root cause: `_start_thumbnail_load` unconditionally re-reads the
+  "hide seen files" preference (`_media_hide_seen_pref()`, **ON by
+  default**) and `_recompute_media_all_paths()` then filters every
+  path already in `_media_seen_paths` OUT of `_media_all_paths` — the
+  correct, wanted behavior for an ordinary folder, but catastrophic
+  for `_show_user_media_seen_files`'s own review grid, whose ENTIRE
+  result set is, by definition, already-seen files: with the default
+  preference on, every single one got filtered right back out,
+  leaving the real active list genuinely empty — not a cosmetic
+  display bug, the underlying `_media_all_paths` itself was emptied.
+  The earlier verification pass for this feature checked
+  `_media_context` (a raw, unconditional tuple assignment the review
+  methods themselves make, never touched by the hide-seen filter) and
+  never checked `_media_all_paths`/the real model row count — the
+  actual rendered state — so it passed cleanly despite the real
+  gallery being empty. Recorded directly as the lesson it is: checking
+  a value a bug can't actually reach proves nothing about whether the
+  feature works.
+
+  Fixed with a new `force_show_seen: bool = False` parameter on
+  `_start_thumbnail_load`, forcing `_media_hide_seen` to `False` for
+  that call (and therefore that whole view, until the examiner
+  navigates to an ordinary folder, which resets it back to the real
+  preference via `_load_media_from_file_model`'s own unconditional
+  re-read) — so a file's own seen-status is never used to hide it from
+  a view whose entire point is to show files BY seen or ignored
+  status. Both `_show_user_media_seen_files` and
+  `_show_user_media_ignored_files` now pass `force_show_seen=True` —
+  the ignored-files view needed the identical fix even though ignore-
+  status and seen-status are independent concepts, since a file can
+  easily be BOTH ignored AND separately marked seen, and that overlap
+  case would otherwise still vanish from the ignored view too.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive,
+  with a freshly-isolated preference store confirmed to genuinely
+  default "hide seen files" to `True` (the real condition that
+  triggers the bug for essentially every real user) — this time
+  checking `_media_all_paths`/`_media_model.rowCount()` directly, the
+  actual rendered state, not `_media_context`: 5 real files marked
+  seen now all correctly appear in the "Not Relevant" review grid,
+  with `_media_hide_seen` confirmed forced to `False` for that view; 2
+  real files added to the ignore list — one of them ALSO marked seen,
+  specifically exercising the overlap case — both correctly appear in
+  the ignored-files review grid. A regression check confirmed ordinary
+  folder browsing is completely unaffected: switching to an ordinary
+  folder (after first switching to the Media Browser tab, so
+  `on_folder_selected`'s own media-reload branch actually fires rather
+  than being short-circuited by the still-active review view's own
+  "leave the alternate view alone" tab-switch guard — a real, if
+  test-only, ordering trap caught and fixed in the verification script
+  itself before trusting its result) still correctly respects the REAL
+  "hide seen files" preference and correctly hides a real seen file
+  there. Full pytest suite (18/18) and `scripts/check_claude_md.py`
+  clean throughout.
+
+- **"Selected Only" tree gains a "Recursive" checkbox — a folder clicked
+  there now shows every file in it AND its subfolders by default,
+  2026-10-03.** Direct request: "can we make it that for the selected
+  only folder tree that when you select a folder it shows all the files
+  in that folder and its subfolder by default but at the top at the
+  line 'selected folder' tick box show recursive so that the user can
+  uncheck it if they want to see only the files in that folder."
+  Deliberately scoped to the "Selected Only" branch alone — per direct
+  mid-turn clarification ("remember this is selected only not the
+  normal folder tree") — "/ [Full Filesystem]" always shows a plain
+  direct-children listing regardless of the checkbox, exactly as before.
+
+  New `self._selected_only_recursive_chk` (checked by default), placed
+  right next to the existing "Selected" checkbox in the tree panel's own
+  header row. `on_folder_selected` is the one place the decision is
+  made: `_tree_item_root_is_selected_only(item)` (new — walks up to the
+  clicked item's top-level ancestor and compares identity against
+  `self._selected_root_item`, the same technique
+  `_save_tree_selection_for_carryover` already uses for a related
+  purpose) combined with the checkbox's own state decides whether to
+  call the new `_refresh_folder_view_recursive()` or the pre-existing
+  `_refresh_folder_view()`.
+
+  `_refresh_folder_view_recursive` mirrors `_refresh_folder_view`
+  closely but populates the table from `_collect_files_recursive
+  (self._view_path)` (every file depth-first under that folder,
+  excluding folders themselves — already existed, built for the
+  recursive-bookmark-folder-dialog feature) instead of only
+  `folder_map`'s direct children, frame-budgeted the same way
+  `_rebuild_file_view_from_checked` already is (`QTimer.singleShot`
+  batches respecting `FRAME_BUDGET_SECS`, guarded by `_load_gen`) since
+  a single folder's own recursive subtree can in principle be just as
+  large as the whole checked-folders aggregate — confirmed a real
+  concern, not theoretical, against the real archive below (one real
+  folder's own recursive subtree held 1,947 files).
+
+  **Deliberately did NOT reuse the pre-existing `_view_is_recursive`
+  flag for this**, despite the obvious-looking name match — investigated
+  every one of its ~10 existing call sites first and found four
+  (`_on_photo_index_changed`, the metadata-load poll handler, the header-
+  scan-done handler, the single-file-scan-done handler) that each branch
+  `if self._view_is_recursive: self._rebuild_file_view_from_checked(...)
+  else: self._refresh_folder_view(...)` — that flag specifically means
+  "the checked-folders AGGREGATE is showing, `_view_path` is blank."
+  Setting it `True` for this new single-real-folder recursive view would
+  have made all four of those silently rebuild the (likely empty or
+  unrelated) checked-folders aggregate instead of refreshing THIS
+  folder, the moment a header scan or photo-index load finished while
+  viewing it — a real, if narrow, correctness bug avoided by reasoning
+  through the existing call sites before reusing their flag, not by
+  testing into it. It would also have disabled per-folder saved column
+  layouts for this view (`_current_folder_config`/`_apply_column_
+  visibility`/`_show_columns_dialog` all gate on that same flag), an
+  unwanted side effect for a view that's still genuinely about one real
+  folder. A new, separate `self._view_folder_recursive` flag tracks
+  "the current `_view_path` is being shown recursively" instead, stamped
+  by `_refresh_folder_view_recursive`/`_refresh_folder_view` themselves
+  on entry (never set by their callers) and reset at every other place
+  `_view_path`/`_view_is_recursive` already get reset to a different kind
+  of view (the checked-folders aggregate, a bookmark group, Deselect
+  All). New `_refresh_current_file_view(preserve_filter, select_path)` is
+  the shared 3-way dispatcher (aggregate / recursive-folder / direct-
+  folder) that replaced those four call sites' own hand-rolled 2-way
+  `if`/`else`, so the new third case is handled once, not duplicated four
+  times with three of them silently missing it.
+
+  Toggling the checkbox while already viewing a folder re-renders it
+  immediately via `_on_selected_only_recursive_toggled` (re-invokes
+  `on_folder_selected` on the tree's own current selection, guarded
+  against a placeholder/synthetic-root-marker selection).
+
+  Verified end-to-end against the real Android 14 JoshHickman archive
+  (a scratch case_dir, `FFS_ARCHIVES_FILE`/`QSettings` org-name both
+  isolated per this project's own standing test-isolation rules),
+  driving the real running app in-process: a real branching folder
+  (`vendor/firmware`, 47 real direct files, 1,947 real files
+  recursively) showed exactly 1,947 rows by default once ticked into
+  "Selected Only" scope and clicked, with `_view_folder_recursive` True
+  and `_view_is_recursive` correctly still False throughout; unchecking
+  "Recursive" immediately dropped the view to a real, smaller direct-
+  only listing (53 rows — the true direct listing, files AND real
+  subfolder rows together, confirmed to exactly match what clicking the
+  SAME folder via "/ [Full Filesystem]" produces with the checkbox left
+  checked, since that branch is correctly unaffected by it either way);
+  re-checking it correctly went back to all 1,947; a real leaf folder
+  (no subfolders at all) correctly showed the identical count either
+  way, as expected; and `_refresh_current_file_view(preserve_filter=
+  True)`, called directly to simulate a header-scan-done refresh while
+  the recursive view was active, correctly kept it recursive (1,947
+  rows, `_view_path` still pointing at the real folder, never cleared
+  the way the aggregate view's own refresh does). Full pytest suite
+  (18/18) and `scripts/check_claude_md.py` clean throughout; the real
+  `config/` directory confirmed untouched afterward.
+
+  **Extended to the Media Browser the same day, direct follow-up**: "it
+  works great but i want the behaviour to also work for the media
+  browser." Investigated rather than assumed free — `_load_media_from_
+  file_model` (`app/media_viewer.py`) reads directly from `self.
+  file_model._rows` at the moment it's called, and `on_folder_selected`'s
+  existing "refresh media tab if visible" call ran UNCONDITIONALLY right
+  after kicking off whichever folder-view refresh — fine for the
+  synchronous direct-listing path, but `_refresh_folder_view_recursive`
+  is async/frame-budgeted (same as the checked-folders aggregate), so
+  that same unconditional call would have read the model before the
+  recursive batch had populated it, showing an empty or partial gallery.
+
+  Fixed by moving the "refresh media tab" call so it only fires
+  immediately for the direct-listing branch (still synchronous, still
+  correct); `_refresh_folder_view_recursive`'s own batch-completion
+  branch now triggers it itself, once the WHOLE recursive listing has
+  actually finished loading — mirroring `_rebuild_file_view_from_
+  checked`'s own completion-time media refresh, but deliberately
+  WITHOUT that method's `_media_showing_embedded`/`_media_showing_
+  user_only` guard: that guard exists specifically because ticking a
+  folder can happen as an INCIDENTAL side effect mid-flight during a
+  User Media/Embedded Media selection-adoption flow, while the
+  alternate view is still legitimately showing — `_refresh_folder_view_
+  recursive` is never reached that way (only via a genuine, deliberate
+  folder navigation or an explicit re-render of whatever's currently
+  being viewed), so it should always exit either alternate view, the
+  same as the direct-listing branch's own unconditional call already
+  does.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive
+  (same test-isolation discipline as above): found a real folder with
+  genuine subfolder-only media content —
+  `data/data/com.groupme.android/files` has 0 media files directly but
+  323 real ones recursively (GroupMe's own cached images, 347 real
+  files total under it) — exactly the case this feature exists to
+  surface. With the Media Browser tab already active, ticking that
+  folder into "Selected Only" scope and clicking it (Recursive checked,
+  the default) correctly populated `_media_context` with all 323 real
+  media files, not 0; unchecking "Recursive" correctly dropped it to the
+  real direct-only count (0, matching "/ [Full Filesystem]"'s own count
+  for the identical folder); re-checking restored 323. `_media_showing_
+  embedded`/`_media_showing_user_only` both confirmed `False` throughout
+  — an ordinary folder view, not mistaken for an alternate view. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout; the real `config/` directory confirmed untouched
+  afterward.
+
+  **"Recursive" checkbox moved onto the "Selected Only" row itself, same
+  day, direct follow-up**: "i want the recursive check box to be on the
+  root selected only item in the selected view tree is this posible[,]
+  as it would look nicer." Moved from a separate, always-visible toolbar
+  checkbox into a real `QCheckBox` embedded directly on the "Selected
+  Only" tree row via `QTreeView.setIndexWidget` — not the item's own
+  (unused) checkbox machinery, which already means something very
+  different for an ordinary folder item (the 2/3-click tick cycle); this
+  root is deliberately kept non-checkable to stay out of that system
+  entirely. A nice side effect of the move, not separately engineered:
+  the row — and therefore the checkbox — is only ever VISIBLE while
+  "Selected Only" is the active branch (`_apply_selected_only_visibility`'s
+  existing `setRowHidden` flip), exactly when this checkbox's own effect
+  actually matters; no change needed to make that true, since the two
+  tree roots already share one `setRowHidden` toggle. Built fresh inside
+  `reload_tree_entirely`, right alongside the root item itself, since
+  `_rebuild_selected_only_children` only ever touches that item's
+  CHILDREN (never the root row), so the embedded widget survives every
+  scope change untouched in between — the same lifecycle reasoning
+  already documented for the root item. `self._selected_only_recursive_
+  chk` starts `None` until then (`on_folder_selected`'s own check gained
+  a `is not None` guard) — never actually reachable in practice, since a
+  folder click can't happen before `reload_tree_entirely` has run at
+  least once, but defensive regardless.
+
+  **Two real, confirmed Qt layout bugs found and fixed before this
+  looked right, neither obvious from the geometry alone — caught by
+  taking an actual screenshot and finding the checkbox genuinely
+  invisible, twice, not by reasoning about the layout in the abstract.**
+  (1) First attempt: label, then `addStretch()`, then the checkbox.
+  `QTreeView.setIndexWidget` always stretches the container to fill the
+  ENTIRE cell rect — and this tree's own column 0 is deliberately kept
+  at least viewport-width wide even when most of that width is blank
+  (`_update_tree_column`, built to support horizontal scrolling for deep
+  nesting), routinely 900+ pixels versus the ~350px actually-visible
+  left panel. The `addStretch()` correctly consumed the leftover space
+  — but that pushed the checkbox to the far right edge of the FULL
+  column, not the visible splitter area: rendering correctly, just
+  scrolled off-screen by default. Confirmed directly via widget geometry
+  introspection (`checkbox.geometry()`), not assumed: `x=888` against a
+  visible panel only ~350px wide. (2) Second attempt: removed the
+  `addStretch()` entirely, expecting the checkbox to simply sit snug
+  after the label with the leftover space left blank. Instead, Qt
+  expanded the CHECKBOX's own width to absorb the leftover space
+  (confirmed: `88px -> 482px`), pushing its actual glyph far to the
+  right of its own label — the identical end symptom (invisible without
+  horizontal scrolling) from a different cause. Fixed by doing both
+  correctly together: explicit `QSizePolicy.Fixed` on both the label and
+  the checkbox (so neither can absorb leftover space), with
+  `addStretch()` moved to AFTER the checkbox rather than between it and
+  the label — consuming the real leftover space without affecting
+  either widget's own size or position.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive
+  (same test-isolation discipline as above), confirming both the
+  structure AND the fix with real evidence, not just a passing
+  assertion: the checkbox's own `parentWidget()` is the embedded row
+  widget (not the old toolbar layout); `tree_view.indexWidget()` on the
+  "Selected Only" row's index returns a container that genuinely
+  contains it; the full recursive-vs-direct behavior (a real branching
+  folder: 1,947 files recursively vs. 53 direct) still works exactly as
+  before through the relocated checkbox; and a REAL screenshot
+  (`window.grab()`, not a geometry check alone) — taken only after the
+  size-policy fix — visually confirms "Selected Only ☑ Recursive"
+  rendering cleanly on one row, replacing the separate toolbar checkbox
+  entirely. Full pytest suite (18/18) and `scripts/check_claude_md.py`
+  clean throughout; the real `config/` directory confirmed untouched
+  afterward.
+
+- **"Selected Only" tree's own ancestor-chain auto-expand now stops at a
+  meaningful landmark instead of opening every level down to the scope
+  folder, 2026-10-03.** Direct request, after an initial misread (see
+  below): "it is more about if there [are] file[s] that are s[e]lected
+  inside application [or] media folder[s] that by default the tree is
+  fold[ed] to the level of the application [string] and the media
+  folders so it [is] easy to navigate the selected files." A file ticked
+  deep inside an app's container (e.g.
+  `mobile/Containers/Data/Application/<GUID>/Library/SyncedPreferences/...`)
+  used to auto-open EVERY ancestor segment down near the file — a long
+  staircase — rather than stopping at the one level an examiner actually
+  orients from: the app-identifying folder itself.
+
+  **First draft of this request was a real misread, caught and corrected
+  by the user before any code was written** — initially read as "auto-
+  expand the Full Filesystem tree at case load so app folders are
+  visible to pick from," prompted by the earlier phrasing mentioning
+  "default start fold" and the same 3 iOS container folders. A direct
+  correction ("i do not want there to be a prpopulated select[ion]...
+  it is more about if there [are] file[s] that are [already] s[e]lected")
+  redirected this to the ACTUAL target: the "Selected Only" tree's own
+  existing auto-expand behavior for an ALREADY-selected file, not a new
+  pre-population feature on a different tree. Flagged here since the
+  whole point of asking for a plan first was to catch exactly this kind
+  of gap before implementation — worth recording that the plan step did
+  its job.
+
+  New `_selected_only_landmark_sets()` — returns `(container_paths,
+  media_only_paths)`, both built from EXISTING canonical location lists
+  rather than a third, possibly-drifting copy: `container_paths` is
+  exactly `FfsAdapter.container_parents()` (Data/Application, Data/
+  PluginKitPlugin, Shared/AppGroup on iOS; `data/data` on Android) — a
+  path one level below one of these IS the app-identifying (GUID/
+  bundle-id, or Android package name) folder. `media_only_paths` is
+  `_user_media_include_prefixes()` MINUS `container_parents()` — the
+  SAME "User Media" filter's own location list, with the container-
+  parent entries it happens to also include subtracted out, leaving
+  exactly the real media folders themselves (DCIM/PhotoData on iOS,
+  `data/media` on Android) — a path EQUAL to one of these IS the
+  landmark itself, not one level below it.
+
+  `_rebuild_selected_only_children` gained a third tracking set,
+  `past_landmark`, alongside the pre-existing `created`/`full_expand` —
+  populated as each ancestor segment is walked (`cur_path in
+  media_only_paths`, or `parent_path in container_paths`, or
+  `parent_path` already in `past_landmark`), independent of creation
+  order or whether a given ancestor item was already shared with an
+  earlier scope path in the same pass (every segment still gets its own
+  landmark check even when the item itself was created earlier). Every
+  item down to and including the scope folder is still CREATED exactly
+  as before — ticking/navigation and a manual click to open any of them
+  are completely unaffected — only whether each one starts OPEN
+  (`tree_view.expand(...)`) changed: the final expand loop now skips
+  `past_landmark` paths alongside the pre-existing `full_expand` skip.
+  The landmark folder's own PARENT still auto-expands normally (so the
+  landmark itself is visible, just collapsed) — only the landmark and
+  everything below it stays closed by default.
+
+  Verified end-to-end against two real, independent archives (IOS17
+  JoshHickman and Android 14 JoshHickman — deliberately both platforms,
+  confirming the one shared implementation handles the Data/Application+
+  PluginKitPlugin+Shared/AppGroup split correctly on iOS and the single
+  `data/data` case on Android with no platform branching in the new
+  code), driving the real running app in-process, not simulated: a real
+  11-levels-deep file ticked inside a real PluginKitPlugin container
+  correctly left the app-id (GUID) folder present in the tree but NOT
+  auto-expanded, while that folder's own parent (`.../PluginKitPlugin`)
+  WAS auto-expanded; a folder deeper still than the app-id landmark
+  (the file's own direct parent) was also confirmed not auto-expanded;
+  a real file nested under `mobile/Media/PhotoData` correctly left
+  PhotoData itself present-but-collapsed while its own parent
+  (`mobile/Media`) stayed expanded; a real Android file deep inside
+  `data/data/com.google.android.gms` correctly left the package folder
+  collapsed while `data/data` itself stayed expanded; and a regression
+  check confirmed a SHALLOW selection (a top-level folder with no
+  landmark involved at all) is completely unaffected by this change —
+  still governed only by the pre-existing `full_expand` "scope leaf
+  stays collapsed" rule. 15/15 checks passed across both archives. Full
+  pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout; the real `config/` directory confirmed untouched
+  afterward.
+
+- **`MediaFullViewDialog`'s image preview rebuilt around a new
+  `ZoomableImageView`, with real zoom controls, 2026-10-04.** Direct
+  report: "when you double click on a media file in the m[edia] browser
+  it opens up in a full previ[ew] window but the image is not resize[d]
+  to the window so the whole image can be seen... i would also like
+  [it] to be able to be resize[d]... zoom in and out button[s] and if
+  you double click a spot it will zoom into it." The previous
+  `_build_image` was a plain `QLabel` (holding a fixed-size `QPixmap`)
+  inside a `QScrollArea` — always rendered the image at its NATIVE pixel
+  size, so anything larger than the dialog needed scrollbars to see any
+  of it, and resizing the window did nothing to the image at all
+  (`QLabel.setPixmap` never auto-scales its content; `setScaledContents`
+  was never set).
+
+  New `ZoomableImageView(QGraphicsView)` — a single `QGraphicsPixmapItem`
+  in a `QGraphicsScene`, not a bigger tool: Qt's own transform-based
+  scaling already makes smooth zoom, "fit the whole image in the
+  viewport" (`fitInView`), and "zoom centered on the mouse"
+  (`setTransformationAnchor(AnchorUnderMouse)`) all built-in, rather
+  than hand-rolled scroll-position math on top of a `QLabel`.
+  `set_image(img)` fits the image to the current viewport and sets a new
+  `self._auto_fit = True` flag; `resizeEvent`/`showEvent` both re-fit
+  while that flag is still `True` — so the image keeps resizing to the
+  window continuously, the second half of the request ("i would also
+  like it to be able to be resized"). `zoom_in()`/`zoom_out()` (wired to
+  new "−"/"+" buttons) and `mouseDoubleClickEvent` (zooms in by the same
+  step, toward whichever point was double-clicked — `AnchorUnderMouse`
+  makes this free, no manual centering math needed) all turn `_auto_fit`
+  off first — once the examiner has expressed an explicit zoom
+  preference, further window resizes keep that zoom level instead of
+  silently snapping back, matching ordinary image-viewer behavior
+  (Preview.app, etc.). A new "Fit to Window" button
+  (`reset_to_fit()`) is the explicit way back into continuous auto-fit.
+  Zoom is clamped to `[0.02x, 20x]` so repeated clicks can't reach a
+  degenerate transform. `_build_image` adds a small controls row below
+  the view: `[− ] [ 100% ] [+]  [Fit to Window]      Double-click the
+  image to zoom in on that spot` — the percentage label is kept live via
+  a new `zoom_changed` Signal, firing on every fit/zoom/resize so it
+  never shows a stale number.
+
+  Click-and-drag panning (`setDragMode(ScrollHandDrag)`) was added
+  alongside the explicitly-requested controls, not separately requested
+  but treated as necessary rather than scope creep: without SOME way to
+  pan, zooming in at all would leave part of the image permanently out
+  of reach except via the view's own plain scrollbars.
+
+  `QScrollArea` dropped from the file's own import list — `_build_image`
+  was its only user, and nothing else in this module needs it any more.
+
+  Verified at two levels against real behavior, not just constructed
+  plausibly: (1) pure `ZoomableImageView` unit checks (synthetic
+  oversized/undersized `QImage`s, no archive needed) — confirmed a large
+  image fits DOWN (scale < 1.0) and a small one fits UP (scale > 1.0,
+  "fit to window" uses the available space either direction); resizing
+  while `auto_fit` is `True` changes the fitted scale, while resizing
+  after a manual zoom (`auto_fit` now `False`) leaves the chosen zoom
+  level exactly unchanged; `zoom_in`/`zoom_out` each move the scale by
+  very close to the exact `1.25x`/`0.8x` step; a REAL simulated
+  `QMouseEvent` of type `MouseButtonDblClick` dispatched through the
+  actual `mouseDoubleClickEvent` override zooms in and turns `auto_fit`
+  off; 60 consecutive `zoom_in()` calls clamp at exactly `_MAX_SCALE`
+  and 80 consecutive `zoom_out()` calls clamp at exactly `_MIN_SCALE`,
+  neither overshooting. (2) End-to-end through the real
+  `MediaFullViewDialog`, with a REAL 1080×1080 JPEG read via this
+  project's own `_read_zip_bytes` from a real file inside the real
+  Android 14 JoshHickman archive (`ch.swisscows.messenger.teleguardapp`'s
+  own cached avatar) — confirmed the whole real image's own scaled
+  width AND height both fit within the real dialog's actual viewport
+  rect after fitting (not just that SOME scale was computed); resizing
+  the real dialog from 760×680 down to 500×450 correctly re-fit the real
+  image to a smaller scale; clicking the real "+" button in the real
+  dialog increased the scale further; clicking the real "Fit to Window"
+  button correctly re-enabled `auto_fit`. A real screenshot
+  (`dialog.grab()`, not just the numeric checks) visually confirms the
+  whole real photo rendered cleanly within the window with the "−  57%
+  +", "Fit to Window", and double-click hint all legible underneath it.
+  Full pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout; the real `config/` directory confirmed untouched
+  afterward.
+
+- **`_load_qimage` now auto-applies a photo's own EXIF/TIFF orientation
+  tag; Rotate Left/Right buttons added to the full-size viewer,
+  2026-10-04.** Direct request: "can we look at the metadata and if
+  there is information about the orin[t]ation[,] if it is portrait[,]
+  can [we] turn it so that it is the right way up. also [add] a turn 90
+  degree left[/]right button on the viewer." A real, confirmed gap for
+  the common (non-HEIC) case, found BEFORE writing any fix, not assumed:
+  `_load_qimage`'s Qt-native decode path called the bare `QImage.
+  loadFromData(data)` convenience method, which NEVER reads EXIF
+  orientation on any platform — only the separate HEIC-fallback path
+  (added 2026-09-14, for when Qt itself can't decode HEIC at all) ever
+  applied an orientation correction. Confirmed directly against two real
+  portrait photos in this project's own Android 14 JoshHickman archive
+  (both real `Orientation=6` — "rotate 90° CW"): the old path decoded
+  one at `4032x3024` — its raw sensor buffer, landscape-shaped — a real
+  photo shot in portrait, rendered sideways.
+
+  Fixed by switching the Qt-native decode from `QImage.loadFromData()`
+  to `QImageReader` (over a `QBuffer` wrapping the same bytes) with
+  `setAutoTransform(True)` — Qt's own, already-correct built-in
+  mechanism for this, not a hand-rolled EXIF reader. Re-verified against
+  the same real file: now decodes at `3024x4032`, correctly portrait.
+  Since `_load_qimage` is the ONE shared decode entry point for both
+  `ThumbnailWorker` (the Media Browser grid) and `MediaFullViewDialog`
+  (the full-size viewer), this one fix correctly orients BOTH — not
+  scope creep, just where the shared function already lived. The
+  pre-existing HEIC-specific `pillow_heif` fallback path (and its own
+  earlier `original_orientation` bug fix — see that entry above) is
+  completely unchanged; it's still only reached when Qt's own decode
+  (now via `QImageReader`) fails outright.
+
+  **Two new "⟲"/"⟳" (Rotate Left/Right) buttons** on `ZoomableImageView`
+  (see the entry above for that class), added alongside the automatic
+  fix as the second, explicitly-requested half — an ADDITIONAL manual
+  rotation on top of whatever auto-orientation `_load_qimage` already
+  applied, for a file with no orientation tag at all, or when the
+  examiner just wants a different view than the recorded one. Rotates
+  the `QGraphicsPixmapItem` itself (`setRotation`, around its own center
+  via `setTransformOriginPoint`) rather than the VIEW's transform — kept
+  deliberately separate from the view's own zoom transform, so
+  `_current_scale()`'s `transform().m11()` reading stays a pure scale
+  factor, never contaminated by a rotation component in the same
+  matrix. Always wraps to a clean `0/90/180/270` (`degrees % 360`) and
+  always re-fits to the window immediately after rotating (same
+  reasoning `reset_to_fit` itself already documents — a rotation changes
+  the image's own effective aspect ratio, so whatever zoom/pan was
+  active no longer points at anything meaningful) — `fitInView`'s own
+  item-based overload already accounts for the item's current rotation
+  via its scene-mapped bounding rect, so the WHOLE rotated image
+  correctly stays fully visible, not just re-centered. `set_image`
+  always resets rotation back to `0` for a freshly loaded file — a
+  manual rotation never carries over from one photo to the next.
+
+  Verified against real data at every step, not constructed plausibly:
+  (1) both real portrait photos confirmed to still decode correctly via
+  the NEW `_load_qimage` path (non-null, genuinely portrait-shaped,
+  dimensions actually different from the old uncorrected decode); (2) a
+  real `MediaFullViewDialog` driving the actual Rotate Right/Rotate Left
+  buttons — confirmed `0 → 90 → 180 → 90` across a real click sequence,
+  the underlying `QGraphicsPixmapItem.rotation()` matching exactly,
+  `auto_fit` correctly re-enabled by each rotation, four further Rotate
+  Right clicks correctly wrapping back to the same value (`450 % 360`);
+  the WHOLE rotated real image (accounting for the width/height swap at
+  90°) confirmed to still fit entirely within the real viewport's actual
+  pixel dimensions; clicking "Fit to Window" confirmed NOT to undo an
+  active rotation; loading a second, different real file into the same
+  already-open dialog confirmed to reset rotation back to 0. Two real
+  screenshots (`dialog.grab()`, not just the numeric checks) visually
+  confirm a real Copenhagen street photo rendering correctly upright by
+  default, and rendering genuinely sideways (readable, not cut off or
+  distorted) after one manual Rotate Right click. 19/19 checks passed.
+  Full pytest suite (18/18) and `scripts/check_claude_md.py` clean
+  throughout; the real `config/` directory confirmed untouched
+  afterward.
+
+- **Media Browser's "Not Relevant"/"Undo" row now shows for a folder
+  with just one media file, instead of being hidden entirely alongside
+  Prev/Next, 2026-10-04.** Direct request: "i need to have the not
+  relevant button on the bottom even when there is not enough images to
+  make it worth[]while to have a next and previous[,] because if there
+  is only one image in a folder i want to be able to say not relevant."
+  The whole page-nav row (`_media_page_nav_widget` — Prev/label/Undo/Not
+  Relevant/Next together) used to be hidden as ONE unit whenever a
+  folder wasn't genuinely paginated (`n_pages <= 1`) — correct for Prev/
+  Next (nothing to page through), but it made "Not Relevant" completely
+  unreachable for a single-image folder, exactly the reported gap.
+
+  New `_update_media_page_nav_visibility(paginated)` splits the one
+  True/False the row used to get into two independent decisions: Prev/
+  label/Next stay gated on `paginated` exactly as before, but the row's
+  OWN overall visibility, and Undo/"Not Relevant"'s, are now gated on
+  whether the folder has ANY real media at all —
+  `bool(self._media_all_paths_unfiltered)`, the folder's TRUE full list,
+  not the possibly-already-filtered active one. That distinction matters
+  for a real follow-on case, not just the single-image one: once the
+  examiner marks the only image "Not Relevant" (with "hide seen files"
+  on, the default), the ACTIVE list drops to 0 — using that instead of
+  the unfiltered list would have made the row (and Undo, the one way
+  back out of that exact action) vanish the instant it was needed most.
+  All three of `_load_media_page`'s/`_start_thumbnail_load`'s own
+  existing `_media_page_nav_widget.setVisible(...)` call sites were
+  switched to this one shared method, including `_load_media_page`'s
+  `total == 0` early return, which also now explicitly disables "Not
+  Relevant" there (nothing active left to mark) without touching the
+  row's own visibility or Undo's independently-managed enabled state.
+
+  **A second, real (if narrower) gate was found and fixed along the
+  way, via direct testing against an artificially small window, not
+  assumed safe from the main fix alone.** `_update_media_next_button_
+  enabled`'s existing "scrolled to the bottom" gate for "Not Relevant"
+  (`sb.maximum() <= 0 or sb.value() >= sb.maximum() - 2`) — built for
+  the general "make sure every distinct item on the page has been
+  seen" case — doesn't actually serve that purpose at all for a single-
+  item page: confirmed directly against a real, deliberately small
+  window (1100×700, leaving only a 177px grid viewport) that one
+  186px-tall thumbnail+label cell (`THUMB_SIZE` 160 + `_GRID_NAME_
+  HEIGHT` 18 + margins) can genuinely exceed the viewport by a few
+  pixels (`scrollbar maximum=9` for exactly one item), which would have
+  kept "Not Relevant" disabled behind a near-invisible scroll gate for
+  precisely the one-image scenario this whole fix targets. Re-confirmed
+  this does NOT reproduce at a realistic window size (1400×900 gave a
+  1029×377 viewport, `maximum=0`, correctly enabled) — a real, narrow
+  edge case tied to a small/unmaximized window, not a general bug.
+  Fixed by also exempting the gate whenever the CURRENT page shows one
+  item or none (`self._media_model.rowCount() <= 1`) — scrolling that
+  sliver would only reveal more of the SAME already-visible thumbnail,
+  never a second, unseen one, so the gate's own purpose doesn't apply.
+
+  Verified end-to-end against the real Android 14 JoshHickman archive
+  (same test-isolation discipline as above), driving
+  `_start_thumbnail_load` directly (the real entry point ordinary
+  folder navigation already uses) with a real single media file: the
+  page-nav row visible, Prev/label/Next all hidden, Undo/"Not Relevant"
+  both visible and "Not Relevant" correctly enabled immediately (no
+  scrolling needed); clicking it correctly emptied the active list
+  while the row STAYED visible and Undo became enabled; clicking Undo
+  correctly restored the file and re-enabled "Not Relevant." Two
+  regressions confirmed clean: a genuinely empty folder still hides the
+  row entirely, and a real multi-file folder forced into pagination
+  (page size monkeypatched to 2) still shows Prev/label/Next exactly as
+  before, alongside Undo/"Not Relevant." A real screenshot
+  (`window.grab()`, the same artificially small 1100×700 window the
+  scroll-gate bug was found on) visually confirms a single real photo
+  with no Prev/Next/page label and a clearly enabled "Not Relevant ▶"
+  button directly beneath it. 21/21 checks passed. Full pytest suite
+  (18/18) and `scripts/check_claude_md.py` clean throughout; the real
+  `config/` directory confirmed untouched afterward.

@@ -15,6 +15,7 @@ from db_utils import (_open_cache_db, _open_results_db, load_embedded_media_hits
                       load_all_bookmarked_paths, load_bookmark_colors)
 from dialog_helpers import note_label
 from zip_cd_cache import CachedZipView, load as _zcd_load
+import user_media_ignore_list
 # MEDIA_EXTENSIONS/VIDEO_THUMB_EXTENSIONS/TEXT_ATTACHMENT_EXTENSIONS/
 # sniff_media_kind moved to header_scan.py 2026-08-25 (re-exported here
 # unchanged, so existing `from media_viewer import ...` call sites keep
@@ -26,12 +27,13 @@ from header_scan import (classify_magic, is_text, TEXT_SIZE_LIMIT,
                          MEDIA_EXTENSIONS, VIDEO_THUMB_EXTENSIONS,
                          TEXT_ATTACHMENT_EXTENSIONS, sniff_media_kind)
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QScrollArea, QVBoxLayout,
+    QWidget, QLabel, QVBoxLayout,
     QDialog, QHBoxLayout, QPushButton, QSlider, QTextEdit,
     QListView, QAbstractItemView, QStyledItemDelegate, QStyle, QMenu,
-    QApplication,
+    QApplication, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
 )
-from PySide6.QtGui import QImage, QPixmap, QFontDatabase, QColor, QPen
+from PySide6.QtGui import (QImage, QImageReader, QPixmap, QFontDatabase, QColor,
+                           QPen, QPainter)
 from PySide6.QtCore import (Qt, QThread, Signal, QBuffer, QIODevice,
                             QUrl, QAbstractListModel, QModelIndex, QSize, QRect,
                             QSettings, QItemSelectionModel)
@@ -51,14 +53,6 @@ _MEDIA_PAGE_SIZE_DEFAULT = 500
 # exactly the same persisted value Preferences ▸ Media Browser writes.
 _SETTINGS_ORG = "KlasScripts"
 _SETTINGS_APP = "FFS Explorer"
-
-# Deliberately a small, LOCAL copy of ffs-explorer.py's own module-level
-# _BM_GROUP_PREFIX constant (same "app/ never imports from ffs-explorer.py"
-# rule as above) — used by _load_media_from_file_model to recognize a
-# bookmark-group view as a "selection" worth remembering for the "Last
-# Selection" button, added 2026-09-25.
-_BM_GROUP_PREFIX = "__bm_group_"
-
 
 def _media_page_size_pref() -> int:
     """The user's own Media Browser page-size preference (global,
@@ -200,8 +194,32 @@ def _load_qimage(data: bytes, ext: str = '') -> QImage | None:
     image's own exif data before calling exif_transpose, so that
     well-tested standard library code does the actual rotation rather
     than a hand-rolled transform table."""
-    img = QImage()
-    if img.loadFromData(data):
+    # EXIF/TIFF orientation is applied automatically here — added
+    # 2026-10-04, direct request: "look at the metadata and if there is
+    # information about the orinta[t]ion[,] if it is portrait[,] can [we]
+    # turn it so that it is the right way up." A real, confirmed gap for
+    # the common (non-HEIC) case, not just a hypothetical ask: the bare
+    # QImage.loadFromData(data) convenience method this used to call
+    # NEVER reads EXIF orientation at all, on any platform — confirmed
+    # directly against two real portrait photos in this project's own
+    # Android 14 JoshHickman archive (both real Orientation=6, "rotate
+    # 90° CW"): the old path decoded one at 4032x3024 (its raw sensor
+    # buffer, landscape-shaped) — a real photo shot in portrait, shown
+    # sideways. QImageReader.setAutoTransform(True) is Qt's own built-in
+    # mechanism for this (reading via a QBuffer instead of the bare
+    # loadFromData call) — re-verified against the same real file: now
+    # decodes at 3024x4032, correctly portrait. Benefits every caller of
+    # this one shared function — the thumbnail grid AND the full-size
+    # viewer both get correctly-oriented images, not just wherever this
+    # was reported from.
+    reader = QImageReader()
+    buf = QBuffer()
+    buf.setData(data)
+    buf.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader.setDevice(buf)
+    reader.setAutoTransform(True)
+    img = reader.read()
+    if not img.isNull():
         return img
     if ext.lower() not in ('.heic', '.heif'):
         return None
@@ -448,6 +466,162 @@ class MediaGridDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+# ── ZoomableImageView ──────────────────────────────────────────────────────────
+
+class ZoomableImageView(QGraphicsView):
+    """A pannable, zoomable full-size image view for MediaFullViewDialog's
+    own image preview — added 2026-10-04, direct request: the previous
+    QLabel-in-QScrollArea approach always showed an image at its native
+    pixel size, so anything larger than the dialog needed scrolling to
+    see any of it at all, and resizing the window did nothing to the
+    image. This fits the whole image in the window by default, keeps
+    doing so as the window is resized (until the examiner zooms
+    manually), and adds explicit Zoom In/Out plus double-click-to-zoom
+    toward the clicked point.
+
+    QGraphicsView + a single QGraphicsPixmapItem, not a bigger/heavier
+    tool — Qt's own transform-based scaling already makes smooth zoom,
+    "fit the whole image in the viewport" (fitInView), and "zoom
+    centered on the mouse" (setTransformationAnchor(AnchorUnderMouse))
+    all built-in, rather than hand-rolled scroll-position arithmetic on
+    top of a plain QLabel."""
+
+    _ZOOM_STEP = 1.25
+    _MIN_SCALE = 0.02
+    _MAX_SCALE = 20.0
+
+    zoom_changed = Signal(float)   # current scale factor, 1.0 == native size
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pixmap_item: QGraphicsPixmapItem | None = None
+        self._rotation = 0   # degrees, always 0/90/180/270 — see rotate_left/right
+        # Follows the window size until the examiner zooms manually
+        # (a button, double-click, or wheel) — at that point resizing
+        # the dialog keeps the chosen zoom level instead of silently
+        # snapping back, matching ordinary image-viewer behavior.
+        self._auto_fit = True
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        # Click-and-drag panning — necessary, not decorative, once zoom
+        # exists at all: without it, anything beyond fit-to-window would
+        # leave part of the image permanently out of reach except via
+        # the view's own scrollbars.
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+
+    def set_image(self, img: QImage) -> None:
+        """(Re)populate the scene with *img* and fit it to the current
+        viewport — called both for the first image shown and whenever
+        MediaFullViewDialog.load_content swaps in a different file.
+        *img* has already had its own EXIF/TIFF orientation tag applied
+        by _load_qimage (QImageReader.setAutoTransform) — self._rotation
+        below is purely an ADDITIONAL, manual rotation on top of that,
+        for a file with no orientation tag at all, or when the examiner
+        just wants a different view; always reset to 0 for a freshly
+        loaded file."""
+        self._scene.clear()
+        self._rotation = 0
+        self._pixmap_item = self._scene.addPixmap(QPixmap.fromImage(img))
+        self._pixmap_item.setTransformOriginPoint(
+            self._pixmap_item.boundingRect().center())
+        self._scene.setSceneRect(self._pixmap_item.boundingRect())
+        self._auto_fit = True
+        self._fit_to_window()
+
+    def rotate_left(self) -> None:
+        """Rotate 90° counter-clockwise — added 2026-10-04 alongside the
+        automatic EXIF-orientation fix in _load_qimage: that one corrects
+        what the file's own metadata says; these two buttons cover what
+        metadata doesn't (no orientation tag at all, or the examiner
+        wants a different rotation than the recorded one)."""
+        self._set_rotation(self._rotation - 90)
+
+    def rotate_right(self) -> None:
+        """Rotate 90° clockwise — see rotate_left's own docstring."""
+        self._set_rotation(self._rotation + 90)
+
+    def _set_rotation(self, degrees: int) -> None:
+        if self._pixmap_item is None:
+            return
+        self._rotation = degrees % 360
+        self._pixmap_item.setRotation(self._rotation)
+        self._scene.setSceneRect(self._pixmap_item.sceneBoundingRect())
+        # A rotation changes the image's own effective aspect ratio, so
+        # whatever zoom/pan was active no longer points at anything
+        # meaningful — always re-fit to the (newly rotated) whole image,
+        # same reasoning reset_to_fit's own docstring already gives for
+        # the identical "re-establish the baseline" situation.
+        self._auto_fit = True
+        self._fit_to_window()
+
+    def _fit_to_window(self) -> None:
+        if self._pixmap_item is None:
+            return
+        self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        self.zoom_changed.emit(self._current_scale())
+
+    def _current_scale(self) -> float:
+        return self.transform().m11()
+
+    def zoom_in(self) -> None:
+        self._auto_fit = False
+        self._apply_relative_scale(self._ZOOM_STEP)
+
+    def zoom_out(self) -> None:
+        self._auto_fit = False
+        self._apply_relative_scale(1 / self._ZOOM_STEP)
+
+    def reset_to_fit(self) -> None:
+        """"Fit to Window" button — explicitly opts back into the
+        continuous auto-fit-on-resize behavior, the only way back once a
+        manual zoom has turned it off."""
+        self._auto_fit = True
+        self._fit_to_window()
+
+    def _apply_relative_scale(self, factor: float) -> None:
+        current = self._current_scale()
+        if current <= 0:
+            return
+        target = max(self._MIN_SCALE, min(self._MAX_SCALE, current * factor))
+        actual_factor = target / current
+        if actual_factor == 1.0:
+            return
+        self.scale(actual_factor, actual_factor)
+        self.zoom_changed.emit(self._current_scale())
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        """Zoom in centered on the clicked point — setTransformationAnchor
+        (AnchorUnderMouse) already makes self.scale() zoom toward
+        whatever's under the cursor, so no manual centering math is
+        needed here."""
+        if self._pixmap_item is not None:
+            self._auto_fit = False
+            self._apply_relative_scale(self._ZOOM_STEP)
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._auto_fit:
+            self._fit_to_window()
+
+    def showEvent(self, event) -> None:
+        """Re-fit on becoming visible, not just on resize — a freshly
+        constructed dialog's view can still have a placeholder (pre-
+        layout) size at the moment set_image() first runs, since
+        MediaFullViewDialog.__init__ calls load_content() BEFORE its own
+        self.resize(760, 680); the resize that follows usually re-fires
+        resizeEvent and self-corrects, but relying on that timing alone
+        risked a wrong initial fit flashing briefly. Harmless/idempotent
+        once auto-fit is already off or the view is already correctly
+        fitted."""
+        super().showEvent(event)
+        if self._auto_fit:
+            self._fit_to_window()
+
+
 # ── MediaFullViewDialog ────────────────────────────────────────────────────────
 
 class MediaFullViewDialog(QDialog):
@@ -542,19 +716,66 @@ class MediaFullViewDialog(QDialog):
                 child_layout.deleteLater()
 
     def _build_image(self, layout, data: bytes, ext: str = '') -> None:
+        """A zoomable, resize-to-fit image view (ZoomableImageView) plus a
+        small Zoom Out / current-% / Zoom In / "Fit to Window" / Rotate
+        Left / Rotate Right controls row — replaced the previous fixed-
+        native-size QLabel/QScrollArea pair 2026-10-04, direct request:
+        a large image used to need scrolling to see any of it, and the
+        window's own resize had no effect on it at all. *img* itself
+        already comes back from _load_qimage with its own EXIF/TIFF
+        orientation tag auto-applied (same request, same day) — the
+        rotate buttons are an ADDITIONAL manual rotation on top of that,
+        not a replacement for it."""
         img = _load_qimage(data, ext)
         if img is None:
             layout.addWidget(QLabel(
                 "Could not decode this file as an image — it may be an "
                 "unsupported format, or not actually image data."))
             return
-        label = QLabel()
-        label.setPixmap(QPixmap.fromImage(img))
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        scroll = QScrollArea()
-        scroll.setWidget(label)
-        scroll.setWidgetResizable(img.width() < 760 and img.height() < 680)
-        layout.addWidget(scroll)
+
+        view = ZoomableImageView()
+        layout.addWidget(view, 1)
+
+        controls = QHBoxLayout()
+        zoom_out_btn = QPushButton("−")
+        zoom_out_btn.setToolTip("Zoom out")
+        zoom_out_btn.setFixedWidth(32)
+        zoom_out_btn.clicked.connect(view.zoom_out)
+        zoom_label = QLabel("100%")
+        zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        zoom_label.setMinimumWidth(56)
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setToolTip("Zoom in")
+        zoom_in_btn.setFixedWidth(32)
+        zoom_in_btn.clicked.connect(view.zoom_in)
+        fit_btn = QPushButton("Fit to Window")
+        fit_btn.setToolTip("Reset zoom so the whole image fits the window, "
+                           "and keep it fitted as the window is resized")
+        fit_btn.clicked.connect(view.reset_to_fit)
+        rotate_left_btn = QPushButton("⟲")
+        rotate_left_btn.setToolTip("Rotate 90° left")
+        rotate_left_btn.setFixedWidth(32)
+        rotate_left_btn.clicked.connect(view.rotate_left)
+        rotate_right_btn = QPushButton("⟳")
+        rotate_right_btn.setToolTip("Rotate 90° right")
+        rotate_right_btn.setFixedWidth(32)
+        rotate_right_btn.clicked.connect(view.rotate_right)
+        view.zoom_changed.connect(lambda s: zoom_label.setText(f"{s * 100:.0f}%"))
+        controls.addWidget(zoom_out_btn)
+        controls.addWidget(zoom_label)
+        controls.addWidget(zoom_in_btn)
+        controls.addSpacing(12)
+        controls.addWidget(fit_btn)
+        controls.addSpacing(12)
+        controls.addWidget(rotate_left_btn)
+        controls.addWidget(rotate_right_btn)
+        hint = QLabel("Double-click the image to zoom in on that spot")
+        hint.setStyleSheet("color: gray;")
+        controls.addStretch()
+        controls.addWidget(hint)
+        layout.addLayout(controls)
+
+        view.set_image(img)
 
     def _build_text(self, layout, data: bytes) -> None:
         view = QTextEdit()
@@ -953,26 +1174,15 @@ class MediaViewerMixin:
         self._media_hide_seen: bool = False
         self._media_last_seen_batch: list | None = None
         self._media_last_seen_batch_page: int = 0
+        # Which of the last "Not Relevant" batch's paths were actually
+        # part of the tick-based selection before being deselected —
+        # added 2026-10-03, see _on_media_not_relevant's own docstring.
+        # Only these are re-added on Undo, not the whole batch blindly.
+        self._media_last_seen_batch_deselected: list = []
         # ui_path -> hex color for a bookmarked file's grid outline
         # (added 2026-09-25) — see MediaGridDelegate.set_bookmark_colors
         # and db_utils.load_bookmark_colors.
         self._media_bookmark_colors: dict = {}
-
-        # "Last Selection" state (added 2026-09-25, direct request: "a
-        # button similar to the show selected button in the media
-        # browser that allows the user to go back to the previous
-        # selection"). Snapshotted by _load_media_from_file_model
-        # whenever the CURRENT file-browser view is itself a "selection"
-        # (the checked-folders aggregate view, or a bookmark group — see
-        # that method's own docstring for the exact predicate) rather
-        # than a single plain folder, so the examiner can return to it
-        # later without re-selecting from scratch. _media_showing_selection
-        # protects the restored view from _on_center_tab_changed's own
-        # tab-switch reload logic, same convention _media_showing_embedded
-        # already established for the Embedded Media button.
-        self._media_last_selection_paths: list | None = None
-        self._media_last_selection_label: str = ""
-        self._media_showing_selection: bool = False
 
         self._media_model = MediaFileListModel()
         self._media_delegate = MediaGridDelegate(THUMB_SIZE)
@@ -993,30 +1203,37 @@ class MediaViewerMixin:
         self._embedded_media_btn = QPushButton("Embedded Media")
         self._embedded_media_btn.setVisible(False)
         self._embedded_media_btn.clicked.connect(self._show_embedded_media_hits)
-        # "◀ Last Selection" (added 2026-09-25) — see this class's own
-        # _media_last_selection_paths docstring above for what counts as
-        # a "selection." Hidden until a selection has actually been
-        # snapshotted; clicking it shows only the UNSEEN files from that
-        # selection, regardless of the global "hide seen files"
-        # preference — see _on_media_last_selection_clicked.
-        self._media_last_selection_btn = QPushButton("◀ Last Selection")
-        self._media_last_selection_btn.setVisible(False)
-        self._media_last_selection_btn.setToolTip(
-            "Return to the last file selection (bookmark group or "
-            "checked-folders view) — showing only files not yet seen")
-        self._media_last_selection_btn.clicked.connect(
-            self._on_media_last_selection_clicked)
+        # "User Media" filter — added 2026-09-27 as a status-row button
+        # here; MOVED 2026-10-03 to a live, synthetic bookmark-panel
+        # entry (ffs-explorer.py's _apply_bookmark_groups, right below
+        # "Selected Files") per direct request: "can we take the user
+        # media button away from the media browser and have it as a
+        # bookmark[,] have it above evidence like selected files." The
+        # underlying filter logic (_user_media_paths/
+        # _show_user_created_media below) is unchanged and unmoved —
+        # only the UI entry point relocated; _media_showing_user_only
+        # still gates the "leave this alternate view alone on tab
+        # switch" check in ffs-explorer.py's _on_center_tab_changed.
+        self._media_showing_user_only = False
         status_row = QHBoxLayout()
         status_row.addWidget(self._media_status, 1)
-        status_row.addWidget(self._media_last_selection_btn)
         status_row.addWidget(self._embedded_media_btn)
         status_row_widget = QWidget()
         status_row_widget.setLayout(status_row)
 
-        # Page navigation row — hidden entirely for a folder with
-        # <= _MEDIA_PAGE_SIZE media files (see _load_media_page), so a
-        # small folder looks exactly as it always did, no new UI in the
-        # way.
+        # Page navigation row. Two independently-visible groups within
+        # ONE row widget (see _update_media_page_nav_visibility) — Prev/
+        # label/Next only appear once a folder is genuinely paginated
+        # (unchanged original behavior), but Undo/"Not Relevant" show
+        # whenever the folder has ANY real media at all, even just one
+        # file — added 2026-10-04, direct request: "i need to have the
+        # not relevant button on the bottom even when there is not
+        # enough images to make it worth[]while to have a next and
+        # previous[,] because if there is only one image in a folder i
+        # want to be able to say not relevant." The whole row was
+        # previously hidden as a unit whenever a folder wasn't paginated
+        # (n_pages <= 1), which made "Not Relevant" completely
+        # unreachable for a single-image folder — exactly this gap.
         self._media_page_prev_btn = QPushButton("◀ Prev")
         self._media_page_prev_btn.clicked.connect(self._on_media_prev_page)
         self._media_page_label = QLabel("")
@@ -1034,12 +1251,18 @@ class MediaViewerMixin:
         # marks every file on the CURRENT page (except any bookmarked one
         # — a bookmark is itself a statement that the file IS of
         # interest) as "seen" and moves on, plus an Undo for the last such
-        # batch. Scoped to the page-nav row (only ever visible when the
-        # folder is paginated) per the literal "next to the next button"
-        # framing — a single-page folder has no page to bulk-dismiss in
-        # the first place. Greyed out until scrolled to the bottom of the
-        # page, same as "Next" — see _update_media_next_button_enabled,
-        # which now drives both.
+        # batch. Visible whenever the folder has ANY real media at all —
+        # NOT scoped to "only when paginated" any more (see
+        # _update_media_page_nav_visibility — a direct follow-up request
+        # closed that original gap for a single-image folder). Greyed
+        # out until scrolled to the bottom of the page, same as "Next" —
+        # see _update_media_next_button_enabled, which now drives both.
+        # For the one-image case this was added for, the content already
+        # fits with nothing to scroll (_update_media_next_button_enabled
+        # treats `maximum() <= 0` as already-at-the-bottom), so the
+        # button is enabled immediately — but a single PAGE can still
+        # hold many items (up to the page-size preference) that need
+        # scrolling through first, same gate as always in that case.
         self._media_not_relevant_btn = QPushButton("Not Relevant ▶")
         self._media_not_relevant_btn.setToolTip(
             "Mark every file on this page as seen (except bookmarked "
@@ -1189,6 +1412,228 @@ class MediaViewerMixin:
                        if recovered else ""))
         self._start_thumbnail_load(media_paths, len(media_paths), sort_desc)
 
+    def _user_media_candidate_paths(self) -> list[str]:
+        """Every real media file across the WHOLE archive sitting
+        under one of FastZipBrowser._user_media_include_prefixes()'s
+        own default user-content locations — the RAW candidate set,
+        before either the ignore-list or seen-status exclusion is
+        applied. Factored out 2026-10-03 (previously inlined in
+        _user_media_paths) so that function and the two "review what
+        got excluded" actions below (_user_media_seen_paths/
+        _user_media_ignored_paths, for the right-click "Show Media
+        Marked 'Not Relevant'"/"Show Media Excluded by Ignore List"
+        actions) all agree on exactly what counts as a User Media
+        LOCATION candidate in the first place — one shared definition,
+        never three copies that could drift apart on what "a user
+        media location" even means."""
+        prefixes = self._user_media_include_prefixes()
+        return sorted(
+            p for p in self.full_metadata
+            if p not in self.folder_map
+            and self._is_media_file(p)
+            and self._is_user_media_path(p, prefixes)
+        )
+
+    def _user_media_paths(self) -> list[str]:
+        """The real, shared list of every User Media LOCATION candidate
+        (_user_media_candidate_paths) that is NEITHER on
+        user_media_ignore_list.py's own list NOR already marked
+        "seen" — factored out of _show_user_created_media 2026-10-03
+        (that method now just calls this) so the bookmark panel's own
+        live "User Media (N)" count (ffs-explorer.py's
+        _apply_bookmark_groups) uses the EXACT same matching logic as
+        the real click action, never a second, possibly-drifting copy.
+        A plain in-memory dict scan plus one small SELECT, cheap enough
+        to re-run on every panel refresh (bookmark add/delete/color-
+        change, case load, and — added 2026-10-03 — every "Not
+        Relevant"/"Undo" click, since marking or unmarking a file as
+        seen is exactly what changes this count) — never on every
+        tick.
+
+        Direct clarification, 2026-10-03: ""[this] button is me[a]nt
+        to show all the files that are in the locations... designated
+        as user media that the user has not yet viewed" — the seen
+        exclusion is therefore UNCONDITIONAL here, never gated by the
+        "hide seen files" Media Browser preference the way an ordinary
+        folder's own grid is (_recompute_media_all_paths) — this
+        entry's whole purpose is "what's left to review," so it always
+        excludes seen content regardless of that separate, general
+        display toggle.
+
+        Reads the seen-set FRESH from caseresults.db rather than
+        self._media_seen_paths — that attribute is only ever populated
+        once some folder has actually been loaded in the Media Browser
+        this session (_start_thumbnail_load), so it can be stale/empty
+        when this is called from the bookmark panel before the examiner
+        has ever visited that tab, or after reopening a case with
+        already-seen files persisted from an earlier session."""
+        ignore_entries = user_media_ignore_list.load()
+        seen_paths = self._load_seen_media_paths_fresh()
+        return [
+            p for p in self._user_media_candidate_paths()
+            if not user_media_ignore_list.is_ignored(p, ignore_entries)
+            and p not in seen_paths
+        ]
+
+    def _load_seen_media_paths_fresh(self) -> set:
+        """A small shared helper — read caseresults.db's own current
+        seen-set directly, never the possibly-stale/empty
+        self._media_seen_paths (see _user_media_paths' own docstring
+        for exactly why). Factored out 2026-10-03 once a second real
+        caller (_user_media_seen_paths) needed the identical read."""
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                return load_seen_media_paths(conn)
+        except Exception:
+            return set()
+
+    def _user_media_seen_paths(self) -> list[str]:
+        """User Media LOCATION candidates that have been marked "seen"
+        (i.e. dismissed via "Not Relevant") — added 2026-10-03, direct
+        request: a right-click review action "to show the user all the
+        media files that were classed as user media files but the
+        user has indicated are [ir]relevant," so a "Not Relevant" click
+        made in haste can be double-checked later rather than simply
+        vanishing from view for good."""
+        seen_paths = self._load_seen_media_paths_fresh()
+        return [p for p in self._user_media_candidate_paths() if p in seen_paths]
+
+    def _user_media_ignored_paths(self) -> list[str]:
+        """User Media LOCATION candidates excluded by
+        user_media_ignore_list.py's own list — either a direct file
+        entry or a folder-level entry covering it — added 2026-10-03,
+        direct request: a right-click review action to "check the
+        file[s] [the examiner has] ignored and check that the location
+        [they have] decided will never have user data is in fact
+        correct." Lets a folder-level "this will never have real user
+        content" judgment be sanity-checked against what it's actually
+        hiding, not just trusted forever once made."""
+        ignore_entries = user_media_ignore_list.load()
+        return [p for p in self._user_media_candidate_paths()
+                if user_media_ignore_list.is_ignored(p, ignore_entries)]
+
+    def _show_user_created_media(self) -> None:
+        """"User Media" — added 2026-09-27 as a Media Browser status-row
+        button; its own entry point MOVED 2026-10-03 to a live,
+        synthetic bookmark-panel row (see _user_media_paths' own
+        docstring and ffs-explorer.py's _apply_bookmark_groups /
+        _on_bookmark_item_clicked). Loads the archive-wide
+        _user_media_paths() result into the SAME thumbnail grid a
+        folder's media normally uses, and ticks each individual media
+        file as the live selection — added 2026-09-27, direct
+        follow-up: "the folder[s] that are selected should all be
+        ticked... this mean[s] in the file browser all the same files
+        will be selected and the selected folder tree will show the
+        selected folders."
+
+        FIXED 2026-10-03, direct report: "since 'User Media' is the
+        same as the other bookmark groups[,] i.e. when selected it
+        overwrites the selected files with the selected files[,] the
+        same dialog should be used[,] ask[ing] the user if they want
+        to save the current selected files if they['re] not s[ou]rced
+        from the other bookmark groups which are saved." This now
+        routes through the EXACT SAME _selection_at_risk()/
+        _warn_before_losing_selection() mechanism every real bookmark-
+        group click already uses (Cancel / Save as New Group… /
+        Continue Without Saving) — replacing the previous, narrower
+        "Replace Selected Folders?" Yes/No check, which only ever
+        compared against pre-existing FOLDER-level ticks and didn't
+        offer to save anything. Empty-result guard mirrors
+        _show_bookmark_group's own identical one: an empty
+        _user_media_paths() result is a complete no-op (status-bar
+        message only), checked BEFORE the at-risk warning, so a case
+        with nothing left to show never pointlessly asks to save a
+        selection it isn't actually about to touch.
+
+        Marks the result _selection_dirty = False once adopted — the
+        SAME convention _replace_selection_from_bookmark_entries
+        already uses for a real group — so switching FROM "User
+        Media" to a different real bookmark group afterward correctly
+        skips the warning too, UNLESS the examiner changed the
+        selection since: direct follow-up, "when you switch to
+        another bookmark group from user media[,] remember there is
+        no need for a dialog unless a user has [made a] change from
+        what is described by user media." This falls out of the
+        EXISTING _selection_at_risk() check for free once this method
+        sets the same dirty flag — no separate code needed for that
+        direction.
+
+        Owns the Media Browser tab-switch itself now (rather than a
+        separate wrapper switching eagerly before this runs) so a
+        Cancel genuinely does nothing at all, not even change tabs."""
+        media_paths = self._user_media_paths()
+        if not media_paths:
+            self.status_bar.showMessage(
+                "\"User Media\" has no not-yet-viewed files right now.", 4000)
+            return
+        if self._selection_at_risk():
+            choice = self._warn_before_losing_selection()
+            if choice == 'cancel':
+                return
+            if choice == 'save' and not self._save_current_selection_as_new_group():
+                return
+        self.center_tabs.setCurrentIndex(1)
+        self._media_showing_user_only = True
+        self._media_context = tuple(media_paths)
+        sort_desc = " from known user-created locations"
+        self._start_thumbnail_load(media_paths, len(media_paths), sort_desc)
+        self._deselect_all_files()
+        self._select_user_media_files_and_folders(set(media_paths))
+        self._selection_dirty = False
+
+    def _show_user_media_seen_files(self) -> None:
+        """Right-click "Show Media Marked 'Not Relevant'" on the "User
+        Media" bookmark-panel row — added 2026-10-03, direct request:
+        a review action "to show the user all the media files that
+        were classed as user media files but the user has indicated
+        are [ir]relevant," so a "Not Relevant" click made in haste (or
+        just worth a second look later) can be double-checked rather
+        than vanishing from view for good. A pure REVIEW action —
+        deliberately does NOT tick/select anything (unlike "User
+        Media" itself), since the point here is only to look, not to
+        build a selection out of content already dismissed as not
+        worth reviewing.
+
+        force_show_seen=True on the _start_thumbnail_load call —
+        FIXED 2026-10-03, a real, confirmed bug: without it, the
+        "hide seen files" preference (ON by default) filtered every
+        single result right back out, since this view's entire
+        result IS the seen set — see _start_thumbnail_load's own
+        docstring for the full root-cause writeup."""
+        media_paths = self._user_media_seen_paths()
+        self._media_showing_user_only = True
+        self._media_context = tuple(media_paths)
+        sort_desc = " marked \"Not Relevant\" in known user-created locations"
+        self._start_thumbnail_load(media_paths, len(media_paths), sort_desc,
+                                   force_show_seen=True)
+
+    def _show_user_media_ignored_files(self) -> None:
+        """Right-click "Show Media Excluded by Ignore List" on the
+        "User Media" bookmark-panel row — added 2026-10-03, direct
+        request: a review action to "check the file[s] [the examiner
+        has] ignored and check that the location [they have] decided
+        will never have user data is in fact correct." Covers BOTH
+        real ignore shapes (user_media_ignore_list.is_ignored already
+        handles either) — an individual file ignored directly, or a
+        whole folder ignored as "this will never have real user
+        content," letting that judgment call be sanity-checked against
+        what it's actually hiding rather than trusted forever once
+        made. Same pure-REVIEW shape as _show_user_media_seen_files —
+        no ticking/selecting.
+
+        force_show_seen=True for the same reason
+        _show_user_media_seen_files now passes it — an ignored file
+        that ALSO happens to be marked seen must still show up here
+        (this view is about ignore-status, not seen-status; the two
+        are independent), not be silently dropped by the "hide seen
+        files" preference."""
+        media_paths = self._user_media_ignored_paths()
+        self._media_showing_user_only = True
+        self._media_context = tuple(media_paths)
+        sort_desc = " excluded by the User Media ignore list"
+        self._start_thumbnail_load(media_paths, len(media_paths), sort_desc,
+                                   force_show_seen=True)
+
     def _is_media_file(self, ui_path: str) -> bool:
         """True if ui_path counts as media — either by extension (the
         common, cheap case) or by its header-scan-derived type override
@@ -1238,12 +1683,12 @@ class MediaViewerMixin:
 
     def _load_media_from_file_model(self):
         """Load the media tab using exactly the current visible file model
-        rows. Also exits the "Last Selection"/Embedded Media alternate
-        views — picking an ordinary folder (or an aggregate/bookmark view,
-        see below) is what "picks an ordinary folder again" means in both
-        of those features' own docstrings."""
+        rows. Also exits the Embedded Media/User Media alternate views —
+        picking an ordinary folder (or an aggregate/bookmark view) is
+        what "picks an ordinary folder again" means in each feature's own
+        docstring."""
         self._media_showing_embedded = False
-        self._media_showing_selection = False
+        self._media_showing_user_only = False
         model = self.file_model
 
         total_files = sum(1 for r in model._rows if r[1] not in self.folder_map)
@@ -1255,28 +1700,6 @@ class MediaViewerMixin:
 
         self._media_context = tuple(media_paths)
 
-        # Snapshot this as the "Last Selection" — added 2026-09-25 —
-        # whenever the CURRENT file-browser view is itself an explicit
-        # multi-item SELECTION rather than one plain folder: either the
-        # checked-folders aggregate view (_view_is_recursive is only ever
-        # set True by _rebuild_file_view_from_checked, i.e. "Show Selected
-        # Files") or a bookmark group (_view_path prefixed _BM_GROUP_PREFIX,
-        # set by _show_bookmark_group). An ordinary single-folder
-        # navigation never qualifies, so browsing around afterward doesn't
-        # keep overwriting this with "the last folder I happened to look
-        # at" — only a genuine selection counts.
-        is_selection = bool(media_paths) and (
-            getattr(self, '_view_is_recursive', False)
-            or (getattr(self, '_view_path', '') or '').startswith(_BM_GROUP_PREFIX))
-        if is_selection:
-            self._media_last_selection_paths = list(media_paths)
-            self._media_last_selection_label = self.status_bar.currentMessage() or "Last selection"
-            self._media_last_selection_btn.setToolTip(
-                f"Return to: {self._media_last_selection_label}\n"
-                "(showing only files not yet seen)")
-        self._media_last_selection_btn.setVisible(
-            bool(self._media_last_selection_paths))
-
         if 0 <= model._sort_col < len(model._headers):
             arrow = "↑" if model._sort_order == Qt.SortOrder.AscendingOrder else "↓"
             sort_desc = f", sorted by {model._headers[model._sort_col]} {arrow}"
@@ -1285,43 +1708,35 @@ class MediaViewerMixin:
 
         self._start_thumbnail_load(media_paths, total_files, sort_desc)
 
-    def _on_media_last_selection_clicked(self) -> None:
-        """"◀ Last Selection" — added 2026-09-25, direct request: "a
-        button... that allows the user to go back to the previous
-        selection[;]... it should show all the files in the last
-        selection that have not been viewed." Filters the snapshotted
-        selection down to files NOT in _media_seen_paths — always, for
-        this button specifically, regardless of the global "hide seen
-        files" preference (_media_hide_seen), since the whole point here
-        is "show me what I haven't looked at yet from that batch," not a
-        display preference. Loads _media_seen_paths fresh first (same
-        query _start_thumbnail_load always runs) so a file marked seen
-        moments ago is correctly excluded even if the preference itself
-        is off."""
-        if not self._case_dir or not self._media_last_selection_paths:
-            return
-        try:
-            with closing(_open_results_db(self._case_dir)) as conn:
-                seen = load_seen_media_paths(conn)
-        except Exception:
-            seen = set()
-        unseen = [p for p in self._media_last_selection_paths if p not in seen]
-        self._media_showing_selection = True
-        self._media_context = tuple(unseen)
-        n_total = len(self._media_last_selection_paths)
-        n_seen = n_total - len(unseen)
-        sort_desc = f" from your last selection ({n_seen:,} already seen, hidden)" \
-            if n_seen else " from your last selection"
-        self._start_thumbnail_load(unseen, n_total, sort_desc)
-
-    def _start_thumbnail_load(self, media_paths, total_files=None, sort_desc=""):
+    def _start_thumbnail_load(self, media_paths, total_files=None, sort_desc="",
+                              force_show_seen: bool = False):
         """Records *media_paths* as the folder's own FULL media list
         (_media_all_paths — not necessarily what's shown, once paginated)
         and loads the first page (or the page containing a pending File-
         Browser-driven selection, if one's waiting). See _load_media_page
         for the actual per-page work; this method's own job is just the
         once-per-folder-load setup (resolver maps, the overall status
-        text, retiring any stale workers from the previous folder)."""
+        text, retiring any stale workers from the previous folder).
+
+        *force_show_seen* — added 2026-10-03, a real bug found by
+        direct report: "when i [click the] not relevant option[,]
+        noting was displayed in the media gall[e]ry." Root cause: this
+        method always re-reads the "hide seen files" preference
+        (`_media_hide_seen_pref()`, ON by default) and
+        `_recompute_media_all_paths()` then unconditionally filters
+        OUT every path already in `_media_seen_paths` — correct for an
+        ordinary folder, but catastrophic for
+        `_show_user_media_seen_files`'s own review grid, whose ENTIRE
+        result set is, by definition, already-seen files: with the
+        default preference on, every single one got filtered right
+        back out, leaving the grid genuinely empty — not a display
+        bug, the active list itself really was emptied. Pass True to
+        force `_media_hide_seen` off for THIS load (and therefore this
+        whole view, until the examiner navigates to an ordinary folder
+        — _load_media_from_file_model resets it back to the real
+        preference on its own next call), so a file's own seen-status
+        is never used to hide it from a view whose entire point is to
+        show files BY their seen (or ignored) status."""
         self._retire_worker(self._thumb_worker)
         self._thumb_worker = None
         self._retire_worker(self._media_page_prefetch_worker)
@@ -1336,7 +1751,7 @@ class MediaViewerMixin:
         # Snapshotted once per folder load, not re-read mid-navigation —
         # see _media_page_size_pref's own docstring for why.
         self._media_page_size = _media_page_size_pref()
-        self._media_hide_seen = _media_hide_seen_pref()
+        self._media_hide_seen = False if force_show_seen else _media_hide_seen_pref()
 
         if not media_paths or not self.zip_path:
             self._media_all_paths = []
@@ -1347,7 +1762,7 @@ class MediaViewerMixin:
             self._media_delegate.set_bookmark_colors({})
             self._media_page_index = 0
             self._media_model.set_items([])
-            self._media_page_nav_widget.setVisible(False)
+            self._update_media_page_nav_visibility(paginated=False)
             self._media_status.setText(
                 "No media files" if self.zip_path else "Select a folder to view media")
             self._clear_hex_preview()
@@ -1438,6 +1853,36 @@ class MediaViewerMixin:
         self._media_delegate.set_bookmark_colors(self._media_bookmark_colors)
         self._media_view.viewport().update()
 
+    def _update_media_page_nav_visibility(self, paginated: bool) -> None:
+        """Drives the page-nav row's own visibility, and the visibility
+        of its Prev/label/Next sub-widgets specifically — added
+        2026-10-04 to split "is this folder paginated" from "is there a
+        real review action (Undo/Not Relevant) available," which used to
+        be the same single True/False (the whole row only ever appeared
+        once a folder had more than one page). Direct request: "i need
+        to have the not relevant button on the bottom even when there is
+        not enough images to make it worth[]while to have a next and
+        previous[,] because if there is only one image in a folder i
+        want to be able to say not relevant."
+
+        Checks self._media_all_paths_unfiltered (the folder's TRUE full
+        media list) rather than the possibly-already-filtered
+        self._media_all_paths — a folder whose every file has just been
+        marked "Not Relevant" (so the ACTIVE/filtered list is empty when
+        "hide seen files" is on) should still show Undo, not vanish the
+        one way back out of that action. Undo/"Not Relevant" themselves
+        are never explicitly hidden here — only the row's own overall
+        visibility, and Prev/label/Next, are controlled by this method;
+        each button's ENABLED state (greyed out vs. clickable) is a
+        separate, already-existing concern handled elsewhere (_update_
+        media_next_button_enabled, and the explicit disable in
+        _load_media_page's own total==0 branch)."""
+        has_content = bool(self._media_all_paths_unfiltered)
+        self._media_page_nav_widget.setVisible(paginated or has_content)
+        self._media_page_prev_btn.setVisible(paginated)
+        self._media_page_label.setVisible(paginated)
+        self._media_page_next_btn.setVisible(paginated)
+
     def _load_media_page(self, page_index: int, include_bookmarks: bool = True) -> None:
         """Loads page *page_index* (_MEDIA_PAGE_SIZE files at a time) —
         the core of the "buttery smooth" redesign, 2026-09-24, direct
@@ -1482,7 +1927,17 @@ class MediaViewerMixin:
         if total == 0:
             self._media_page_index = 0
             self._media_model.set_items([])
-            self._media_page_nav_widget.setVisible(False)
+            # Not paginated (nothing active to page through) — but the
+            # row itself still shows, and stays reachable for "Undo", if
+            # the folder has real media hidden-as-seen by the filter
+            # (_update_media_page_nav_visibility checks the TRUE
+            # unfiltered list, not this now-empty active one). "Not
+            # Relevant" itself is explicitly disabled here since there's
+            # nothing currently active to mark — _update_media_next_
+            # button_enabled's own identical total==0 branch isn't
+            # reached from this early return.
+            self._update_media_page_nav_visibility(paginated=False)
+            self._media_not_relevant_btn.setEnabled(False)
             return
 
         page_size = self._media_page_size
@@ -1520,7 +1975,7 @@ class MediaViewerMixin:
         self._media_view.scrollToTop()
 
         paginated = n_pages > 1
-        self._media_page_nav_widget.setVisible(paginated)
+        self._update_media_page_nav_visibility(paginated)
         # "Back" is always available once page_index > 0 — direct
         # request, 2026-09-24: "they can go back at any time." "Next" is
         # gated on having scrolled to the bottom of THIS page
@@ -1633,9 +2088,21 @@ class MediaViewerMixin:
         (nothing to scroll, `maximum() <= 0`) as already at the bottom —
         the examiner has necessarily already seen everything on such a
         page, so there's no real "keep scrolling" gate left to apply.
-        "Not Relevant" is deliberately NOT also gated on "is there a next
-        page" — the LAST page still has real content worth dismissing
-        even though there's nowhere further to advance to."""
+        Also exempt whenever the CURRENT page shows one item or none at
+        all (self._media_model.rowCount() <= 1) — added 2026-10-04,
+        direct request ("if there is only one image in a folder i want
+        to be able to say not relevant"): a single thumbnail+label cell
+        (186px) can be a few pixels taller than a genuinely small/
+        unmaximized window's own grid viewport, confirmed directly
+        against a real deliberately-small window (177px viewport,
+        scrollbar maximum=9 for exactly one item) — the gate's own
+        purpose (make sure every DISTINCT item has actually been seen
+        before a bulk dismissal) doesn't apply at all when there's only
+        one item to begin with; scrolling that sliver would only reveal
+        more of the SAME already-visible thumbnail, never a second,
+        unseen one. "Not Relevant" is deliberately NOT also gated on "is
+        there a next page" — the LAST page still has real content worth
+        dismissing even though there's nowhere further to advance to."""
         total = len(self._media_all_paths)
         if total == 0:
             self._media_page_next_btn.setEnabled(False)
@@ -1645,7 +2112,8 @@ class MediaViewerMixin:
         n_pages = max(1, -(-total // page_size))
         self._media_page_next_btn.setEnabled(self._media_page_index < n_pages - 1)
         sb = self._media_view.verticalScrollBar()
-        at_bottom = sb.maximum() <= 0 or sb.value() >= sb.maximum() - 2
+        at_bottom = (sb.maximum() <= 0 or sb.value() >= sb.maximum() - 2
+                    or self._media_model.rowCount() <= 1)
         self._media_not_relevant_btn.setEnabled(at_bottom)
 
     def _on_media_prev_page(self) -> None:
@@ -1718,6 +2186,22 @@ class MediaViewerMixin:
         self._media_last_seen_batch_page = self._media_page_index
         self._media_undo_seen_btn.setEnabled(True)
 
+        # Also deselect each marked file from the tick-based selection —
+        # added 2026-10-03, direct follow-up: "can you also make it
+        # that they become not selected so in [e]ffect the selected
+        # files number decreases." Only the subset actually selected
+        # beforehand is recorded (_deselect_path's own return value),
+        # so Undo restores exactly those, not the whole batch blindly —
+        # most files marked "Not Relevant" were never ticked at all
+        # (e.g. browsing "User Media" without having ticked anything),
+        # and _deselect_path is a safe no-op for those either way.
+        deselected = [p for p in to_mark if self._deselect_path(p)]
+        self._media_last_seen_batch_deselected = deselected
+        if deselected:
+            self._selected_only_scope = self._compute_selected_only_scope()
+            self._sync_selected_only_after_scope_change()
+            self._refresh_file_checked_paths()
+
         n_skipped = len(page_items) - len(to_mark)
         skipped_note = f" ({n_skipped} bookmarked file(s) left as-is)" if n_skipped else ""
         self.status_bar.showMessage(
@@ -1732,6 +2216,16 @@ class MediaViewerMixin:
             self._load_media_page(self._media_page_index, include_bookmarks=False)
         else:
             self._load_media_page(self._media_page_index + 1, include_bookmarks=False)
+        # The bookmark panel's own "User Media (N)" count excludes
+        # already-seen files (_user_media_paths' own docstring) — added
+        # 2026-10-03, direct request: marking a page as seen here can
+        # reduce how many not-yet-viewed user-media files remain, so
+        # that live count needs to pick it up immediately, not just the
+        # next time something ELSE refreshes the panel. Cheap (one
+        # background-pool DB round-trip, same as every other bookmark
+        # mutation already does) and harmless even when none of this
+        # batch happened to be user-media content at all.
+        self._refresh_bookmark_panel()
 
     def _on_media_undo_seen(self) -> None:
         """Reverts exactly the last "Not Relevant" batch — added
@@ -1755,9 +2249,27 @@ class MediaViewerMixin:
         self._media_undo_seen_btn.setEnabled(False)
         self.status_bar.showMessage(f"Undid — {len(batch):,} file(s) no longer marked seen")
 
+        # Re-select exactly the paths _on_media_not_relevant actually
+        # deselected (never the whole batch — most of it was likely
+        # never selected at all) — added 2026-10-03, same follow-up as
+        # that method's own deselection. A plain _checked_files re-add
+        # is sufficient regardless of whether a path was originally
+        # covered via a fully-checked ancestor folder rather than its
+        # own direct entry — it renders identically checked either way.
+        if self._media_last_seen_batch_deselected:
+            self._checked_files.update(self._media_last_seen_batch_deselected)
+            self._media_last_seen_batch_deselected = []
+            self._selected_only_scope = self._compute_selected_only_scope()
+            self._sync_selected_only_after_scope_change()
+            self._refresh_file_checked_paths()
+
         if self._media_hide_seen:
             self._recompute_media_all_paths()
         self._load_media_page(self._media_last_seen_batch_page)
+        # Same reasoning as _on_media_not_relevant's own identical call
+        # — undoing a "seen" mark can restore files to the "not yet
+        # viewed" user-media count too.
+        self._refresh_bookmark_panel()
 
     def _on_thumbnail_ready(self, ui_path, img):
         row = self._media_model.row_of(ui_path)

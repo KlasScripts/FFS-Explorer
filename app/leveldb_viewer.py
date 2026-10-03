@@ -1190,6 +1190,7 @@ class LevelDbViewerMixin:
         self.folder_map[ui_path] = virtual_children
         self.full_metadata.setdefault(ui_path, {})['size'] = total_size
         self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_children)
+        self._auto_tick_new_tree_entries(ui_path, virtual_children)
         self._leveldb_folder_map[ui_path] = {
             'extract_dir':    extract_dir,
             'records':        records,
@@ -1435,6 +1436,7 @@ class LevelDbViewerMixin:
         self.folder_map[ui_path] = virtual_children
         self.full_metadata.setdefault(ui_path, {})['size'] = total_size
         self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_children)
+        self._auto_tick_new_tree_entries(ui_path, virtual_children)
         self._leveldb_folder_map[ui_path] = {
             'extract_dir':    extract_dir,
             'records':        records,

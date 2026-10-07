@@ -1384,6 +1384,19 @@ def save_bookmark_group(conn: 'sqlite3.Connection',
     return cur.lastrowid
 
 
+def get_or_create_bookmark_group(conn: 'sqlite3.Connection', name: str) -> int:
+    """Return an existing group's id by exact name match, else create one
+    (via save_bookmark_group, so it still gets an auto-assigned palette
+    color). Added 2026-10-07 for "Import Bookmarks…" — repeated imports
+    against the same spreadsheet, or several spreadsheets sharing a
+    bookmark-value column (e.g. a shared STATUS value), land in the SAME
+    group rather than hitting bookmark_groups.name's UNIQUE constraint."""
+    row = conn.execute('SELECT id FROM bookmark_groups WHERE name=?', (name,)).fetchone()
+    if row:
+        return row[0]
+    return save_bookmark_group(conn, name)
+
+
 def update_bookmark_group_color(conn: 'sqlite3.Connection',
                                 group_id: int, color: str) -> None:
     """Change an existing group's own badge color (examiner-triggered,
@@ -1409,6 +1422,34 @@ def load_bookmark_colors(conn: 'sqlite3.Connection') -> dict:
     for ui_path, color in rows:
         if ui_path not in result:
             result[ui_path] = color or BOOKMARK_COLOR_PALETTE[0]
+    return result
+
+
+def load_bookmark_colors_multi(conn: 'sqlite3.Connection') -> dict:
+    """Maps every bookmarked ui_path to ALL of its own groups' colors
+    (group_id ascending, duplicates removed but order preserved) rather
+    than load_bookmark_colors' single earliest-group-wins pick. Added
+    2026-10-07 for the File Browser's own split-color Name-column tint
+    (FileTableModel.data()'s BackgroundRole branch renders a 1-color
+    file as a plain tint, a 2+-color file as hard-edged equal bands) —
+    direct request after "Import Bookmarks…" left several files
+    genuinely in two groups at once (an earlier test import plus the
+    real one) and the single-color version's silent earliest-wins pick
+    made that invisible. The Media Browser's own badge still uses
+    load_bookmark_colors' single-color version unchanged — not asked to
+    change there, and its badge is a small outline rather than a filled
+    cell background, so splitting it isn't the same kind of fit."""
+    rows = conn.execute(
+        'SELECT be.ui_path, g.color FROM bookmark_entries be '
+        'JOIN bookmark_groups g ON g.id = be.group_id '
+        'ORDER BY be.group_id ASC'
+    ).fetchall()
+    result: dict = {}
+    for ui_path, color in rows:
+        c = color or BOOKMARK_COLOR_PALETTE[0]
+        colors = result.setdefault(ui_path, [])
+        if c not in colors:
+            colors.append(c)
     return result
 
 

@@ -46,6 +46,8 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       save_bookmark_entries, load_bookmark_entries,
                       delete_bookmark_group, load_all_bookmarked_paths,
                       update_bookmark_group_color, load_bookmark_colors,
+                      load_bookmark_colors_multi,
+                      get_or_create_bookmark_group,
                       BOOKMARK_COLOR_PALETTE,
                       mark_media_seen, unmark_media_seen, load_seen_media_paths,
                       indexed_leveldb_folders,
@@ -57,6 +59,7 @@ import header_scan
 import nested_archive
 import embedded_media_skip_list
 import user_media_ignore_list
+import spreadsheet_import
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin
 from keyword_search import KeywordSearchMixin, format_byte_size
@@ -93,9 +96,12 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QTreeWidget, QTreeWidgetItem, QTextEdit,
                               QListWidget, QListWidgetItem, QDateEdit,
                               QRadioButton, QButtonGroup, QInputDialog, QSpinBox,
-                              QColorDialog, QStyleFactory)
+                              QColorDialog, QStyleFactory,
+                              QTableWidget, QTableWidgetItem, QFormLayout, QGroupBox,
+                              QStyledItemDelegate)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
-                           QColor, QIcon, QShortcut, QKeySequence, QCursor, QPixmap)
+                           QColor, QIcon, QShortcut, QKeySequence, QCursor, QPixmap,
+                           QBrush)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QDate,
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
                              qInstallMessageHandler, QtMsgType)
@@ -1950,18 +1956,23 @@ class FileTableModel(QAbstractTableModel):
     _research_fg  = None
     _research_tip = None
 
-    # {ui_path: "#rrggbb"} for the Name column's own background tint — the
-    # bookmark group a file belongs to (earliest group on a multi-group
-    # file, matching db_utils.load_bookmark_colors' own rule), injected by
-    # _set_file_model the same way as the research callbacks above. Added
-    # 2026-09-26, direct request: "can the filename cell for the bookmarked
-    # file in backgroud be the colour of the bookmark[?] so when you look
-    # at the files in the folder you can see the bookmark against the
-    # other files" — the right-click "Select Bookmarked Files" action
-    # (see that method's own docstring) selects a bookmark's CONTAINING
-    # folder(s), not the individual files, so browsing into one of those
-    # folders shows the bookmarked file mixed in with every other real
-    # file there; this is what lets it still stand out.
+    # {ui_path: ["#rrggbb", ...]} for the Name column's own background
+    # tint — every group color a file belongs to, in group-id order
+    # (db_utils.load_bookmark_colors_multi), injected by _set_file_model
+    # the same way as the research callbacks above. Added 2026-09-26,
+    # direct request: "can the filename cell for the bookmarked file in
+    # backgroud be the colour of the bookmark[?] so when you look at the
+    # files in the folder you can see the bookmark against the other
+    # files" — the right-click "Select Bookmarked Files" action (see that
+    # method's own docstring) selects a bookmark's CONTAINING folder(s),
+    # not the individual files, so browsing into one of those folders
+    # shows the bookmarked file mixed in with every other real file
+    # there; this is what lets it still stand out. A single-color list
+    # renders as a plain tint; 2+ colors render as hard-edged equal
+    # bands (see the BackgroundRole branch below) — added 2026-10-07,
+    # direct report after a file bookmarked into two groups silently
+    # only showed its EARLIEST group's color, making the other
+    # membership invisible at a glance.
     _bookmark_colors: dict = {}
 
     def __init__(self, headers, parent=None):
@@ -2080,15 +2091,24 @@ class FileTableModel(QAbstractTableModel):
                     return c
             return self._GREY_COLOR if row[4] else None
         if role == Qt.ItemDataRole.BackgroundRole and real_col == 0 and self._bookmark_colors:
-            color_hex = self._bookmark_colors.get(row[1])
-            if color_hex:
+            colors = self._bookmark_colors.get(row[1])
+            if not colors:
+                return None
+            # Only the plain single-color case is handled here — a flat
+            # QColor paints correctly through the normal BackgroundRole
+            # path. 2+ colors are handled entirely by
+            # BookmarkSplitColorDelegate (installed on this column)
+            # instead — see that class's own docstring for why a delegate
+            # was used rather than a QLinearGradient brush returned from
+            # here.
+            if len(colors) == 1:
                 # Translucent, not the group's own full-saturation color —
                 # same "tint, don't paint over" convention this project's
                 # own sqlite_viewer.py WAL-diff/segb_viewer.py deleted-
                 # record highlighting already use, so filenames stay
                 # readable in both light and dark mode regardless of
                 # which bookmark color a group happens to use.
-                c = QColor(color_hex)
+                c = QColor(colors[0])
                 c.setAlpha(70)
                 return c
             return None
@@ -2278,6 +2298,66 @@ class FileTableModel(QAbstractTableModel):
         self.layoutChanged.emit()
 
 
+class BookmarkSplitColorDelegate(QStyledItemDelegate):
+    """Paints the File Browser's Name column background as exact,
+    pixel-precise equal-width bands when a file is bookmarked into 2+
+    groups — one band per group's own color, hard-edged, left to right
+    in group-id order. The single-color case (one group, or no
+    bookmark) is left to FileTableModel's own plain BackgroundRole —
+    only installed on the Name column; every other column paints
+    normally via the superclass.
+
+    Added 2026-10-07 — a first attempt returned a
+    QLinearGradient(ObjectBoundingMode) QBrush straight from
+    BackgroundRole instead of using a delegate at all. A direct report
+    ("colour are not taking up an equal proportion") prompted pixel-
+    sampling the real rendered view to check it — that first sampling
+    pass itself had a bug (grabbing the whole QTableView, which includes
+    its column-header row, while reading coordinates from visualRect(),
+    which excludes it — so the sampled y values actually landed in the
+    HEADER, not the data row being checked) and wrongly suggested the
+    gradient wasn't dividing evenly at all. Once that offset was fixed,
+    corrected sampling showed the gradient version actually DID land on
+    exact pixel boundaries (131/262 for a 2-color split, 87/174/262 for
+    3 colors). Kept this delegate anyway, now confirmed correct the same
+    rigorous way (exact boundary pixels, not a visual guess): filling
+    each band's own literal QRect is simpler to reason about and doesn't
+    depend on how a particular Qt paint pipeline interprets a gradient's
+    coordinate mode, which is one less thing to get subtly wrong again."""
+
+    def __init__(self, get_colors, parent=None):
+        super().__init__(parent)
+        self._get_colors = get_colors   # callable(ui_path) -> list[str] | None
+
+    def paint(self, painter, option, index):
+        ui_path = index.data(Qt.ItemDataRole.UserRole)
+        colors = self._get_colors(ui_path) if ui_path else None
+        if not colors or len(colors) < 2:
+            super().paint(painter, option, index)
+            return
+        self.initStyleOption(option, index)
+        rect = option.rect
+        n = len(colors)
+        painter.save()
+        painter.setClipRect(rect)
+        for i, color_hex in enumerate(colors):
+            c = QColor(color_hex)
+            c.setAlpha(70)   # same translucent "tint, don't paint over" convention as the single-color case
+            x0 = rect.left() + round(rect.width() * i / n)
+            x1 = rect.left() + round(rect.width() * (i + 1) / n)
+            painter.fillRect(x0, rect.top(), x1 - x0, rect.height(), c)
+        painter.restore()
+        # Background bands are already down — the base style must not
+        # paint over them. Blank backgroundBrush (not None — initStyleOption
+        # already resolved it from BackgroundRole, which is None in the
+        # 2+-color case per FileTableModel's own data(), but setting it
+        # explicitly here documents the dependency rather than relying on
+        # that silently staying true) so only selection highlight/icon/text
+        # draw on top.
+        option.backgroundBrush = QBrush(Qt.BrushStyle.NoBrush)
+        super().paint(painter, option, index)
+
+
 class MultiColumnFilterProxy(QSortFilterProxyModel):
     """Thin proxy used only for sort delegation — filtering is now handled
     inside FileTableModel so filterAcceptsRow always returns True."""
@@ -2293,6 +2373,442 @@ class MultiColumnFilterProxy(QSortFilterProxyModel):
         if src is not None:
             assert isinstance(src, FileTableModel)
             src.set_filter(*args, **kwargs)
+
+
+class ImportBookmarksWorker(QThread):
+    """Runs one "Import Bookmarks…" pass in the background: for every
+    spreadsheet row, normalizes the path/hash columns, looks the path up
+    in the FFS, re-hashes the FILE'S OWN BYTES from the archive, and only
+    bookmarks it when that hash matches the spreadsheet's — the row's own
+    hash column is evidence to VERIFY against, never trusted as a label.
+    Added 2026-10-07, direct request to import a spreadsheet of known
+    hashes+paths (e.g. a ProjectVic CAID differences/export report) and
+    bookmark whichever rows genuinely verify against this archive.
+
+    Owns its own independent CachedZipView (never the GUI's shared
+    self._zip_handle) — same standing convention every other background
+    worker in this file already follows (EmbeddedMediaScanWorker,
+    KeywordSearchWorker, ...).
+
+    Group-per-bookmark-value, not a single imported group — direct
+    choice when this was scoped: each distinct value from the chosen
+    bookmark-value column (or the one fixed value, if that mode was
+    picked instead) becomes/reuses its own bookmark group (via
+    get_or_create_bookmark_group), so results land organized the same
+    way the source spreadsheet already organized them (e.g. a ProjectVic
+    STATUS column's distinct values). A row whose value column is blank
+    falls back to *default_group_name* rather than being silently
+    dropped — a verified hash match is real evidence; a missing label
+    shouldn't be the reason it never gets bookmarked."""
+    progress      = Signal(int, int, str)   # (index, total, current ui_path or '')
+    finished_import = Signal(dict)          # summary — see run()'s own tail
+
+    def __init__(self, zip_path: str, case_dir: str, ffs_adapter, rows: list,
+                archive_basename: str, hash_col: int, hash_algo: str,
+                filepath_col: int, filename_col: int | None,
+                bookmark_col: int | None, fixed_bookmark_value: str,
+                default_group_name: str, allowed_values: set | None = None,
+                parent=None):
+        super().__init__(parent)
+        self._zip_path = zip_path
+        self._case_dir = case_dir
+        self._adapter = ffs_adapter
+        self._rows = rows
+        self._archive_basename = archive_basename
+        self._hash_col = hash_col
+        self._hash_algo = hash_algo
+        self._filepath_col = filepath_col
+        self._filename_col = filename_col
+        self._bookmark_col = bookmark_col
+        self._fixed_bookmark_value = fixed_bookmark_value.strip()
+        self._default_group_name = default_group_name
+        # Restricts which bookmark-column VALUES get imported at all —
+        # e.g. only "Evidence - Videos" out of several distinct values
+        # present in the column — direct request, 2026-10-07. None (the
+        # common case) means no filtering, every verified match gets
+        # bookmarked. Only ever set in "From a column" mode — a fixed
+        # value has nothing to filter between.
+        self._allowed_values = allowed_values
+
+    def run(self):
+        import spreadsheet_import as si
+
+        z = _build_cached_zip_view(self._zip_path, self._case_dir)
+        if z is None:
+            self.finished_import.emit({'error': 'Local .zcd cache not available'})
+            return
+
+        total = len(self._rows)
+        groups: dict[str, list[tuple[str, str]]] = {}
+        n_matched = n_hash_mismatch = n_not_found = n_missing_data = n_group_excluded = 0
+
+        for i, row in enumerate(self._rows):
+            if self.isInterruptionRequested():
+                break
+            raw_hash = row[self._hash_col] if self._hash_col < len(row) else ''
+            raw_path = row[self._filepath_col] if self._filepath_col < len(row) else ''
+            expected_hash = si.normalize_hash(raw_hash)
+            if not expected_hash or not raw_path.strip():
+                n_missing_data += 1
+                self.progress.emit(i, total, '')
+                continue
+            ui_path = si.normalize_ffs_path(raw_path, self._archive_basename)
+            self.progress.emit(i, total, ui_path)
+            if not ui_path:
+                n_missing_data += 1
+                continue
+            if self._bookmark_col is not None and self._bookmark_col < len(row) and row[self._bookmark_col].strip():
+                bookmark_value = row[self._bookmark_col].strip()
+            else:
+                bookmark_value = self._fixed_bookmark_value or self._default_group_name
+            # Checked BEFORE the archive read/hash below — skipping an
+            # excluded row early avoids hashing a (possibly large) file
+            # the examiner has already said they don't want bookmarked.
+            if self._allowed_values is not None and bookmark_value not in self._allowed_values:
+                n_group_excluded += 1
+                continue
+            try:
+                physical = self._adapter.resolve(ui_path)
+                data = z.open(physical).read()
+            except Exception:
+                data = None
+            if data is None:
+                n_not_found += 1
+                continue
+            actual_hash = si.compute_hash(data, self._hash_algo)
+            if actual_hash != expected_hash:
+                n_hash_mismatch += 1
+                continue
+            n_matched += 1
+            if self._filename_col is not None and self._filename_col < len(row) and row[self._filename_col].strip():
+                display_name = row[self._filename_col].strip()
+            else:
+                display_name = os.path.basename(ui_path)
+            groups.setdefault(bookmark_value, []).append((ui_path, display_name))
+
+        self.progress.emit(total, total, '')
+
+        group_summaries = []
+        if groups and self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    for name, entries in groups.items():
+                        group_id = get_or_create_bookmark_group(db, name)
+                        save_bookmark_entries(db, group_id, entries)
+                        group_summaries.append({'name': name, 'count': len(entries)})
+            except Exception as e:
+                self.finished_import.emit({'error': f'Could not save bookmarks: {e}'})
+                return
+
+        self.finished_import.emit({
+            'total': total, 'matched': n_matched,
+            'hash_mismatch': n_hash_mismatch, 'not_found': n_not_found,
+            'missing_data': n_missing_data, 'group_excluded': n_group_excluded,
+            'groups': group_summaries,
+        })
+
+
+class ImportBookmarksDialog(QDialog):
+    """"Import Bookmarks…" — pick a CSV/XLSX hash list, map its columns
+    (hash + algorithm, filepath, optional separate filename, bookmark
+    value), preview the mapping against the file's own first few rows,
+    then run ImportBookmarksWorker. See that class's own docstring for
+    the matching/bookmarking design."""
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Bookmarks…")
+        self.setMinimumWidth(640)
+        self._window = window
+        self._file_path: str | None = None
+        self._headers: list[str] = []
+        self._rows: list[list[str]] = []
+        self._worker: ImportBookmarksWorker | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        file_row = QHBoxLayout()
+        self._file_label = QLabel("No file selected.")
+        self._file_label.setWordWrap(True)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._browse)
+        file_row.addWidget(self._file_label, 1)
+        file_row.addWidget(browse_btn)
+        layout.addLayout(file_row)
+        layout.addWidget(note_label(
+            "Each row is matched by filepath, then CONFIRMED by re-hashing "
+            "that file's own bytes from this archive — only a verified "
+            "match is bookmarked. CSV or XLSX only."))
+
+        self._mapping_box = QGroupBox("Column Mapping")
+        self._mapping_box.setEnabled(False)
+        form = QFormLayout(self._mapping_box)
+
+        self._hash_combo = QComboBox()
+        form.addRow("Hash column:", self._hash_combo)
+        self._hash_type_combo = QComboBox()
+        self._hash_type_combo.addItems(list(spreadsheet_import.HASH_ALGORITHMS.keys()))
+        form.addRow("Hash type:", self._hash_type_combo)
+        self._filepath_combo = QComboBox()
+        form.addRow("Filepath column:", self._filepath_combo)
+
+        filename_row = QHBoxLayout()
+        self._filename_check = QCheckBox("Filename is its own column:")
+        self._filename_check.toggled.connect(self._on_filename_toggled)
+        self._filename_combo = QComboBox()
+        self._filename_combo.setEnabled(False)
+        filename_row.addWidget(self._filename_check)
+        filename_row.addWidget(self._filename_combo, 1)
+        form.addRow(filename_row)
+        form.addRow(note_label(
+            "Unchecked: the filename is read from the end of the filepath column."))
+
+        self._bookmark_col_radio = QRadioButton("From a column:")
+        self._bookmark_fixed_radio = QRadioButton("One fixed value for every row:")
+        self._bookmark_fixed_radio.setChecked(True)
+        bm_group = QButtonGroup(self)
+        bm_group.addButton(self._bookmark_col_radio)
+        bm_group.addButton(self._bookmark_fixed_radio)
+        self._bookmark_col_combo = QComboBox()
+        self._bookmark_col_combo.setEnabled(False)
+        self._bookmark_col_radio.toggled.connect(self._bookmark_col_combo.setEnabled)
+        self._bookmark_fixed_edit = QLineEdit("Imported")
+        self._bookmark_fixed_radio.toggled.connect(self._bookmark_fixed_edit.setEnabled)
+        bm_col_row = QHBoxLayout()
+        bm_col_row.addWidget(self._bookmark_col_radio)
+        bm_col_row.addWidget(self._bookmark_col_combo, 1)
+        bm_fixed_row = QHBoxLayout()
+        bm_fixed_row.addWidget(self._bookmark_fixed_radio)
+        bm_fixed_row.addWidget(self._bookmark_fixed_edit, 1)
+        form.addRow("Bookmark group name:", bm_col_row)
+        form.addRow("", bm_fixed_row)
+        form.addRow(note_label(
+            "Each distinct value becomes (or reuses) its own bookmark group."))
+
+        # Which distinct values (from the bookmark column) to actually
+        # import — only meaningful in "From a column" mode, since "One
+        # fixed value" only ever has the one value. Added 2026-10-07,
+        # direct request: import only specific groups (e.g. only
+        # "Evidence - Videos" out of several distinct STATUS/CATEGORY
+        # values present in the sheet), not an all-or-nothing run.
+        self._group_values_box = QGroupBox("Which values to import")
+        self._group_values_box.setEnabled(False)
+        gv_layout = QVBoxLayout(self._group_values_box)
+        gv_btn_row = QHBoxLayout()
+        gv_select_all = QPushButton("Select All")
+        gv_select_all.clicked.connect(lambda: self._set_all_group_values_checked(True))
+        gv_select_none = QPushButton("Select None")
+        gv_select_none.clicked.connect(lambda: self._set_all_group_values_checked(False))
+        gv_btn_row.addWidget(gv_select_all)
+        gv_btn_row.addWidget(gv_select_none)
+        gv_btn_row.addStretch()
+        gv_layout.addLayout(gv_btn_row)
+        self._group_values_list = QListWidget()
+        self._group_values_list.setMaximumHeight(120)
+        gv_layout.addWidget(self._group_values_list)
+        form.addRow(self._group_values_box)
+
+        for combo in (self._hash_combo, self._filepath_combo, self._filename_combo,
+                     self._bookmark_col_combo):
+            combo.currentIndexChanged.connect(self._update_preview)
+        self._bookmark_col_combo.currentIndexChanged.connect(self._refresh_group_values_list)
+        self._bookmark_col_radio.toggled.connect(self._refresh_group_values_list)
+
+        layout.addWidget(self._mapping_box)
+
+        layout.addWidget(QLabel("Preview (first 5 rows):"))
+        self._preview_table = QTableWidget(0, 4)
+        self._preview_table.setHorizontalHeaderLabels(
+            ["Hash", "Filepath", "Filename", "Bookmark Group"])
+        self._preview_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._preview_table.setMaximumHeight(160)
+        layout.addWidget(self._preview_table)
+
+        self._progress_label = QLabel("")
+        layout.addWidget(self._progress_label)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setVisible(False)
+        layout.addWidget(self._progress_bar)
+
+        btn_row, self._cancel_btn, self._run_btn = button_row(
+            self, ok_text="Run Import", on_ok=self._run_import)
+        self._run_btn.setEnabled(False)
+        layout.addLayout(btn_row)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Spreadsheet", "", "Spreadsheets (*.csv *.xlsx)")
+        if not path:
+            return
+        try:
+            headers, rows = spreadsheet_import.read_spreadsheet(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Bookmarks", f"Couldn't read this file:\n{e}")
+            return
+        if not headers or not rows:
+            QMessageBox.critical(self, "Import Bookmarks",
+                                 "This file has no header row, or no data rows.")
+            return
+        self._file_path = path
+        self._headers = headers
+        self._rows = rows
+        self._file_label.setText(f"{os.path.basename(path)} — {len(rows):,} rows")
+        self._bookmark_fixed_edit.setText(f"Imported — {os.path.basename(path)}")
+        for combo in (self._hash_combo, self._filepath_combo, self._filename_combo,
+                     self._bookmark_col_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(headers)
+            combo.blockSignals(False)
+        self._mapping_box.setEnabled(True)
+        self._run_btn.setEnabled(True)
+        self._refresh_group_values_list()
+        self._update_preview()
+
+    def _on_filename_toggled(self, checked: bool):
+        self._filename_combo.setEnabled(checked)
+        self._update_preview()
+
+    def _refresh_group_values_list(self):
+        """Repopulate the "Which values to import" checklist with every
+        distinct, non-blank value currently in the chosen bookmark
+        column — only when "From a column" mode is selected; cleared and
+        disabled otherwise, since "One fixed value" has nothing to
+        choose between. Previously-checked values are preserved across a
+        refresh (e.g. switching to a different column and back) by
+        name, not position."""
+        previously_checked = {
+            self._group_values_list.item(i).text()
+            for i in range(self._group_values_list.count())
+            if self._group_values_list.item(i).checkState() == Qt.CheckState.Checked
+        }
+        had_any_items = self._group_values_list.count() > 0
+        self._group_values_list.clear()
+        if not self._bookmark_col_radio.isChecked() or not self._rows:
+            self._group_values_box.setEnabled(False)
+            return
+        self._group_values_box.setEnabled(True)
+        bm_i = self._bookmark_col_combo.currentIndex()
+        if bm_i < 0:
+            return
+        values = sorted({row[bm_i].strip() for row in self._rows
+                        if bm_i < len(row) and row[bm_i].strip()})
+        for value in values:
+            item = QListWidgetItem(value)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            checked = value in previously_checked if had_any_items else True
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            self._group_values_list.addItem(item)
+
+    def _set_all_group_values_checked(self, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for i in range(self._group_values_list.count()):
+            self._group_values_list.item(i).setCheckState(state)
+
+    def _update_preview(self):
+        if not self._rows:
+            return
+        archive_basename = os.path.basename(self._window.zip_path) if self._window.zip_path else ''
+        hash_i = self._hash_combo.currentIndex()
+        path_i = self._filepath_combo.currentIndex()
+        name_i = self._filename_combo.currentIndex() if self._filename_check.isChecked() else -1
+        bm_i = self._bookmark_col_combo.currentIndex() if self._bookmark_col_radio.isChecked() else -1
+        preview_rows = self._rows[:5]
+        self._preview_table.setRowCount(len(preview_rows))
+        for r, row in enumerate(preview_rows):
+            h = spreadsheet_import.normalize_hash(row[hash_i]) if 0 <= hash_i < len(row) else ''
+            raw_path = row[path_i] if 0 <= path_i < len(row) else ''
+            ui_path = spreadsheet_import.normalize_ffs_path(raw_path, archive_basename) if raw_path else ''
+            if name_i >= 0 and name_i < len(row) and row[name_i].strip():
+                fname = row[name_i].strip()
+            else:
+                fname = os.path.basename(ui_path) if ui_path else ''
+            if bm_i >= 0 and bm_i < len(row) and row[bm_i].strip():
+                bm = row[bm_i].strip()
+            else:
+                bm = self._bookmark_fixed_edit.text().strip()
+            for col, text in enumerate((h, ui_path, fname, bm)):
+                self._preview_table.setItem(r, col, QTableWidgetItem(text))
+
+    def _run_import(self):
+        if not self._window.zip_path:
+            QMessageBox.critical(self, "Import Bookmarks", "No archive is loaded.")
+            return
+        hash_i = self._hash_combo.currentIndex()
+        path_i = self._filepath_combo.currentIndex()
+        name_i = self._filename_combo.currentIndex() if self._filename_check.isChecked() else None
+        bm_i = self._bookmark_col_combo.currentIndex() if self._bookmark_col_radio.isChecked() else None
+        hash_algo = spreadsheet_import.HASH_ALGORITHMS[self._hash_type_combo.currentText()]
+        archive_basename = os.path.basename(self._window.zip_path)
+        default_group_name = self._bookmark_fixed_edit.text().strip() or "Imported"
+
+        # Only filter by the checklist when the examiner has actually
+        # narrowed it down (unchecked at least one value) — if every
+        # listed value is still checked (the untouched default), import
+        # everything unfiltered, same as before this feature existed.
+        # Otherwise a row whose bookmark-column cell is BLANK (which
+        # falls back to default_group_name, a name that can never appear
+        # in this checklist) would start silently getting skipped the
+        # moment the sheet has any blank cells at all, even though the
+        # examiner never asked to narrow anything down.
+        allowed_values = None
+        if bm_i is not None and self._group_values_list.count() > 0:
+            checked = {self._group_values_list.item(i).text()
+                      for i in range(self._group_values_list.count())
+                      if self._group_values_list.item(i).checkState() == Qt.CheckState.Checked}
+            if len(checked) < self._group_values_list.count():
+                allowed_values = checked
+
+        self._mapping_box.setEnabled(False)
+        self._run_btn.setEnabled(False)
+        self._cancel_btn.setText("Cancel")
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, len(self._rows))
+
+        self._worker = ImportBookmarksWorker(
+            self._window.zip_path, self._window._case_dir, self._window._adapter,
+            self._rows, archive_basename, hash_i, hash_algo, path_i, name_i,
+            bm_i, self._bookmark_fixed_edit.text() if bm_i is None else '',
+            default_group_name, allowed_values, parent=self)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished_import.connect(self._on_finished)
+        self._cancel_btn.clicked.disconnect()
+        self._cancel_btn.clicked.connect(self._worker.requestInterruption)
+        self._worker.start()
+
+    def _on_progress(self, i: int, total: int, ui_path: str):
+        self._progress_bar.setValue(i)
+        self._progress_label.setText(f"Checking {i:,} of {total:,} — {ui_path}")
+
+    def _on_finished(self, summary: dict):
+        self._progress_bar.setValue(self._progress_bar.maximum())
+        if 'error' in summary:
+            QMessageBox.critical(self, "Import Bookmarks", summary['error'])
+            self.reject()
+            return
+        lines = [
+            f"Bookmarked: {summary['matched']:,}",
+            f"Hash didn't match: {summary['hash_mismatch']:,}",
+            f"Not found in this archive: {summary['not_found']:,}",
+            f"Blank hash/path cell: {summary['missing_data']:,}",
+        ]
+        if summary.get('group_excluded'):
+            lines.append(f"Skipped (group not selected): {summary['group_excluded']:,}")
+        if summary['groups']:
+            lines.append("")
+            lines.append("Groups:")
+            for g in summary['groups']:
+                lines.append(f"  {g['name']} — {g['count']:,}")
+        QMessageBox.information(self, "Import Bookmarks Complete", "\n".join(lines))
+        self._window._refresh_bookmark_panel()
+        self.accept()
+
+    def reject(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.requestInterruption()
+            self._worker.wait()
+        super().reject()
 
 
 class ExportProgressDialog(QDialog):
@@ -5492,6 +6008,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # that coincidence).
         self._timestamp_display_act.triggered.connect(lambda: self._timestamp_display_dialog())
         self._tools_menu.addAction(self._timestamp_display_act)
+        self._import_bookmarks_act = QAction("Import Bookmarks…", self)
+        self._import_bookmarks_act.setEnabled(False)   # needs an open case
+        self._import_bookmarks_act.triggered.connect(self._open_import_bookmarks_dialog)
+        self._tools_menu.addAction(self._import_bookmarks_act)
         self._view_path = ""
         self._view_is_recursive = False
         # True while self._view_path points at a single real folder shown
@@ -5677,6 +6197,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._reset_tree_model()
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.tree_model)
+        self.tree_view.selectionModel().currentChanged.connect(self._on_tree_current_changed)
         # Forced to Fusion, not the native macOS style — direct report,
         # 2026-09-26: "the checkboxes are not visable on the folder
         # structure on mac os[,] both in dark and light mode[;] there is
@@ -5828,6 +6349,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._file_view_style = QStyleFactory.create("Fusion")
         if self._file_view_style is not None:
             self.file_view.setStyle(self._file_view_style)
+        # Model column 1 is always "Name" (file_headers always starts
+        # with it, column 0 is the synthetic checkbox gutter) — looks up
+        # self.file_model fresh on every paint rather than capturing the
+        # model instance here, since _set_file_model swaps in a new
+        # FileTableModel on every archive/folder-shape change.
+        self._bookmark_split_delegate = BookmarkSplitColorDelegate(
+            lambda ui_path: self.file_model._bookmark_colors.get(ui_path), parent=self)
+        self.file_view.setItemDelegateForColumn(1, self._bookmark_split_delegate)
         # User-defined column order, persisted across views and sessions.
         _s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         saved_order = _s.value('file_column_order', []) or []
@@ -6075,7 +6604,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return {}
         try:
             with closing(_open_results_db(self._case_dir)) as conn:
-                return load_bookmark_colors(conn)
+                return load_bookmark_colors_multi(conn)
         except Exception:
             return {}
 
@@ -7211,15 +7740,124 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """The shared select+scroll+open tail navigate_tree_to_path uses
         for either branch — factored out 2026-09-26 so both the
         "Selected only" and "Full Filesystem" jump paths share exactly
-        one implementation of it."""
+        one implementation of it. setCurrentIndex alone drives the
+        actual scrolling — see _on_tree_current_changed, connected to
+        the tree's own selection model — so this no longer needs its
+        own visibility check."""
         new_idx = self.tree_model.indexFromItem(item)
         self.tree_view.setCurrentIndex(new_idx)
-        # For programmatic navigation, only scroll when the target is not already visible.
-        rect = self.tree_view.visualRect(new_idx)
-        if not self.tree_view.viewport().rect().contains(rect):
-            self.tree_view.scrollTo(new_idx, QAbstractItemView.ScrollHint.EnsureVisible)
         self._view_is_recursive = False
         self.on_folder_selected(new_idx)
+
+    def _on_tree_current_changed(self, current, previous) -> None:
+        """Connected to the tree's own QItemSelectionModel.currentChanged
+        — reconnected after every setModel() call, since Qt replaces the
+        selection model each time (see each setModel call site) — so
+        this one slot covers every way the tree's current item can
+        change: a click, arrow keys, or any of this file's many
+        programmatic jumps/rebuilds/redirects. Added 2026-10-05, direct
+        request to keep the selected item "clear[ly] visible" by always
+        showing it in hierarchical context rather than isolated:
+        vertically, the row directly ABOVE the selection (its immediate
+        predecessor in display order — NOT necessarily its parent, e.g.
+        when the selection has preceding siblings or their own expanded
+        subtrees) should stay visible too, not just the selection
+        itself; horizontally, the PARENT's own name/arrow specifically
+        should stay visible from its own start, even if the child's full
+        name has to be cut off on the right to make room. Replaces what
+        used to be separate, inconsistent manual scrollTo calls at each
+        selection call site.
+
+        Two real, non-obvious Qt behaviors confirmed empirically here
+        (reproduced on a bare QTreeView with no app code involved, not
+        just this view) before relying on them:
+          1. QTreeView.scrollTo(idx, EnsureVisible) only scrolls the
+             MINIMUM distance needed — when the target is below the
+             current viewport (the common case: selecting/navigating
+             forward/down), that lands it flush against the BOTTOM edge,
+             with nothing of it visible below and no row of context
+             above it guaranteed either. Direct report, 2026-10-06: "the
+             vertical lock is at the bottom I want near the top just
+             leave one row above" — EnsureVisible is the wrong primitive
+             for that; PositionAtTop plus a one-row-up nudge (below) is
+             used instead, whenever a scroll is actually needed at all.
+          2. QTreeView.scrollTo(idx, EnsureVisible) only ever adjusts the
+             VERTICAL scrollbar — it never touches the horizontal one,
+             even when the item's rect is entirely outside the viewport
+             horizontally. Only PositionAtCenter/Top/Bottom move it (and
+             PositionAtTop resets it to 0, harmless here since the
+             horizontal section below always recomputes its target from
+             whatever the scrollbar's value is at that point, never
+             assuming it's unchanged from before this method ran).
+             Confirmed by scrolling a deeply-indented item with EnsureVisible
+             and observing the horizontal scrollbar's value never changes."""
+        if not current.isValid():
+            return
+        item = self.tree_model.itemFromIndex(current)
+        if item is None:
+            return
+        viewport_rect = self.tree_view.viewport().rect()
+
+        # Vertical: if the item isn't already fully on-screen, land it
+        # near the TOP of the viewport (not minimally-scrolled flush
+        # against whichever edge is nearest, which is what plain
+        # EnsureVisible does and is what prompted this fix) — then nudge
+        # up by one row so the immediately preceding row (in display
+        # order, not necessarily the parent) stays visible as context
+        # above it. Already fully visible -> leave the scroll position
+        # alone (don't yank the view on every click) except for that same
+        # one-row-of-context nudge if it's missing. verticalScrollMode
+        # defaults to ScrollPerItem for this view (confirmed empirically
+        # — never set explicitly anywhere in this file), so a single step
+        # is exactly one row.
+        cur_rect = self.tree_view.visualRect(current)
+        fully_visible = (viewport_rect.top() <= cur_rect.top()
+                          and cur_rect.bottom() <= viewport_rect.bottom())
+        if not fully_visible:
+            self.tree_view.scrollTo(current, QAbstractItemView.ScrollHint.PositionAtTop)
+        above_idx = self.tree_view.indexAbove(current)
+        if above_idx.isValid():
+            above_rect = self.tree_view.visualRect(above_idx)
+            if above_rect.top() < viewport_rect.top():
+                vsb = self.tree_view.verticalScrollBar()
+                vsb.setValue(max(vsb.minimum(), vsb.value() - 1))
+
+        parent_item = item.parent()
+        if parent_item is None:
+            return  # top-level root ("/ [Full Filesystem]" / "Selected Only") has no parent to show
+        parent_index = self.tree_model.indexFromItem(parent_item)
+        if not parent_index.isValid():
+            return
+
+        # Horizontal: horizontalScrollMode defaults to ScrollPerPixel
+        # (also confirmed empirically) and scrollTo never moves it (see
+        # docstring above), so compute the target value directly rather
+        # than nudging from wherever scrollTo happened to leave it.
+        # "Virtual" (scroll-independent) x positions are recovered by
+        # adding back the CURRENT scrollbar value to each item's
+        # scroll-relative visualRect — this must happen before the
+        # scrollbar is changed below, since visualRect reports positions
+        # relative to whatever the scroll position is at the time of the
+        # call. Priority, per direct request: the parent's own name/
+        # arrow start must stay visible even if that cuts off the
+        # (already-indicated-by-selection) child's own full name on the
+        # right — so the final value is capped at the parent's own
+        # virtual left edge, never scrolled past it.
+        hsb = self.tree_view.horizontalScrollBar()
+        cur_hsb = hsb.value()
+        child_rect = self.tree_view.visualRect(current)
+        child_virtual_left = child_rect.left() + cur_hsb
+        child_virtual_right = child_virtual_left + child_rect.width()
+        if child_virtual_left < cur_hsb:
+            desired = child_virtual_left
+        elif child_virtual_right > cur_hsb + viewport_rect.width():
+            desired = child_virtual_right - viewport_rect.width()
+        else:
+            desired = cur_hsb
+        parent_rect = self.tree_view.visualRect(parent_index)
+        parent_virtual_left = parent_rect.left() + cur_hsb
+        new_hsb = min(desired, parent_virtual_left)
+        hsb.setValue(max(hsb.minimum(), min(hsb.maximum(), new_hsb)))
 
     def on_file_selected(self, index):
         source = self.proxy_model.mapToSource(index)
@@ -8346,6 +8984,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._populate_recent_menu()
             self._apply_ai_pref_visibility()
 
+    def _open_import_bookmarks_dialog(self):
+        dlg = ImportBookmarksDialog(self, parent=self)
+        dlg.exec()
+
     def _unextracted_archive_count(self) -> int:
         """Number of discoverable archives not yet successfully extracted.
 
@@ -8702,6 +9344,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._log(f"SESSION START — Archive loaded: {zip_path}")
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
+        self.tree_view.selectionModel().currentChanged.connect(self._on_tree_current_changed)
         self._start_search_index_build()
         # Clear hex viewer from the previous archive
         if self._hex_worker is not None and self._hex_worker.isRunning():
@@ -8933,6 +9576,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._artifact_act.setEnabled(True)
         self._mcp_act.setEnabled(True)
         self._timestamp_display_act.setEnabled(True)
+        self._import_bookmarks_act.setEnabled(True)
         # Header-type overrides and the photo index can take seconds of DB
         # reads on a big case; this whole slot runs between two frames, so
         # anything slow here is a beach ball.  Load them on the background
@@ -9072,10 +9716,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     # ── AI access (embedded MCP server) ───────────────────────────────────────
 
     def _apply_ai_pref_visibility(self):
-        """Show/hide the whole AI feature per the global preference; turning
-        it off in Preferences also stops any running server."""
+        """Show/hide the AI feature's own two actions per the global
+        preference; turning it off in Preferences also stops any running
+        server.
+
+        REAL BUG fixed 2026-10-07, found via direct report ("i can only
+        see file" in the menu bar) then confirmed with an actual
+        screenshot of the running app: this used to hide the entire
+        Tools MENU (`self._tools_menu.menuAction().setVisible(enabled)`)
+        rather than just these two actions — correct back when Tools
+        held only AI-related items (see the commit that added this
+        method), but silently wrong the moment Timestamp Display, and
+        now Import Bookmarks, joined the same menu: with AI access off
+        (the default for a fresh install — `ai_enabled` defaults to
+        False), the WHOLE Tools menu vanished, hiding those two
+        unrelated features along with it. Toggling the two AI actions
+        directly instead keeps Tools itself always visible."""
         enabled = _load_prefs().get('ai_enabled', False)
-        self._tools_menu.menuAction().setVisible(enabled)
+        self._mcp_act.setVisible(enabled)
+        self._mcp_copy_act.setVisible(enabled)
         if not enabled:
             self._shutdown_mcp_server("AI access turned off in Preferences")
 
@@ -10182,6 +10841,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._search_index_worker.wait()
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
+        self.tree_view.selectionModel().currentChanged.connect(self._on_tree_current_changed)
         self._tree_populating = True
         root_item = QStandardItem("/ [Full Filesystem]")
         root_item.setData("", Qt.ItemDataRole.UserRole)
@@ -12627,11 +13287,74 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         every path at or below a landmark, independent of creation order
         or whether a given ancestor item was shared with an earlier scope
         path in this same pass (an already-created item still needs its
-        own landmark check — it just skips the create step)."""
+        own landmark check — it just skips the create step).
+
+        Preserves expand state and the tree's own current selection
+        across the rebuild — added 2026-10-05, direct report: every
+        tick/untick ANYWHERE in the tree rebuilds this WHOLE branch
+        (root.removeRows destroys every existing item), which previously
+        reset every ancestor segment back to its bare landmark-folding
+        default — discarding any manual expansion the examiner had done
+        beyond it, even for a folder completely unrelated to whatever
+        was just (un)ticked, and leaving the tree's own selection
+        highlight on a now-destroyed item with nothing visibly selected.
+        Two fixes, both scoped to the SYNTHETIC ancestor-chain items this
+        method itself builds (the `created` dict) — never the real
+        content lazily loaded under an already-expanded scope-folder
+        leaf, which this same `removeRows` also wipes: restoring THAT
+        would mean re-triggering an arbitrarily deep async re-population,
+        a materially bigger feature than what was reported. A real,
+        already-ticked-but-currently-browsed-deeper folder degrades
+        gracefully anyway — the walk below naturally redirects back to
+        that scope folder's own top level (still real, still ticked),
+        which the examiner can simply re-expand, rather than anything
+        crashing or silently vanishing.
+        (1) previously_expanded, captured from the OLD tree before it's
+        destroyed, re-opens every ancestor item that was manually
+        expanded, on top of (never instead of) the landmark-folding
+        defaults — except a full_expand leaf, which must never be
+        force-expanded here regardless of its prior state (see that
+        set's own crash-risk comment below — expanding it schedules an
+        async job that can't survive a second rebuild landing before it
+        finishes).
+        (2) if the tree's own current selection was somewhere under this
+        branch, it's restored by path after rebuilding; if that exact
+        path no longer exists (it — or an ancestor of it — was the thing
+        just removed from scope), walks up to the nearest surviving
+        ancestor and navigates there (on_folder_selected), so the
+        examiner lands one level up rather than on a stale, orphaned
+        view. Never redirects to the synthetic root itself (not a real,
+        navigable folder) — if not even the top-level single-segment
+        ancestor survives, nothing further happens here; the caller's
+        own existing empty-scope handling (turning "Selected only" off)
+        takes over in that case."""
         root = self._selected_root_item
         if root is None:
             return
         container_paths, media_only_paths = self._selected_only_landmark_sets()
+
+        # Capture "before" state — the old tree is about to be destroyed.
+        previously_expanded: set[str] = set()
+        _stack = [root]
+        while _stack:
+            _item = _stack.pop()
+            if _item is not root:
+                _p = _item.data(Qt.ItemDataRole.UserRole)
+                if (_p and _p != _TREE_PLACEHOLDER
+                        and self.tree_view.isExpanded(self.tree_model.indexFromItem(_item))):
+                    previously_expanded.add(_p)
+            for _row in range(_item.rowCount()):
+                _stack.append(_item.child(_row))
+
+        current_path = None
+        _cur_idx = self.tree_view.currentIndex()
+        if _cur_idx.isValid():
+            _cur_item = self.tree_model.itemFromIndex(_cur_idx)
+            if _cur_item is not None and self._tree_item_root_is_selected_only(_cur_item):
+                _data = _cur_item.data(Qt.ItemDataRole.UserRole)
+                if _data and _data != _TREE_PLACEHOLDER:
+                    current_path = _data
+
         self.tree_model.blockSignals(True)
         try:
             root.removeRows(0, root.rowCount())
@@ -12678,9 +13401,24 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     full_expand.add(scope_path)
         finally:
             self.tree_model.blockSignals(False)
+        # A real, confirmed Qt quirk, found 2026-10-05 while testing expand-
+        # state restoration specifically against a SECOND (or later) call to
+        # this method in the same session — not something the original
+        # landmark-folding feature's own first-build-only testing had ever
+        # exercised: blockSignals above suppresses the rowsRemoved/
+        # rowsInserted notifications QTreeView normally relies on to keep
+        # its own internal layout/geometry cache in sync, so after a
+        # destroy-and-rebuild, every expand() call below silently fails to
+        # register (isExpanded() immediately reads back False) until the
+        # view is told to recompute its layout. doItemsLayout() forces
+        # exactly that, confirmed directly to fix it — without this call,
+        # isExpanded() comes back False for 'data' then 'data/data' then
+        # the landmark item (data/data/ch.protonmail.android) in a real
+        # second-rebuild test; with it, all three correctly stick.
+        self.tree_view.doItemsLayout()
         self.tree_view.expand(self.tree_model.indexFromItem(root))
         for path in created:
-            if not path or path in full_expand or path in past_landmark:
+            if not path or path in full_expand:
                 # A scope folder's own leaf item (full_expand) still
                 # carries a REAL, ordinary lazy placeholder — expanding
                 # it here would fire Qt's own `expanded` signal straight
@@ -12699,7 +13437,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 # checking two folders, declining a replace-confirmation,
                 # then confirming a second one crashed with exactly
                 # "Internal C++ object (QStandardItem) already deleted".
-                #
+                # Deliberately unconditional — NEVER force-expanded here
+                # even if it was previously_expanded (see this method's
+                # own docstring on why that's a hard constraint, not just
+                # a default).
+                continue
+            if path in past_landmark and path not in previously_expanded:
                 # past_landmark — added 2026-10-03 alongside full_expand
                 # for the identical reason: an item at or below the
                 # app-id/media-folder landmark still carries only the
@@ -12707,9 +13450,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 # folder (never a lazy placeholder of its own, unlike a
                 # full_expand leaf) — nothing async is scheduled by
                 # leaving it collapsed, so there's no crash risk here,
-                # just the same "don't auto-open this" intent.
+                # just the default "don't auto-open this" intent — which
+                # previously_expanded (2026-10-05) now overrides when the
+                # examiner had manually opened this exact item before.
                 continue
             self.tree_view.expand(self.tree_model.indexFromItem(created[path]))
+
+        # Restore or redirect the tree's own current selection — see
+        # this method's own docstring, point (2).
+        if current_path is not None:
+            _item = created.get(current_path)
+            if _item is not None:
+                self.tree_view.setCurrentIndex(self.tree_model.indexFromItem(_item))
+            else:
+                _parts = [p for p in current_path.split('/') if p]
+                while len(_parts) > 1:
+                    _parts.pop()
+                    _ancestor_item = created.get('/'.join(_parts))
+                    if _ancestor_item is not None:
+                        _idx = self.tree_model.indexFromItem(_ancestor_item)
+                        self.tree_view.setCurrentIndex(_idx)
+                        self.on_folder_selected(_idx)
+                        break
 
     def _apply_selected_only_visibility(self) -> None:
         """Instantly switches which of the two top-level tree roots is
@@ -12789,8 +13551,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             item = self._expand_walk_to_path(path, root_item=root_item)
             if item is not None and item.data(Qt.ItemDataRole.UserRole) == path:
                 idx = self.tree_model.indexFromItem(item)
+                # setCurrentIndex alone drives scrolling — see
+                # _on_tree_current_changed.
                 self.tree_view.setCurrentIndex(idx)
-                self.tree_view.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
                 return
         self.tree_view.setCurrentIndex(QModelIndex())
 

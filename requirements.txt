@@ -49,3 +49,7 @@ zstandard
 # full builds so the frozen exe includes the feature.
 mcp
 uvicorn
+# app/spreadsheet_import.py's .xlsx reading for the "Import Bookmarks…"
+# dialog. Lazy-imported only inside that module's own xlsx-reading
+# function, same optional-but-listed convention as brotli/zstandard above.
+openpyxl

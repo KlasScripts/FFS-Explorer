@@ -326,6 +326,34 @@ aware) or sitting inside an unextracted embedded archive (check
   `ai_summaries`, `embedded_media_hits`, `media_seen` (Media Browser's own
   "Not Relevant" tracking — one row per file marked reviewed).
 
+**Import Bookmarks…** (Tools menu) — bulk-bookmarks files from a CSV/XLSX
+hash list (e.g. a ProjectVic CAID differences/export report): the
+examiner maps which column holds the hash (+ its algorithm), the
+filepath, an optional separate filename, and which column (or one fixed
+value) becomes the bookmark group name. A row's own hash is matched by
+path then CONFIRMED by re-hashing that file's actual bytes from the
+archive — never trusted as a label on its own. Each distinct bookmark-
+value becomes/reuses its own group (`get_or_create_bookmark_group`), so
+results land organized the same way the source spreadsheet already was.
+`app/spreadsheet_import.py` (Qt-free) does the parsing/normalization;
+`ImportBookmarksWorker`/`ImportBookmarksDialog` in `ffs-explorer.py` do
+the archive matching and UI. A spreadsheet's path cells commonly carry
+the source archive's own filename as their first segment (confirmed
+against a real ProjectVic export, 2026-10-07) — stripped before matching,
+since this app's own ui_path convention never includes it.
+
+In "From a column" mode, a checklist (every distinct value in the
+chosen column, all checked by default) lets the examiner import only
+specific groups (e.g. only "Evidence - Videos" out of several values
+present) instead of all-or-nothing — only shown in that mode, since a
+fixed value has nothing to choose between. Only applies real filtering
+once the examiner has actually unchecked something; left fully checked,
+behavior is unfiltered (including the existing blank-cell-falls-back-to-
+the-default-group rule) — otherwise a sheet with ANY blank cells in the
+bookmark column would start silently dropping those rows the moment
+this feature shipped, even for an examiner who never touched the
+checklist at all.
+
 ## app/ modules
 
 | File | What it is |
@@ -368,6 +396,7 @@ aware) or sitting inside an unextracted embedded archive (check
 | `mcp_server.py` | Read-only MCP server over processed case data — `list_apps`, `get_sqlite_schema`/`sample_sqlite_rows` (opt-in, Tier 3), `build_artifact_parser` prompt, AI Summary tools. |
 | `mcp_control.py` | Lifecycle for the embedded MCP server (uvicorn, localhost + per-start bearer token). |
 | `highlight_delegate.py` | Yellow highlight of the active search term in views. |
+| `spreadsheet_import.py` | Qt-free CSV/XLSX reading + path/hash normalization for "Import Bookmarks…" — see above. |
 
 ## ffs-explorer.py section map (no line numbers — see why below)
 
@@ -569,6 +598,54 @@ re-checked. No need to say anything for 🔴/🟡 rows.
   verification script must neutralize every modal its own code path can
   reach (the Timestamp Display dialog's first-load prompt is a common one
   to forget), not just the one the test author happened to expect.
+- After a `QTreeView`/`QStandardItemModel` subtree is destroyed and
+  rebuilt under `blockSignals(True)` (needed to suppress spurious
+  `itemChanged` firing while mass-constructing items), a subsequent
+  `tree_view.expand(index)` on a freshly-built item can silently fail to
+  register (`isExpanded()` reads back `False` immediately after) — the
+  view's own layout/geometry cache never got the suppressed rowsRemoved/
+  rowsInserted notifications it normally relies on to stay in sync. Call
+  `tree_view.doItemsLayout()` once, right after re-enabling signals and
+  before any `expand()` calls, to force it to recompute. Only shows up
+  on a SECOND (or later) rebuild of the same branch in one session — easy
+  to ship unnoticed if only the first rebuild is ever tested.
+- `QTreeView.scrollTo(index, EnsureVisible)` only ever moves the
+  VERTICAL scrollbar — confirmed on a bare `QTreeView` with no app code
+  involved, so this is a real Qt/PySide6 behavior, not something specific
+  to this file. Only the `PositionAtCenter`/`Top`/`Bottom` hints touch
+  the horizontal one. Anything that needs a deeply-indented item's
+  horizontal position adjusted (e.g. `_on_tree_current_changed`'s
+  parent-stays-visible nudge) has to compute and set
+  `horizontalScrollBar().value()` directly rather than relying on
+  `scrollTo` for that axis.
+- Never gate an entire menu's visibility on ONE feature's own on/off
+  preference once that menu holds more than just that feature — a real
+  bug this way: `_apply_ai_pref_visibility` used to hide the whole
+  "Tools" menu (`menuAction().setVisible(...)`) when the AI-access
+  preference was off (the default for a fresh install), which was
+  correct back when Tools held only AI actions but silently hid every
+  OTHER unrelated action added to Tools later (Timestamp Display, then
+  Import Bookmarks) too — found via direct report ("i can only see
+  file" in the menu bar) and confirmed with a real screenshot of the
+  running app. Toggle the specific actions a preference owns, never the
+  shared menu they happen to live in.
+- A file bookmarked into 2+ groups renders the File Browser Name cell as
+  hard-edged equal color bands (one per group, in group-id order), not a
+  single earliest-group-wins color — `load_bookmark_colors_multi`
+  (`db_utils.py`) + `BookmarkSplitColorDelegate`, which fills each
+  band's own exact `QRect` directly rather than returning a
+  `QLinearGradient` brush from `BackgroundRole` (that was tried first;
+  see the delegate's own docstring for why it was dropped — not because
+  the gradient was provably wrong, but because the pixel-sampling test
+  used to check it had its own bug, so the delegate's simpler, harder-
+  to-get-subtly-wrong approach was kept instead once both were confirmed
+  correct). Direct report, 2026-10-07: an "Import Bookmarks…" run had
+  put several files in two groups at once, and the old single-color
+  version silently showed only the earliest group's color, making the
+  second membership invisible. The Media Browser's own bookmark badge
+  still uses the single-color `load_bookmark_colors` unchanged — it's a
+  small outline, not a filled cell, so splitting it isn't the same kind
+  of fit; only asked to change the File Browser.
 - This project's own `CLAUDE.md` entries should record **design
   decisions and standing rules**, not a verification/bug-hunting
   narrative — the detailed "found via real archive X, Y checks, screenshot

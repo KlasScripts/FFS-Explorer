@@ -6041,6 +6041,19 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # files" mechanism but for an ad hoc pick instead of a saved
         # bookmark; it never adds to the recursive aggregate view.
         self._checked_files: set = set()
+        # Which real bookmark group (if any) the bookmark panel's own
+        # QListWidget is currently highlighting as "selected", and that
+        # group's own ui_paths — set by _show_bookmark_group, checked on
+        # every _refresh_file_checked_paths call (the shared choke point
+        # every selection change already funnels through, regardless of
+        # whether it came from a tree click, the "Deselect" button, or
+        # "User Media"). Added 2026-10-08, direct report: the group stayed
+        # highlighted even after the live selection no longer matched it
+        # at all. None/_active_bookmark_group_paths empty = nothing
+        # highlighted — the "Selected Files"/"User Media" sentinel rows
+        # are never tracked here, only a real saved group.
+        self._active_bookmark_group_id: int | None = None
+        self._active_bookmark_group_paths: set = set()
         # Folders that AREN'T themselves fully checked but contain (at
         # any depth) something that is — a checked descendant folder, or
         # an individually-ticked file — rendered as a "half tick"
@@ -6077,6 +6090,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # _carry_over_tree_selection's own docstring for the full design
         # and its own direct-request history.
         self._tree_last_selected_path: str | None = None
+        # Each branch's OWN independently-remembered last selection —
+        # {False: <path for "/ [Full Filesystem]">, True: <path for
+        # "Selected Only">} — added 2026-10-09, direct request: when a
+        # straight carry-over isn't possible (nothing was selected
+        # before the switch, or that path isn't part of the branch being
+        # switched TO), fall back to whatever THAT branch's own
+        # selection last was, rather than always landing on nothing. See
+        # _carry_over_tree_selection's own docstring for exactly where
+        # this fits into the carry-over-then-fallback order.
+        self._tree_last_selected_path_by_branch: dict = {False: None, True: None}
         # True once the tick-based selection has changed since it last
         # exactly matched an already-saved bookmark group — added
         # 2026-10-01, see _selection_at_risk().
@@ -9383,11 +9406,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._view_path = ""
         self._checked_folders = set()
         self._checked_files = set()
+        self._active_bookmark_group_id = None
+        self._active_bookmark_group_paths = set()
         self._partial_folders = set()
         self._prev_checked_folders_snapshot = set()
         self._selected_only_mode = False
         self._selected_only_scope = set()
         self._tree_last_selected_path = None
+        self._tree_last_selected_path_by_branch = {False: None, True: None}
         # True once the tick-based selection has changed since it last
         # exactly matched an already-saved bookmark group (a fresh load
         # from clicking a group, or a brand-new empty case, both start
@@ -10554,6 +10580,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         folder_path = self._view_path
         self._view_folder_recursive = False
         children = self.folder_map.get(folder_path, [])
+        if self._should_apply_selected_only_filter():
+            # Folders always stay (they're navigation, not content to
+            # hide) — only FILES are filtered down to the ones actually
+            # part of the current selection.
+            children = [p for p in children
+                       if p in self.folder_map or self._path_currently_selected(p)]
         has_bundles = any(p.split('/')[-1] in self.guid_to_bundle for p in children)
         has_photos = bool(self._photo_index) and any(
             (k := self._photo_key(p)) and k in self._photo_index
@@ -10638,6 +10670,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._view_folder_recursive = True
 
         files = sorted(self._collect_files_recursive(folder_path))
+        if self._should_apply_selected_only_filter():
+            files = [p for p in files if self._path_currently_selected(p)]
         has_bundles = any(p.split('/')[-1] in self.guid_to_bundle for p in files)
         has_photos = bool(self._photo_index) and any(
             (k := self._photo_key(p)) and k in self._photo_index
@@ -10932,6 +10966,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._selected_only_recursive_chk.toggled.connect(
             self._on_selected_only_recursive_toggled)
         _sel_layout.addWidget(self._selected_only_recursive_chk)
+        # "Only Show Selected" — added 2026-10-08, direct request: a
+        # folder opened via this tree can hold many files besides the
+        # ones actually bookmarked/ticked (e.g. a photos folder with a
+        # handful of bookmarked images among hundreds of others),
+        # making the bookmarked ones hard to spot. Unchecked by default
+        # (unchanged "show everything in this folder" behavior) — see
+        # _show_bookmark_group/_show_user_created_media for where the
+        # default is forced differently per entry point ("User Media"
+        # defaults to checked, since its whole point is showing only
+        # the relevant media, not everything in whatever folder it
+        # happens to sit in).
+        self._selected_only_filter_chk = QCheckBox("Only Show Selected")
+        self._selected_only_filter_chk.setChecked(False)
+        self._selected_only_filter_chk.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._selected_only_filter_chk.setToolTip(
+            "When checked, a folder opened in this tree shows only the "
+            "files that are actually part of the current selection "
+            "(ticked, or bookmarked in this group), hiding everything "
+            "else in that folder. Unchecked (the default) shows every "
+            "file in the folder, same as before this existed.")
+        self._selected_only_filter_chk.toggled.connect(
+            self._on_selected_only_filter_toggled)
+        _sel_layout.addWidget(self._selected_only_filter_chk)
         _sel_layout.addStretch()
         self.tree_view.setIndexWidget(
             self.tree_model.indexFromItem(self._selected_root_item), _sel_row)
@@ -11395,7 +11453,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if group_id == _SELECTED_FILES_SENTINEL:
             # Just show the aggregate — it's already whatever's ticked,
             # so there's nothing to replace/warn about (unlike clicking
-            # a real, different group).
+            # a real, different group). Clears the tracked "highlighted
+            # group" state (not just its visual highlight, which this
+            # click already moves via the list's own normal selection
+            # behavior) so a LATER tick change doesn't evaluate against
+            # a group that isn't even displayed any more.
+            self._active_bookmark_group_id = None
+            self._active_bookmark_group_paths = set()
             self._rebuild_file_view_from_checked()
             return
         if group_id == _USER_MEDIA_SENTINEL:
@@ -11850,7 +11914,26 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 return
             if choice == 'save' and not self._save_current_selection_as_new_group():
                 return  # the save dialog itself was cancelled
+        # Set AFTER replacing the selection, not before — confirmed by a
+        # real failure while this shipped: _replace_selection_from_
+        # bookmark_entries calls _deselect_all_files() FIRST internally
+        # (to clear whatever was ticked before), which itself calls
+        # _refresh_file_checked_paths() while _checked_folders/_checked_
+        # files are still empty — setting these two attributes any
+        # earlier made that intermediate empty-selection moment look
+        # like "the group's own files are no longer present," clearing
+        # the highlight this exact click was trying to set, before the
+        # entries even got ticked. See this attribute's own docstring
+        # (__init__) for the full feature.
         self._replace_selection_from_bookmark_entries(entries)
+        self._active_bookmark_group_id = group_id
+        self._active_bookmark_group_paths = {e['ui_path'] for e in entries}
+        # "Only Show Selected" defaults OFF for an ordinary group (see
+        # that checkbox's own docstring) — reset on every real group
+        # click so it doesn't silently carry over a forced-on state left
+        # by a PREVIOUS "User Media" view.
+        if getattr(self, '_selected_only_filter_chk', None) is not None:
+            self._selected_only_filter_chk.setChecked(False)
 
         group = next((g for g in groups if g['id'] == group_id), None)
         group_name = group['name'] if group else 'Bookmarks'
@@ -12954,6 +13037,71 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 self._ancestor_checked_state)
         self._refresh_tree_check_states(changed)
         self._refresh_selected_files_panel_label()
+        self._refresh_active_bookmark_group_highlight()
+
+    def _refresh_active_bookmark_group_highlight(self) -> None:
+        """Un-highlights the bookmark panel's currently-selected GROUP
+        row the moment none of that group's own files are part of the
+        live tick-based selection any more — direct report, 2026-10-08:
+        clicking a group, then changing the selection some OTHER way
+        (clicking "User Media", the "Deselect" button, or unticking via
+        the folder tree) left the group still looking selected even
+        though the displayed/ticked files no longer had anything to do
+        with it. Runs on every _refresh_file_checked_paths call (the
+        shared choke point every one of those mechanisms already funnels
+        through), so it's checked regardless of which one changed the
+        selection.
+
+        Retains the highlight as long as AT LEAST ONE of the group's own
+        files/folders is still part of the selection (directly ticked,
+        or covered by a fully-ticked ancestor folder) — a partial
+        overlap still counts as "this group, modified," not "a
+        different selection entirely." Only clears when the overlap
+        drops to zero. Deliberately does not ever RE-highlight a group
+        once cleared, even if the examiner later re-ticks back to an
+        identical selection — this only ever counts down, never back up,
+        matching the direct request ("if they are then retain hilight
+        otherwise deselect") exactly as asked, not a stronger two-way
+        sync."""
+        if self._active_bookmark_group_id is None:
+            return
+        still_present = any(self._path_currently_selected(p)
+                            for p in self._active_bookmark_group_paths)
+        if still_present:
+            return
+        self._active_bookmark_group_id = None
+        self._active_bookmark_group_paths = set()
+        self._bookmark_list.clearSelection()
+        self._bookmark_list.setCurrentItem(None)
+
+    def _path_currently_selected(self, path: str) -> bool:
+        """True when *path* (a file or folder ui_path) is currently part
+        of the live tick-based selection — either directly (in
+        _checked_folders/_checked_files) or implicitly, covered by some
+        fully-ticked ANCESTOR folder (_ancestor_checked_state; see that
+        method's own docstring — _exclude_from_full_ancestor already
+        guarantees an individually-excluded file's ancestor chain is
+        "exploded" down to exclude it specifically, so this never gives
+        a false positive for a file the examiner deliberately unticked
+        out of an otherwise-full folder)."""
+        if path in self._checked_folders or path in self._checked_files:
+            return True
+        return self._ancestor_checked_state(path) == Qt.CheckState.Checked
+
+    def _should_apply_selected_only_filter(self) -> bool:
+        """True when a folder opened via the "Selected Only" tree should
+        have its own FILE list narrowed to just the current selection —
+        added 2026-10-08 for the "Only Show Selected" checkbox. Gated on
+        self._selected_only_mode (which branch of the tree is currently
+        VISIBLE), not on the clicked item's own ancestry — matches the
+        "Recursive" checkbox's own scoping, and is correct for the same
+        reason: _refresh_folder_view's plain (non-recursive) branch is
+        shared by BOTH tree branches, so this must never apply while
+        "/ [Full Filesystem]" is what's actually showing, regardless of
+        the checkbox's own state."""
+        return (self._selected_only_mode
+                and getattr(self, '_selected_only_filter_chk', None) is not None
+                and self._selected_only_filter_chk.isChecked())
 
     def _refresh_selected_files_panel_label(self) -> None:
         """Keeps the synthetic 'Selected Files' bookmark-panel row's own
@@ -13188,6 +13336,24 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         state actually changes anything (it only matters within "Selected
         Only", regardless of which branch happens to be visible right
         now)."""
+        idx = self.tree_view.currentIndex()
+        if not idx.isValid():
+            return
+        item = self.tree_model.itemFromIndex(idx)
+        if item is None:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if data is None or data in (_TREE_PLACEHOLDER, _SELECTED_ROOT_MARKER):
+            return
+        self.on_folder_selected(idx)
+
+    def _on_selected_only_filter_toggled(self, checked: bool) -> None:
+        """Re-renders the currently selected tree folder so "Only Show
+        Selected"'s effect is visible immediately — identical pattern to
+        _on_selected_only_recursive_toggled just above (added alongside
+        it, same reasoning: only matters within "Selected Only", so a
+        no-op for a placeholder/root-marker selection is correct here
+        too)."""
         idx = self.tree_view.currentIndex()
         if not idx.isValid():
             return
@@ -13516,13 +13682,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         any — filtering out the placeholder/root-marker sentinels), right
         BEFORE a real 'Selected only' transition — the first half of the
         carry-over rule described in _carry_over_tree_selection's own
-        docstring, added 2026-09-26 as a direct simplification of an
-        earlier same-day design (remembering each branch's own
-        INDEPENDENT last position) per direct follow-up: "when switch
-        between the view[s] which ever item is selected sh[oul]d be
-        selected in the other if it exist[s][;] if not then nothing
-        should be selected" — a single shared "what was just selected"
-        value, not two separately-remembered histories."""
+        docstring. Originally (2026-09-26) a single shared "what was just
+        selected" value, deliberately simplifying away an earlier same-
+        day per-branch-memory design — also ALSO records it into
+        self._tree_last_selected_path_by_branch, keyed by
+        self._selected_only_mode's CURRENT value (the branch being left,
+        since this runs before that flag flips) — re-added 2026-10-09,
+        direct request, as a fallback for when a straight carry-over
+        isn't possible: "if no folder was selected in the other view or
+        that folder does not exist in the folder you are going to[,] it
+        will go back to the previously selected folder." Both values
+        updated together from the exact same read, so they can never
+        drift apart."""
         idx = self.tree_view.currentIndex()
         path = None
         if idx.isValid():
@@ -13532,29 +13703,50 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 if data is not None and data not in (_TREE_PLACEHOLDER, _SELECTED_ROOT_MARKER):
                     path = data
         self._tree_last_selected_path = path
+        if path is not None:
+            self._tree_last_selected_path_by_branch[self._selected_only_mode] = path
 
     def _carry_over_tree_selection(self, now_selected_only: bool) -> None:
-        """Called right after the OTHER branch becomes visible. Tries to
-        select the SAME path that was selected just before the switch
-        (self._tree_last_selected_path) in the branch that's now shown —
-        if that path doesn't exist there (e.g. switching into 'Selected
-        only' with a folder that isn't part of the current scope),
-        selects NOTHING instead of leaving a stale or unrelated item
-        highlighted. Deliberately does NOT call on_folder_selected/
-        navigate_tree_to_path's own tail: this only restores the TREE's
-        own selection, it never re-triggers a file-table reload —
-        self._view_path (and what the File Browser actually shows) was
-        never changed by this toggle in the first place."""
-        path = self._tree_last_selected_path
-        if path:
-            root_item = self._selected_root_item if now_selected_only else None
+        """Called right after the OTHER branch becomes visible. Tries, in
+        order:
+          1. The SAME path that was selected just before the switch
+             (self._tree_last_selected_path), if it exists in the branch
+             now shown — e.g. switching into 'Selected only' with a
+             folder that's genuinely still part of the current scope.
+          2. Failing that (nothing was selected before the switch, or
+             that exact path isn't part of this branch), THIS branch's
+             own independently-remembered last selection
+             (self._tree_last_selected_path_by_branch), if it's still
+             valid — added 2026-10-09, direct request, so switching back
+             to a branch lands where the examiner last actually was in
+             IT specifically, rather than always landing on nothing just
+             because the carry-over candidate didn't apply here.
+          3. Selects NOTHING — the original rule's own final fallback,
+             unchanged.
+        Deliberately does NOT call on_folder_selected/navigate_tree_to_
+        path's own tail: this only restores the TREE's own selection, it
+        never re-triggers a file-table reload — self._view_path (and
+        what the File Browser actually shows) was never changed by this
+        toggle in the first place."""
+        root_item = self._selected_root_item if now_selected_only else None
+
+        def _try_select(path: str | None) -> bool:
+            if not path:
+                return False
             item = self._expand_walk_to_path(path, root_item=root_item)
             if item is not None and item.data(Qt.ItemDataRole.UserRole) == path:
                 idx = self.tree_model.indexFromItem(item)
                 # setCurrentIndex alone drives scrolling — see
                 # _on_tree_current_changed.
                 self.tree_view.setCurrentIndex(idx)
-                return
+                self._tree_last_selected_path_by_branch[now_selected_only] = path
+                return True
+            return False
+
+        if _try_select(self._tree_last_selected_path):
+            return
+        if _try_select(self._tree_last_selected_path_by_branch.get(now_selected_only)):
+            return
         self.tree_view.setCurrentIndex(QModelIndex())
 
     def _on_recent_context_menu(self, point):

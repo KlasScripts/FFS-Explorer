@@ -598,6 +598,18 @@ re-checked. No need to say anything for 🔴/🟡 rows.
   verification script must neutralize every modal its own code path can
   reach (the Timestamp Display dialog's first-load prompt is a common one
   to forget), not just the one the test author happened to expect.
+- A headless verification script that drives a real archive load can get
+  its ENTIRE body re-executed a second time, racing/duplicating whatever
+  it does (including real DB writes) — macOS's default `multiprocessing`
+  'spawn' start method (used by the first-open metadata parse — see
+  `ffs_metadata.py`'s own entry in the module table) re-imports the
+  launching script as `__main__` in the child process it starts, and a
+  standalone test script run directly (not through pytest, which already
+  guards against this itself) has no such guard of its own. Root cause
+  of several confusing "printed twice"/"ran twice" oddities this project
+  hit during testing before this was diagnosed. Guard every such script
+  with `if multiprocessing.current_process().name != "MainProcess":
+  sys.exit(0)` right after the imports.
 - After a `QTreeView`/`QStandardItemModel` subtree is destroyed and
   rebuilt under `blockSignals(True)` (needed to suppress spurious
   `itemChanged` firing while mass-constructing items), a subsequent
@@ -646,6 +658,53 @@ re-checked. No need to say anything for 🔴/🟡 rows.
   still uses the single-color `load_bookmark_colors` unchanged — it's a
   small outline, not a filled cell, so splitting it isn't the same kind
   of fit; only asked to change the File Browser.
+- The bookmark panel's own GROUP highlight (`_active_bookmark_group_id`/
+  `_active_bookmark_group_paths`) tracks whether the live tick-based
+  selection still overlaps that group AT ALL, re-checked on every
+  `_refresh_file_checked_paths` call (the one shared choke point a tree
+  tick, "Deselect", and "User Media" already all funnel through) — not
+  tied to the QListWidget's own click-selection, which only changes when
+  that list itself is clicked. Retains the highlight on a PARTIAL
+  overlap (one of a multi-file group's files got unticked, not all);
+  clears it once the overlap hits zero — and never re-sets it later even
+  if the examiner ticks back to an identical selection (counts down
+  only, per the direct request this shipped for). Setting these two
+  attributes must happen AFTER `_replace_selection_from_bookmark_entries`
+  runs, never before — that method calls `_deselect_all_files()`
+  internally FIRST (clearing everything, then re-ticking), and setting
+  them early meant that internal empty-selection moment immediately
+  self-cleared the very highlight the click was trying to set, found via
+  a real failing test before this shipped.
+- "Only Show Selected" (the "Selected Only" tree root row, next to
+  "Recursive") narrows a folder's own File Browser listing down to just
+  the files that are part of the current selection, hiding the rest —
+  direct request: a bookmarked file can be hard to spot among many
+  others in the same real folder. Unchecked by default (unchanged
+  behavior); `_show_bookmark_group` resets it to unchecked on every
+  ordinary group click, while `_show_user_created_media` forces it ON —
+  "User Media"'s whole point is showing only the relevant files, so a
+  folder opened from it should default to hiding everything else too,
+  not just its own thumbnail grid. Folders are never hidden by this (an
+  unselected folder can still contain selected files deeper down) — only
+  FILE rows are filtered, via the same `_path_currently_selected` check
+  the group-highlight feature above uses. Gated on `_selected_only_mode`
+  (which tree branch is currently visible), not on the clicked item's
+  ancestry — `_refresh_folder_view`'s non-recursive branch is shared by
+  BOTH tree branches, so this must never apply while browsing "/ [Full
+  Filesystem]", regardless of the checkbox's own state.
+- Switching between "/ [Full Filesystem]" and "Selected Only"
+  (`_carry_over_tree_selection`) tries, in order: (1) carry the exact
+  path that was selected just before the switch, if it exists in the
+  branch now shown; (2) failing that, THAT BRANCH'S OWN independently-
+  remembered last selection (`_tree_last_selected_path_by_branch`,
+  keyed by branch), if it's still valid; (3) select nothing. Re-added
+  2026-10-09 as a fallback layered on top of the existing single-value
+  carry-over (not a revert of it) — direct request, so switching back
+  to a branch after a failed carry-over lands where the examiner last
+  actually was in THAT branch specifically, rather than always landing
+  on nothing. `_save_tree_selection_for_carryover` updates both the
+  shared carry-over value AND this per-branch map from the exact same
+  read, every transition, so they can never drift apart.
 - This project's own `CLAUDE.md` entries should record **design
   decisions and standing rules**, not a verification/bug-hunting
   narrative — the detailed "found via real archive X, Y checks, screenshot

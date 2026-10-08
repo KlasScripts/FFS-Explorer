@@ -1572,6 +1572,22 @@ class MediaViewerMixin:
                 return
             if choice == 'save' and not self._save_current_selection_as_new_group():
                 return
+        # Clears the tracked "highlighted group" state — this can be
+        # entered via the panel row's OWN inline button, bypassing
+        # _on_bookmark_item_clicked's identical clear there, so it's
+        # repeated here rather than assumed. See that attribute's own
+        # docstring (ffs-explorer.py's __init__) for the full feature.
+        self._active_bookmark_group_id = None
+        self._active_bookmark_group_paths = set()
+        # "Only Show Selected" defaults ON for "User Media" (unlike an
+        # ordinary bookmark group, which defaults it off in
+        # _show_bookmark_group) — direct request, 2026-10-08: User
+        # Media's whole point is showing only the relevant files, so a
+        # folder opened via the "Selected Only" tree while in this mode
+        # should start out hiding everything else in it too, not just
+        # the thumbnail grid itself.
+        if getattr(self, '_selected_only_filter_chk', None) is not None:
+            self._selected_only_filter_chk.setChecked(True)
         self.center_tabs.setCurrentIndex(1)
         self._media_showing_user_only = True
         self._media_context = tuple(media_paths)

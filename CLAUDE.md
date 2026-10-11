@@ -105,6 +105,32 @@ extractions, and can only ever yield a bare GUID→bundle-id pair anyway).
 Android has no GUID indirection to resolve — `build_app_registry` is a
 no-op there.
 
+**GUID vs. bundle id in cross-case lists — a real bug, fixed 2026-10-10.**
+A per-install container GUID is specific to ONE extraction (reinstalling
+the same app gets a new GUID) — any list meant to work across cases
+(`user_media_ignore_list.py`, `embedded_media_skip_list.py`, both
+global/git-tracked) must compare the BUNDLE id, never the raw GUID.
+`FfsAdapter.canonical_app_path(ui_path, guid_map, folder_map=None)` is
+the one shared fix: returns *ui_path* with its container GUID segment
+replaced by the resolved bundle id (full path shape preserved), or
+UNCHANGED if it doesn't apply — safe to call on any path. Confirmed via
+real evidence, not just theory: the live `user_media_ignore_list.json`
+already had exactly this bug — a bare GUID entry for `com.apple.stocks`
+that would never have matched again once that GUID stopped existing
+(migrated to canonical form as part of this fix). A second, separate
+instance of the same root cause was found in `embedded_media_skip_list.py`:
+`_app_scoped_skip_entry()` already stored bundle-id-scoped entries
+correctly, but nothing canonicalized the CANDIDATE side at match time,
+so those entries could never actually match anything — fixed by
+canonicalizing every match-time candidate through `canonical_app_path()`
+before calling `matches()`/`find_matching_entries()` (the stored entry
+shape itself needed no change, since a bundle-id-scoped entry like
+"com.example.app/foo.db" is already a substring of the canonical full
+path). Every call site of both lists' add/remove/match operations now
+canonicalizes: `FastZipBrowser._canonical_user_media_entry()` and the
+`EmbeddedMediaScanWorker`/`ProcessDialog`/`EmbeddedMediaSkipListDialog`
+constructors all thread `guid_to_bundle`/`folder_map` through for this.
+
 ## 2. Header-scan tiers
 
 Extension-based typing is the default and is sometimes wrong (a renamed
@@ -114,6 +140,120 @@ that depends on "is this file really a database/image/archive" — Keyword
 Search's coverage reminder, the embedded-media sweep's candidate list, the
 raw file-browser preview — reads from the SAME `_header_type_overrides` dict
 this scan populates, never a second guess.
+
+**`scan_rules.py` — the one shared ruleset.** `scan_folders()`/
+`scan_excludes()`/`user_media_folders()`/`embedded_media_excludes()`
+(all on `FfsAdapter`) all read from `config/scan_rules_ios.json`/
+`scan_rules_android.json`, platform-split like
+`embedded_media_skip_list.py` (no shared vocabulary between
+`mobile/Containers/...` and `data/data/...`, and a case is always one
+platform). Added 2026-10-10 after a design discussion found the obvious
+alternative — 4 independently hand-maintained folder lists, one per
+consumer — had ALREADY silently drifted (`archive_discovery_folders()`
+was missing folders `scan_folders()` had, purely by accident; it's now
+just `scan_folders()` itself). One row per folder prefix:
+`{"path", "include": 1|0, "user_media": "not_user_media"|
+"user_media_only"|"also_user_media", "embedded_media_exclude": 1}` (the
+last key optional). `include` is the shared base scope for header-scan
+tiers 1/2, nested-archive discovery, AND the embedded sqlite/plist
+sweep — those three really do want the identical "is this user data or
+system noise" answer; `user_media` is an independent, deliberately
+narrower tri-state consulted only by the Media Browser's own "User
+Media" filter (a precision view, not a coverage tool); and
+`embedded_media_exclude` is a one-directional carve-out for the embedded
+sweep specifically, since it can be too expensive (parses every sqlite/
+plist) for a folder that's still cheap enough for header-scan/zip-
+discovery to cover.
+
+Paths are stored CANONICAL (Cellebrite-format, no `private/var/`
+prefix); `FfsAdapter.prefix_shortcut()` is applied per-path for a
+GrayKey case, same mechanism `FORENSIC_SHORTCUTS` already used — one
+file covers both iOS acquisition tools.
+
+`mobile/Media/`, `mobile/Library/ContactsMetadata/`, and
+`mobile/Library/Passes/` were added 2026-10-10 after a user report that
+a genuinely-image extensionless file in `ContactsMetadata/` stayed
+"Other" after a Tier 1 rerun — a real scope gap, not staleness (all
+three confirmed to hold genuine user content; Passes/ is real Wallet
+pass bundles — `pass.json`, rendered card images, Apple's own
+cryptographic `signature` file, not internal templates).
+
+`mobile/Library/Caches/` is also in scope, with 24 confirmed-noise
+subfolders excluded. The real bar, refined twice on 2026-10-10 through
+direct correction each time: (1) "noise" means NO RECOGNIZABLE CONTENT
+AT ALL (every unknown-extension file individually magic-byte-checked
+and classified `None`), not just "no media" — the exclude list was
+first built checking ONLY Picture/Video/Audio hits, which missed that
+19 of the original 29 "noise" subfolders actually held real JSON/
+Property List/Database/Archive/XML content; (2) having a real TYPE
+still isn't enough — the content also has to be LINKABLE TO THE USER,
+not just structurally parseable. Re-checking those 19 by actual content
+(not just type) found most were generic system/service config with
+zero device-to-device variation — bundled reference data, A/B-test
+bucket IDs, server bootstrap URLs, ML model binaries — indistinguishable
+from any other device regardless of user. Only 5 of the 19 had genuine
+user-linked content and stayed in scope: `GeoServices` (a paired Apple
+Watch's own offline map cache — device-ownership evidence),
+`com.apple.HomeKit` (real home/accessory configuration),
+`com.apple.findmy.fmipcore` (the actual Find My device list),
+`com.apple.chrono` (widget snapshot renders reflecting the user's own
+configured widgets), `com.apple.ctcategories.service` (cached App Store
+lookups tied to specific apps the user viewed). The other 14 — including
+`com.apple.HomeKit`'s own sibling `com.apple.AppleMediaServices`, whose
+real Database+JSON+Property List content turned out to be nothing but
+generic experiment-bucket definitions — went back to excluded. A
+denylist, not an allowlist: an unrecognized subfolder stays in scope by
+default. `com.apple.geod/` and `com.apple.MobileSMS/` are kept OFF the
+exclude list for a different, narrower reason — both hold real value in
+their KNOWN-extension files (`geod`'s `AP.db`/`MapTiles.sqlitedb`;
+MobileSMS's own `Previews/Search/*.png`), which a header-scan-signal
+check (type or content) can never see, since known-extension files are
+never header-scan candidates at all.
+
+**App containers (`Application`/`PluginKitPlugin`/`AppGroup`) were
+reviewed the same way, 2026-10-10, and found to have NO comparable
+exclusion opportunity** — confirmed by checking every file, not a
+sample (a real methodological trap hit along the way: an initial
+200-file SAMPLE wrongly flagged `com.google.Gmail` and
+`com.google.chrome.ios` as fully empty, missing 991 and 96 real pictures
+respectively that existed elsewhere in those same apps' thousands of
+cached files). Restricting to `com.apple.*` only (the safer,
+Caches-like starting point) still found nothing comparable: real Apple
+apps with substantial cache content (`com.apple.mobilesafari`: 1,449
+unknown-ext files, `com.apple.AppStore`: 477, `com.apple.Home`: 251)
+all have real Picture/JSON/Database content and must stay in scope.
+The confirmed-empty containers are architecturally different from
+Caches' noise — ~700 of them, each tiny (5–38 files, usually fewer),
+spread across PluginKit's own extension-point scaffolding (every app
+ships a NotificationServiceExtension/ShareExtension/DiagnosticExtension/
+etc. with a handful of empty placeholder files whether the extension is
+ever used or not) — a structural fact about iOS, not evidence about any
+one app or device. No ruleset entries were added for these: the list
+would be unmaintainably long, would go stale with every iOS version,
+the files are mostly already zero bytes (so there's no real I/O cost
+being saved), and a real trap sits right next to the empty ones —
+`com.apple.stocks.widget`/`com.apple.news.widget`/`com.apple.weather.
+widget` all have real JSON/Database content in superficially-identical-
+looking widget-extension containers.
+
+The "Scanned Folders…" dialog shows the include list, the excluded
+subfolders, and (once any exist) the embedded-media-only excludes, for
+transparency — its wording deliberately says "no recognizable file
+content," never "no media," for the same reason. User Media's own
+`user_media_folders()` had
+no visible surface at all until a "Folders…" button was added next to
+the User Media bookmark-panel row (`_show_user_media_folders_dialog`) —
+a separate small dialog rather than another section on the header-scan
+one, since an examiner looking at the Media Browser has no reason to
+go find it inside Process Case's own dialog. That dialog's own exclude
+section reads `user_media_ignore_list.load()` directly — the existing,
+already-working, right-click-driven folder/file exclude list for this
+filter (see section 3's own entry for that module) — NOT a second,
+scan_rules.py-based mechanism; one was briefly added (a
+`user_media_exclude` rule field) then reverted the same day, direct
+correction, since it duplicated that already-built mechanism instead
+of pointing the dialog at it. `scan_rules.py` has no equivalent field
+for this reason.
 
 Four levels, persisted per case (`header_scan_tier`/`header_scan_complete_tier`
 in `case_settings`):
@@ -138,6 +278,32 @@ source of truth for what each tier covers — any other UI surface describing
 tier coverage (the Search Coverage dialog, Process Case's own status label)
 reads the SAME shared text/coverage dict rather than keeping an independent
 copy that could drift.
+
+**Stale-completion detection (`_header_scan_staleness`).** A case's own
+`header_scan_complete_tier` claiming a tier is done doesn't necessarily
+mean it still is — found via a real report, 2026-10-10: a case's flag
+said Tier 1 while 38,141+ of its real candidates had never actually been
+scanned, with the old data giving no way to tell. Fixed by persisting a
+`header_scan_candidate_count` snapshot (how many files genuinely
+qualified) alongside `header_scan_complete_tier` at the moment a scan
+actually finishes (both write sites: the creation-time path and
+`ProcessDialog`'s own tier-upgrade completion). On load, the CURRENT
+candidate count for the recorded tier is recomputed and compared — a
+growing gap (or a legacy case with no stored count at all, i.e. unknown
+provenance) renders the main window's header-scan banner in red instead
+of the normal blue, with the gap count stated plainly, and
+`ProcessDialog` shows the same warning on its own status label plus
+leaves that one already-run tier's radio button ENABLED (styled red,
+labeled "select to rerun") instead of greyed out — selecting it is
+treated as a genuine rerun request through the exact same tier-upgrade
+machinery as picking a higher tier, not a special code path. Confirmed
+this is unrelated to nested-archive extraction or embedded-media
+recovery — both already classify correctly via `header_scan.
+classify_magic` at the moment each entry is extracted/discovered
+(verified directly against 1,281 real nested-archive files, zero
+mismatches); the gap is specifically ordinary files already inside the
+main FFS zip falling out of sync with the bulk Tier 1/2/3 scan's own
+candidate set.
 
 ## 3. Recovering media embedded inside other files
 
@@ -181,6 +347,81 @@ extracted without knowing which table or app it belongs to.
   copy of the same name.
 - `user_media_ignore_list.py` — a GLOBAL, examiner-editable exclusion layer
   on the separate "User Media" filter (below), not on the sweep itself.
+  Supports wildcard entries (`*` fragments) as of 2026-10-10, same
+  convention as `embedded_media_skip_list.py`'s own, for a cross-app
+  structural rule rather than one folder's own path. The one shipped so
+  far: `*@2x.png*`/`*@3x.png*` ("UI Graphics" — `display_label()`'s own lookup),
+  confirmed safe/generalizable by checking real User Media candidates
+  across 3 different real iOS devices (6,081 of 49,840 total candidates,
+  8.6%–21% per device, every sample checked genuinely bundled UI chrome,
+  zero real contact/user photos caught). A DIFFERENT idea tried the same
+  day — "duplicate filename = chrome" — was REJECTED with hard evidence:
+  the single biggest duplicate-basename cluster, `5005.JPG` (2,491
+  occurrences), is real per-photo thumbnail data
+  (`mobile/Media/PhotoData/Thumbnails/V2/DCIM/.../IMG_0001.HEIC/5005.JPG`
+  — iOS gives every photo's own thumbnail the same fixed filename), not
+  chrome — a bare duplicate-name rule would have hidden 2,491 real
+  photos. The lesson: a wildcard rule here needs a STRUCTURAL anchor
+  (Apple's own Retina-asset naming convention, never used for real
+  photos) to be safe, not just "this pattern repeats a lot." Hidden
+  matches stay fully reviewable — the right-click "Show Media Excluded
+  by Ignore List…" action (unchanged) shows exactly what's filtered.
+  Three more shipped the same day after reviewing real images across
+  3 iOS AND 3 Android devices (49,840 + 33,091 real candidates), same
+  bar (a platform-reserved convention, verified by checking EVERY
+  matching file, not a sample): `*__MACOSX/*._*` ("Zip Metadata
+  (macOS)" — the AppleDouble resource-fork sidecar every Mac-created
+  zip leaves, preserving the real file's own subdirectory structure
+  — confirmed by its own literal `\x00\x05\x16\x07...Mac OS X`
+  signature across all 2,814 real matches in one archive, present on
+  both platforms); `*.9.png` ("UI Graphics (nine-patch)" — Android's
+  reserved stretchable-UI-chrome format); `*/drawable-*dpi*` and
+  `*/mipmap-*dpi*` ("UI Graphics (Android resource)" — Android's own
+  reserved density-bucket resource folder naming). A parallel idea —
+  EXIF Make/Model presence as a "real photo" signal — was tried and
+  REJECTED, direct correction: real DCIM photos in this same archive
+  had NO EXIF and were smaller than a real camera capture, because
+  they'd passed through a messaging/social app's own lossy re-encode
+  pipeline first — exactly the category of real evidence (a received/
+  shared photo) the signal would have systematically misclassified as
+  chrome. Content-based signals (EXIF, dimensions, color depth) are
+  unsafe here for that reason; only "how the file got onto the device"
+  (a build-time/packaging convention, never passed through a lossy
+  re-encode) has held up as a safe signal so far.
+
+  **A real precision bug, caught and fixed the same day**: a wildcard
+  entry with no trailing `*` (`*.9.png`) was matching ANYWHERE in the
+  path, not anchored to the real end of the filename — direct report,
+  "is this safe? `*.9.png`" — `version1.9.pngBACKUP.zip` (real
+  extension `.zip`) matched, since the substring ".9.png" just happens
+  to appear mid-path. `_wildcard_matches()` now appends a real `$`
+  anchor whenever the pattern doesn't end with `*`; a pattern that
+  genuinely wants "appears anywhere, more can follow" (`@2x.`/`@3x.` —
+  the real extension always follows) must say so explicitly with a
+  trailing `*`, hence `*@2x.*`/`*@3x.*` rather than the original
+  `*@2x.`/`*@3x.`. Re-verified against all 3 iOS + 3 Android archives
+  after the fix: identical real-world match counts, zero behavior
+  change on real data — the fix only closes the theoretical gap.
+
+  **A second real correction, same day**: direct report on a pasted
+  real path, "`...Edge/Default/Snapshots/{SyntheticIdentifier}/
+  1112275668Grey@2x.jpg` — this actually be of value it looks like a
+  screenshot of a website... can you change the grep to include that
+  the filename must be a png." Checked rather than assumed: of 6,081
+  real `@2x`/`@3x` matches, exactly 8 were `.jpg` — and all 8 were real
+  Microsoft Edge/Google Chrome tab-switcher snapshots (an actual
+  rendered screenshot of whatever page was open), not bundled chrome,
+  despite sharing the same Retina-scale naming convention; the other
+  6,073 `.png` matches stayed confirmed generic icons. Patterns changed
+  to `*@2x.png*`/`*@3x.png*` (PNG-only) — re-verified across all 3 iOS
+  + 3 Android archives: zero `.jpg`/`.jpeg` files now hidden by this
+  rule anywhere. The lesson, consistent with the EXIF rejection above:
+  a browser's own tab snapshot is REAL per-session content (varies by
+  site/tab) that happens to reuse a chrome-style naming convention —
+  "shares the filename pattern" still isn't sufficient on its own
+  without also checking which FORMAT real bundled assets actually use
+  (lossless PNG for crisp UI elements) versus what a content-snapshot
+  mechanism uses (lossy JPEG, cheaper for a full-page render).
 
 **Results are real, precious findings**, not a rebuildable cache —
 `caseresults.db`'s `embedded_media_hits` table, `UNIQUE(source_ui_path,
@@ -198,6 +439,380 @@ blake2b hash of the module's own source, so the NEXT improvement to the
 sweep automatically re-offers every previously-scanned file) — avoids
 re-reading a huge database on every bulk run while still letting a single
 file be manually re-swept on demand.
+
+**Picture/Video/Graphics preset toggle (Media Browser) — added
+2026-10-11**, direct request: "it is easy to miss [an] illegal movie if
+the first frame is not illegal so it is better for the user to be able
+to know when they are looking at images vers[us] video," extended the
+same day into a full preset system: "a sort fa[c]tion like excel...
+save this as a setting that can be quickly used[;] picture could be one
+and that would have pictures and sort[ed] by newest first... for
+graphic[s] size may be the one[,] as... the bigger one[s] are more
+likel[y] to have value." Four exclusive buttons (All/Pictures/Videos/
+Graphics) in the status row, each a real filter+sort PRESET
+(`MediaViewerMixin._MEDIA_TYPE_PRESETS`), applied live in
+`_recompute_media_all_paths` — the one function both an ordinary
+folder's own file-model load AND every alternate aggregate view (User
+Media, Embedded Media) already funnel through, so the preset's
+filter+sort apply identically regardless of which populated the
+underlying list, per the same direct request: "if a user used the
+selected view to select a folder then the folder should show the media
+files in that folder that meet the filter type and will be sorted in
+the described manner."
+
+Three-way classification (`MediaViewerMixin._media_kind`): 'picture'
+(ordinary image extensions), 'video' (real video extensions — mov/mp4/
+m4v/3gp/avi), 'graphics' (`.png`/`.gif` specifically) — GIF was
+initially folded into 'video' for this feature, then moved to its OWN
+'graphics' bucket the same day, direct revision. PNG/GIF are exactly
+the two formats this project's own `user_media_ignore_list.py` "UI
+Graphics" research already established as the common shape of bundled
+app chrome — the Graphics preset's own "biggest first" sort exists
+because a tiny PNG is far more likely to be an icon than a real image,
+while a large one is more likely to be real content, if anything is.
+Originally a SEPARATE, narrower classifier than `header_scan.py`'s own
+MEDIA_EXTENSIONS/sniff_media_kind or the File Browser's Type column — a
+GIF still showed as a real 'Picture' type everywhere else in the app at
+first, only "which review bucket" changed here. Direct correction the
+same day made it consistent instead (see "File Browser filter+sort
+presets" below): a GIF/PNG now shows as Type=`"Graphic"` everywhere —
+File Browser Type column, header-scan tiers, this classifier — not just
+within this one feature.
+
+The grid's own video-play badge (`MediaGridDelegate.set_video_paths`,
+bottom-left corner, never collides with the top-right "seen" checkmark)
+uses a DIFFERENT, deliberately broader check —
+`MediaViewerMixin._has_frame_risk` — real video extensions OR gif,
+regardless of which preset bucket a file is in: "could this thumbnail
+be hiding something its first frame doesn't show" and "which bucket
+should this be reviewed in" are two separate questions that happen to
+overlap on gif, not the same question asked twice.
+
+Verified against a real archive, 2026-10-11: a real 305-file DCIM
+folder split cleanly into 255 picture + 16 video + 34 graphics (no file
+dropped or double-counted), each preset's own sort order confirmed
+correct (newest-first by `mtime` for Picture/Video, biggest-first by
+`size` for Graphics).
+
+**Real regression, same day, fixed**: `self._media_type_filter` was
+never reset on folder navigation — picking "Videos" in one folder then
+navigating to a DIFFERENT folder with no real videos silently carried
+the filter over, rendering as "shows nothing," reported as the whole
+feature being broken: "select an app folder... shows nothing[,] i want
+it like before to show the media files in that location[,] i just want
+to be able to filter for video, picture or graphics or all in that
+folder." Confirmed directly (not assumed) with a real two-folder repro
+before fixing: a DCIM folder's "Videos" selection (16 real matches)
+left active, then navigating to a real picture-only folder showed 0 of
+its own 3 real media files. `_load_media_from_file_model` and all four
+alternate-view entry points (`_show_embedded_media_hits`,
+`_show_user_created_media`, `_show_user_media_seen_files`,
+`_show_user_media_ignored_files`) now reset `_media_type_filter` to
+`'all'` (and sync the button) on every call — each one IS a fresh
+"picked a folder/view" moment; same-folder refreshes ("Not Relevant"/
+Undo) go straight through `_recompute_media_all_paths`/
+`_load_media_page` instead, never back through here, so they correctly
+keep whatever type filter was active. A second, related bug found
+alongside it: the status line's old single "N hidden as seen" note
+mislabeled a type-filter reduction as a seen-filter one even with the
+reset in place (a folder with some-but-not-all matching files, filtered
+by type, would still misreport the hidden count's cause) —
+`_recompute_media_all_paths` now tracks `_media_hidden_by_seen`/
+`_media_hidden_by_type` separately, and the status line reports
+whichever actually applied.
+
+**File Browser filter+sort presets — generalized the same day**, direct
+request: "i want a dropdown in the filebrowser view that let the user
+uses, edit and creat the filter,sorts were it was more that just one
+thing like the current interface works... for the edit and new i want
+to be able to filter by multiple column so i select the column and then
+for most column there is a text box where i put the value and then i
+can click add... for time and data and file type i want it to look
+like it does in the gui currently... grouped into the 3 column types t
+and d, filetype and other... then there need to be a sort section...
+sort by one column after another and select[] if it is ascending or
+desending." Scoped with one direct question first — should editing a
+preset here also change the Media Browser's own Picture/Video/Graphics
+buttons, given they classify by file EXTENSION on raw media paths while
+the File Browser's table filters/sorts by COLUMN VALUE — answered
+**"Fully unify both."**
+
+`app/file_browser_presets.py` is the single shared store (JSON,
+examiner-editable, checked into the repo like `user_media_ignore_list.
+json`) for both. A preset is `{name, date_filters: [...], type_filter:
+{types:[...]} | null, text_filters: [...], sort: [...]}` —
+`date_filters`/`text_filters`/`sort` are LISTS (the direct "for each you
+can have multiple" requirement) of independent, ANDed criteria (sort
+entries are priority-ordered instead); `type_filter` stays one set,
+since there's only ever one real `'Type'` column. The File Browser's new
+preset dropdown (next to the plain filter bar, in `FastZipBrowser.
+_setup_file_tab`) is a SEPARATE mode from that bar's own text/date/type
+fields, never composed with them — picking a preset disables the whole
+plain row (`_set_plain_filter_enabled`) and applies directly via
+`_apply_preset`; `"(No Preset)"` hands control back. `Edit…`/`New…`
+buttons open `FilterSortPresetDialog` — three groupboxes (Time & Date /
+File Type / Other Columns) matching the user's own grouping, the first
+two REUSING the plain filter bar's own widgets (`QDateEdit` range
+pickers, the Type multi-select checklist) rather than a generic text
+box, per that same request; a Sort groupbox with its own add-one-level,
+Move Up/Down list, the same Excel-style multi-sort described above.
+
+A real granularity gap, found empirically before writing any of this —
+a real iOS17 archive's raw per-file metadata carries NO semantic type
+field at all (only filesystem stat fields: atime/btime/ctime/mtime/
+size/mode/...), so the File Browser's own `'Type'` column is itself
+computed from extension via `ffs-explorer.py`'s `_EXT_TO_TYPE`, which
+used to collapse `.jpg`/`.heic`/`.png`/`.gif` all down to ONE label,
+`"Picture"` — too coarse to express the Graphics-vs-Picture split
+("graphics...gif and png") the feature needs. FIRST fixed by shipping
+Pictures/Videos/Graphics as `text_filters` on the `'Name'` column with
+`"ends_with"` mode against extension lists instead of the `'Type'`
+checklist — then, direct correction the same day ("i do not want you to
+use ext for the filter i want you to seperate out png and gif into
+graphic type both via the ext and the header scan[,] so that the filter
+only need to use the type without filltering further and missing some
+images"), fixed PROPERLY upstream instead: `_EXT_TO_TYPE` and
+`header_scan.py`'s `classify_magic()` BOTH now give PNG/GIF their own
+`'Graphic'` Type, separate from `'Picture'` (`header_scan.
+GRAPHIC_EXTENSIONS`, the `_SIGNATURES` table's PNG/GIF87a/GIF89a
+entries) — so Pictures/Videos/Graphics go back to being plain
+`type_filter`s again, and an extensionless PNG/GIF recovered only by
+magic bytes gets `'Graphic'` too, closing a second, independently
+accepted gap (`media_viewer.py`'s `_media_kind` used to document that
+exact case as falling back to `'picture'`, never `'graphics'`, since
+`classify_magic` had no Graphic/Picture split at all — now it does).
+`_MAGIC_KIND`/`_MEDIA_MAGIC_KIND` (`header_scan.py`/
+`embedded_media_scan.py`) both gained a `'Graphic': 'image'` entry so
+nothing silently stops recognizing a PNG/GIF as real image content
+through either path. Same request also asked to fold TIFF/RAW into
+Pictures ("i am also happy for you to in[c]lu[d]e the raw/tiff as
+pictures") — `.tiff`/`.tif`/`.raw`/`.cr2`/`.nef`/`.dng` were already
+Type=`"Picture"` via `_EXT_TO_TYPE` but invisible to the Media Browser,
+since `MEDIA_EXTENSIONS` (the Media Browser's own "is this a media
+file" gate) didn't have them — added there too, so a `type_filter` on
+`"Picture"` now genuinely means every file that Type.
+
+**Multi-level sort** (`FileTableModel.sort_multi`, `real_column, bool`
+pairs with NO checkbox-column offset, unlike the header-click `sort()`
+it sits beside) sorts once per level from LEAST to MOST significant —
+`list.sort()`'s own stability means each pass's relative order survives
+untouched among rows the next, more senior pass treats as equal, giving
+a real composite sort with an independent ascending/descending per
+level without needing one combined tuple key (which couldn't give each
+level its own direction anyway).
+
+**Multi-clause filtering** (`FileTableModel.set_filter`'s new
+`extra_date_filters`/`extra_text_filters` params, both lists, both
+`None` for every existing plain-filter-bar caller — fully backward
+compatible) — the plain bar only ever has ONE text/date/type clause at a
+time; a custom preset can need several ANDed together (e.g. two
+independent date ranges, or Name-contains AND App-equals). Within one
+`text_filters` entry, `"values"` is OR'd (any value in the list
+matches) — this machinery stays fully available for a user-made
+preset's own "Other Columns" criteria even though the three BUILTIN
+presets (Pictures/Videos/Graphics) no longer use it themselves (see
+below — they moved to `type_filter`).
+
+**A preset survives folder navigation** (not just the folder it was
+picked on) — unlike the plain filter bar, which has never kept state
+across a folder change. All three file-model rebuild sites
+(`_refresh_folder_view`, `_refresh_folder_view_recursive`,
+`_rebuild_file_view_from_checked`) funnel their post-population filter
+step through one new chokepoint, `_apply_active_filter`, which checks
+`self._active_preset_name` first, regardless of that site's own
+`preserve_filter` flag, before falling back to the existing plain-filter
+preservation logic.
+
+**Full unification, concretely**: `MediaViewerMixin._media_kind`/
+`_recompute_media_all_paths` now call `_preset_types`/`_preset_sort`
+(in `media_viewer.py`), which read the LIVE "Pictures"/"Videos"/
+"Graphics" presets from the shared store first. `_media_kind` resolves
+a file's real Type (`_file_type_for` — extension via the same
+`GRAPHIC_EXTENSIONS`/`VIDEO_THUMB_EXTENSIONS`/`MEDIA_EXTENSIONS`
+`header_scan.py` constants `_EXT_TO_TYPE` itself is built from, or the
+header-scan override for an extensionless file) and checks it against
+each bucket's own Type SET (`self._kind_types`, refreshed once per
+`_recompute_media_all_paths` pass via `_resolve_media_type_sets`, not
+per-file) — both that and each bucket's sort fall back to the ORIGINAL
+hardcoded `_FALLBACK_KIND_TYPES`/`_MEDIA_TYPE_PRESETS` whenever the
+matching preset is missing (deleted via the File Browser dialog), has
+no `type_filter`, or the store can't be read — the Media Browser button
+must never go blank just because the shared preset got edited into an
+unusable shape. Verified directly, 2026-10-11: re-mapping the real
+"Graphics" preset's `type_filter` to `["Picture"]` made the Media
+Browser's Graphics button start showing ordinary JPGs instead of PNGs
+(confirmed live, not just inferred); deleting that preset afterward
+correctly fell back to the original `Graphic`-type/size-descending
+behavior rather than breaking. Also confirmed: an extensionless file
+whose ONLY signal is a header-scan override of `'Graphic'` now
+genuinely classifies as `'graphics'` through this same path — the
+narrow gap `_media_kind`'s own docstring used to document (an
+extensionless PNG/GIF always fell back to `'picture'`, since
+`classify_magic` had no Graphic/Picture split to report) is closed, not
+just narrowed, now that the split happens upstream in `header_scan.py`
+itself (see above).
+
+**Hover-scrub in the video player (`MediaFullViewDialog`) — added
+2026-10-11**, direct request: "one of the thing that griffeye does with
+videos is al[l]ows you to put your curssor over the top of a view in
+the media browser and it then scrolls through exstracted thumbnails so
+it is like fast forwarding through the video... what about a scroll
+over depending on how fast is the speed that the playhead goes and if
+you stop the video stops playing and if you go backward the video plays
+backwards from that point," explicitly asked to explore doing this via
+real seeking rather than pre-extracting frame thumbnails: "i though it
+would be worth exsploring rather than create the thumbnails." Confirmed
+feasible and shipped as a feature of `_build_video`'s own player (not
+the grid thumbnails — that was the scope asked for first): the video
+already plays via Qt's native `QMediaPlayer` (AVFoundation/FFmpeg
+backend) on a real local scratch-file copy, and `QMediaPlayer.
+setPosition()` is already a cheap native seek — this reuses exactly
+that, no second PyAV decode path and no frame pre-extraction at all.
+
+**Position-mapped, not velocity-integrated** — direct clarification
+once asked which Griffeye actually does: "the way it works in grifeye
+is a bit like sp[osition]ing[,] i.e. at to the far left start and then
+if you are middle then you would be halfway through." Mouse X position
+across the video widget's own width maps linearly to a position in the
+clip (`eventFilter`'s `QEvent.Type.MouseMove` branch sets
+`self._scrub_target_frac`), far simpler than a velocity-driven virtual
+playhead.
+
+**Not a hard teleport, though** — direct refinement: "it needs to go to
+that point relativ[el]y quickly... based on the l[e]ngth of the video
+but not so quick that it is silly." `_on_scrub_tick` (a `QTimer` at
+`_SCRUB_TICK_MS` = 40ms) advances `self._scrub_current_ms` toward the
+live mouse-mapped target by at most a per-tick cap derived from
+`_SCRUB_MIN_FULL_SWEEP_MS` (2500ms) — sweeping the ENTIRE width of even
+a very long clip takes at least that long in real time, so the examiner
+actually sees the intervening frames sweep by (a real "fast-forwarding
+through," via ordinary cheap seeks at a fixed wall-clock rate) rather
+than an instant cut; a short clip still reaches the hovered position
+almost immediately since the whole clip is short relative to the floor.
+Verified against a real 44-second iPhone video (HEVC/1080p, Josh
+Hickman IOS17 archive): sweeping to the far end advances about 700ms of
+video per 40ms tick (not an instant jump), and the REAL `QMediaPlayer.
+position()` tracks the computed target within ~1ms at every step
+(confirmed by polling it directly, not just the internal counter).
+
+**"Backward" needed no special-case logic at all** — it's just a seek
+to a smaller position than the one before it, which `setPosition`
+already does correctly either direction; this also sidesteps real,
+confirmed cross-backend unreliability of `QMediaPlayer`'s own negative
+`setPlaybackRate` for true reverse DECODE, never attempted here.
+"Stop" needs none either: once the live target stops changing (mouse
+stationary), the next few ticks converge `_scrub_current_ms` to it and
+then produce a near-zero delta forever after, which the `>= 15ms`
+dead-zone check in `_on_scrub_tick` turns into "stop calling
+`setPosition()` at all" — the displayed frame just stays put.
+
+**Only engages while the player is PAUSED** — checked via `self.
+_is_playing()` (a closure bound in `_build_video`, where `QMediaPlayer`
+is in scope — it's only ever imported locally there, the project's
+existing lazy-import convention for `QtMultimedia`, kept rather than
+forcing it in at module scope for this one feature) — deliberate, so a
+mouse merely resting over a video the examiner pressed Play on doesn't
+hijack real playback/audio out from under them. The existing Play/
+Pause button and slider-drag are untouched; this is an additional,
+separate interaction mode for a stopped clip, not a second control
+layer fighting the first. `video_widget.setMouseTracking(True)` +
+`installEventFilter(self)` is what makes plain hover (no button held)
+deliver `MouseMove` at all — off by default on a bare `QVideoWidget`.
+`QEvent.Type.Leave` disengages scrubbing (`_scrub_target_frac = None`)
+so the frame doesn't keep drifting once the cursor leaves. Both the
+timer and the installed filter are torn down on `load_content`'s
+existing teardown path (swapping to a different file in an
+already-open dialog) and in `closeEvent`, the same places the
+player/temp-file cleanup already happens.
+
+**EXIF / video-metadata columns (`app/media_metadata_scan.py`) — added
+2026-10-11**, direct request: "i kind of think i should just do a
+media pass after the header check via type i.e. pic[t]ure, png and
+video[,] get all the exif and add it as ad[d]itional columns in the
+browser... it is super use[ful] where it is present." A new Process
+Case stage (`MediaMetadataScanWorker`), checked by default — direct
+instruction ("lets make it that it is a[u]tomat[ic]ly tick[ed] but the
+user can untick it if they want") — that runs LAST (after the header
+scan, nested-archive extraction, and the embedded-media sweep: "for
+the zips and embe[d]ded it should be done as part of the process like
+the header review," since reading nested/embedded content needs those
+to have already run), scoped to `scan_folders()`/`scan_excludes()` —
+the SAME in-scope-for-processing folders the header scan already uses,
+direct correction when this was scoped: "we are only doing this in the
+[folders] that are marked as place to include and not the one
+exscluded for the header proceesing."
+
+Seven new File Browser columns, `"(EXIF)"`-suffixed (`Taken (EXIF)`,
+`Camera (EXIF)`, `GPS (EXIF)`, `Duration (EXIF)`, `Dimensions (EXIF)`,
+`Software (EXIF)`, `Orientation (EXIF)`) — the suffix, not a rename of
+the existing `_PHOTO_HEADERS` (`Taken`/`Camera`/`GPS`/`Place`), was the
+direct answer to a real overlap flagged before building this: iOS's
+Photos.sqlite already provides those for Photos-indexed images
+specifically; these instead come from the file's OWN bytes and apply
+to every Picture/Graphic/Video file in scope, Photos-indexed or not —
+keeping the shipped names unchanged avoids touching anything already
+saved in a report/column layout. Shown whenever `self._media_exif` is
+non-empty for the case at all (not a narrower per-folder prediction —
+same "blank cell when absent" convention `_PHOTO_HEADERS` already
+uses, so a folder with no EXIF-bearing files just shows blank columns,
+not a missing/wrong set).
+
+**"a smaller check before the decode" — confirmed real, not assumed**:
+neither extraction ever decodes a pixel or a video frame (`Image.
+open()` is lazy; PyAV's container open only reads the moov/metadata
+atoms). The real cost is I/O, not CPU — reading a whole candidate's
+bytes first (the obvious approach) wastes effort on a large video
+whose `moov` atom sits near the front. `_LazyZipSlice` (read/seek/tell
+backed directly by `zip_reader.ZipReader.read_at()` — no `zipfile`, no
+decompression, FFS archives are always stored uncompressed) lets PyAV
+pull only what it needs. Verified directly against the largest real
+video in the Josh Hickman archive (102MB): a full read took 25.2ms and
+touched 100% of the file; the lazy reader took 6.2ms and touched 0.22%
+of it (225KB). Also verified directly (a second real worry: "does a
+file WITHOUT EXIF cost the same as one WITH it, or could a cheap
+pre-check skip further work"): no measurable difference — 151 real
+app-bundle PNGs (9 had EXIF) averaged 0.162ms/file; 139 real DCIM HEIC
+photos (139 had EXIF) averaged 0.146ms/file — the cost is parsing the
+file's own container structure, which happens either way just to
+confirm it's openable at all; checking for EXIF afterward is then a
+free dict lookup, so there's no cheaper signal below that to pre-check
+with.
+
+**A real, confirmed bug caught during this feature's own first test
+run**: `extract_image_exif` initially never registered `pillow_heif`'s
+HEIC opener (media_viewer.py's `_load_qimage` does this, but that
+Qt-importing module can't be imported from this Qt-free one) — EVERY
+real HEIC file (iOS's default photo format since iOS 11; 139/139 in
+one real DCIM folder) silently raised `UnidentifiedImageError` and
+returned `{}` — no width/height, no EXIF, nothing. Fixed with the same
+one-time-registration flag/pattern, duplicated rather than imported.
+Re-verified after the fix: 139/139 real HEIC files yielded width/
+height, 138/139 yielded `taken`, 137/139 yielded real GPS coordinates.
+
+Nested-archive entries and embedded-media hits ("for the zips and
+embe[d]ded") are collected separately
+(`FastZipBrowser._collect_local_media_metadata_candidates`, only
+FastZipBrowser owns `_nested_archive_map`/`_embedded_media_containers`)
+and handed to `ProcessDialog` as a CALLABLE, not a precomputed list —
+a plain list captured at dialog-open time would miss hits THIS SAME
+Process Case run's own embedded-media sweep (the stage immediately
+before this one in the chain) just found. A nested-archive entry's
+real bytes live inside a REPACKAGED zip (`zip_reader.
+read_nested_entry`, not a plain extracted file) so those are read
+eagerly into `bytes`; an embedded-media hit is already a real local
+file (`embedded_media_scan.extract_media_bytes`'s content-addressed
+output) so that one is opened lazily instead — `scan_local_candidates`
+accepts either shape per candidate. Verified directly against this
+same real case's own pre-existing nested-archive/embedded-media
+results: a real nested-archive JPG (an iOS effects-bundle resource)
+and two real embedded-media hits (a GroupMe cache PNG, an App Store
+cache HEIC) all scanned correctly through this path.
+
+Persisted in casecache.db's new `media_metadata` table (one row per
+ui_path, mirroring `header_types` exactly — fully re-derivable from the
+archive's own bytes, so it belongs there, not caseresults.db), reloaded
+at case-open through the SAME background poll `_start_case_meta_load`
+already uses for header types/photo index/timezone.
 
 ## 4. In-app format viewers
 
@@ -354,6 +969,65 @@ bookmark column would start silently dropping those rows the moment
 this feature shipped, even for an examiner who never touched the
 checklist at all.
 
+**Separate filepath/filename columns — real bug fixed 2026-10-10.**
+When "Filename is its own column" is used, the matching path MUST be
+the two columns joined (`combine_filepath_and_filename`) — the first
+release only ever read the filename column for the bookmark's own
+display name, so the path actually looked up in the archive was just
+the containing DIRECTORY, which can never match a file. Confirmed
+against a real Griffeye case-analysis export, whose own "File Path"/
+"File Name" columns split exactly this way — every row "worked" when
+path+filename were combined in one column and silently failed the
+moment they were split, with no visible error (every row just counted
+as "not found").
+
+**"Remove parent folder from Filepath"** — a second checkbox next to
+"Filepath column:", for tools (confirmed: Griffeye) that prefix every
+path with ANOTHER segment above the archive's own filename: the folder
+the FFS zip itself was sitting in on disk, e.g.
+"CaseFolder\EXTRACTION\_FFS.zip\data\...". `normalize_ffs_path`'s own
+archive-name check only ever looks at the FIRST segment, so it can't
+remove this on its own — the new flag strips one leading segment
+unconditionally BEFORE that check runs, so the check still correctly
+fires against whatever's now first. The preview table updates live
+when toggled, same as every other mapping control.
+
+**iOS `private/var/mobile`/`private/var/root` collapsing
+(`ios_path_candidates`)** — a SEPARATE real quirk found testing against
+a real Griffeye export + a real Cellebrite-format iOS archive: this
+app's own ui_path convention collapses `private/var/mobile` and
+`private/var/root` down to just `mobile`/`root` for those two per-user
+home directories (baked into how `folder_map` itself gets built, not
+exposed as a reusable transform — `FfsAdapter.strip_display_prefix`
+only strips the archive's own internal format prefix, e.g.
+"filesystem1/", never this). Griffeye's raw path spells out
+"private/var/mobile/..." literally AND separately prefixes its own
+generic "root/" marker for "the top of the extracted device
+filesystem" — a real, confusing name collision with this app's own
+different, specific meaning of "root" (`/private/var/root`). Passing a
+path with that marker still attached straight to
+`FfsAdapter.resolve()` produces a doubled, nonsense physical path
+(confirmed directly: resolve() re-inserts "private/var/" before a
+recognized "root"/"mobile" first segment). `ios_path_candidates`
+offers several interpretations (with/without Griffeye's marker,
+with/without the collapse) and `ImportBookmarksWorker` tries each in
+turn, keeping whichever one actually resolves — confirmed end-to-end
+against the real export: 3 of its 4 real rows matched with a verified
+hash; the 4th has an anomalous zero `Created Date` unlike the other
+three's real dates, consistent with Griffeye-recovered/synthetic
+content with no live zip entry to match at all, not a bug here.
+
+**Saved presets** — a "Preset:" row with Save/Delete, for re-running
+the same spreadsheet "type" (e.g. "Griffeye") without re-picking every
+column each time. Stored in `QSettings` (key
+`import_bookmarks_presets`, JSON-encoded dict, same convention as
+`folder_column_configs`) BY COLUMN NAME, not index/position, so a
+preset still applies correctly to a later export whose columns are in
+a different order. `_browse` auto-applies a saved preset the moment
+exactly one of them is a clean fit for the newly-loaded file's own
+headers; more than one fit (or none) leaves mapping at its normal
+reset state and the preset combo on "(None)" rather than guessing.
+
 ## app/ modules
 
 | File | What it is |
@@ -366,9 +1040,12 @@ checklist at all.
 | `zip_entry.py` / `zip_reader.py` | `ZipEntry` — the universal archive-read handle every viewer uses. |
 | `zip_cd_cache.py` | `.zcd` central-directory sidecar cache; in-memory memoization of the parsed `ZipInfo` list per `.zcd` file (avoids a real multi-second re-parse on every call). |
 | `header_scan.py` | Magic-byte/text file-type detection (`classify_magic`) — see Header-scan tiers above. |
+| `scan_rules.py` | The shared folder-prefix ruleset (include/exclude/user_media/embedded_media_exclude) behind `FfsAdapter.scan_folders()` and friends — see Header-scan tiers above. |
 | `embedded_media_scan.py` | The embedded-media sweep — see section 3 above. |
 | `embedded_media_skip_list.py` | Known-noise database skip list — see section 3. |
+| `media_metadata_scan.py` | EXIF (images) / container metadata (video) extraction for the File Browser's "(EXIF)" columns — `_LazyZipSlice`, `extract_image_exif`, `extract_video_metadata` — see "EXIF / video-metadata columns" above. |
 | `user_media_ignore_list.py` | Global exclusion list for the Media Browser's "User Media" filter. |
+| `file_browser_presets.py` | Shared, examiner-editable filter+sort presets behind the File Browser's preset dropdown AND the Media Browser's Picture/Video/Graphics buttons — see "File Browser filter+sort presets" below. |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers (button rows, note/error labels, warning/error colors) — no case/business logic. |
 | `timestamp_display.py` | `TimestampDisplayMixin` — the timestamp-mode banner, `format_ts`, the Timestamp Display dialog. See Conventions below. |
 | `device_timezone.py` | Best-effort handset/acquisition/system timezone detection — never applied silently. |

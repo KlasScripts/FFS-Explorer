@@ -16,6 +16,7 @@ from db_utils import (_open_cache_db, _open_results_db, load_embedded_media_hits
 from dialog_helpers import note_label
 from zip_cd_cache import CachedZipView, load as _zcd_load
 import user_media_ignore_list
+import file_browser_presets
 # MEDIA_EXTENSIONS/VIDEO_THUMB_EXTENSIONS/TEXT_ATTACHMENT_EXTENSIONS/
 # sniff_media_kind moved to header_scan.py 2026-08-25 (re-exported here
 # unchanged, so existing `from media_viewer import ...` call sites keep
@@ -25,18 +26,20 @@ import user_media_ignore_list
 # (used by the MCP server too). See header_scan.py's own comment.
 from header_scan import (classify_magic, is_text, TEXT_SIZE_LIMIT,
                          MEDIA_EXTENSIONS, VIDEO_THUMB_EXTENSIONS,
+                         GRAPHIC_EXTENSIONS,
                          TEXT_ATTACHMENT_EXTENSIONS, sniff_media_kind)
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout,
     QDialog, QHBoxLayout, QPushButton, QSlider, QTextEdit,
     QListView, QAbstractItemView, QStyledItemDelegate, QStyle, QMenu,
     QApplication, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QButtonGroup,
 )
 from PySide6.QtGui import (QImage, QImageReader, QPixmap, QFontDatabase, QColor,
                            QPen, QPainter)
 from PySide6.QtCore import (Qt, QThread, Signal, QBuffer, QIODevice,
                             QUrl, QAbstractListModel, QModelIndex, QSize, QRect,
-                            QSettings, QItemSelectionModel)
+                            QSettings, QItemSelectionModel, QTimer, QEvent)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -370,6 +373,13 @@ class MediaGridDelegate(QStyledItemDelegate):
         # db_utils.load_bookmark_colors, for how a multi-group file's
         # color is chosen.
         self._bookmark_colors: dict[str, str] = {}
+        # Which ui_paths carry "first frame may not show everything"
+        # risk (added 2026-10-11, see MediaViewerMixin._has_frame_risk)
+        # — paints a small play-triangle badge, bottom-left of the
+        # thumbnail, deliberately a different corner from the top-right
+        # "seen" checkmark above so the two never overlap on the same
+        # file.
+        self._video_paths: set = set()
 
     def cell_size(self) -> QSize:
         return QSize(self._thumb_size + _GRID_CELL_MARGIN * 2,
@@ -383,6 +393,9 @@ class MediaGridDelegate(QStyledItemDelegate):
 
     def set_bookmark_colors(self, colors: dict) -> None:
         self._bookmark_colors = colors
+
+    def set_video_paths(self, paths: set) -> None:
+        self._video_paths = paths
 
     def has_pixmap(self, ui_path: str) -> bool:
         return ui_path in self._pixmaps
@@ -452,6 +465,24 @@ class MediaGridDelegate(QStyledItemDelegate):
             painter.drawEllipse(badge_rect)
             painter.setPen(QColor('white'))
             painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "✓")
+
+        # Video/frame-risk badge (added 2026-10-11, direct request: "it
+        # is easy to miss [an] illegal movie if the first frame is not
+        # illegal so it is better for the user to be able to know when
+        # they are looking at images vers[us] video") — a small
+        # translucent dark circle + white play-triangle, bottom-left of
+        # the thumbnail area (the "seen" badge above owns top-right, so
+        # the two never collide on the same file).
+        if ui_path in self._video_paths:
+            badge_size = 18
+            badge_rect = QRect(img_rect.left() + 2,
+                               img_rect.bottom() - badge_size - 2,
+                               badge_size, badge_size)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 170))
+            painter.drawEllipse(badge_rect)
+            painter.setPen(QColor('white'))
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "▶")
 
         if ui_path:
             name = ui_path.rsplit('/', 1)[-1]
@@ -652,6 +683,9 @@ class MediaFullViewDialog(QDialog):
         self._tmpdir = None
         self._player = None
         self._webview = None
+        self._scrub_timer = None
+        self._scrub_video_widget = None
+        self._is_playing = lambda: False
         QVBoxLayout(self)
         self.load_content(ui_path, data)
         self.resize(760, 680)
@@ -663,6 +697,10 @@ class MediaFullViewDialog(QDialog):
         Tears down whatever the PREVIOUS content needed (a running
         QMediaPlayer, a temp-file copy) before rebuilding; closeEvent below
         still handles final cleanup when the dialog itself closes."""
+        if self._scrub_timer is not None:
+            self._scrub_timer.stop()
+            self._scrub_timer = None
+        self._scrub_video_widget = None
         if self._player is not None:
             self._player.stop()
             self._player = None
@@ -878,8 +916,23 @@ class MediaFullViewDialog(QDialog):
                 "Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play")
         self._player.playbackStateChanged.connect(_sync_btn)
 
+        # Bound here (not referenced via self._player.PlaybackState in
+        # eventFilter/_on_scrub_tick below) since QMediaPlayer itself is
+        # only ever imported locally in this method, not at module scope
+        # — same lazy-import convention the project already uses for
+        # QtMultimedia, kept deliberately rather than forcing it in for
+        # this feature alone.
+        self._is_playing = lambda: (
+            self._player is not None
+            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
+
         slider = QSlider(Qt.Orientation.Horizontal)
-        self._player.durationChanged.connect(lambda d: slider.setRange(0, d))
+        self._video_duration_ms = 0
+
+        def _on_duration(d):
+            self._video_duration_ms = d
+            slider.setRange(0, d)
+        self._player.durationChanged.connect(_on_duration)
 
         def _sync_slider(pos):
             if not slider.isSliderDown():
@@ -893,7 +946,103 @@ class MediaFullViewDialog(QDialog):
 
         self._player.play()
 
+        # Hover-scrub (Griffeye-style "run the cursor across the frame to
+        # fast-forward/rewind") — added 2026-10-11, direct request: "put
+        # your curssor over the top of a view in the media browser and it
+        # then scrolls through exstracted thumbnails so it is like fast
+        # forwarding through the video," explicitly asked to explore this
+        # via "playing with the playspeed" (real seeking) rather than
+        # pre-extracting thumbnails — confirmed feasible since QMediaPlayer
+        # already seeks on a real local scratch file via setPosition(),
+        # which this reuses rather than a second, parallel PyAV decode
+        # path. Position-mapped, matching the user's own description of
+        # Griffeye's real behavior ("far left start... middle... halfway
+        # through... based on the l[e]ngth of the video") — far simpler
+        # and more standard than a velocity-integrated playhead, and it's
+        # what was actually confirmed, not guessed.
+        #
+        # NOT a hard teleport straight to the hovered position, though —
+        # direct refinement: "it needs to go to that point relativ[el]y
+        # quickly... but not so quick that it is silly." _on_scrub_tick
+        # advances self._scrub_current_ms toward the live mouse-mapped
+        # target by at most a per-tick cap derived from
+        # _SCRUB_MIN_FULL_SWEEP_MS, so sweeping the ENTIRE width of even a
+        # very long video takes at least that long in real time — giving
+        # a genuine "fast-forwarding through" sweep across the
+        # intervening frames (via ordinary, cheap forward/backward SEEKS,
+        # ticked at a fixed wall-clock rate) rather than an instant cut,
+        # while a short clip still snaps to-position almost immediately
+        # since the whole clip is short. "Backward" needs no special
+        # case at all — it's just a seek to a smaller position than the
+        # one before it, which setPosition already does correctly; this
+        # also sidesteps real, confirmed cross-backend unreliability of
+        # QMediaPlayer's own negative setPlaybackRate for true reverse
+        # DECODE, never attempted here.
+        #
+        # Only engages while the player is PAUSED (not mid hover-tick
+        # while _toggle's "Play" is active) — deliberate, so a mouse
+        # merely resting over a video the examiner pressed Play on
+        # doesn't hijack real playback and audio out from under them;
+        # scrubbing is a preview/triage action for a stopped clip, not a
+        # second control layer fighting the first.
+        self._scrub_target_frac: float | None = None
+        self._scrub_current_ms: float = 0.0
+        video_widget.setMouseTracking(True)
+        video_widget.installEventFilter(self)
+        self._scrub_video_widget = video_widget
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setInterval(self._SCRUB_TICK_MS)
+        self._scrub_timer.timeout.connect(self._on_scrub_tick)
+        self._scrub_timer.start()
+
+    # Wall-clock floor for sweeping the FULL width of even the longest
+    # clip — see _build_video's own comment above for the direct request
+    # this answers. Deliberately a few seconds, not sub-second: fast
+    # enough to read as "fast-forwarding," slow enough that intervening
+    # frames are actually visible rather than a blur/skip.
+    _SCRUB_MIN_FULL_SWEEP_MS = 2500
+    _SCRUB_TICK_MS = 40   # ~25 polls/sec — paced by this timer, not the
+                          # raw mouseMoveEvent flood, so a fast swipe
+                          # across the bar can't spam the media backend
+                          # with more seeks than it can keep up with.
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._scrub_video_widget and self._player is not None:
+            et = event.type()
+            if et == QEvent.Type.MouseMove:
+                if not self._is_playing() and self._video_duration_ms > 0:
+                    if self._scrub_target_frac is None:
+                        # First move after (re)engaging scrub mode — start
+                        # the sweep from wherever the clip actually sits,
+                        # not from 0, so re-hovering a clip paused midway
+                        # doesn't jump-cut back to the start first.
+                        self._scrub_current_ms = float(self._player.position())
+                    w = obj.width() or 1
+                    self._scrub_target_frac = min(1.0, max(0.0, event.position().x() / w))
+            elif et == QEvent.Type.Leave:
+                self._scrub_target_frac = None
+        return super().eventFilter(obj, event)
+
+    def _on_scrub_tick(self) -> None:
+        if self._scrub_target_frac is None or self._player is None:
+            return
+        if self._is_playing():
+            return
+        target_ms = self._scrub_target_frac * self._video_duration_ms
+        max_step = (self._video_duration_ms / self._SCRUB_MIN_FULL_SWEEP_MS) * self._SCRUB_TICK_MS
+        delta = target_ms - self._scrub_current_ms
+        if abs(delta) <= max_step:
+            self._scrub_current_ms = target_ms
+        else:
+            self._scrub_current_ms += max_step if delta > 0 else -max_step
+        # A real re-seek has its own decode/render cost — skip one that
+        # wouldn't move the displayed frame anyway (sub-frame distance).
+        if abs(self._scrub_current_ms - self._player.position()) >= 15:
+            self._player.setPosition(int(self._scrub_current_ms))
+
     def closeEvent(self, event) -> None:
+        if self._scrub_timer is not None:
+            self._scrub_timer.stop()
         if self._player is not None:
             self._player.stop()
         if self._tmpdir:
@@ -1172,6 +1321,20 @@ class MediaViewerMixin:
         self._media_seen_paths: set = set()
         self._media_bookmarked_paths: set = set()
         self._media_hide_seen: bool = False
+        # Picture/Video toggle (added 2026-10-11, direct request) —
+        # 'all' | 'picture' | 'video', applied in
+        # _recompute_media_all_paths alongside the hide-seen filter
+        # above. Deliberately a LIVE, per-tab toggle rather than a
+        # Preferences setting like hide-seen is: "a button to move
+        # between video and picture" — the examiner wants to switch
+        # mid-review, not dig into Preferences first.
+        self._media_type_filter: str = 'all'
+        # Set for real by _recompute_media_all_paths — see its own
+        # comment for why these are tracked separately (a type-filter
+        # reduction must never be mislabeled as a seen-filter one in the
+        # status line).
+        self._media_hidden_by_seen: int = 0
+        self._media_hidden_by_type: int = 0
         self._media_last_seen_batch: list | None = None
         self._media_last_seen_batch_page: int = 0
         # Which of the last "Not Relevant" batch's paths were actually
@@ -1215,8 +1378,41 @@ class MediaViewerMixin:
         # still gates the "leave this alternate view alone on tab
         # switch" check in ffs-explorer.py's _on_center_tab_changed.
         self._media_showing_user_only = False
+
+        # Picture/Video/Graphics preset toggle (added 2026-10-11, direct
+        # request: "it is easy to miss [an] illegal movie if the first
+        # frame is not illegal so it is better for the user to be able
+        # to know when they are looking at images vers[us] video,"
+        # extended the same day with a "Graphics" preset — see
+        # _media_kind's own docstring for what each bucket means and
+        # _MEDIA_TYPE_PRESETS above for each one's own filter+sort).
+        # Four exclusive, checkable buttons rather than a dropdown — the
+        # point is a fast, visible-at-a-glance mode switch mid-review,
+        # not a settings choice.
+        self._media_type_all_btn = QPushButton("All")
+        self._media_type_picture_btn = QPushButton("Pictures")
+        self._media_type_video_btn = QPushButton("Videos")
+        self._media_type_graphics_btn = QPushButton("Graphics")
+        self._media_type_group = QButtonGroup(self)
+        self._media_type_group.setExclusive(True)
+        self._media_type_buttons = {
+            self._media_type_all_btn: 'all',
+            self._media_type_picture_btn: 'picture',
+            self._media_type_video_btn: 'video',
+            self._media_type_graphics_btn: 'graphics',
+        }
+        for btn in self._media_type_buttons:
+            btn.setCheckable(True)
+            self._media_type_group.addButton(btn)
+        self._media_type_all_btn.setChecked(True)
+        self._media_type_group.buttonClicked.connect(self._on_media_type_filter_changed)
+
         status_row = QHBoxLayout()
         status_row.addWidget(self._media_status, 1)
+        status_row.addWidget(self._media_type_all_btn)
+        status_row.addWidget(self._media_type_picture_btn)
+        status_row.addWidget(self._media_type_video_btn)
+        status_row.addWidget(self._media_type_graphics_btn)
         status_row.addWidget(self._embedded_media_btn)
         status_row_widget = QWidget()
         status_row_widget.setLayout(status_row)
@@ -1410,6 +1606,13 @@ class MediaViewerMixin:
         sort_desc = (f" from the embedded-media sweep"
                     + (f" — {recovered:,} recovered from deleted content"
                        if recovered else ""))
+        # Reset the Picture/Video/Graphics toggle — see
+        # _load_media_from_file_model's own docstring for why switching
+        # to any different view (an ordinary folder OR, as here, a whole
+        # alternate aggregate view) must never leave a stale type filter
+        # from whatever was last browsed silently hiding everything.
+        self._media_type_filter = 'all'
+        self._media_type_all_btn.setChecked(True)
         self._start_thumbnail_load(media_paths, len(media_paths), sort_desc)
 
     def _user_media_candidate_paths(self) -> list[str]:
@@ -1425,7 +1628,15 @@ class MediaViewerMixin:
         actions) all agree on exactly what counts as a User Media
         LOCATION candidate in the first place — one shared definition,
         never three copies that could drift apart on what "a user
-        media location" even means."""
+        media location" even means.
+
+        Folder-level excludes belong to user_media_ignore_list.py (its
+        own folder-prefix entries, added via that right-click menu),
+        applied downstream in _user_media_paths() — NOT here. A second,
+        separate "user_media_exclude" field was briefly added to
+        scan_rules.py on 2026-10-10 then reverted the same day, direct
+        correction: it duplicated this already-working, already-UI-
+        wired mechanism rather than surfacing it."""
         prefixes = self._user_media_include_prefixes()
         return sorted(
             p for p in self.full_metadata
@@ -1471,7 +1682,8 @@ class MediaViewerMixin:
         seen_paths = self._load_seen_media_paths_fresh()
         return [
             p for p in self._user_media_candidate_paths()
-            if not user_media_ignore_list.is_ignored(p, ignore_entries)
+            if not user_media_ignore_list.is_ignored(
+                self._canonical_user_media_entry(p), ignore_entries)
             and p not in seen_paths
         ]
 
@@ -1510,7 +1722,8 @@ class MediaViewerMixin:
         hiding, not just trusted forever once made."""
         ignore_entries = user_media_ignore_list.load()
         return [p for p in self._user_media_candidate_paths()
-                if user_media_ignore_list.is_ignored(p, ignore_entries)]
+                if user_media_ignore_list.is_ignored(
+                    self._canonical_user_media_entry(p), ignore_entries)]
 
     def _show_user_created_media(self) -> None:
         """"User Media" — added 2026-09-27 as a Media Browser status-row
@@ -1592,6 +1805,8 @@ class MediaViewerMixin:
         self._media_showing_user_only = True
         self._media_context = tuple(media_paths)
         sort_desc = " from known user-created locations"
+        self._media_type_filter = 'all'
+        self._media_type_all_btn.setChecked(True)
         self._start_thumbnail_load(media_paths, len(media_paths), sort_desc)
         self._deselect_all_files()
         self._select_user_media_files_and_folders(set(media_paths))
@@ -1620,6 +1835,8 @@ class MediaViewerMixin:
         self._media_showing_user_only = True
         self._media_context = tuple(media_paths)
         sort_desc = " marked \"Not Relevant\" in known user-created locations"
+        self._media_type_filter = 'all'
+        self._media_type_all_btn.setChecked(True)
         self._start_thumbnail_load(media_paths, len(media_paths), sort_desc,
                                    force_show_seen=True)
 
@@ -1647,6 +1864,8 @@ class MediaViewerMixin:
         self._media_showing_user_only = True
         self._media_context = tuple(media_paths)
         sort_desc = " excluded by the User Media ignore list"
+        self._media_type_filter = 'all'
+        self._media_type_all_btn.setChecked(True)
         self._start_thumbnail_load(media_paths, len(media_paths), sort_desc,
                                    force_show_seen=True)
 
@@ -1692,19 +1911,179 @@ class MediaViewerMixin:
         if os.path.splitext(ui_path)[1].lower() in MEDIA_EXTENSIONS:
             is_media = True
         else:
-            is_media = self._header_type_overrides.get(ui_path) in ('Picture', 'Video')
+            is_media = self._header_type_overrides.get(ui_path) in ('Picture', 'Graphic', 'Video')
         if not is_media:
             return False
         return self.full_metadata.get(ui_path, {}).get('size', 0) > 0
+
+    # Extensions that carry the "first frame may not show everything"
+    # risk the grid badge (set_video_paths) warns about — real video
+    # formats AND gif (an animated GIF has the exact same risk, even
+    # though it's bucketed as 'graphics', not 'video', for the type
+    # filter above — these are deliberately two SEPARATE questions:
+    # "what review bucket does this belong in" vs "could this thumbnail
+    # be hiding something its first frame doesn't show"). Independent of
+    # the Type-based Picture/Graphic/Video split below — this badge has
+    # never been, and still isn't, driven by a preset.
+    _FRAME_RISK_EXTENSIONS = VIDEO_THUMB_EXTENSIONS | {'.gif'}
+
+    # Preset name (app/file_browser_presets.py) that owns each bucket's
+    # own sort order — see _preset_sort.
+    _SORT_PRESET_NAME_FOR_KIND = {'picture': 'Pictures', 'video': 'Videos', 'graphics': 'Graphics'}
+    _SORT_HEADER_TO_RAW_KEY = {'Modified': 'mtime', 'Created': 'btime',
+                              'Changed': 'ctime', 'Size (Bytes)': 'size'}
+
+    # Fallback Type set per bucket, read from the shared File Browser
+    # preset store first (_preset_types) — these only matter when that
+    # store can't be read, or a preset was deleted/edited into having no
+    # type_filter at all. 'Graphic'/'Picture'/'Video' are real Type
+    # column values (ffs-explorer.py's _EXT_TO_TYPE, header_scan.py's
+    # classify_magic) — see _file_type_for.
+    _FALLBACK_KIND_TYPES = {'graphics': frozenset({'Graphic'}),
+                            'video':    frozenset({'Video'}),
+                            'picture':  frozenset({'Picture'})}
+
+    def _preset_sort(self, name: str, fallback: tuple) -> tuple:
+        """(raw_metadata_key, descending) from preset *name*'s own first
+        sort level, mapped via _SORT_HEADER_TO_RAW_KEY — or *fallback* if
+        that preset/sort level is missing or its column isn't one of the
+        four this raw-metadata-keyed sort can express (Name/App/Path/Type
+        have no raw numeric equivalent to sort fast on here)."""
+        try:
+            preset = file_browser_presets.find(name)
+            if preset:
+                for sl in preset.get('sort', []):
+                    raw_key = self._SORT_HEADER_TO_RAW_KEY.get(sl.get('column'))
+                    if raw_key:
+                        return (raw_key, bool(sl.get('descending')))
+        except Exception:
+            pass
+        return fallback
+
+    def _preset_types(self, name: str, fallback: frozenset) -> frozenset:
+        """The real Type set from File Browser preset *name*'s own File
+        Type checklist (its 'type_filter'), or *fallback* if that preset
+        is missing, has no type_filter (e.g. edited into a different
+        shape), or the store can't be read."""
+        try:
+            preset = file_browser_presets.find(name)
+            if preset:
+                tf = preset.get('type_filter')
+                if tf and tf.get('types'):
+                    return frozenset(tf['types'])
+        except Exception:
+            pass
+        return fallback
+
+    def _resolve_media_type_sets(self) -> None:
+        """Refreshes the Type sets _media_kind() buckets by, from the
+        SAME shared store the File Browser's own preset dropdown edits
+        (app/file_browser_presets.py) — added 2026-10-11 ("this is were
+        the video,graphics,picture preset are and they can be altered"),
+        revised the same day from an extension-list lookup to a Type-set
+        lookup once the presets themselves switched from a Name/
+        ends_with text filter to the File Type checklist, direct
+        request: "i do not want you to use ext for the filter i want
+        you to seperate out png and gif into graphic type both via the
+        ext and the header scan[,] so that the filter only need to use
+        the type without filltering further and missing some images."
+        Called once per _recompute_media_all_paths() pass
+        (file_browser_presets.load() is itself mtime-cached, so this is
+        one cheap stat() call, not a real re-parse) rather than inside
+        _media_kind() itself, which runs in a per-file loop over
+        potentially thousands of paths."""
+        self._kind_types = {
+            kind: self._preset_types(name, self._FALLBACK_KIND_TYPES[kind])
+            for kind, name in self._SORT_PRESET_NAME_FOR_KIND.items()
+        }
+
+    def _file_type_for(self, ui_path: str) -> str:
+        """The same 'Picture'/'Graphic'/'Video'/... Type value the File
+        Browser's own Type column would show for ui_path — reimplemented
+        here (rather than imported from ffs-explorer.py's _EXT_TO_TYPE)
+        since this app/ module can't import back from the top-level
+        script. Extension first; for an extensionless file, falls back
+        to the same header-scan-derived override dict the File Browser's
+        own _classify_entry already falls back to for an 'Other'
+        extension — so a PNG/GIF recovered only by magic bytes gets
+        'Graphic' here too, not 'Picture', now that header_scan.
+        classify_magic's own signature table makes that same split (see
+        header_scan.py's _SIGNATURES)."""
+        ext = os.path.splitext(ui_path)[1].lower()
+        if ext in GRAPHIC_EXTENSIONS:
+            return 'Graphic'
+        if ext in VIDEO_THUMB_EXTENSIONS:
+            return 'Video'
+        if ext in MEDIA_EXTENSIONS:
+            return 'Picture'
+        return self._header_type_overrides.get(ui_path, 'Other')
+
+    def _media_kind(self, ui_path: str) -> str:
+        """'picture' | 'video' | 'graphics' for the Picture/Video/
+        Graphics preset toggle — added 2026-10-11, direct request: "it
+        is easy to miss [an] illegal movie if the first frame is not
+        illegal so it is better for the user to be able to know when
+        they are looking at images vers[us] video," revised the same day
+        to add the 'graphics' bucket, then again to classify by the real
+        Type value (_file_type_for) checked against each preset's own
+        Type set (_resolve_media_type_sets) instead of an extension list,
+        once PNG/GIF got their own 'Graphic' Type (both by extension AND
+        by header-scan magic bytes — see header_scan.py's _SIGNATURES)
+        specifically so this never again has to fall back to guessing
+        from an extension list and risk missing an image, per direct
+        request. Only ever called on a path _is_media_file already said
+        yes to, so there's always a real answer either way.
+
+        Relies on _resolve_media_type_sets having already set
+        self._kind_types for this pass (done once at the top of
+        _recompute_media_all_paths, the only real caller) — falls back
+        to _FALLBACK_KIND_TYPES if called before that (e.g. a future
+        caller that forgets to)."""
+        ft = self._file_type_for(ui_path)
+        kind_types = getattr(self, '_kind_types', self._FALLBACK_KIND_TYPES)
+        for kind in ('graphics', 'video', 'picture'):
+            if ft in kind_types[kind]:
+                return kind
+        return 'picture'
+
+    def _has_frame_risk(self, ui_path: str) -> bool:
+        """True if ui_path's thumbnail might not show the whole story —
+        drives the grid's own video-play badge, independent of
+        _media_kind's Type-based bucketing (see _FRAME_RISK_EXTENSIONS'
+        own comment for why GIF is in both but a true video extension
+        never counts as 'graphics')."""
+        ext = os.path.splitext(ui_path)[1].lower()
+        if ext in self._FRAME_RISK_EXTENSIONS:
+            return True
+        if ext in MEDIA_EXTENSIONS or ext in GRAPHIC_EXTENSIONS:
+            return False
+        return self._header_type_overrides.get(ui_path) == 'Video'
 
     def _load_media_from_file_model(self):
         """Load the media tab using exactly the current visible file model
         rows. Also exits the Embedded Media/User Media alternate views —
         picking an ordinary folder (or an aggregate/bookmark view) is
         what "picks an ordinary folder again" means in each feature's own
-        docstring."""
+        docstring.
+
+        Resets the Picture/Video/Graphics preset toggle back to "All" —
+        added 2026-10-11, direct bug report: a Videos/Pictures/Graphics
+        selection made in one folder used to silently carry over to the
+        NEXT folder navigated to, with no visible indicator — a folder
+        with no matching files then rendered as "shows nothing," read as
+        the whole feature being broken rather than a stale filter still
+        being active ("i want it like before to show the media files in
+        that location[,] i just want to be able to filter for video,
+        picture or graphics or all in that folder"). Every real call site
+        of this method IS a fresh "picked a folder" moment (same-folder
+        refreshes — "Not Relevant"/Undo — go straight through
+        _recompute_media_all_paths/_load_media_page instead, never back
+        through here), so resetting unconditionally on every call is
+        correct, not just a narrow special case."""
         self._media_showing_embedded = False
         self._media_showing_user_only = False
+        self._media_type_filter = 'all'
+        self._media_type_all_btn.setChecked(True)
         model = self.file_model
 
         total_files = sum(1 for r in model._rows if r[1] not in self.folder_map)
@@ -1776,6 +2155,7 @@ class MediaViewerMixin:
             self._media_bookmark_colors = {}
             self._media_delegate.set_seen_paths(set())
             self._media_delegate.set_bookmark_colors({})
+            self._media_delegate.set_video_paths(set())
             self._media_page_index = 0
             self._media_model.set_items([])
             self._update_media_page_nav_visibility(paginated=False)
@@ -1805,8 +2185,13 @@ class MediaViewerMixin:
         self._media_total_files = total_files
         self._media_sort_desc   = sort_desc
         of_total = f" of {total_files:,} file(s)" if total_files is not None else ""
-        hidden_count = len(self._media_all_paths_unfiltered) - len(self._media_all_paths)
-        hidden_note = f" ({hidden_count:,} hidden as seen)" if hidden_count else ""
+        notes = []
+        if self._media_hidden_by_seen:
+            notes.append(f"{self._media_hidden_by_seen:,} hidden as seen")
+        if self._media_hidden_by_type:
+            notes.append(f"{self._media_hidden_by_type:,} not "
+                         f"{self._media_type_filter}")
+        hidden_note = f" ({', '.join(notes)})" if notes else ""
         self._media_status.setText(
             f"{len(media_paths):,} media file(s){of_total}{sort_desc}{hidden_note}")
 
@@ -1834,6 +2219,30 @@ class MediaViewerMixin:
             self._select_media_item(pending)
         self._pending_media_selection = None
 
+    # FALLBACK sort per Picture/Video/Graphics button (added 2026-10-11,
+    # direct request: "a sort fa[c]tion like excel were you can set
+    # multiple sorts... save this as a setting that can be quickly
+    # used[;] for example picture could be one and that would have
+    # pictures and sort[ed] by newest first... for graphic[s] size may
+    # be the one[,] as... the bigger one[s] are more likel[y] to have
+    # value if any do"). Each preset is (sort_key, descending). 'all' has
+    # no preset-driven sort at all (files stay in whatever order
+    # _media_all_paths_unfiltered already built them in — unaffected by
+    # this feature).
+    #
+    # Superseded as the PRIMARY source by _preset_sort reading the real,
+    # editable File Browser preset (app/file_browser_presets.py) once
+    # editing one there was asked to affect this button too — see
+    # _resolve_media_type_sets' own comment for the same story on the
+    # Video/Graphics Type sets. This dict is what's used when that store
+    # can't be read, or the matching preset has no sort level on a
+    # column this raw-metadata-keyed sort can express.
+    _MEDIA_TYPE_PRESETS = {
+        'picture':  ('mtime', True),   # newest first
+        'video':    ('mtime', True),   # newest first
+        'graphics': ('size', True),    # biggest first
+    }
+
     def _recompute_media_all_paths(self) -> None:
         """Re-derives the ACTIVE _media_all_paths from the folder's TRUE
         full list (_media_all_paths_unfiltered) plus the current seen-set
@@ -1841,13 +2250,64 @@ class MediaViewerMixin:
         Media Browser's "Not Relevant" feature. Called at folder load
         and again after any seen-state change (mark/undo) so the hide-seen
         filter is always LIVE within a browsing session, not just applied
-        once when the folder was first opened."""
+        once when the folder was first opened.
+
+        Also applies the Picture/Video/Graphics preset (added
+        2026-10-11) — both its type filter and its own sort order (see
+        _MEDIA_TYPE_PRESETS, now only the FALLBACK — _preset_types/
+        _preset_sort read the real, editable version from the shared
+        File Browser preset store first) — same "always live within a
+        session" treatment, called again by the toggle's own click
+        handlers. This is the ONE place both a folder's own
+        file-model-driven load (_load_media_from_file_model) and every
+        alternate aggregate view (User Media, Embedded Media) funnel
+        through before anything reaches the grid, so the preset's
+        filter+sort apply identically regardless of which one populated
+        _media_all_paths_unfiltered — direct request: "if a user used
+        the selected view to select a folder then the folder should
+        show the media files in that folder that meet the filter type
+        and will be sorted in the described manner.\""""
         if self._media_hide_seen:
-            self._media_all_paths = [
-                p for p in self._media_all_paths_unfiltered
-                if p not in self._media_seen_paths]
+            paths = [p for p in self._media_all_paths_unfiltered
+                     if p not in self._media_seen_paths]
         else:
-            self._media_all_paths = list(self._media_all_paths_unfiltered)
+            paths = list(self._media_all_paths_unfiltered)
+        # Tracked SEPARATELY from the type-filter reduction below — added
+        # 2026-10-11, direct bug report: a lingering Pictures/Videos/
+        # Graphics selection from a PREVIOUSLY viewed folder silently
+        # carried over to a new one ("select an app folder... shows
+        # nothing... i want it like before to show the media files in
+        # that location"), and the status line's own old single
+        # "N hidden as seen" note mislabeled a type-filter reduction as a
+        # seen-filter one even once that was found — confirmed directly:
+        # a folder with zero matching videos but an active "Videos"
+        # filter showed "3 hidden as seen" when the real cause was 3 of 4
+        # files not being videos at all.
+        self._media_hidden_by_seen = len(self._media_all_paths_unfiltered) - len(paths)
+        if self._media_type_filter != 'all':
+            self._resolve_media_type_sets()
+            before_type = len(paths)
+            paths = [p for p in paths if self._media_kind(p) == self._media_type_filter]
+            self._media_hidden_by_type = before_type - len(paths)
+            sort_key, sort_desc = self._preset_sort(
+                self._SORT_PRESET_NAME_FOR_KIND[self._media_type_filter],
+                self._MEDIA_TYPE_PRESETS[self._media_type_filter])
+            paths.sort(
+                key=lambda p: self.full_metadata.get(p, {}).get(sort_key) or 0,
+                reverse=sort_desc)
+        else:
+            self._media_hidden_by_type = 0
+        self._media_all_paths = paths
+
+    def _on_media_type_filter_changed(self, button) -> None:
+        """Picture/Video/Graphics preset toggle click handler — added
+        2026-10-11. Takes effect immediately on the CURRENTLY loaded
+        folder (no reload of the underlying file list needed, same as
+        the hide-seen filter's own live re-apply), resets to page 0
+        since the filtered+resorted set is effectively a new view."""
+        self._media_type_filter = self._media_type_buttons.get(button, 'all')
+        self._recompute_media_all_paths()
+        self._load_media_page(0)
 
     def _refresh_media_bookmark_badges(self) -> None:
         """Re-reads bookmark state from caseresults.db and updates the
@@ -1943,6 +2403,7 @@ class MediaViewerMixin:
         if total == 0:
             self._media_page_index = 0
             self._media_model.set_items([])
+            self._media_delegate.set_video_paths(set())
             # Not paginated (nothing active to page through) — but the
             # row itself still shows, and stays reachable for "Undo", if
             # the folder has real media hidden-as-seen by the filter
@@ -1988,6 +2449,14 @@ class MediaViewerMixin:
         display_items = page_items if include_bookmarks else [
             p for p in page_items if p not in self._media_bookmarked_paths]
         self._media_model.set_items(display_items)
+        # Video badge (added 2026-10-11, same feature as the Picture/
+        # Video/Graphics toggle above) — scoped to just this page's own
+        # items, not the whole folder, same bounded-cost principle as
+        # the pixmap cache's own per-page eviction above. Uses
+        # _has_frame_risk, NOT _media_kind == 'video' — a GIF gets this
+        # badge too even though its preset bucket is 'graphics'.
+        self._media_delegate.set_video_paths(
+            {p for p in display_items if self._has_frame_risk(p)})
         self._media_view.scrollToTop()
 
         paginated = n_pages > 1

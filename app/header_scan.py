@@ -13,14 +13,25 @@ import struct
 
 from zip_reader import ZipReader
 
-# (signature, category) — first match wins.
+# (signature, category) — first match wins. PNG/GIF are their own
+# 'Graphic' category, not 'Picture' — added 2026-10-11, direct request:
+# "i want you to seperate out png and gif into graphic type both via the
+# ext and the header scan[,] so that the filter only need to use the
+# type without filltering further and missing some images." Matches
+# ffs-explorer.py's own _EXT_TO_TYPE split (GRAPHIC_EXTENSIONS below) so
+# an extensionless PNG/GIF recovered only by these magic bytes gets the
+# SAME Type the File Browser would show it if it still had its real
+# extension — previously a real, documented gap (see media_viewer.py's
+# _media_kind — that classifier used to fall back to 'picture' for ANY
+# extensionless image since classify_magic had no Graphic/Picture split
+# at all; closed now that this table has one).
 _SIGNATURES: list[tuple[bytes, str | None]] = [
     (b'SQLite format 3\x00', 'Database'),
     (b'\xff\xd8\xff',        'Picture'),   # JPEG
-    (b'\x89PNG\r\n\x1a\n',  'Picture'),   # PNG
-    (b'GIF87a',              'Picture'),
-    (b'GIF89a',              'Picture'),
-    (b'II*\x00',             'Picture'),   # TIFF LE
+    (b'\x89PNG\r\n\x1a\n',  'Graphic'),   # PNG
+    (b'GIF87a',              'Graphic'),
+    (b'GIF89a',              'Graphic'),
+    (b'II*\x00',             'Picture'),   # TIFF LE (also covers TIFF-based RAW: CR2/NEF/DNG)
     (b'MM\x00*',             'Picture'),   # TIFF BE
     (b'%PDF',                'Document'),
     (b'PK\x03\x04',         'Archive'),    # ZIP
@@ -124,6 +135,15 @@ def is_text(data: bytes) -> bool:
 # app_intelligence.py must stay (it's used by the MCP server too, which
 # needs to run on a plain background thread with no Qt requirement).
 
+# .png/.gif are their OWN 'Graphic' category, separate from ordinary
+# photo extensions — added 2026-10-11, direct request: "i want you to
+# seperate out png and gif into graphic type both via the ext and the
+# header scan[,] so that the filter only need to use the type without
+# filltering further and missing some images." See _SIGNATURES above for
+# the matching header-byte split, and ffs-explorer.py's _EXT_TO_TYPE,
+# which maps this exact set to the 'Graphic' Type column value.
+GRAPHIC_EXTENSIONS = frozenset({'.png', '.gif'})
+
 MEDIA_EXTENSIONS = frozenset({
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif',
     '.mov', '.mp4', '.m4v', '.3gp', '.avi',
@@ -137,6 +157,14 @@ MEDIA_EXTENSIONS = frozenset({
     # — it never falls back to sniffing magic bytes the way the Artifact
     # Report thumbnail pipeline already does) skips it entirely.
     '.thumb',
+    # TIFF/RAW — added 2026-10-11, direct request ("i am also happy for
+    # you to in[c]lu[d]e the raw/tiff as pictures"): these already showed
+    # as Type="Picture" in the File Browser (PICTURE_EXTENSIONS) but were
+    # invisible to the Media Browser until now, since this set — not that
+    # one — gates whether a folder listing even considers a file "media"
+    # at all. CR2/NEF/DNG are TIFF-based RAW formats, same II*/MM* magic
+    # bytes as plain TIFF (see _SIGNATURES above).
+    '.tiff', '.tif', '.raw', '.cr2', '.nef', '.dng',
 })
 VIDEO_THUMB_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.avi'})
 TEXT_ATTACHMENT_EXTENSIONS = frozenset({'.txt', '.vcf'})
@@ -161,8 +189,14 @@ WEBPAGE_ARCHIVE_EXTENSIONS = frozenset({'.mhtml', '.mht'})
 # classify_magic() categories this function knows how to fold into its own
 # 'image'/'video'/'pdf' vocabulary. 'Document' today only ever comes from
 # the %PDF signature (see _SIGNATURES above) — revisit this mapping if
-# that table ever grows a second Document-category entry.
-_MAGIC_KIND = {'Picture': 'image', 'Video': 'video', 'Document': 'pdf'}
+# that table ever grows a second Document-category entry. 'Graphic' maps
+# to the same 'image' kind as 'Picture' here — this function's own
+# vocabulary doesn't need the finer Picture-vs-Graphic split the Type
+# column does, but it DOES need the key present, or an extensionless
+# PNG/GIF (classify_magic now returns 'Graphic' for those, not 'Picture'
+# — see _SIGNATURES) would silently stop being recognized as an image at
+# all through this path.
+_MAGIC_KIND = {'Picture': 'image', 'Graphic': 'image', 'Video': 'video', 'Document': 'pdf'}
 
 
 def sniff_media_kind(ext: str, data: bytes) -> str | None:

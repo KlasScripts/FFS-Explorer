@@ -86,6 +86,84 @@ def test_normalize_ffs_path(raw, archive, expected):
     assert si.normalize_ffs_path(raw, archive) == expected
 
 
+@pytest.mark.parametrize("raw,archive,expected", [
+    # Real shape confirmed against an actual Griffeye case-analysis
+    # export, 2026-10-10: the folder the FFS zip itself was sitting in
+    # on disk, ON TOP of the zip's own filename -- two extra segments,
+    # not one.
+    (r"CaseFolder\EXTRACTION_FFS.zip\data\data\kik.android\x.mp4",
+     "EXTRACTION_FFS.zip", "data/data/kik.android/x.mp4"),
+    # Still works with no archive-name segment to find afterward.
+    (r"CaseFolder\data\x.mp4", "EXTRACTION_FFS.zip", "data/x.mp4"),
+    # Nothing left after stripping the parent -- no crash, no archive
+    # segment to match either.
+    ("CaseFolder", "EXTRACTION_FFS.zip", "CaseFolder"),
+    ("", "EXTRACTION_FFS.zip", ""),
+])
+def test_normalize_ffs_path_strip_parent_folder(raw, archive, expected):
+    assert si.normalize_ffs_path(raw, archive, strip_parent_folder=True) == expected
+
+
+@pytest.mark.parametrize("raw_path,raw_name,expected", [
+    # Real shape confirmed against an actual Griffeye export, 2026-10-10:
+    # "File Path" holds only the containing directory, "File Name" the
+    # leaf -- joining them is required before the path can be matched
+    # against the archive at all (a bug fixed this same day: the
+    # filename column used to be read ONLY for the bookmark's own
+    # display name, never joined into the path actually looked up).
+    (r"EXTRACTION_FFS.zip\data\data\kik.android", "x.mp4",
+     r"EXTRACTION_FFS.zip\data\data\kik.android/x.mp4"),
+    # Trailing separator on the directory doesn't double up.
+    ("EXTRACTION_FFS.zip\\data\\data\\kik.android\\", "x.mp4",
+     "EXTRACTION_FFS.zip\\data\\data\\kik.android/x.mp4"),
+    # Blank filename -- no-op, filepath used as-is (so an ordinary
+    # combined-column row with "Filename is its own column" accidentally
+    # left checked still works rather than silently breaking).
+    (r"data\x.mp4", "", r"data\x.mp4"),
+    # Blank filepath -- filename alone (a root-level file).
+    ("", "x.mp4", "x.mp4"),
+])
+def test_combine_filepath_and_filename(raw_path, raw_name, expected):
+    assert si.combine_filepath_and_filename(raw_path, raw_name) == expected
+
+
+@pytest.mark.parametrize("ui_path,expected", [
+    # Real shape confirmed against a real Cellebrite-format iOS archive
+    # + a real Griffeye export, 2026-10-10: TWO real quirks stacked —
+    # Griffeye's own generic "root/" extraction-root marker (unrelated
+    # to this app's OWN "root" = /private/var/root meaning), on top of
+    # the literal "private/var/mobile/..." this app's convention
+    # collapses to "mobile/...". All three interpretations offered;
+    # only the last ("mobile/Library/ContactsMetadata") is the one that
+    # actually resolves in a real archive.
+    ("root/private/var/mobile/Library/ContactsMetadata",
+     ["root/private/var/mobile/Library/ContactsMetadata",
+      "private/var/mobile/Library/ContactsMetadata",
+      "mobile/Library/ContactsMetadata"]),
+    # Already-collapsed form (no Griffeye "root/" marker) -- the
+    # straight private/var/mobile collapse alone is enough.
+    ("private/var/mobile/Library/X",
+     ["private/var/mobile/Library/X", "mobile/Library/X"]),
+    ("private/var/root/Library/X",
+     ["private/var/root/Library/X", "root/Library/X"]),
+    ("private/var/mobile", ["private/var/mobile", "mobile"]),
+    # Griffeye's own root/ marker with NO private/var underneath --
+    # just the marker-stripped candidate, no collapse possible.
+    ("root/Library/Preferences/x.plist",
+     ["root/Library/Preferences/x.plist", "Library/Preferences/x.plist"]),
+    # private/var/mobile appearing mid-path (not as a prefix) must NOT
+    # be rewritten -- this is prefix-anchored, not a substring match.
+    ("data/backup/private/var/mobile/x",
+     ["data/backup/private/var/mobile/x"]),
+    # No "private/var/mobile|root" segment and no "root/" marker at all
+    # -- just the one candidate, unchanged.
+    ("data/data/com.example/file.db", ["data/data/com.example/file.db"]),
+    ("", [""]),
+])
+def test_ios_path_candidates(ui_path, expected):
+    assert si.ios_path_candidates(ui_path) == expected
+
+
 @pytest.mark.parametrize("raw,expected", [
     ("ABC123", "abc123"),
     ("  abc123  ", "abc123"),

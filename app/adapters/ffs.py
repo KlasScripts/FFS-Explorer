@@ -659,47 +659,101 @@ class FfsAdapter:
                 return self.container_bundle_id(f'{parent}/{child_name}', guid_map)
         return None
 
-    def scan_folders(self) -> list[str]:
-        """Return default header-scan folder prefixes for this format."""
-        if self.format == self.FORMAT_GRAYKEY:
-            pv = 'private/var/'
-            return [
-                pv + 'mobile/Containers/',
-                pv + 'mobile/Library/Mobile Documents/',
-                pv + 'mobile/Library/Mail/',
-                pv + 'mobile/Library/SMS/Attachments/',
-                pv + 'mobile/Library/Biome/streams/',
-                'data/data/',
-                'data/media/',
-            ]
+    def canonical_app_path(self, ui_path: str, guid_map: dict,
+                           folder_map: dict | None = None) -> str:
+        """Return *ui_path* with its app-container GUID segment (if any)
+        replaced by the resolved bundle/package id, keeping the rest of
+        the path shape identical — e.g. "mobile/Containers/Data/
+        Application/<GUID>/Library/foo" becomes ".../Application/
+        com.example.app/Library/foo". Returns *ui_path* UNCHANGED if it
+        doesn't fall under one of container_parents()'s prefixes, or the
+        GUID can't be resolved — safe to call on ANY path unconditionally.
+
+        Added 2026-10-10, direct correction: a raw GUID-based path is
+        specific to ONE install/case (a reinstall of the same app gets a
+        new GUID) — any list meant to be shared/compared ACROSS cases
+        (user_media_ignore_list.py, embedded_media_skip_list.py) must
+        store and match this canonical form, never the raw ui_path, for
+        anything under an app container. Confirmed via real evidence,
+        not just theory: a real stored user_media_ignore_list.json entry
+        was found to be exactly this bug — a bare install-specific GUID
+        that will never match again once that GUID stops existing.
+        Android needs no equivalent: container_bundle_id() already
+        returns the package name directly for an Android path (no GUID
+        indirection exists there at all), so this is naturally a no-op
+        for Android paths too — one function, safe for both platforms."""
+        for parent in self.container_parents(folder_map):
+            prefix = parent + '/'
+            if ui_path.startswith(prefix):
+                rest = ui_path[len(prefix):]
+                child_name, sep, relative = rest.partition('/')
+                bundle_id = self.container_bundle_id(f'{parent}/{child_name}', guid_map)
+                if bundle_id:
+                    return f'{parent}/{bundle_id}{sep}{relative}'
+                return ui_path
+        return ui_path
+
+    def _rule_prefixes(self, getter) -> list[str]:
+        """Shared plumbing for scan_folders()/scan_excludes()/
+        user_media_folders(): pull canonical prefixes from scan_rules.py
+        for whichever platform(s) this archive's format could hold, and
+        apply prefix_shortcut() to the iOS ones for a GrayKey case. See
+        scan_rules.py's own docstring for why GrayKey unions BOTH
+        platforms rather than trying to pick one — the format alone is
+        genuinely ambiguous between iOS/Android, and a non-matching
+        prefix is harmless (it just never matches any real path)."""
+        import scan_rules
         if self.format == self.FORMAT_ZIP_EXTRAS:
-            return ['data/data/', 'data/media/']
-        return [
-            'mobile/Containers/',
-            'mobile/Library/Mobile Documents/',
-            'mobile/Library/Mail/',
-            'mobile/Library/SMS/Attachments/',
-            'mobile/Library/Biome/streams/',
-        ]
+            return list(getter('android'))
+        ios = [self.prefix_shortcut(p) for p in getter('ios')]
+        if self.format == self.FORMAT_GRAYKEY:
+            return ios + list(getter('android'))
+        return ios
+
+    def scan_folders(self) -> list[str]:
+        """Return the base in-scope folder prefixes for this format —
+        the shared foundation for header-scan tiers 1/2, nested-archive
+        discovery, and the embedded sqlite/plist sweep. Paired with
+        scan_excludes(): every one of those three features must treat a
+        path as in-scope only if it matches a scan_folders() prefix AND
+        does not match a scan_excludes() one. See scan_rules.py."""
+        import scan_rules
+        return self._rule_prefixes(scan_rules.include_prefixes)
+
+    def scan_excludes(self) -> list[str]:
+        """Subfolders of scan_folders() confirmed to hold no real user
+        data — see scan_rules.py's own docstring for the full reasoning
+        (a denylist, not an allowlist: an unrecognized subfolder stays
+        in scope rather than being silently dropped)."""
+        import scan_rules
+        return self._rule_prefixes(scan_rules.exclude_prefixes)
+
+    def embedded_media_excludes(self) -> list[str]:
+        """Subfolders carved OUT of the embedded sqlite/plist sweep
+        specifically, on top of scan_excludes() — a folder can stay in
+        scope for header-scan/nested-archive-discovery while being
+        excluded here because parsing every sqlite/plist inside it was
+        judged too expensive for the value found. See scan_rules.py's
+        embedded_media_excludes()."""
+        import scan_rules
+        return self._rule_prefixes(scan_rules.embedded_media_excludes)
+
+    def user_media_folders(self) -> list[str]:
+        """Folder prefixes the Media Browser's "User Media" filter
+        considers USER-created content — independent of scan_folders()/
+        scan_excludes() above (see scan_rules.py's own docstring for
+        why: this is a precision view, not a coverage tool)."""
+        import scan_rules
+        return self._rule_prefixes(scan_rules.user_media_prefixes)
 
     def archive_discovery_folders(self) -> list[str]:
-        """Paths to scan for archive discovery — containers plus high-value Library locations.
-
-        For GrayKey the zip may hold an Android device (data/data/, data/media/)
-        rather than iOS, so both sets of paths are included."""
-        if self.format == self.FORMAT_ZIP_EXTRAS:
-            return ['data/data/', 'data/media/']
-        pv = 'private/var/' if self.format == self.FORMAT_GRAYKEY else ''
-        base = pv + 'mobile/'
-        paths = [
-            base + 'Containers/',
-            base + 'Library/Mobile Documents/',
-            base + 'Library/Mail/',
-            base + 'Library/SMS/Attachments/',
-        ]
-        if self.format == self.FORMAT_GRAYKEY:
-            paths += ['data/data/', 'data/media/']
-        return paths
+        """Paths to scan for archive discovery. Historically a separate,
+        narrower, hand-maintained list from scan_folders() — confirmed
+        2026-10-10 that the difference was accidental drift (it was
+        missing Biome/Media/ContactsMetadata/Passes/Caches that
+        scan_folders() already had), not intentional, so this is now
+        just scan_folders() itself."""
+        return self.scan_folders()
 
     def strip_display_prefix(self, path: str) -> str:
         """Strip the archive-format prefix for display.

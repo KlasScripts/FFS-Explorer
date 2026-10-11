@@ -1,0 +1,8 @@
+{
+  "_note": "Android counterpart to scan_rules_ios.json -- see that file's own _note for the full schema. Android has no Cellebrite/GrayKey path-prefix quirk (both tools use identical bare 'data/data/'/'data/media/' paths), so no prefix_shortcut()-style transform is needed here.",
+  "version": 1,
+  "rules": [
+    {"path": "data/data/", "include": 1, "user_media": "also_user_media"},
+    {"path": "data/media/", "include": 1, "user_media": "also_user_media"}
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "_note": "Filter+sort presets for the File Browser's preset dropdown (and the Media Browser's Picture/Video/Graphics buttons, which read the three built-in entries by name) -- hand-maintained via that dropdown's Edit/New buttons. See app/file_browser_presets.py.",
+  "version": 1,
+  "presets": [
+    {
+      "name": "Pictures",
+      "date_filters": [],
+      "type_filter": {
+        "types": [
+          "Picture"
+        ]
+      },
+      "text_filters": [],
+      "sort": [
+        {
+          "column": "Modified",
+          "descending": true
+        }
+      ]
+    },
+    {
+      "name": "Videos",
+      "date_filters": [],
+      "type_filter": {
+        "types": [
+          "Video"
+        ]
+      },
+      "text_filters": [],
+      "sort": [
+        {
+          "column": "Modified",
+          "descending": true
+        }
+      ]
+    },
+    {
+      "name": "Graphics",
+      "date_filters": [],
+      "type_filter": {
+        "types": [
+          "Graphic"
+        ]
+      },
+      "text_filters": [],
+      "sort": [
+        {
+          "column": "Size (Bytes)",
+          "descending": true
+        }
+      ]
+    }
+  ]
+}

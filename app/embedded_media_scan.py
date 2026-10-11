@@ -83,7 +83,7 @@ _SQLITE_MAIN_EXTENSIONS = frozenset({'.db', '.sqlite', '.sqlite3', '.db3'})
 _SQLITE_SIDECAR_SUFFIXES = ('-wal', '-shm', '-journal')
 _PLIST_EXTENSION = '.plist'
 
-_MEDIA_MAGIC_KIND = {'Picture': 'image', 'Video': 'video'}
+_MEDIA_MAGIC_KIND = {'Picture': 'image', 'Graphic': 'image', 'Video': 'video'}
 
 _HTTP_STATUS_RE = re.compile(rb'^HTTP/\d\.\d \d{3}')
 
@@ -142,7 +142,8 @@ def classify_scan_candidate(ui_path: str, header_type_overrides: dict) -> str | 
 
 
 def enumerate_candidates(full_metadata: dict, header_type_overrides: dict,
-                         scan_folders: tuple | None = None) -> tuple[list[str], list[str]]:
+                         scan_folders: tuple | None = None,
+                         scan_excludes: tuple = ()) -> tuple[list[str], list[str]]:
     """(sqlite_ui_paths, plist_ui_paths), both lists, no I/O.
 
     *scan_folders*, if given, restricts candidates to ui_paths starting
@@ -151,10 +152,16 @@ def enumerate_candidates(full_metadata: dict, header_type_overrides: dict,
     scan tiers 1/2 to (FfsAdapter.scan_folders()) — so this scan's own
     "app/user-accessible areas only" choice means exactly what an
     examiner already understands that phrase to mean elsewhere in this
-    app. None means everywhere (tier-3-style, unscoped)."""
+    app. None means everywhere (tier-3-style, unscoped). *scan_excludes*
+    (FfsAdapter.scan_excludes()) carves confirmed-noise subfolders back
+    out of *scan_folders* — ignored when *scan_folders* is None, since
+    an unscoped sweep has no "within scope" notion to carve anything out
+    of."""
     sqlite_paths, plist_paths = [], []
     for ui_path in full_metadata:
         if scan_folders is not None and not ui_path.startswith(scan_folders):
+            continue
+        if scan_folders is not None and scan_excludes and ui_path.startswith(scan_excludes):
             continue
         kind = classify_scan_candidate(ui_path, header_type_overrides)
         if kind == 'sqlite':

@@ -34,6 +34,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       check_cache_schema, check_results_schema,
                       save_blob, load_blob, open_blob,
                       save_header_types, load_header_types, clear_header_types,
+                      save_media_metadata, load_media_metadata, clear_media_metadata,
                       save_guid_bundle_map, load_guid_bundle_map, save_app_registry,
                       save_folder_counts, save_folder_sizes, load_folder_data,
                       save_device_info, load_device_info,
@@ -57,8 +58,10 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       processing_registry_entry)
 import header_scan
 import nested_archive
+import media_metadata_scan
 import embedded_media_skip_list
 import user_media_ignore_list
+import file_browser_presets
 import spreadsheet_import
 from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin
@@ -68,7 +71,7 @@ from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
 from leveldb_viewer import LevelDbViewerMixin, _looks_like_leveldb_dir
 from timestamp_display import TimestampDisplayMixin
-from dialog_helpers import button_row, error_label, note_label, WARNING_STYLE, ACTIVE_COLOR
+from dialog_helpers import button_row, error_label, note_label, WARNING_STYLE, ACTIVE_COLOR, ERROR_COLOR
 import research_store as _research
 from artifact_db import load_artifact_results
 from zip_reader import read_nested_entry
@@ -335,8 +338,14 @@ FORENSIC_SHORTCUTS = [
     ]),
 ]
 
+# .png/.gif are deliberately NOT here — see header_scan.GRAPHIC_EXTENSIONS
+# and _EXT_TO_TYPE below for why they're their own 'Graphic' Type instead
+# (added 2026-10-11, direct request: "i want you to seperate out png and
+# gif into graphic type both via the ext and the header scan[,] so that
+# the filter only need to use the type without filltering further and
+# missing some images").
 PICTURE_EXTENSIONS = {
-    '.jpg', '.jpeg', '.heic', '.heif', '.png', '.gif',
+    '.jpg', '.jpeg', '.heic', '.heif',
     '.bmp', '.tiff', '.tif', '.webp', '.raw', '.cr2', '.nef', '.dng',
 }
 VIDEO_EXTENSIONS = {
@@ -395,6 +404,7 @@ _TEXT_RENDERABLE_EXTENSIONS = frozenset({
 # full-archive loops.  The extension sets are mutually disjoint.
 _EXT_TO_TYPE: dict = {
     **{e: 'Picture'       for e in PICTURE_EXTENSIONS},
+    **{e: 'Graphic'       for e in header_scan.GRAPHIC_EXTENSIONS},
     **{e: 'Video'         for e in VIDEO_EXTENSIONS},
     **{e: 'Database'      for e in DATABASE_EXTENSIONS},
     '.plist': 'Property List',
@@ -1086,7 +1096,8 @@ def _confirm_tier3(parent) -> bool:
     return box.clickedButton() is yes_btn
 
 
-def _header_candidate_matches(ui_path: str, scan_folders: tuple, tier: int) -> bool:
+def _header_candidate_matches(ui_path: str, scan_folders: tuple, tier: int,
+                               excludes: tuple = ()) -> bool:
     """Does *ui_path* need a header read under *tier*? Shared predicate for
     both the counting and collecting passes, so the three tiers can never
     silently drift apart between "how many will this scan" (dialog display)
@@ -1101,12 +1112,19 @@ def _header_candidate_matches(ui_path: str, scan_folders: tuple, tier: int) -> b
       3 — every file, everywhere (no folder restriction — the exhaustive
           backstop for "the curated scan_folders() list itself might be
           wrong or incomplete for this case," not a routine default)
+
+    *excludes* — see FfsAdapter.scan_excludes() (e.g. mobile/Library/
+    Caches/ minus its own confirmed-noise subfolders) — tiers 1/2 only,
+    same as scan_folders() itself; tier 3 is already unrestricted and
+    ignores it.
     """
     if tier <= 0:
         return False
     if tier >= 3:
         return True
     if not ui_path.startswith(scan_folders):
+        return False
+    if excludes and ui_path.startswith(excludes):
         return False
     if tier == 2:
         return True
@@ -1129,18 +1147,109 @@ def _show_scan_folders_dialog(parent, adapter) -> None:
     dlg.setMinimumSize(520, 300)
     lay = QVBoxLayout(dlg)
     intro = QLabel(
-        "These are the app/user-accessible folders this archive's own "
-        "detected format defines. A folder-scoped scan tier (\"unknown-"
-        "extension files\" or \"all files, in these folders\") only ever "
-        "reads bytes from files inside them — anywhere else keeps its "
-        "plain extension-based type unless the exhaustive \"all files, "
-        "everywhere\" tier is chosen instead.")
+        "A folder-scoped scan tier only reads bytes from files inside "
+        "these folders — anywhere else keeps its plain extension-based "
+        "type unless the \"all files, everywhere\" tier is used.")
     intro.setWordWrap(True)
     lay.addWidget(intro)
     folder_list = QListWidget()
     for prefix in adapter.scan_folders():
         QListWidgetItem(prefix, folder_list)
     lay.addWidget(folder_list)
+    excludes = adapter.scan_excludes()
+    if excludes:
+        excl_label = QLabel(
+            f"Within those, {len(excludes)} subfolder(s) confirmed not "
+            "worth header-scan's attention are skipped — either no "
+            "recognizable file content at all, or a real type (JSON/"
+            "database/plist/etc.) whose actual content was checked and "
+            "found to be generic system config with no way to link it "
+            "to this specific user:")
+        excl_label.setWordWrap(True)
+        lay.addWidget(excl_label)
+        excl_list = QListWidget()
+        for prefix in excludes:
+            QListWidgetItem(prefix, excl_list)
+        excl_list.setMaximumHeight(100)
+        lay.addWidget(excl_list)
+    em_excludes = adapter.embedded_media_excludes()
+    if em_excludes:
+        em_label = QLabel(
+            f"The embedded-media sweep (sqlite/plist BLOB scan) ALSO skips "
+            f"{len(em_excludes)} more folder(s) not worth its extra cost, "
+            "even though header-scan and archive-discovery still cover them:")
+        em_label.setWordWrap(True)
+        lay.addWidget(em_label)
+        em_list = QListWidget()
+        for prefix in em_excludes:
+            QListWidgetItem(prefix, em_list)
+        em_list.setMaximumHeight(100)
+        lay.addWidget(em_list)
+    btn_row = QHBoxLayout()
+    btn_row.addStretch()
+    close_btn = QPushButton("Close")
+    close_btn.clicked.connect(dlg.accept)
+    btn_row.addWidget(close_btn)
+    lay.addLayout(btn_row)
+    dlg.exec()
+
+
+def _show_user_media_folders_dialog(parent, adapter) -> None:
+    """The real folder prefixes the "User Media" filter treats as
+    user-created content, PLUS the real current contents of
+    user_media_ignore_list.py's own exclude list — added 2026-10-10,
+    direct request: there was no way to see either at all before
+    (unlike scan_folders()/scan_excludes(), which the "Scanned
+    Folders…" dialog already showed). Deliberately a SEPARATE small
+    dialog, not another section bolted onto that one: an examiner
+    looking at the Media Browser's User Media row has no reason to go
+    find it inside Process Case's own dialog.
+
+    The exclude section shows user_media_ignore_list.load() directly —
+    NOT a second, scan_rules.py-based mechanism. One was briefly built
+    (a "user_media_exclude" rule field) then reverted the same day,
+    direct correction: "there is a media ignor list were it add the
+    ability to right click on a folder to ignore it form the list. i
+    want this to update the exclude list" — the ignore list already IS
+    the real, working, right-click-driven exclude mechanism; this
+    dialog just needed to read FROM it instead of inventing a second,
+    disconnected one. Updating via that right-click menu (or
+    Preferences ▸ Media Browser's own "Manage Ignore List…") is
+    reflected here immediately, since both read the same JSON store."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("User Media Folders")
+    dlg.setMinimumSize(480, 300)
+    lay = QVBoxLayout(dlg)
+    intro = QLabel(
+        "The \"User Media\" filter only looks for real pictures/videos "
+        "inside these folders — anywhere else is excluded even if it "
+        "holds real media, to keep this a precise \"what did the user "
+        "create/receive\" view rather than everything the header scan "
+        "might cover.")
+    intro.setWordWrap(True)
+    lay.addWidget(intro)
+    folder_list = QListWidget()
+    for prefix in adapter.user_media_folders():
+        QListWidgetItem(prefix, folder_list)
+    lay.addWidget(folder_list)
+    ignore_entries = user_media_ignore_list.load()
+    excl_label = QLabel(
+        f"Excluded from this filter specifically (the \"User Media "
+        f"ignore list\" — right-click a folder or file in the Media "
+        f"Browser to add to it, or Preferences ▸ Media Browser ▸ "
+        f"\"Manage Ignore List…\"): {len(ignore_entries)} entr"
+        f"{'y' if len(ignore_entries) == 1 else 'ies'}.")
+    excl_label.setWordWrap(True)
+    lay.addWidget(excl_label)
+    if ignore_entries:
+        excl_list = QListWidget()
+        for entry in ignore_entries:
+            label = user_media_ignore_list.display_label(entry)
+            item = QListWidgetItem(label, excl_list)
+            if label != entry:
+                item.setToolTip(entry)
+        excl_list.setMaximumHeight(120)
+        lay.addWidget(excl_list)
     btn_row = QHBoxLayout()
     btn_row.addStretch()
     close_btn = QPushButton("Close")
@@ -1154,10 +1263,56 @@ def _count_header_candidates(ui_metadata: dict, ffs_adapter, tier: int = 1) -> i
     """Count files that qualify for a header read under *tier* — no I/O,
     used for dialog display only (see _header_candidate_matches)."""
     scan_folders = tuple(ffs_adapter.scan_folders())
+    excludes = tuple(ffs_adapter.scan_excludes())
     return sum(
         1 for ui_path in ui_metadata
-        if _header_candidate_matches(ui_path, scan_folders, tier)
+        if _header_candidate_matches(ui_path, scan_folders, tier, excludes)
     )
+
+
+def _header_scan_staleness(case_dir: str | None, ui_metadata: dict,
+                           ffs_adapter) -> tuple[int, bool, int, int] | None:
+    """Returns (complete_tier, is_stale, current_candidate_count,
+    gap_count) for whatever header-scan tier this case's own
+    case_settings claims is COMPLETE — None if no case is open, or tier
+    is 0 (nothing recorded, nothing to verify). gap_count is how many
+    MORE candidates exist now than were recorded as scanned (0 when not
+    stale; equals current_candidate_count itself for a legacy case with
+    no stored count at all, i.e. "treat the whole thing as unverified").
+
+    Added 2026-10-10, direct report: a real case's 'header_scan_
+    complete_tier' claimed Tier 1 while 38,141 of its real candidates —
+    ordinary files already inside the main FFS zip, not anything to do
+    with nested-archive/embedded-media content (confirmed separately:
+    both of those already classify correctly at extraction time) — had
+    never actually been scanned, with no way to tell from the old data
+    alone. 'Stale' means the CURRENT candidate count for that tier
+    (every file that genuinely qualifies right now) doesn't match
+    'header_scan_candidate_count', the count persisted at the moment
+    that tier's scan last genuinely finished (see both write sites:
+    _on_header_scan_done, and ProcessDialog's own tier-upgrade
+    completion path). A case from before this check existed has no such
+    stored count at all — also treated as stale (unknown provenance),
+    which is exactly the real case this was built for: there is no way
+    to retroactively prove an old completion claim was ever accurate,
+    so it isn't trusted by default."""
+    if not case_dir:
+        return None
+    try:
+        with closing(_open_results_db(case_dir)) as db:
+            complete_tier = int(load_case_setting(db, 'header_scan_complete_tier', '0'))
+            stored_raw = load_case_setting(db, 'header_scan_candidate_count', '')
+    except Exception:
+        return None
+    if complete_tier <= 0:
+        return None
+    current_count = _count_header_candidates(ui_metadata, ffs_adapter, tier=complete_tier)
+    try:
+        stored_count = int(stored_raw)
+    except (TypeError, ValueError):
+        return (complete_tier, True, current_count, current_count)
+    gap = max(0, current_count - stored_count)
+    return (complete_tier, gap > 0, current_count, gap)
 
 
 def _classify_header_scan_results(results: dict) -> tuple[int, int]:
@@ -1221,6 +1376,20 @@ def _is_extractable(name: str, ft: str) -> bool:
 _PHOTO_HEADERS = ['Flags', 'Taken', 'Added', 'Original Name', 'Album', 'Labels',
                   'Origin', 'Camera', 'Place', 'GPS', 'Faces',
                   'Face Ages', 'Status']
+
+# File Browser columns for app/media_metadata_scan.py's EXIF/video-
+# container metadata — added 2026-10-11, direct request ("get all the
+# exif and add it as ad[d]itional columns"). "(EXIF)" suffix on every
+# one — direct choice when this overlap was flagged: iOS's Photos.sql
+# already provides Taken/Camera/GPS (the _PHOTO_HEADERS above) for
+# Photos-indexed images specifically; these columns instead come from
+# the file's OWN bytes directly and apply to every Picture/Graphic/
+# Video file in scope, Photos-indexed or not — keeping the existing
+# names unchanged (never renamed to disambiguate) avoids touching
+# anything already shipped/saved in a report or column layout.
+_EXIF_HEADERS = ['Taken (EXIF)', 'Camera (EXIF)', 'GPS (EXIF)',
+                 'Duration (EXIF)', 'Dimensions (EXIF)', 'Software (EXIF)',
+                 'Orientation (EXIF)']
 
 # Cocoa/Mac epoch (2001-01-01) -> Unix epoch, seconds. photos_metadata.py's
 # Taken/Added (timestamp_fields unit "cocoa_s") store the raw value in this
@@ -1366,9 +1535,12 @@ def _discover_all_archives(
     mtime is nanoseconds since epoch (0 if unknown).
     """
     scan_roots = None if unscoped else tuple(ffs_adapter.archive_discovery_folders())
+    excludes = () if unscoped else tuple(ffs_adapter.scan_excludes())
     results = []
     for ui_path, meta in ui_metadata.items():
         if scan_roots is not None and not ui_path.startswith(scan_roots):
+            continue
+        if excludes and ui_path.startswith(excludes):
             continue
         name = ui_path.rsplit('/', 1)[-1]
         ft = _get_file_type(name)
@@ -1396,9 +1568,12 @@ def _collect_nested_archive_candidates(
     'Archive' = ZIP containers; 'Compressed' = gzip/bzip2/xz streams.
     """
     scan_roots = tuple(ffs_adapter.scan_folders())
+    excludes = tuple(ffs_adapter.scan_excludes())
     results = []
     for ui_path in ui_metadata:
         if not ui_path.startswith(scan_roots):
+            continue
+        if excludes and ui_path.startswith(excludes):
             continue
         name = ui_path.rsplit('/', 1)[-1]
         ft   = _get_file_type(name)
@@ -1458,11 +1633,52 @@ def _collect_header_candidates(
     """Return [(ui_path, data_offset, file_size)] that qualify for a header
     read under *tier* — see _header_candidate_matches for the three tiers."""
     scan_folders = tuple(ffs_adapter.scan_folders())
+    excludes = tuple(ffs_adapter.scan_excludes())
     targets = [
         ui_path for ui_path in ui_metadata
-        if _header_candidate_matches(ui_path, scan_folders, tier)
+        if _header_candidate_matches(ui_path, scan_folders, tier, excludes)
     ]
     return _resolve_file_candidates(zip_path, targets, ffs_adapter, z=z, delta=delta)
+
+
+_MEDIA_METADATA_TYPES = ('Picture', 'Graphic', 'Video')
+
+
+def _collect_media_metadata_candidates(
+    zip_path: str,
+    ui_metadata: dict,
+    ffs_adapter,
+    header_type_overrides: dict,
+    z=None,
+    delta: int | None = None,
+) -> list[tuple[str, int, int, str]]:
+    """Return [(ui_path, data_offset, file_size, ext)] for every file in
+    *ui_metadata* typed Picture/Graphic/Video (by extension via
+    _get_file_type, or the header-scan override for an 'Other' one) —
+    for app/media_metadata_scan.py's EXIF/video-metadata pass (added
+    2026-10-11). Scoped to scan_folders()/scan_excludes() — the SAME
+    in-scope-for-processing folders header-scan tiers and the embedded-
+    media sweep already use, direct correction when this was scoped:
+    "we are only doing this in the [folders] that are marked as place
+    to include and not the one exscluded for the header proceesing" —
+    deliberately NOT unscoped the way the Media Browser's own
+    Picture/Video/Graphics classification is."""
+    scan_folders = tuple(ffs_adapter.scan_folders())
+    excludes = tuple(ffs_adapter.scan_excludes())
+    targets = []
+    for ui_path in ui_metadata:
+        if not ui_path.startswith(scan_folders):
+            continue
+        if excludes and ui_path.startswith(excludes):
+            continue
+        name = ui_path.rsplit('/', 1)[-1]
+        ft = _get_file_type(name)
+        if ft == 'Other':
+            ft = header_type_overrides.get(ui_path, 'Other')
+        if ft in _MEDIA_METADATA_TYPES:
+            targets.append(ui_path)
+    triples = _resolve_file_candidates(zip_path, targets, ffs_adapter, z=z, delta=delta)
+    return [(p, off, sz, os.path.splitext(p)[1].lower()) for p, off, sz in triples]
 
 
 class ZipMetadataWorker(QThread):
@@ -2176,7 +2392,8 @@ class FileTableModel(QAbstractTableModel):
 
     def set_filter(self, text, col=-1, text_cols=None,
                    date_col=-1, date_from='', date_to='',
-                   type_col=-1, types=None):
+                   type_col=-1, types=None,
+                   extra_date_filters=None, extra_text_filters=None):
         """Start an incremental filter. Clears visible rows immediately, then
         adds matching rows in chunks so the UI count updates live.
 
@@ -2185,7 +2402,22 @@ class FileTableModel(QAbstractTableModel):
         date_col/from/to — keep rows whose 'YYYY-MM-DD …' cell date is within
                            [date_from, date_to] (inclusive, 'YYYY-MM-DD').
         type_col/types — keep rows whose type cell is in the *types* set
-                         (None = no type filtering)."""
+                         (None = no type filtering).
+
+        extra_date_filters/extra_text_filters — added 2026-10-11 for the
+        File Browser's preset dropdown (see app/file_browser_presets.py),
+        which can need several independent date ranges and/or several
+        independent column criteria ANDed together, something the single
+        date_col/text_cols pair above (designed for the plain filter bar,
+        which only ever has ONE of each) can't express. Each is a list:
+          extra_date_filters: [{'col': int, 'from': 'YYYY-MM-DD', 'to': 'YYYY-MM-DD'}, ...]
+          extra_text_filters: [{'cols': [int, ...], 'mode': 'contains'|'ends_with'|'equals',
+                                'values': [str, ...]}, ...]
+        — every list entry is ANDed with the others and with the plain
+        text/date_col/type_col checks above; within one text entry,
+        'values' is OR'd (see file_browser_presets.match_text) and so are
+        the columns in 'cols'. Plain filter-bar callers never pass these
+        (default None), so existing behavior is unchanged."""
         self._filter_gen += 1
         my_gen = self._filter_gen
         needle = text.casefold()
@@ -2221,9 +2453,22 @@ class FileTableModel(QAbstractTableModel):
                 if not any(needle in cols[c].casefold()
                            for c in check_cols if c < len(cols) and cols[c]):
                     return False
+            if extra_date_filters:
+                for ef in extra_date_filters:
+                    c = ef['col']
+                    v = cols[c] if c < len(cols) else ''
+                    if not v or not (ef['from'] <= v[:10] <= ef['to']):
+                        return False
+            if extra_text_filters:
+                for tf in extra_text_filters:
+                    if not any(c < len(cols) and cols[c]
+                               and file_browser_presets.match_text(cols[c], tf['mode'], tf['values'])
+                               for c in tf['cols']):
+                        return False
             return True
 
-        if not needle and date_col < 0 and types is None:
+        if (not needle and date_col < 0 and types is None
+                and not extra_date_filters and not extra_text_filters):
             visible = [r for r in self._all_rows if _row_ok(r)]
             if visible:
                 # beginInsertRows(0, -1) is an invalid range per Qt docs —
@@ -2287,14 +2532,45 @@ class FileTableModel(QAbstractTableModel):
         self._sort_col = column
         self._sort_order = order
         reverse = (order == Qt.SortOrder.DescendingOrder)
-        if real_column == self._files_col:
-            key = itemgetter(2)   # C-level accessor — faster than a lambda on large row lists
-        elif real_column == self._size_col:
-            key = lambda r: int(r[0][real_column].replace(',', '')) if real_column < len(r[0]) and r[0][real_column] else 0
-        else:
-            key = lambda r: r[0][real_column].lower() if real_column < len(r[0]) and r[0][real_column] else ''
+        key = self._sort_key_for_column(real_column)
         self._all_rows.sort(key=key, reverse=reverse)
         self._rows.sort(key=key, reverse=reverse)
+        self.layoutChanged.emit()
+
+    def _sort_key_for_column(self, real_column):
+        """A sort key callable for one real _headers-space column index
+        (no checkbox-column offset) — shared by sort() (view-column
+        space, offset applied by its own caller) and sort_multi() below."""
+        if real_column == self._files_col:
+            return itemgetter(2)   # C-level accessor — faster than a lambda on large row lists
+        if real_column == self._size_col:
+            return lambda r: int(r[0][real_column].replace(',', '')) if real_column < len(r[0]) and r[0][real_column] else 0
+        return lambda r: r[0][real_column].lower() if real_column < len(r[0]) and r[0][real_column] else ''
+
+    def sort_multi(self, levels: list) -> None:
+        """Excel-style multi-level sort for the File Browser's preset
+        dropdown (app/file_browser_presets.py) — *levels* is
+        [(real_column, descending), ...] in priority order, first =
+        primary key. Unlike sort(), *real_column* is a plain index into
+        self._headers with NO checkbox-column offset, since callers only
+        ever have header names (preset JSON), never a view column.
+
+        list.sort() is Python's own stable sort — sorting once per
+        level, from LEAST to MOST significant, means each pass's
+        relative row order survives untouched among rows the next (more
+        senior) pass treats as equal, which is exactly a real composite
+        sort with an independent ascending/descending per level, without
+        needing a single combined tuple key (which couldn't give each
+        level its own direction anyway when some are numeric-descending
+        and others string-ascending)."""
+        if not levels:
+            return
+        self.layoutAboutToBeChanged.emit()
+        self._sort_col = -1   # no single header arrow applies to a multi-sort
+        for real_column, descending in reversed(levels):
+            key = self._sort_key_for_column(real_column)
+            self._all_rows.sort(key=key, reverse=descending)
+            self._rows.sort(key=key, reverse=descending)
         self.layoutChanged.emit()
 
 
@@ -2368,6 +2644,13 @@ class MultiColumnFilterProxy(QSortFilterProxyModel):
             src.sort(column, order)
             self.invalidate()
 
+    def sort_multi(self, levels: list) -> None:
+        src = self.sourceModel()
+        if src is not None:
+            assert isinstance(src, FileTableModel)
+            src.sort_multi(levels)
+            self.invalidate()
+
     def set_filter(self, *args, **kwargs):
         src = self.sourceModel()
         if src is not None:
@@ -2399,7 +2682,17 @@ class ImportBookmarksWorker(QThread):
     STATUS column's distinct values). A row whose value column is blank
     falls back to *default_group_name* rather than being silently
     dropped — a verified hash match is real evidence; a missing label
-    shouldn't be the reason it never gets bookmarked."""
+    shouldn't be the reason it never gets bookmarked.
+
+    REAL BUG fixed 2026-10-10, direct report ("worked great" with a
+    combined path+filename column, "did not work" with them separate —
+    confirmed against a real Griffeye case-analysis export, whose own
+    "File Path" column holds only the containing directory): the
+    matching ui_path used to come from filepath_col ALONE — filename_col
+    was only ever read for display_name. With filename_col set, the two
+    are now joined (spreadsheet_import.combine_filepath_and_filename)
+    BEFORE normalization, so the path actually points at the file being
+    verified, not its containing folder."""
     progress      = Signal(int, int, str)   # (index, total, current ui_path or '')
     finished_import = Signal(dict)          # summary — see run()'s own tail
 
@@ -2408,7 +2701,7 @@ class ImportBookmarksWorker(QThread):
                 filepath_col: int, filename_col: int | None,
                 bookmark_col: int | None, fixed_bookmark_value: str,
                 default_group_name: str, allowed_values: set | None = None,
-                parent=None):
+                strip_parent_folder: bool = False, parent=None):
         super().__init__(parent)
         self._zip_path = zip_path
         self._case_dir = case_dir
@@ -2422,6 +2715,7 @@ class ImportBookmarksWorker(QThread):
         self._bookmark_col = bookmark_col
         self._fixed_bookmark_value = fixed_bookmark_value.strip()
         self._default_group_name = default_group_name
+        self._strip_parent_folder = strip_parent_folder
         # Restricts which bookmark-column VALUES get imported at all —
         # e.g. only "Evidence - Videos" out of several distinct values
         # present in the column — direct request, 2026-10-07. None (the
@@ -2452,7 +2746,10 @@ class ImportBookmarksWorker(QThread):
                 n_missing_data += 1
                 self.progress.emit(i, total, '')
                 continue
-            ui_path = si.normalize_ffs_path(raw_path, self._archive_basename)
+            if self._filename_col is not None and self._filename_col < len(row):
+                raw_path = si.combine_filepath_and_filename(raw_path, row[self._filename_col])
+            ui_path = si.normalize_ffs_path(raw_path, self._archive_basename,
+                                            strip_parent_folder=self._strip_parent_folder)
             self.progress.emit(i, total, ui_path)
             if not ui_path:
                 n_missing_data += 1
@@ -2467,11 +2764,25 @@ class ImportBookmarksWorker(QThread):
             if self._allowed_values is not None and bookmark_value not in self._allowed_values:
                 n_group_excluded += 1
                 continue
-            try:
-                physical = self._adapter.resolve(ui_path)
-                data = z.open(physical).read()
-            except Exception:
-                data = None
+            # Try the straightforward normalized path first, then any
+            # iOS-specific fallback shape (see ios_path_candidates' own
+            # docstring — a real tool's raw path can spell out
+            # "private/var/mobile/..." literally, which this app's own
+            # ui_path convention already collapses to "mobile/...").
+            # Whichever candidate actually resolves is what gets
+            # bookmarked — ui_path is updated to match, so the saved
+            # entry points at the path this app itself recognizes, not
+            # whichever guess happened to be tried first.
+            data = None
+            for candidate in si.ios_path_candidates(ui_path):
+                try:
+                    physical = self._adapter.resolve(candidate)
+                    data = z.open(physical).read()
+                except Exception:
+                    data = None
+                if data is not None:
+                    ui_path = candidate
+                    break
             if data is None:
                 n_not_found += 1
                 continue
@@ -2541,6 +2852,31 @@ class ImportBookmarksDialog(QDialog):
             "that file's own bytes from this archive — only a verified "
             "match is bookmarked. CSV or XLSX only."))
 
+        # Saved column-mapping presets, by spreadsheet "type" (e.g.
+        # "Griffeye") — added 2026-10-10, direct request: re-selecting
+        # the same columns every time for a tool that always exports the
+        # same shape is pure repetition. Stored by COLUMN NAME, not
+        # index/position, under QSettings key 'import_bookmarks_presets'
+        # (same JSON-in-QSettings convention as folder_column_configs) —
+        # see _apply_preset/_save_preset for the full read/write/apply
+        # logic, and _browse for the auto-apply-on-load behavior.
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Preset:"))
+        self._preset_combo = QComboBox()
+        self._preset_combo.addItem("(None)")
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_combo_changed)
+        preset_row.addWidget(self._preset_combo, 1)
+        self._preset_save_btn = QPushButton("Save As Preset…")
+        self._preset_save_btn.setEnabled(False)
+        self._preset_save_btn.clicked.connect(self._save_preset)
+        preset_row.addWidget(self._preset_save_btn)
+        self._preset_delete_btn = QPushButton("Delete Preset")
+        self._preset_delete_btn.setEnabled(False)
+        self._preset_delete_btn.clicked.connect(self._delete_preset)
+        preset_row.addWidget(self._preset_delete_btn)
+        layout.addLayout(preset_row)
+        self._refresh_preset_combo()
+
         self._mapping_box = QGroupBox("Column Mapping")
         self._mapping_box.setEnabled(False)
         form = QFormLayout(self._mapping_box)
@@ -2552,6 +2888,16 @@ class ImportBookmarksDialog(QDialog):
         form.addRow("Hash type:", self._hash_type_combo)
         self._filepath_combo = QComboBox()
         form.addRow("Filepath column:", self._filepath_combo)
+        self._strip_parent_folder_check = QCheckBox("Remove parent folder from Filepath")
+        self._strip_parent_folder_check.setToolTip(
+            "Some tools (e.g. Griffeye) prefix every path with the folder "
+            "the FFS zip itself was sitting in on disk, on top of the "
+            "zip's own filename — e.g. \"CaseFolder\\EXTRACTION_FFS.zip\\"
+            "data\\...\". Check this to strip that extra leading folder "
+            "too. The preview below updates live so you can confirm the "
+            "result before running.")
+        self._strip_parent_folder_check.toggled.connect(self._update_preview)
+        form.addRow("", self._strip_parent_folder_check)
 
         filename_row = QHBoxLayout()
         self._filename_check = QCheckBox("Filename is its own column:")
@@ -2663,8 +3009,22 @@ class ImportBookmarksDialog(QDialog):
             combo.blockSignals(False)
         self._mapping_box.setEnabled(True)
         self._run_btn.setEnabled(True)
+        self._preset_save_btn.setEnabled(True)
         self._refresh_group_values_list()
         self._update_preview()
+        # Auto-apply a saved preset when exactly one of them is a clean
+        # fit for this file's own headers — e.g. opening another
+        # Griffeye export after having saved a "Griffeye" preset once
+        # already. More than one fit, or none, leaves column mapping as
+        # freshly reset (every combo defaults to its first item) and the
+        # preset combo on "(None)", same as before this feature existed
+        # — ambiguous auto-selection would be worse than just asking.
+        presets = self._load_presets()
+        fitting = [name for name, cfg in presets.items() if self._preset_fits_headers(cfg)]
+        if len(fitting) == 1:
+            idx = self._preset_combo.findText(fitting[0])
+            if idx >= 0:
+                self._preset_combo.setCurrentIndex(idx)   # triggers _on_preset_combo_changed
 
     def _on_filename_toggled(self, checked: bool):
         self._filename_combo.setEnabled(checked)
@@ -2706,6 +3066,134 @@ class ImportBookmarksDialog(QDialog):
         for i in range(self._group_values_list.count()):
             self._group_values_list.item(i).setCheckState(state)
 
+    # ── Saved presets ────────────────────────────────────────────────
+
+    def _load_presets(self) -> dict:
+        s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        raw = s.value('import_bookmarks_presets', '', type=str)
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_presets(self, presets: dict) -> None:
+        s = _QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        s.setValue('import_bookmarks_presets', json.dumps(presets))
+
+    def _refresh_preset_combo(self) -> None:
+        presets = self._load_presets()
+        self._preset_combo.blockSignals(True)
+        self._preset_combo.clear()
+        self._preset_combo.addItem("(None)")
+        self._preset_combo.addItems(sorted(presets.keys()))
+        self._preset_combo.blockSignals(False)
+
+    def _preset_fits_headers(self, cfg: dict) -> bool:
+        """True when every column name this preset needs is actually
+        present in self._headers — the test used both for auto-applying
+        a preset on file load (_browse) and for deciding whether a
+        manually-picked preset can actually be applied at all."""
+        required = [cfg.get('hash_col', ''), cfg.get('filepath_col', '')]
+        if cfg.get('filename_separate'):
+            required.append(cfg.get('filename_col', ''))
+        if cfg.get('bookmark_mode') == 'column':
+            required.append(cfg.get('bookmark_col', ''))
+        return all(name and name in self._headers for name in required)
+
+    def _apply_preset(self, cfg: dict) -> None:
+        """Applies a saved preset's column mapping to the current combos
+        — BY COLUMN NAME, not index/position, since the whole point is
+        reusing a mapping across different files of the same "type"
+        whose columns may not be in the same order every export. A
+        column name the preset expects but this file doesn't have is
+        silently left at whatever that combo already showed — best-
+        effort, not an error, since _preset_fits_headers already gates
+        whether this gets called at all for the auto-apply path; a
+        manually-picked preset that doesn't fully fit still applies
+        whatever DOES match rather than refusing outright."""
+        def _set_combo_by_name(combo: QComboBox, name: str) -> None:
+            idx = combo.findText(name)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        _set_combo_by_name(self._hash_combo, cfg.get('hash_col', ''))
+        _set_combo_by_name(self._hash_type_combo, cfg.get('hash_type', ''))
+        _set_combo_by_name(self._filepath_combo, cfg.get('filepath_col', ''))
+        self._filename_check.setChecked(bool(cfg.get('filename_separate')))
+        if cfg.get('filename_separate'):
+            _set_combo_by_name(self._filename_combo, cfg.get('filename_col', ''))
+        self._strip_parent_folder_check.setChecked(bool(cfg.get('strip_parent_folder')))
+        if cfg.get('bookmark_mode') == 'column':
+            self._bookmark_col_radio.setChecked(True)
+            _set_combo_by_name(self._bookmark_col_combo, cfg.get('bookmark_col', ''))
+        else:
+            self._bookmark_fixed_radio.setChecked(True)
+            if cfg.get('bookmark_fixed'):
+                self._bookmark_fixed_edit.setText(cfg['bookmark_fixed'])
+        self._refresh_group_values_list()
+        self._update_preview()
+
+    def _current_mapping_as_preset_dict(self) -> dict:
+        return {
+            'hash_col': self._hash_combo.currentText(),
+            'hash_type': self._hash_type_combo.currentText(),
+            'filepath_col': self._filepath_combo.currentText(),
+            'filename_separate': self._filename_check.isChecked(),
+            'filename_col': (self._filename_combo.currentText()
+                            if self._filename_check.isChecked() else ''),
+            'strip_parent_folder': self._strip_parent_folder_check.isChecked(),
+            'bookmark_mode': 'column' if self._bookmark_col_radio.isChecked() else 'fixed',
+            'bookmark_col': (self._bookmark_col_combo.currentText()
+                            if self._bookmark_col_radio.isChecked() else ''),
+            'bookmark_fixed': (self._bookmark_fixed_edit.text()
+                               if self._bookmark_fixed_radio.isChecked() else ''),
+        }
+
+    def _on_preset_combo_changed(self, index: int) -> None:
+        name = self._preset_combo.currentText()
+        self._preset_delete_btn.setEnabled(index > 0)
+        if index <= 0 or not self._headers:
+            return
+        presets = self._load_presets()
+        cfg = presets.get(name)
+        if cfg is not None:
+            self._apply_preset(cfg)
+
+    def _save_preset(self) -> None:
+        if not self._headers:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Save As Preset", "Preset name (e.g. the tool that exported this sheet):")
+        name = name.strip()
+        if not ok or not name:
+            return
+        presets = self._load_presets()
+        presets[name] = self._current_mapping_as_preset_dict()
+        self._save_presets(presets)
+        self._refresh_preset_combo()
+        idx = self._preset_combo.findText(name)
+        if idx >= 0:
+            self._preset_combo.blockSignals(True)
+            self._preset_combo.setCurrentIndex(idx)
+            self._preset_combo.blockSignals(False)
+            self._preset_delete_btn.setEnabled(True)
+
+    def _delete_preset(self) -> None:
+        name = self._preset_combo.currentText()
+        if self._preset_combo.currentIndex() <= 0:
+            return
+        if QMessageBox.question(
+                self, "Delete Preset", f'Delete the saved preset "{name}"?'
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        presets = self._load_presets()
+        presets.pop(name, None)
+        self._save_presets(presets)
+        self._refresh_preset_combo()
+
     def _update_preview(self):
         if not self._rows:
             return
@@ -2714,12 +3202,17 @@ class ImportBookmarksDialog(QDialog):
         path_i = self._filepath_combo.currentIndex()
         name_i = self._filename_combo.currentIndex() if self._filename_check.isChecked() else -1
         bm_i = self._bookmark_col_combo.currentIndex() if self._bookmark_col_radio.isChecked() else -1
+        strip_parent = self._strip_parent_folder_check.isChecked()
         preview_rows = self._rows[:5]
         self._preview_table.setRowCount(len(preview_rows))
         for r, row in enumerate(preview_rows):
             h = spreadsheet_import.normalize_hash(row[hash_i]) if 0 <= hash_i < len(row) else ''
             raw_path = row[path_i] if 0 <= path_i < len(row) else ''
-            ui_path = spreadsheet_import.normalize_ffs_path(raw_path, archive_basename) if raw_path else ''
+            if name_i >= 0 and name_i < len(row):
+                raw_path = spreadsheet_import.combine_filepath_and_filename(raw_path, row[name_i])
+            ui_path = (spreadsheet_import.normalize_ffs_path(
+                raw_path, archive_basename, strip_parent_folder=strip_parent)
+                if raw_path else '')
             if name_i >= 0 and name_i < len(row) and row[name_i].strip():
                 fname = row[name_i].strip()
             else:
@@ -2770,7 +3263,8 @@ class ImportBookmarksDialog(QDialog):
             self._window.zip_path, self._window._case_dir, self._window._adapter,
             self._rows, archive_basename, hash_i, hash_algo, path_i, name_i,
             bm_i, self._bookmark_fixed_edit.text() if bm_i is None else '',
-            default_group_name, allowed_values, parent=self)
+            default_group_name, allowed_values,
+            self._strip_parent_folder_check.isChecked(), parent=self)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_import.connect(self._on_finished)
         self._cancel_btn.clicked.disconnect()
@@ -3678,7 +4172,7 @@ class EmbeddedMediaScanWorker(QThread):
 
     def __init__(self, zip_path, case_dir, ui_metadata, header_type_overrides,
                  ffs_adapter, delta=None, scan_folders=None, skip_entries=None,
-                 parent=None):
+                 guid_to_bundle=None, folder_map=None, parent=None):
         super().__init__(parent)
         self._zip_path        = zip_path
         self._case_dir        = case_dir
@@ -3688,6 +4182,15 @@ class EmbeddedMediaScanWorker(QThread):
         self._delta           = delta
         self._scan_folders    = scan_folders   # None = everywhere
         self._skip_entries    = skip_entries   # None = skip-list feature off
+        # Needed to canonicalize a candidate's own GUID → bundle id
+        # before checking it against skip-list entries, which may be
+        # stored in bundle-id-scoped form — see
+        # FfsAdapter.canonical_app_path()'s own docstring, added
+        # 2026-10-10 as a real fix (bundle-id-scoped entries never
+        # matched anything before this, since the raw candidate path
+        # never contains the bundle id, only the GUID).
+        self._guid_to_bundle  = guid_to_bundle or {}
+        self._folder_map      = folder_map
 
     def _read_bytes(self, z, ui_path: str) -> bytes | None:
         try:
@@ -3704,17 +4207,23 @@ class EmbeddedMediaScanWorker(QThread):
             self.finished_scan.emit({'error': 'Local .zcd cache not available'})
             return
 
+        excludes = ()
+        if self._scan_folders is not None:
+            excludes = (tuple(self._adapter.scan_excludes())
+                       + tuple(self._adapter.embedded_media_excludes()))
         sqlite_paths, plist_paths = ems.enumerate_candidates(
-            self._ui_metadata, self._overrides, self._scan_folders)
+            self._ui_metadata, self._overrides, self._scan_folders, excludes)
         n_databases, n_plists = len(sqlite_paths), len(plist_paths)
 
         n_skip_listed = 0
         if self._skip_entries:
             before = len(sqlite_paths) + len(plist_paths)
-            sqlite_paths = [p for p in sqlite_paths
-                           if not embedded_media_skip_list.matches(p, self._skip_entries)]
-            plist_paths = [p for p in plist_paths
-                          if not embedded_media_skip_list.matches(p, self._skip_entries)]
+            skip_check = lambda p: embedded_media_skip_list.matches(
+                self._adapter.canonical_app_path(
+                    p, self._guid_to_bundle, self._folder_map),
+                self._skip_entries)
+            sqlite_paths = [p for p in sqlite_paths if not skip_check(p)]
+            plist_paths = [p for p in plist_paths if not skip_check(p)]
             n_skip_listed = before - (len(sqlite_paths) + len(plist_paths))
 
         current_version = ems.scan_logic_version()
@@ -3794,6 +4303,53 @@ class EmbeddedMediaScanWorker(QThread):
             'already_scanned': len(already_scanned),
             'skip_listed': n_skip_listed, **counts,
         })
+
+
+class MediaMetadataScanWorker(QThread):
+    """Drives app/media_metadata_scan.py's EXIF/video-container metadata
+    pass — added 2026-10-11, direct request: "i kind of think i should
+    just do a media pass after the header check via type i.e.
+    pic[t]ure, png and video[,] get all the exif and add it as
+    ad[d]itional columns in the browser." Runs as the LAST stage in
+    ProcessDialog's own operation chain (after header scan, nested-
+    archive extraction, and the embedded-media sweep — "it should be
+    done as part of the process like the header review," and reading
+    nested/embedded content needs those two to have already run this
+    session or a past one).
+
+    *zip_candidates* — [(ui_path, data_offset, file_size, ext)] from the
+    main FFS zip (see _collect_media_metadata_candidates — scoped to
+    scan_folders()/scan_excludes(), direct correction: "we are only
+    doing this in the [folders] that are marked as place to include").
+    *local_candidates* — [(ui_path, bytes_or_local_path, ext)] for
+    nested-archive entries and embedded-media hits (see
+    FastZipBrowser._collect_local_media_metadata_candidates) — "for the
+    zips and embe[d]ded," direct request, same session."""
+    progress = Signal(int)   # remaining count (combined, both sources)
+    done     = Signal(dict)  # {ui_path: {field: value, ...}}
+
+    def __init__(self, zip_path, zip_candidates, local_candidates):
+        super().__init__()
+        self._zip_path = zip_path
+        self._zip_candidates = zip_candidates
+        self._local_candidates = local_candidates
+
+    def run(self):
+        total = len(self._zip_candidates) + len(self._local_candidates)
+        if total == 0:
+            self.done.emit({})
+            return
+        self.progress.emit(total)
+        n_local = len(self._local_candidates)
+        results = media_metadata_scan.scan_zip_candidates(
+            self._zip_path, self._zip_candidates,
+            progress_cb=lambda remaining: self.progress.emit(remaining + n_local),
+            cancel_check=self.isInterruptionRequested)
+        results.update(media_metadata_scan.scan_local_candidates(
+            self._local_candidates,
+            progress_cb=lambda remaining: self.progress.emit(remaining),
+            cancel_check=self.isInterruptionRequested))
+        self.done.emit(results)
 
 
 class SingleFileEmbeddedMediaWorker(QThread):
@@ -4050,7 +4606,9 @@ class EmbeddedMediaSkipListDialog(QDialog):
     (`platform`, 'android' or 'ios') — never both at once — so opening it
     from an Android case never shows an iOS entry and vice versa."""
 
-    def __init__(self, platform: str, ui_metadata: dict | None = None, parent=None):
+    def __init__(self, platform: str, ui_metadata: dict | None = None,
+                 adapter=None, guid_to_bundle: dict | None = None,
+                 folder_map: dict | None = None, parent=None):
         super().__init__(parent)
         self._platform = platform
         self.setWindowTitle(f"Embedded-Media Skip List ({platform.capitalize()})")
@@ -4061,6 +4619,14 @@ class EmbeddedMediaSkipListDialog(QDialog):
         # None (no archive open, or this dialog opened from a context
         # with no metadata handy) simply skips that check.
         self._ui_metadata = ui_metadata
+        # For canonicalizing each candidate path (GUID → bundle id)
+        # before running the SAME validation against a bundle-id-scoped
+        # entry — added 2026-10-10, see FfsAdapter.canonical_app_path().
+        # None (adapter unavailable) just skips canonicalization, same
+        # graceful degradation as _ui_metadata being None above.
+        self._adapter = adapter
+        self._guid_to_bundle = guid_to_bundle or {}
+        self._folder_map = folder_map
         layout = QVBoxLayout(self)
         layout.addWidget(note_label(
             f"Showing the {platform.capitalize()} list only — a separate, "
@@ -4110,8 +4676,14 @@ class EmbeddedMediaSkipListDialog(QDialog):
         if not ok or not text.strip():
             return
         text = text.strip()
-        if self._ui_metadata is not None and not embedded_media_skip_list.entry_matches_any_path(
-                text, self._ui_metadata):
+        candidate_paths = self._ui_metadata
+        if candidate_paths is not None and self._adapter is not None:
+            candidate_paths = [
+                self._adapter.canonical_app_path(p, self._guid_to_bundle, self._folder_map)
+                for p in candidate_paths
+            ]
+        if candidate_paths is not None and not embedded_media_skip_list.entry_matches_any_path(
+                text, candidate_paths):
             proceed = QMessageBox.question(
                 self, "No Match in Current Archive",
                 f"\"{text}\" doesn't match any file in the currently open "
@@ -4211,6 +4783,326 @@ class UserMediaIgnoreListDialog(QDialog):
         self._list.addItems(user_media_ignore_list.load())
 
 
+class FilterSortPresetDialog(QDialog):
+    """Create/edit one File Browser filter+sort preset (app/
+    file_browser_presets.py) — added 2026-10-11, direct request for "a
+    dropdown in the filebrowser view that let the user uses, edit and
+    creat the filter,sorts... for the edit and new i want to be able to
+    filter by multiple column so i select the column and then for most
+    column there is a text box where i put the value and then i can
+    click add... for time and data and file type i want it to look like
+    it does in the gui currently... grouped into the 3 column types t
+    and d, filetype and other... then there need to be a sort section...
+    sort by one column after another and select[] if it is ascending or
+    desending."
+
+    Three independent, ANDed filter groups (Time & Date / File Type /
+    Other Columns), each editable one row at a time — the first two
+    mirror the plain filter bar's own widgets (QDateEdit range pickers,
+    the Type checklist) instead of a generic text box, per that same
+    direct request, rather than reinventing them — plus a Sort section
+    with its own add-one-level-at-a-time list, the same Excel-style
+    multi-sort the request describes (list.sort()'s own stability is
+    what makes that work — see FileTableModel.sort_multi's docstring).
+
+    *headers* — the current file model's real column headers (no
+    checkbox column). *type_values* — this view's own distinct 'Type'
+    values for the File Type checklist (fine if empty — e.g. editing a
+    preset before any case is loaded). *existing* — the preset dict
+    being edited, or None for a brand-new one (the caller asks for its
+    name separately before even showing this dialog for a new preset —
+    see FastZipBrowser._new_preset)."""
+
+    _TIME_HEADERS = ('Created', 'Changed', 'Modified')
+    _MODE_LABELS = (("contains", "Contains"), ("ends_with", "Ends With"),
+                   ("equals", "Equals"))
+
+    def __init__(self, headers: list, type_values: list,
+                existing: dict | None, parent=None):
+        super().__init__(parent)
+        self._headers = list(headers)
+        self._other_headers = [h for h in headers
+                               if h not in self._TIME_HEADERS and h != 'Type']
+        self._date_headers = [h for h in headers if h in self._TIME_HEADERS]
+        self.setWindowTitle("Edit Preset" if existing else "New Preset")
+        self.setMinimumSize(640, 680)
+        self._deleted = False
+
+        self._date_filters = [dict(d) for d in (existing or {}).get('date_filters', [])]
+        self._text_filters = [dict(t) for t in (existing or {}).get('text_filters', [])]
+        self._sort_levels  = [dict(s) for s in (existing or {}).get('sort', [])]
+        _tf = (existing or {}).get('type_filter')
+        self._initial_types = set(_tf['types']) if _tf else set()
+
+        layout = QVBoxLayout(self)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.name_edit = QLineEdit(existing['name'] if existing else '')
+        name_row.addWidget(self.name_edit, 1)
+        layout.addLayout(name_row)
+
+        # ── Time & Date ──────────────────────────────────────────────
+        date_box = QGroupBox("Time && Date")
+        date_v = QVBoxLayout(date_box)
+        self.date_list = QListWidget()
+        self.date_list.setMaximumHeight(90)
+        date_v.addWidget(self.date_list)
+        date_add_row = QHBoxLayout()
+        self.date_col_combo = QComboBox()
+        self.date_col_combo.addItems(self._date_headers)
+        self.date_from = QDateEdit(QDate(2000, 1, 1))
+        self.date_to   = QDateEdit(QDate.currentDate())
+        for de in (self.date_from, self.date_to):
+            de.setDisplayFormat("yyyy-MM-dd")
+            de.setCalendarPopup(True)
+        date_add_row.addWidget(self.date_col_combo)
+        date_add_row.addWidget(self.date_from)
+        date_add_row.addWidget(QLabel("–"))
+        date_add_row.addWidget(self.date_to)
+        date_add_btn = QPushButton("Add")
+        date_add_btn.clicked.connect(self._on_add_date)
+        date_add_row.addWidget(date_add_btn)
+        date_rm_btn = QPushButton("Remove Selected")
+        date_rm_btn.clicked.connect(self._on_remove_date)
+        date_add_row.addWidget(date_rm_btn)
+        date_v.addLayout(date_add_row)
+        layout.addWidget(date_box)
+
+        # ── File Type ────────────────────────────────────────────────
+        type_box = QGroupBox("File Type")
+        type_v = QVBoxLayout(type_box)
+        self.type_list = QListWidget()
+        self.type_list.setMaximumHeight(110)
+        for v in sorted(type_values):
+            item = QListWidgetItem(v)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if v in self._initial_types
+                               else Qt.CheckState.Unchecked)
+            self.type_list.addItem(item)
+        type_v.addWidget(self.type_list)
+        type_btn_row = QHBoxLayout()
+        type_all_btn = QPushButton("Select All")
+        type_all_btn.clicked.connect(partial(self._set_all_type_checks, True))
+        type_none_btn = QPushButton("Select None")
+        type_none_btn.clicked.connect(partial(self._set_all_type_checks, False))
+        type_btn_row.addWidget(type_all_btn)
+        type_btn_row.addWidget(type_none_btn)
+        type_btn_row.addStretch()
+        type_v.addLayout(type_btn_row)
+        layout.addWidget(type_box)
+
+        # ── Other Columns ────────────────────────────────────────────
+        other_box = QGroupBox("Other Columns")
+        other_v = QVBoxLayout(other_box)
+        self.text_list = QListWidget()
+        self.text_list.setMaximumHeight(90)
+        other_v.addWidget(self.text_list)
+        other_add_row = QHBoxLayout()
+        self.text_col_combo = QComboBox()
+        self.text_col_combo.addItems(self._other_headers)
+        self.text_mode_combo = QComboBox()
+        for value, label in self._MODE_LABELS:
+            self.text_mode_combo.addItem(label, value)
+        self.text_value_edit = QLineEdit()
+        self.text_value_edit.setPlaceholderText(
+            "Value — comma-separated for \"matches any of\"")
+        other_add_row.addWidget(self.text_col_combo)
+        other_add_row.addWidget(self.text_mode_combo)
+        other_add_row.addWidget(self.text_value_edit, 1)
+        text_add_btn = QPushButton("Add")
+        text_add_btn.clicked.connect(self._on_add_text)
+        other_add_row.addWidget(text_add_btn)
+        other_v.addLayout(other_add_row)
+        text_rm_btn = QPushButton("Remove Selected")
+        text_rm_btn.clicked.connect(self._on_remove_text)
+        other_v.addWidget(text_rm_btn)
+        layout.addWidget(other_box)
+
+        # ── Sort ─────────────────────────────────────────────────────
+        sort_box = QGroupBox("Sort")
+        sort_v = QVBoxLayout(sort_box)
+        self.sort_list = QListWidget()
+        self.sort_list.setMaximumHeight(90)
+        sort_v.addWidget(self.sort_list)
+        sort_add_row = QHBoxLayout()
+        self.sort_col_combo = QComboBox()
+        self.sort_col_combo.addItems(self._headers)
+        self.sort_dir_combo = QComboBox()
+        self.sort_dir_combo.addItem("Ascending", False)
+        self.sort_dir_combo.addItem("Descending", True)
+        sort_add_row.addWidget(self.sort_col_combo)
+        sort_add_row.addWidget(self.sort_dir_combo)
+        sort_add_btn = QPushButton("Add Level")
+        sort_add_btn.clicked.connect(self._on_add_sort)
+        sort_add_row.addWidget(sort_add_btn)
+        sort_v.addLayout(sort_add_row)
+        sort_btn_row = QHBoxLayout()
+        sort_up_btn = QPushButton("Move Up")
+        sort_up_btn.clicked.connect(partial(self._move_sort, -1))
+        sort_down_btn = QPushButton("Move Down")
+        sort_down_btn.clicked.connect(partial(self._move_sort, 1))
+        sort_rm_btn = QPushButton("Remove Selected")
+        sort_rm_btn.clicked.connect(self._on_remove_sort)
+        sort_btn_row.addWidget(sort_up_btn)
+        sort_btn_row.addWidget(sort_down_btn)
+        sort_btn_row.addWidget(sort_rm_btn)
+        sort_btn_row.addStretch()
+        sort_v.addLayout(sort_btn_row)
+        layout.addWidget(sort_box)
+
+        self._refresh_date_list()
+        self._refresh_text_list()
+        self._refresh_sort_list()
+
+        # ── Save / Cancel / Delete ───────────────────────────────────
+        btn_row = QHBoxLayout()
+        self.delete_btn = QPushButton("Delete Preset")
+        self.delete_btn.setVisible(existing is not None)
+        self.delete_btn.clicked.connect(self._on_delete)
+        btn_row.addWidget(self.delete_btn)
+        btn_row.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self._on_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    # ── Time & Date ──────────────────────────────────────────────────
+
+    def _refresh_date_list(self):
+        self.date_list.clear()
+        for d in self._date_filters:
+            self.date_list.addItem(f"{d['column']}: {d['from']} → {d['to']}")
+
+    def _on_add_date(self):
+        if not self._date_headers:
+            return
+        self._date_filters.append({
+            'column': self.date_col_combo.currentText(),
+            'from': self.date_from.date().toString('yyyy-MM-dd'),
+            'to': self.date_to.date().toString('yyyy-MM-dd'),
+        })
+        self._refresh_date_list()
+
+    def _on_remove_date(self):
+        row = self.date_list.currentRow()
+        if row >= 0:
+            del self._date_filters[row]
+            self._refresh_date_list()
+
+    # ── File Type ────────────────────────────────────────────────────
+
+    def _set_all_type_checks(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for i in range(self.type_list.count()):
+            self.type_list.item(i).setCheckState(state)
+
+    def _checked_types(self) -> list:
+        return [self.type_list.item(i).text() for i in range(self.type_list.count())
+               if self.type_list.item(i).checkState() == Qt.CheckState.Checked]
+
+    # ── Other Columns ────────────────────────────────────────────────
+
+    def _refresh_text_list(self):
+        self.text_list.clear()
+        labels = dict(self._MODE_LABELS)
+        for t in self._text_filters:
+            cols = '/'.join(t['columns'])
+            vals = ', '.join(t['values'])
+            self.text_list.addItem(
+                f"{cols} {labels.get(t['mode'], t['mode']).lower()} \"{vals}\"")
+
+    def _on_add_text(self):
+        if not self._other_headers:
+            return
+        raw = self.text_value_edit.text().strip()
+        values = [v.strip() for v in raw.split(',') if v.strip()]
+        if not values:
+            return
+        self._text_filters.append({
+            'columns': [self.text_col_combo.currentText()],
+            'mode': self.text_mode_combo.currentData(),
+            'values': values,
+        })
+        self.text_value_edit.clear()
+        self._refresh_text_list()
+
+    def _on_remove_text(self):
+        row = self.text_list.currentRow()
+        if row >= 0:
+            del self._text_filters[row]
+            self._refresh_text_list()
+
+    # ── Sort ─────────────────────────────────────────────────────────
+
+    def _refresh_sort_list(self):
+        self.sort_list.clear()
+        for s in self._sort_levels:
+            arrow = '↓' if s['descending'] else '↑'
+            self.sort_list.addItem(f"{s['column']} {arrow}")
+
+    def _on_add_sort(self):
+        if not self._headers:
+            return
+        self._sort_levels.append({
+            'column': self.sort_col_combo.currentText(),
+            'descending': bool(self.sort_dir_combo.currentData()),
+        })
+        self._refresh_sort_list()
+
+    def _on_remove_sort(self):
+        row = self.sort_list.currentRow()
+        if row >= 0:
+            del self._sort_levels[row]
+            self._refresh_sort_list()
+
+    def _move_sort(self, delta: int):
+        row = self.sort_list.currentRow()
+        new_row = row + delta
+        if row < 0 or not (0 <= new_row < len(self._sort_levels)):
+            return
+        self._sort_levels[row], self._sort_levels[new_row] = \
+            self._sort_levels[new_row], self._sort_levels[row]
+        self._refresh_sort_list()
+        self.sort_list.setCurrentRow(new_row)
+
+    # ── Save / Delete ────────────────────────────────────────────────
+
+    def _on_delete(self):
+        if QMessageBox.question(
+                self, "Delete Preset",
+                "Delete this preset? This cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self._deleted = True
+        self.accept()
+
+    def _on_save(self):
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Name Required", "Enter a name for this preset.")
+            return
+        self._deleted = False
+        self.accept()
+
+    def was_deleted(self) -> bool:
+        return self._deleted
+
+    def result_preset(self) -> dict:
+        """Call after exec() returns Accepted and was_deleted() is False."""
+        checked = self._checked_types()
+        return {
+            'name': self.name_edit.text().strip(),
+            'date_filters': list(self._date_filters),
+            'type_filter': {'types': checked} if checked else None,
+            'text_filters': list(self._text_filters),
+            'sort': list(self._sort_levels),
+        }
+
+
 class ProcessDialog(QDialog):
     """Lets the user view header-scan history and re-run the file header scan."""
     header_scan_done       = Signal(dict)
@@ -4218,6 +5110,7 @@ class ProcessDialog(QDialog):
     header_types_cleared   = Signal()   # emitted before a rescan so the main window can reset
     nested_extraction_done = Signal()   # emitted after NestedArchiveWorker finishes
     embedded_media_scan_done = Signal()   # emitted after EmbeddedMediaScanWorker finishes
+    media_metadata_scan_done = Signal()   # emitted after MediaMetadataScanWorker finishes
 
     _RUN_TYPE           = 'header_scan'
     _RUN_TYPE_INTEGRITY = 'integrity_check'
@@ -4226,8 +5119,30 @@ class ProcessDialog(QDialog):
                  delta=None, preselect_nested=False,
                  auto_archive_selection=False,
                  preselect_tier1=False, preselect_embedded_media=False,
-                 is_android=False, parent=None):
+                 is_android=False, guid_to_bundle=None, folder_map=None,
+                 local_media_metadata_candidates_fn=None,
+                 parent=None):
         super().__init__(parent)
+        # Callable (not a plain list) — [(ui_path, bytes_or_local_path,
+        # ext)] for nested-archive/embedded-media files needs to be
+        # computed FRESH right before the media-metadata stage actually
+        # starts, not once at dialog-open time: THIS SAME run may have
+        # just found new embedded-media hits a moment earlier (the
+        # previous stage in this exact chain), and a list captured
+        # before that would miss them. FastZipBrowser (the only place
+        # that owns _nested_archive_map/_embedded_media_containers) is
+        # the only one that can build this, so it hands over a callable
+        # rather than a value — see MediaMetadataScanWorker's own
+        # docstring and _start_media_metadata_scan below.
+        self._local_media_metadata_candidates_fn = local_media_metadata_candidates_fn
+        self._media_metadata_worker: MediaMetadataScanWorker | None = None
+        # Needed to canonicalize a candidate's GUID → bundle id before
+        # checking it against embedded_media_skip_list.py's own entries
+        # — see FfsAdapter.canonical_app_path()'s docstring, added
+        # 2026-10-10 as a real fix for bundle-id-scoped entries that
+        # never matched anything before this.
+        self._guid_to_bundle = guid_to_bundle or {}
+        self._folder_map     = folder_map
         # preselect_tier1/preselect_embedded_media (added 2026-09-26) are
         # for FastZipBrowser._open_process_dialog_for_new_case — the
         # first-load flow that hands off from the Timestamp Display
@@ -4429,6 +5344,36 @@ class ProcessDialog(QDialog):
             rb.toggled.connect(self._update_embedded_scope_label)
         self._chk_embedded_media.toggled.connect(self._on_embedded_media_toggled)
         self._on_embedded_media_toggled(False)   # scope controls start hidden
+
+        # Media metadata (EXIF / video info) — added 2026-10-11, direct
+        # request: "i kind of think i should just do a media pass after
+        # the header check via type i.e. pic[t]ure, png and video[,] get
+        # all the exif and add it as ad[d]itional columns in the
+        # browser." Runs LAST (after header scan, nested-archive
+        # extraction, and the embedded-media sweep above — "for the zips
+        # and embe[d]ded it should be done as part of the process like
+        # the header review"), scoped the SAME in-scope-for-processing
+        # way the header scan already is (see
+        # _collect_media_metadata_candidates — direct correction: "we
+        # are only doing this in the [folders] that are marked as place
+        # to include"). Checked by default — direct instruction ("lets
+        # make it that it is a[u]tomat[ic]ly tick[ed] but the user can
+        # untick it if they want") — real cost confirmed low (benchmarked
+        # against real archive data before shipping this: ~0.6ms/image,
+        # ~12ms/video, and a lazy zip-slice reader so a large video's
+        # metadata read touches only the bytes it actually needs, not
+        # the whole file).
+        self._chk_media_metadata = QCheckBox(
+            "Extract media metadata (EXIF / video info) into new File Browser columns")
+        self._chk_media_metadata.setChecked(True)
+        self._chk_media_metadata.setToolTip(
+            "Reads EXIF (photos) and container metadata (videos) — taken "
+            "date, camera, GPS, duration, dimensions, software — for "
+            "every Picture/Graphic/Video file in the folders marked for "
+            "processing (same scope as the header scan), plus any "
+            "already-extracted nested-archive and embedded-media files. "
+            "Shown as new \"(EXIF)\" columns in the File Browser.")
+        layout.addWidget(self._chk_media_metadata)
 
         # Stats block
         self._stats_label = QLabel()
@@ -4702,14 +5647,36 @@ class ProcessDialog(QDialog):
             self._tier_radios_container.takeAt(0)   # only ever holds these radio buttons
 
         self._current_tier = self._load_current_header_tier()
+        # Is the HIGHEST already-run tier's own "complete" claim actually
+        # backed by real coverage? Added 2026-10-10, direct report: a
+        # case's 'complete' flag can claim a tier is done while most of
+        # its real candidates were never scanned (see
+        # _header_scan_staleness's own docstring). Only the highest tier
+        # needs checking — a LOWER already-run tier is always subsumed by
+        # a genuinely-complete higher one, and if the highest is itself
+        # stale, that already covers everything beneath it too.
+        self._current_tier_stale = False
+        self._current_tier_gap_count = 0
+        if self._current_tier > 0:
+            staleness = _header_scan_staleness(self._case_dir, self._ui_metadata, self._adapter)
+            if staleness is not None:
+                _, self._current_tier_stale, _cur, self._current_tier_gap_count = staleness
         self._selected_upgrade_tier = 0
         self._checked_tier_radio_id = 0
         self._tier_radios = {}
         for t in (1, 2, 3):
             already_done = t <= self._current_tier
+            stale_highest = already_done and t == self._current_tier and self._current_tier_stale
             label = _HEADER_SCAN_TIER_LABELS[t]
-            rb = QRadioButton(f"{label} (already run)" if already_done else label)
-            rb.setEnabled(not already_done)
+            if stale_highest:
+                label = (f"{label} (already run, but {self._current_tier_gap_count:,} "
+                         "file(s) may be unscanned — select to rerun)")
+            elif already_done:
+                label = f"{label} (already run)"
+            rb = QRadioButton(label)
+            rb.setEnabled(not already_done or stale_highest)
+            if stale_highest:
+                rb.setStyleSheet(f"color: {ERROR_COLOR};")
             self._tier_button_group.addButton(rb, t)
             self._tier_radios[t] = rb
             self._tier_radios_container.addWidget(rb)
@@ -4760,6 +5727,16 @@ class ProcessDialog(QDialog):
             text += (f" ⚠ A Tier {requested} scan was requested and is still "
                      "running in the background — archive/type data may be "
                      "incomplete until it finishes.")
+        # Stale-completion warning — added 2026-10-10, direct request to
+        # also surface this here (not just the red radio label above),
+        # same ERROR_COLOR this project converges every "something's
+        # wrong" indicator on. Select the highlighted radio below to
+        # rerun it.
+        if getattr(self, '_current_tier_stale', False):
+            text += (f' <span style="color:{ERROR_COLOR}; font-weight:bold;">'
+                     f'⚠ {self._current_tier_gap_count:,} candidate file(s) under this '
+                     'tier may never have been scanned — select the highlighted tier '
+                     'below to rerun it.</span>')
         self._header_status_label.setText(text)
 
     def _on_process_tier_toggled(self, tier_id: int, checked: bool):
@@ -4774,11 +5751,17 @@ class ProcessDialog(QDialog):
         for the programmatic default selection _rebuild_tier_upgrade_ui
         makes on open (see its own _tier_building_default flag).
 
-        tier_id <= self._current_tier means this is the highest
-        ALREADY-RUN tier's own radio, checked only to show current status
-        at a glance (see _rebuild_tier_upgrade_ui) — never a real upgrade
-        request, so self._selected_upgrade_tier stays/becomes 0 and no
-        candidate count is computed for it."""
+        tier_id <= self._current_tier means this is an already-run tier's
+        own radio, checked only to show current status at a glance (see
+        _rebuild_tier_upgrade_ui) — never a real upgrade request, so
+        self._selected_upgrade_tier stays/becomes 0 and no candidate
+        count is computed for it. EXCEPT when tier_id is the highest
+        tier AND it's flagged stale (self._current_tier_stale) — added
+        2026-10-10: that radio is deliberately left ENABLED precisely so
+        selecting it again starts a real rerun, not just a status
+        re-display — see _rebuild_tier_upgrade_ui's own handling of
+        stale_highest for why it's the only already-run tier this can
+        ever apply to."""
         if not checked:
             return
         if (tier_id == 3 and not getattr(self, '_tier_building_default', False)
@@ -4796,7 +5779,8 @@ class ProcessDialog(QDialog):
                 self._tier_radios[prev].setChecked(True)
             return
         self._checked_tier_radio_id = tier_id
-        if tier_id <= self._current_tier:
+        stale_rerun = tier_id == self._current_tier and self._current_tier_stale
+        if tier_id <= self._current_tier and not stale_rerun:
             self._selected_upgrade_tier = 0
             self._candidate_count = 0
             self._refresh_stats()
@@ -4851,7 +5835,8 @@ class ProcessDialog(QDialog):
         run_integrity = self._chk_integrity.isChecked()
         if (not run_integrity and not run_scan
                 and not self._chk_nested.isChecked()
-                and not self._chk_embedded_media.isChecked()):
+                and not self._chk_embedded_media.isChecked()
+                and not self._chk_media_metadata.isChecked()):
             self._status_label.setText("Nothing to do — no operations selected.")
             return
         self._run_btn.setEnabled(False)
@@ -5059,6 +6044,11 @@ class ProcessDialog(QDialog):
                                           str(self._pending_upgrade_tier))
                         save_case_setting(results_db, 'header_scan_complete_tier',
                                           str(self._pending_upgrade_tier))
+                        # See _header_scan_staleness's own docstring for
+                        # why this snapshot is stored at all.
+                        count = _count_header_candidates(
+                            self._ui_metadata, self._adapter, tier=self._pending_upgrade_tier)
+                        save_case_setting(results_db, 'header_scan_candidate_count', str(count))
             except Exception:
                 pass
 
@@ -5286,17 +6276,28 @@ class ProcessDialog(QDialog):
             self._integrity_worker.requestInterruption()
         if self._embedded_media_worker and self._embedded_media_worker.isRunning():
             self._embedded_media_worker.requestInterruption()
+        if self._media_metadata_worker and self._media_metadata_worker.isRunning():
+            self._media_metadata_worker.requestInterruption()
 
     # ── Embedded-media sweep ────────────────────────────────────────────────
 
     def _continue_after_nested(self):
-        """The last stage in the operation chain — see the class-level
-        note by the embedded-media checkbox for why this runs LAST,
-        after archive extraction: a database or plist that only existed
-        inside a nested archive just extracted is already visible to
-        this scan by the time it runs."""
+        """Runs after archive extraction — a database or plist that only
+        existed inside a nested archive just extracted is already
+        visible to the embedded-media scan by the time it runs."""
         if self._chk_embedded_media.isChecked():
             self._start_embedded_media_scan()
+        else:
+            self._continue_after_embedded_media()
+
+    def _continue_after_embedded_media(self):
+        """The real last stage in the operation chain — media-metadata
+        extraction (app/media_metadata_scan.py) runs after EVERYTHING
+        else, direct request: "it should be done as part of the process
+        like the header review," reading nested-archive/embedded-media
+        content that must already exist by the time this runs."""
+        if self._chk_media_metadata.isChecked():
+            self._start_media_metadata_scan()
         else:
             self._finish_operations()
 
@@ -5310,6 +6311,7 @@ class ProcessDialog(QDialog):
             self._zip_path, self._case_dir, self._ui_metadata,
             self._header_type_overrides_snapshot(), self._adapter,
             self._delta, scan_folders, skip_entries,
+            self._guid_to_bundle, self._folder_map,
         )
         self._embedded_media_worker.discovery_done.connect(self._on_embedded_media_discovery)
         self._embedded_media_worker.progress.connect(self._on_embedded_media_progress)
@@ -5335,6 +6337,8 @@ class ProcessDialog(QDialog):
     def _show_embedded_media_skip_list_dialog(self):
         EmbeddedMediaSkipListDialog(
             platform=self._skip_list_platform, ui_metadata=self._ui_metadata,
+            adapter=self._adapter, guid_to_bundle=self._guid_to_bundle,
+            folder_map=self._folder_map,
             parent=self).exec()
 
     def _on_embedded_media_discovery(self, n_databases: int, n_plists: int,
@@ -5404,6 +6408,46 @@ class ProcessDialog(QDialog):
             msg += "."
             self._status_label.setText(msg)
         self.embedded_media_scan_done.emit()
+        self._continue_after_embedded_media()
+
+    def _start_media_metadata_scan(self):
+        infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
+        z = CachedZipView(self._zip_path, infos) if infos is not None else None
+        zip_candidates = _collect_media_metadata_candidates(
+            self._zip_path, self._ui_metadata, self._adapter,
+            self._header_type_overrides_snapshot(), z=z, delta=self._delta)
+        local_candidates = (self._local_media_metadata_candidates_fn()
+                            if self._local_media_metadata_candidates_fn else [])
+        total = len(zip_candidates) + len(local_candidates)
+        if total == 0:
+            self._status_label.setText(
+                "Media metadata: no Picture/Graphic/Video files found to scan.")
+            self._finish_operations()
+            return
+        self._status_label.setText(f"Media metadata: scanning {total:,} file(s)…")
+        self._media_metadata_worker = MediaMetadataScanWorker(
+            self._zip_path, zip_candidates, local_candidates)
+        self._media_metadata_worker.progress.connect(self._on_media_metadata_progress)
+        self._media_metadata_worker.done.connect(self._on_media_metadata_done)
+        self._media_metadata_worker.start()
+
+    def _on_media_metadata_progress(self, remaining: int):
+        self._status_label.setText(
+            f"Media metadata: {remaining:,} file(s) remaining…"
+            if remaining > 0 else "Finishing media metadata scan…")
+
+    def _on_media_metadata_done(self, results: dict):
+        if self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as cache_db:
+                    if results:
+                        save_media_metadata(cache_db, results)
+            except Exception:
+                pass
+        self._status_label.setText(
+            f"Media metadata scan done — {len(results):,} file(s) yielded "
+            "EXIF/video metadata.")
+        self.media_metadata_scan_done.emit()
         self._finish_operations()
 
     def _finish_operations(self):
@@ -5419,7 +6463,9 @@ class ProcessDialog(QDialog):
                 (bool(self._integrity_worker and
                       self._integrity_worker.isRunning())) or
                 (bool(self._embedded_media_worker and
-                      self._embedded_media_worker.isRunning())))
+                      self._embedded_media_worker.isRunning())) or
+                (bool(self._media_metadata_worker and
+                      self._media_metadata_worker.isRunning())))
 
     def closeEvent(self, event):
         if self._is_scanning():
@@ -6462,6 +7508,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.filter_clear_btn.clicked.connect(self._clear_filter)
         filter_bar.addWidget(self.filter_go_btn)
         filter_bar.addWidget(self.filter_clear_btn)
+        filter_bar.addSpacing(10)
+
+        # Preset — saved multi-column filter+sort combinations, added
+        # 2026-10-11 (see app/file_browser_presets.py's own docstring).
+        # A SEPARATE mode from the plain text/date/type fields above, not
+        # composed with them: picking a preset disables that whole row
+        # (see _set_plain_filter_enabled) and drives the model directly
+        # via _apply_preset, so the two mechanisms can never silently
+        # combine into a confusing filter state the examiner didn't ask
+        # for; "(No Preset)" is what hands control back to the plain row.
+        self._active_preset_name: str | None = None
+        filter_bar.addWidget(QLabel("Preset:"))
+        self._NO_PRESET_LABEL = "(No Preset)"
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(120)
+        self.preset_combo.currentTextChanged.connect(self._on_preset_selected)
+        filter_bar.addWidget(self.preset_combo)
+        self.preset_edit_btn = QPushButton("Edit…")
+        self.preset_edit_btn.clicked.connect(self._edit_current_preset)
+        self.preset_new_btn = QPushButton("New…")
+        self.preset_new_btn.clicked.connect(self._new_preset)
+        filter_bar.addWidget(self.preset_edit_btn)
+        filter_bar.addWidget(self.preset_new_btn)
+        self._refresh_preset_combo()
 
         # Hidden-column names for the selected-files (aggregate) view —
         # remembered across rebuilds; plain folder views always reset.
@@ -6935,6 +8005,160 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.filter_type_btn.setText("Type: All")
         self.proxy_model.set_filter("", -1)
         self._log(f"Filter cleared in: {self._view_path}")
+
+    # ── Filter+sort presets (app/file_browser_presets.py) ───────────────────
+
+    def _set_plain_filter_enabled(self, enabled: bool) -> None:
+        """Grey out the plain text/date/type filter row while a preset is
+        active, and re-enable it when control is handed back to "(No
+        Preset)" — the two mechanisms are deliberately never composed
+        (see the preset-dropdown comment in _setup_file_tab's own
+        toolbar construction for why)."""
+        for w in (self.filter_col_combo, self.filter_input,
+                 self.filter_date_enable, self.filter_date_combo,
+                 self.filter_date_from, self.filter_date_to,
+                 self.filter_type_btn, self.filter_go_btn, self.filter_clear_btn):
+            w.setEnabled(enabled)
+
+    def _refresh_preset_combo(self, select: str | None = None) -> None:
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem(self._NO_PRESET_LABEL)
+        for p in file_browser_presets.load():
+            self.preset_combo.addItem(p['name'])
+        target = select if select is not None else self._NO_PRESET_LABEL
+        idx = self.preset_combo.findText(target)
+        self.preset_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.preset_combo.blockSignals(False)
+        self.preset_edit_btn.setEnabled(self.preset_combo.currentText() != self._NO_PRESET_LABEL)
+
+    def _on_preset_selected(self, name: str) -> None:
+        self.preset_edit_btn.setEnabled(name != self._NO_PRESET_LABEL)
+        if name == self._NO_PRESET_LABEL:
+            self._active_preset_name = None
+            self._set_plain_filter_enabled(True)
+            self._apply_filter()
+            return
+        self._active_preset_name = name
+        self._set_plain_filter_enabled(False)
+        preset = file_browser_presets.find(name)
+        if preset is not None:
+            self._apply_preset(preset)
+
+    def _apply_preset(self, preset: dict) -> None:
+        """Translate *preset* (app/file_browser_presets.py's own dict
+        shape) into FileTableModel.set_filter/sort_multi calls against
+        the CURRENT file model's real column indexes — called both when
+        the dropdown picks a preset and, via _apply_active_filter, every
+        time a folder is (re)loaded while one stays active."""
+        if self.file_model is None:
+            return
+        headers = self.file_model._headers
+
+        def _col(name):
+            return headers.index(name) if name in headers else -1
+
+        extra_date_filters = []
+        for df in preset.get('date_filters', []):
+            c = _col(df['column'])
+            if c >= 0:
+                extra_date_filters.append({'col': c, 'from': df['from'], 'to': df['to']})
+
+        extra_text_filters = []
+        for tf in preset.get('text_filters', []):
+            cols = [c for c in (_col(h) for h in tf['columns']) if c >= 0]
+            if cols:
+                extra_text_filters.append(
+                    {'cols': cols, 'mode': tf['mode'], 'values': tf['values']})
+
+        type_col, types = -1, None
+        tfl = preset.get('type_filter')
+        if tfl and 'Type' in headers:
+            type_col = headers.index('Type')
+            types = set(tfl['types'])
+
+        total = self.file_model.rowCount()
+        self.table_status_label.setText(f"0 of {total:,} items (filtering…)")
+        self.proxy_model.set_filter(
+            text='', col=-1, type_col=type_col, types=types,
+            extra_date_filters=extra_date_filters,
+            extra_text_filters=extra_text_filters)
+
+        levels = []
+        for sl in preset.get('sort', []):
+            c = _col(sl['column'])
+            if c >= 0:
+                levels.append((c, bool(sl['descending'])))
+        if levels:
+            self.proxy_model.sort_multi(levels)
+
+    def _apply_active_filter(self, fallback_args: dict | None) -> bool:
+        """Single chokepoint called by every folder-view rebuild (plain
+        navigation, recursive, checked-folders aggregate) once its rows
+        are fully populated: re-applies the active preset if one is set
+        (so it survives navigating to a new folder, not just the folder
+        it was picked on), else falls back to *fallback_args* (the plain
+        toolbar's own current filter, only when preserve_filter asked
+        for it to survive — unchanged pre-existing behavior). Returns
+        True if either path actually applied some real filter, so the
+        caller knows whether to fall through to its own "nothing was
+        filtered" branch (scroll-position/select_path restore)."""
+        if self._active_preset_name:
+            preset = file_browser_presets.find(self._active_preset_name)
+            if preset is not None:
+                self._apply_preset(preset)
+                return True
+        if fallback_args is not None and self._filter_is_active(fallback_args):
+            self.proxy_model.set_filter(**fallback_args)
+            return True
+        return False
+
+    def _current_type_values_for_preset_dialog(self) -> list:
+        return self.file_model.distinct_values('Type') if self.file_model else []
+
+    def _edit_current_preset(self) -> None:
+        name = self.preset_combo.currentText()
+        if name == self._NO_PRESET_LABEL:
+            return
+        preset = file_browser_presets.find(name)
+        if preset is None:
+            return
+        headers = self.file_model._headers if self.file_model else self.file_headers
+        dlg = FilterSortPresetDialog(
+            headers, self._current_type_values_for_preset_dialog(), preset, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.was_deleted():
+            file_browser_presets.delete(name)
+            was_active = (self._active_preset_name == name)
+            self._refresh_preset_combo()
+            if was_active:
+                self._on_preset_selected(self._NO_PRESET_LABEL)
+            return
+        new_preset = dlg.result_preset()
+        file_browser_presets.upsert(new_preset)
+        was_active = (self._active_preset_name == name)
+        self._refresh_preset_combo(select=new_preset['name'])
+        if was_active or new_preset['name'] == name:
+            self._on_preset_selected(new_preset['name'])
+
+    def _new_preset(self) -> None:
+        headers = self.file_model._headers if self.file_model else self.file_headers
+        dlg = FilterSortPresetDialog(
+            headers, self._current_type_values_for_preset_dialog(), None, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.was_deleted():
+            return
+        new_preset = dlg.result_preset()
+        if file_browser_presets.find(new_preset['name']) is not None:
+            if QMessageBox.question(
+                    self, "Replace Preset",
+                    f"A preset named \"{new_preset['name']}\" already exists — replace it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        file_browser_presets.upsert(new_preset)
+        self._refresh_preset_combo(select=new_preset['name'])
+        self._on_preset_selected(new_preset['name'])
 
     def _get_zip_handle(self) -> "CachedZipView | None":
         """Return the shared zip-metadata handle, opening it lazily on
@@ -7982,7 +9206,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _build_entry_row(self, path: str, has_bundles: bool = False,
                          display_parent: str | None = None,
-                         photo_cols: bool = False):
+                         photo_cols: bool = False, exif_cols: bool = False):
         """Return one file-model row tuple for *path*, or None if hidden.
 
         Single source of truth for building file-browser rows — used by the
@@ -8023,6 +9247,23 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 cols.extend(info)
             else:
                 cols.extend([''] * len(_PHOTO_HEADERS))
+        if exif_cols:
+            fields = self._media_exif.get(path)
+            if fields:
+                dur = fields.get('duration_s')
+                w, h = fields.get('width'), fields.get('height')
+                orientation = fields.get('orientation')
+                cols.extend([
+                    fields.get('taken', ''),
+                    fields.get('camera', ''),
+                    fields.get('gps', ''),
+                    media_metadata_scan.format_duration(dur) if dur else '',
+                    f"{w}x{h}" if w and h else '',
+                    fields.get('software', ''),
+                    str(orientation) if orientation else '',
+                ])
+            else:
+                cols.extend([''] * len(_EXIF_HEADERS))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
                 path in self._nested_archive_map or path in self._leveldb_folder_map
                 or path in self._embedded_media_containers)
@@ -8485,7 +9726,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             any(self._photo_key(f) for f in checked)
             or any(self._photo_key(f.rsplit('/', 1)[0] if '/' in f else '')
                    for f in extra_files))
-        headers = self.file_headers + (_PHOTO_HEADERS if has_photos else [])
+        has_exif = bool(self._media_exif)
+        headers = (self.file_headers + (_PHOTO_HEADERS if has_photos else [])
+                  + (_EXIF_HEADERS if has_exif else []))
         self._set_file_model(FileTableModel(headers))
         # Captured AFTER _set_file_model, which now ALSO bumps _load_gen
         # unconditionally (added 2026-10-03 — see that method's own
@@ -8536,7 +9779,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 disp_parent = self._display_path(folder)
                 for child in self.folder_map.get(folder, []):
                     row = self._build_entry_row(child, display_parent=disp_parent,
-                                                photo_cols=has_photos)
+                                                photo_cols=has_photos, exif_cols=has_exif)
                     if row is None:
                         continue
                     batch_rows.append(row)
@@ -8557,7 +9800,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     parent = f.rsplit('/', 1)[0] if '/' in f else ''
                     disp_parent = self._display_path(parent)
                     row = self._build_entry_row(f, display_parent=disp_parent,
-                                                photo_cols=has_photos)
+                                                photo_cols=has_photos, exif_cols=has_exif)
                     if row is not None:
                         batch_rows.append(row)
                         state['count'] += 1
@@ -8574,15 +9817,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 QTimer.singleShot(0, _process_batch)
             else:
                 self.file_view.resizeColumnsToContents()
-                if _filter_args is not None and self._filter_is_active(_filter_args):
-                    if select_path:
-                        _model = self.file_model
-                        def _on_filter_done_select(*_):
-                            _model.filter_done.disconnect(_on_filter_done_select)
-                            self._select_file_by_path(select_path)
-                        _model.filter_done.connect(_on_filter_done_select)
-                    self.proxy_model.set_filter(**_filter_args)
-                elif select_path:
+                if select_path and (self._active_preset_name or
+                                    (_filter_args is not None and self._filter_is_active(_filter_args))):
+                    _model = self.file_model
+                    def _on_filter_done_select(*_):
+                        _model.filter_done.disconnect(_on_filter_done_select)
+                        self._select_file_by_path(select_path)
+                    _model.filter_done.connect(_on_filter_done_select)
+                if not self._apply_active_filter(_filter_args) and select_path:
                     self._select_file_by_path(select_path)
                 self._refresh_table_status()
                 extra_note = f" + {total_extra:,} individually-ticked file(s)" if total_extra else ""
@@ -8709,7 +9951,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             import embedded_media_scan as _ems
             if _ems.classify_scan_candidate(ui_path, self._header_type_overrides):
                 on_list = embedded_media_skip_list.matches(
-                    ui_path, platform=self._skip_list_platform())
+                    self._adapter.canonical_app_path(
+                        ui_path, self.guid_to_bundle, self.folder_map),
+                    platform=self._skip_list_platform())
                 skip_act = QAction(
                     "🗑️ Remove from Embedded-Media Skip List" if on_list
                     else "🗑️ Add to Embedded-Media Skip List", self)
@@ -8740,7 +9984,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         ignore_sel_paths = [p for p in ignore_sel_paths if p]
         if ignore_sel_paths:
             ignore_entries = user_media_ignore_list.load()
-            already_on_list = [p for p in ignore_sel_paths if p in ignore_entries]
+            already_on_list = [
+                p for p in ignore_sel_paths
+                if user_media_ignore_list.is_ignored(
+                    self._canonical_user_media_entry(p), ignore_entries)
+            ]
             menu.addSeparator()
             if _load_prefs().get('user_media_ignore_editable', False):
                 n = len(ignore_sel_paths)
@@ -8909,27 +10157,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         2026-09-27, direct request: "a filter for media files that shows
         all media files in location[s] that are user created[;] so for
         ios that is jump to 'app data', 'app dat[a] plugins', 'app data
-        shared', DCIM & PhotoData." The iOS paths are exactly the same
-        three FfsAdapter.container_parents() already resolves (every
-        app's own data) plus the same two real Photos-library locations
-        FORENSIC_SHORTCUTS' own "Media" submenu already jumps to — reused
-        rather than re-derived, so this filter and "Jump to" can never
-        silently drift onto two different ideas of where these are.
-        Android has no equivalent request on record yet — 'data/data/'
-        (app data) and 'data/media/' (the real DCIM/Pictures equivalent)
-        are used as a reasonable default, matching this project's own
-        existing "app/user-accessible areas" convention (see
-        FfsAdapter.scan_folders() for the same two prefixes used
-        elsewhere for the identical platform distinction)."""
-        if self._is_android_archive():
-            return ['data/data/', 'data/media/']
-        return [self._adapt_shortcut_path(p) for p in (
-            'mobile/Containers/Data/Application',
-            'mobile/Containers/Data/PluginKitPlugin',
-            'mobile/Containers/Shared/AppGroup',
-            'mobile/Media/DCIM',
-            'mobile/Media/PhotoData',
-        )]
+        shared', DCIM & PhotoData." Unified 2026-10-10 into the shared
+        scan_rules.py ruleset also used by header-scan/nested-archive-
+        discovery/embedded-media-scan (FfsAdapter.user_media_folders())
+        — this method now just delegates, kept so existing callers don't
+        need to change."""
+        return self._adapter.user_media_folders()
 
     def _is_user_media_path(self, ui_path: str, prefixes: list[str]) -> bool:
         """True if ui_path falls under one of *prefixes* — a plain folder
@@ -9256,6 +10489,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             preselect_tier1=preselect_tier1,
             preselect_embedded_media=preselect_embedded_media,
             is_android=self._is_android_archive(),
+            guid_to_bundle=self.guid_to_bundle,
+            folder_map=self.folder_map,
+            local_media_metadata_candidates_fn=self._collect_local_media_metadata_candidates,
             parent=self,
         )
         dlg.header_types_cleared.connect(self._on_header_types_cleared)
@@ -9267,6 +10503,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         dlg.header_scan_tier_done.connect(lambda _t: self._refresh_header_scan_indicator())
         dlg.nested_extraction_done.connect(self._on_nested_extraction_done)
         dlg.embedded_media_scan_done.connect(self._on_embedded_media_scan_injected)
+        dlg.media_metadata_scan_done.connect(self._on_media_metadata_scan_done)
         dlg.exec()
         # Came here from a keyword search — run that search automatically
         # once the dialog closes, whether or not anything was extracted.
@@ -9336,6 +10573,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._shutdown_mcp_server("archive changed")
         self._case_dir = case_dir
         self._photo_index = {}        # rebuilt in on_metadata_ready
+        self._media_exif = {}         # rebuilt in _start_case_meta_load
         self._photos_prompt_shown = False
         self._search_entries = None   # clear cached index for the new archive
         self.zip_path = zip_path
@@ -9517,6 +10755,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._zip_ui_paths = zip_ui_paths
         self._metadata_only_folders = metadata_only_folders or set()
         self._header_type_overrides = {}
+        self._media_exif = getattr(self, '_media_exif', {}) or {}
         self._file_count_cache = {}
         if self._case_dir:
             # Counts stay synchronous: one small blob unpack (~tens of ms),
@@ -9645,13 +10884,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         def _load():
             overrides = {}
+            media_exif = {}
             try:
                 with closing(_open_cache_db(case_dir)) as db:
                     overrides = load_header_types(db)
+                    media_exif = load_media_metadata(db)
             except Exception:
                 pass
             tz = self._load_or_detect_timezone_settings(zip_path, adapter, case_dir)
-            return overrides, _build_photo_index(case_dir, rules), tz
+            return overrides, _build_photo_index(case_dir, rules), tz, media_exif
 
         fut = _BG_POOL.submit(_load)
 
@@ -9662,7 +10903,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 QTimer.singleShot(30, _poll)
                 return
             try:
-                overrides, photos, tz = fut.result()
+                overrides, photos, tz, media_exif = fut.result()
             except Exception:
                 return
             # A real, higher-impact instance of the SAME gap
@@ -9685,6 +10926,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._header_type_overrides = overrides
             self._reapply_leveldb_type_overrides()
             self._photo_index = photos
+            self._media_exif = media_exif
             (self._handset_zone_name, self._acquisition_zone_name,
              self._manual_zone_name,
              self._timestamp_display_mode, is_first_load) = tz
@@ -9982,6 +11224,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 with closing(_open_results_db(self._case_dir)) as db:
                     save_case_setting(db, 'header_scan_tier', str(tier))
                     save_case_setting(db, 'header_scan_complete_tier', str(tier))
+                    # Snapshot of how many files qualified as Tier-*tier*
+                    # candidates AT THIS MOMENT — see _header_scan_staleness's
+                    # own docstring for why this is stored at all (without
+                    # it, a later genuine growth in the candidate set is
+                    # indistinguishable from "this was always fully covered").
+                    count = _count_header_candidates(self.full_metadata, self._adapter, tier=tier)
+                    save_case_setting(db, 'header_scan_candidate_count', str(count))
             except Exception:
                 pass
             self._refresh_header_scan_indicator()
@@ -10042,8 +11291,27 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         except Exception:
             pass
         text = self._HEADER_SCAN_TIER_TEXT.get(tier, self._HEADER_SCAN_TIER_TEXT[0])
-        if tier > complete_tier:
+        in_progress = tier > complete_tier
+        if in_progress:
             text += " — scan in progress…"
+        # Stale-completion check — added 2026-10-10, direct report: a
+        # case's own 'complete' flag can claim a tier is done while most
+        # of its real candidates were never actually scanned (see
+        # _header_scan_staleness's own docstring for the real case this
+        # was built from). Never checked while a scan is already known
+        # to be in progress — that's a separate, already-handled state,
+        # and the candidate count would be a moving target anyway.
+        stale = False
+        if not in_progress:
+            staleness = _header_scan_staleness(self._case_dir, self.full_metadata, self._adapter)
+            if staleness is not None:
+                _, stale, _current_count, gap_count = staleness
+                if stale:
+                    text += (f" ⚠ {gap_count:,} candidate file(s) may never have been "
+                             "scanned under this tier — rerun recommended (Process Case…).")
+        self._header_scan_banner.setStyleSheet(
+            f"color: {ERROR_COLOR if stale else ACTIVE_COLOR}; "
+            "font-weight: bold; font-size: 12px; padding: 2px 6px;")
         self._header_scan_banner.setText(text)
         self._header_scan_banner.setVisible(True)
 
@@ -10227,6 +11495,67 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if new_containers:
             self._rebuild_file_view_from_checked(preserve_filter=True)
 
+    def _collect_local_media_metadata_candidates(self) -> list:
+        """[(ui_path, bytes_or_local_path, ext)] for every nested-archive
+        entry and embedded-media hit typed Picture/Graphic/Video — the
+        "for the zips and embe[d]ded" half of app/media_metadata_scan.py
+        (direct request). Only FastZipBrowser owns _nested_archive_map/
+        _embedded_media_containers, so ProcessDialog calls this (via the
+        callable it's handed, not a value — see its own __init__
+        comment) right before the scan actually starts, guaranteeing it
+        reflects whatever THIS SAME Process Case run's own embedded-
+        media sweep just found, not a stale snapshot from dialog-open
+        time.
+
+        No scan_folders()/scan_excludes() check here — unlike
+        _collect_media_metadata_candidates (the main-zip half), these
+        paths were already scoped to those same in-scope folders back
+        when THEY were discovered (nested-archive discovery and the
+        embedded-media sweep both already apply that scoping
+        themselves), so re-checking it here would be redundant, not
+        more correct."""
+        out = []
+        for ui_path in self._nested_virtual_paths:
+            name = ui_path.rsplit('/', 1)[-1]
+            ext = os.path.splitext(name)[1].lower()
+            ft = _get_file_type(name)
+            if ft == 'Other':
+                ft = self._header_type_overrides.get(ui_path, 'Other')
+            if ft not in _MEDIA_METADATA_TYPES:
+                continue
+            meta = self.full_metadata.get(ui_path, {})
+            archive_path = meta.get('_archive_path')
+            if archive_path is not None:
+                rec = self._nested_archive_map.get(archive_path)
+                entry_path = meta.get('_display_name')
+                if not rec or not entry_path:
+                    continue
+                data = read_nested_entry(rec['stored_path'], entry_path)
+                if data is None:
+                    continue
+                out.append((ui_path, data, ext))
+                continue
+            source_local = meta.get('_embedded_media_source')
+            if source_local is not None:
+                out.append((ui_path, source_local, ext))
+        return out
+
+    def _on_media_metadata_scan_done(self) -> None:
+        """Runs when ProcessDialog's media-metadata scan finishes (see
+        MediaMetadataScanWorker/ProcessDialog.media_metadata_scan_done)
+        — reloads the saved results and refreshes the current view so
+        the new "(EXIF)" columns appear immediately, same "reload then
+        repaint" shape _on_photo_index_changed already uses for the
+        analogous Photos-metadata case."""
+        self._media_exif = {}
+        if self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    self._media_exif = load_media_metadata(db)
+            except Exception:
+                pass
+        self._refresh_current_file_view(preserve_filter=True)
+
     def _on_nested_extraction_done(self):
         saved_checked = set(self._checked_folders)
         before = set(self._nested_archive_map.keys())
@@ -10373,7 +11702,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         platform = self._skip_list_platform()
         if was_on_list:
             entries = embedded_media_skip_list.find_matching_entries(
-                ui_path, platform=platform)
+                self._adapter.canonical_app_path(
+                    ui_path, self.guid_to_bundle, self.folder_map),
+                platform=platform)
             for entry in entries:
                 embedded_media_skip_list.remove_entry(entry, platform)
             self.status_bar.showMessage(
@@ -10384,6 +11715,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.status_bar.showMessage(
                 f"Added to embedded-media skip list: {entry}", 6000)
 
+    def _canonical_user_media_entry(self, ui_path: str) -> str:
+        """Canonicalize *ui_path* (GUID → bundle id, see FfsAdapter.
+        canonical_app_path()) before it's stored in or compared against
+        user_media_ignore_list.py's own GLOBAL, cross-case list — added
+        2026-10-10, direct correction: a raw per-install GUID stored
+        there would only ever match the one case it was added from."""
+        return self._adapter.canonical_app_path(
+            ui_path, self.guid_to_bundle, self.folder_map)
+
     def _add_to_user_media_ignore_list(self, paths: list) -> None:
         """Right-click "Add to User Media Ignore List" — added
         2026-09-27. Only ever reachable from the menu when Preferences'
@@ -10393,7 +11733,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         triggered some other way."""
         if not _load_prefs().get('user_media_ignore_editable', False):
             return
-        user_media_ignore_list.add_entries(paths)
+        canonical_paths = [self._canonical_user_media_entry(p) for p in paths]
+        user_media_ignore_list.add_entries(canonical_paths)
         n = len(paths)
         self.status_bar.showMessage(
             f"Added {n:,} item{'s' if n != 1 else ''} to the User Media "
@@ -10405,7 +11746,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         undoing an existing exclusion carries none of the risk adding a
         new one does (see user_media_ignore_list.py's own docstring)."""
         for p in paths:
-            user_media_ignore_list.remove_entry(p)
+            user_media_ignore_list.remove_entry(self._canonical_user_media_entry(p))
         n = len(paths)
         self.status_bar.showMessage(
             f"Removed {n:,} item{'s' if n != 1 else ''} from the User "
@@ -10590,8 +11931,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         has_photos = bool(self._photo_index) and any(
             (k := self._photo_key(p)) and k in self._photo_index
             for p in children)
+        has_exif = bool(self._media_exif)
         headers = (self.file_headers + (['UUID'] if has_bundles else [])
-                   + (_PHOTO_HEADERS if has_photos else []))
+                   + (_PHOTO_HEADERS if has_photos else [])
+                   + (_EXIF_HEADERS if has_exif else []))
         new_model = FileTableModel(headers)
         # _update_filter_columns resets the type selection — save the filter
         # bar state around it when the filter must survive the refresh.
@@ -10612,28 +11955,32 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         disp_parent = self._display_path(folder_path)
         for path in sorted(children):
             row = self._build_entry_row(path, has_bundles, display_parent=disp_parent,
-                                        photo_cols=has_photos)
+                                        photo_cols=has_photos, exif_cols=has_exif)
             if row is not None:
                 batch.append(row)
         new_model.append_rows_batch(batch)
         self._set_file_model(new_model)
 
-        if preserve_filter:
-            # Compute against the new model so column indexes line up.
-            _filter_args = self._current_filter_args()
-            if self._filter_is_active(_filter_args):
-                if select_path:
-                    def _on_filter_done_select(*_):
-                        new_model.filter_done.disconnect(_on_filter_done_select)
-                        self._select_file_by_path(select_path)
-                    new_model.filter_done.connect(_on_filter_done_select)
-                self.proxy_model.set_filter(**_filter_args)
-            else:
+        # Compute against the new model so column indexes line up. A
+        # preset (self._active_preset_name) takes priority and is
+        # reapplied on EVERY rebuild regardless of preserve_filter — see
+        # _apply_active_filter's own docstring — so this folder-navigate
+        # path is where a preset survives "pick Graphics, then click
+        # through folders" even though preserve_filter defaults False
+        # here (plain navigation has never kept the old plain-filter-bar
+        # state, by design; a preset deliberately does).
+        _filter_args = self._current_filter_args() if preserve_filter else None
+        if select_path and (self._active_preset_name or
+                            (_filter_args is not None and self._filter_is_active(_filter_args))):
+            def _on_filter_done_select(*_):
+                new_model.filter_done.disconnect(_on_filter_done_select)
+                self._select_file_by_path(select_path)
+            new_model.filter_done.connect(_on_filter_done_select)
+        if not self._apply_active_filter(_filter_args):
+            if preserve_filter:
                 self.file_view.verticalScrollBar().setValue(_scroll_val)
-                if select_path:
-                    self._select_file_by_path(select_path)
-        elif select_path:
-            self._select_file_by_path(select_path)
+            if select_path:
+                self._select_file_by_path(select_path)
 
         # Resize columns but preserve the splitter position
         splitter_sizes = self.splitter.sizes()
@@ -10676,8 +12023,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         has_photos = bool(self._photo_index) and any(
             (k := self._photo_key(p)) and k in self._photo_index
             for p in files)
+        has_exif = bool(self._media_exif)
         headers = (self.file_headers + (['UUID'] if has_bundles else [])
-                   + (_PHOTO_HEADERS if has_photos else []))
+                   + (_PHOTO_HEADERS if has_photos else [])
+                   + (_EXIF_HEADERS if has_exif else []))
         new_model = FileTableModel(headers)
 
         if preserve_filter:
@@ -10713,7 +12062,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             while state['idx'] < total:
                 path = files[state['idx']]
                 state['idx'] += 1
-                row = self._build_entry_row(path, has_bundles, photo_cols=has_photos)
+                row = self._build_entry_row(path, has_bundles, photo_cols=has_photos, exif_cols=has_exif)
                 if row is not None:
                     batch_rows.append(row)
                     state['count'] += 1
@@ -10730,14 +12079,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 splitter_sizes = self.splitter.sizes()
                 self.file_view.resizeColumnsToContents()
                 self.splitter.setSizes(splitter_sizes)
-                if _filter_args is not None and self._filter_is_active(_filter_args):
-                    if select_path:
-                        def _on_filter_done_select(*_):
-                            new_model.filter_done.disconnect(_on_filter_done_select)
-                            self._select_file_by_path(select_path)
-                        new_model.filter_done.connect(_on_filter_done_select)
-                    self.proxy_model.set_filter(**_filter_args)
-                else:
+                if select_path and (self._active_preset_name or
+                                    (_filter_args is not None and self._filter_is_active(_filter_args))):
+                    def _on_filter_done_select(*_):
+                        new_model.filter_done.disconnect(_on_filter_done_select)
+                        self._select_file_by_path(select_path)
+                    new_model.filter_done.connect(_on_filter_done_select)
+                if not self._apply_active_filter(_filter_args):
                     if preserve_filter:
                         self.file_view.verticalScrollBar().setValue(_scroll_val)
                     if select_path:
@@ -11376,28 +12724,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._user_media_row_btn.setToolTip(um_item.toolTip())
         self._user_media_row_btn.clicked.connect(self._show_user_created_media)
         um_row_layout.addWidget(self._user_media_row_btn, 1)
-        # "Reset" — direct request: "i would also like a button[,]
-        # like deselect for selected files[,] call[ed] reset[,] so
-        # that the file[s] that have been marked as not relevant are
-        # [re-]added to the [Selected Files] group." Full reversal of
-        # every "Not Relevant" click ever made on this case (not just
-        # the last batch — that's what the Media Browser's own "Undo"
-        # button already covers): unmarks every file this project's
-        # media_seen table holds as seen — the ONLY way a file ever
-        # gets marked seen at all is via "Not Relevant" (see
-        # app/media_viewer.py's own _on_media_not_relevant) — and
-        # re-adds them all to the tick-based selection, undoing both
-        # halves of what that button did, not just the selection half,
-        # since "reset" otherwise read as a confusing partial state
-        # (selected again, but still excluded from this row's own
-        # not-yet-viewed count).
-        self._reset_not_relevant_btn = QPushButton("Reset")
-        self._reset_not_relevant_btn.setFlat(True)
-        self._reset_not_relevant_btn.setToolTip(
-            "Un-mark every file ever marked \"Not Relevant\" in this "
-            "case as seen, and re-select them all.")
-        self._reset_not_relevant_btn.clicked.connect(self._reset_not_relevant_marks)
-        um_row_layout.addWidget(self._reset_not_relevant_btn, 0)
+        # "Reset" lives in the right-click menu, not inline here — see
+        # _show_bookmark_panel_menu's own _USER_MEDIA_SENTINEL branch for
+        # the feature's own history/semantics.
+        self._user_media_folders_btn = QPushButton("Folders…")
+        self._user_media_folders_btn.setFlat(True)
+        self._user_media_folders_btn.setToolTip(
+            "Show which folders this filter actually looks in.")
+        self._user_media_folders_btn.clicked.connect(
+            lambda: _show_user_media_folders_dialog(self, self._adapter))
+        um_row_layout.addWidget(self._user_media_folders_btn, 0)
+        # "Reset" moved into the right-click menu 2026-10-10, direct
+        # request — see _show_bookmark_panel_menu's own _USER_MEDIA_
+        # SENTINEL branch, alongside the other two review actions this
+        # row already has there.
         self._bookmark_list.setItemWidget(um_item, um_row_widget)
         um_item.setSizeHint(um_row_widget.sizeHint())
         for g in groups:
@@ -11518,6 +12858,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 ignored_act = QAction("Show Media Excluded by Ignore List…", self)
                 ignored_act.triggered.connect(self._show_user_media_ignored_row)
                 menu.addAction(ignored_act)
+                # "Reset" — originally an inline button, moved into this
+                # menu 2026-10-10, direct request. Original direct
+                # request: "i would also like a button[,] like deselect
+                # for selected files[,] call[ed] reset[,] so that the
+                # file[s] that have been marked as not relevant are
+                # [re-]added to the [Selected Files] group." Full
+                # reversal of every "Not Relevant" click ever made on
+                # this case (not just the last batch — that's what the
+                # Media Browser's own "Undo" button already covers):
+                # unmarks every file this project's media_seen table
+                # holds as seen — the ONLY way a file ever gets marked
+                # seen at all is via "Not Relevant" (see
+                # app/media_viewer.py's own _on_media_not_relevant) — and
+                # re-adds them all to the tick-based selection, undoing
+                # both halves of what "Not Relevant" did, not just the
+                # selection half, since "reset" otherwise read as a
+                # confusing partial state (selected again, but still
+                # excluded from this row's own not-yet-viewed count).
+                reset_act = QAction("Reset \"Not Relevant\" Marks", self)
+                reset_act.setToolTip(
+                    "Un-mark every file ever marked \"Not Relevant\" in "
+                    "this case as seen, and re-select them all.")
+                reset_act.triggered.connect(self._reset_not_relevant_marks)
+                menu.addAction(reset_act)
         menu.exec(self._bookmark_list.viewport().mapToGlobal(point))
 
     def _show_user_media_seen_row(self) -> None:

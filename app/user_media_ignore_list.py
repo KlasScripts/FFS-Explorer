@@ -20,12 +20,51 @@ A single, FLAT, GLOBAL (cross-case) list — deliberately not split by
 platform the way embedded_media_skip_list.py is: entries here are real
 UI PATHS (not bare filenames), so an iOS path and an Android path can
 never collide the way a bare database filename could, and a case is
-always one platform anyway. Each entry matches two ways:
+always one platform anyway. Each entry matches three ways:
   - An EXACT match — this one specific file (or folder, along with
     everything inside it — see below) is excluded.
   - A FOLDER-PREFIX match — a real archive path that starts with
     "<entry>/" is excluded too, so adding a folder excludes its entire
     real subtree, not just files that happen to sit directly inside it.
+  - A WILDCARD match (added 2026-10-10, direct request) — an entry
+    containing '*' is a regex-style fragment match (each '*' matches
+    any run of characters), same convention embedded_media_skip_list.py
+    already uses, reused rather than reinvented — EXCEPT that a pattern
+    with no TRAILING '*' is anchored to the real end of the path, not
+    just "appears somewhere" (added 2026-10-10, direct correction: see
+    _wildcard_matches' own docstring for the real bug this fixed).
+    "*@2x.png*" / "*@3x.png*" (confirmed safe/generalizable across 3
+    real iOS devices, 2026-10-10 — see KNOWN_PATTERN_LABELS below)
+    match any PNG whose name contains that scale fragment. Deliberately
+    PNG-only, not "any extension" — direct correction the same day:
+    checked all 8 real "@2x"/"@3x" matches that were .jpg instead, and
+    every one was a real Microsoft Edge/Google Chrome tab-switcher
+    snapshot (an actual rendered screenshot of whatever page was open,
+    "Library/Application Support/.../Snapshots/{id}/NNN@2x.jpg") — real
+    per-session content, not bundled chrome, despite sharing the same
+    Retina-scale naming convention; all 6,073 real .png matches stayed
+    confirmed generic icons. Unlike
+    the exact/folder-prefix modes, a wildcard entry is NOT itself a
+    "this one location is noise" judgment about one folder — it's a
+    structural, cross-app rule, which is exactly why it needs to be
+    high-confidence (Apple's own Retina-asset-catalog naming
+    convention, never used for real photos/videos) before being added
+    at all; a duplicate-FILENAME rule without such a structural anchor
+    was tried and rejected the same day — see CLAUDE.md's own "User
+    Media" entry for why (it would have caught 2,491 real photo
+    thumbnails, "5005.JPG", as false positives). Three more added the
+    same day, same bar (a platform-reserved convention, never real
+    user content, confirmed by checking EVERY matching file in a real
+    archive, not a sample): "*__MACOSX/*._*" (the AppleDouble resource-
+    fork sidecar every Mac-created zip leaves, preserving the real
+    file's own subdirectory structure — "__MACOSX/images/._seq_0.png"
+    for a real "images/seq_0.png" — verified by its own literal file
+    signature, not just the name, across all 2,814 real matches in one
+    archive, present on both iOS and Android);
+    "*.9.png" (Android's reserved "nine-patch" stretchable-UI-chrome
+    format — the encoding itself requires a border-pixel structure a
+    real photo can't have); "*/drawable-*dpi*" and "*/mipmap-*dpi*"
+    (Android's own reserved density-bucket resource folder naming).
 
 Deliberately checked into the project (not gitignored, same as
 research_status.json/parser_versions.json/embedded_media_skip_list_*.json
@@ -51,6 +90,22 @@ import os
 import sys
 
 _cache = {"stat": None, "data": None}
+
+KNOWN_PATTERN_LABELS = {
+    "*@2x.png*": "UI Graphics (@2x)",
+    "*@3x.png*": "UI Graphics (@3x)",
+    "*__MACOSX/*._*": "Zip Metadata (macOS)",
+    "*.9.png": "UI Graphics (nine-patch)",
+    "*/drawable-*dpi*": "UI Graphics (Android resource)",
+    "*/mipmap-*dpi*": "UI Graphics (Android resource)",
+}
+
+
+def display_label(entry: str) -> str:
+    """A short, human name for *entry* if it's a known pattern (shown in
+    the "User Media Folders" dialog and the ignore-list review grid),
+    else the raw entry string itself."""
+    return KNOWN_PATTERN_LABELS.get(entry, entry)
 
 
 def store_path() -> str:
@@ -123,14 +178,38 @@ def remove_entry(path: str) -> None:
     _write(entries)
 
 
+def _wildcard_matches(pattern: str, ui_path: str) -> bool:
+    """True if *pattern* (containing '*') matches *ui_path* — each '*'
+    matches any run of characters, same convention
+    embedded_media_skip_list.py's own _entry_matches uses. UNLIKE that
+    module, a pattern with NO trailing '*' is anchored to the END of
+    ui_path, not just "appears somewhere" — added 2026-10-10, direct
+    correction: "*.9.png" (no trailing '*') matched
+    "version1.9.pngBACKUP.zip" before this fix, since the real file
+    extension there is ".zip", not ".png" — the substring just happened
+    to appear mid-path. A pattern that genuinely wants "appears
+    anywhere, more can follow" (e.g. "*@2x.*" — more of the real
+    extension always follows "@2x.") must say so explicitly with a
+    trailing '*'."""
+    import re
+    regex = '.*'.join(re.escape(part) for part in pattern.split('*'))
+    if not pattern.endswith('*'):
+        regex += '$'
+    return re.search(regex, ui_path) is not None
+
+
 def is_ignored(ui_path: str, entries: list | None = None) -> bool:
-    """True if *ui_path* is excluded by an exact entry, or sits inside a
-    folder entry's own subtree. Pass *entries* (an already-loaded list)
-    when checking many paths in a row, to avoid re-reading the store for
-    each one."""
+    """True if *ui_path* is excluded by an exact entry, sits inside a
+    folder entry's own subtree, or matches a wildcard entry (one
+    containing '*' — see this module's own docstring). Pass *entries*
+    (an already-loaded list) when checking many paths in a row, to
+    avoid re-reading the store for each one."""
     if entries is None:
         entries = load()
     for e in entries:
-        if ui_path == e or ui_path.startswith(e + '/'):
+        if '*' in e:
+            if _wildcard_matches(e, ui_path):
+                return True
+        elif ui_path == e or ui_path.startswith(e + '/'):
             return True
     return False

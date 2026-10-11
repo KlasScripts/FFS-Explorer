@@ -5,7 +5,7 @@ SQLite databases:
 
   casecache.db   — reconstructable cache; can be deleted and rebuilt:
                      thumbnails, blobs (folder sizes, search entry index),
-                     header_types, guid_bundle
+                     header_types, guid_bundle, media_metadata
 
   caseresults.db — precious user-generated results; never auto-deleted:
                      search_index, search_results, device_info,
@@ -89,6 +89,30 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS header_types (
             ui_path       TEXT NOT NULL PRIMARY KEY,
             detected_type TEXT NOT NULL
+        )
+    ''')
+
+    # EXIF/video-container metadata (app/media_metadata_scan.py) for the
+    # File Browser's "(EXIF)" columns — added 2026-10-11, direct request
+    # ("get all the exif and add it as ad[d]itional columns"). Fully
+    # re-derivable from the archive's own bytes (a pure function of a
+    # file's own content, which never changes for a given case), so this
+    # belongs here, not caseresults.db — same reasoning as header_types
+    # right above it, which this otherwise mirrors exactly (one row per
+    # ui_path, nothing fancier). taken/camera/gps/software are left NULL
+    # (not '') when absent, matching every column builder downstream
+    # that already treats a blank/None cell as "not present."
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS media_metadata (
+            ui_path     TEXT NOT NULL PRIMARY KEY,
+            taken       TEXT,
+            camera      TEXT,
+            gps         TEXT,
+            duration_s  REAL,
+            width       INTEGER,
+            height      INTEGER,
+            software    TEXT,
+            orientation INTEGER
         )
     ''')
 
@@ -729,6 +753,54 @@ def load_header_types(conn: 'sqlite3.Connection') -> dict:
 def clear_header_types(conn: 'sqlite3.Connection') -> None:
     """Delete all header_types rows (used before a full rescan)."""
     conn.execute('DELETE FROM header_types')
+    conn.commit()
+
+
+# ── Media metadata (EXIF / video container) ─────────────────────────────────
+
+_MEDIA_METADATA_FIELDS = ('taken', 'camera', 'gps', 'duration_s',
+                          'width', 'height', 'software', 'orientation')
+
+
+def save_media_metadata(conn: 'sqlite3.Connection', results: dict) -> None:
+    """Persist {ui_path: {field: value, ...}} into media_metadata — only
+    the fields app/media_metadata_scan.py actually found are set on each
+    row; a field that scan never found for THIS file stays NULL (never
+    overwritten with a stale value from some earlier partial result,
+    since every row is a fresh INSERT OR REPLACE of the whole tuple)."""
+    rows = [
+        (ui_path, *(fields.get(f) for f in _MEDIA_METADATA_FIELDS))
+        for ui_path, fields in results.items()
+    ]
+    if not rows:
+        return
+    conn.executemany(
+        f'INSERT OR REPLACE INTO media_metadata '
+        f'(ui_path, {", ".join(_MEDIA_METADATA_FIELDS)}) '
+        f'VALUES (?, {", ".join("?" * len(_MEDIA_METADATA_FIELDS))})',
+        rows,
+    )
+    conn.commit()
+
+
+def load_media_metadata(conn: 'sqlite3.Connection') -> dict:
+    """Return {ui_path: {field: value, ...}} previously saved — a field
+    that was NULL is simply absent from that ui_path's dict, matching
+    the shape app/media_metadata_scan.py's own extract_* functions
+    already return."""
+    cols = ('ui_path', *_MEDIA_METADATA_FIELDS)
+    results: dict = {}
+    for row in conn.execute(f'SELECT {", ".join(cols)} FROM media_metadata'):
+        ui_path = row[0]
+        fields = {f: v for f, v in zip(_MEDIA_METADATA_FIELDS, row[1:]) if v is not None}
+        if fields:
+            results[ui_path] = fields
+    return results
+
+
+def clear_media_metadata(conn: 'sqlite3.Connection') -> None:
+    """Delete all media_metadata rows (used before a full rescan)."""
+    conn.execute('DELETE FROM media_metadata')
     conn.commit()
 
 

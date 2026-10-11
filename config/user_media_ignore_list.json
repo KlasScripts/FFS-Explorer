@@ -1,0 +1,12 @@
+{
+  "_note": "Folders/files excluded from the Media Browser's own \"User Media\" filter -- hand-maintained via that button's right-click menu, or Preferences' own \"Manage Ignore List...\" button. See user_media_ignore_list.py.",
+  "version": 1,
+  "entries": [
+    "*@2x.png*",
+    "*@3x.png*",
+    "*__MACOSX/*._*",
+    "*.9.png",
+    "*/drawable-*dpi*",
+    "*/mipmap-*dpi*"
+  ]
+}

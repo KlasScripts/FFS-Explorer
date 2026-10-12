@@ -5111,6 +5111,8 @@ class ProcessDialog(QDialog):
     nested_extraction_done = Signal()   # emitted after NestedArchiveWorker finishes
     embedded_media_scan_done = Signal()   # emitted after EmbeddedMediaScanWorker finishes
     media_metadata_scan_done = Signal()   # emitted after MediaMetadataScanWorker finishes
+    leveldb_indexing_started = Signal()   # emitted right before the LevelDB indexing stage starts
+    leveldb_indexing_done    = Signal()   # emitted once it finishes (or is skipped as "nothing to do")
 
     _RUN_TYPE           = 'header_scan'
     _RUN_TYPE_INTEGRITY = 'integrity_check'
@@ -5121,8 +5123,25 @@ class ProcessDialog(QDialog):
                  preselect_tier1=False, preselect_embedded_media=False,
                  is_android=False, guid_to_bundle=None, folder_map=None,
                  local_media_metadata_candidates_fn=None,
+                 leveldb_coverage_fn=None, leveldb_index_fn=None,
                  parent=None):
         super().__init__(parent)
+        # Both callables only — FastZipBrowser owns the real engine
+        # (_leveldb_search_coverage/_index_leveldb_folders_batched)
+        # since the indexing pass deliberately shares the GUI's own zip
+        # reader rather than opening an independent one (see
+        # _index_leveldb_folders_batched's own docstring for why — it's
+        # the one Process Case stage that genuinely can't be a
+        # standalone QThread worker the way every other stage here is).
+        # Moved into an explicit, checked-by-default stage 2026-10-12,
+        # direct request: "the leveldb processing that is do[ne] is
+        # started after the data is loaded into the gui and at the same
+        # time that the process dialog opens[;] can we instead have it
+        # as an option in the process case and have [it] ticked on...
+        # like media data processing."
+        self._leveldb_coverage_fn = leveldb_coverage_fn
+        self._leveldb_index_fn = leveldb_index_fn
+        self._leveldb_indexing_active = False
         # Callable (not a plain list) — [(ui_path, bytes_or_local_path,
         # ext)] for nested-archive/embedded-media files needs to be
         # computed FRESH right before the media-metadata stage actually
@@ -5344,6 +5363,31 @@ class ProcessDialog(QDialog):
             rb.toggled.connect(self._update_embedded_scope_label)
         self._chk_embedded_media.toggled.connect(self._on_embedded_media_toggled)
         self._on_embedded_media_toggled(False)   # scope controls start hidden
+
+        # LevelDB/IndexedDB indexing for Keyword Search — moved
+        # 2026-10-12 from an automatic QTimer.singleShot fired right
+        # after case load into this explicit, checked-by-default stage
+        # — direct request: "the leveldb processing that is do[ne] is
+        # started after the data is loaded into the gui and at the same
+        # time that the process dialog opens[;] can we instead have it
+        # as an option in the process case and have [it] ticked on...
+        # like media [meta]data processing." It used to race the
+        # Process Case dialog opening for a brand-new case, competing
+        # for the same CPU/UI thread as whatever the examiner just
+        # asked that dialog to do. Runs FIRST among the new/moved
+        # stages (before the header scan) — unlike media metadata,
+        # nothing else in this chain needs it to have run first, and it
+        # doesn't need anything else to have run first either.
+        self._chk_leveldb = QCheckBox(
+            "Index LevelDB/IndexedDB folders for Keyword Search")
+        self._chk_leveldb.setChecked(True)
+        self._chk_leveldb.setToolTip(
+            "Indexes every LevelDB/IndexedDB folder (Chrome/WebKit local "
+            "storage, app caches, etc.) not already covered so Keyword "
+            "Search can find records inside them. Unticking this just "
+            "means Keyword Search runs with whatever coverage this case "
+            "already has — run it again later from here at any time.")
+        layout.addWidget(self._chk_leveldb)
 
         # Media metadata (EXIF / video info) — added 2026-10-11, direct
         # request: "i kind of think i should just do a media pass after
@@ -5836,7 +5880,8 @@ class ProcessDialog(QDialog):
         if (not run_integrity and not run_scan
                 and not self._chk_nested.isChecked()
                 and not self._chk_embedded_media.isChecked()
-                and not self._chk_media_metadata.isChecked()):
+                and not self._chk_media_metadata.isChecked()
+                and not self._chk_leveldb.isChecked()):
             self._status_label.setText("Nothing to do — no operations selected.")
             return
         self._run_btn.setEnabled(False)
@@ -5853,6 +5898,41 @@ class ProcessDialog(QDialog):
             self._continue_after_integrity()
 
     def _continue_after_integrity(self):
+        if self._chk_leveldb.isChecked() and self._leveldb_coverage_fn and self._leveldb_index_fn:
+            self._start_leveldb_indexing()
+        else:
+            self._continue_after_leveldb_indexing()
+
+    def _start_leveldb_indexing(self):
+        self.leveldb_indexing_started.emit()
+        _, unindexed = self._leveldb_coverage_fn()
+        if not unindexed:
+            self._status_label.setText(
+                "LevelDB/IndexedDB indexing: already fully covered — nothing to do.")
+            self.leveldb_indexing_done.emit()
+            self._continue_after_leveldb_indexing()
+            return
+        total = len(unindexed)
+
+        def _progress(done, total_):
+            remaining = total_ - done
+            if remaining > 0:
+                self._status_label.setText(
+                    f"Indexing LevelDB/IndexedDB folders for search: "
+                    f"{remaining:,} of {total_:,} remaining…")
+
+        def _done():
+            self._leveldb_indexing_active = False
+            self._status_label.setText(
+                f"Indexed {total:,} LevelDB/IndexedDB folder(s) for search.")
+            self.leveldb_indexing_done.emit()
+            self._continue_after_leveldb_indexing()
+
+        self._leveldb_indexing_active = True
+        self._leveldb_index_fn(unindexed, on_progress=_progress, on_done=_done,
+                              cancel_check=lambda: self._scan_cancelled)
+
+    def _continue_after_leveldb_indexing(self):
         if self._post_integrity_scan:
             self._start_header_scan()
         elif self._chk_nested.isChecked():
@@ -6465,7 +6545,8 @@ class ProcessDialog(QDialog):
                 (bool(self._embedded_media_worker and
                       self._embedded_media_worker.isRunning())) or
                 (bool(self._media_metadata_worker and
-                      self._media_metadata_worker.isRunning())))
+                      self._media_metadata_worker.isRunning())) or
+                self._leveldb_indexing_active)
 
     def closeEvent(self, event):
         if self._is_scanning():
@@ -10324,7 +10405,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _, unindexed = self._leveldb_search_coverage()
         return len(unindexed)
 
-    def _index_leveldb_folders_batched(self, ui_paths: list, on_progress=None, on_done=None):
+    def _index_leveldb_folders_batched(self, ui_paths: list, on_progress=None, on_done=None,
+                                       cancel_check=None):
         """Index every path in *ui_paths* for Keyword Search coverage —
         writes to casecache.db's leveldb_search_index table via
         index_leveldb_folder_for_search (app/leveldb_viewer.py), which
@@ -10352,15 +10434,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         *on_progress(done, total)* and *on_done()* are optional callbacks;
         writes happen incrementally (one save_leveldb_search_records call
         per folder) so a cancelled/interrupted run still leaves whatever
-        was completed usable rather than losing it all."""
+        was completed usable rather than losing it all.
+
+        *cancel_check* — added 2026-10-12 alongside moving this into an
+        explicit Process Case stage with its own Cancel button (this
+        pass previously had no cancellation hook at all, since it used
+        to run unconditionally with nothing to cancel it with). Checked
+        once per folder, same cadence as every other check here — on a
+        cancelled run, _finish() deliberately skips writing the version
+        marker: the real folders indexed so far stay usable (same as a
+        plain interruption), but the whole case must NOT be recorded as
+        "fully covered" when it demonstrably isn't yet."""
         from db_utils import save_leveldb_search_records
         from leveldb_viewer import leveldb_decode_logic_version
-        state = {'idx': 0}
+        state = {'idx': 0, 'cancelled': False}
         total = len(ui_paths)
         version = leveldb_decode_logic_version()
 
         def _step(deadline):
             while state['idx'] < total:
+                if cancel_check and cancel_check():
+                    state['cancelled'] = True
+                    return True
                 ui_path = ui_paths[state['idx']]
                 state['idx'] += 1
                 # An ALREADY-decoded folder's own folder_map[ui_path] holds
@@ -10392,7 +10487,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return True
 
         def _finish():
-            if self._case_dir:
+            if self._case_dir and not state['cancelled']:
                 try:
                     with closing(_open_cache_db(self._case_dir)) as db:
                         save_blob(db, 'leveldb_search_index_version', '1', version.encode())
@@ -10414,64 +10509,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     _SEARCH_TAB_INDEX = 2   # matches center_tabs.addTab(search_tab, "Keyword Search")
 
-    def _start_leveldb_auto_indexing(self) -> None:
-        """Indexes every not-yet-indexed LevelDB/IndexedDB folder for
-        Keyword Search as part of ordinary case loading, rather than
-        lazily the first time a search runs — direct follow-up request,
-        2026-09-26: "for the leveldb instead of on your first search can
-        we just do that during the initial processing? where the header
-        search was before i ask you to move to the dialog[;] can you
-        make it show its progress like it did for headers." Mirrors
-        _on_header_scan_progress's own "N remaining…" status-bar phrasing
-        for exactly that reason.
-
-        The lazy search-time fallback this used to have
-        (_ensure_leveldb_indexed_then_run, app/keyword_search.py) was
-        REMOVED the same day, direct follow-up: "can you remove the code
-        from the sea[r]ch[,] and make that the sea[r]ch tab is grayed out
-        until the index[e]dDB work is finished." The Keyword Search tab
-        itself (center_tabs index _SEARCH_TAB_INDEX) is disabled here —
-        greyed out, unclickable, per Qt's own default QTabBar rendering
-        for a disabled tab — the MOMENT indexing work is found (start_loading
-        disables it unconditionally up front, before metadata even
-        finishes loading, so there's no gap where it's clickable but not
-        yet actually indexed), and re-enabled the instant this method's
-        own _done() fires. A case with nothing left to index (every real
-        LevelDB folder already covered — the common case on a re-open)
-        re-enables essentially immediately, so the grey-out is only ever
-        as long as real indexing work actually takes.
-
-        Called from on_metadata_ready on a short delay so it doesn't
-        compete with the very first tree-population frames."""
-        if not self._case_dir:
-            self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
-            return
-        _, unindexed = self._leveldb_search_coverage()
-        if not unindexed:
-            self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
-            self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, "")
-            return
-        total = len(unindexed)
-        self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, False)
-        self.center_tabs.setTabToolTip(
-            self._SEARCH_TAB_INDEX,
-            f"Indexing {total:,} LevelDB/IndexedDB folder(s) for search…")
-
-        def _progress(done, total_):
-            remaining = total_ - done
-            if remaining > 0:
-                msg = f"Indexing LevelDB folders for search: {remaining:,} remaining…"
-                self.status_bar.showMessage(msg)
-                self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, msg)
-
-        def _done():
-            self.status_bar.showMessage(
-                f"Indexed {total:,} LevelDB/IndexedDB folder(s) for search.", 5000)
-            self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, "")
-            self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
-
-        self._index_leveldb_folders_batched(unindexed, on_progress=_progress, on_done=_done)
-
     def _open_process_dialog(self, preselect_nested=False, resume_search=False,
                              auto_archive_selection=False,
                              preselect_tier1=False, preselect_embedded_media=False):
@@ -10492,6 +10529,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             guid_to_bundle=self.guid_to_bundle,
             folder_map=self.folder_map,
             local_media_metadata_candidates_fn=self._collect_local_media_metadata_candidates,
+            leveldb_coverage_fn=self._leveldb_search_coverage,
+            leveldb_index_fn=self._index_leveldb_folders_batched,
             parent=self,
         )
         dlg.header_types_cleared.connect(self._on_header_types_cleared)
@@ -10504,7 +10543,21 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         dlg.nested_extraction_done.connect(self._on_nested_extraction_done)
         dlg.embedded_media_scan_done.connect(self._on_embedded_media_scan_injected)
         dlg.media_metadata_scan_done.connect(self._on_media_metadata_scan_done)
+        # Keyword Search tab is greyed out only for the real duration of
+        # this stage (moved 2026-10-12 from an automatic, always-on grey-
+        # out — see ProcessDialog's own "Index LevelDB..." checkbox) —
+        # searching mid-index would just silently miss whatever hasn't
+        # been indexed yet.
+        dlg.leveldb_indexing_started.connect(
+            lambda: self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, False))
+        dlg.leveldb_indexing_done.connect(
+            lambda: self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True))
         dlg.exec()
+        # A cancelled/never-run indexing stage must not leave the tab
+        # permanently stuck disabled if the dialog closes any other way
+        # (e.g. the window's own close button rather than the Cancel
+        # button reaching leveldb_indexing_done).
+        self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
         # Came here from a keyword search — run that search automatically
         # once the dialog closes, whether or not anything was extracted.
         if resume_search and self.search_field.text().strip():
@@ -10587,15 +10640,21 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._pending_db_hits.clear()
         self.search_status.setText("No search running")
         self.center_tabs.setCurrentIndex(0)
-        # Greyed out (unclickable) until _start_leveldb_auto_indexing
-        # confirms LevelDB/IndexedDB indexing is actually finished for
-        # this case — added 2026-09-26, direct request, replacing the
-        # lazy search-time indexing this tab used to fall back on. Set
-        # here, up front, rather than only once indexing is found to be
-        # needed, so there's no window where the tab is clickable before
-        # this case's own coverage has even been checked.
-        self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, False)
-        self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, "Loading archive…")
+        # LevelDB/IndexedDB indexing for Keyword Search is no longer
+        # eagerly auto-run at load time (moved 2026-10-12 into an
+        # explicit, checked-by-default Process Case stage — direct
+        # request: "the leveldb processing... is do[ne] after the data
+        # is loaded into the gui and at the same time that the process
+        # dialog opens[;] can we instead have it as an option in the
+        # process case" — it used to race the Process Case dialog
+        # opening for a brand-new case, competing for the same CPU/UI
+        # thread). The tab is no longer disabled here either — unlike
+        # the LevelDB-specific grey-out this replaces, there's nothing
+        # left here it would be waiting ON; search just runs with
+        # whatever LevelDB coverage this case currently has, exactly
+        # like every other optional Process Case stage already works
+        # when skipped. See ProcessDialog's own "Index LevelDB..."
+        # checkbox for where this moved to.
         self._load_recent_searches_from_db()
         # Stop the old index worker before replacing the tree model — a running
         # worker thread can trigger Python GC which traverses freed Qt wrappers.
@@ -10850,14 +10909,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Start background precomputation of folder counts if not already cached.
         if len(self._file_count_cache) < len(self.folder_map):
             QTimer.singleShot(300, self._start_precompute_folder_counts)
-        # Index any not-yet-indexed LevelDB/IndexedDB folders for Keyword
-        # Search as part of ordinary case loading — direct request,
-        # 2026-09-26: "instead of on your first search can we just do
-        # that during the initial processing? where the header search
-        # was before i ask you to move to the dialog." Delayed past the
-        # folder-count precompute above so it doesn't compete with the
-        # very first tree-population frames right at case open.
-        QTimer.singleShot(500, self._start_leveldb_auto_indexing)
+        # LevelDB/IndexedDB indexing for Keyword Search — moved
+        # 2026-10-12 from an automatic QTimer.singleShot fired right
+        # here into an explicit Process Case stage (see ProcessDialog's
+        # own "Index LevelDB..." checkbox) — direct request: it used to
+        # run at the exact same moment the Process Case dialog opens for
+        # a brand-new case, competing for the same CPU/UI thread as
+        # whatever the examiner just asked that dialog to do.
 
         if missing_plist_paths:
             # Only warn about UUID folders that actually have content in the zip.
@@ -12357,13 +12415,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # except clause) — there is no tree population to wait for, so
             # don't leave the bar spinning on a load that already failed.
             self._tree_done = True
-            # Nor is there anything for _start_leveldb_auto_indexing to
-            # ever run against (it's only ever scheduled from within
-            # on_metadata_ready) — re-enable the Keyword Search tab
-            # start_loading disabled up front, rather than leaving it
-            # permanently greyed out after a failed load.
-            self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True)
-            self.center_tabs.setTabToolTip(self._SEARCH_TAB_INDEX, "")
         self._maybe_hide_load_progress()
 
     def _maybe_hide_load_progress(self):

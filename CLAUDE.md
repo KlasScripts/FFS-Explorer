@@ -814,6 +814,55 @@ archive's own bytes, so it belongs there, not caseresults.db), reloaded
 at case-open through the SAME background poll `_start_case_meta_load`
 already uses for header types/photo index/timezone.
 
+**LevelDB/IndexedDB indexing moved into an explicit, checked-by-default
+Process Case stage — 2026-10-12**, direct request: "the leveldb
+processing that is do[ne] is started after the data is loaded into the
+gui and at the same time that the process dialog opens[;] can we
+instead have it as an option in the process case and have [it] ticked
+on... like media [meta]data processing." Previously ran unconditionally
+on a `QTimer.singleShot(500, ...)` fired from `on_metadata_ready` —
+confirmed the real complaint: that's the EXACT same moment a brand-new
+case's Process Case dialog auto-opens (`_open_process_dialog_for_new_
+case`), so the two genuinely competed for the same CPU/UI thread. Now
+runs FIRST in ProcessDialog's own operation chain (before the header
+scan — unlike media metadata, nothing else here needs it to have run
+first, and it needs nothing else to have run first either), via a new
+`ProcessDialog._start_leveldb_indexing`/`_continue_after_leveldb_
+indexing` pair inserted between `_continue_after_integrity` and the old
+chain start.
+
+The real engine (`FastZipBrowser._leveldb_search_coverage`/
+`_index_leveldb_folders_batched`, unchanged) is handed to ProcessDialog
+as two callables, not reimplemented as a QThread worker the way every
+OTHER stage here is — `_index_leveldb_folders_batched`'s own docstring
+explains why it deliberately runs frame-budgeted on the MAIN thread
+instead: it reads archive bytes via `self._read_zip_bytes`, the GUI's
+shared reader, and this project's standing convention is that a
+background worker must own an INDEPENDENT reader rather than share
+that one. Turning this into a real stage gave it something it never
+had before — actual cancellation: `cancel_check` is now checked once
+per folder (same cadence as its own progress callback), and a
+cancelled run deliberately skips writing the "fully covered" version
+marker, so the folders it didn't reach stay correctly reported as
+unindexed rather than being falsely marked complete.
+
+The Keyword Search tab is still greyed out while this runs (searching
+mid-index would silently miss whatever hasn't been indexed yet) —
+but ONLY for the real duration of the stage now, via `leveldb_indexing_
+started`/`_done` signals FastZipBrowser connects to `setTabEnabled`,
+not unconditionally from the moment ANY case loads. Unticking the
+checkbox just means Keyword Search runs with whatever coverage this
+case already has, exactly like skipping any other optional stage —
+the tab is never disabled at all if this stage doesn't run.
+
+Verified directly against a real archive (not just "should work"): 19
+real LevelDB/IndexedDB folders, forced into a stale-coverage state,
+correctly dropped from 19 unindexed to 0 after running through
+Process Case; a simulated real Cancel-button click fired the instant
+indexing started left coverage at 19 unindexed afterward (not 0) —
+confirming the version-marker skip genuinely prevents a false
+"fully covered" claim, not just in theory.
+
 ## 4. In-app format viewers
 
 Every one of these is reachable by double-clicking the file in the ordinary

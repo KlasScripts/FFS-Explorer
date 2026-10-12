@@ -1139,6 +1139,29 @@ File order, top to bottom:
   `build/ffs_explorer/warn-ffs_explorer.txt` after a CLEAN rebuild
   (`rm -rf build dist` first) for "excluded module named X," don't just
   confirm the package installs.
+- A config file with its own `store_path()` is invisible to PyInstaller
+  unless EXPLICITLY added to the spec's `datas=` — confirmed a real,
+  shipped bug this way, 2026-10-12: `app/scan_rules.py`'s two JSON files
+  (added 2026-10-10) were never added to `datas=`, so a real frozen exe
+  had NOTHING in scope for the header scan, nested-archive discovery,
+  OR the Media Browser's "User Media" filter at all (`load_rules()`'s
+  own "missing file → `[]`" fallback is deliberately safe for a
+  genuinely corrupt file, not for "never shipped" — every real caller
+  silently got an empty scope instead) — direct report: "for the user
+  media was 0 and then i checked scanned folders in process case there
+  was nothing there." Dev/venv runs never catch this: `sys._MEIPASS`
+  only exists in a real frozen process. Two DIFFERENT destination
+  conventions are both in play and must each match their own module's
+  `store_path()` exactly — `scan_rules.py` reads via `sys._MEIPASS +
+  'config'` (so `datas=('config/scan_rules_ios.json', 'config')`, same
+  as `hardware_models.json`), while `user_media_ignore_list.py`/
+  `file_browser_presets.py` read DIRECTLY next to the exe with NO
+  `config` subfolder (so `datas=(..., '.')`, not `'config'` — the two
+  look almost identical in the spec file but a mismatched destination
+  silently ships the file to the wrong place, which is exactly as
+  broken as not shipping it at all). When adding a new hand-maintained
+  config file, check which convention its own module's `store_path()`
+  actually uses before copying either example.
 
 ## Keeping this map current (instruction to Claude)
 

@@ -25,6 +25,37 @@ a = Analysis(
         # Bundle config JSON files under config/ next to the exe
         ('config/hardware_models.json', 'config'),
         ('config/photo_flags.json', 'config'),
+        # app/scan_rules.py's store_path() reads these via sys._MEIPASS
+        # + 'config' (same convention as hardware_models.json above,
+        # re-derived there since that module has no Qt/ffs-explorer.py
+        # dependency) — added 2026-10-12, a REAL confirmed packaging bug
+        # found via direct report against a real frozen exe: "for the
+        # user media was 0 and then i checked scanned folders in process
+        # case there was nothing there" — load_rules() returns [] on a
+        # missing file (a deliberately SAFE fallback for a corrupt file,
+        # not for "never shipped" — see its own docstring), so every
+        # real caller (scan_folders/scan_excludes/user_media_folders)
+        # silently had NOTHING in scope in any frozen build before this,
+        # not just a narrow edge case. Never caught in dev/venv runs
+        # since _MEIPASS is only ever set in a real frozen process.
+        ('config/scan_rules_ios.json', 'config'),
+        ('config/scan_rules_android.json', 'config'),
+        # user_media_ignore_list.py's store_path() instead reads this
+        # DIRECTLY next to the exe (no 'config' subfolder, dest='.') —
+        # it's examiner-EDITABLE at runtime (Add/Remove via the GUI),
+        # unlike scan_rules above, so this bundled copy is only ever the
+        # real, already-curated starting point (the six real "UI
+        # Graphics" wildcard entries — see CLAUDE.md), not baked-in
+        # read-only reference data; an examiner's own later edits land
+        # in this exact same file, in place.
+        ('config/user_media_ignore_list.json', '.'),
+        # file_browser_presets.py's own store_path() is the same
+        # dest='.' convention — unlike the two above, its load() already
+        # self-heals a missing file via default_presets() with
+        # byte-identical content, so this isn't fixing a real gap, just
+        # keeping the single source of truth in the committed JSON
+        # rather than a second, possibly-drifting copy in Python code.
+        ('config/file_browser_presets.json', '.'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),
         # Artifact parser scripts — loaded dynamically so PyInstaller can't

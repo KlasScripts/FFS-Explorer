@@ -35,6 +35,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       save_blob, load_blob, open_blob,
                       save_header_types, load_header_types, clear_header_types,
                       save_media_metadata, load_media_metadata, clear_media_metadata,
+                      load_attachment_links,
                       save_guid_bundle_map, load_guid_bundle_map, save_app_registry,
                       save_folder_counts, save_folder_sizes, load_folder_data,
                       save_device_info, load_device_info,
@@ -1390,6 +1391,35 @@ _PHOTO_HEADERS = ['Flags', 'Taken', 'Added', 'Original Name', 'Album', 'Labels',
 _EXIF_HEADERS = ['Taken (EXIF)', 'Camera (EXIF)', 'GPS (EXIF)',
                  'Duration (EXIF)', 'Dimensions (EXIF)', 'Software (EXIF)',
                  'Orientation (EXIF)']
+
+# File Browser <-> Artifact Report cross-reference — added 2026-10-12,
+# direct request: "i want to be able to link together the artifact
+# view and the file browser if a[n] messaging report ha[s] a[n]
+# attachment... you could filter for sms in that column and get all
+# the atacha[t]ment for sms." One column, conditionally shown the same
+# way as _EXIF_HEADERS/_PHOTO_HEADERS — see app/artifact_db.py's
+# build_attachment_links for where the underlying rows come from.
+_LINKED_REPORT_HEADER = 'Linked Report'
+
+
+def _format_attachment_links(links: list) -> str:
+    """[{script_name, row_id, label}, ...] -> one display string for the
+    "Linked Report" cell — grouped by *label* (a report's own display
+    name is the same for every link from it, by design — see
+    build_attachment_links) so a file referenced by several rows of
+    the SAME report (a group-MMS attachment shared across multiple
+    message rows is the common real case) shows one entry with a
+    count, e.g. "SMS Messages (×3)", rather than three near-duplicate
+    ones. A file referenced by two DIFFERENT reports (rarer, but not
+    assumed impossible) shows both, comma-joined."""
+    if not links:
+        return ''
+    counts: dict[str, int] = {}
+    for link in links:
+        counts[link['label']] = counts.get(link['label'], 0) + 1
+    parts = [f"{label} (×{n})" if n > 1 else label
+            for label, n in counts.items()]
+    return ', '.join(parts)
 
 # Cocoa/Mac epoch (2001-01-01) -> Unix epoch, seconds. photos_metadata.py's
 # Taken/Added (timestamp_fields unit "cocoa_s") store the raw value in this
@@ -9287,7 +9317,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _build_entry_row(self, path: str, has_bundles: bool = False,
                          display_parent: str | None = None,
-                         photo_cols: bool = False, exif_cols: bool = False):
+                         photo_cols: bool = False, exif_cols: bool = False,
+                         link_cols: bool = False):
         """Return one file-model row tuple for *path*, or None if hidden.
 
         Single source of truth for building file-browser rows — used by the
@@ -9345,6 +9376,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 ])
             else:
                 cols.extend([''] * len(_EXIF_HEADERS))
+        if link_cols:
+            cols.append(_format_attachment_links(self._attachment_links.get(path)))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
                 path in self._nested_archive_map or path in self._leveldb_folder_map
                 or path in self._embedded_media_containers)
@@ -9808,8 +9841,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             or any(self._photo_key(f.rsplit('/', 1)[0] if '/' in f else '')
                    for f in extra_files))
         has_exif = bool(self._media_exif)
+        has_links = bool(self._attachment_links)
         headers = (self.file_headers + (_PHOTO_HEADERS if has_photos else [])
-                  + (_EXIF_HEADERS if has_exif else []))
+                  + (_EXIF_HEADERS if has_exif else [])
+                  + ([_LINKED_REPORT_HEADER] if has_links else []))
         self._set_file_model(FileTableModel(headers))
         # Captured AFTER _set_file_model, which now ALSO bumps _load_gen
         # unconditionally (added 2026-10-03 — see that method's own
@@ -9860,7 +9895,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 disp_parent = self._display_path(folder)
                 for child in self.folder_map.get(folder, []):
                     row = self._build_entry_row(child, display_parent=disp_parent,
-                                                photo_cols=has_photos, exif_cols=has_exif)
+                                                photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links)
                     if row is None:
                         continue
                     batch_rows.append(row)
@@ -9881,7 +9916,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     parent = f.rsplit('/', 1)[0] if '/' in f else ''
                     disp_parent = self._display_path(parent)
                     row = self._build_entry_row(f, display_parent=disp_parent,
-                                                photo_cols=has_photos, exif_cols=has_exif)
+                                                photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links)
                     if row is not None:
                         batch_rows.append(row)
                         state['count'] += 1
@@ -9952,6 +9987,34 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             hex_act = QAction("🔍 Preview in Hex Viewer", self)
             hex_act.triggered.connect(partial(self._load_hex_preview, ui_path))
             menu.addAction(hex_act)
+
+        # Jump to the message/record that references this file as an
+        # attachment — added 2026-10-12, direct request: "if a[n]
+        # messaging report ha[s] a[n] attachment... right[-]click to
+        # see the message." Reuses the pre-existing
+        # _art_jump_to_report_row (built for "Interpret as SQL Record"
+        # and bookmark row-citation) rather than a new navigation
+        # mechanism — see app/db_utils.py's artifact_attachment_links
+        # table and app/artifact_db.py's build_attachment_links for
+        # where these links come from. A single link jumps directly; 2+
+        # (the common real case for a group-MMS attachment shared
+        # across several message rows) opens a submenu naming each by
+        # its own row_id, since the File Browser cell itself only shows
+        # a count, not which specific rows.
+        links = self._attachment_links.get(ui_path) if ui_path else None
+        if links:
+            if len(links) == 1:
+                link = links[0]
+                show_act = QAction(f"🔗 Show in Artifact Report ({link['label']})", self)
+                show_act.triggered.connect(
+                    partial(self._art_jump_to_report_row, link['script_name'], link['row_id']))
+                menu.addAction(show_act)
+            else:
+                show_menu = menu.addMenu("🔗 Show in Artifact Report")
+                for link in links:
+                    act = show_menu.addAction(f"{link['label']} — row {link['row_id']}")
+                    act.triggered.connect(
+                        partial(self._art_jump_to_report_row, link['script_name'], link['row_id']))
 
         if ui_path and '/' in ui_path:
             parent_path = ui_path.rsplit('/', 1)[0]
@@ -10627,6 +10690,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._case_dir = case_dir
         self._photo_index = {}        # rebuilt in on_metadata_ready
         self._media_exif = {}         # rebuilt in _start_case_meta_load
+        self._attachment_links = {}   # rebuilt in _start_case_meta_load
         self._photos_prompt_shown = False
         self._search_entries = None   # clear cached index for the new archive
         self.zip_path = zip_path
@@ -10815,6 +10879,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._metadata_only_folders = metadata_only_folders or set()
         self._header_type_overrides = {}
         self._media_exif = getattr(self, '_media_exif', {}) or {}
+        self._attachment_links = getattr(self, '_attachment_links', {}) or {}
         self._file_count_cache = {}
         if self._case_dir:
             # Counts stay synchronous: one small blob unpack (~tens of ms),
@@ -10943,14 +11008,24 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         def _load():
             overrides = {}
             media_exif = {}
+            links = {}
             try:
                 with closing(_open_cache_db(case_dir)) as db:
                     overrides = load_header_types(db)
                     media_exif = load_media_metadata(db)
             except Exception:
                 pass
+            # artifact_attachment_links lives in caseresults.db, not
+            # casecache.db (alongside the artifact_<script> report
+            # tables it points into — see db_utils.py's own
+            # _open_results_db) — a SEPARATE connection, not an oversight.
+            try:
+                with closing(_open_results_db(case_dir)) as db:
+                    links = load_attachment_links(db)
+            except Exception:
+                pass
             tz = self._load_or_detect_timezone_settings(zip_path, adapter, case_dir)
-            return overrides, _build_photo_index(case_dir, rules), tz, media_exif
+            return overrides, _build_photo_index(case_dir, rules), tz, media_exif, links
 
         fut = _BG_POOL.submit(_load)
 
@@ -10961,7 +11036,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 QTimer.singleShot(30, _poll)
                 return
             try:
-                overrides, photos, tz, media_exif = fut.result()
+                overrides, photos, tz, media_exif, links = fut.result()
             except Exception:
                 return
             # A real, higher-impact instance of the SAME gap
@@ -10985,6 +11060,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._reapply_leveldb_type_overrides()
             self._photo_index = photos
             self._media_exif = media_exif
+            self._attachment_links = links
             (self._handset_zone_name, self._acquisition_zone_name,
              self._manual_zone_name,
              self._timestamp_display_mode, is_first_load) = tz
@@ -11614,6 +11690,26 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 pass
         self._refresh_current_file_view(preserve_filter=True)
 
+    def _on_attachment_links_changed(self) -> None:
+        """Runs when ArtifactRunnerDialog's parsers_completed fires (see
+        artifact_viewer.ArtifactRunnerWorker._register_attachment_links)
+        — reloads the File Browser's "Linked Report" column data from
+        caseresults.db and refreshes the current view so it appears
+        immediately, same "reload then repaint" shape
+        _on_media_metadata_scan_done/_on_photo_index_changed already use
+        for their own analogous cases. Opens caseresults.db (NOT
+        casecache.db) since artifact_attachment_links lives alongside
+        the artifact_<script> report tables it points into — see
+        db_utils.py's own _open_results_db."""
+        self._attachment_links = {}
+        if self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    self._attachment_links = load_attachment_links(db)
+            except Exception:
+                pass
+        self._refresh_current_file_view(preserve_filter=True)
+
     def _on_nested_extraction_done(self):
         saved_checked = set(self._checked_folders)
         before = set(self._nested_archive_map.keys())
@@ -11990,9 +12086,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             (k := self._photo_key(p)) and k in self._photo_index
             for p in children)
         has_exif = bool(self._media_exif)
+        has_links = bool(self._attachment_links)
         headers = (self.file_headers + (['UUID'] if has_bundles else [])
                    + (_PHOTO_HEADERS if has_photos else [])
-                   + (_EXIF_HEADERS if has_exif else []))
+                   + (_EXIF_HEADERS if has_exif else [])
+                   + ([_LINKED_REPORT_HEADER] if has_links else []))
         new_model = FileTableModel(headers)
         # _update_filter_columns resets the type selection — save the filter
         # bar state around it when the filter must survive the refresh.
@@ -12013,7 +12111,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         disp_parent = self._display_path(folder_path)
         for path in sorted(children):
             row = self._build_entry_row(path, has_bundles, display_parent=disp_parent,
-                                        photo_cols=has_photos, exif_cols=has_exif)
+                                        photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links)
             if row is not None:
                 batch.append(row)
         new_model.append_rows_batch(batch)
@@ -12082,9 +12180,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             (k := self._photo_key(p)) and k in self._photo_index
             for p in files)
         has_exif = bool(self._media_exif)
+        has_links = bool(self._attachment_links)
         headers = (self.file_headers + (['UUID'] if has_bundles else [])
                    + (_PHOTO_HEADERS if has_photos else [])
-                   + (_EXIF_HEADERS if has_exif else []))
+                   + (_EXIF_HEADERS if has_exif else [])
+                   + ([_LINKED_REPORT_HEADER] if has_links else []))
         new_model = FileTableModel(headers)
 
         if preserve_filter:
@@ -12120,7 +12220,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             while state['idx'] < total:
                 path = files[state['idx']]
                 state['idx'] += 1
-                row = self._build_entry_row(path, has_bundles, photo_cols=has_photos, exif_cols=has_exif)
+                row = self._build_entry_row(path, has_bundles, photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links)
                 if row is not None:
                     batch_rows.append(row)
                     state['count'] += 1

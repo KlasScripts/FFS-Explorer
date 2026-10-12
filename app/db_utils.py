@@ -568,6 +568,40 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
+    # File Browser <-> Artifact Report cross-reference (added 2026-10-12,
+    # direct request: "i want to be able to link together the artifact
+    # view and the file browser if a[n] messaging report ha[s] a[n]
+    # attachment... you could filter for sms in that column and get all
+    # the atacha[t]ment for sms and then if you wa[nte]d you could
+    # right[-]click to see the message"). Keyed by (ui_path, script_name,
+    # row_id) rather than ui_path alone — a single attachment can be
+    # referenced by MORE than one real row (a group-MMS attachment shared
+    # across several message rows is the common real case). row_id is
+    # the artifact_<script_name> table's own implicit SQLite rowid at
+    # the moment this was written — see app/artifact_db.py's
+    # build_attachment_links for why that's stable enough across an
+    # unchanged re-run, and app/artifact_viewer.py's own pre-existing
+    # _art_jump_to_report_row for the exact row-select mechanism this
+    # row_id feeds (built for "Interpret as SQL Record," reused here
+    # rather than inventing a second one). Always rebuilt per script
+    # name (see clear_attachment_links_for_script), same "fully replaced
+    # on every parser re-run" convention write_artifact_results itself
+    # already uses — a stale link from a since-changed parser run must
+    # never survive silently.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS artifact_attachment_links (
+            ui_path     TEXT    NOT NULL,
+            script_name TEXT    NOT NULL,
+            row_id      INTEGER NOT NULL,
+            label       TEXT    NOT NULL,
+            PRIMARY KEY (ui_path, script_name, row_id)
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_artifact_attachment_links_ui_path
+        ON artifact_attachment_links (ui_path)
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
     return conn
@@ -1369,6 +1403,49 @@ def clear_embedded_media_hits(conn: 'sqlite3.Connection') -> None:
     per its own module docstring in _open_results_db)."""
     conn.execute('DELETE FROM embedded_media_hits')
     conn.commit()
+
+
+# ── File Browser <-> Artifact Report cross-reference ────────────────────────
+
+def clear_attachment_links_for_script(conn: 'sqlite3.Connection', script_name: str) -> None:
+    """Delete every artifact_attachment_links row for *script_name* —
+    called right before re-inserting that parser's fresh links, same
+    "always rebuilt from scratch on re-run" convention
+    write_artifact_results itself already uses for the report table
+    these rows point into; a stale link to a row that moved or no
+    longer exists must never silently survive a re-run."""
+    conn.execute('DELETE FROM artifact_attachment_links WHERE script_name = ?', (script_name,))
+
+
+def save_attachment_links(conn: 'sqlite3.Connection', script_name: str, links: list) -> None:
+    """Replace script_name's own attachment links with *links* — a list
+    of {ui_path, row_id, label} dicts, see
+    app/artifact_db.py's build_attachment_links. Clears first (see
+    clear_attachment_links_for_script) so this is always a full replace,
+    never an accumulation of old + new."""
+    clear_attachment_links_for_script(conn, script_name)
+    if links:
+        conn.executemany(
+            'INSERT OR REPLACE INTO artifact_attachment_links '
+            '(ui_path, script_name, row_id, label) '
+            'VALUES (:ui_path, :script_name, :row_id, :label)',
+            [{'script_name': script_name, **link} for link in links],
+        )
+    conn.commit()
+
+
+def load_attachment_links(conn: 'sqlite3.Connection') -> dict:
+    """Return {ui_path: [{script_name, row_id, label}, ...]} for every
+    recorded link, across every script — the File Browser's own "Linked
+    Report" column reads this whole, small table once per case-open
+    (same chokepoint as header_types/media_metadata) rather than
+    querying per-row."""
+    results: dict = {}
+    for ui_path, script_name, row_id, label in conn.execute(
+            'SELECT ui_path, script_name, row_id, label FROM artifact_attachment_links'):
+        results.setdefault(ui_path, []).append(
+            {'script_name': script_name, 'row_id': row_id, 'label': label})
+    return results
 
 
 def save_nested_archive_failure(conn: 'sqlite3.Connection',

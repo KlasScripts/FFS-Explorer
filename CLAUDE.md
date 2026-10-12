@@ -863,6 +863,74 @@ indexing started left coverage at 19 unindexed afterward (not 0) —
 confirming the version-marker skip genuinely prevents a false
 "fully covered" claim, not just in theory.
 
+**File Browser ↔ Artifact Report cross-reference ("Linked Report"
+column) — added 2026-10-12**, direct request: "i want to be able to
+link together the artifact view and the file browser if a[n] messaging
+report ha[s] a[n] attachment... you could filter for sms in that
+column and get all the atacha[t]ment for sms and then... right[-]click
+to see the message." The user's own first idea was a new per-report
+auto-incrementing id (e.g. "sms-attachment-1") — scoped instead around
+reusing what was already there: `sms_messages.py` already resolves a
+real `attachment_path` per message and declares it via `media_fields =
+["attachment_path"]`, a convention `artifact_viewer.py` already used
+for thumbnail pre-caching; every artifact table also gets a real,
+stable SQLite rowid for free; and `_art_jump_to_report_row(script_name,
+rowid)` already existed (built for "Interpret as SQL Record," with
+bookmark row-citation explicitly named as shared groundwork) — a jump-
+to-exact-row mechanism with its own graceful "row no longer there"
+fallback already battle-tested. No new per-script convention was
+needed in the parser scripts themselves: any parser that already
+supports thumbnail columns automatically qualifies.
+
+`app/artifact_db.py`'s `build_attachment_links(script_name, rows,
+media_fields, label)` computes `[{ui_path, row_id, label}]` — `row_id`
+is 1-based and MUST equal the real implicit rowid
+`write_artifact_results` assigns that same row: true by construction
+since that function always drops and recreates `artifact_<script>`
+with no explicit PRIMARY KEY, so a fresh table's rowid is 1 for the
+first inserted row, 2 for the second, deterministically, as long as
+both are called with the exact same `rows` list in the same order
+(confirmed, not assumed — see below). `label` is the report's own
+display name, the SAME string for every link from that script (not a
+per-row id) — deliberate, so a filter fragment like "sms" finds every
+attachment that report references at once; the exact row only matters
+once the examiner has already decided to jump to it.
+
+Persisted in caseresults.db's new `artifact_attachment_links` table
+(alongside the `artifact_<script>` tables it points into, not
+casecache.db) — keyed by `(ui_path, script_name, row_id)`, since a
+single attachment can legitimately be referenced by more than one row
+(a group-MMS attachment shared across several message rows is the
+common real case, confirmed against this one real archive: 19 real SMS
+attachments from 91 real messages). Always fully rebuilt per
+script_name on each parser re-run (`clear_attachment_links_for_script`)
+— same "never let a stale link silently survive" convention
+`write_artifact_results` itself already follows for the report table
+these rows point into. Registered right next to
+`_precache_media_thumbnails` in `ArtifactRunnerWorker.run()` (the new
+`_register_attachment_links`), reusing the exact same `media_fields`
+read and the exact same `rows` list, in the exact same order — the one
+real constraint this whole design depends on.
+
+The File Browser's new "Linked Report" column (conditionally shown,
+same pattern as the "(EXIF)" columns) shows `_format_attachment_links`'
+grouped-by-label output — e.g. `"SMS Messages"`, or `"SMS Messages
+(×3)"` for several references from the same report. The right-click
+menu's new "Show in Artifact Report" action (single link) or submenu
+(2+, each naming its own row_id) calls the pre-existing
+`_art_jump_to_report_row` directly — no new navigation code needed at
+all.
+
+Verified end-to-end against a real archive, not just unit-level: ran
+the real `sms_messages.py` parser against a real iOS17 archive (91
+messages, 19 with a real attachment), wrote results, built and
+persisted links, reloaded them, and independently queried
+`artifact_sms_messages` by the computed `row_id` to confirm it names
+the EXACT same real row the link claims to (not merely "doesn't
+crash") — then right-clicked (programmatically) to confirm the jump
+genuinely switches tabs and selects that real row in the live
+`QTableView`, not just that the function returns without error.
+
 ## 4. In-app format viewers
 
 Every one of these is reachable by double-clicking the file in the ordinary

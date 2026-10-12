@@ -89,3 +89,52 @@ def list_completed_artifacts(case_conn: sqlite3.Connection) -> list[str]:
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'artifact_%'"
     ).fetchall()
     return [r[0][len('artifact_'):] for r in rows]
+
+
+def build_attachment_links(script_name: str, rows: list[dict],
+                           media_fields: list | None, label: str) -> list[dict]:
+    """[{ui_path, row_id, label}] for the File Browser's "Linked Report"
+    column (added 2026-10-12, direct request: "if a[n] messaging report
+    ha[s] a[n] attachment... you could filter for sms in that column
+    and get all the atacha[t]ment for sms and then... right[-]click to
+    see the message"). Reuses `media_fields` — the SAME declaration
+    `artifact_viewer.py`'s own `_precache_media_thumbnails` already
+    reads off a parser module to know which row keys hold a real
+    archive ui_path — rather than inventing a second per-script
+    convention: any parser that already supports thumbnail columns
+    (`sms_messages.py`'s `media_fields = ["attachment_path"]`, for one)
+    gets this for free, no parser script changes needed.
+
+    *row_id* is 1-based and MUST match the implicit SQLite rowid
+    write_artifact_results' own INSERT assigns that row — true as long
+    as this is called with the EXACT SAME *rows* list, in the same
+    order, right after (or before) write_artifact_results(case_conn,
+    script_name, rows) for that same run: that function always drops
+    and recreates artifact_<script_name> with no explicit PRIMARY KEY,
+    so a freshly inserted table's own rowid is 1 for the first row,
+    2 for the second, and so on, deterministically, by construction —
+    not re-derived from the row's own content, which could collide or
+    be absent. app/artifact_viewer.py's pre-existing
+    _art_jump_to_report_row(script_name, row_id) is what actually
+    navigates to it later, and already handles a row_id that's gone
+    stale (the parser was re-run and the row moved or vanished) with a
+    graceful "no longer present" message rather than jumping to the
+    wrong row.
+
+    *label* is the report's own human display name (e.g. "SMS
+    Messages") — deliberately the SAME string for every link from this
+    script, not a per-row identifier, so typing a fragment of it into
+    the File Browser's text filter (e.g. "sms") finds every attachment
+    this report references at once; the exact row is only needed once
+    an examiner has already decided to jump to it via the right-click
+    menu, which labels each option by its own row_id instead."""
+    if not media_fields or not rows:
+        return []
+    links = []
+    for i, row in enumerate(rows):
+        row_id = i + 1
+        for field in media_fields:
+            path = row.get(field)
+            if path:
+                links.append({'ui_path': path, 'row_id': row_id, 'label': label})
+    return links

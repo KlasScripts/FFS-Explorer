@@ -563,7 +563,7 @@ class ArtifactRunnerWorker(QThread):
 
     def run(self):
         from artifact_runner import run_artifact
-        from artifact_db import write_artifact_results
+        from artifact_db import write_artifact_results, build_attachment_links
 
         try:
             case_conn = _open_results_db(self._case_dir)
@@ -637,6 +637,8 @@ class ArtifactRunnerWorker(QThread):
                         except Exception:
                             pass
                     self._precache_media_thumbnails(module, rows, zip_obj)
+                    self._register_attachment_links(
+                        case_conn, script_name, module, rows, label)
         except Exception as exc:
             self.log.emit(f"\nUnexpected error: {exc}")
         finally:
@@ -699,6 +701,29 @@ class ArtifactRunnerWorker(QThread):
             thumb_worker.run()
         except Exception as exc:
             self.log.emit(f"  Thumbnail pre-cache skipped: {exc}")
+
+    def _register_attachment_links(self, case_conn, script_name: str, module,
+                                    rows: list[dict], label: str) -> None:
+        """File Browser "Linked Report" column — added 2026-10-12, direct
+        request: see app/artifact_db.build_attachment_links' own
+        docstring for the full design. Reuses the SAME `media_fields`
+        declaration _precache_media_thumbnails just read off *module* a
+        moment ago, and must run with this EXACT *rows* list (same
+        order) write_artifact_results was just called with, for the
+        SAME reason that function's own docstring explains — row_id
+        here has to agree with the real table's own freshly-assigned
+        rowid. Best effort, like thumbnail pre-caching right above:
+        never allowed to fail the parser run itself."""
+        try:
+            from artifact_db import build_attachment_links
+            from db_utils import save_attachment_links
+            media_fields = getattr(module, 'media_fields', None)
+            links = build_attachment_links(script_name, rows, media_fields, label)
+            save_attachment_links(case_conn, script_name, links)
+            if links:
+                self.log.emit(f"  Linked {len(links)} attachment(s) to this report.")
+        except Exception as exc:
+            self.log.emit(f"  Attachment linking skipped: {exc}")
 
 
 class ArtifactRunnerDialog(QDialog):
@@ -3340,6 +3365,7 @@ class ArtifactViewerMixin:
         )
         dlg.parsers_completed.connect(self._refresh_artifact_tab)
         dlg.parsers_completed.connect(self._on_photo_index_changed)
+        dlg.parsers_completed.connect(self._on_attachment_links_changed)
         dlg.exec()
 
     def _open_ai_summary_dialog(self) -> None:

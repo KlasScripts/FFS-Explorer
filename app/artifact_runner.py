@@ -337,6 +337,8 @@ parser skips extraction if the file is already present.
 
 import contextlib
 import fnmatch
+
+from zip_cd_cache import is_capture_alias
 import importlib.util
 import io
 import os
@@ -663,7 +665,10 @@ def open_leveldb(paths: dict, relative_dir: str, extract_subdir: str | None = No
         physical_prefix = adapter.resolve(ui_prefix.rstrip("/")) + "/"
     except Exception:
         return None
-    entry_names = [n for n in zip_names if n.startswith(physical_prefix) and not n.endswith("/")]
+    # An earlier capture of a repeated path (zip_cd_cache.capture_alias) is
+    # never part of a parser's default file set (ASSUMPTIONS.md A-72).
+    entry_names = [n for n in zip_names if n.startswith(physical_prefix) and not n.endswith("/")
+                   and not is_capture_alias(n)]
     if not entry_names:
         return None
 
@@ -1189,7 +1194,7 @@ def _resolve_glob_subpath(app_base: str, subpath: str, adapter,
     for prefix in adapter.user_candidates(app_base):
         p = prefix.rstrip('/') + '/'
         for name in zip_names:
-            if name.startswith(p):
+            if name.startswith(p) and not is_capture_alias(name):
                 remainder = name[len(p):]
                 if fnmatch.fnmatch(remainder, subpath):
                     return remainder

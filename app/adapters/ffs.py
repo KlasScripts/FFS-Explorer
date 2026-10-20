@@ -22,6 +22,7 @@ Usage
     raw = adapter.load_metadata(zip_path, z)
 """
 
+from zip_cd_cache import annotate_captures
 import plistlib
 import re
 import struct
@@ -811,6 +812,13 @@ class FfsAdapter:
     # ── Metadata loading ──────────────────────────────────────────────────────
 
     def load_metadata(self, zip_path: str, z: zipfile.ZipFile) -> dict:
+        """See _load_metadata_raw; adds the "capture" field for paths the
+        zip stores more than once (zip_cd_cache.annotate_captures, A-72)."""
+        meta = self._load_metadata_raw(zip_path, z)
+        annotate_captures(meta)
+        return meta
+
+    def _load_metadata_raw(self, zip_path: str, z: zipfile.ZipFile) -> dict:
         """Return the raw metadata dict for this extraction.
 
         For GrayKey the metadata is parsed from the zip's extra fields.
@@ -948,6 +956,7 @@ class FfsAdapter:
                 _emit("Cellebrite Android archive detected — reading metadata...")
                 guid_to_bundle = {}
             ui_metadata = self.load_metadata(zip_path, z)
+            annotate_captures(ui_metadata)
             return ui_metadata, guid_to_bundle, frozenset(ui_metadata.keys())
 
         # ── Cellebrite iOS ────────────────────────────────────────────────────
@@ -1002,4 +1011,5 @@ class FfsAdapter:
                 or {}
             )
 
+        annotate_captures(ui_metadata)
         return ui_metadata, guid_to_bundle, zip_ui_paths

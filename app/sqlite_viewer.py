@@ -27,6 +27,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QAbstractTableModel, QMo
 from PySide6.QtGui import QColor, QBrush
 
 from artifact_viewer import ArtifactTableModel, ArtifactFilterWorker
+from zip_cd_cache import capture_alias, capture_marker
 
 
 # A file is treated as a database by its content, not its name: every SQLite
@@ -275,6 +276,11 @@ class SqliteViewerMixin:
         self._sql_table_view.verticalHeader().setVisible(False)
 
         self._sql_status_label = QLabel("No database selected")
+        # Which capture of a database the zip stores more than once — its
+        # own label, since the status line above is rewritten per table.
+        self._sql_capture_label = QLabel()
+        self._sql_capture_label.setWordWrap(True)
+        self._sql_capture_label.setVisible(False)
 
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -283,6 +289,7 @@ class SqliteViewerMixin:
         layout.addLayout(controls)
         layout.addWidget(self._sql_table_view, stretch=1)
         layout.addWidget(self._sql_status_label)
+        layout.addWidget(self._sql_capture_label)
 
         self._set_sql_controls_enabled(False)
         return tab
@@ -334,6 +341,9 @@ class SqliteViewerMixin:
                 else:
                     shm = sidecar
 
+        note = self._capture_note(ui_path, wal)
+        self._sql_capture_label.setText(note)
+        self._sql_capture_label.setVisible(bool(note))
         self._set_sql_controls_enabled(False)
         self._sql_status_label.setText(f"Loading {name}…")
         self._stop_sqlite_preview_worker()
@@ -412,6 +422,33 @@ class SqliteViewerMixin:
             f"{name} — {len(tables)} table{'s' if len(tables) != 1 else ''} · "
             f"{total:,} rows{wal_note}")
         self._on_sql_table_changed(0)
+
+    def _capture_note(self, ui_path: str, wal) -> str:
+        """Status-line note for a copy of a database the zip stores more than
+        once (ASSUMPTIONS.md A-72): which capture this is, and — when this
+        copy has no WAL of its own but another capture of it does — say so
+        rather than borrowing that other capture's WAL, which would mix two
+        moments of the database."""
+        meta = getattr(self, 'full_metadata', None) or {}
+        cap = (meta.get(ui_path) or {}).get('capture')
+        if not cap:
+            return ''
+        note = (f"Capture {cap} of this database — the zip holds more than one "
+                "copy (ASSUMPTIONS.md A-72).")
+        if wal:
+            if (meta.get(ui_path + '-wal') or {}).get('capture'):
+                return note + " Using the WAL from the same capture."
+            return note + " Using the only WAL captured (it was written once)."
+        k, n = (int(x) for x in cap.split(' of '))
+        marker = capture_marker(ui_path)
+        main = ui_path.replace(marker, '') if marker else ui_path
+        others = [main] + [capture_alias(main, j, n) for j in range(1, n)]
+        with_wal = [o for o in others if o != ui_path and (o + '-wal') in meta]
+        if with_wal:
+            which = (meta.get(with_wal[0]) or {}).get('capture', '')
+            note += (f" No WAL was captured with this copy; capture {which} "
+                     "has one (not borrowed, so the two moments aren't mixed).")
+        return note
 
     def _on_sql_table_changed(self, idx: int) -> None:
         if idx < 0 or self._sql_db_path is None:

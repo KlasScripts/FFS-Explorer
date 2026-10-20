@@ -260,9 +260,26 @@ real.** *Confirmed (real), 2026-10-16.*
   `private/var/mobile/Library/Mail/Envelope Index-wal` was captured twice,
   54 s apart (1,256,632 vs 1,268,992 bytes), because the WAL changed during
   acquisition.
-- The app keys files by path, so it shows only the later copy. The earlier
-  WAL state is in the zip but not visible in the app. This is an open gap,
-  not a decision.
+- Why: GrayKey appears to collect key databases in an early pass, then
+  again in its full file-system walk. On IOS18, 18 database families have
+  the database and WAL in both passes and the SHM only in the second;
+  the keychain's WAL and SHM were written once, next to its first copy.
+- *Decision (owner), 2026-10-20:* show every copy. `zip_cd_cache` gives each
+  earlier copy its own name, e.g. `sms [capture 1 of 2].db`,
+  `Envelope Index [capture 1 of 2]-wal`; the last copy keeps the real name
+  (what the app always showed). A "Capture" column ("1 of 2"/"2 of 2")
+  appears on archives that have repeats.
+- *Decision (owner):* a database copy uses the WAL/SHM from its own capture,
+  never another's. The shared base name does this in the SQLite viewer; a
+  sidecar written once keeps its real name, so the main database still uses
+  it. A copy with no WAL of its own says so, and names the capture that has
+  one.
+- Parsers use only the real-named (latest) set by default; earlier captures
+  are skipped by `is_capture_alias`. Re-running a parser on an earlier
+  capture is planned, not built.
+- Verified on IOS18 and CTF26: every renamed copy reads at the right offset
+  with a matching CRC; no file path is repeated after renaming; the four
+  Cellebrite archives are unchanged.
 
 **A-73. Per-file hashes: GrayKey records them, Cellebrite doesn't.**
 *Confirmed (real), 2026-10-20.*

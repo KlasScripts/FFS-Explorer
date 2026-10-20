@@ -20,6 +20,7 @@ metadata operations use the local copy.
 import hashlib
 import io
 import os
+import re
 import struct
 import zipfile
 from array import array
@@ -252,9 +253,90 @@ def load(zip_path: str, case_dir: str) -> list[zipfile.ZipInfo] | None:
     except Exception:
         return None
 
+    _name_repeated_captures(infos, by_name)
     _parsed_cache[path] = (st.st_mtime, st.st_size, infos, by_name)
     _register_layout(zip_path, infos)
     return infos
+
+
+# ── Paths stored more than once (ASSUMPTIONS.md A-72) ─────────────────────────
+#
+# GrayKey can write the same path twice — it collects key databases in an
+# early pass, then again in its full file-system walk — and the two copies
+# can differ (IOS18: Mail's Envelope Index-wal changed in the 54 s between
+# them). zipfile's name index keeps only the last, so the earlier copy used
+# to be invisible. Every copy but the last now gets its own name, which every
+# reader in the app already handles as an ordinary separate file. The marker
+# goes before the extension and before a -wal/-shm/-journal suffix, so the
+# file type is kept and a capture's database and sidecars still share one
+# base name — the SQLite viewer's "<db path> + '-wal'" lookup pairs capture 1
+# with capture 1. The last copy keeps the real name (what the app always
+# showed). A path written once keeps its name even if its database was
+# written twice, so parsers never lose a sidecar. Folder entries are left
+# alone. orig_filename keeps the stored name for offset arithmetic.
+
+_SIDECAR_SUFFIXES = ('-wal', '-shm', '-journal')
+_CAPTURE_MARKER_RE = re.compile(r' \[capture \d+ of \d+\]')
+
+
+def capture_alias(name: str, k: int, n: int) -> str:
+    """'dir/sms.db-wal' -> 'dir/sms [capture 1 of 2].db-wal'."""
+    suffix = next((s for s in _SIDECAR_SUFFIXES if name.endswith(s)), '')
+    base = name[:len(name) - len(suffix)]
+    folder, slash, leaf = base.rpartition('/')
+    stem, dot, ext = leaf.rpartition('.')
+    if not dot or not stem:                 # no extension, or a dotfile
+        stem, ext = leaf, ''
+    else:
+        ext = '.' + ext
+    return f"{folder}{slash}{stem} [capture {k} of {n}]{ext}{suffix}"
+
+
+def is_capture_alias(name: str) -> bool:
+    return bool(_CAPTURE_MARKER_RE.search(name))
+
+
+def capture_marker(name: str) -> str:
+    """The ' [capture k of n]' marker in *name*, or '' if it has none."""
+    m = _CAPTURE_MARKER_RE.search(name)
+    return m.group(0) if m else ''
+
+
+def annotate_captures(ui_metadata: dict) -> None:
+    """Set metadata 'capture' = "k of n" on every copy of a repeated path,
+    the last (real-named) copy included. Read back from the names
+    _name_repeated_captures gave the earlier copies — ZipInfo has __slots__,
+    so nothing else can carry it — which also means it survives the load
+    snapshot unchanged."""
+    for key in [k for k in ui_metadata if is_capture_alias(k)]:
+        m = _CAPTURE_MARKER_RE.search(key)
+        k, n = (int(x) for x in re.findall(r'\d+', m.group(0)))
+        if ui_metadata[key] is not None:
+            ui_metadata[key]['capture'] = f"{k} of {n}"
+        main = ui_metadata.get(key[:m.start()] + key[m.end():])
+        if main is not None:
+            main['capture'] = f"{n} of {n}"
+
+
+def _name_repeated_captures(infos: list, by_name: dict) -> None:
+    copies: dict[str, list] = {}
+    for info in infos:
+        if not info.filename.endswith('/'):
+            copies.setdefault(info.filename, []).append(info)
+    for name, group in copies.items():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda i: i.header_offset)
+        n = len(group)
+        for k, info in enumerate(group, 1):
+            if k == n:
+                break
+            alias = capture_alias(name, k, n)
+            if alias in by_name:          # a real entry already has that name
+                continue
+            info.filename = alias
+            by_name[alias] = info
+        by_name[name] = group[-1]
 
 
 def _name_index(infos: list[zipfile.ZipInfo]) -> dict:
@@ -395,7 +477,7 @@ def _name_len(info: zipfile.ZipInfo) -> int:
     """Byte length of the name as stored: UTF-8 when general-purpose bit 11
     is set, else cp437 (what zipfile decoded it with). -1 if the stored bytes
     can't be reproduced."""
-    name = info.filename
+    name = getattr(info, 'orig_filename', None) or info.filename   # the stored name
     if name.isascii():
         return len(name)        # same bytes in either encoding — the common case
     enc = 'utf-8' if info.flag_bits & 0x800 else 'cp437'
@@ -506,7 +588,8 @@ def compute_data_offsets(
                     extra = info.extra
                     delta = delta_by_zip64.get(_zip64_len(extra) if extra else 0)
                     name = info.filename
-                    name_len = len(name) if name.isascii() else _name_len(info)
+                    stored = info.orig_filename
+                    name_len = len(stored) if stored.isascii() else _name_len(info)
                     k = bisect_right(offs, info.header_offset)
                     if trailer is None or delta is None or name_len < 0 or k >= n_offs:
                         unresolved.append(info)

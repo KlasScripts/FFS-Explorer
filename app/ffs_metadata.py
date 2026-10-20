@@ -38,7 +38,7 @@ from zip_cd_cache import (CachedZipView, load as _cd_cache_load,
 # chunks so the GUI can deserialize them incrementally and yield the GIL between
 # chunks (a single 500 MB+ unpackb held the GIL ~1-2 s and froze the UI).
 SNAPSHOT_KEY     = 'load_snapshot'
-SNAPSHOT_VERSION = '2'
+SNAPSHOT_VERSION = '3'   # 3: earlier captures of repeated paths get their own entry (A-72)
 
 # Items per snapshot chunk — small enough that one chunk's unpack is well under a
 # frame, so yielding the GIL between chunks keeps the UI animating.

@@ -1496,10 +1496,17 @@ def _format_duplicate_cols(dup_info: dict | None) -> tuple[str, str]:
 # Project VIC export. Parsed by app/adapters/graykey.py from the S2/S1/MD
 # extra-field blocks (ASSUMPTIONS.md A-73). "(GrayKey)" in each header keeps
 # them apart from duplicate detection's own computed "MD5" column. Each is
-# shown only when this archive carries it (self._acq_hash_keys, set in
+# shown only when this archive carries it (self._meta_col_keys, set in
 # on_metadata_ready) — CTF26 records SHA-256 only, IOS18 all three.
 _ACQ_HASH_HEADERS = {'sha256': 'SHA-256 (GrayKey)', 'sha1': 'SHA-1 (GrayKey)',
                      'md5': 'MD5 (GrayKey)'}
+
+# Columns shown straight from a per-file metadata key, each only when this
+# archive has it (self._meta_col_keys, set in on_metadata_ready). "Capture"
+# (added 2026-10-20, ASSUMPTIONS.md A-72): "1 of 2" / "2 of 2" on every copy
+# of a path GrayKey wrote more than once; the earlier copies also carry
+# "[capture k of n]" in their name (zip_cd_cache.capture_alias).
+_META_COL_HEADERS = {'capture': 'Capture', **_ACQ_HASH_HEADERS}
 
 # Cocoa/Mac epoch (2001-01-01) -> Unix epoch, seconds. photos_metadata.py's
 # Taken/Added (timestamp_fields unit "cocoa_s") store the raw value in this
@@ -7648,9 +7655,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # counts — set per archive, see _detect_time_columns' own sampling
         # for why this isn't a simple format check.
         self._has_link_count_data = False
-        # Which acquisition hashes this archive records ('sha256'/'sha1'/
-        # 'md5', in column order) — see _ACQ_HASH_HEADERS.
-        self._acq_hash_keys: tuple = ()
+        # Which _META_COL_HEADERS keys this archive's metadata carries, in
+        # column order.
+        self._meta_col_keys: tuple = ()
 
 
         main_widget = QWidget()
@@ -10211,7 +10218,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                   + ([_LINKED_REPORT_HEADER] if has_links else [])
                   + ([_INODE_HEADER] if has_inode else [])
                   + ([_LINK_COUNT_HEADER] if has_link_count else [])
-                  + [_ACQ_HASH_HEADERS[k] for k in self._acq_hash_keys]
+                  + [_META_COL_HEADERS[k] for k in self._meta_col_keys]
                   + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         self._set_file_model(FileTableModel(headers))
         # Captured AFTER _set_file_model, which now ALSO bumps _load_gen
@@ -10265,7 +10272,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     row = self._build_entry_row(child, display_parent=disp_parent,
                                                 photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
                                                 inode_cols=has_inode, link_count_cols=has_link_count,
-                                                dup_cols=has_dup, hash_keys=self._acq_hash_keys)
+                                                dup_cols=has_dup, hash_keys=self._meta_col_keys)
                     if row is None:
                         continue
                     batch_rows.append(row)
@@ -10288,7 +10295,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     row = self._build_entry_row(f, display_parent=disp_parent,
                                                 photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
                                                 inode_cols=has_inode, link_count_cols=has_link_count,
-                                                dup_cols=has_dup, hash_keys=self._acq_hash_keys)
+                                                dup_cols=has_dup, hash_keys=self._meta_col_keys)
                     if row is not None:
                         batch_rows.append(row)
                         state['count'] += 1
@@ -11321,10 +11328,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._has_link_count_data = any(
             v.get('links') is not None
             for v in islice((v for v in data.values() if v), 500))
-        # Not sampled: folders carry no hashes, and a sample could be all
-        # folders. any() stops at the first file on a GrayKey archive.
-        self._acq_hash_keys = tuple(
-            k for k in _ACQ_HASH_HEADERS
+        # Not sampled: folders carry no hashes, a sample could be all
+        # folders, and a repeated path is rare. any() stops at the first hit.
+        self._meta_col_keys = tuple(
+            k for k in _META_COL_HEADERS
             if any(k in v for v in data.values() if v))
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'App', 'Path'])
@@ -12545,7 +12552,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                    + ([_LINKED_REPORT_HEADER] if has_links else [])
                    + ([_INODE_HEADER] if has_inode else [])
                    + ([_LINK_COUNT_HEADER] if has_link_count else [])
-                   + [_ACQ_HASH_HEADERS[k] for k in self._acq_hash_keys]
+                   + [_META_COL_HEADERS[k] for k in self._meta_col_keys]
                    + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         new_model = FileTableModel(headers)
         # _update_filter_columns resets the type selection — save the filter
@@ -12569,7 +12576,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             row = self._build_entry_row(path, has_bundles, display_parent=disp_parent,
                                         photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
                                         inode_cols=has_inode, link_count_cols=has_link_count,
-                                        dup_cols=has_dup, hash_keys=self._acq_hash_keys)
+                                        dup_cols=has_dup, hash_keys=self._meta_col_keys)
             if row is not None:
                 batch.append(row)
         new_model.append_rows_batch(batch)
@@ -12648,7 +12655,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                    + ([_LINKED_REPORT_HEADER] if has_links else [])
                    + ([_INODE_HEADER] if has_inode else [])
                    + ([_LINK_COUNT_HEADER] if has_link_count else [])
-                   + [_ACQ_HASH_HEADERS[k] for k in self._acq_hash_keys]
+                   + [_META_COL_HEADERS[k] for k in self._meta_col_keys]
                    + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         new_model = FileTableModel(headers)
 
@@ -12688,7 +12695,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 row = self._build_entry_row(path, has_bundles, photo_cols=has_photos, exif_cols=has_exif,
                                             link_cols=has_links, inode_cols=has_inode,
                                             link_count_cols=has_link_count, dup_cols=has_dup,
-                                            hash_keys=self._acq_hash_keys)
+                                            hash_keys=self._meta_col_keys)
                 if row is not None:
                     batch_rows.append(row)
                     state['count'] += 1

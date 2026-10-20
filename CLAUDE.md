@@ -89,8 +89,12 @@ Details and decisions for each are in `ASSUMPTIONS.md` (section in brackets).
   (`_get_media_paths_for_bookmark`).
 - **GrayKey acquisition hashes** (A-73): `graykey._parse_entry` reads the
   `S2`/`S1`/`MD` blocks into metadata `sha256`/`sha1`/`md5`;
-  `_ACQ_HASH_HEADERS` + `self._acq_hash_keys` add the "(GrayKey)" columns;
+  `_META_COL_HEADERS` + `self._meta_col_keys` add the "(GrayKey)" and "Capture" columns;
   `duplicate_scan` groups on the recorded SHA-256 (A-69).
+- **Paths stored twice** (A-72): `zip_cd_cache._name_repeated_captures`
+  renames every earlier copy via `capture_alias` ("sms [capture 1 of 2].db");
+  `info.orig_filename` keeps the stored name for offsets; parsers skip
+  `is_capture_alias` names.
 - **Review features** (§10): Media Browser buckets and presets
   (`file_browser_presets.py`, shared with the File Browser), hover-scrub,
   "(EXIF)" columns, "Linked Report" column.

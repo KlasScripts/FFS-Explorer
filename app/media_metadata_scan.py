@@ -18,8 +18,8 @@ addressing is I/O, not CPU: the obvious implementation reads a whole
 candidate's bytes into memory before handing them to PyAV/Pillow, which
 is wasteful for a large video (one real test file: 102MB, `moov` atom
 near the front) when only the metadata actually gets touched.
-`_LazyZipSlice` (a read/seek/tell file-like view backed directly by
-`zip_reader.ZipReader.read_at()` — no `zipfile`, no decompression, FFS
+`_LazyZipSlice` (a read/seek/tell file-like view doing direct seeks on
+one held file handle — no `zipfile`, no decompression, FFS
 archives are always stored uncompressed, confirmed and reused rather
 than re-derived) lets PyAV/Pillow pull only the bytes they actually
 need. Confirmed directly against that same real 102MB video: full-read
@@ -49,14 +49,20 @@ from zip_reader import ZipReader
 
 class _LazyZipSlice:
     """A read/seek/tell file-like VIEW of one zip entry's bytes
-    (data_offset..data_offset+size within *zip_path*), backed by
-    ZipReader.read_at() — reads only what the caller (PyAV/Pillow)
-    actually asks for, never materializes the whole entry up front. See
-    this module's own docstring for the real, confirmed cost difference.
+    (data_offset..data_offset+size within *zip_path*) — reads only what the
+    caller (PyAV/Pillow) actually asks for, never materializes the whole
+    entry up front. See this module's own docstring for the real, confirmed
+    cost difference.
+
+    Holds ONE file handle, opened on first read, for the slice's lifetime:
+    PyAV/Pillow make many small reads per file, and opening the archive
+    afresh for each one is a real cost on a network share. Use as a context
+    manager (or call close()) so the handle is released promptly.
     """
 
     def __init__(self, zip_path: str, data_offset: int, size: int):
-        self._reader = ZipReader(zip_path)
+        self._zip_path = zip_path
+        self._fh = None
         self._base = data_offset
         self._size = size
         self._pos = 0
@@ -67,9 +73,23 @@ class _LazyZipSlice:
         n = max(0, min(n, self._size - self._pos))
         if n == 0:
             return b''
-        data = self._reader.read_at(self._base + self._pos, n)
+        if self._fh is None:
+            self._fh = open(self._zip_path, 'rb')
+        self._fh.seek(self._base + self._pos)
+        data = self._fh.read(n)
         self._pos += len(data)
         return data
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
     def seek(self, offset: int, whence: int = 0) -> int:
         if whence == 0:
@@ -302,8 +322,8 @@ def scan_zip_candidates(
 
     def _scan_one(item):
         ui_path, data_offset, file_size, ext = item
-        slice_ = _LazyZipSlice(zip_path, data_offset, file_size)
-        return extract_one(slice_, ext)
+        with _LazyZipSlice(zip_path, data_offset, file_size) as slice_:
+            return extract_one(slice_, ext)
 
     results: dict = {}
     _pcb = (lambda d, t: progress_cb(t - d)) if progress_cb else None

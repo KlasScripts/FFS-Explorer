@@ -5,11 +5,7 @@ read strategies so callers never have to know which one applies:
 
 * ZIP_STORED   → seek directly into the raw zip file (zero decompression).
 * ZIP_DEFLATED → fall back to zipfile.ZipFile.open() (standard decompress).
-
-The sqlite_uri() helper exposes the SQLite "file:?offset=&immutable=1" URI
-so a SQLite viewer can open a database that lives inside a zip with no
-extraction at all, provided it is stored uncompressed (which is almost
-always true for iOS FFS archives).
+  Never hit for the main FFS archive, which is always stored uncompressed.
 """
 
 import struct
@@ -52,8 +48,15 @@ class ZipEntry:
         (header_offset + 30 + filename_len + extra_len)."""
         if self._data_offset is None:
             with open(self.zip_path, 'rb') as f:
-                f.seek(self._header_offset + 26)
-                fname_len, extra_len = struct.unpack('<HH', f.read(4))
+                self._resolve_data_offset(f)
+        return self._data_offset
+
+    def _resolve_data_offset(self, f) -> int:
+        """Resolve data_offset from the local header using the already-open
+        handle *f* (so a first read() costs one open, not two)."""
+        if self._data_offset is None:
+            f.seek(self._header_offset + 26)
+            fname_len, extra_len = struct.unpack('<HH', f.read(4))
             self._data_offset = self._header_offset + 30 + fname_len + extra_len
         return self._data_offset
 
@@ -67,7 +70,7 @@ class ZipEntry:
         size = self._file_size if limit is None else min(self._file_size, limit)
         if self.is_stored:
             with open(self.zip_path, 'rb') as f:
-                f.seek(self.data_offset)
+                f.seek(self._resolve_data_offset(f))
                 return f.read(size)
         with zipfile.ZipFile(self.zip_path) as z:
             with z.open(self.physical_path) as f:
@@ -81,18 +84,5 @@ class ZipEntry:
         if not self.is_stored:
             raise ValueError("read_at requires a ZIP_STORED entry")
         with open(self.zip_path, 'rb') as f:
-            f.seek(self.data_offset + offset)
+            f.seek(self._resolve_data_offset(f) + offset)
             return f.read(limit)
-
-    # ── SQLite helper ─────────────────────────────────────────────────────────
-
-    def sqlite_uri(self) -> str | None:
-        """Return a SQLite URI that opens this entry in-place (STORED only).
-
-        Example result:
-            file:/path/to/archive.zip?offset=12345&immutable=1
-
-        Returns None for compressed entries — caller must extract first."""
-        if not self.is_stored:
-            return None
-        return f"file:{self.zip_path}?offset={self.data_offset}&immutable=1"

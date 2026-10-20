@@ -20,9 +20,10 @@ metadata operations use the local copy.
 import hashlib
 import io
 import os
-import random
 import struct
 import zipfile
+from array import array
+from bisect import bisect_right
 
 _MAGIC = b'ZCD\x02'   # v1 (msgpack) silently invalidated by magic mismatch
 
@@ -215,7 +216,13 @@ def save(zip_path: str, case_dir: str, progress_cb=None) -> bool:
 # holds its own such list today (e.g. FastZipBrowser.self._zip_handle),
 # so a single shared, memoized list is a wash at worst and a real
 # reduction at best, not a new cost class.
-_parsed_cache: dict[str, tuple[float, int, list]] = {}
+#
+# Each entry also keeps the {filename: ZipInfo} index zipfile itself builds
+# while parsing (NameToInfo), so CachedZipView never has to rebuild one.
+# Rebuilding it per view was ~0.3 s on a 700k-entry archive, paid once per
+# nested archive extracted (found by SlowHens, KlasScripts/FFS-Explorer#2).
+# Living here, it's invalidated together with the list it indexes.
+_parsed_cache: dict[str, tuple[float, int, list, dict]] = {}
 
 
 def load(zip_path: str, case_dir: str) -> list[zipfile.ZipInfo] | None:
@@ -241,11 +248,22 @@ def load(zip_path: str, case_dir: str) -> list[zipfile.ZipInfo] | None:
             payload = fh.read()
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
             infos = zf.infolist()
+            by_name = zf.NameToInfo
     except Exception:
         return None
 
-    _parsed_cache[path] = (st.st_mtime, st.st_size, infos)
+    _parsed_cache[path] = (st.st_mtime, st.st_size, infos, by_name)
+    _register_layout(zip_path, infos)
     return infos
+
+
+def _name_index(infos: list[zipfile.ZipInfo]) -> dict:
+    """{filename: ZipInfo} for *infos* — the one load() already holds when
+    *infos* is its memoized list (every real caller), else built fresh."""
+    for cached in _parsed_cache.values():
+        if cached[2] is infos:
+            return cached[3]
+    return {i.filename: i for i in infos}
 
 
 # ── CachedZipView ─────────────────────────────────────────────────────────────
@@ -262,7 +280,7 @@ class CachedZipView:
     def __init__(self, zip_path: str, infos: list[zipfile.ZipInfo]) -> None:
         self._zip_path = zip_path
         self._infos    = infos
-        self._by_name  = {i.filename: i for i in infos}
+        self._by_name  = _name_index(infos)
 
     # ── ZipFile-compatible metadata interface ─────────────────────────────────
 
@@ -295,105 +313,200 @@ class CachedZipView:
 
 
 # ── Data offset resolution ────────────────────────────────────────────────────
+#
+# An entry's data starts at header_offset + 30 + local name length + local
+# extra length — and the local extra length is NOT the central directory's.
+# They differ by the ZIP64 block: any FFS zip over 4 GiB stores the real
+# header offset of every entry past the 4 GiB mark in a CD ZIP64 block the
+# local header doesn't have, so a single archive-wide "CD→local delta"
+# (this function's old approach, probed from 5 random entries) was wrong
+# for one whole group — keyword hits highlighted 12 bytes off, header scans
+# read the wrong 16 bytes, exports shifted. Found by SlowHens
+# (KlasScripts/FFS-Explorer#2), whose fix probed per ZIP64 group; that
+# still trusted a random 5-entry sample, so a group mixing local-header
+# shapes the CD can't see could still go wrong — and nondeterministically.
+#
+# Instead, the layout is read off the sidecar itself: entries are stored
+# back to back, so an entry's data ENDS where the next entry's local header
+# begins (sorted by header_offset), and therefore STARTS at
+#     next_header_offset - compress_size
+# — exact per entry, deterministic, zero archive I/O. Not derivable, so
+# resolved by reading the entry's own local header instead (exactly what
+# ZipEntry does on every read anyway):
+#   * the last entry (the .zcd doesn't keep the real CD start offset),
+#   * entries with a data descriptor (flag bit 3 — trailer size varies),
+#   * any result implying an impossible local extra length (a gap between
+#     entries, or a hand-built CD),
+#   * any entry whose stored name length can't be reproduced.
+# The derived layout is spot-checked ONCE per archive per session against
+# real local headers (deterministic sample, every ZIP64 group covered); a
+# single mismatch disables it for that archive and everything is read from
+# local headers — slower, never wrong. The check also records which
+# CD→local extra deltas genuinely occur; a derived offset implying any OTHER
+# delta (a gap after that entry, or a local-header shape the sample never
+# hit) is read from its header rather than trusted.
 
-_PROBE_N = 5   # entries sampled to detect a consistent CD→local extra delta
+_VERIFY_SPREAD = 8   # evenly spaced entries checked, plus first/last of each group
 
 
-def probe_delta(zip_path: str, infos: list[zipfile.ZipInfo]) -> int | None:
-    """Return the consistent CD→local extra_len delta across a sample of *infos*.
+class _Layout:
+    __slots__ = ('offsets', 'infos', 'trusted', 'deltas')
 
-    Returns None if the delta differs between entries (fall back to per-entry
-    seeks) or if the file cannot be read.  Call once at archive-open time and
-    pass the result to compute_data_offsets() to avoid re-probing later.
-    """
-    if not infos:
-        return None
-    sample = random.sample(infos, min(_PROBE_N, len(infos)))
-    delta: int | None = None
+    def __init__(self, offsets, infos):
+        self.offsets = offsets   # sorted array('Q') of every header_offset
+        self.infos   = infos     # the full list it came from (for verification)
+        self.trusted = None      # None = not yet verified, then True/False
+        self.deltas: set[int] = set()   # CD→local extra deltas confirmed real
+
+
+_layouts: dict[str, _Layout] = {}
+
+
+def _layout_key(zip_path: str) -> str:
+    return os.path.normcase(os.path.abspath(zip_path))
+
+
+def _register_layout(zip_path: str, infos: list[zipfile.ZipInfo]) -> None:
+    """Record the header-offset layout of a FULL infolist (load() only —
+    a subset would make neighbouring entries look adjacent)."""
+    offs = array('Q', sorted({i.header_offset for i in infos}))
+    _layouts[_layout_key(zip_path)] = _Layout(offs, infos)
+
+
+def _name_len(info: zipfile.ZipInfo) -> int:
+    """Byte length of the name as stored: UTF-8 when general-purpose bit 11
+    is set, else cp437 (what zipfile decoded it with). -1 if the stored bytes
+    can't be reproduced."""
+    name = info.filename
+    if name.isascii():
+        return len(name)        # same bytes in either encoding — the common case
+    enc = 'utf-8' if info.flag_bits & 0x800 else 'cp437'
     try:
-        with open(zip_path, 'rb') as fh:
-            for info in sample:
-                fh.seek(info.header_offset + 26)
-                local_fname_len, local_extra_len = struct.unpack('<HH', fh.read(4))
-                if local_fname_len != len(
-                        info.filename.encode('utf-8', errors='surrogatepass')):
-                    return None
-                d = local_extra_len - len(info.extra)
-                if delta is None:
-                    delta = d
-                elif d != delta:
-                    return None
-    except OSError:
+        return len(name.encode(enc, errors='surrogatepass'))
+    except UnicodeEncodeError:
+        return -1
+
+
+def _zip64_len(extra: bytes) -> int:
+    off = 0
+    while off + 4 <= len(extra):
+        tag, size = struct.unpack_from('<HH', extra, off)
+        if tag == 0x0001:
+            return size
+        off += 4 + size
+    return 0
+
+
+def _derived_offset(layout: _Layout, info: zipfile.ZipInfo,
+                    require_known_delta: bool = True) -> int | None:
+    """Data offset from the sidecar layout alone, or None if not derivable
+    (or, once verified, if it implies a delta no real header showed)."""
+    if info.flag_bits & 0x08:
         return None
-    return delta
+    name_len = _name_len(info)
+    if name_len < 0:
+        return None
+    k = bisect_right(layout.offsets, info.header_offset)
+    if k >= len(layout.offsets):
+        return None                              # last entry
+    data_off = layout.offsets[k] - info.compress_size
+    local_extra = data_off - info.header_offset - 30 - name_len
+    if not 0 <= local_extra <= 0xFFFF:
+        return None
+    if require_known_delta and local_extra - len(info.extra) not in layout.deltas:
+        return None
+    return data_off
+
+
+def _header_offset_read(fh, info: zipfile.ZipInfo) -> int:
+    fh.seek(info.header_offset + 26)
+    fname_len, extra_len = struct.unpack('<HH', fh.read(4))
+    return info.header_offset + 30 + fname_len + extra_len
+
+
+def _verify_layout(fh, layout: _Layout) -> bool:
+    """Compare derived offsets with real local headers for a deterministic
+    sample: evenly spread entries plus the first and last of every CD ZIP64
+    group (the group boundary is exactly where the old bug lived)."""
+    order = sorted(layout.infos, key=lambda i: i.header_offset)
+    picks: dict[int, zipfile.ZipInfo] = {}
+    n = len(order)
+    for s in range(_VERIFY_SPREAD):
+        info = order[(s * (n - 1)) // max(_VERIFY_SPREAD - 1, 1)]
+        picks[info.header_offset] = info
+    seen: dict[int, list] = {}
+    for info in order:
+        seen.setdefault(_zip64_len(info.extra), []).append(info)
+    for group in seen.values():
+        picks[group[0].header_offset] = group[0]
+        picks[group[-1].header_offset] = group[-1]
+    for info in picks.values():
+        derived = _derived_offset(layout, info, require_known_delta=False)
+        if derived is None:
+            continue
+        if derived != _header_offset_read(fh, info):
+            return False
+        layout.deltas.add(derived - info.header_offset - 30
+                          - _name_len(info) - len(info.extra))
+    return bool(layout.deltas)
+
+
+def probe_delta(zip_path: str, infos: list[zipfile.ZipInfo]) -> None:
+    """Obsolete — offsets are derived from the sidecar layout now. Kept so
+    existing callers (and snapshots that stored its result) keep working;
+    compute_data_offsets() ignores whatever they pass back in."""
+    return None
 
 
 def compute_data_offsets(
     zip_path: str,
     infos: list[zipfile.ZipInfo],
-    delta: int | None = None,
+    delta=None,
 ) -> dict[str, int]:
     """Return {filename: data_offset} for each ZipInfo in *infos*.
 
-    If *delta* (obtained from probe_delta()) is provided, offsets are computed
-    arithmetically with no file I/O.  Without it, the function probes a sample
-    internally and falls back to per-entry seeks if the delta is inconsistent.
-    """
+    Pure arithmetic over the sidecar layout for nearly every entry (see the
+    section comment above); the rest are read from their own local headers.
+    *delta* is accepted for backward compatibility and ignored."""
     if not infos:
         return {}
 
+    layout = _layouts.get(_layout_key(zip_path))
     result: dict[str, int] = {}
-
-    if delta is not None:
-        # Known delta — pure arithmetic, no file I/O needed.
-        for info in infos:
-            fname_len = len(info.filename.encode('utf-8', errors='surrogatepass'))
-            result[info.filename] = (
-                info.header_offset + 30 + fname_len + len(info.extra) + delta)
-        return result
-
-    # No pre-computed delta — probe and compute in a single file open.
-    sample = random.sample(infos, min(_PROBE_N, len(infos)))
-    _delta: int | None = None
-    probe_ok = True
-    probed: dict[str, int] = {}
-
+    unresolved: list[zipfile.ZipInfo] = []
     try:
         with open(zip_path, 'rb') as fh:
-            for info in sample:
-                fh.seek(info.header_offset + 26)
-                local_fname_len, local_extra_len = struct.unpack('<HH', fh.read(4))
-                cd_fname_len = len(info.filename.encode('utf-8', errors='surrogatepass'))
-                if local_fname_len != cd_fname_len:
-                    probe_ok = False
-                    break
-                d = local_extra_len - len(info.extra)
-                if _delta is None:
-                    _delta = d
-                elif d != _delta:
-                    probe_ok = False
-                    break
-                probed[info.filename] = (
-                    info.header_offset + 30 + local_fname_len + local_extra_len)
-
-            if probe_ok and _delta is not None:
+            if layout is not None and layout.trusted is None:
+                layout.trusted = _verify_layout(fh, layout)
+                if not layout.trusted:
+                    print(f"[zip_cd_cache] sidecar layout of {zip_path} did not "
+                          "match its local headers — reading headers per entry")
+            if layout is not None and layout.trusted:
+                # _derived_offset() inlined: this loop runs over every stored
+                # entry of an 800k-entry archive at load and on every export.
+                offs, n_offs, deltas = layout.offsets, len(layout.offsets), layout.deltas
                 for info in infos:
-                    if info.filename in probed:
-                        result[info.filename] = probed[info.filename]
+                    if info.flag_bits & 0x08:
+                        unresolved.append(info)
+                        continue
+                    name = info.filename
+                    name_len = len(name) if name.isascii() else _name_len(info)
+                    k = bisect_right(offs, info.header_offset)
+                    if name_len < 0 or k >= n_offs:
+                        unresolved.append(info)
+                        continue
+                    data_off = offs[k] - info.compress_size
+                    local_extra = data_off - info.header_offset - 30 - name_len
+                    if 0 <= local_extra <= 0xFFFF and local_extra - len(info.extra) in deltas:
+                        result[name] = data_off
                     else:
-                        fname_len = len(
-                            info.filename.encode('utf-8', errors='surrogatepass'))
-                        result[info.filename] = (
-                            info.header_offset + 30 + fname_len + len(info.extra) + _delta)
+                        unresolved.append(info)
             else:
-                for info in infos:
-                    fh.seek(info.header_offset + 26)
-                    fname_len, extra_len = struct.unpack('<HH', fh.read(4))
-                    result[info.filename] = info.header_offset + 30 + fname_len + extra_len
-
+                unresolved = list(infos)
+            for info in sorted(unresolved, key=lambda i: i.header_offset):
+                result[info.filename] = _header_offset_read(fh, info)
     except OSError:
         pass
-
     return result
 
 

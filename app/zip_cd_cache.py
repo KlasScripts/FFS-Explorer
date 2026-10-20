@@ -250,6 +250,27 @@ def load(zip_path: str, case_dir: str) -> list[zipfile.ZipInfo] | None:
 
 # ── CachedZipView ─────────────────────────────────────────────────────────────
 
+# {filename: ZipInfo} index per infolist, keyed by the list's identity.
+# load() hands every caller the SAME memoized list, but each CachedZipView
+# used to rebuild this dict from scratch — ~128 ms for a 708k-entry archive,
+# paid once per nested archive (93% of the nested-archive stage's time on a
+# real iOS 16 case). The entry holds a strong reference to the list, so an
+# id() can't be reused while its entry exists. Bounded: an ad-hoc list
+# passed by a caller only ever displaces older entries.
+_name_index_cache: list[tuple[list, dict]] = []
+_NAME_INDEX_MAX = 4
+
+
+def _name_index(infos: list[zipfile.ZipInfo]) -> dict:
+    for cached_infos, index in _name_index_cache:
+        if cached_infos is infos:
+            return index
+    index = {i.filename: i for i in infos}
+    _name_index_cache.insert(0, (infos, index))
+    del _name_index_cache[_NAME_INDEX_MAX:]
+    return index
+
+
 class CachedZipView:
     """zipfile.ZipFile-compatible view backed by a loaded .zcd infolist.
 
@@ -262,7 +283,7 @@ class CachedZipView:
     def __init__(self, zip_path: str, infos: list[zipfile.ZipInfo]) -> None:
         self._zip_path = zip_path
         self._infos    = infos
-        self._by_name  = {i.filename: i for i in infos}
+        self._by_name  = _name_index(infos)
 
     # ── ZipFile-compatible metadata interface ─────────────────────────────────
 
@@ -295,102 +316,128 @@ class CachedZipView:
 
 
 # ── Data offset resolution ────────────────────────────────────────────────────
+#
+# An entry's data starts at header_offset + 30 + local name length + local
+# extra length. The local extra length is NOT the central-directory one: in
+# every real FFS archive checked (8 archives, 1.9M entries — Cellebrite iOS
+# and Android, GrayKey iOS and Android) the only difference is the ZIP64
+# block (tag 0x0001), which the CD carries only for entries that need it
+# (header_offset past 4 GiB, or always) while the local header carries its
+# own fixed-size one or none. So the CD→local gap ("delta") is constant
+# within a group of entries sharing the same CD ZIP64 block length, but it
+# differs BETWEEN groups (e.g. 0 vs −12, or +20 vs +8 on Cellebrite iOS).
+# A single archive-wide delta was therefore wrong for one whole group —
+# keyword-search hits highlighted 12 bytes away from the real match, header
+# scans read the wrong 16 bytes, exports were shifted. Deltas are now
+# probed and applied per group; a group whose sample disagrees falls back
+# to reading each of its entries' local headers.
 
-_PROBE_N = 5   # entries sampled to detect a consistent CD→local extra delta
+_PROBE_N = 5   # entries sampled per ZIP64 group
 
 
-def probe_delta(zip_path: str, infos: list[zipfile.ZipInfo]) -> int | None:
-    """Return the consistent CD→local extra_len delta across a sample of *infos*.
+def _zip64_len(extra: bytes) -> int:
+    """Length of the ZIP64 (0x0001) block in *extra*, 0 if absent."""
+    off = 0
+    while off + 4 <= len(extra):
+        tag, size = struct.unpack_from('<HH', extra, off)
+        if tag == 0x0001:
+            return size
+        off += 4 + size
+    return 0
 
-    Returns None if the delta differs between entries (fall back to per-entry
-    seeks) or if the file cannot be read.  Call once at archive-open time and
-    pass the result to compute_data_offsets() to avoid re-probing later.
-    """
+
+def _name_len(info: zipfile.ZipInfo) -> int:
+    """Byte length of the entry's name as stored in the archive — UTF-8 when
+    general-purpose flag bit 11 is set, otherwise cp437 (what zipfile decoded
+    it with)."""
+    enc = 'utf-8' if info.flag_bits & 0x800 else 'cp437'
+    try:
+        return len(info.filename.encode(enc, errors='surrogatepass'))
+    except UnicodeEncodeError:
+        return -1   # can't reproduce the stored bytes -> never matches a probe
+
+
+def _group_by_zip64(infos: list[zipfile.ZipInfo]) -> dict[int, list[zipfile.ZipInfo]]:
+    groups: dict[int, list[zipfile.ZipInfo]] = {}
+    for info in infos:
+        groups.setdefault(_zip64_len(info.extra), []).append(info)
+    return groups
+
+
+def _probe_group(fh, group: list[zipfile.ZipInfo]) -> int | None:
+    """The CD→local extra delta shared by a sample of *group*, or None if the
+    sample disagrees or a stored name length can't be reproduced."""
+    delta: int | None = None
+    for info in random.sample(group, min(_PROBE_N, len(group))):
+        fh.seek(info.header_offset + 26)
+        local_fname_len, local_extra_len = struct.unpack('<HH', fh.read(4))
+        if local_fname_len != _name_len(info):
+            return None
+        d = local_extra_len - len(info.extra)
+        if delta is None:
+            delta = d
+        elif d != delta:
+            return None
+    return delta
+
+
+def probe_delta(zip_path: str, infos: list[zipfile.ZipInfo]) -> dict[int, int] | None:
+    """Return {CD ZIP64 block length: delta} for every group in *infos*, or
+    None if any group's sample disagrees (callers then fall back to per-entry
+    seeks for that group). Call once at archive-open time and pass the result
+    to compute_data_offsets()."""
     if not infos:
         return None
-    sample = random.sample(infos, min(_PROBE_N, len(infos)))
-    delta: int | None = None
+    deltas: dict[int, int] = {}
     try:
         with open(zip_path, 'rb') as fh:
-            for info in sample:
-                fh.seek(info.header_offset + 26)
-                local_fname_len, local_extra_len = struct.unpack('<HH', fh.read(4))
-                if local_fname_len != len(
-                        info.filename.encode('utf-8', errors='surrogatepass')):
+            for key, group in _group_by_zip64(infos).items():
+                d = _probe_group(fh, group)
+                if d is None:
                     return None
-                d = local_extra_len - len(info.extra)
-                if delta is None:
-                    delta = d
-                elif d != delta:
-                    return None
+                deltas[key] = d
     except OSError:
         return None
-    return delta
+    return deltas
 
 
 def compute_data_offsets(
     zip_path: str,
     infos: list[zipfile.ZipInfo],
-    delta: int | None = None,
+    delta: dict[int, int] | None = None,
 ) -> dict[str, int]:
     """Return {filename: data_offset} for each ZipInfo in *infos*.
 
-    If *delta* (obtained from probe_delta()) is provided, offsets are computed
-    arithmetically with no file I/O.  Without it, the function probes a sample
-    internally and falls back to per-entry seeks if the delta is inconsistent.
+    *delta* is probe_delta()'s per-group map. Any group it doesn't cover —
+    including every group when *delta* is a legacy single int saved by an
+    older version, which was unreliable — is probed here; a group whose
+    probe disagrees is resolved by reading each entry's local header.
     """
     if not infos:
         return {}
+    known = delta if isinstance(delta, dict) else {}
 
     result: dict[str, int] = {}
-
-    if delta is not None:
-        # Known delta — pure arithmetic, no file I/O needed.
-        for info in infos:
-            fname_len = len(info.filename.encode('utf-8', errors='surrogatepass'))
-            result[info.filename] = (
-                info.header_offset + 30 + fname_len + len(info.extra) + delta)
-        return result
-
-    # No pre-computed delta — probe and compute in a single file open.
-    sample = random.sample(infos, min(_PROBE_N, len(infos)))
-    _delta: int | None = None
-    probe_ok = True
-    probed: dict[str, int] = {}
-
     try:
         with open(zip_path, 'rb') as fh:
-            for info in sample:
-                fh.seek(info.header_offset + 26)
-                local_fname_len, local_extra_len = struct.unpack('<HH', fh.read(4))
-                cd_fname_len = len(info.filename.encode('utf-8', errors='surrogatepass'))
-                if local_fname_len != cd_fname_len:
-                    probe_ok = False
-                    break
-                d = local_extra_len - len(info.extra)
-                if _delta is None:
-                    _delta = d
-                elif d != _delta:
-                    probe_ok = False
-                    break
-                probed[info.filename] = (
-                    info.header_offset + 30 + local_fname_len + local_extra_len)
-
-            if probe_ok and _delta is not None:
-                for info in infos:
-                    if info.filename in probed:
-                        result[info.filename] = probed[info.filename]
-                    else:
-                        fname_len = len(
-                            info.filename.encode('utf-8', errors='surrogatepass'))
+            for key, group in _group_by_zip64(infos).items():
+                d = known.get(key)
+                if d is None:
+                    d = _probe_group(fh, group)
+                unresolved = group
+                if d is not None:
+                    unresolved = []
+                    for info in group:
+                        name_len = _name_len(info)
+                        if name_len < 0:
+                            unresolved.append(info)
+                            continue
                         result[info.filename] = (
-                            info.header_offset + 30 + fname_len + len(info.extra) + _delta)
-            else:
-                for info in infos:
+                            info.header_offset + 30 + name_len + len(info.extra) + d)
+                for info in sorted(unresolved, key=lambda i: i.header_offset):
                     fh.seek(info.header_offset + 26)
                     fname_len, extra_len = struct.unpack('<HH', fh.read(4))
                     result[info.filename] = info.header_offset + 30 + fname_len + extra_len
-
     except OSError:
         pass
 

@@ -2720,16 +2720,38 @@ class MediaViewerMixin:
         the literal request as closely as its own wording allows ("undo a
         hide of the last file they hide" is read here as the last BATCH,
         since marking only ever happens in whole-page batches, never
-        per-file)."""
+        per-file).
+
+        With "Hide Duplicates" on, each marked file's hidden copies (same
+        md5, self._duplicate_groups) are marked too — added 2026-10-17,
+        direct answer "yes" to "should 'Not Relevant' mark every copy of
+        a duplicate while Hide Duplicates is ticked?" Otherwise a copy
+        dismissed here resurfaces for review in another folder/view. A
+        bookmarked copy is still never marked. The copies join the same
+        batch, so Undo reverts them along with the shown files."""
         page_size = self._media_page_size
         start = self._media_page_index * page_size
         end = min(len(self._media_all_paths), start + page_size)
         page_items = self._media_all_paths[start:end]
-        to_mark = [p for p in page_items if p not in self._media_bookmarked_paths]
-        if not to_mark:
+        shown_to_mark = [p for p in page_items if p not in self._media_bookmarked_paths]
+        if not shown_to_mark:
             self.status_bar.showMessage(
                 "Nothing to mark — every file on this page is bookmarked")
             return
+        to_mark = list(shown_to_mark)
+        if self._media_hide_duplicates:
+            dup_files = getattr(self, '_duplicate_files', {})
+            dup_groups = getattr(self, '_duplicate_groups', {})
+            already = set(to_mark)
+            for p in shown_to_mark:
+                info = dup_files.get(p)
+                if info is None:
+                    continue
+                for copy in dup_groups.get(info['md5'], ()):
+                    if copy not in already and copy not in self._media_bookmarked_paths:
+                        already.add(copy)
+                        to_mark.append(copy)
+        n_copies = len(to_mark) - len(shown_to_mark)
 
         try:
             with closing(_open_results_db(self._case_dir)) as conn:
@@ -2766,10 +2788,16 @@ class MediaViewerMixin:
             self._sync_selected_only_after_scope_change()
             self._refresh_file_checked_paths()
 
-        n_skipped = len(page_items) - len(to_mark)
-        skipped_note = f" ({n_skipped} bookmarked file(s) left as-is)" if n_skipped else ""
+        n_skipped = len(page_items) - len(shown_to_mark)
+        notes = []
+        if n_copies:
+            notes.append(f"plus {n_copies:,} hidden duplicate cop"
+                         f"{'y' if n_copies == 1 else 'ies'}")
+        if n_skipped:
+            notes.append(f"{n_skipped} bookmarked file(s) left as-is")
+        note = f" ({'; '.join(notes)})" if notes else ""
         self.status_bar.showMessage(
-            f"Marked {len(to_mark):,} file(s) as seen{skipped_note}")
+            f"Marked {len(shown_to_mark):,} file(s) as seen{note}")
 
         # include_bookmarks=False in both branches — this button always
         # advances into new/next content, so a bookmarked file should

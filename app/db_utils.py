@@ -116,6 +116,25 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
+    # Size+CRC32+MD5 duplicate detection (app/duplicate_scan.py) — added
+    # 2026-10-16, direct request. One row per file CONFIRMED (by MD5, not
+    # just the free size+CRC32 match) to be byte-identical to at least one
+    # other file in the archive; group_size is how many files (including
+    # this one) share that md5. A file with no duplicate has no row here
+    # at all — same "absent means not present" convention as media_metadata.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS duplicate_files (
+            ui_path    TEXT    NOT NULL PRIMARY KEY,
+            md5        TEXT    NOT NULL,
+            size       INTEGER NOT NULL,
+            group_size INTEGER NOT NULL
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_duplicate_files_md5
+        ON duplicate_files (md5)
+    ''')
+
     conn.execute('''
         CREATE TABLE IF NOT EXISTS guid_bundle (
             guid      TEXT NOT NULL PRIMARY KEY,
@@ -836,6 +855,47 @@ def clear_media_metadata(conn: 'sqlite3.Connection') -> None:
     """Delete all media_metadata rows (used before a full rescan)."""
     conn.execute('DELETE FROM media_metadata')
     conn.commit()
+
+
+def save_duplicate_files(conn: 'sqlite3.Connection', results: dict) -> None:
+    """Persist {ui_path: {'md5':, 'size':, 'group_size':}} into
+    duplicate_files — always fully rebuilt first (unlike media_metadata),
+    since group membership genuinely changes between runs (a file that WAS
+    a duplicate last time may not be any more) and a stale row claiming an
+    outdated duplicate count would be a real correctness problem, not just
+    cosmetic staleness."""
+    clear_duplicate_files(conn)
+    if not results:
+        return
+    conn.executemany(
+        'INSERT INTO duplicate_files (ui_path, md5, size, group_size) '
+        'VALUES (?, ?, ?, ?)',
+        [(ui_path, v['md5'], v['size'], v['group_size'])
+         for ui_path, v in results.items()],
+    )
+    conn.commit()
+
+
+def load_duplicate_files(conn: 'sqlite3.Connection') -> dict:
+    """Return {ui_path: {'md5':, 'size':, 'group_size':}} previously saved."""
+    results: dict = {}
+    for ui_path, md5, size, group_size in conn.execute(
+            'SELECT ui_path, md5, size, group_size FROM duplicate_files'):
+        results[ui_path] = {'md5': md5, 'size': size, 'group_size': group_size}
+    return results
+
+
+def clear_duplicate_files(conn: 'sqlite3.Connection') -> None:
+    """Delete all duplicate_files rows (used before a full rescan)."""
+    conn.execute('DELETE FROM duplicate_files')
+    conn.commit()
+
+
+def count_duplicate_groups(conn: 'sqlite3.Connection') -> int:
+    """Return the number of distinct duplicate groups (by md5) on record."""
+    row = conn.execute(
+        'SELECT COUNT(DISTINCT md5) FROM duplicate_files').fetchone()
+    return row[0] if row else 0
 
 
 # ── Run log ───────────────────────────────────────────────────────────────────

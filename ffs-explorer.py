@@ -35,6 +35,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       save_blob, load_blob, open_blob,
                       save_header_types, load_header_types, clear_header_types,
                       save_media_metadata, load_media_metadata, clear_media_metadata,
+                      save_duplicate_files, load_duplicate_files, count_duplicate_groups,
                       load_attachment_links,
                       save_guid_bundle_map, load_guid_bundle_map, save_app_registry,
                       save_folder_counts, save_folder_sizes, load_folder_data,
@@ -60,6 +61,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
 import header_scan
 import nested_archive
 import media_metadata_scan
+import duplicate_scan
 import embedded_media_skip_list
 import user_media_ignore_list
 import file_browser_presets
@@ -1421,6 +1423,70 @@ def _format_attachment_links(links: list) -> str:
             for label, n in counts.items()]
     return ', '.join(parts)
 
+# "Inode" column — added 2026-10-16, direct request after confirming (inode,
+# devID) reliably identifies same-file-different-path entries on GrayKey
+# archives (real bind-mount/hardlink aliases found and cross-checked against
+# CRC32+size with zero false positives). GrayKey-only: Cellebrite's zip_extras
+# format (Android) never carries inode, and Cellebrite's metadata.msgpack
+# format (iOS) carries inode but with no device qualifier — confirmed ~23%
+# of its same-inode groups are coincidental collisions between unrelated
+# files, so it is deliberately NOT shown there. Display-only, filterable by
+# the user — NOT used anywhere to drive automatic duplicate detection.
+_INODE_HEADER = 'Inode'
+
+
+def _format_inode(meta: dict) -> str:
+    """'<inode>:<devid>' for a GrayKey entry (devid disambiguates Android's
+    several mount filesystems); bare '<inode>' for Cellebrite iOS user-
+    partition entries, which have no devid key at all but were confirmed
+    (metadata2/metadata.msgpack, new-layout archives only) to carry inode
+    numbers that don't collide within that one partition. '' when absent."""
+    inode = meta.get('inode') or 0
+    if not inode:
+        return ''
+    if 'devid' in meta:
+        return f"{inode}:{meta.get('devid') or 0}"
+    return str(inode)
+
+# "Link Count" column — added 2026-10-16, direct request, same batch as
+# Accessed above. Named "Link Count" rather than plain "Links" to avoid
+# confusion with the existing "Linked Report" column (File Browser <->
+# Artifact Report cross-reference, an unrelated feature). Real (non-None)
+# only on Cellebrite's metadata.msgpack format (both old- and new-layout —
+# unlike Inode, a plain hardlink count isn't subject to the cross-
+# partition collision problem, so no old_layout gating needed here);
+# GrayKey never stores it (always None, confirmed in graykey.py's own
+# docstring). Gated on real sampled data (self._has_link_count_data, set
+# in on_metadata_ready), not a format check — "only want the column
+# present if the data is present."
+_LINK_COUNT_HEADER = 'Link Count'
+
+
+def _format_link_count(meta: dict) -> str:
+    links = meta.get('links')
+    return str(links) if links is not None else ''
+
+# "Duplicate Count" and "MD5" columns — added 2026-10-16, direct request,
+# surfacing app/duplicate_scan.py's size+CRC32+MD5 duplicate detection
+# (a new optional Process Case stage) in the File Browser. Unlike Inode/
+# Link Count/Accessed above, this isn't per-archive-format metadata — it's
+# a precomputed result dict (self._duplicate_files, keyed by ui_path,
+# loaded from casecache.db) that genuinely is empty until the examiner
+# runs the stage, so "only present if data present" here just means
+# `bool(self._duplicate_files)`, no sampling needed. A file absent from
+# that dict has no duplicate on record — both columns blank, not '0'/'1
+# group', since "not checked yet" and "checked, no duplicate found" are
+# not actually distinguishable from this dict alone (see its own
+# docstring) and blank reads honestly as "nothing to report" either way.
+_DUPLICATE_COUNT_HEADER = 'Duplicate Count'
+_MD5_HEADER = 'MD5'
+
+
+def _format_duplicate_cols(dup_info: dict | None) -> tuple[str, str]:
+    if not dup_info:
+        return '', ''
+    return str(dup_info['group_size']), dup_info['md5']
+
 # Cocoa/Mac epoch (2001-01-01) -> Unix epoch, seconds. photos_metadata.py's
 # Taken/Added (timestamp_fields unit "cocoa_s") store the raw value in this
 # unit; _build_entry_row converts to Unix seconds before calling format_ts.
@@ -1709,6 +1775,48 @@ def _collect_media_metadata_candidates(
             targets.append(ui_path)
     triples = _resolve_file_candidates(zip_path, targets, ffs_adapter, z=z, delta=delta)
     return [(p, off, sz, os.path.splitext(p)[1].lower()) for p, off, sz in triples]
+
+
+def _collect_duplicate_candidates(ffs_adapter, ui_metadata: dict, z) -> list[tuple[str, str, zipfile.ZipInfo, int, int]]:
+    """Return [(ui_path, physical_path, zinfo, inode, devid)] for every
+    real file in *ui_metadata*, for app/duplicate_scan.py's
+    size+CRC32+MD5 duplicate detection (added 2026-10-16, direct
+    request). inode/devid come straight from the already-loaded
+    ui_metadata dict (0 when absent) — see duplicate_scan.py's own
+    docstring for how they shortcut the MD5 step when
+    FfsAdapter.inode_trusted is True for this archive.
+
+    Resolves the SAME way _resolve_file_candidates already does for every
+    other candidate-collection pass (resolve() then z.getinfo()) —
+    deliberately NOT FfsAdapter.build_zip_entries(), which the comment on
+    its own only call site (ffs_metadata.py's "Only Cellebrite iOS uses
+    the Pass-1 zip-entry precompute") already flags as Cellebrite-only,
+    and which was confirmed empirically here to silently return an EMPTY
+    dict for a real GrayKey archive: its prefix-matching assumes no
+    leading slash, but GrayKey physical paths always have one
+    ('/private/var/...', '/data/data/...') — not a hypothetical, a real
+    zero-candidates bug caught before this shipped.
+
+    Deliberately NOT scoped to scan_folders()/scan_excludes() the way
+    _collect_media_metadata_candidates above is — unlike a header-byte
+    read or an EXIF parse, grouping by size+CRC32 costs no extra I/O no
+    matter how many candidates there are (both already sit on every
+    zinfo, parsed once from the central directory), so there is no real
+    cost to considering the WHOLE archive. Finding every place a file's
+    content recurs needs that whole-archive view: the original real-world
+    case this was built for (an app-cache copy of a user's own photo) can
+    sit well outside whatever folders are marked for header-scan
+    processing."""
+    resolve = ffs_adapter.resolve
+    out = []
+    for ui_path, meta in ui_metadata.items():
+        try:
+            info = z.getinfo(resolve(ui_path))
+        except KeyError:
+            continue
+        out.append((ui_path, info.filename, info,
+                   meta.get('inode') or 0, meta.get('devid') or 0))
+    return out
 
 
 class ZipMetadataWorker(QThread):
@@ -4382,6 +4490,43 @@ class MediaMetadataScanWorker(QThread):
         self.done.emit(results)
 
 
+class DuplicateDetectionWorker(QThread):
+    """Drives app/duplicate_scan.py's size+CRC32+MD5 duplicate detection —
+    added 2026-10-16, direct request: "i want to use the size and crc and
+    then md5 check to confirm. hopefully only do the md5 for the
+    duplicates will make it not too long." Runs as the new LAST stage in
+    ProcessDialog's own operation chain (after media metadata) — it has no
+    dependency on any other stage's output, so it was simplest to append
+    rather than interleave.
+
+    *candidates* — [(ui_path, physical_path, zinfo, inode, devid)] from
+    _collect_duplicate_candidates, built fresh right before this starts
+    (same reason MediaMetadataScanWorker's own candidates are rebuilt
+    fresh each run rather than cached from dialog-open time).
+
+    *inode_trusted* — FfsAdapter.inode_trusted for this archive; when
+    True, duplicate_scan.py skips hashing files already proven identical
+    by (inode, devid) — added same day, direct follow-up: "if we already
+    know it has the same inode can we not shortcut the check[?] do not
+    bother with the md5" (confirmed a 97% reduction in actual file reads
+    on a real archive)."""
+    progress = Signal(int, int)    # done, total (total = real candidates only, after the free size+CRC32 filter AND the inode shortcut)
+    done     = Signal(dict, bool)  # {ui_path: {'md5':, 'size':, 'group_size':}}, complete
+
+    def __init__(self, zip_path, candidates, inode_trusted):
+        super().__init__()
+        self._zip_path = zip_path
+        self._candidates = candidates
+        self._inode_trusted = inode_trusted
+
+    def run(self):
+        results = duplicate_scan.find_duplicate_groups(
+            self._zip_path, self._candidates, inode_trusted=self._inode_trusted,
+            progress_cb=lambda done, total: self.progress.emit(done, total),
+            cancel_check=self.isInterruptionRequested)
+        self.done.emit(results, not self.isInterruptionRequested())
+
+
 class SingleFileEmbeddedMediaWorker(QThread):
     """Manual, single-file "Search for Embedded Media" context-menu
     action — added 2026-09-23, direct request: "can we make it that for
@@ -5143,9 +5288,11 @@ class ProcessDialog(QDialog):
     media_metadata_scan_done = Signal()   # emitted after MediaMetadataScanWorker finishes
     leveldb_indexing_started = Signal()   # emitted right before the LevelDB indexing stage starts
     leveldb_indexing_done    = Signal()   # emitted once it finishes (or is skipped as "nothing to do")
+    duplicate_detection_done = Signal()   # emitted after DuplicateDetectionWorker finishes
 
     _RUN_TYPE           = 'header_scan'
     _RUN_TYPE_INTEGRITY = 'integrity_check'
+    _RUN_TYPE_DEDUP      = 'duplicate_detection'
 
     def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
                  delta=None, preselect_nested=False,
@@ -5222,6 +5369,7 @@ class ProcessDialog(QDialog):
         self._nested_worker:    NestedArchiveWorker  | None = None
         self._integrity_worker: IntegrityCheckWorker | None = None
         self._embedded_media_worker: EmbeddedMediaScanWorker | None = None
+        self._dedup_worker: DuplicateDetectionWorker | None = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -5449,6 +5597,32 @@ class ProcessDialog(QDialog):
             "Shown as new \"(EXIF)\" columns in the File Browser.")
         layout.addWidget(self._chk_media_metadata)
 
+        # Duplicate detection (app/duplicate_scan.py) — added 2026-10-16,
+        # direct request, runs as the new LAST stage (after media
+        # metadata — see DuplicateDetectionWorker's own docstring for
+        # why appending was simplest). Checked by default, same
+        # "automatically ticked but the user can untick it" convention
+        # as media metadata above — real cost is low because size+CRC32
+        # (both free, already parsed from the central directory) filter
+        # the archive down to real candidates BEFORE any file is
+        # actually read; MD5 only ever runs on that much smaller set.
+        self._chk_dedup = QCheckBox(
+            "Detect duplicate files (size + CRC32, MD5-confirmed) into new File Browser columns")
+        self._chk_dedup.setChecked(True)
+        self._chk_dedup.setToolTip(
+            "Groups files by size and CRC32 (free — already read from the "
+            "zip's own central directory) across the WHOLE archive, then "
+            "MD5-hashes only the files inside a multi-member group to "
+            "confirm they are genuinely byte-identical (CRC32 alone can "
+            "coincidentally collide between unrelated files). On GrayKey "
+            "archives (and new-layout Cellebrite iOS), files already "
+            "proven identical by a shared inode skip the MD5 read "
+            "entirely — a real hardlink IS the same file, no hash needed. "
+            "Shown as new \"Duplicate Count\" and \"MD5\" columns in the "
+            "File Browser, present only for files confirmed to have a "
+            "real duplicate elsewhere in the archive.")
+        layout.addWidget(self._chk_dedup)
+
         # Stats block
         self._stats_label = QLabel()
         self._stats_label.setWordWrap(True)
@@ -5632,7 +5806,40 @@ class ProcessDialog(QDialog):
         else:
             lines.append("No nested archives extracted yet.")
 
+        # Duplicate detection status — added 2026-10-16, direct request:
+        # "again at the bottom of this dialog i want a bit of text to
+        # indicate that it is done or not." Same shape as the header-scan
+        # block above (last['complete'] drives the same "re-running will
+        # start fresh" warning).
+        dedup_last = self._load_last_dedup_run()
+        if dedup_last is None:
+            lines.append("No duplicate detection recorded yet.")
+        else:
+            run_at = _format_tool_ts_local(dedup_last['run_at'])
+            n_files = dedup_last['output_rows'] or 0
+            n_groups = re.search(r'(\d+) group', dedup_last['notes'] or '')
+            n_groups = n_groups.group(1) if n_groups else '0'
+            lines.append(
+                f"<b>Duplicate detection:</b> {run_at} — "
+                f"{n_files:,} file(s) in {n_groups} group(s) confirmed"
+            )
+            if not dedup_last['complete']:
+                lines.append(
+                    "<i>⚠ Previous duplicate detection was cancelled before "
+                    "finishing. Re-running will clear previous results and "
+                    "start fresh.</i>"
+                )
+
         self._stats_label.setText("<br>".join(lines))
+
+    def _load_last_dedup_run(self) -> dict | None:
+        if not self._case_dir:
+            return None
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                return load_last_run(db, self._RUN_TYPE_DEDUP)
+        except Exception:
+            return None
 
     # ── Case folder browse ────────────────────────────────────────────────────
 
@@ -5911,7 +6118,8 @@ class ProcessDialog(QDialog):
                 and not self._chk_nested.isChecked()
                 and not self._chk_embedded_media.isChecked()
                 and not self._chk_media_metadata.isChecked()
-                and not self._chk_leveldb.isChecked()):
+                and not self._chk_leveldb.isChecked()
+                and not self._chk_dedup.isChecked()):
             self._status_label.setText("Nothing to do — no operations selected.")
             return
         self._run_btn.setEnabled(False)
@@ -6401,15 +6609,17 @@ class ProcessDialog(QDialog):
             self._continue_after_embedded_media()
 
     def _continue_after_embedded_media(self):
-        """The real last stage in the operation chain — media-metadata
-        extraction (app/media_metadata_scan.py) runs after EVERYTHING
-        else, direct request: "it should be done as part of the process
-        like the header review," reading nested-archive/embedded-media
-        content that must already exist by the time this runs."""
+        """Media-metadata extraction (app/media_metadata_scan.py) runs
+        after EVERYTHING else before it, direct request: "it should be
+        done as part of the process like the header review," reading
+        nested-archive/embedded-media content that must already exist by
+        the time this runs. No longer the real last stage — duplicate
+        detection (_continue_after_media_metadata) was appended after it,
+        2026-10-16."""
         if self._chk_media_metadata.isChecked():
             self._start_media_metadata_scan()
         else:
-            self._finish_operations()
+            self._continue_after_media_metadata()
 
     def _start_embedded_media_scan(self):
         scan_folders = (tuple(self._adapter.scan_folders())
@@ -6532,7 +6742,7 @@ class ProcessDialog(QDialog):
         if total == 0:
             self._status_label.setText(
                 "Media metadata: no Picture/Graphic/Video files found to scan.")
-            self._finish_operations()
+            self._continue_after_media_metadata()
             return
         self._status_label.setText(f"Media metadata: scanning {total:,} file(s)…")
         self._media_metadata_worker = MediaMetadataScanWorker(
@@ -6558,6 +6768,83 @@ class ProcessDialog(QDialog):
             f"Media metadata scan done — {len(results):,} file(s) yielded "
             "EXIF/video metadata.")
         self.media_metadata_scan_done.emit()
+        self._continue_after_media_metadata()
+
+    def _continue_after_media_metadata(self):
+        """The real last stage in the operation chain — duplicate
+        detection (app/duplicate_scan.py), added 2026-10-16. Has no
+        dependency on any other stage's own output, so appending it here
+        was simplest rather than interleaving it earlier."""
+        if self._chk_dedup.isChecked():
+            self._start_dedup_scan()
+        else:
+            self._finish_operations()
+
+    def _start_dedup_scan(self):
+        # Deliberately no raw-zipfile fallback on the main archive when the
+        # local .zcd cache isn't available — same standing convention
+        # _resolve_file_candidates' own docstring documents: honestly skip
+        # rather than open the main archive directly.
+        infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
+        if infos is None:
+            self._status_label.setText(
+                "Duplicate detection: local archive cache not available — skipped.")
+            self._finish_operations()
+            return
+        z = CachedZipView(self._zip_path, infos)
+        candidates = _collect_duplicate_candidates(self._adapter, self._ui_metadata, z)
+        if not candidates:
+            self._status_label.setText("Duplicate detection: no files found to check.")
+            self._finish_operations()
+            return
+        self._status_label.setText(
+            f"Duplicate detection: checking {len(candidates):,} file(s) "
+            "for size+CRC32 matches…")
+        self._dedup_worker = DuplicateDetectionWorker(
+            self._zip_path, candidates, self._adapter.inode_trusted)
+        self._dedup_worker.progress.connect(self._on_dedup_progress)
+        self._dedup_worker.done.connect(self._on_dedup_done)
+        self._dedup_worker.start()
+
+    def _on_dedup_progress(self, done: int, total: int):
+        if total == 0:
+            self._status_label.setText(
+                "Duplicate detection: no size+CRC32 matches found — nothing to MD5-confirm.")
+        else:
+            self._status_label.setText(
+                f"Duplicate detection: MD5-confirming {done:,} / {total:,} "
+                "candidate file(s)…")
+
+    def _on_dedup_done(self, results: dict, complete: bool):
+        n_groups = len({v['md5'] for v in results.values()})
+        if self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as cache_db:
+                    save_duplicate_files(cache_db, results)
+            except Exception:
+                pass
+            try:
+                with closing(_open_results_db(self._case_dir)) as results_db:
+                    run_id = start_run_log(
+                        results_db, self._RUN_TYPE_DEDUP, total=len(results),
+                        notes=f"{n_groups} group(s)")
+                    complete_run_log(results_db, run_id,
+                                     processed=len(results), output_rows=len(results))
+                    if not complete:
+                        results_db.execute(
+                            'UPDATE run_log SET complete=0 WHERE id=?', (run_id,))
+                        results_db.commit()
+            except Exception:
+                pass
+        if not complete:
+            self._status_label.setText(
+                f"Duplicate detection cancelled — {len(results):,} file(s) "
+                f"in {n_groups:,} group(s) confirmed so far.")
+        else:
+            self._status_label.setText(
+                f"Duplicate detection done — {len(results):,} file(s) in "
+                f"{n_groups:,} group(s) confirmed byte-identical.")
+        self.duplicate_detection_done.emit()
         self._finish_operations()
 
     def _finish_operations(self):
@@ -7310,6 +7597,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._tree_pending_jobs: dict = {}
         # (header_label, metadata_key) pairs for the time columns — set per archive
         self._time_cols: list[tuple[str, str]] = [('Changed', 'ctime'), ('Modified', 'mtime')]
+        # Whether this archive's metadata carries real (non-None) hardlink
+        # counts — set per archive, see _detect_time_columns' own sampling
+        # for why this isn't a simple format check.
+        self._has_link_count_data = False
 
 
         main_widget = QWidget()
@@ -7656,6 +7947,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         self.table_status_label = QLabel()
         self.table_status_label.setStyleSheet(_status_style)
+
 
         # ── File Browser tab ────────────────────────────────────────────────
         file_tab = QWidget()
@@ -9315,10 +9607,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         QTimer.singleShot(
             0, partial(self._maybe_offer_photos_processing, folder_path))
 
+    def _inode_col_available(self) -> bool:
+        """Whether the "Inode" column can be shown reliably for the current
+        archive — delegates to FfsAdapter.inode_trusted (promoted there
+        2026-10-16 so ProcessDialog's duplicate-detection shortcut can use
+        the exact same, already-proven gate instead of a second copy of
+        this logic — see that property's own docstring for the real-
+        archive evidence)."""
+        return self._adapter.inode_trusted
+
     def _build_entry_row(self, path: str, has_bundles: bool = False,
                          display_parent: str | None = None,
                          photo_cols: bool = False, exif_cols: bool = False,
-                         link_cols: bool = False):
+                         link_cols: bool = False, inode_cols: bool = False,
+                         link_count_cols: bool = False, dup_cols: bool = False):
         """Return one file-model row tuple for *path*, or None if hidden.
 
         Single source of truth for building file-browser rows — used by the
@@ -9378,6 +9680,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 cols.extend([''] * len(_EXIF_HEADERS))
         if link_cols:
             cols.append(_format_attachment_links(self._attachment_links.get(path)))
+        if inode_cols:
+            cols.append(_format_inode(meta))
+        if link_count_cols:
+            cols.append(_format_link_count(meta))
+        if dup_cols:
+            cols.extend(_format_duplicate_cols(self._duplicate_files.get(path)))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
                 path in self._nested_archive_map or path in self._leveldb_folder_map
                 or path in self._embedded_media_containers)
@@ -9842,9 +10150,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                    for f in extra_files))
         has_exif = bool(self._media_exif)
         has_links = bool(self._attachment_links)
+        has_inode = self._inode_col_available()
+        has_link_count = self._has_link_count_data
+        has_dup = bool(self._duplicate_files)
         headers = (self.file_headers + (_PHOTO_HEADERS if has_photos else [])
                   + (_EXIF_HEADERS if has_exif else [])
-                  + ([_LINKED_REPORT_HEADER] if has_links else []))
+                  + ([_LINKED_REPORT_HEADER] if has_links else [])
+                  + ([_INODE_HEADER] if has_inode else [])
+                  + ([_LINK_COUNT_HEADER] if has_link_count else [])
+                  + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         self._set_file_model(FileTableModel(headers))
         # Captured AFTER _set_file_model, which now ALSO bumps _load_gen
         # unconditionally (added 2026-10-03 — see that method's own
@@ -9895,7 +10209,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 disp_parent = self._display_path(folder)
                 for child in self.folder_map.get(folder, []):
                     row = self._build_entry_row(child, display_parent=disp_parent,
-                                                photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links)
+                                                photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
+                                                inode_cols=has_inode, link_count_cols=has_link_count,
+                                                dup_cols=has_dup)
                     if row is None:
                         continue
                     batch_rows.append(row)
@@ -9916,7 +10232,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     parent = f.rsplit('/', 1)[0] if '/' in f else ''
                     disp_parent = self._display_path(parent)
                     row = self._build_entry_row(f, display_parent=disp_parent,
-                                                photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links)
+                                                photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
+                                                inode_cols=has_inode, link_count_cols=has_link_count,
+                                                dup_cols=has_dup)
                     if row is not None:
                         batch_rows.append(row)
                         state['count'] += 1
@@ -10217,9 +10535,22 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         iOS archives always carry btime (APFS birth time), ctime, and mtime.
         Android archives vary: many only have mtime; show ctime/btime columns
-        only when at least one non-zero value is found in the metadata sample."""
+        only when at least one non-zero value is found in the metadata sample.
+
+        Accessed (atime) is sampled the same way for BOTH platforms — added
+        2026-10-16, direct request ("i only want the column present if the
+        data is present"). Its presence doesn't track platform at all:
+        Cellebrite's Android zip-extras format never has it (its UT block's
+        atime flag bit claims presence but the stored value is always 0 in
+        every real entry checked), while GrayKey Android and both iOS
+        formats carry real values."""
+        has_atime = any(v.get('atime')
+                        for v in islice((v for v in ui_metadata.values() if v), 500))
         if not self._is_android_archive():
-            return [('Created', 'btime'), ('Changed', 'ctime'), ('Modified', 'mtime')]
+            cols = [('Created', 'btime'), ('Changed', 'ctime'), ('Modified', 'mtime')]
+            if has_atime:
+                cols.append(('Accessed', 'atime'))
+            return cols
         # Sample up to 500 metadata dicts to detect which timestamps are present.
         has_ctime = has_btime = False
         for v in islice((v for v in ui_metadata.values() if v), 500):
@@ -10233,6 +10564,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if has_ctime:
             cols.append(('Changed', 'ctime'))
         cols.append(('Modified', 'mtime'))
+        if has_atime:
+            cols.append(('Accessed', 'atime'))
         return cols
 
     def _detect_android_user_data(self, folder_map: dict) -> str:
@@ -10606,6 +10939,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         dlg.nested_extraction_done.connect(self._on_nested_extraction_done)
         dlg.embedded_media_scan_done.connect(self._on_embedded_media_scan_injected)
         dlg.media_metadata_scan_done.connect(self._on_media_metadata_scan_done)
+        dlg.duplicate_detection_done.connect(self._on_duplicate_detection_done)
         # Keyword Search tab is greyed out only for the real duration of
         # this stage (moved 2026-10-12 from an automatic, always-on grey-
         # out — see ProcessDialog's own "Index LevelDB..." checkbox) —
@@ -10691,6 +11025,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._photo_index = {}        # rebuilt in on_metadata_ready
         self._media_exif = {}         # rebuilt in _start_case_meta_load
         self._attachment_links = {}   # rebuilt in _start_case_meta_load
+        self._duplicate_files = {}    # rebuilt in _start_case_meta_load
+        self._duplicate_groups: dict = {}   # md5 -> every member ui_path, rebuilt alongside
         self._photos_prompt_shown = False
         self._search_entries = None   # clear cached index for the new archive
         self.zip_path = zip_path
@@ -10880,6 +11216,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._header_type_overrides = {}
         self._media_exif = getattr(self, '_media_exif', {}) or {}
         self._attachment_links = getattr(self, '_attachment_links', {}) or {}
+        self._duplicate_files = getattr(self, '_duplicate_files', {}) or {}
+        self._recompute_duplicate_groups()
         self._file_count_cache = {}
         if self._case_dir:
             # Counts stay synchronous: one small blob unpack (~tens of ms),
@@ -10926,6 +11264,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._zip_open_future = _BG_POOL.submit(
                 _build_cached_zip_view, self.zip_path, self._case_dir)
         self._time_cols = self._detect_time_columns(data)
+        self._has_link_count_data = any(
+            v.get('links') is not None
+            for v in islice((v for v in data.values() if v), 500))
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'App', 'Path'])
         self._update_filter_columns(self.file_headers)
@@ -11008,11 +11349,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         def _load():
             overrides = {}
             media_exif = {}
+            duplicates = {}
             links = {}
             try:
                 with closing(_open_cache_db(case_dir)) as db:
                     overrides = load_header_types(db)
                     media_exif = load_media_metadata(db)
+                    duplicates = load_duplicate_files(db)
             except Exception:
                 pass
             # artifact_attachment_links lives in caseresults.db, not
@@ -11025,7 +11368,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
             tz = self._load_or_detect_timezone_settings(zip_path, adapter, case_dir)
-            return overrides, _build_photo_index(case_dir, rules), tz, media_exif, links
+            return overrides, _build_photo_index(case_dir, rules), tz, media_exif, duplicates, links
 
         fut = _BG_POOL.submit(_load)
 
@@ -11036,7 +11379,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 QTimer.singleShot(30, _poll)
                 return
             try:
-                overrides, photos, tz, media_exif, links = fut.result()
+                overrides, photos, tz, media_exif, duplicates, links = fut.result()
             except Exception:
                 return
             # A real, higher-impact instance of the SAME gap
@@ -11060,6 +11403,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._reapply_leveldb_type_overrides()
             self._photo_index = photos
             self._media_exif = media_exif
+            self._duplicate_files = duplicates
+            self._recompute_duplicate_groups()
             self._attachment_links = links
             (self._handset_zone_name, self._acquisition_zone_name,
              self._manual_zone_name,
@@ -11068,6 +11413,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._refresh_header_scan_indicator()
             self._refresh_embedded_media_button()
             self._refresh_current_file_view(preserve_filter=True)
+            # The bookmark panel's "User Media (N)" count was first built
+            # at tree-done, BEFORE these header-type overrides existed —
+            # _is_media_file counts a header-detected picture/video as
+            # media, so that early count was short. Real report
+            # 2026-10-17: CTF26 showed "User Media (1,294)" but clicking
+            # it selected 3,913 files; reproduced exactly (0 overrides →
+            # 1,294; 5,049 overrides loaded → 3,913). Recount now.
+            self._refresh_bookmark_panel()
             if is_first_load:
                 # Surface the choice proactively on a brand-new case rather
                 # than leaving it undiscovered behind the Tools menu — the
@@ -11328,6 +11681,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._header_type_overrides.clear()
         self._reapply_leveldb_type_overrides()
         self._refresh_folder_view()
+        self._refresh_bookmark_panel()   # "User Media (N)" depends on these types
 
     def _on_header_scan_done(self, results: dict, tier: int | None = None):
         """*tier* is only passed by the fresh-case-open path (the worker
@@ -11378,6 +11732,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
         self._refresh_current_file_view(preserve_filter=True)
+        self._refresh_bookmark_panel()   # "User Media (N)" depends on these types
 
     _HEADER_SCAN_TIER_TEXT = {
         0: "Header scan: Off (extension-based typing only)",
@@ -11709,6 +12064,39 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
         self._refresh_current_file_view(preserve_filter=True)
+
+    def _on_duplicate_detection_done(self) -> None:
+        """Runs when ProcessDialog's duplicate_detection_done fires (see
+        ProcessDialog._on_dedup_done) — reloads the File Browser's
+        "Duplicate Count"/"MD5" column data from casecache.db and
+        refreshes the current view, same "reload then repaint" shape
+        _on_attachment_links_changed above already uses."""
+        self._duplicate_files = {}
+        if self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    self._duplicate_files = load_duplicate_files(db)
+            except Exception:
+                pass
+        self._recompute_duplicate_groups()
+        self._refresh_current_file_view(preserve_filter=True)
+        self._refresh_bookmark_panel()   # "User Media (N · M to review)"
+
+    def _recompute_duplicate_groups(self) -> None:
+        """Rebuild self._duplicate_groups (md5 -> every member ui_path,
+        sorted) from self._duplicate_files — called wherever
+        self._duplicate_files itself is (re)loaded. Used by the Media
+        Browser's "Hide Duplicates" (media_viewer._recompute_media_all_paths
+        collapses each group to one thumbnail, and
+        _get_media_paths_for_bookmark expands a bookmarked one back out
+        to every copy). The File Browser itself never hides duplicates —
+        direct correction, 2026-10-17: "in the file bowser... you would
+        see all files and duplicates are not hiden the hiding only
+        happends when view the selected files in the media browser."""
+        groups: dict[str, list[str]] = {}
+        for ui_path, info in self._duplicate_files.items():
+            groups.setdefault(info['md5'], []).append(ui_path)
+        self._duplicate_groups = {m: sorted(ps) for m, ps in groups.items()}
 
     def _on_nested_extraction_done(self):
         saved_checked = set(self._checked_folders)
@@ -12059,6 +12447,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 pass
         primary = getattr(self, '_single_scan_primary_path', None)
         self._refresh_current_file_view(preserve_filter=True, select_path=primary)
+        if results:
+            self._refresh_bookmark_panel()   # "User Media (N)" depends on these types
         self.status_bar.showMessage(
             f"Header scan: {n_updated} of {n_total} file(s) identified"
         )
@@ -12087,10 +12477,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             for p in children)
         has_exif = bool(self._media_exif)
         has_links = bool(self._attachment_links)
+        has_inode = self._inode_col_available()
+        has_link_count = self._has_link_count_data
+        has_dup = bool(self._duplicate_files)
         headers = (self.file_headers + (['UUID'] if has_bundles else [])
                    + (_PHOTO_HEADERS if has_photos else [])
                    + (_EXIF_HEADERS if has_exif else [])
-                   + ([_LINKED_REPORT_HEADER] if has_links else []))
+                   + ([_LINKED_REPORT_HEADER] if has_links else [])
+                   + ([_INODE_HEADER] if has_inode else [])
+                   + ([_LINK_COUNT_HEADER] if has_link_count else [])
+                   + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         new_model = FileTableModel(headers)
         # _update_filter_columns resets the type selection — save the filter
         # bar state around it when the filter must survive the refresh.
@@ -12111,7 +12507,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         disp_parent = self._display_path(folder_path)
         for path in sorted(children):
             row = self._build_entry_row(path, has_bundles, display_parent=disp_parent,
-                                        photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links)
+                                        photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
+                                        inode_cols=has_inode, link_count_cols=has_link_count,
+                                        dup_cols=has_dup)
             if row is not None:
                 batch.append(row)
         new_model.append_rows_batch(batch)
@@ -12181,10 +12579,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             for p in files)
         has_exif = bool(self._media_exif)
         has_links = bool(self._attachment_links)
+        has_inode = self._inode_col_available()
+        has_link_count = self._has_link_count_data
+        has_dup = bool(self._duplicate_files)
         headers = (self.file_headers + (['UUID'] if has_bundles else [])
                    + (_PHOTO_HEADERS if has_photos else [])
                    + (_EXIF_HEADERS if has_exif else [])
-                   + ([_LINKED_REPORT_HEADER] if has_links else []))
+                   + ([_LINKED_REPORT_HEADER] if has_links else [])
+                   + ([_INODE_HEADER] if has_inode else [])
+                   + ([_LINK_COUNT_HEADER] if has_link_count else [])
+                   + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         new_model = FileTableModel(headers)
 
         if preserve_filter:
@@ -12220,7 +12624,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             while state['idx'] < total:
                 path = files[state['idx']]
                 state['idx'] += 1
-                row = self._build_entry_row(path, has_bundles, photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links)
+                row = self._build_entry_row(path, has_bundles, photo_cols=has_photos, exif_cols=has_exif,
+                                            link_cols=has_links, inode_cols=has_inode,
+                                            link_count_cols=has_link_count, dup_cols=has_dup)
                 if row is not None:
                     batch_rows.append(row)
                     state['count'] += 1
@@ -12846,7 +13252,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # fine to re-run on every panel refresh (bookmark add/delete/
         # color-change, case load — never on every tick, unlike
         # "Selected Files" own count).
-        n_user_media = len(self._user_media_paths())
+        user_media = self._user_media_paths()
+        n_user_media = len(user_media)
+        # Two values while the Media Browser's "Hide Duplicates" is on —
+        # added 2026-10-17, direct request: "make it that user media is
+        # altered by the hide duplicates... that it show the two values."
+        # N = files clicking this selects (matches "Selected Files");
+        # M = thumbnails actually left to review once duplicates collapse
+        # (the same _collapse_duplicate_paths the grid itself uses).
+        n_to_review = (len(self._collapse_duplicate_paths(user_media))
+                       if getattr(self, '_media_hide_duplicates', False)
+                       else n_user_media)
+        um_label = (f"User Media  ({n_user_media:,} · {n_to_review:,} to review)"
+                    if n_to_review != n_user_media
+                    else f"User Media  ({n_user_media:,})")
         um_item = QListWidgetItem()
         um_item.setData(Qt.ItemDataRole.UserRole, _USER_MEDIA_SENTINEL)
         um_item.setToolTip(
@@ -12854,7 +13273,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             "locations only (app data, DCIM, Photo Library Data) — "
             "excludes anything on the User Media ignore list "
             "(Preferences ▸ Media Browser). Switches to the Media "
-            "Browser tab.")
+            "Browser tab."
+            + ("\n\nWith \"Hide Duplicates\" on: the first number is "
+               "how many files get selected; \"to review\" is how many "
+               "thumbnails you'll see once identical copies are hidden."
+               if n_to_review != n_user_media else ""))
         self._bookmark_list.addItem(um_item)
         # A real inline widget, same two-button shape as "Selected
         # Files" above — "Reset" moved HERE 2026-10-03, direct
@@ -12868,7 +13291,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         um_row_layout = QHBoxLayout(um_row_widget)
         um_row_layout.setContentsMargins(4, 1, 4, 1)
         um_row_layout.setSpacing(4)
-        self._user_media_row_btn = QPushButton(f"User Media  ({n_user_media:,})")
+        self._user_media_row_btn = QPushButton(um_label)
         self._user_media_row_btn.setFlat(True)
         self._user_media_row_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._user_media_row_btn.setStyleSheet("text-align: left;")

@@ -23,6 +23,7 @@ Schema (keyed by full entry path, no leading slash):
             "uid":   int,
             "gid":   int,
             "inode": int,
+            "devid": int,    # 0 when the IN block is absent or too short to carry it
             "links": None,   # not stored in Graykey
             "mode":  None,   # not stored in Graykey
             "prot":  None,   # not stored in Graykey
@@ -161,8 +162,14 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
     else:
         uid = gid = 0
 
-    # Inode from IN block: inode(Q=8B) + additional fields (ignored)
+    # Inode from IN block: inode(Q=8B) + devID(L=4B) + additional fields (ignored).
+    # devID distinguishes real same-file duplicates from coincidental inode-number
+    # reuse across Android's separate mount filesystems — confirmed via real
+    # archives: inode numbers alone collide between unrelated files on different
+    # devices, but (inode, devID) together never did across sampled real duplicates.
     inode = int.from_bytes(in_block[:8], 'little') if in_block is not None else 0
+    devid = (int.from_bytes(in_block[8:12], 'little')
+             if in_block is not None and len(in_block) >= 12 else 0)
 
     # Graykey block: version(1B) flags(1B) [prot_class(4B)] [xattrs]
     xattrs = {}
@@ -184,6 +191,7 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
         'uid':   uid,
         'gid':   gid,
         'inode': inode,
+        'devid': devid,
         'links': None,
         'mode':  None,
         'prot':  None,

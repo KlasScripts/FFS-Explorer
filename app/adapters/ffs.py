@@ -424,6 +424,40 @@ class FfsAdapter:
         self.sys_prefix  = sys_prefix    # e.g. 'filesystem1' (Cellebrite only)
         self.old_layout  = old_layout    # True = old Cellebrite: keys include private/var/
 
+    @property
+    def inode_trusted(self) -> bool:
+        """True when a nonzero (inode, devid) pair in ui_metadata reliably
+        identifies ONE real file within this archive — POSIX guarantees
+        (device, inode) is unique for any live file, so this is provable,
+        not just empirically observed, PROVIDED the archive's own data
+        never mixes two genuinely different devices/filesystems into one
+        unpartitioned namespace with no device discriminator at all.
+
+        GrayKey (iOS and Android): always — the IN zip-extra block carries
+        both inode(8B) and devid(4B); confirmed on real archives that bare
+        inode numbers alone DO collide across Android's several mount
+        filesystems, but (inode, devid) together never did.
+
+        Cellebrite: only new-layout (old_layout=False) — metadata2's own
+        metadata.msgpack is loaded in isolation from metadata1 (the system
+        partition), one real partition's worth of inodes only, confirmed
+        collision-free on a real archive. Old-layout Cellebrite merges
+        system+user into ONE metadata.msgpack with no device field at
+        all — confirmed real collisions there (2,499 of 10,869 same-inode
+        groups had mismatched file sizes on a real old-layout archive) —
+        never trusted for that layout. FORMAT_ZIP_EXTRAS never has inode
+        data to begin with.
+
+        Used both for the File Browser's "Inode" column (display-only)
+        and, added 2026-10-16 (direct request: "if we already know it has
+        the same inode can we not shortcut the check[?] do not bother
+        with the md5"), app/duplicate_scan.py's duplicate-detection
+        shortcut — files already proven identical by (inode, devid) never
+        need to be read or hashed at all."""
+        if self.format == self.FORMAT_GRAYKEY:
+            return True
+        return self.format == self.FORMAT_CELLEBRITE and not self.old_layout
+
     # ── Detection ─────────────────────────────────────────────────────────────
 
     @classmethod

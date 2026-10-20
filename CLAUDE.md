@@ -931,6 +931,250 @@ crash") — then right-clicked (programmatically) to confirm the jump
 genuinely switches tabs and selects that real row in the live
 `QTableView`, not just that the function returns without error.
 
+**File Browser "Inode" column (GrayKey + new-layout Cellebrite iOS) —
+added 2026-10-16**, after a direct investigation into whether Android's
+bind-mount model (the same real file appearing at multiple paths, e.g.
+`/data/data/...` vs. `/data/user/0/...` vs.
+`/data_mirror/data_ce/null/0/...`) could be surfaced from inode data.
+Confirmed empirically across all real extraction formats before building
+anything, then refined once more real archives were checked:
+
+- **GrayKey (iOS and Android)**: real inode data in the zip extra
+  fields' `0x4e49` ("IN") TLV block — `inode(8B) + devID(4B)`
+  (`app/adapters/graykey.py`'s `_TAG_IN` parser). Raw inode numbers
+  alone collide across Android's separate mount filesystems (a real
+  false match was found: `mmssms.db-wal` sharing an inode number with an
+  unrelated `.apk` on a different device) — `devid` is required
+  alongside `inode` to disambiguate. With both, cross-checked against
+  real duplicate groups (CRC32+size and cross-platform spot checks):
+  zero false positives found.
+- **Cellebrite iOS, new layout** (`user_prefix='filesystem2' != sys_prefix
+  ='filesystem1'`, `old_layout=False`; separate `metadata1/metadata.msgpack`
+  = system and `metadata2/metadata.msgpack` = user partition files exist
+  side by side in the zip): `load_metadata` already only ever loads
+  `metadata2` — the user partition — in isolation (tries that candidate
+  first, returns immediately; `metadata1` is never read at all for this
+  layout, matching `build_zip_entries` which only ever walks
+  `user_prefix`). Checked a real such archive (`iOS16.5 CTF23
+  Cellebrite`) directly: `metadata2` alone has 5,046 real same-file-
+  different-path groups and **zero** size-mismatched false collisions;
+  `metadata1` alone (confirmed separately, even though the app never
+  loads it) also zero. A single isolated partition's inode numbers
+  don't collide in practice — safe to show. No `devid` key exists in
+  this schema at all, so the column shows the bare inode, no suffix.
+- **Cellebrite iOS, old layout** (`user_prefix == sys_prefix`, no
+  partition split available — `metadata1/metadata.msgpack` covers
+  system *and* user merged into one dict, which is also everything the
+  app shows, since there is no second partition to exclude): checked a
+  real such archive (`IOS17 JoshHickman`) directly — 2,499 of 10,869
+  same-inode groups (23%) have mismatched file sizes, i.e. real
+  coincidental inode-number reuse between unrelated files (inode `2`,
+  the classic root-directory inode, was "shared" by dozens of unrelated
+  directories). Not reliable — never shown for this layout.
+- **Cellebrite Android (`FORMAT_ZIP_EXTRAS`, the "Dump/" + UT-extras
+  layout)**: no inode data anywhere — confirmed zero `0x4e49` blocks
+  across ~288K real file entries; `load_metadata` hardcodes `inode: 0`
+  for this format.
+
+`_inode_col_available()` is the single gate used everywhere the column
+is conditionally added (same pattern as `_EXIF_HEADERS`/
+`_LINKED_REPORT_HEADER`): true for `FORMAT_GRAYKEY` always, true for
+`FORMAT_CELLEBRITE` only when `not old_layout`. `_format_inode()` shows
+`f"{inode}:{devid}"` when a `devid` key is present (GrayKey) or the bare
+inode when it isn't (Cellebrite new-layout) — never a misleading `:0`
+suffix for a format that has no device concept at all. Deliberately NOT
+wired into any automatic duplicate-detection or dedup logic — the user
+wants to filter/sort on it manually themselves, nothing more.
+`graykey.py`'s `extract_metadata` now also returns a `devid` key
+alongside `inode` (previously decoded and discarded).
+
+Verified end-to-end against real archives (loaded through the real
+adapter, not mocked), not just the collision analysis above: the
+"Android 14 CTF26 Magnet" GrayKey archive's known real triplicate
+`mmssms.db` (`/data/data/...`, `/data/user/0/...`,
+`/data_mirror/data_ce/null/0/...`) all show the identical "Inode" value
+`6981:65077` in a live `QTableView`; "iOS16.5 CTF23 Cellebrite" (new
+layout) shows bare inode values with no colon suffix; "IOS17
+JoshHickman" (old layout, Cellebrite) and both real
+`FORMAT_ZIP_EXTRAS` Android archives correctly show no "Inode" column
+at all.
+
+**"Accessed" and "Link Count" columns — added 2026-10-16**, same batch,
+direct request: "i only want the column present if the data is
+present" — both gated on real sampled data rather than a format check,
+unlike Inode above.
+
+- **Accessed** (`atime`) folds into the existing `_detect_time_columns`
+  sampling that already decided whether to show Created/Changed — it
+  already only shows Created/Changed when real nonzero values are
+  found in a 500-entry sample; Accessed now gets the same treatment,
+  for BOTH platforms (previously only Android was sampled; iOS
+  unconditionally got Created/Changed). Real on GrayKey (iOS and
+  Android) and both Cellebrite iOS layouts; absent on Cellebrite
+  Android zip-extras, where the UT block's atime flag bit claims
+  presence but the stored value is always `0` in every real entry
+  checked (same phenomenon already noted for Changed/ctime on that
+  format). Verified end-to-end: real non-zero Accessed timestamps shown
+  for both GrayKey archives and both Cellebrite iOS layouts; correctly
+  absent for the real Android zip-extras archive.
+- **Link Count** (`links`, the file's hardlink count) — named "Link
+  Count" rather than plain "Links" specifically to avoid confusion with
+  the unrelated "Linked Report" column above. Gated on
+  `self._has_link_count_data`, set once per archive load in
+  `on_metadata_ready` the same way `self._time_cols` is — sampling up
+  to 500 metadata dicts for a non-`None` `links` value. Real only on
+  Cellebrite's `metadata.msgpack` schema, for BOTH old- and new-layout
+  archives (unlike Inode, a plain hardlink count isn't subject to the
+  cross-partition collision problem that `old_layout` gates — it's
+  just an integer field in the dict, nothing computed from it); GrayKey
+  never stores it (`extract_metadata` always returns `links: None`).
+  Verified end-to-end: real values (`'8'`, `'487'`, `'12'`, `'169'`,
+  etc.) shown for both real Cellebrite iOS archives (old and new
+  layout); correctly absent for both real GrayKey archives and the
+  real Android zip-extras archive.
+
+**Duplicate file detection ("Duplicate Count"/"MD5" columns,
+`app/duplicate_scan.py`) — added 2026-10-16**, direct request following
+the Inode investigation above: "i want to use the size and crc and then
+md5 check to confirm. hopefully only do the md5 for the duplicates will
+make it not too long. i want it to be an option that is pre[]ticked in
+process case.. and again at the bottom of this dialog i want a bit of
+text to indicate that it is done or not" — then "the result needs to be
+a column with duplicate count and a column with md5."
+
+New last stage in `ProcessDialog`'s operation chain (after media
+metadata; `_continue_after_media_metadata` → `_start_dedup_scan`),
+checked by default via `self._chk_dedup`. Algorithm: group every real
+file by `(size, CRC32)` — both free, already parsed from the zip's
+central directory, no I/O — then MD5-hash only the files inside a
+multi-member group to confirm genuine byte-identity (CRC32 alone can
+coincidentally collide). `DuplicateDetectionWorker` (`QThread`) drives
+`duplicate_scan.find_duplicate_groups`; `_on_dedup_done` persists
+results to casecache.db's new `duplicate_files` table (`ui_path`, `md5`,
+`size`, `group_size` — always fully rebuilt, same "never let stale data
+survive" convention as `artifact_attachment_links`, NOT media_metadata's
+own never-cleared convention, since a file's duplicate status can
+genuinely become false between runs) and a `run_log` entry
+(`_RUN_TYPE_DEDUP`), then emits `duplicate_detection_done` →
+`FastZipBrowser._on_duplicate_detection_done` reloads and repaints, same
+"reload then repaint" shape every other per-file-results feature here
+uses. The dialog's own stats block (`_refresh_stats`) gained a
+"Duplicate detection: `<time>` — N file(s) in M group(s) confirmed"
+line, with a cancelled-run warning — directly answering "a bit of text
+to indicate that it is done or not."
+
+`_collect_duplicate_candidates` resolves `[(ui_path, physical_path,
+zinfo, inode, devid)]` the SAME way `_resolve_file_candidates` already
+does for every other candidate pass (`resolve()` then `z.getinfo()`) —
+deliberately NOT `FfsAdapter.build_zip_entries()`, which turned out to
+be exercised only for Cellebrite elsewhere in this codebase
+(`ffs_metadata.py`'s own comment: "Only Cellebrite iOS uses the Pass-1
+zip-entry precompute") and was confirmed here to silently return an
+EMPTY dict for a real GrayKey archive — its prefix-matching assumes no
+leading slash, but GrayKey physical paths always have one. A real bug
+caught before shipping, not a hypothetical. Deliberately unscoped by
+`scan_folders()`/`scan_excludes()` — grouping by size+CRC32 costs no
+extra I/O regardless of candidate count, and the original real-world
+motivation (an app-cache copy of a user's own photo) can sit well
+outside whatever folders are marked for header-scan processing.
+
+**Inode shortcut — same day, direct follow-up**: "if we already know it
+has the same inode can we not shortcut the check[?] do not bother with
+the md5." `FfsAdapter.inode_trusted` (the same gate the Inode column
+above uses: GrayKey always, Cellebrite only when `not old_layout`) is
+passed through to `find_duplicate_groups`. POSIX guarantees `(device,
+inode)` uniquely identifies a live file — not a heuristic — so members
+of a `(size, CRC32)` candidate group sharing a real `(inode, devid)`
+collapse into one "hash unit": only the first member is actually read;
+its MD5 is applied to every sibling sharing that inode. Confirmed on a
+real archive ("Android 14 CTF26 Magnet," GrayKey): 121,382 candidate
+files down to 42,492 actual reads (65% fewer), with byte-for-byte
+identical results (121,381 confirmed duplicate files, 34,134 groups,
+same known `mmssms.db` triplicate) to the un-optimized run — the
+shortcut changes performance only, never the outcome. Cellebrite has no
+real `devid` field at all; candidates get `devid=0` uniformly, making
+`(inode, 0)` grouping exactly equivalent to grouping on bare inode —
+correct specifically because `inode_trusted` for Cellebrite only turns
+on when a single partition's metadata is loaded in isolation (new
+layout), so there is no second device's inode namespace to collide
+with. Confirmed the `inode_trusted=False` path (old-layout Cellebrite)
+is unaffected — every candidate still gets hashed individually, matching
+pre-optimization behavior exactly.
+
+**"Hide Duplicates" checkbox — Media Browser only.** Added 2026-10-16
+in the File Browser; MOVED 2026-10-17, direct correction: "in the file
+bowser... you would see all files and duplicates are not hiden the hiding
+only happends when view the selected files in the media browser. so that
+is were the hide duplicate tick should be. and it only affect how many
+files are present in that view." The File Browser never hides duplicates
+(`_build_entry_row` has no duplicate check; the "Duplicate Count"/"MD5"
+columns are still shown there).
+
+The checkbox (`self._media_hide_dup_chk`, flag
+`self._media_hide_duplicates`, ticked by default, per-session — not reset
+on folder change) sits in the Media Browser status row. It's applied in
+`_recompute_media_all_paths`, the one funnel every Media Browser view
+(folder, Selected Files, User Media, Embedded Media) goes through, and runs
+BEFORE the hide-seen and Picture/Video filters:
+- Each md5 group keeps its FIRST copy in that view's own list — not an
+  archive-wide representative. An archive-wide pick would make a file
+  disappear completely from a folder that only holds a non-chosen copy.
+  (The 2026-10-16 File Browser version did use an archive-wide pick,
+  `_duplicate_representatives`, now removed.)
+- Because it runs before the seen filter, a group whose kept copy is
+  already "Not Relevant" stays hidden instead of the next copy surfacing.
+- The hidden count shows in the status line ("N duplicate(s) hidden"),
+  built by `_update_media_status_text` (factored out of
+  `_start_thumbnail_load` so the toggle can refresh it).
+
+**"User Media (N · M to review)" — added 2026-10-17**, direct request:
+"make it that user media is altered by the hide duplicates... that it
+show the two values." While "Hide Duplicates" is on and duplicates exist,
+the bookmark panel row shows N (files clicking it selects, the same as
+"Selected Files") and M (thumbnails left after collapsing duplicates).
+Both the panel and `_recompute_media_all_paths` use
+`_collapse_duplicate_paths`, so M always equals the grid's own count.
+Toggling the checkbox and `_on_duplicate_detection_done` both refresh the
+panel. Verified on CTF26: 3,913 · 3,609 to review; the grid shows 3,609
+(304 duplicates hidden); an independent count gives 3,609; unticking
+shows "User Media (3,913)".
+
+**User Media count was stale on case open — fixed 2026-10-17.** The panel
+counted at tree-done, before `_start_case_meta_load` loaded the
+header-type overrides that `_is_media_file` uses. CTF26 showed 1,294 when
+the click selected 3,913 (reproduced exactly: 0 vs. 5,049 overrides). The
+panel now refreshes after that load, after `_on_header_scan_done`,
+`_on_header_types_cleared` and `_on_single_scan_done`.
+
+`self._duplicate_groups` (md5 → sorted member `ui_path`s) is rebuilt by
+`_recompute_duplicate_groups` wherever `self._duplicate_files` is
+(re)loaded: `on_metadata_ready`, `_start_case_meta_load`'s background poll,
+and `_on_duplicate_detection_done`.
+
+**Bookmarking a shown duplicate bookmarks every copy — added
+2026-10-17**, direct request: "if the hide duplicate is active and in the
+media viewer you selected a file with duplicates all the duplicates are
+bookmarked as in practise we want to have less media files to review
+visually but if there is one that is important we want to know all the
+locations that it apears." `media_viewer._get_media_paths_for_bookmark`
+(used by both the right-click "Bookmarks" menu and Ctrl+B) expands each
+selected path in `self._duplicate_files` to every member of its md5 group,
+archive-wide, while `_media_hide_duplicates` is on. With it off, the
+selection is taken as-is.
+
+Verified 2026-10-17 against the real CTF26 duplicate scan (121,381 rows /
+34,134 groups), on a real offscreen `FastZipBrowser`:
+- The checkbox is in the Media Browser tab and not the File Browser tab.
+- A 3-copy Chrome `app_textures/0.jpeg` group plus one unique file shows 2
+  thumbnails, with the status line reading "(2 duplicate(s) hidden)".
+- Unticking the real checkbox restores all 4; re-ticking collapses them
+  again.
+- A list holding only a non-first copy still shows it.
+- A group whose kept copy is seen stays hidden.
+- Bookmark expansion returns all 3 paths when on and 1 when off, with no
+  double-adding.
+- Every rebuilt group's member count matches its stored `group_size`.
+
 ## 4. In-app format viewers
 
 Every one of these is reachable by double-clicking the file in the ordinary
@@ -1159,6 +1403,7 @@ reset state and the preset combo on "(None)" rather than guessing.
 | `header_scan.py` | Magic-byte/text file-type detection (`classify_magic`) — see Header-scan tiers above. |
 | `scan_rules.py` | The shared folder-prefix ruleset (include/exclude/user_media/embedded_media_exclude) behind `FfsAdapter.scan_folders()` and friends — see Header-scan tiers above. |
 | `embedded_media_scan.py` | The embedded-media sweep — see section 3 above. |
+| `duplicate_scan.py` | Process Case duplicate detection: size+CRC grouping, MD5 to confirm (inode shortcut where trusted). Qt-free. |
 | `embedded_media_skip_list.py` | Known-noise database skip list — see section 3. |
 | `media_metadata_scan.py` | EXIF (images) / container metadata (video) extraction for the File Browser's "(EXIF)" columns — `_LazyZipSlice`, `extract_image_exif`, `extract_video_metadata` — see "EXIF / video-metadata columns" above. |
 | `user_media_ignore_list.py` | Global exclusion list for the Media Browser's "User Media" filter. |

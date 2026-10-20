@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QPushButton, QSlider, QTextEdit,
     QListView, QAbstractItemView, QStyledItemDelegate, QStyle, QMenu,
     QApplication, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QButtonGroup,
+    QButtonGroup, QCheckBox,
 )
 from PySide6.QtGui import (QImage, QImageReader, QPixmap, QFontDatabase, QColor,
                            QPen, QPainter)
@@ -1335,6 +1335,14 @@ class MediaViewerMixin:
         # status line).
         self._media_hidden_by_seen: int = 0
         self._media_hidden_by_type: int = 0
+        # "Hide Duplicates" (moved here 2026-10-17 from the File Browser,
+        # direct correction: "the hiding only happends when view the
+        # selected files in the media browser... it only affect how many
+        # files are present in that view"). Ticked by default; applied
+        # in _recompute_media_all_paths. A per-session toggle, like the
+        # Picture/Video one — not reset on folder change.
+        self._media_hide_duplicates: bool = True
+        self._media_hidden_by_dup: int = 0
         self._media_last_seen_batch: list | None = None
         self._media_last_seen_batch_page: int = 0
         # Which of the last "Not Relevant" batch's paths were actually
@@ -1407,8 +1415,20 @@ class MediaViewerMixin:
         self._media_type_all_btn.setChecked(True)
         self._media_type_group.buttonClicked.connect(self._on_media_type_filter_changed)
 
+        self._media_hide_dup_chk = QCheckBox("Hide Duplicates")
+        self._media_hide_dup_chk.setChecked(self._media_hide_duplicates)
+        self._media_hide_dup_chk.setToolTip(
+            "Shows one thumbnail per confirmed duplicate group (same MD5) "
+            "in this view — the File Browser still lists every copy.\n"
+            "Bookmarking a file while this is on bookmarks every copy of "
+            "it, wherever it is in the archive.\n"
+            "Has no effect until Process Case's duplicate detection has "
+            "been run at least once.")
+        self._media_hide_dup_chk.toggled.connect(self._on_media_hide_duplicates_toggled)
+
         status_row = QHBoxLayout()
         status_row.addWidget(self._media_status, 1)
+        status_row.addWidget(self._media_hide_dup_chk)
         status_row.addWidget(self._media_type_all_btn)
         status_row.addWidget(self._media_type_picture_btn)
         status_row.addWidget(self._media_type_video_btn)
@@ -2184,16 +2204,7 @@ class MediaViewerMixin:
 
         self._media_total_files = total_files
         self._media_sort_desc   = sort_desc
-        of_total = f" of {total_files:,} file(s)" if total_files is not None else ""
-        notes = []
-        if self._media_hidden_by_seen:
-            notes.append(f"{self._media_hidden_by_seen:,} hidden as seen")
-        if self._media_hidden_by_type:
-            notes.append(f"{self._media_hidden_by_type:,} not "
-                         f"{self._media_type_filter}")
-        hidden_note = f" ({', '.join(notes)})" if notes else ""
-        self._media_status.setText(
-            f"{len(media_paths):,} media file(s){of_total}{sort_desc}{hidden_note}")
+        self._update_media_status_text()
 
         self._media_zip_info_map = {
             self._adapter.resolve(p): self.full_metadata.get(p, {}).get('size', 0)
@@ -2243,6 +2254,62 @@ class MediaViewerMixin:
         'graphics': ('size', True),    # biggest first
     }
 
+    def _collapse_duplicate_paths(self, paths) -> list:
+        """*paths* with each confirmed duplicate group (same md5,
+        self._duplicate_files) reduced to its FIRST copy in *paths*' own
+        order — the one shared definition of "Hide Duplicates", used by
+        _recompute_media_all_paths for the grid and by ffs-explorer.py's
+        bookmark panel for "User Media (N · M to review)", so the two
+        numbers can never disagree."""
+        dup_files = getattr(self, '_duplicate_files', {})
+        if not dup_files:
+            return list(paths)
+        kept_md5: set = set()
+        result = []
+        for p in paths:
+            info = dup_files.get(p)
+            if info is not None:
+                if info['md5'] in kept_md5:
+                    continue
+                kept_md5.add(info['md5'])
+            result.append(p)
+        return result
+
+    def _update_media_status_text(self) -> None:
+        """The Media Browser status line ("N media file(s) of M file(s),
+        sorted by ... (x hidden as seen, ...)") — factored out of
+        _start_thumbnail_load 2026-10-17 so the "Hide Duplicates" toggle
+        can refresh its own count without a full folder reload."""
+        total_files = self._media_total_files
+        of_total = f" of {total_files:,} file(s)" if total_files is not None else ""
+        notes = []
+        if self._media_hidden_by_dup:
+            notes.append(f"{self._media_hidden_by_dup:,} duplicate(s) hidden")
+        if self._media_hidden_by_seen:
+            notes.append(f"{self._media_hidden_by_seen:,} hidden as seen")
+        if self._media_hidden_by_type:
+            notes.append(f"{self._media_hidden_by_type:,} not "
+                         f"{self._media_type_filter}")
+        hidden_note = f" ({', '.join(notes)})" if notes else ""
+        self._media_status.setText(
+            f"{len(self._media_all_paths_unfiltered):,} media file(s)"
+            f"{of_total}{self._media_sort_desc}{hidden_note}")
+
+    def _on_media_hide_duplicates_toggled(self, checked: bool) -> None:
+        """"Hide Duplicates" checkbox handler — same live re-apply as
+        the Picture/Video toggle: recompute the active list from the
+        folder's unfiltered one, back to page 0, refresh the status
+        count. Only stores the flag if nothing is loaded yet."""
+        self._media_hide_duplicates = checked
+        # "User Media (N · M to review)" depends on this flag too.
+        if hasattr(self, '_refresh_bookmark_panel'):
+            self._refresh_bookmark_panel()
+        if not self._media_all_paths_unfiltered:
+            return
+        self._recompute_media_all_paths()
+        self._load_media_page(0)
+        self._update_media_status_text()
+
     def _recompute_media_all_paths(self) -> None:
         """Re-derives the ACTIVE _media_all_paths from the folder's TRUE
         full list (_media_all_paths_unfiltered) plus the current seen-set
@@ -2267,11 +2334,23 @@ class MediaViewerMixin:
         the selected view to select a folder then the folder should
         show the media files in that folder that meet the filter type
         and will be sorted in the described manner.\""""
-        if self._media_hide_seen:
-            paths = [p for p in self._media_all_paths_unfiltered
-                     if p not in self._media_seen_paths]
+        # "Hide Duplicates" (2026-10-17) runs FIRST: each confirmed
+        # duplicate group (same md5, self._duplicate_files) keeps only its
+        # first copy IN THIS VIEW'S OWN LIST — never an archive-wide pick,
+        # which would hide a file entirely from a folder that only holds
+        # a non-chosen copy. Running before the seen filter means a group
+        # whose shown copy is already "Not Relevant" stays gone, rather
+        # than another copy surfacing to be reviewed all over again.
+        all_paths = self._media_all_paths_unfiltered
+        if self._media_hide_duplicates:
+            deduped = self._collapse_duplicate_paths(all_paths)
         else:
-            paths = list(self._media_all_paths_unfiltered)
+            deduped = list(all_paths)
+        self._media_hidden_by_dup = len(all_paths) - len(deduped)
+        if self._media_hide_seen:
+            paths = [p for p in deduped if p not in self._media_seen_paths]
+        else:
+            paths = deduped
         # Tracked SEPARATELY from the type-filter reduction below — added
         # 2026-10-11, direct bug report: a lingering Pictures/Videos/
         # Graphics selection from a PREVIOUSLY viewed folder silently
@@ -2283,7 +2362,7 @@ class MediaViewerMixin:
         # a folder with zero matching videos but an active "Videos"
         # filter showed "3 hidden as seen" when the real cause was 3 of 4
         # files not being videos at all.
-        self._media_hidden_by_seen = len(self._media_all_paths_unfiltered) - len(paths)
+        self._media_hidden_by_seen = len(deduped) - len(paths)
         if self._media_type_filter != 'all':
             self._resolve_media_type_sets()
             before_type = len(paths)
@@ -2854,14 +2933,36 @@ class MediaViewerMixin:
         browser and media browser." Scoped to whatever's selected on the
         CURRENTLY DISPLAYED PAGE only — selection can't span pages in the
         first place, since paging (2026-09-24) replaces the grid's own
-        model entirely on every page change."""
+        model entirely on every page change.
+
+        With "Hide Duplicates" on, each selected file that belongs to a
+        confirmed duplicate group (self._duplicate_groups, same md5)
+        expands to EVERY member of that group, hidden copies included —
+        added 2026-10-17, direct request: "if the hide duplicate is
+        active and in the media viewer you selected a file with
+        duplicates all the duplicates are bookmarked as in practise we
+        want to have less media files to review visually but if there is
+        one that is important we want to know all the locations that it
+        apears." With it off every copy is already visible and
+        individually selectable, so the selection is taken as-is.
+        Driven by the Media Browser's own checkbox
+        (self._media_hide_duplicates) since 2026-10-17."""
+        expand = getattr(self, '_media_hide_duplicates', False)
+        dup_files = getattr(self, '_duplicate_files', {})
+        dup_groups = getattr(self, '_duplicate_groups', {})
         result: list = []
         seen: set = set()
         for index in self._media_view.selectionModel().selectedIndexes():
             ui_path = index.data(Qt.ItemDataRole.DisplayRole)
-            if ui_path and ui_path not in seen:
-                seen.add(ui_path)
-                result.append((ui_path, ui_path.rsplit('/', 1)[-1]))
+            if not ui_path:
+                continue
+            members = [ui_path]
+            if expand and ui_path in dup_files:
+                members = dup_groups.get(dup_files[ui_path]['md5'], members)
+            for p in members:
+                if p not in seen:
+                    seen.add(p)
+                    result.append((p, p.rsplit('/', 1)[-1]))
         return result
 
     def _show_media_context_menu(self, pos) -> None:

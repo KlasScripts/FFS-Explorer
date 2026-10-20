@@ -87,6 +87,10 @@ Details and decisions for each are in `ASSUMPTIONS.md` (section in brackets).
   `_collapse_duplicate_paths`, also used by the "User Media (N · M to
   review)" count; bookmarking expands back to every copy
   (`_get_media_paths_for_bookmark`).
+- **GrayKey acquisition hashes** (A-73): `graykey._parse_entry` reads the
+  `S2`/`S1`/`MD` blocks into metadata `sha256`/`sha1`/`md5`;
+  `_ACQ_HASH_HEADERS` + `self._acq_hash_keys` add the "(GrayKey)" columns;
+  `duplicate_scan` groups on the recorded SHA-256 (A-69).
 - **Review features** (§10): Media Browser buckets and presets
   (`file_browser_presets.py`, shared with the File Browser), hover-scrub,
   "(EXIF)" columns, "Linked Report" column.

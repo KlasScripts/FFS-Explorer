@@ -197,7 +197,8 @@ other tools such as Griffeye; see `ios_path_candidates` in
 |---|---|---|---|---|---|
 | File metadata source | `metadata2/` or `metadata1/metadata.msgpack` | zip extra fields (GK/UT/UX/inode) | zip extra fields (GK/UT/UX/inode) | UT extra field only | presumably msgpack, as A (Q2) |
 | Timestamps | as recorded in the msgpack (stored as ns) | mtime/atime/ctime/btime; whole seconds (32-bit UT values) | as B | **mtime only**; atime/ctime/btime are always 0 | as A (Q2) |
-| uid/gid, inode, xattrs | from msgpack | from UX/inode/GK blocks | as B | none (0) | as A (Q2) |
+| uid/gid, inode, xattrs | from msgpack | from UX/inode/GK blocks | as B | none: the UX block is present but uid/gid are 0 on every entry; the Unix mode in the external attributes only marks file vs folder (all permission bits 0); no symlinks | as A (Q2) |
+| Per-file hashes | none | SHA-256, optionally SHA-1 + MD5 (A-73) | as B | none (CRC-32 only) | (Q2) |
 | What the tree contains | **user partition only** | every entry in the zip | every entry in the zip | everything under `Dump/` | the detected `filesystemN/` only (Q2) |
 | System partition files | not in the tree; read only for device info via `system_candidates()` | in the tree (no separate partition) | in the tree | under `Dump/` | (Q2) |
 | GUID → bundle-id map | yes | yes | no | no | no |
@@ -251,6 +252,39 @@ real.** *Confirmed (real), 2026-10-16.*
   GrayKey never records it. Named "Link Count" to avoid confusion with
   "Linked Report".
 
+**A-72. A zip can store the same path twice; the app shows one copy.**
+*Confirmed (real), 2026-10-20.*
+- GrayKey zips do this: CTF26 has 37 repeated paths (20 files, 17 folders),
+  IOS18 has 85 repeated file paths. Cellebrite archives had none.
+- Most copies are identical (same size and CRC). One is not: IOS18's
+  `private/var/mobile/Library/Mail/Envelope Index-wal` was captured twice,
+  54 s apart (1,256,632 vs 1,268,992 bytes), because the WAL changed during
+  acquisition.
+- The app keys files by path, so it shows only the later copy. The earlier
+  WAL state is in the zip but not visible in the app. This is an open gap,
+  not a decision.
+
+**A-73. Per-file hashes: GrayKey records them, Cellebrite doesn't.**
+*Confirmed (real), 2026-10-20.*
+- GrayKey stores tagged extra-field blocks per file: `S2` = SHA-256 (32
+  bytes), `S1` = SHA-1 (20), `MD` = MD5 (16). Which ones appear depends on
+  the archive (CTF26: S2 only; IOS18: all three). Folders have none.
+- Three copies per file: the local header holds an all-zero placeholder
+  (GrayKey streams the file before it knows the hash); the trailer after
+  the data repeats the real values (A-15); the central directory holds the
+  real values. `graykey.py` parses the central-directory copy.
+- Evidence: every file entry in both archives has `S2`; the CD values equal
+  the trailer bytes for every entry; recomputed hashes matched on 4,116
+  sampled files, and 1,598 more through the parsed metadata.
+- Used for: the "SHA-256/SHA-1/MD5 (GrayKey)" File Browser columns and the
+  duplicate scan (A-69). Not used to verify files (owner's choice,
+  2026-10-20).
+- Cellebrite: no per-file hash anywhere (msgpack, extra fields, trailers,
+  `.ufd`, side files). Only the zip's CRC-32 per file and the whole zip's
+  SHA-256 in the `.ufd`. Cellebrite Android zips also hold
+  `extra/Secrets/secrets.json` (per-app script output, not file metadata)
+  and, on Android 15 CTF25, `extra/Secrets/gen_mem.dat` (unidentified).
+
 ## 5. The main FFS zip itself
 
 These are what allow the app's own direct-seek zip reader (`ZipEntry`,
@@ -258,8 +292,9 @@ These are what allow the app's own direct-seek zip reader (`ZipEntry`,
 `zipfile` makes. That is where the speed comes from. See the review dated
 2026-10-20.
 
-**A-12. Entries are never compressed.** *Examiner; Confirmed (real) on one
-case: 0 of 124,949 entries compressed (Android 14 JoshHickman).*
+**A-12. Entries are never compressed.** *Examiner; Confirmed (real) on all
+six test archives, 2026-10-20: 0 of 2,158,435 entries compressed (CTF26,
+IOS18, CTF23, IOS17, Android 14 JoshHickman, Android 15 CTF25).*
 - Relied on by: every direct-offset reader, i.e. the header scan, EXIF/video
   metadata scan, keyword search, hex view and export.
 - If wrong: those readers would return compressed bytes as if they were the
@@ -277,16 +312,32 @@ case: 0 of 124,949 entries compressed (Android 14 JoshHickman).*
 **A-14. Entries are not encrypted.** *Examiner.*
 If wrong, encrypted bytes would be returned as the file. No check exists.
 
-**A-15. Files are stored back to back in the zip.** *Confirmed on synthetic
-test zips only; not yet confirmed on a real FFS archive.*
-- `compute_data_offsets` works out each entry's data position as the next
-  entry's header offset minus its own size, with no reads from the archive.
-- Guards: once per session, a sample is checked against the real local
-  headers. Anything that can't be derived is read from its own header
-  instead: the last entry, entries with a data descriptor, and any entry
-  implying a header shape the sample never saw (e.g. a gap).
-- If the sample check fails, every entry is read from its own header: slower
-  but never wrong.
+**A-15. Files are stored back to back in the zip, each followed by a
+fixed-size trailer.** *Confirmed (real), 2026-10-20, on all six test
+archives (every entry checked against its own local header).*
+- After each file's data comes exactly the tool's trailer, then the next
+  entry's header. Nothing else, no gaps:
+  | Tool | Trailer after the data | Bytes |
+  |---|---|---|
+  | Cellebrite (iOS and Android) | ZIP64 data descriptor, on every entry | 24 |
+  | GrayKey, SHA-256 only (CTF26) | 16-byte data descriptor + the file's SHA-256 (A-73); none after folders | 48 |
+  | GrayKey, three hashes (IOS18) | descriptor + SHA-256 + SHA-1 + MD5 | 84 |
+- The local header's extra field differs from the central directory's by a
+  fixed amount per CD ZIP64-block length (GrayKey: 0 before 4 GiB, -12
+  past it; Cellebrite: +20 and +8, because its local headers carry their
+  own ZIP64 sizes block). One Android 15 CTF25 file over 4 GiB has its own
+  group (+24-byte CD block, -8).
+- `compute_data_offsets` learns both per archive from a sample of real
+  headers (about 100 reads), then derives every entry's data offset with
+  no I/O. An entry is accepted only if the trailer it implies equals the
+  learned one for its class; anything else is read from its own header.
+  Result on all six: 0 wrong offsets in 2,158,435 entries; 95-127 header
+  reads per archive; CRC-32 matched on ~13,300 sampled files (10 GB).
+- Residual risk: a derived offset can only be wrong if one entry has both
+  an unseen header shape and an unseen trailer size that cancel exactly.
+  None of the entries checked had either.
+- If wrong: offsets would shift, as in A-16. Guarded by the per-entry
+  trailer check above.
 
 **A-16. ZIP64 appears in every large FFS zip.** *Reasoned from the zip
 format; reproduced on a synthetic archive.*
@@ -295,6 +346,11 @@ the 4 GiB mark in a ZIP64 block in the central directory, which the local
 header doesn't have. This is what made the old single-delta offset
 calculation 12 bytes wrong for one group of entries. Fixed in
 `zip_cd_cache.py` (KlasScripts/FFS-Explorer#2 and the follow-up commit).
+*Confirmed (real), 2026-10-20:* all six test archives are over 4 GiB; the old
+code (5 runs each) placed files wrong on five of them, depending on its
+random sample: up to 164,079 on CTF23, 37,975 on IOS18, 31,457 on Android 14
+JoshHickman, 27,263 on Android 15 CTF25, 4,406 on CTF26 (IOS17 escaped by
+luck). Header-scan types stored before v0.45.0 may be wrong for those files.
 
 **A-17. CRC is not verified on reads.** *Decision, not a fact.*
 Deliberate, for speed. It is acceptable only because acquisition integrity is
@@ -688,6 +744,15 @@ order.** *Decision, 2026-10-12; the numbering is Code only.*
   changes, so a later Process Case run shouldn't silently redo it. The run
   log (`caseresults.db`) alone isn't enough, because `casecache.db` can be
   recreated; the results must still be present too.
+- GrayKey (*Decision + Confirmed (real), 2026-10-20*): a size+CRC group
+  whose every member has a recorded SHA-256 (A-73) is grouped on it with
+  no reads. Those results keep the 64-char SHA-256 in the table's `md5`
+  field (no schema change); the "MD5" column shows only real 32-char MD5s.
+  CTF26: identical groups to the MD5 run, 0 files read, 0.1 s instead of
+  about 10 s. Groups with any member lacking a hash take the MD5 path.
+- Folder entries are never candidates. GrayKey's root folder `/` used to
+  join the size-0 group and was listed as a "duplicate" of 5,561 empty
+  files (fixed 2026-10-20).
 
 **A-70. Duplicates are hidden only in the Media Browser.** *Decision (owner
 correction), 2026-10-17.*

@@ -1483,9 +1483,23 @@ _MD5_HEADER = 'MD5'
 
 
 def _format_duplicate_cols(dup_info: dict | None) -> tuple[str, str]:
+    """The digest is a real MD5 (32 hex chars) unless the group was
+    matched on GrayKey's recorded SHA-256 (64) — that one shows in the
+    "SHA-256 (GrayKey)" column instead, never under an "MD5" header."""
     if not dup_info:
         return '', ''
-    return str(dup_info['group_size']), dup_info['md5']
+    digest = dup_info['md5']
+    return str(dup_info['group_size']), digest if len(digest) == 32 else ''
+
+# Acquisition-time hashes recorded by GrayKey for every file (not folders) —
+# added 2026-10-20, direct request: hashes "without any work", e.g. for a
+# Project VIC export. Parsed by app/adapters/graykey.py from the S2/S1/MD
+# extra-field blocks (ASSUMPTIONS.md A-73). "(GrayKey)" in each header keeps
+# them apart from duplicate detection's own computed "MD5" column. Each is
+# shown only when this archive carries it (self._acq_hash_keys, set in
+# on_metadata_ready) — CTF26 records SHA-256 only, IOS18 all three.
+_ACQ_HASH_HEADERS = {'sha256': 'SHA-256 (GrayKey)', 'sha1': 'SHA-1 (GrayKey)',
+                     'md5': 'MD5 (GrayKey)'}
 
 # Cocoa/Mac epoch (2001-01-01) -> Unix epoch, seconds. photos_metadata.py's
 # Taken/Added (timestamp_fields unit "cocoa_s") store the raw value in this
@@ -1777,8 +1791,8 @@ def _collect_media_metadata_candidates(
     return [(p, off, sz, os.path.splitext(p)[1].lower()) for p, off, sz in triples]
 
 
-def _collect_duplicate_candidates(ffs_adapter, ui_metadata: dict, z) -> list[tuple[str, str, zipfile.ZipInfo, int, int]]:
-    """Return [(ui_path, physical_path, zinfo, inode, devid)] for every
+def _collect_duplicate_candidates(ffs_adapter, ui_metadata: dict, z) -> list[tuple[str, str, zipfile.ZipInfo, int, int, str]]:
+    """Return [(ui_path, physical_path, zinfo, inode, devid, sha256)] for every
     real file in *ui_metadata*, for app/duplicate_scan.py's
     size+CRC32+MD5 duplicate detection (added 2026-10-16, direct
     request). inode/devid come straight from the already-loaded
@@ -1814,8 +1828,14 @@ def _collect_duplicate_candidates(ffs_adapter, ui_metadata: dict, z) -> list[tup
             info = z.getinfo(resolve(ui_path))
         except KeyError:
             continue
+        if info.is_dir():
+            # A folder entry (GrayKey's root '/' resolves to one) is never a
+            # duplicate: it has no content, and it would join — and force
+            # the MD5 path on — the size-0 group of empty files.
+            continue
         out.append((ui_path, info.filename, info,
-                   meta.get('inode') or 0, meta.get('devid') or 0))
+                   meta.get('inode') or 0, meta.get('devid') or 0,
+                   meta.get('sha256', '')))
     return out
 
 
@@ -5624,6 +5644,8 @@ class ProcessDialog(QDialog):
             "archives (and new-layout Cellebrite iOS), files already "
             "proven identical by a shared inode skip the MD5 read "
             "entirely — a real hardlink IS the same file, no hash needed. "
+            "On GrayKey archives, files whose SHA-256 GrayKey recorded at "
+            "acquisition are grouped on that hash with no reads at all. "
             "Shown as new \"Duplicate Count\" and \"MD5\" columns in the "
             "File Browser, present only for files confirmed to have a "
             "real duplicate elsewhere in the archive.")
@@ -7626,6 +7648,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # counts — set per archive, see _detect_time_columns' own sampling
         # for why this isn't a simple format check.
         self._has_link_count_data = False
+        # Which acquisition hashes this archive records ('sha256'/'sha1'/
+        # 'md5', in column order) — see _ACQ_HASH_HEADERS.
+        self._acq_hash_keys: tuple = ()
 
 
         main_widget = QWidget()
@@ -9645,7 +9670,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                          display_parent: str | None = None,
                          photo_cols: bool = False, exif_cols: bool = False,
                          link_cols: bool = False, inode_cols: bool = False,
-                         link_count_cols: bool = False, dup_cols: bool = False):
+                         link_count_cols: bool = False, dup_cols: bool = False,
+                         hash_keys: tuple = ()):
         """Return one file-model row tuple for *path*, or None if hidden.
 
         Single source of truth for building file-browser rows — used by the
@@ -9709,6 +9735,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             cols.append(_format_inode(meta))
         if link_count_cols:
             cols.append(_format_link_count(meta))
+        for k in hash_keys:
+            cols.append(meta.get(k, ''))
         if dup_cols:
             cols.extend(_format_duplicate_cols(self._duplicate_files.get(path)))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
@@ -10183,6 +10211,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                   + ([_LINKED_REPORT_HEADER] if has_links else [])
                   + ([_INODE_HEADER] if has_inode else [])
                   + ([_LINK_COUNT_HEADER] if has_link_count else [])
+                  + [_ACQ_HASH_HEADERS[k] for k in self._acq_hash_keys]
                   + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         self._set_file_model(FileTableModel(headers))
         # Captured AFTER _set_file_model, which now ALSO bumps _load_gen
@@ -10236,7 +10265,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     row = self._build_entry_row(child, display_parent=disp_parent,
                                                 photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
                                                 inode_cols=has_inode, link_count_cols=has_link_count,
-                                                dup_cols=has_dup)
+                                                dup_cols=has_dup, hash_keys=self._acq_hash_keys)
                     if row is None:
                         continue
                     batch_rows.append(row)
@@ -10259,7 +10288,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     row = self._build_entry_row(f, display_parent=disp_parent,
                                                 photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
                                                 inode_cols=has_inode, link_count_cols=has_link_count,
-                                                dup_cols=has_dup)
+                                                dup_cols=has_dup, hash_keys=self._acq_hash_keys)
                     if row is not None:
                         batch_rows.append(row)
                         state['count'] += 1
@@ -11292,6 +11321,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._has_link_count_data = any(
             v.get('links') is not None
             for v in islice((v for v in data.values() if v), 500))
+        # Not sampled: folders carry no hashes, and a sample could be all
+        # folders. any() stops at the first file on a GrayKey archive.
+        self._acq_hash_keys = tuple(
+            k for k in _ACQ_HASH_HEADERS
+            if any(k in v for v in data.values() if v))
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'App', 'Path'])
         self._update_filter_columns(self.file_headers)
@@ -12511,6 +12545,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                    + ([_LINKED_REPORT_HEADER] if has_links else [])
                    + ([_INODE_HEADER] if has_inode else [])
                    + ([_LINK_COUNT_HEADER] if has_link_count else [])
+                   + [_ACQ_HASH_HEADERS[k] for k in self._acq_hash_keys]
                    + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         new_model = FileTableModel(headers)
         # _update_filter_columns resets the type selection — save the filter
@@ -12534,7 +12569,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             row = self._build_entry_row(path, has_bundles, display_parent=disp_parent,
                                         photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
                                         inode_cols=has_inode, link_count_cols=has_link_count,
-                                        dup_cols=has_dup)
+                                        dup_cols=has_dup, hash_keys=self._acq_hash_keys)
             if row is not None:
                 batch.append(row)
         new_model.append_rows_batch(batch)
@@ -12613,6 +12648,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                    + ([_LINKED_REPORT_HEADER] if has_links else [])
                    + ([_INODE_HEADER] if has_inode else [])
                    + ([_LINK_COUNT_HEADER] if has_link_count else [])
+                   + [_ACQ_HASH_HEADERS[k] for k in self._acq_hash_keys]
                    + ([_DUPLICATE_COUNT_HEADER, _MD5_HEADER] if has_dup else []))
         new_model = FileTableModel(headers)
 
@@ -12651,7 +12687,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 state['idx'] += 1
                 row = self._build_entry_row(path, has_bundles, photo_cols=has_photos, exif_cols=has_exif,
                                             link_cols=has_links, inode_cols=has_inode,
-                                            link_count_cols=has_link_count, dup_cols=has_dup)
+                                            link_count_cols=has_link_count, dup_cols=has_dup,
+                                            hash_keys=self._acq_hash_keys)
                 if row is not None:
                     batch_rows.append(row)
                     state['count'] += 1

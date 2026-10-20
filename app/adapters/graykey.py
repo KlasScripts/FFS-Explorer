@@ -48,6 +48,16 @@ _TAG_UX     = 0x7875   # Info-ZIP Unix   — version + uid_sz + uid + gid_sz + g
 _TAG_IN     = 0x4e49   # Inode number    — inode(Q) + devID(L) + ...
 _TAG_GK     = 0x4b47   # Graykey block (newer)  — tag bytes b'GK'
 _TAG_GK_OLD = 0x0004   # Graykey block (older)  — original format tag
+# Acquisition-time hashes of the file's content, one block per algorithm
+# GrayKey was set to record (ASSUMPTIONS.md A-73). Real values only in the
+# CENTRAL DIRECTORY copy (what this module parses — f.extra); the local
+# header copy is an all-zero placeholder, since GrayKey streams the file
+# before it knows the hash, and repeats the values after the data in the
+# data-descriptor trailer. Folders carry none.
+_TAG_S2     = 0x3253   # b'S2' — SHA-256 (32 bytes)
+_TAG_S1     = 0x3153   # b'S1' — SHA-1   (20 bytes)
+_TAG_MD     = 0x444d   # b'MD' — MD5     (16 bytes)
+_HASH_TAGS  = {_TAG_S2: ('sha256', 32), _TAG_S1: ('sha1', 20), _TAG_MD: ('md5', 16)}
 
 _ST_TLV = Struct('<HH')   # block tag + length
 _ST_U32 = Struct('<I')    # single uint32 (xattr count / length)
@@ -106,6 +116,7 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
     # Single-pass TLV scan — collect all needed blocks in one traversal
     # instead of calling _find_block separately for each tag.
     ut = ux = in_block = gk = None
+    hashes = {}
     off = 0
     _unpack_tlv_local = _unpack_tlv
     while off + 4 <= len(extra):
@@ -119,6 +130,12 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
             in_block = extra[off:off + length]
         elif t == _TAG_GK or t == _TAG_GK_OLD:
             gk       = extra[off:off + length]
+        elif t in _HASH_TAGS:
+            key, want = _HASH_TAGS[t]
+            value = extra[off:off + length]
+            # Wrong length or an all-zero placeholder = not recorded.
+            if length == want and value.strip(b'\0'):
+                hashes[key] = value.hex()
         off += length
 
     # UT block: flags(1B) then up to 4 × uint32 timestamps, each present only
@@ -183,7 +200,7 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
         if gflag & 2:
             xattrs = _parse_xattrs(gk, off)
 
-    return {
+    entry = {
         'atime': atime * _S_TO_NS,
         'btime': btime * _S_TO_NS,
         'ctime': ctime * _S_TO_NS,
@@ -198,6 +215,9 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
         'size':  f.file_size,
         'xattr': xattrs,
     }
+    if hashes:
+        entry.update(hashes)   # 'sha256' / 'sha1' / 'md5', lowercase hex
+    return entry
 
 
 def _has_ut_extras(z: zipfile.ZipFile) -> bool:

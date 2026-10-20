@@ -24,7 +24,14 @@ hardlink siblings this way — a 97% reduction in actual file reads/hashes,
 with zero loss of correctness (same-device-same-inode is definitionally
 the same file, a stronger guarantee than a matching MD5 even gives,
 since MD5 only proves identical content, not that it is literally the
-same underlying data)."""
+same underlying data).
+
+Extended 2026-10-20, direct request: GrayKey records each file's SHA-256
+at acquisition (ASSUMPTIONS.md A-73). A (size, CRC32) group whose every
+member carries one is grouped on it with no reads at all. Those results
+store the SHA-256 hex (64 chars) in the same 'md5' field — the table's
+schema is unchanged, so casecache.db isn't rebuilt — and the File
+Browser's own "MD5" column shows only real 32-char MD5 values."""
 
 import hashlib
 
@@ -64,11 +71,31 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
     confirmed so far if it becomes true (a partial, still-correct result,
     never a half-hashed group)."""
     by_size_crc: dict[tuple[int, int], list] = {}
-    for ui_path, phys, zinfo, inode, devid in candidates:
+    for ui_path, phys, zinfo, inode, devid, *rest in candidates:
         by_size_crc.setdefault((zinfo.file_size, zinfo.CRC), []).append(
-            (ui_path, phys, zinfo, inode, devid))
+            (ui_path, phys, zinfo, inode, devid, rest[0] if rest else ''))
 
-    to_process = [group for group in by_size_crc.values() if len(group) > 1]
+    results: dict[str, dict] = {}
+    to_process = []
+    for group in by_size_crc.values():
+        if len(group) < 2:
+            continue
+        # Every member carries the SHA-256 the acquisition tool recorded
+        # (GrayKey, ASSUMPTIONS.md A-73): group on it — no file is read.
+        # Otherwise the whole group takes the MD5 path below, so a group
+        # never mixes the two digest types.
+        if all(m[5] for m in group):
+            by_sha: dict[str, list] = {}
+            for m in group:
+                by_sha.setdefault(m[5], []).append(m)
+            for digest, members in by_sha.items():
+                if len(members) < 2:
+                    continue
+                for m in members:
+                    results[m[0]] = {'md5': digest, 'size': m[2].file_size,
+                                     'group_size': len(members)}
+        else:
+            to_process.append(group)
 
     # Collapse same-(inode,devid) members within each (size, CRC32) group
     # into one hash unit — (representative_member, [ui_path, ...]).  When
@@ -96,13 +123,12 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
     if progress_cb:
         progress_cb(0, total)
     if total == 0:
-        return {}
+        return results
 
-    results: dict[str, dict] = {}
     done = 0
     for units in grouped_units:
         by_md5: dict[str, list] = {}
-        for (ui_path, phys, zinfo, inode, devid), member_paths in units:
+        for (ui_path, phys, zinfo, inode, devid, _sha), member_paths in units:
             if cancel_check and cancel_check():
                 return results
             digest = hashlib.md5(ZipEntry(zip_path, phys, zinfo).read()).hexdigest()

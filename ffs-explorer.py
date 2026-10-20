@@ -5608,7 +5608,13 @@ class ProcessDialog(QDialog):
         # actually read; MD5 only ever runs on that much smaller set.
         self._chk_dedup = QCheckBox(
             "Detect duplicate files (size + CRC32, MD5-confirmed) into new File Browser columns")
-        self._chk_dedup.setChecked(True)
+        # Ticked for a fresh case; starts unticked once a COMPLETE run's
+        # results are on record — same convention as "Check data
+        # integrity" above. Direct request, 2026-10-20: the archive never
+        # changes, so a later Process Case run (e.g. a header-scan tier
+        # upgrade) shouldn't silently redo it. See
+        # _dedup_results_on_record for why the run log alone isn't enough.
+        self._chk_dedup.setChecked(not self._dedup_results_on_record())
         self._chk_dedup.setToolTip(
             "Groups files by size and CRC32 (free — already read from the "
             "zip's own central directory) across the WHOLE archive, then "
@@ -5831,6 +5837,25 @@ class ProcessDialog(QDialog):
                 )
 
         self._stats_label.setText("<br>".join(lines))
+
+    def _dedup_results_on_record(self) -> bool:
+        """True when the last duplicate-detection run completed AND its
+        results are still present. The run log lives in caseresults.db
+        but the results live in casecache.db, a reconstructable cache
+        that is deleted and recreated on a schema change — trusting the
+        log alone would leave the box unticked with no results to show.
+        A complete run that genuinely found no duplicates (output_rows
+        0) counts as on record."""
+        run = self._load_last_dedup_run()
+        if not run or not run['complete']:
+            return False
+        if not run['output_rows']:
+            return True
+        try:
+            with closing(_open_cache_db(self._case_dir)) as db:
+                return count_duplicate_groups(db) > 0
+        except Exception:
+            return False
 
     def _load_last_dedup_run(self) -> dict | None:
         if not self._case_dir:

@@ -80,7 +80,7 @@ Details and decisions for each are in `ASSUMPTIONS.md` (section in brackets).
 - **Process Case stages** (§8, §10): LevelDB indexing → header scan → nested
   archives → embedded-media sweep → EXIF/video metadata → duplicate
   detection, run in that order by `ProcessDialog`.
-- **Duplicates**: `duplicate_scan.py` → `duplicate_files` table
+- **Duplicates** (§10, A-69–A-71): `duplicate_scan.py` → `duplicate_files` table
   (`casecache.db`) → `_duplicate_files` / `_duplicate_groups`. The File
   Browser shows every copy (Duplicate Count/MD5 columns); the Media
   Browser's "Hide Duplicates" collapses each group via

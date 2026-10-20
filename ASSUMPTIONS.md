@@ -223,6 +223,34 @@ is kept as 0 (shown as `---`), not replaced.
 GrayKey and `zip_extras` times are unsigned 32-bit seconds: no sub-second
 precision, and nothing representable before 1970 or after 2106.
 
+**A-67. Which layouts' inode numbers can be trusted.** *Confirmed (real),
+2026-10-16.*
+- **B, C (GrayKey):** inode + device ID from the zip extra field's `0x4e49`
+  block. The device ID is required: inode numbers alone collided across
+  Android's separate filesystems (CTF26: `mmssms.db-wal` shared a number
+  with an unrelated `.apk`). With both, no false matches were found.
+- **A, new layout:** only the user partition's msgpack is loaded, and its
+  inode numbers didn't collide (iOS16.5 CTF23 Cellebrite: 5,046 same-file
+  groups, zero size mismatches). There is no device ID, so the bare inode
+  is shown.
+- **A, old layout:** not reliable. One merged msgpack covers both
+  partitions; in IOS17 JoshHickman 2,499 of 10,869 same-inode groups (23%)
+  were unrelated files. Never used.
+- **D1:** no inode data (zero `0x4e49` blocks in ~288K entries).
+- Relied on by: `FfsAdapter.inode_trusted`, which gates both the File
+  Browser "Inode" column and the duplicate scan's inode shortcut (A-69).
+  The inode is shown for manual filtering only; nothing else infers
+  identity from it.
+
+**A-68. "Accessed" and "Link Count" columns appear only when the data is
+real.** *Confirmed (real), 2026-10-16.*
+- Both are decided by sampling up to 500 entries at load, not by format.
+- **Accessed (atime):** real on B, C and both A layouts. On D1 the UT
+  block's atime flag is set but the value is always 0, so it's hidden.
+- **Link Count (hardlinks):** stored only in A's msgpack (both layouts);
+  GrayKey never records it. Named "Link Count" to avoid confusion with
+  "Linked Report".
+
 ## 5. The main FFS zip itself
 
 These are what allow the app's own direct-seek zip reader (`ZipEntry`,
@@ -638,6 +666,59 @@ order.** *Decision, 2026-10-12; the numbering is Code only.*
   report, so a filter like "sms" finds them all.
 - Links are rebuilt per script on each parser run and stored in
   `caseresults.db` → `artifact_attachment_links`.
+
+**A-69. Duplicate detection.** *Decision; Confirmed (real) on CTF26,
+2026-10-16.*
+- A Process Case stage (`duplicate_scan.py`), run last. Files are grouped
+  by size + CRC32, both free from the central directory; only files that
+  land in a group are MD5-hashed to confirm, since CRC32 alone can collide.
+- Files sharing a trusted inode (A-67) are the same file, so they reuse
+  one MD5: CTF26 went from 121,382 reads to 42,492 with identical results.
+- Covers the whole archive, deliberately not limited to the scan folders:
+  an app's cached copy of a user photo can sit anywhere.
+- Candidates are resolved with `resolve()` + `getinfo()`, not
+  `build_zip_entries()`, which returns nothing for GrayKey (its paths
+  have a leading slash).
+- Results are kept in `casecache.db` → `duplicate_files` and loaded when
+  the case opens; nothing is recomputed on open. Running the stage again
+  clears and rebuilds them completely, so no stale group survives. That's
+  cheap: about 10 s for CTF26 (39 GB, 131,397 files).
+- The checkbox starts ticked for a new case and unticked once a complete
+  run's results are on record (*Decision, 2026-10-20*): the archive never
+  changes, so a later Process Case run shouldn't silently redo it. The run
+  log (`caseresults.db`) alone isn't enough, because `casecache.db` can be
+  recreated; the results must still be present too.
+
+**A-70. Duplicates are hidden only in the Media Browser.** *Decision (owner
+correction), 2026-10-17.*
+- The File Browser always lists every copy, with "Duplicate Count" and
+  "MD5" columns.
+- The Media Browser's "Hide Duplicates" (ticked by default) shows one
+  thumbnail per MD5 group: the first copy in the current view's own list,
+  not one chosen for the whole archive, which would make a file vanish
+  from a folder that only holds another copy.
+- Collapsing runs before the "seen" filter, so a group whose shown copy
+  is "Not Relevant" stays hidden rather than another copy surfacing.
+- While it's on:
+  - Bookmarking a shown copy bookmarks every copy archive-wide: fewer
+    thumbnails to review, but every location of an important file is
+    kept.
+  - "Not Relevant" marks every copy too, except bookmarked ones, in the
+    same Undo batch. Verified (real), CTF26: one 500-thumbnail page
+    marked 500 shown files plus 1,084 hidden copies.
+  - The bookmark panel shows "User Media (N · M to review)": N is what
+    clicking selects, M the thumbnails left after collapsing. Both use
+    `_collapse_duplicate_paths`, so M always equals the grid's count
+    (CTF26: 3,913 · 3,609).
+
+**A-71. The "User Media" count depends on header-scan types.** *Confirmed
+(real), CTF26, 2026-10-17.*
+- `_is_media_file` counts a header-detected picture or video as media, so
+  the count is only right once `_header_type_overrides` has loaded.
+- The panel used to count at tree-done, before the background load: CTF26
+  showed 1,294 while clicking selected 3,913 (0 vs 5,049 overrides).
+- The panel is now refreshed after that load and after every change to
+  the header types.
 
 ## 11. In-app format decoding
 

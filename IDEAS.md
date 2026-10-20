@@ -21,15 +21,16 @@ review, and in the one real case checked the earlier copy held nothing new
 **Sketch.**
 - After a parser runs, check each file it read (database, `-wal`, `-shm`,
   `-journal`) for a "capture" value in the metadata.
-- If any has an earlier capture, show a warning with the parser's results,
-  e.g. "An earlier capture of `Envelope Index-wal` exists (capture 1 of 2).
-  You may wish to review it in the SQLite viewer." Clicking the file name
-  jumps to it in the File Browser.
+- If any has an earlier capture, write a warning line to the **parser run
+  log** (the log pane of the Run Artifact Parsers dialog, fed by the
+  runner worker's `log` signal), e.g. "WARNING: an earlier capture of
+  `Envelope Index-wal` exists (capture 1 of 2). You may wish to review it
+  in the SQLite viewer."
 - Once idea 2 exists, use its verdict to say how much it matters (see the
   verdicts there), and stay quiet when the copies are identical.
 
-**Open.** Where the warning lives: the Artifact Viewer report header, the
-parser run log, or both.
+**Decided (owner, 2026-10-20):** the warning goes in the parser run log
+only, not in the Artifact Viewer report.
 
 ---
 

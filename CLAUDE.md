@@ -28,6 +28,7 @@ section map below instead of reading it whole.
 | `CLAUDE.md` (this file) | Code map and coding rules only. No facts or decision history. |
 | `WRITING_ARTIFACT_PARSERS.md` | How to write a parser, with examples. |
 | `VERIFICATION_STATUS.md` | Which parts a human has reviewed. |
+| `IDEAS.md` | Ideas not yet scheduled, with evidence and sketches. Not decisions. |
 | `FFS_processing.md` | Older processing walkthrough; `ASSUMPTIONS.md` §17 lists its known errors. |
 
 **`ASSUMPTIONS.md` is read-only.**

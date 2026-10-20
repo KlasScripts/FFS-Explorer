@@ -38,7 +38,11 @@ def _write_zip(path, entries):
         expected[name.decode('utf-8' if e.get('utf8') else 'cp437')] = len(body)
         body += data
         if e.get('descriptor'):
-            body += struct.pack('<4sIII', b'PK\x07\x08', crc, len(data), len(data))
+            if e.get('descriptor_zip64'):    # Cellebrite: 8-byte sizes, 24 bytes
+                body += struct.pack('<4sIQQ', b'PK\x07\x08', crc, len(data), len(data))
+            else:                            # 16 bytes
+                body += struct.pack('<4sIII', b'PK\x07\x08', crc, len(data), len(data))
+            body += e.get('after_descriptor', b'')   # GrayKey: the file's own hashes
         body += b'\0' * e.get('gap_after', 0)
         cd_extra = struct.pack('<HHQ', 1, 8, offset) if e.get('cd_zip64') else b''
         cd += struct.pack('<4sHHHHHHIIIHHHHHII', b'PK\x01\x02', 20, 20, flags, 0, 0,
@@ -74,6 +78,10 @@ def _count_header_reads(monkeypatch):
     return calls
 
 
+def _sample_bound(n_groups):
+    return zc._SAMPLE_SPREAD + n_groups * (zc._SAMPLE_PER_GROUP + 2) + 1
+
+
 def _entries(n, **per_entry):
     return [{'name': f'private/var/mobile/f{i:04}.bin'.encode(),
              'data': os.urandom(40 + i % 13),
@@ -88,9 +96,9 @@ def test_cd_zip64_past_4gib_boundary(tmp_path, monkeypatch):
     zip_path, infos, expected = _load(tmp_path, _entries(400, cd_zip64=lambda i: i >= 10))
     reads = _count_header_reads(monkeypatch)
     assert zc.compute_data_offsets(zip_path, infos) == expected
-    # Derived from the sidecar: only the one-off verification sample and the
-    # last entry need a real header read — not one read per entry.
-    assert len(reads) < 20
+    # Derived from the sidecar: only the one-off learning sample and the
+    # last entry need a real header read — a fixed bound, not one per entry.
+    assert len(reads) <= _sample_bound(n_groups=2)
 
 
 def test_local_only_zip64_mix_is_never_guessed(tmp_path):
@@ -151,3 +159,59 @@ def test_cached_views_share_load_index(tmp_path):
     assert a._by_name is b._by_name
     assert a.getinfo(infos[4].filename) is infos[4]
     assert a.namelist() == [i.filename for i in infos]
+
+
+# ── Data-descriptor layouts measured on real FFS zips (ASSUMPTIONS.md A-15) ──
+
+def _sha256(i):
+    import hashlib
+    return hashlib.sha256(str(i).encode()).digest()
+
+
+@pytest.mark.parametrize('label, per_entry', [
+    # Cellebrite: a ZIP64 sizes block in EVERY local header and a 24-byte
+    # ZIP64 descriptor after every entry; CD ZIP64 offset only past 4 GiB.
+    ('cellebrite', dict(local_zip64=lambda i: True, descriptor=lambda i: True,
+                        descriptor_zip64=lambda i: True, cd_zip64=lambda i: i >= 40)),
+    # GrayKey: a 16-byte descriptor + the file's SHA-256 on most entries.
+    ('graykey_sha256', dict(descriptor=lambda i: i % 4 != 0,
+                            after_descriptor=lambda i: _sha256(i), cd_zip64=lambda i: i >= 40)),
+    # GrayKey with SHA-256 + SHA-1 + MD5 after the descriptor (84 bytes).
+    ('graykey_three_hashes', dict(descriptor=lambda i: True,
+                                  after_descriptor=lambda i: _sha256(i) + b'\x11' * 36,
+                                  cd_zip64=lambda i: i >= 40)),
+])
+def test_tool_trailers_are_derived_not_read(tmp_path, monkeypatch, label, per_entry):
+    zip_path, infos, expected = _load(tmp_path, _entries(500, **per_entry))
+    reads = _count_header_reads(monkeypatch)
+    assert zc.compute_data_offsets(zip_path, infos) == expected
+    assert len(reads) <= _sample_bound(n_groups=4), label
+
+
+def test_unexpected_gap_after_a_trailer_is_read_not_guessed(tmp_path):
+    # 12 extra bytes after one entry: the size by which Cellebrite's two
+    # header shapes differ — the case a "known delta" check alone accepts.
+    entries = _entries(300, local_zip64=lambda i: True, descriptor=lambda i: True,
+                       descriptor_zip64=lambda i: True, cd_zip64=lambda i: i >= 100,
+                       gap_after=lambda i: 12 if i == 150 else 0)
+    zip_path, infos, expected = _load(tmp_path, entries)
+    assert zc.compute_data_offsets(zip_path, infos) == expected
+
+
+def test_one_oversized_descriptor_falls_back(tmp_path):
+    # A >4 GiB file gets a 24-byte ZIP64 descriptor among 16-byte ones.
+    entries = _entries(200, descriptor=lambda i: True, descriptor_zip64=lambda i: i == 77)
+    zip_path, infos, expected = _load(tmp_path, entries)
+    assert zc.compute_data_offsets(zip_path, infos) == expected
+
+
+def test_gap_equal_to_header_shape_difference_is_read_not_guessed(tmp_path):
+    # GrayKey shape, no descriptors: deltas 0 (before 4 GiB) and -12 (past
+    # it). 12 stray bytes after a past-4-GiB entry make its derived offset
+    # imply delta 0 — a delta that DOES occur, so a "known delta" check
+    # accepts it 12 bytes off. The learned per-group delta + trailer check
+    # sees a 12-byte trailer where 0 is expected and reads the header.
+    entries = _entries(300, cd_zip64=lambda i: i >= 100,
+                       gap_after=lambda i: 12 if i == 150 else 0)
+    zip_path, infos, expected = _load(tmp_path, entries)
+    assert zc.compute_data_offsets(zip_path, infos) == expected

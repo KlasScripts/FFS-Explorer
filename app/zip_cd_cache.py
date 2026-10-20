@@ -326,37 +326,55 @@ class CachedZipView:
 # still trusted a random 5-entry sample, so a group mixing local-header
 # shapes the CD can't see could still go wrong — and nondeterministically.
 #
-# Instead, the layout is read off the sidecar itself: entries are stored
-# back to back, so an entry's data ENDS where the next entry's local header
-# begins (sorted by header_offset), and therefore STARTS at
-#     next_header_offset - compress_size
-# — exact per entry, deterministic, zero archive I/O. Not derivable, so
-# resolved by reading the entry's own local header instead (exactly what
-# ZipEntry does on every read anyway):
-#   * the last entry (the .zcd doesn't keep the real CD start offset),
-#   * entries with a data descriptor (flag bit 3 — trailer size varies),
-#   * any result implying an impossible local extra length (a gap between
-#     entries, or a hand-built CD),
-#   * any entry whose stored name length can't be reproduced.
-# The derived layout is spot-checked ONCE per archive per session against
-# real local headers (deterministic sample, every ZIP64 group covered); a
-# single mismatch disables it for that archive and everything is read from
-# local headers — slower, never wrong. The check also records which
-# CD→local extra deltas genuinely occur; a derived offset implying any OTHER
-# delta (a gap after that entry, or a local-header shape the sample never
-# hit) is read from its header rather than trusted.
+# Instead, the layout is read off the sidecar itself. Entries are stored
+# back to back (sorted by header_offset), so for every entry
+#     next_header_offset = data_offset + compress_size + trailer
+# where data_offset = header_offset + 30 + name length + LOCAL extra length,
+# and "trailer" is whatever the tool writes after the data: nothing, or a
+# data descriptor (flag bit 3) the acquisition tool appends because it
+# streams each file before knowing its CRC and size. Measured on real FFS
+# zips (2026-10-20, ASSUMPTIONS.md A-15): Cellebrite writes a 24-byte ZIP64
+# descriptor after EVERY entry; GrayKey writes a 16-byte descriptor followed
+# by the file's own SHA-256 (48 bytes), or SHA-256 + SHA-1 + MD5 (84 bytes),
+# on most entries. Both unknowns are learned per archive, then CHECKED
+# against each other for every entry:
+#   * the local extra length = the CD's own extra length + a delta that
+#     depends only on the CD ZIP64 block's length (the local header lacks
+#     the CD's header-offset field; Cellebrite's local header carries its
+#     own ZIP64 sizes block) — one delta per ZIP64-block length;
+#   * the trailer length — one per "has a data descriptor" class.
+# Given the delta, the trailer an entry implies is exact; the entry is
+# derived only if that equals the learned trailer for its class. Anything
+# else — an unexpected local-header shape, a gap, a different descriptor
+# size (a >4 GiB file's ZIP64 descriptor) — shows up as a trailer mismatch
+# and is read from the entry's own local header instead (what ZipEntry does
+# on every read anyway). Also read from their headers: the last entry (the
+# .zcd doesn't keep the real CD start offset) and any entry whose stored
+# name length can't be reproduced.
+#
+# Learned ONCE per archive per session from real local headers: the first
+# and last entry plus an even spread of every (ZIP64-block length,
+# descriptor) group, and an even spread of the whole archive. A group whose
+# sample shows more than one delta, or a class with more than one trailer
+# length, is never derived — slower for those entries, never wrong. The
+# only way a derived offset can be wrong is two independent anomalies on
+# the SAME entry cancelling exactly (an unseen header shape AND an unseen
+# trailer size differing by the same number of bytes); none of 2.16 million
+# real entries checked showed even one.
 
-_VERIFY_SPREAD = 8   # evenly spaced entries checked, plus first/last of each group
+_SAMPLE_SPREAD = 64      # evenly spaced entries across the whole archive
+_SAMPLE_PER_GROUP = 16   # evenly spaced per (ZIP64 length, descriptor) group
 
 
 class _Layout:
-    __slots__ = ('offsets', 'infos', 'trusted', 'deltas')
+    __slots__ = ('offsets', 'infos', 'trusted', 'delta_by_zip64', 'trailer_by_dd')
 
     def __init__(self, offsets, infos):
         self.offsets = offsets   # sorted array('Q') of every header_offset
-        self.infos   = infos     # the full list it came from (for verification)
-        self.trusted = None      # None = not yet verified, then True/False
-        self.deltas: set[int] = set()   # CD→local extra deltas confirmed real
+        self.infos   = infos     # the full list it came from (for learning)
+        self.trusted = None      # None = not yet learned, then True/False
+        self.delta_by_zip64: dict[int, int] = {}   # CD ZIP64 block length -> local-CD extra delta
+        self.trailer_by_dd: dict[bool, int] = {}   # has data descriptor -> bytes after the data
 
 
 _layouts: dict[str, _Layout] = {}
@@ -388,34 +406,16 @@ def _name_len(info: zipfile.ZipInfo) -> int:
 
 
 def _zip64_len(extra: bytes) -> int:
+    """Length of the ZIP64 (0x0001) block's data in an extra field, 0 if
+    absent. -1 if the extra field is malformed (never derived)."""
     off = 0
-    while off + 4 <= len(extra):
+    n = len(extra)
+    while off + 4 <= n:
         tag, size = struct.unpack_from('<HH', extra, off)
         if tag == 0x0001:
             return size
         off += 4 + size
-    return 0
-
-
-def _derived_offset(layout: _Layout, info: zipfile.ZipInfo,
-                    require_known_delta: bool = True) -> int | None:
-    """Data offset from the sidecar layout alone, or None if not derivable
-    (or, once verified, if it implies a delta no real header showed)."""
-    if info.flag_bits & 0x08:
-        return None
-    name_len = _name_len(info)
-    if name_len < 0:
-        return None
-    k = bisect_right(layout.offsets, info.header_offset)
-    if k >= len(layout.offsets):
-        return None                              # last entry
-    data_off = layout.offsets[k] - info.compress_size
-    local_extra = data_off - info.header_offset - 30 - name_len
-    if not 0 <= local_extra <= 0xFFFF:
-        return None
-    if require_known_delta and local_extra - len(info.extra) not in layout.deltas:
-        return None
-    return data_off
+    return 0 if off == n else -1
 
 
 def _header_offset_read(fh, info: zipfile.ZipInfo) -> int:
@@ -424,31 +424,46 @@ def _header_offset_read(fh, info: zipfile.ZipInfo) -> int:
     return info.header_offset + 30 + fname_len + extra_len
 
 
-def _verify_layout(fh, layout: _Layout) -> bool:
-    """Compare derived offsets with real local headers for a deterministic
-    sample: evenly spread entries plus the first and last of every CD ZIP64
-    group (the group boundary is exactly where the old bug lived)."""
+def _learn_layout(fh, layout: _Layout) -> bool:
+    """Read real local headers for a deterministic sample and record, per
+    group, the one delta / trailer length they show (see the section
+    comment). Returns False when nothing usable was learned."""
     order = sorted(layout.infos, key=lambda i: i.header_offset)
+    nxt = {a.header_offset: b.header_offset for a, b in zip(order, order[1:])}
     picks: dict[int, zipfile.ZipInfo] = {}
-    n = len(order)
-    for s in range(_VERIFY_SPREAD):
-        info = order[(s * (n - 1)) // max(_VERIFY_SPREAD - 1, 1)]
-        picks[info.header_offset] = info
-    seen: dict[int, list] = {}
+
+    def spread(seq, k):
+        n = len(seq)
+        for s in range(min(k, n)):
+            info = seq[(s * (n - 1)) // max(k - 1, 1)]
+            picks[info.header_offset] = info
+
+    spread(order, _SAMPLE_SPREAD)
+    groups: dict[tuple, list] = {}
     for info in order:
-        seen.setdefault(_zip64_len(info.extra), []).append(info)
-    for group in seen.values():
+        groups.setdefault((_zip64_len(info.extra), bool(info.flag_bits & 0x08)), []).append(info)
+    for group in groups.values():
         picks[group[0].header_offset] = group[0]
         picks[group[-1].header_offset] = group[-1]
+        spread(group, _SAMPLE_PER_GROUP)
+
+    deltas: dict[int, set] = {}
+    trailers: dict[bool, set] = {}
     for info in picks.values():
-        derived = _derived_offset(layout, info, require_known_delta=False)
-        if derived is None:
+        z64 = _zip64_len(info.extra)
+        name_len = _name_len(info)
+        if z64 < 0 or name_len < 0:
             continue
-        if derived != _header_offset_read(fh, info):
-            return False
-        layout.deltas.add(derived - info.header_offset - 30
-                          - _name_len(info) - len(info.extra))
-    return bool(layout.deltas)
+        data_off = _header_offset_read(fh, info)
+        deltas.setdefault(z64, set()).add(
+            data_off - info.header_offset - 30 - name_len - len(info.extra))
+        if info.header_offset in nxt:
+            trailers.setdefault(bool(info.flag_bits & 0x08), set()).add(
+                nxt[info.header_offset] - data_off - info.compress_size)
+    layout.delta_by_zip64 = {k: next(iter(v)) for k, v in deltas.items() if len(v) == 1}
+    layout.trailer_by_dd = {k: next(iter(v)) for k, v in trailers.items()
+                            if len(v) == 1 and next(iter(v)) >= 0}
+    return bool(layout.delta_by_zip64 and layout.trailer_by_dd)
 
 
 def probe_delta(zip_path: str, infos: list[zipfile.ZipInfo]) -> None:
@@ -477,27 +492,29 @@ def compute_data_offsets(
     try:
         with open(zip_path, 'rb') as fh:
             if layout is not None and layout.trusted is None:
-                layout.trusted = _verify_layout(fh, layout)
+                layout.trusted = _learn_layout(fh, layout)
                 if not layout.trusted:
-                    print(f"[zip_cd_cache] sidecar layout of {zip_path} did not "
-                          "match its local headers — reading headers per entry")
+                    print(f"[zip_cd_cache] no consistent layout learned for {zip_path} "
+                          "— reading every local header (correct, just slower)")
             if layout is not None and layout.trusted:
-                # _derived_offset() inlined: this loop runs over every stored
-                # entry of an 800k-entry archive at load and on every export.
-                offs, n_offs, deltas = layout.offsets, len(layout.offsets), layout.deltas
+                # Inlined: this loop runs over every stored entry of an
+                # 800k-entry archive when the keyword-search index is built.
+                offs, n_offs = layout.offsets, len(layout.offsets)
+                delta_by_zip64, trailer_by_dd = layout.delta_by_zip64, layout.trailer_by_dd
                 for info in infos:
-                    if info.flag_bits & 0x08:
-                        unresolved.append(info)
-                        continue
+                    trailer = trailer_by_dd.get(bool(info.flag_bits & 0x08))
+                    extra = info.extra
+                    delta = delta_by_zip64.get(_zip64_len(extra) if extra else 0)
                     name = info.filename
                     name_len = len(name) if name.isascii() else _name_len(info)
                     k = bisect_right(offs, info.header_offset)
-                    if name_len < 0 or k >= n_offs:
+                    if trailer is None or delta is None or name_len < 0 or k >= n_offs:
                         unresolved.append(info)
                         continue
-                    data_off = offs[k] - info.compress_size
-                    local_extra = data_off - info.header_offset - 30 - name_len
-                    if 0 <= local_extra <= 0xFFFF and local_extra - len(info.extra) in deltas:
+                    local_extra = len(extra) + delta
+                    data_off = info.header_offset + 30 + name_len + local_extra
+                    if (0 <= local_extra <= 0xFFFF
+                            and offs[k] - data_off - info.compress_size == trailer):
                         result[name] = data_off
                     else:
                         unresolved.append(info)

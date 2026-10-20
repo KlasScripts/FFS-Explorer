@@ -21,7 +21,7 @@ from zip_cd_cache import CachedZipView, load as _zcd_load, compute_data_offsets 
 from zip_entry import ZipEntry
 from zip_reader import ZipReader, read_nested_entry
 
-_SEARCH_ENTRIES_VERSION = '1'
+_SEARCH_ENTRIES_VERSION = '2'   # 2: offsets past the 4 GiB ZIP64 boundary were 12 bytes off
 
 # Cellebrite internal metadata entries — excluded from "all files" searches.
 _CELLEBRITE_META_PREFIXES = ('metadata1/', 'metadata2/')

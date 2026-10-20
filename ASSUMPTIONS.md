@@ -260,7 +260,7 @@ calculation 12 bytes wrong for one group of entries. Fixed in
 **A-17. CRC is not verified on reads.** *Decision, not a fact.*
 Deliberate, for speed. It is acceptable only because acquisition integrity is
 established separately: the integrity check compares the whole zip's SHA256
-with the capture record (A-4 table). If that check isn't run, nothing detects
+with the capture record (section 4 table). If that check isn't run, nothing detects
 a corrupted entry.
 
 **A-18. The main zip is never read with raw `zipfile`.** *Decision.*

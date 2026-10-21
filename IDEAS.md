@@ -124,3 +124,33 @@ containers, never in Selected Files.
 
 **Check first.** What export and reports do with hidden columns. Hidden must
 never mean dropped from an export without asking.
+
+---
+
+## 4. Link every artifact report to the media files it mentions
+
+**Decided (owner, 2026-10-21):** all artifact reports should link to the
+files they reference through the File Browser's "Linked Report" column
+(ASSUMPTIONS.md A-41), not just iOS SMS, where it was built and checked.
+
+**Where it stands.** Linking is generic: after a parser runs, every row
+with a path in a declared `media_fields` column is linked
+(`artifact_viewer._register_attachment_links`). So:
+
+| Parsers | `media_fields` | Links checked on real data |
+|---|---|---|
+| iOS `sms_messages` | yes | yes (one run, 2026-10-12) |
+| iOS `whatsapp`, `photos_metadata`; Android `google_messages`, `whatsapp`, `chrome_cache_pages`, `chrome_cache_media`, `chrome_favicons`, `chrome_offline_pages` | yes | no |
+| The other 30 parsers (iOS 4, Android 26) | none | n/a |
+
+**Work.**
+1. Run each of the 8 unchecked parsers on a real case that has the app;
+   confirm linked files show the right report row (row id names the same
+   record). Fix any that don't.
+2. Go through the 30 without `media_fields`: for each, check whether its
+   rows name files in the archive (attachments, voice notes, avatars,
+   downloads, cached pages). Where they do, build the full ui_path in
+   `run()` and declare `media_fields`, checking the database column
+   against the real schema first (WRITING_ARTIFACT_PARSERS.md).
+3. Mark each parser's status here (or in VERIFICATION_STATUS.md) as it's
+   done.

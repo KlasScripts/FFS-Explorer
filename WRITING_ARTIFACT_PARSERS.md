@@ -158,6 +158,15 @@ database value, not a filesystem path) to a media file. The Report table
 then shows a thumbnail there, with double-click opening it full-size or
 playing it. Build the ui_path in `run()`:
 
+**Required whenever the report points at files** (owner, 2026-10-21;
+ASSUMPTIONS.md A-41): every parser whose rows name an attachment, photo,
+video, voice note or other file in the archive must declare it here. This
+is also what fills the File Browser's "Linked Report" column, so an
+examiner looking at a media file can see which report row mentions it.
+Check the links on a real case before shipping: run the parser, then
+confirm in the File Browser that a linked file's "Linked Report" names the
+right row.
+
 ```python
 attachment_path = f"{paths['_app_base_ui_path']}/{row['media_column']}"
 ```

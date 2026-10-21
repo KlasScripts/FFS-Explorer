@@ -743,6 +743,16 @@ order.** *Decision, 2026-10-12; the numbering is Code only.*
   report, so a filter like "sms" finds them all.
 - Links are rebuilt per script on each parser run and stored in
   `caseresults.db` → `artifact_attachment_links`.
+- *Decision (owner), 2026-10-21:* every artifact report whose rows point at
+  files in the archive must link them this way, not just iOS SMS. The
+  mechanism is already generic (any parser declaring `media_fields`), but:
+  - 9 parsers declare `media_fields` (iOS: sms_messages, whatsapp,
+    photos_metadata; Android: google_messages, whatsapp, chrome_cache_pages,
+    chrome_cache_media, chrome_favicons, chrome_offline_pages); only iOS SMS
+    has been checked on real data;
+  - the other 30 parsers declare none; any that reference files need it.
+  Tracked in IDEAS.md idea 4; the rule for new parsers is in
+  WRITING_ARTIFACT_PARSERS.md (`media_fields`).
 
 **A-69. Duplicate detection.** *Decision; Confirmed (real) on CTF26,
 2026-10-16.*

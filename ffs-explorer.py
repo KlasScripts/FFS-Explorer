@@ -10549,11 +10549,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     partial(self._toggle_embedded_media_skip_list, ui_path, on_list))
                 menu.addAction(skip_act)
 
-        # Bookmarks submenu
-        bm_paths = self._get_paths_for_bookmark()
-        if bm_paths:
+        # Bookmarks submenu — paths resolved only when a bookmark action is
+        # actually clicked (the callable form), same as the folder tree's own
+        # menu. Resolving them here asked the "include subfolders?" question
+        # the moment the menu opened whenever the selection held a folder
+        # with subfolders (owner report, 2026-10-21: "it does not make sense").
+        if self.file_view.selectionModel().selectedRows():
             menu.addSeparator()
-            self._bookmark_submenu(menu, bm_paths)
+            self._bookmark_submenu(menu, self._get_paths_for_bookmark)
 
         # User Media ignore list — added 2026-09-27, direct request:
         # "i also wa[n]t to be able to select a folder and file [and] be

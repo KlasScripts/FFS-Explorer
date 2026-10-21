@@ -37,21 +37,20 @@ ACTIVE_BUTTON_STYLE = (
 )
 
 
-_FUSION_STYLE = None
-
-
 def show_item_checkboxes(view) -> None:
     """Give an item view (QListWidget/QTreeView/...) the Fusion style so its
     item checkboxes are drawn. On macOS, QMacStyle draws an item's tick only
     while that row is selected (ASSUMPTIONS.md A-61) — reproduced 2026-10-21
-    on a Columns-dialog list: only the current row showed a tick. One shared
-    style object, created on first use and kept alive for the process
-    (setStyle doesn't take ownership)."""
-    global _FUSION_STYLE
-    if _FUSION_STYLE is None:
-        _FUSION_STYLE = QStyleFactory.create("Fusion")
-    if _FUSION_STYLE is not None:
-        view.setStyle(_FUSION_STYLE)
+    on a Columns-dialog list: only the current row showed a tick.
+
+    One style object PER VIEW, parented to it, so it lives exactly as long as
+    the view. A single shared style was tried first and was wrong: Qt deleted
+    it along with the first dialog's list, and every later dialog then
+    crashed with "Internal C++ object (QCommonStyle) already deleted"."""
+    style = QStyleFactory.create("Fusion")
+    if style is not None:
+        style.setParent(view)
+        view.setStyle(style)
 
 
 def error_label() -> QLabel:

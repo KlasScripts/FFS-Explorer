@@ -30,7 +30,8 @@ from artifact_media import (
 # artifact_media.py, where it originally lived as this file's own single
 # caller.
 from media_viewer import MediaFullViewDialog
-from dialog_helpers import note_label, error_label, ERROR_STYLE, WARNING_COLOR, ACTIVE_BUTTON_STYLE
+from dialog_helpers import (note_label, error_label, show_item_checkboxes,
+                            ERROR_STYLE, WARNING_COLOR, ACTIVE_BUTTON_STYLE)
 import validation_store
 import parser_validation
 import parser_versions
@@ -2596,6 +2597,7 @@ class ArtifactViewerMixin:
         lay.addLayout(preset_row)
 
         lst = QListWidget()
+        show_item_checkboxes(lst)
         lst.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         lst.setDefaultDropAction(Qt.DropAction.MoveAction)
         for name in order:

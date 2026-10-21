@@ -74,7 +74,8 @@ from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
 from leveldb_viewer import LevelDbViewerMixin, _looks_like_leveldb_dir
 from timestamp_display import TimestampDisplayMixin
-from dialog_helpers import button_row, error_label, note_label, WARNING_STYLE, ACTIVE_COLOR, ERROR_COLOR
+from dialog_helpers import (button_row, error_label, note_label, show_item_checkboxes,
+                            WARNING_STYLE, ACTIVE_COLOR, ERROR_COLOR)
 import research_store as _research
 from artifact_db import load_artifact_results
 from zip_reader import read_nested_entry
@@ -3116,6 +3117,7 @@ class ImportBookmarksDialog(QDialog):
         gv_btn_row.addStretch()
         gv_layout.addLayout(gv_btn_row)
         self._group_values_list = QListWidget()
+        show_item_checkboxes(self._group_values_list)
         self._group_values_list.setMaximumHeight(120)
         gv_layout.addWidget(self._group_values_list)
         form.addRow(self._group_values_box)
@@ -5075,6 +5077,7 @@ class FilterSortPresetDialog(QDialog):
         type_box = QGroupBox("File Type")
         type_v = QVBoxLayout(type_box)
         self.type_list = QListWidget()
+        show_item_checkboxes(self.type_list)
         self.type_list.setMaximumHeight(110)
         for v in sorted(type_values):
             item = QListWidgetItem(v)
@@ -8322,6 +8325,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         note.setWordWrap(True)
         lay.addWidget(note)
         lst = QListWidget()
+        show_item_checkboxes(lst)
         lst.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         lst.setDefaultDropAction(Qt.DropAction.MoveAction)
         # List in the on-screen (visual) order — the tickbox column

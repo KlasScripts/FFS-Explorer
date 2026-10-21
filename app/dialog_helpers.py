@@ -13,7 +13,7 @@ Pure Qt-widget construction — no case/business logic — so any dialog
 anywhere in the app can use these with no dependency on case state.
 """
 
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QStyleFactory
 
 WARNING_COLOR = "#b8860b"   # amber — matches research_store.py's REVIEW_COLOR
 ERROR_COLOR   = "#c62828"   # red — matches research_store.py's OUTCOME_COLORS["no_value"]
@@ -35,6 +35,23 @@ ACTIVE_BUTTON_STYLE = (
     f"QPushButton:hover {{ background-color: {ACTIVE_COLOR}; color: white; }} "
     f"QPushButton:pressed {{ background-color: {ACTIVE_COLOR}; color: white; }}"
 )
+
+
+_FUSION_STYLE = None
+
+
+def show_item_checkboxes(view) -> None:
+    """Give an item view (QListWidget/QTreeView/...) the Fusion style so its
+    item checkboxes are drawn. On macOS, QMacStyle draws an item's tick only
+    while that row is selected (ASSUMPTIONS.md A-61) — reproduced 2026-10-21
+    on a Columns-dialog list: only the current row showed a tick. One shared
+    style object, created on first use and kept alive for the process
+    (setStyle doesn't take ownership)."""
+    global _FUSION_STYLE
+    if _FUSION_STYLE is None:
+        _FUSION_STYLE = QStyleFactory.create("Fusion")
+    if _FUSION_STYLE is not None:
+        view.setStyle(_FUSION_STYLE)
 
 
 def error_label() -> QLabel:

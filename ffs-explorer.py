@@ -7998,6 +7998,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Hidden-column names for the selected-files (aggregate) view —
         # remembered across rebuilds; plain folder views always reset.
         self._agg_hidden_columns: set[str] = set()
+        # Columns with no value for any file in the current view, hidden
+        # automatically (owner request, 2026-10-21: "hide column that have
+        # no data at all with that specific set of files"). Never stored in
+        # a saved folder layout, so a column that later gains data is never
+        # kept hidden by it. _empty_columns_shown: columns the examiner chose
+        # to show anyway (ticked in the Columns dialog), for the session.
+        self._auto_empty_columns: set[str] = set()
+        self._empty_columns_shown: set[str] = set()
         self.columns_btn = QPushButton("Columns…")
         self.columns_btn.setToolTip(
             "Show or hide columns in the current view.\n"
@@ -8191,13 +8199,38 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             hidden = getattr(self, '_agg_hidden_columns', set())
         else:
             hidden = set()
+        self._auto_empty_columns = self._empty_columns() - self._empty_columns_shown
         # Column 0 is the synthetic far-left tickbox column (see
         # FileTableModel._checked_paths) — permanently visible, real
         # headers shifted +1 in the view/model's own column space.
         self.file_view.setColumnHidden(0, False)
         for i, h in enumerate(headers):
-            self.file_view.setColumnHidden(i + 1, h in hidden)
+            self.file_view.setColumnHidden(
+                i + 1, h in hidden or h in self._auto_empty_columns)
         self._update_columns_indicator()
+
+    # A cell counts as "no data" when blank, or '---' (a timestamp that isn't
+    # set). '0' is real data (e.g. a zero-byte file's size).
+    _NO_DATA_VALUES = frozenset(('', '---'))
+
+    def _empty_columns(self) -> set[str]:
+        """Headers with no value for ANY row the current view loaded (all
+        rows, not just those a text filter shows, so filtering never changes
+        which columns exist). Name is never included; an empty view hides
+        nothing. Each column stops at its first real value, so only truly
+        empty columns are scanned in full."""
+        model = getattr(self, 'file_model', None)
+        rows = getattr(model, '_all_rows', None) if model is not None else None
+        if not rows:
+            return set()
+        no_data = self._NO_DATA_VALUES
+        empty = set()
+        for i, h in enumerate(model._headers):
+            if h == 'Name':
+                continue
+            if all(str(r[0][i]) in no_data for r in rows):
+                empty.add(h)
+        return empty
 
     # ── Column ordering & per-folder layouts (persisted) ──────────────────────
 
@@ -8294,15 +8327,23 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not hasattr(self, 'columns_btn') or not hasattr(self, 'file_view'):
             return
         headers = self.file_model._headers
+        empty = getattr(self, '_auto_empty_columns', set())
         hidden_names = [headers[i] for i in range(len(headers))
-                        if self.file_view.isColumnHidden(i + 1)]
+                        if self.file_view.isColumnHidden(i + 1) and headers[i] not in empty]
+        empty_names = [h for h in headers if h in empty]
         saved = self._current_folder_config() is not None
+        parts = []
         if hidden_names:
-            self.columns_btn.setText(f"Columns ⊘{len(hidden_names)}")
-            tip = "Hidden: " + ", ".join(hidden_names)
-        else:
-            self.columns_btn.setText("Columns…")
-            tip = "Show, hide or reorder columns in the current view."
+            parts.append(f"⊘{len(hidden_names)}")
+        if empty_names:
+            parts.append(f"{len(empty_names)} empty hidden")
+        self.columns_btn.setText("Columns " + " · ".join(parts) if parts else "Columns…")
+        tips = []
+        if hidden_names:
+            tips.append("Hidden by you: " + ", ".join(hidden_names))
+        if empty_names:
+            tips.append("Hidden because no file here has a value: " + ", ".join(empty_names))
+        tip = "\n".join(tips) or "Show, hide or reorder columns in the current view."
         if saved:
             tip += "\nLayout saved for this folder."
         self.columns_btn.setToolTip(tip)
@@ -8335,7 +8376,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             logical = header_view.logicalIndex(v)
             if logical == 0:
                 continue
-            item = QListWidgetItem(headers[logical - 1])
+            name = headers[logical - 1]
+            empty_here = name in self._auto_empty_columns
+            item = QListWidgetItem(f"{name}  (empty here)" if empty_here else name)
+            item.setData(Qt.ItemDataRole.UserRole, name)   # the real column name
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
                 Qt.CheckState.Unchecked
@@ -8343,12 +8387,27 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 else Qt.CheckState.Checked)
             lst.addItem(item)
 
+        def _col(i):
+            return lst.item(i).data(Qt.ItemDataRole.UserRole)
+
         def _on_item_changed(item):
-            name = item.text()
+            name = item.data(Qt.ItemDataRole.UserRole)
             if name not in headers:
                 return
             logical = headers.index(name) + 1
             hide = item.checkState() != Qt.CheckState.Checked
+            if name in self._auto_empty_columns or name in self._empty_columns_shown:
+                # An empty column: showing/hiding it is a session choice,
+                # never written into a saved folder layout.
+                if hide:
+                    self._empty_columns_shown.discard(name)
+                    self._auto_empty_columns.add(name)
+                else:
+                    self._empty_columns_shown.add(name)
+                    self._auto_empty_columns.discard(name)
+                self.file_view.setColumnHidden(logical, hide)
+                self._update_columns_indicator()
+                return
             self.file_view.setColumnHidden(logical, hide)
             cfg = self._current_folder_config()
             if cfg is not None:
@@ -8362,7 +8421,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._update_columns_indicator()
 
         def _on_reordered(*_):
-            self._commit_order([lst.item(i).text() for i in range(lst.count())])
+            self._commit_order([_col(i) for i in range(lst.count())])
             self._apply_column_order()
 
         def _move_current(delta: int):
@@ -8383,9 +8442,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             has_cfg = self._current_folder_config() is not None
 
             def _save_for_folder():
-                order  = [lst.item(i).text() for i in range(lst.count())]
-                hidden = [lst.item(i).text() for i in range(lst.count())
-                          if lst.item(i).checkState() != Qt.CheckState.Checked]
+                order  = [_col(i) for i in range(lst.count())]
+                hidden = [_col(i) for i in range(lst.count())
+                          if lst.item(i).checkState() != Qt.CheckState.Checked
+                          and _col(i) not in self._auto_empty_columns]
                 self._folder_column_configs[self._view_path] = {
                     'order': order, 'hidden': hidden}
                 self._save_folder_configs()
@@ -10325,6 +10385,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     _model.filter_done.connect(_on_filter_done_select)
                 if not self._apply_active_filter(_filter_args) and select_path:
                     self._select_file_by_path(select_path)
+                self._apply_column_visibility()   # now that every row is in
                 self._refresh_table_status()
                 extra_note = f" + {total_extra:,} individually-ticked file(s)" if total_extra else ""
                 self.status_bar.showMessage(
@@ -12727,6 +12788,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                         self.file_view.verticalScrollBar().setValue(_scroll_val)
                     if select_path:
                         self._select_file_by_path(select_path)
+                self._apply_column_visibility()   # now that every row is in
                 self._refresh_table_status()
                 # Refresh the Media tab, if it's visible, only once the
                 # WHOLE recursive listing has actually loaded — added

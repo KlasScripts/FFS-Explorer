@@ -100,9 +100,11 @@ capture...). Examiners hide columns to cope, and a hidden column with values
 in it looks exactly like no data. Today the Columns button shows only how many
 are hidden ("Columns ⊘3") and their names, not whether they hold anything.
 
-**Current preference (owner, 2026-10-21):** hide nothing automatically; the
-examiner hides columns by hand. That is how the app already behaves. These
-are parked, not rejected.
+**Built 2026-10-21 (owner request):** columns with no value for any file in
+the current view are hidden automatically, the Columns button says how many
+("Columns · 6 empty hidden"), the dialog labels them "(empty here)", and
+they're never written into a saved folder layout. Columns with data are
+never hidden automatically. The other options below are still parked.
 
 **How columns appear today (from the code).** A column is shown if any file
 in the view has the data (photo columns, UUID), or if the case has the data
@@ -117,8 +119,6 @@ containers, never in Selected Files.
 - When a hidden column has values in the current view, the Columns button
   turns to a warning colour, "Columns ⊘2 · data hidden", with a tooltip of
   counts. This also catches saved per-folder layouts hiding data later.
-- Collapse columns that are empty for every file in the view, and say so
-  ("3 empty columns hidden"). Never hide a column that has values.
 - Default order (Name, Type, Size, Modified, Path first), related columns
   grouped, one-click show/hide per group.
 

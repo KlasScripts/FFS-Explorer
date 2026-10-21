@@ -275,8 +275,12 @@ real.** *Confirmed (real), 2026-10-16.*
   it. A copy with no WAL of its own says so, and names the capture that has
   one.
 - Parsers use only the real-named (latest) set by default; earlier captures
-  are skipped by `is_capture_alias`. Re-running a parser on an earlier
-  capture is planned, not built.
+  are skipped by `is_capture_alias`. *Decision (owner), 2026-10-21:* no
+  automatic re-run on earlier captures. Instead the parser run log (only
+  there) warns for each file a parser read — or that file's -wal/-shm/
+  -journal — that has an earlier capture, naming the copy to review.
+  Verified: SMS parser on IOS18 warns for sms.db and sms.db-wal; on IOS17
+  (Cellebrite) no warning.
 - Verified on IOS18 and CTF26: every renamed copy reads at the right offset
   with a matching CRC; no file path is repeated after renaming; the four
   Cellebrite archives are unchanged.

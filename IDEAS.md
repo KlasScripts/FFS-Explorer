@@ -9,6 +9,10 @@ once an idea is agreed and built, its decisions move to `ASSUMPTIONS.md`.
 
 ## 1. Warn when a parser reads a file that has an earlier capture
 
+**Built 2026-10-21** (`artifact_viewer._earlier_capture_warnings`); the
+decision is recorded in ASSUMPTIONS.md A-72. Kept here until idea 2 can
+set how loud the warning is.
+
 **Why.** GrayKey can store a path twice (ASSUMPTIONS.md A-72). Parsers read
 only the latest copy. The examiner should know when an earlier copy of a
 file a parser used exists, and decide whether to look at it.

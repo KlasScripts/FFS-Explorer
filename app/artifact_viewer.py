@@ -20,7 +20,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
 
 from db_utils import _open_results_db, start_run_log, complete_run_log, load_last_run
-from zip_cd_cache import CachedZipView, load as _zcd_load
+from zip_cd_cache import CachedZipView, load as _zcd_load, is_capture_alias, capture_marker
 from highlight_delegate import HighlightDelegate
 from artifact_media import (
     MediaThumbnailDelegate, WebpageThumbnailRenderer, THUMB_CELL_SIZE,
@@ -547,6 +547,48 @@ _ART_FILES  = "__art_files__:"
 _ART_VALIDATION = "__art_validation__:"
 
 
+class _RecordingZipView:
+    """Wraps the CachedZipView a parser run reads through and records every
+    entry name it asks for — every artifact_runner read goes through
+    getinfo() (see ArtifactRunnerWorker.run), so this sees exactly which
+    files a parser touched without changing any parser."""
+
+    def __init__(self, view):
+        self._view = view
+        self.touched: set[str] = set()
+
+    def getinfo(self, name):
+        self.touched.add(name)
+        return self._view.getinfo(name)
+
+    def __getattr__(self, attr):
+        return getattr(self._view, attr)
+
+
+def _earlier_capture_warnings(touched, earlier: dict) -> list[str]:
+    """Run-log lines for files a parser read that have an earlier capture in
+    the zip (ASSUMPTIONS.md A-72) — the file itself, or its -wal/-shm/
+    -journal, since an earlier capture of a sidecar holds an earlier state
+    of the same database. *earlier* maps a real entry name to the names
+    zip_cd_cache gave its earlier copies. Parsers read only the latest copy;
+    this tells the examiner the others exist (owner's decision, run log
+    only, 2026-10-20)."""
+    lines = []
+    seen = set()
+    for name in sorted(touched):
+        for cand in (name, name + '-wal', name + '-shm', name + '-journal'):
+            if cand in seen or cand not in earlier:
+                continue
+            seen.add(cand)
+            copies = ', '.join(c.rsplit('/', 1)[-1] for c in earlier[cand])
+            caps = ', '.join(capture_marker(c).strip(' []') for c in earlier[cand])
+            lines.append(
+                f"  WARNING: an earlier capture of {cand.lstrip('/')} exists "
+                f"({caps}). This parser read only the latest copy. You may "
+                f"wish to review the earlier one: {copies}")
+    return lines
+
+
 class ArtifactRunnerWorker(QThread):
     log  = Signal(str)
     done = Signal()
@@ -595,10 +637,18 @@ class ArtifactRunnerWorker(QThread):
             self.done.emit()
             return
 
+        # Real entry name -> the names of its earlier captures (A-72).
+        # Empty for almost every archive, and then nothing is wrapped.
+        earlier: dict[str, list[str]] = {}
+        for info in infos:
+            if is_capture_alias(info.filename):
+                earlier.setdefault(info.orig_filename, []).append(info.filename)
+
         try:
             for script_name, module in self._selected:
                 label = getattr(module, 'name', script_name)
                 self.log.emit(f"Running: {label}…")
+                reader = _RecordingZipView(zip_obj) if earlier else zip_obj
                 run_id = None
                 try:
                     import parser_versions
@@ -622,9 +672,12 @@ class ArtifactRunnerWorker(QThread):
                     script_name, module,
                     self._zip_path, self._adapter,
                     case_dir=self._case_dir,
-                    zip_obj=zip_obj,
+                    zip_obj=reader,
                     guid_to_bundle=self._guid_to_bundle,
                 )
+                if earlier:
+                    for line in _earlier_capture_warnings(reader.touched, earlier):
+                        self.log.emit(line)
                 if error:
                     self.log.emit(f"  Error: {error}")
                 else:

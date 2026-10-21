@@ -98,3 +98,18 @@ def test_archive_without_repeats_is_unchanged(tmp_path):
     zip_path, infos = _load(tmp_path, entries)
     assert [i.filename for i in infos] == [f'f{i}.bin' for i in range(20)]
     assert all(i.filename == i.orig_filename for i in infos)
+
+
+def test_parser_run_log_warning_lines():
+    import os
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    from artifact_viewer import _earlier_capture_warnings
+    earlier = {'/d/sms.db': ['/d/sms [capture 1 of 2].db'],
+               '/d/sms.db-wal': ['/d/sms [capture 1 of 2].db-wal']}
+    # reading only the database still warns about its WAL's earlier capture
+    lines = _earlier_capture_warnings({'/d/sms.db'}, earlier)
+    assert len(lines) == 2
+    assert 'd/sms.db exists (capture 1 of 2)' in lines[0]
+    assert lines[0].endswith('sms [capture 1 of 2].db')
+    assert 'sms.db-wal' in lines[1]
+    assert _earlier_capture_warnings({'/d/other.db'}, earlier) == []

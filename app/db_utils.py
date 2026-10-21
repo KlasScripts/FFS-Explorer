@@ -23,9 +23,12 @@ import msgpack
 _FOLDER_DATA_VERSION    = '8'
 _SEARCH_ENTRIES_VERSION = '1'
 
-# Bump whenever the schema changes incompatibly.
+# Bump whenever the schema changes incompatibly — or when data already
+# stored in the cache was computed wrongly and must not survive.
 # Cache DB is auto-deleted on mismatch; results DB raises OldSchemaError.
-_CACHE_SCHEMA_VERSION   = 18
+# 19 (v0.47.0): header-scan types and other byte reads stored before v0.45.0
+#   could come from the wrong offsets past the 4 GiB ZIP64 boundary.
+_CACHE_SCHEMA_VERSION   = 19
 _RESULTS_SCHEMA_VERSION = 1
 
 

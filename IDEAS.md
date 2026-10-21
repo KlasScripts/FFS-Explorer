@@ -90,3 +90,37 @@ those steps.
 - Whether the same checks should compare an FFS file with the same file in
   another extraction or backup of the device (e.g. IOS17's separate
   `Backup/` zip).
+
+---
+
+## 3. Don't let hidden columns hide data
+
+**Why.** A case can produce 30 columns in one view (photo, EXIF, hashes,
+capture...). Examiners hide columns to cope, and a hidden column with values
+in it looks exactly like no data. Today the Columns button shows only how many
+are hidden ("Columns ⊘3") and their names, not whether they hold anything.
+
+**Current preference (owner, 2026-10-21):** hide nothing automatically; the
+examiner hides columns by hand. That is how the app already behaves. These
+are parked, not rejected.
+
+**How columns appear today (from the code).** A column is shown if any file
+in the view has the data (photo columns, UUID), or if the case has the data
+at all (EXIF, Linked Report, hashes, Capture, Inode). So mixing one DCIM photo
+with 100 other files keeps the photo columns, blank for the 100. The
+"App" column is always shown; "UUID" only in a folder view of app
+containers, never in Selected Files.
+
+**Options, most useful first.**
+- In the Columns dialog, show how many files in the current view have a
+  value per column ("GPS — 37 of 120 files").
+- When a hidden column has values in the current view, the Columns button
+  turns to a warning colour, "Columns ⊘2 · data hidden", with a tooltip of
+  counts. This also catches saved per-folder layouts hiding data later.
+- Collapse columns that are empty for every file in the view, and say so
+  ("3 empty columns hidden"). Never hide a column that has values.
+- Default order (Name, Type, Size, Modified, Path first), related columns
+  grouped, one-click show/hide per group.
+
+**Check first.** What export and reports do with hidden columns. Hidden must
+never mean dropped from an export without asking.

@@ -162,6 +162,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `user_media_ignore_list.py` | Global exclusion list for the "User Media" filter. |
 | `file_browser_presets.py` | Shared filter+sort presets (File Browser dropdown, Media Browser buttons). |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers; no business logic. |
+| `startup_log.py` | Bounded startup/error log + crash/stall snapshot (`Tools → Open Log Folder`). Qt-free. |
 | `timestamp_display.py` | `TimestampDisplayMixin`: timestamp-mode banner, `format_ts`, Timestamp Display dialog. |
 | `device_timezone.py` | Best-effort handset/acquisition/system timezone detection. |
 | `keyword_search.py` | Search workers (main archive, nested archives, LevelDB index), `KeywordSearchMixin`, `SqlHitInterpretWorker`. |

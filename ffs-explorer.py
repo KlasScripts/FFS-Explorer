@@ -74,6 +74,7 @@ from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
 from leveldb_viewer import LevelDbViewerMixin, _looks_like_leveldb_dir
 from timestamp_display import TimestampDisplayMixin
+import startup_log
 from dialog_helpers import (button_row, error_label, note_label, show_item_checkboxes,
                             WARNING_STYLE, ACTIVE_COLOR, ERROR_COLOR)
 import research_store as _research
@@ -108,8 +109,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QStyledItemDelegate)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QColor, QIcon, QShortcut, QKeySequence, QCursor, QPixmap,
-                           QBrush)
-from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QDate,
+                           QBrush, QDesktopServices)
+from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QDate, QUrl,
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
                              qInstallMessageHandler, QtMsgType)
 from PySide6.QtCore import QSettings as _QSettings
@@ -7513,6 +7514,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._import_bookmarks_act.setEnabled(False)   # needs an open case
         self._import_bookmarks_act.triggered.connect(self._open_import_bookmarks_dialog)
         self._tools_menu.addAction(self._import_bookmarks_act)
+        self._tools_menu.addSeparator()
+        log_act = QAction("Open Log Folder", self)
+        log_act.setToolTip("Startup steps, errors and crash snapshots "
+                           "(app/startup_log.py) — send these when reporting a problem.")
+        log_act.triggered.connect(self._open_log_folder)
+        self._tools_menu.addAction(log_act)
         self._view_path = ""
         self._view_is_recursive = False
         # True while self._view_path points at a single real folder shown
@@ -11603,6 +11610,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._timestamp_display_dialog(is_first_load=True)
 
     # ── AI access (embedded MCP server) ───────────────────────────────────────
+
+    def _open_log_folder(self):
+        d = startup_log.log_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(d))
 
     def _apply_ai_pref_visibility(self):
         """Show/hide the AI feature's own two actions per the global
@@ -16202,8 +16217,10 @@ def _qt_message_handler(msg_type, context, message):
         return
     if msg_type == QtMsgType.QtWarningMsg:
         print(f"Qt warning: {message}", file=sys.stderr)
+        startup_log.message('warning', f"Qt warning: {message}")
     elif msg_type in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
         print(f"Qt error: {message}", file=sys.stderr)
+        startup_log.message('error', f"Qt error: {message}")
 
 if __name__ == "__main__":
     # Must run before any process is spawned (and is essential under PyInstaller,
@@ -16224,8 +16241,14 @@ if __name__ == "__main__":
                 _info["CFBundleDisplayName"] = "FFS Explorer"
         except Exception:
             pass
+    # Startup log (app/startup_log.py) — the Windows build has no console, so
+    # without this a stalled or failed start leaves no trace at all.
+    startup_log.setup()
     qInstallMessageHandler(_qt_message_handler)
+    startup_log.step('creating QApplication')
     app = QApplication(sys.argv)
+    startup_log.step(f"QApplication ready (Qt platform: {app.platformName()}, "
+                     f"screens: {[s.geometry().getRect() for s in app.screens()]})")
     app.setApplicationName("FFS Explorer")
     app.setApplicationDisplayName("FFS Explorer")
     app.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
@@ -16242,8 +16265,12 @@ if __name__ == "__main__":
         _stall_timer = QTimer()
         _stall_timer.timeout.connect(_stall_tick)
         _stall_timer.start(50)
+    startup_log.step('building main window')
     window = FastZipBrowser()
+    startup_log.step('main window built')
     app.aboutToQuit.connect(window._stop_all_workers)
     atexit.register(window._stop_all_workers)  # runs before Qt's atexit on exception exit
     window.show()
+    startup_log.step(f"main window show() called, geometry {window.geometry().getRect()}")
+    QTimer.singleShot(0, startup_log.window_shown)
     sys.exit(app.exec())

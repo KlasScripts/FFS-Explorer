@@ -4465,8 +4465,11 @@ class EmbeddedMediaScanWorker(QThread):
                 continue
 
             wal_bytes = self._read_bytes(z, ui_path + '-wal') if kind == 'sqlite' else None
+            # A sparse cache file's Content-Type is in its '_0' record.
+            partner = (self._read_bytes(z, ui_path[:-2] + '_0')
+                       if kind == 'cache' and ui_path.endswith('_s') else None)
             new_rows = ems.scan_container(kind, ui_path, raw, scan_dir, scan_scope,
-                                          wal_bytes=wal_bytes)
+                                          wal_bytes=wal_bytes, partner_bytes=partner)
             rows.extend(new_rows)
             registry_entries.append((ui_path, current_version, len(new_rows)))
             for hit_row in new_rows:
@@ -9438,8 +9441,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if meta.get('_cache_record'):
             # The media's own bytes have no text form; say where it came
             # from instead, and that its times are the record's.
+            rebuilt = ("Rebuilt from the byte ranges cached in a sparse cache file — "
+                       "see that file's Text tab for how much was cached.\n\n"
+                       if meta['_cache_record'].endswith('_s') else "")
             self._load_text_preview(
-                f"Media extracted from a web cache record\n\n"
+                f"Media extracted from a web cache record\n\n{rebuilt}"
                 f"Record:     {meta['_cache_record']}\n"
                 f"Source URL: {meta.get('source_url') or '(not recorded)'}\n\n"
                 "Its Created/Changed/Modified/Accessed times are those of the "

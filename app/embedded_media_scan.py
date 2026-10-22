@@ -147,7 +147,32 @@ def classify_scan_candidate(ui_path: str, header_type_overrides: dict) -> str | 
 # Opera, Brave, DuckDuckGo, Instagram, Imgur, WeChat, ...). The name only
 # nominates a candidate; scan_container('cache') then requires the format's
 # own magic (chrome_cache.parse_simple_cache_entry) before trusting it.
-_SIMPLE_CACHE_NAME = re.compile(r'^[0-9a-f]{16}_0$')
+# '_s' is the sparse file holding range-fetched media (video) for '_0'.
+_SIMPLE_CACHE_NAME = re.compile(r'^[0-9a-f]{16}_[0s]$')
+
+_VIDEO_TYPES = {'video/mp4': '.mp4', 'video/webm': '.webm', 'video/mp2t': '.m2ts',
+                'video/quicktime': '.mov', 'video/3gpp': '.3gp', 'video/x-matroska': '.mkv'}
+
+
+def _sparse_video_kind(data: bytes, content_type: str) -> str | None:
+    """Extension for rebuilt sparse-cache bytes that are video, else None.
+    The record's Content-Type decides first (a response's own declaration);
+    otherwise the bytes: anything classify_media_blob calls video, plus WebM
+    (EBML) and MPEG-TS (0x47 sync every 188 bytes), which header_scan doesn't
+    know. Audio and HLS playlists are not video."""
+    ct = (content_type or '').split(';')[0].strip().lower()
+    if ct.startswith('video/'):
+        return _VIDEO_TYPES.get(ct, '.mp4')
+    if ct.startswith(('audio/', 'application/vnd.apple.mpegurl', 'application/x-mpegurl')):
+        return None
+    got = classify_media_blob(data)
+    if got and got[0] == 'video':
+        return got[1]
+    if data[:4] == b'\x1a\x45\xdf\xa3':
+        return '.webm'
+    if len(data) > 376 and data[0] == 0x47 and data[188] == 0x47 and data[376] == 0x47:
+        return '.m2ts'
+    return None
 
 
 def is_simple_cache_record(ui_path: str) -> bool:
@@ -325,7 +350,7 @@ def extract_media_bytes(scan_dir: str, data: bytes, ext: str) -> tuple[str, str]
 
 
 _MEDIA_EXTS = frozenset(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.tif', '.tiff',
-                         '.bmp', '.avif', '.mp4', '.m4v', '.mov', '.webm', '.avi', '.3gp', '.mkv'))
+                         '.bmp', '.avif', '.mp4', '.m4v', '.mov', '.webm', '.avi', '.3gp', '.mkv', '.m2ts'))
 
 
 def compute_display_name(ui_path: str, source_kind: str, location: str,
@@ -663,7 +688,8 @@ def _build_hit_row(ui_path: str, source_kind: str, location: str,
 
 
 def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
-                   scan_scope: str, wal_bytes: bytes | None = None) -> list[dict]:
+                   scan_scope: str, wal_bytes: bytes | None = None,
+                   partner_bytes: bytes | None = None) -> list[dict]:
     """Scan one already-classified container's raw bytes for embedded
     media and return ready-to-save embedded_media_hits row dicts. Moved
     here 2026-09-23 out of EmbeddedMediaScanWorker's own per-candidate
@@ -685,6 +711,25 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
         # HTTP response. One record holds one response, so at most one hit,
         # carrying the URL for the child's "Source URL" column.
         import chrome_cache
+        if chrome_cache.is_sparse(raw):
+            # '<hash>_s': media fetched in byte ranges, rebuilt at its real
+            # offsets. *partner_bytes* is the matching '<hash>_0' record,
+            # whose headers carry the Content-Type.
+            sp = chrome_cache.parse_sparse_entry(raw)
+            data = sp.get('data') if sp else None
+            if not data:
+                return rows
+            partner = chrome_cache.parse_simple_cache_entry(partner_bytes) if partner_bytes else None
+            ext = _sparse_video_kind(data, (partner or {}).get('content_type', ''))
+            if ext is None:
+                return rows
+            hit = {'blob': data, 'kind': 'video', 'ext': ext,
+                   'http_headers': {'content-type': (partner or {}).get('content_type') or ''},
+                   'url': sp.get('url')}
+            row = _build_hit_row(ui_path, 'cache', 'sparse ranges', scan_dir, hit, scan_scope)
+            row['source_url'] = sp.get('url')
+            rows.append(row)
+            return rows
         rec = chrome_cache.parse_simple_cache_entry(raw)
         body = rec.get('body') if rec else None
         if not body:

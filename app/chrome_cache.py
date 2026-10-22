@@ -52,6 +52,7 @@ never take down the whole parser run.
 
 import re
 import struct
+import zlib
 from urllib.parse import urljoin, urlparse
 
 from artifact_runner import decompress_http_body as _decompress_body
@@ -194,6 +195,90 @@ def parse_simple_cache_entry(raw: bytes) -> dict | None:
         }
 
 
+# ── Sparse entries ('<hash>_s'): media streamed in byte ranges ─────────────
+# Chrome stores range-requested responses (video/audio playback) in a
+# separate sparse file next to the '<hash>_0' record: the same 24-byte header
+# and key, then chunks, each a 32-byte header — range magic (Q), offset in
+# the resource (q), length (q), CRC-32 of the data (I), 4 bytes padding —
+# followed by the data. Confirmed 2026-10-22 on 193 real sparse files
+# (CTF26, Android 14 JoshHickman, Android 15 CTF25): 15,975 of 15,976 chunks
+# match their CRC-32, and every file decodes exactly to its end.
+_SPARSE_RANGE_MAGIC = 0xeb97bf016553676b
+_SPARSE_RANGE = struct.Struct('<QqqI4x')     # 32 bytes
+# Gaps are zero-filled so later chunks stay at their real offsets (MP4 boxes
+# are position-dependent) — unless the cached chunks are scattered over a much
+# bigger span, when only the contiguous part from offset 0 is rebuilt.
+_SPARSE_MAX_SPAN_RATIO = 4
+_SPARSE_MAX_SPAN_BYTES = 64 * 1024 * 1024
+
+
+def is_sparse(raw: bytes) -> bool:
+    """A Simple Cache header whose key is followed by a sparse range."""
+    if not looks_like_record(raw):
+        return False
+    key_len = _HEADER_STRUCT.unpack_from(raw, 0)[2]
+    pos = _HEADER_SIZE + key_len
+    return len(raw) >= pos + 8 and struct.unpack_from('<Q', raw, pos)[0] == _SPARSE_RANGE_MAGIC
+
+
+def parse_sparse_entry(raw: bytes) -> dict | None:
+    """Decode a '<hash>_s' sparse file. Returns {'key', 'url',
+    'top_level_site', 'chunks' (count), 'bad_crc' (count), 'covered' (bytes
+    cached), 'span' (end of the furthest chunk), 'gaps' (count), 'starts_at_0',
+    'data' (rebuilt bytes, or None), 'prefix_only' (True when only the part
+    from offset 0 was rebuilt), 'parse_error' (str or None)}; None if *raw*
+    isn't a sparse entry. Chunks failing their CRC are still used and
+    counted, not dropped — partial evidence beats none, stated."""
+    if not is_sparse(raw):
+        return None
+    _magic, _ver, key_len, _hash, _res = _HEADER_STRUCT.unpack_from(raw, 0)
+    key = raw[_HEADER_SIZE:_HEADER_SIZE + key_len].decode('utf-8', errors='replace')
+    site, url = _parse_cache_key(key)
+    pos = _HEADER_SIZE + key_len
+    chunks, bad_crc, err = [], 0, None
+    while pos + _SPARSE_RANGE.size <= len(raw):
+        magic, offset, length, crc = _SPARSE_RANGE.unpack_from(raw, pos)
+        if magic != _SPARSE_RANGE_MAGIC or offset < 0 or length < 0:
+            err = f'unexpected bytes at {pos:,}'
+            break
+        data = raw[pos + _SPARSE_RANGE.size:pos + _SPARSE_RANGE.size + length]
+        if len(data) < length:
+            err = f'chunk at {pos:,} truncated'
+            data = data
+        if zlib.crc32(data) != crc:
+            bad_crc += 1
+        chunks.append((offset, data))
+        pos += _SPARSE_RANGE.size + length
+        if err:
+            break
+    chunks.sort(key=lambda c: c[0])
+    covered = sum(len(d) for _, d in chunks)
+    span = max((o + len(d) for o, d in chunks), default=0)
+    gaps = sum(1 for (a, da), (b, _) in zip(chunks, chunks[1:]) if a + len(da) < b)
+    if chunks and chunks[0][0] > 0:
+        gaps += 1
+    out = {'key': key, 'url': url, 'top_level_site': site, 'chunks': len(chunks),
+           'bad_crc': bad_crc, 'covered': covered, 'span': span, 'gaps': gaps,
+           'starts_at_0': bool(chunks) and chunks[0][0] == 0, 'data': None,
+           'prefix_only': False, 'parse_error': err}
+    if not chunks:
+        return out
+    if span > _SPARSE_MAX_SPAN_RATIO * covered and span > _SPARSE_MAX_SPAN_BYTES:
+        buf = bytearray()
+        for offset, data in chunks:
+            if offset > len(buf):
+                break
+            buf[offset:offset + len(data)] = data
+        out['data'] = bytes(buf) if buf else None
+        out['prefix_only'] = True
+    else:
+        buf = bytearray(span)
+        for offset, data in chunks:
+            buf[offset:offset + len(data)] = data
+        out['data'] = bytes(buf)
+    return out
+
+
 def looks_like_record(raw: bytes) -> bool:
     """True if *raw* starts with a Simple Cache entry's own magic number."""
     return len(raw) >= _HEADER_SIZE and _HEADER_STRUCT.unpack_from(raw, 0)[0] == _HEADER_MAGIC
@@ -208,6 +293,8 @@ def format_record_text(raw: bytes) -> str | None:
     hidden. None if *raw* isn't a Simple Cache record at all."""
     if not looks_like_record(raw):
         return None
+    if is_sparse(raw):
+        return _format_sparse_text(raw)
     rec = parse_simple_cache_entry(raw)
     if rec is None:
         return None
@@ -233,6 +320,34 @@ def format_record_text(raw: bytes) -> str | None:
     lines += ['', f"Response headers ({len(headers)}):"]
     width = max((len(k) for k in headers), default=0)
     lines += [f"  {k.ljust(width)}  {v}" for k, v in headers.items()]
+    return '\n'.join(lines)
+
+
+def _format_sparse_text(raw: bytes) -> str:
+    sp = parse_sparse_entry(raw) or {}
+    span, covered = sp.get('span', 0), sp.get('covered', 0)
+    if sp.get('chunks') and sp.get('starts_at_0') and not sp.get('gaps'):
+        coverage = f"{covered:,} bytes from offset 0, no gaps"
+    else:
+        coverage = (f"{covered:,} of {span:,} bytes cached, {sp.get('gaps', 0)} gap(s)"
+                    + (" — only the part from offset 0 was rebuilt" if sp.get('prefix_only') else
+                       " — gaps rebuilt as zero bytes"))
+    lines = [
+        'Chromium Simple Cache sparse entry (media fetched in byte ranges)',
+        '',
+        f"URL:              {sp.get('url') or '(not recorded)'}",
+        f"Cache key:        {sp.get('key') or '(not recorded)'}",
+        f"Top-level site:   {sp.get('top_level_site') or '(none)'}",
+        f"File size:        {len(raw):,} bytes",
+        f"Chunks:           {sp.get('chunks', 0):,}",
+        f"Cached content:   {coverage}",
+        f"CRC-32 check:     " + ("all chunks match" if not sp.get('bad_crc')
+                                 else f"{sp['bad_crc']} chunk(s) FAILED (data kept)"),
+    ]
+    if sp.get('parse_error'):
+        lines.append(f"Problem:          {sp['parse_error']}")
+    lines += ['', "The HTTP headers (content type, total size, dates) are in the",
+              "matching '<same hash>_0' record in this folder."]
     return '\n'.join(lines)
 
 

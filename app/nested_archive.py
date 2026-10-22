@@ -85,6 +85,55 @@ def unpacked_file_index(case_dir: str) -> dict:
     return index
 
 
+class _SizeCrc:
+    """The two ZipInfo fields duplicate_scan groups on, for an unpacked file
+    stored as a plain blob (a decompressed gzip) rather than inside a zip."""
+    __slots__ = ('file_size', 'CRC')
+
+    def __init__(self, file_size: int, crc: int):
+        self.file_size = file_size
+        self.CRC = crc
+
+
+def unpacked_duplicate_candidates(case_dir: str) -> list:
+    """duplicate_scan candidates for every file unpacked from a nested archive
+    (owner request, 2026-10-22), in the same shape as the main archive's
+    (ui_path, physical, info, inode, devid, sha256, reader) so both are grouped
+    together: a photo inside an unpacked zip that equals one in DCIM lands in
+    the same group. Size and CRC come free from the repacked zip's own
+    directory; a gzip's blob has none, so its CRC is computed once here. The
+    reader reads the bytes from the unpacked archive (zip_reader)."""
+    import zlib
+    from zip_reader import read_nested_entry
+    by_archive: dict = {}
+    for vpath, (stored, entry, _ft) in unpacked_file_index(case_dir).items():
+        by_archive.setdefault(stored, []).append((vpath, entry))
+    out = []
+    for stored, members in by_archive.items():
+        try:
+            with zipfile.ZipFile(stored) as zf:
+                infos = {i.filename: i for i in zf.infolist()}
+        except zipfile.BadZipFile:
+            infos = None
+        except OSError:
+            continue
+        for vpath, entry in members:
+            if infos is not None:
+                info = infos.get(entry)
+                if info is None:
+                    continue
+            else:
+                try:
+                    with open(stored, 'rb') as f:
+                        blob = f.read()
+                except OSError:
+                    continue
+                info = _SizeCrc(len(blob), zlib.crc32(blob))
+            out.append((vpath, f"{stored}::{entry}", info, 0, 0, '',
+                        lambda s=stored, e=entry: read_nested_entry(s, e)))
+    return out
+
+
 def already_extracted(case_dir: str, ui_path: str) -> bool:
     """True if *ui_path* has already been fully extracted (a DB record
     exists, its output file is still on disk, and its recorded entry

@@ -845,8 +845,16 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
 - Verified: 40 unpacked archives each on IOS18 and CTF23 — sweep candidates
   66 → 211 and 35 → 303 (now including databases), every one read; Android
   14 JoshHickman: 442 small text files now typed Text.
-- Still main-zip only: duplicate detection. EXIF/video metadata already
-  had its own route for unpacked files.
+- Duplicate detection includes unpacked files (owner request, 2026-10-22):
+  `nested_archive.unpacked_duplicate_candidates` gives size + CRC from the
+  repacked zip (computed once for a gzip blob) and a reader, so they group
+  together with main-archive files. A group containing any unpacked file
+  uses MD5 (they have no GrayKey hash). If a run unpacks new archives,
+  "Detect duplicate files" is re-ticked for that run. Verified on IOS18
+  with 40 unpacked archives: 403 groups include unpacked files, 290 of them
+  with main-archive files; every member of those 403 groups shares one MD5
+  (independent check); main-archive groups otherwise identical (11,875).
+- EXIF/video metadata already had its own route for unpacked files.
 
 ## 11. In-app format decoding
 

@@ -6625,6 +6625,14 @@ class ProcessDialog(QDialog):
         # browser.  Done here (main thread) so it covers skipped files too and
         # avoids cross-thread signal chain issues.
         self._apply_gzip_type_overrides()
+        # New unpacked files aren't covered by duplicate results on record,
+        # and "Detect duplicate files" starts unticked once those exist —
+        # so re-tick it for this run (A-74).
+        if ok and not self._chk_dedup.isChecked():
+            self._chk_dedup.setChecked(True)
+            self._status_label.setText(
+                msg + " Duplicate detection re-enabled for this run to include "
+                "the newly unpacked files.")
         self.nested_extraction_done.emit()
         self._continue_after_nested()
 
@@ -6878,6 +6886,8 @@ class ProcessDialog(QDialog):
             return
         z = CachedZipView(self._zip_path, infos)
         candidates = _collect_duplicate_candidates(self._adapter, self._ui_metadata, z)
+        # Files unpacked from nested archives join the same grouping (A-74).
+        candidates += nested_archive.unpacked_duplicate_candidates(self._case_dir)
         if not candidates:
             self._status_label.setText("Duplicate detection: no files found to check.")
             self._finish_operations()

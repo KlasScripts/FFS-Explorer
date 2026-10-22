@@ -71,9 +71,15 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
     confirmed so far if it becomes true (a partial, still-correct result,
     never a half-hashed group)."""
     by_size_crc: dict[tuple[int, int], list] = {}
+    # Optional 6th field: the SHA-256 the acquisition tool recorded ('' if
+    # none). Optional 7th: a zero-arg callable returning the file's bytes,
+    # for files that aren't in the main zip (unpacked from a nested archive,
+    # see nested_archive.unpacked_duplicate_candidates); zinfo then only
+    # needs file_size and CRC.
     for ui_path, phys, zinfo, inode, devid, *rest in candidates:
         by_size_crc.setdefault((zinfo.file_size, zinfo.CRC), []).append(
-            (ui_path, phys, zinfo, inode, devid, rest[0] if rest else ''))
+            (ui_path, phys, zinfo, inode, devid,
+             rest[0] if rest else '', rest[1] if len(rest) > 1 else None))
 
     results: dict[str, dict] = {}
     to_process = []
@@ -128,15 +134,18 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
     done = 0
     for units in grouped_units:
         by_md5: dict[str, list] = {}
-        for (ui_path, phys, zinfo, inode, devid, _sha), member_paths in units:
+        for (ui_path, phys, zinfo, inode, devid, _sha, reader), member_paths in units:
             if cancel_check and cancel_check():
                 return results
-            digest = hashlib.md5(ZipEntry(zip_path, phys, zinfo).read()).hexdigest()
-            by_md5.setdefault(digest, []).extend(
-                (p, zinfo.file_size) for p in member_paths)
+            data = reader() if reader is not None else ZipEntry(zip_path, phys, zinfo).read()
             done += 1
             if progress_cb:
                 progress_cb(done, total)
+            if data is None:
+                continue     # unreadable: can't confirm, so never reported as a duplicate
+            digest = hashlib.md5(data).hexdigest()
+            by_md5.setdefault(digest, []).extend(
+                (p, zinfo.file_size) for p in member_paths)
         for digest, members in by_md5.items():
             if len(members) < 2:
                 continue  # CRC32 collided but MD5 didn't — not a real duplicate

@@ -87,6 +87,35 @@ def read_nested_entry(stored_path: str, entry_path: str) -> bytes | None:
         return None
 
 
+# One open handle per (worker thread, archive), reused for every read that
+# thread makes — added 2026-10-22 after a report that bulk stages were slower
+# on Windows than macOS from the same kind of SSD: each read used to open the
+# archive afresh (19,183 opens for IOS17's media metadata stage), and on
+# Windows every open of a 30-40 GB file goes through Defender's real-time
+# scanning and other file-system filters. Every read still seeks to its own
+# offset first, and threads never share a handle, so results can't change.
+# A worker thread's handles close when the thread ends (thread-local storage
+# is released). The main (GUI) thread keeps opening per read: it only does
+# occasional single reads, and a handle held open there would stop the
+# archive being moved or renamed in Windows Explorer while the app runs.
+_tls = threading.local()
+
+
+def thread_handle(path: str):
+    """An open 'rb' handle on *path* for the calling thread, or None on the
+    main thread (callers then open and close their own)."""
+    if threading.current_thread() is threading.main_thread():
+        return None
+    handles = getattr(_tls, 'handles', None)
+    if handles is None:
+        handles = _tls.handles = {}
+    fh = handles.get(path)
+    if fh is None or fh.closed:
+        fh = open(path, 'rb')
+        handles[path] = fh
+    return fh
+
+
 class ZipReader:
     """Raw byte reader for a single zip file, working directly from stored offsets.
 
@@ -100,11 +129,16 @@ class ZipReader:
     def read_at(self, offset: int, size: int, max_bytes: int | None = None) -> bytes:
         """Read up to max_bytes (or all of size) starting at offset.
 
-        Opens and closes its own file handle — safe to call from threads.
+        Safe to call from threads: a worker thread reuses its own handle
+        (thread_handle), the main thread opens and closes one.
         """
         read_len = min(size, max_bytes) if max_bytes is not None else size
         if read_len <= 0:
             return b''
+        fh = thread_handle(self.zip_path)
+        if fh is not None:
+            fh.seek(offset)
+            return fh.read(read_len)
         with open(self.zip_path, 'rb') as fh:
             fh.seek(offset)
             return fh.read(read_len)

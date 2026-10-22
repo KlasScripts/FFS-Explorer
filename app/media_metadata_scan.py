@@ -44,7 +44,7 @@ import io
 import os
 import re
 
-from zip_reader import ZipReader
+from zip_reader import ZipReader, thread_handle
 
 
 class _LazyZipSlice:
@@ -73,10 +73,16 @@ class _LazyZipSlice:
         n = max(0, min(n, self._size - self._pos))
         if n == 0:
             return b''
-        if self._fh is None:
-            self._fh = open(self._zip_path, 'rb')
-        self._fh.seek(self._base + self._pos)
-        data = self._fh.read(n)
+        # A worker thread's shared handle (zip_reader.thread_handle) — one
+        # open per thread instead of one per media file, which is what made
+        # this stage slow on Windows. Seeks every read, so sharing is safe.
+        fh = thread_handle(self._zip_path)
+        if fh is None:
+            if self._fh is None:
+                self._fh = open(self._zip_path, 'rb')
+            fh = self._fh
+        fh.seek(self._base + self._pos)
+        data = fh.read(n)
         self._pos += len(data)
         return data
 

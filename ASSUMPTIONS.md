@@ -882,7 +882,13 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
 - Verified: CTF26 12,075 records → 2,670 media, all times equal to the
   record (Created/Changed/Accessed/Modified); Android 14 JoshHickman
   16,037 → 2,088 (Modified only); every child real media with a clean URL.
-- Not handled: media stored in sparse `<hash>_s` files (common for video).
+- Sparse `<hash>_s` files (range-fetched video) are rebuilt at their real
+  offsets (gaps zero-filled, or prefix only when widely scattered); video
+  is decided by the `_0` record's Content-Type, then the bytes; MPEG-TS is
+  named `.m2ts` (`.ts` reads as TypeScript). 193 real sparse files: 15,975
+  of 15,976 chunks match their CRC-32; every complete video plays.
+- Cache files are typed **Web Cache**: by name (`<16 hex>_0`/`_1`/`_s`) and
+  by the format's magic in the header scan.
 
 ## 11. In-app format decoding
 

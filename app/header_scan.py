@@ -26,6 +26,9 @@ from zip_reader import ZipReader
 # extensionless image since classify_magic had no Graphic/Picture split
 # at all; closed now that this table has one).
 _SIGNATURES: list[tuple[bytes, str | None]] = [
+    # Chromium Simple Cache entry header magic 0xfcfb6d1ba7725c30 (little-endian) —
+    # '<hash>_0'/'_1'/'_s' files of Chrome and Chromium WebViews (A-75).
+    (b'\x30\x5c\x72\xa7\x1b\x6d\xfb\xfc', 'Web Cache'),
     (b'SQLite format 3\x00', 'Database'),
     (b'\xff\xd8\xff',        'Picture'),   # JPEG
     (b'\x89PNG\r\n\x1a\n',  'Graphic'),   # PNG

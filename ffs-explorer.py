@@ -426,13 +426,23 @@ _EXT_TO_TYPE: dict = {
 }
 
 
+_WEB_CACHE_NAME = re.compile(r'^[0-9a-f]{16}_[01s]$')
+
+
 def _get_file_type(name):
     # Dotted sidecar extensions (.db-wal, .sqlite-journal, …) are all in the
     # table; only bare dotless companions ('foo-wal') need the endswith fallback.
     ft = _EXT_TO_TYPE.get(os.path.splitext(name)[1].lower())
     if ft is not None:
         return ft
-    return 'Database' if name.lower().endswith(('-wal', '-shm')) else 'Other'
+    if name.lower().endswith(('-wal', '-shm')):
+        return 'Database'
+    # Chromium Simple Cache files ('<16 hex>_0'/'_1'/'_s'), used by Chrome and
+    # every app with a Chromium WebView (ASSUMPTIONS.md A-75). By name here;
+    # header_scan also recognises the format's own magic for any other name.
+    if _WEB_CACHE_NAME.match(name):
+        return 'Web Cache'
+    return 'Other'
 
 
 

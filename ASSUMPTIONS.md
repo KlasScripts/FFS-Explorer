@@ -831,6 +831,23 @@ correction), 2026-10-17.*
 - The panel is now refreshed after that load and after every change to
   the header types.
 
+**A-74. Files unpacked from nested archives are typed at unpack time and read
+by the later stages.** *Decision (owner report) + Confirmed (real),
+2026-10-22.*
+- Process Case runs the header scan before unpacking, so it never sees
+  unpacked files. Unpacking now types each one the way the main archive is
+  typed: extension first, then `classify_magic`, then the text check for a
+  small file (`nested_archive.classify_unpacked`).
+- `nested_archive.unpacked_file_index` maps each File Browser path
+  (`{archive}/{entry}`) to its unpacked archive and type. The embedded-media
+  sweep merges those types and reads the bytes from there; before, it typed
+  unpacked files by name only and every read silently failed.
+- Verified: 40 unpacked archives each on IOS18 and CTF23 — sweep candidates
+  66 → 211 and 35 → 303 (now including databases), every one read; Android
+  14 JoshHickman: 442 small text files now typed Text.
+- Still main-zip only: duplicate detection. EXIF/video metadata already
+  had its own route for unpacked files.
+
 ## 11. In-app format decoding
 
 **A-42. Binary plists:** decoded with `plistlib`, with NSKeyedArchiver

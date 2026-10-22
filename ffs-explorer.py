@@ -4365,7 +4365,13 @@ class EmbeddedMediaScanWorker(QThread):
             physical = self._adapter.resolve(ui_path)
             return z.open(physical).read()
         except Exception:
-            return None
+            pass
+        # Not in the main zip: a file unpacked from a nested archive
+        # (including a database's -wal unpacked alongside it).
+        loc = self._unpacked.get(ui_path)
+        if loc is not None:
+            return read_nested_entry(loc[0], loc[1])
+        return None
 
     def run(self):
         import embedded_media_scan as ems
@@ -4374,13 +4380,23 @@ class EmbeddedMediaScanWorker(QThread):
         if z is None:
             self.finished_scan.emit({'error': 'Local .zcd cache not available'})
             return
+        self._unpacked = nested_archive.unpacked_file_index(self._case_dir)
 
         excludes = ()
         if self._scan_folders is not None:
             excludes = (tuple(self._adapter.scan_excludes())
                        + tuple(self._adapter.embedded_media_excludes()))
+        # Unpacked files are normally in _ui_metadata already (the GUI adds
+        # them when unpacking finishes); add any that aren't, so the sweep
+        # never depends on that ordering.
+        meta = self._ui_metadata
+        missing = [v for v in self._unpacked if v not in meta]
+        if missing:
+            meta = dict(meta)
+            for v in missing:
+                meta[v] = {'size': 0}
         sqlite_paths, plist_paths = ems.enumerate_candidates(
-            self._ui_metadata, self._overrides, self._scan_folders, excludes)
+            meta, self._overrides, self._scan_folders, excludes)
         n_databases, n_plists = len(sqlite_paths), len(plist_paths)
 
         n_skip_listed = 0
@@ -6658,9 +6674,13 @@ class ProcessDialog(QDialog):
     # ── Embedded-media sweep ────────────────────────────────────────────────
 
     def _continue_after_nested(self):
-        """Runs after archive extraction — a database or plist that only
-        existed inside a nested archive just extracted is already
-        visible to the embedded-media scan by the time it runs."""
+        """Runs after archive extraction. Files unpacked from nested
+        archives are swept too: their types come from unpacking
+        (nested_archive.classify_unpacked, merged in
+        _header_type_overrides_snapshot) and EmbeddedMediaScanWorker reads
+        them from the unpacked archive (nested_archive.unpacked_file_index).
+        Before 2026-10-22 this comment claimed so, but neither was true:
+        they were typed by name only and every read silently failed."""
         if self._chk_embedded_media.isChecked():
             self._start_embedded_media_scan()
         else:
@@ -6708,9 +6728,16 @@ class ProcessDialog(QDialog):
             return {}
         try:
             with closing(_open_cache_db(self._case_dir)) as db:
-                return load_header_types(db)
+                overrides = load_header_types(db)
         except Exception:
-            return {}
+            overrides = {}
+        # Files unpacked from nested archives earlier in this same run: the
+        # header scan ran BEFORE unpacking and never saw them, so their types
+        # come from unpacking (nested_archive.classify_unpacked).
+        for vpath, (_stored, _entry, ft) in nested_archive.unpacked_file_index(self._case_dir).items():
+            if ft != 'Other':
+                overrides.setdefault(vpath, ft)
+        return overrides
 
     def _show_embedded_media_skip_list_dialog(self):
         EmbeddedMediaSkipListDialog(

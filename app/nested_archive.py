@@ -34,11 +34,55 @@ from contextlib import closing
 from datetime import datetime, timezone
 
 import header_scan
-from db_utils import (_open_cache_db, load_nested_archives, save_nested_archive,
+from db_utils import (_open_cache_db, load_nested_archives, load_nested_archive_entries, save_nested_archive,
                       save_nested_archive_entries, save_nested_archive_failure)
 from zip_cd_cache import CachedZipView, load as _zcd_load
 
 _MEM_LIMIT = 100 * 1024 * 1024   # 100 MB — larger files written to temp first
+
+
+def classify_unpacked(name: str, data: bytes, get_file_type) -> str:
+    """Type one unpacked file the way the main archive's files are typed:
+    the extension first (the File Browser's own precedence); if that says
+    'Other', the header scan's byte check (header_scan.classify_magic, then
+    the text check for a small file — the same steps as scan_entries).
+    Done at unpack time, with the bytes already in memory, so files that
+    only exist inside a nested archive get their types without waiting for
+    the next header scan (which runs before unpacking in Process Case and
+    never sees them). Added 2026-10-22 (owner report)."""
+    ft = get_file_type(name)
+    if ft != 'Other' or not data:
+        return ft
+    detected = header_scan.classify_magic(data[:16])
+    if detected is None and len(data) <= header_scan.TEXT_SIZE_LIMIT and header_scan.is_text(data):
+        detected = 'Text'
+    return detected or 'Other'
+
+
+def unpacked_file_index(case_dir: str) -> dict:
+    """{ui_path: (stored_path, entry_path, file_type)} for every file inside
+    an already-unpacked nested archive, keyed by the same virtual ui_path the
+    File Browser shows (f"{archive_ui_path}/{entry_path}", see
+    ffs-explorer.py's _inject_nested_archives). For Process Case stages that
+    run after unpacking and must type and READ those files — they don't exist
+    in the main zip, so a main-zip read silently fails."""
+    index = {}
+    if not case_dir:
+        return index
+    out_dir = os.path.join(case_dir, 'nested_archives')
+    try:
+        with closing(_open_cache_db(case_dir)) as db:
+            for rec in load_nested_archives(db):
+                stored = os.path.join(out_dir, rec['stored_filename'])
+                if not os.path.isfile(stored):
+                    continue
+                for e in load_nested_archive_entries(db, rec['ui_path']):
+                    ep = e['entry_path']
+                    if ep and not ep.endswith('/'):
+                        index[f"{rec['ui_path']}/{ep}"] = (stored, ep, e.get('file_type') or 'Other')
+    except Exception:
+        return {}
+    return index
 
 
 def already_extracted(case_dir: str, ui_path: str) -> bool:
@@ -146,9 +190,7 @@ def extract_one(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
                 f.write(decompressed)
             child_name = (basename[:-3] if basename.lower().endswith('.gz')
                           else basename)
-            ft = get_file_type(child_name)
-            if ft == 'Other' and decompressed:
-                ft = header_scan.classify_magic(decompressed[:16]) or 'Other'
+            ft = classify_unpacked(child_name, decompressed, get_file_type)
             gz_mtime = struct.unpack_from('<I', raw, 4)[0] if len(raw) >= 8 else 0
             gz_mdate = (datetime.fromtimestamp(gz_mtime, tz=timezone.utc)
                         .strftime('%Y-%m-%d %H:%M:%S') if gz_mtime else None)
@@ -181,9 +223,7 @@ def extract_one(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
                         dst_zip.writestr(info, data, compress_type=zipfile.ZIP_STORED)
                         entry_count += 1
                         name = info.filename
-                        ft = get_file_type(name.rsplit('/', 1)[-1])
-                        if ft == 'Other' and data:
-                            ft = header_scan.classify_magic(data[:16]) or 'Other'
+                        ft = classify_unpacked(name.rsplit('/', 1)[-1], data, get_file_type)
                         dt = info.date_time
                         mdate = (f"{dt[0]:04d}-{dt[1]:02d}-{dt[2]:02d} "
                                 f"{dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}"

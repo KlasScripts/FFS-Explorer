@@ -141,6 +141,33 @@ def classify_scan_candidate(ui_path: str, header_type_overrides: dict) -> str | 
     return None
 
 
+# Chromium "Simple Cache" record files: '<16 hex>_0' (e.g. Cache_Data/
+# 000e5b778df2e766_0). Chrome and every app embedding a Chromium WebView or
+# browser engine use this format (on real Android archives: Chrome, Edge,
+# Opera, Brave, DuckDuckGo, Instagram, Imgur, WeChat, ...). The name only
+# nominates a candidate; scan_container('cache') then requires the format's
+# own magic (chrome_cache.parse_simple_cache_entry) before trusting it.
+_SIMPLE_CACHE_NAME = re.compile(r'^[0-9a-f]{16}_0$')
+
+
+def is_simple_cache_record(ui_path: str) -> bool:
+    return bool(_SIMPLE_CACHE_NAME.match(ui_path.rsplit('/', 1)[-1]))
+
+
+def enumerate_cache_records(full_metadata: dict, scan_folders: tuple | None = None,
+                            scan_excludes: tuple = ()) -> list[str]:
+    """Simple Cache record candidates, scoped exactly like enumerate_candidates."""
+    out = []
+    for ui_path in full_metadata:
+        if scan_folders is not None and not ui_path.startswith(scan_folders):
+            continue
+        if scan_folders is not None and scan_excludes and ui_path.startswith(scan_excludes):
+            continue
+        if is_simple_cache_record(ui_path):
+            out.append(ui_path)
+    return out
+
+
 def enumerate_candidates(full_metadata: dict, header_type_overrides: dict,
                          scan_folders: tuple | None = None,
                          scan_excludes: tuple = ()) -> tuple[list[str], list[str]]:
@@ -297,6 +324,10 @@ def extract_media_bytes(scan_dir: str, data: bytes, ext: str) -> tuple[str, str]
     return digest, path
 
 
+_MEDIA_EXTS = frozenset(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.tif', '.tiff',
+                         '.bmp', '.avif', '.mp4', '.m4v', '.mov', '.webm', '.avi', '.3gp', '.mkv'))
+
+
 def compute_display_name(ui_path: str, source_kind: str, location: str,
                          hit: dict) -> str:
     """The naming scheme confirmed directly with the user, 2026-09-22:
@@ -319,6 +350,17 @@ def compute_display_name(ui_path: str, source_kind: str, location: str,
     (leveldb_viewer.py's own display-name sanitization) so a display name
     is never mistaken for a real nested path."""
     ext = hit.get('ext', '.bin')
+    if source_kind == 'cache':
+        # The URL's last path segment (query/fragment dropped), with the
+        # real media extension appended when the URL doesn't already end in
+        # one; the record's own name if the URL has no usable segment.
+        from urllib.parse import urlparse, unquote
+        url = hit.get('url') or ''
+        seg = unquote(urlparse(url).path.rsplit('/', 1)[-1]) if url else ''
+        seg = seg.strip() or ui_path.rsplit('/', 1)[-1]
+        if os.path.splitext(seg)[1].lower() not in _MEDIA_EXTS:
+            seg += ext
+        return seg.replace('/', '∕')
     if source_kind == 'plist':
         segment = (location.rsplit('.', 1)[-1] if location else '').strip('<>[]')
         if not segment or segment.startswith('nested-bplist'):
@@ -638,6 +680,28 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
     docstring), then scanned again directly off *raw* (+ *wal_bytes*, if
     given) for deleted content via scan_sqlite_deleted."""
     rows: list[dict] = []
+    if kind == 'cache':
+        # A Chromium Simple Cache record (any app): its body is the cached
+        # HTTP response. One record holds one response, so at most one hit,
+        # carrying the URL for the child's "Source URL" column.
+        import chrome_cache
+        rec = chrome_cache.parse_simple_cache_entry(raw)
+        body = rec.get('body') if rec else None
+        if not body:
+            return rows
+        got = classify_media_blob(body)
+        if got is None:
+            return rows
+        media_kind, ext, _wrapped = got
+        headers = dict(rec.get('headers') or {})
+        if rec.get('content_type'):
+            headers.setdefault('content-type', rec['content_type'])
+        hit = {'blob': body, 'kind': media_kind, 'ext': ext,
+               'http_headers': headers, 'url': rec.get('url')}
+        row = _build_hit_row(ui_path, 'cache', 'body', scan_dir, hit, scan_scope)
+        row['source_url'] = rec.get('url')
+        rows.append(row)
+        return rows
     if kind == 'plist':
         for hit in scan_plist_bytes(raw):
             rows.append(_build_hit_row(ui_path, 'plist', hit['plist_path'],

@@ -78,11 +78,23 @@ def _parse_cache_key(key: str) -> tuple[str | None, str]:
         after = key.split('_dk_', 1)[1]
         parts = after.split(' ')
         if len(parts) >= 3:
-            return parts[0], parts[-1]
+            return parts[0], _strip_key_flags(parts[-1])
         if len(parts) == 2:
-            return parts[0], parts[-1]
+            return parts[0], _strip_key_flags(parts[-1])
     parts = key.split(' ')
-    return None, parts[-1] if parts else key
+    return None, _strip_key_flags(parts[-1] if parts else key)
+
+
+# A key with no partition can still start with Chrome's flags prefix, e.g.
+# "1/0/https://host/path" — found 2026-10-22 on roughly half the real records
+# checked (CTF26, Android 14 JoshHickman). Only stripped when what follows is
+# a real URL scheme, so a genuine path that happens to start with digits is
+# never cut. The raw key stays available as 'key'.
+_KEY_FLAGS = re.compile(r'^\d+/\d+/(?=[A-Za-z][A-Za-z0-9+.-]*:)')
+
+
+def _strip_key_flags(resource: str) -> str:
+    return _KEY_FLAGS.sub('', resource, count=1)
 
 
 def _parse_raw_headers(blob: bytes) -> tuple[str, dict[str, str]]:
@@ -128,6 +140,7 @@ def parse_simple_cache_entry(raw: bytes) -> dict | None:
         key_start = _HEADER_SIZE
         key = raw[key_start:key_start + key_len].decode('utf-8', errors='replace')
         top_level_site, url = _parse_cache_key(key)
+        raw_key = key
 
         body_start = key_start + key_len
         eof1 = raw.find(_EOF_MAGIC, body_start)
@@ -136,7 +149,7 @@ def parse_simple_cache_entry(raw: bytes) -> dict | None:
             # body from whatever follows. Real, not hypothetical: happens
             # for a genuinely truncated/partially-overwritten entry.
             return {
-                'url': url, 'top_level_site': top_level_site,
+                'url': url, 'top_level_site': top_level_site, 'key': raw_key,
                 'status_line': '', 'headers': {}, 'content_type': '',
                 'content_encoding': '', 'body': None,
                 'body_error': None, 'raw_body_length': 0,
@@ -161,6 +174,7 @@ def parse_simple_cache_entry(raw: bytes) -> dict | None:
 
         return {
             'url': url,
+            'key': raw_key,
             'top_level_site': top_level_site,
             'status_line': status_line,
             'headers': headers,
@@ -178,6 +192,48 @@ def parse_simple_cache_entry(raw: bytes) -> dict | None:
             'body': None, 'body_error': None, 'raw_body_length': 0,
             'header_parse_error': f'unexpected error: {exc}',
         }
+
+
+def looks_like_record(raw: bytes) -> bool:
+    """True if *raw* starts with a Simple Cache entry's own magic number."""
+    return len(raw) >= _HEADER_SIZE and _HEADER_STRUCT.unpack_from(raw, 0)[0] == _HEADER_MAGIC
+
+
+def format_record_text(raw: bytes) -> str | None:
+    """The record's own information as readable text, for the File
+    Browser's Text tab (any app's Simple Cache record — added 2026-10-22,
+    owner request: double-clicking a cache record shows its information
+    there). Everything parse_simple_cache_entry found, plus anything it
+    couldn't: a truncated record or failed decompression is stated, not
+    hidden. None if *raw* isn't a Simple Cache record at all."""
+    if not looks_like_record(raw):
+        return None
+    rec = parse_simple_cache_entry(raw)
+    if rec is None:
+        return None
+    body = rec.get('body')
+    lines = [
+        'Chromium Simple Cache record',
+        '',
+        f"URL:              {rec.get('url') or '(not recorded)'}",
+        f"Cache key:        {rec.get('key') or '(not recorded)'}",
+        f"Top-level site:   {rec.get('top_level_site') or '(none)'}",
+        f"HTTP status:      {rec.get('status_line') or '(not found)'}",
+        f"Content-Type:     {rec.get('content_type') or '(none)'}",
+        f"Content-Encoding: {rec.get('content_encoding') or '(none)'}",
+        f"Record file size: {len(raw):,} bytes",
+        f"Body (stored):    {rec.get('raw_body_length', 0):,} bytes",
+        f"Body (decoded):   {len(body):,} bytes" if body is not None else 'Body (decoded):   (not available)',
+    ]
+    if rec.get('body_error'):
+        lines.append(f"Body problem:     {rec['body_error']}")
+    if rec.get('header_parse_error'):
+        lines.append(f"Header problem:   {rec['header_parse_error']}")
+    headers = rec.get('headers') or {}
+    lines += ['', f"Response headers ({len(headers)}):"]
+    width = max((len(k) for k in headers), default=0)
+    lines += [f"  {k.ljust(width)}  {v}" for k, v in headers.items()]
+    return '\n'.join(lines)
 
 
 # ── HTML reference extraction + MHTML synthesis ─────────────────────────────

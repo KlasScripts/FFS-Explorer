@@ -856,6 +856,34 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
   (independent check); main-archive groups otherwise identical (11,875).
 - EXIF/video metadata already had its own route for unpacked files.
 
+**A-75. Web cache records (any app) show their media as children.**
+*Decision (owner) + Confirmed (real), 2026-10-22.*
+- Chromium Simple Cache records (`<16 hex>_0`) are used by Chrome and by
+  every app with a Chromium WebView or engine (Edge, Opera, Brave,
+  DuckDuckGo, Instagram, Imgur, WeChat, Fitbit, Facebook Messenger, ...).
+  The embedded-media sweep nominates them by name and accepts them only
+  with the format's magic; a body that is an image or video becomes the
+  record's child (`source_kind` 'cache').
+- The child is named from the URL, carries **Source URL**, and takes
+  **every time field of its record unchanged** (all four on GrayKey,
+  mtime only on Cellebrite Android), because one record holds exactly one
+  cached download. Only cache records do this; database/plist hits don't
+  (their container times describe the whole container).
+- Server `Date`/`Last-Modified` are not columns (server clock, about the
+  website); they are in the record's Text tab with every other header.
+- Double-clicking a record goes inside it and shows the record's
+  information (URL, raw cache key, status, content type, sizes, headers,
+  any parse/decompression problem) in the Text tab. The child's Text tab
+  says which record it came from and that its times are the record's.
+- Cache media is left out of User Media (not user-created content).
+- Cache keys of the form `1/0/<url>` (no partition) had the flags prefix
+  left in the URL; now stripped when a URL scheme follows. This also fixes
+  the Chrome Cache Media/Pages reports' URL column on re-run.
+- Verified: CTF26 12,075 records → 2,670 media, all times equal to the
+  record (Created/Changed/Accessed/Modified); Android 14 JoshHickman
+  16,037 → 2,088 (Modified only); every child real media with a clean URL.
+- Not handled: media stored in sparse `<hash>_s` files (common for video).
+
 ## 11. In-app format decoding
 
 **A-42. Binary plists:** decoded with `plistlib`, with NSKeyedArchiver

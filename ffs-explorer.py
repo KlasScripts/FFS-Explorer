@@ -55,6 +55,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       mark_media_seen, unmark_media_seen, load_seen_media_paths,
                       indexed_leveldb_folders,
                       save_embedded_media_hits, load_embedded_media_hits,
+                      save_cache_record_sources, load_cache_record_sources,
                       clear_embedded_media_hits,
                       save_processing_registry_entries, processed_ui_paths,
                       processing_registry_entry)
@@ -1508,7 +1509,8 @@ _ACQ_HASH_HEADERS = {'sha256': 'SHA-256 (GrayKey)', 'sha1': 'SHA-1 (GrayKey)',
 # (added 2026-10-20, ASSUMPTIONS.md A-72): "1 of 2" / "2 of 2" on every copy
 # of a path GrayKey wrote more than once; the earlier copies also carry
 # "[capture k of n]" in their name (zip_cd_cache.capture_alias).
-_META_COL_HEADERS = {'capture': 'Capture', **_ACQ_HASH_HEADERS}
+_META_COL_HEADERS = {'capture': 'Capture', **_ACQ_HASH_HEADERS,
+                     'source_url': 'Source URL'}   # media extracted from a web cache record
 
 # Cocoa/Mac epoch (2001-01-01) -> Unix epoch, seconds. photos_metadata.py's
 # Taken/Added (timestamp_fields unit "cocoa_s") store the raw value in this
@@ -4334,7 +4336,7 @@ class EmbeddedMediaScanWorker(QThread):
     BEFORE the processing_registry check above, so its own count and
     this one never double-count the same file.
     """
-    discovery_done = Signal(int, int, int, int)   # (n_databases, n_plists, n_already_scanned, n_skip_listed)
+    discovery_done = Signal(int, int, int, int, int)   # (n_databases, n_plists, n_already_scanned, n_skip_listed, n_cache_records)
     progress       = Signal(int, int, str, int, dict)  # (index, total, ui_path, file_size, counts)
     finished_scan  = Signal(dict)               # summary dict, see run()'s own tail
 
@@ -4397,6 +4399,9 @@ class EmbeddedMediaScanWorker(QThread):
                 meta[v] = {'size': 0}
         sqlite_paths, plist_paths = ems.enumerate_candidates(
             meta, self._overrides, self._scan_folders, excludes)
+        # Chromium Simple Cache records from any app (embedded_media_scan.
+        # is_simple_cache_record), same scope as databases/plists.
+        cache_paths = ems.enumerate_cache_records(meta, self._scan_folders, excludes)
         n_databases, n_plists = len(sqlite_paths), len(plist_paths)
 
         n_skip_listed = 0
@@ -4408,6 +4413,9 @@ class EmbeddedMediaScanWorker(QThread):
                 self._skip_entries)
             sqlite_paths = [p for p in sqlite_paths if not skip_check(p)]
             plist_paths = [p for p in plist_paths if not skip_check(p)]
+            before_cache = len(cache_paths)
+            cache_paths = [p for p in cache_paths if not skip_check(p)]
+            n_skip_listed += before_cache - len(cache_paths)
             n_skip_listed = before - (len(sqlite_paths) + len(plist_paths))
 
         current_version = ems.scan_logic_version()
@@ -4421,7 +4429,7 @@ class EmbeddedMediaScanWorker(QThread):
                 already_scanned = set()
 
         self.discovery_done.emit(n_databases, n_plists,
-                                 len(already_scanned), n_skip_listed)
+                                 len(already_scanned), n_skip_listed, len(cache_paths))
 
         scan_dir = os.path.join(self._case_dir, 'embedded_media')
         os.makedirs(scan_dir, exist_ok=True)
@@ -4432,7 +4440,8 @@ class EmbeddedMediaScanWorker(QThread):
         rows: list[dict] = []
         registry_entries: list[tuple[str, str, int]] = []
         all_candidates = [('plist', p) for p in plist_paths if p not in already_scanned] + \
-                        [('sqlite', p) for p in sqlite_paths if p not in already_scanned]
+                        [('sqlite', p) for p in sqlite_paths if p not in already_scanned] + \
+                        [('cache', p) for p in cache_paths if p not in already_scanned]
         total = len(all_candidates)
 
         for i, (kind, ui_path) in enumerate(all_candidates):
@@ -4471,6 +4480,10 @@ class EmbeddedMediaScanWorker(QThread):
             try:
                 with closing(_open_results_db(self._case_dir)) as db:
                     save_embedded_media_hits(db, rows)
+                    sources = [(r['source_ui_path'], r.get('source_url'), r.get('content_type_hint'))
+                               for r in rows if r.get('source_kind') == 'cache']
+                    if sources:
+                        save_cache_record_sources(db, sources)
             except Exception:
                 pass
 
@@ -6755,15 +6768,17 @@ class ProcessDialog(QDialog):
             parent=self).exec()
 
     def _on_embedded_media_discovery(self, n_databases: int, n_plists: int,
-                                     n_already_scanned: int, n_skip_listed: int):
+                                     n_already_scanned: int, n_skip_listed: int,
+                                     n_cache: int = 0):
         self._embedded_media_totals = (n_databases, n_plists)
-        if n_databases == 0 and n_plists == 0:
+        if n_databases == 0 and n_plists == 0 and n_cache == 0:
             self._status_label.setText(
-                "Embedded-media sweep: no SQLite databases or property "
-                "lists found to scan.")
+                "Embedded-media sweep: no SQLite databases, property "
+                "lists or web cache records found to scan.")
             return
-        msg = (f"Embedded-media sweep: found {n_databases:,} database(s) and "
-              f"{n_plists:,} property list(s) to scan…")
+        msg = (f"Embedded-media sweep: found {n_databases:,} database(s), "
+              f"{n_plists:,} property list(s) and {n_cache:,} web cache "
+              "record(s) to scan…")
         notes = []
         if n_skip_listed:
             # embedded_media_skip_list.py -- an examiner-maintained "not
@@ -7705,6 +7720,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Which _META_COL_HEADERS keys this archive's metadata carries, in
         # column order.
         self._meta_col_keys: tuple = ()
+        # Media children extracted from web cache records (_inject_embedded_media).
+        self._cache_media_children: frozenset = frozenset()
 
 
         main_widget = QWidget()
@@ -9191,6 +9208,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         ui_path = self.file_model.index(source.row(), 0).data(Qt.ItemDataRole.UserRole)
         if ui_path in self.folder_map:
             self.navigate_tree_to_path(ui_path)
+            import embedded_media_scan as _ems
+            if (ui_path in self._embedded_media_containers
+                    and _ems.is_simple_cache_record(ui_path)):
+                # A web cache record: go inside it (its media child) AND
+                # show the record's own information in the Text tab (owner
+                # request, 2026-10-22). After the navigation settles, so
+                # the folder change can't clear it again.
+                def _show_record(p=ui_path):
+                    self._load_file_preview(p)
+                    self.preview_tabs.setCurrentIndex(1)   # Text
+                QTimer.singleShot(0, _show_record)
         elif ui_path in self._nested_virtual_paths:
             self._load_virtual_entry_preview(ui_path)
         elif ui_path and self._in_zip(ui_path):
@@ -9198,6 +9226,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _render_as_text(self, data: bytes, name: str) -> str | None:
         """Return a (possibly pretty-printed) string for *data*, or None if binary."""
+        # A web cache record (any app) shows its own information.
+        import chrome_cache
+        if chrome_cache.looks_like_record(data):
+            return chrome_cache.format_record_text(data)
         if data[:6] == b'bplist':
             # Binary plist — not text at all, but decodable structured data.
             # artifact_runner.decode_plist_blob is the project's one real
@@ -9403,6 +9435,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return
         name = meta.get('_display_name') or ui_path.rsplit('/', 1)[-1]
         self._display_preview_bytes(ui_path, data, name)
+        if meta.get('_cache_record'):
+            # The media's own bytes have no text form; say where it came
+            # from instead, and that its times are the record's.
+            self._load_text_preview(
+                f"Media extracted from a web cache record\n\n"
+                f"Record:     {meta['_cache_record']}\n"
+                f"Source URL: {meta.get('source_url') or '(not recorded)'}\n\n"
+                "Its Created/Changed/Modified/Accessed times are those of the "
+                "cache record file that contains it (a record holds exactly one "
+                "cached download), passed through as the archive records them.",
+                ui_path)
 
     def _load_nested_entry_preview(self, ui_path: str) -> None:
         """Read an entry from an extracted nested archive and display it."""
@@ -11442,9 +11485,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             for v in islice((v for v in data.values() if v), 500))
         # Not sampled: folders carry no hashes, a sample could be all
         # folders, and a repeated path is rare. any() stops at the first hit.
-        self._meta_col_keys = tuple(
-            k for k in _META_COL_HEADERS
-            if any(k in v for v in data.values() if v))
+        self._recompute_meta_col_keys(data)
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'App', 'Path'])
         self._update_filter_columns(self.file_headers)
@@ -11647,6 +11688,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._timestamp_display_dialog(is_first_load=True)
 
     # ── AI access (embedded MCP server) ───────────────────────────────────────
+
+    def _recompute_meta_col_keys(self, data: dict | None = None) -> None:
+        """Which _META_COL_HEADERS keys this archive's metadata carries —
+        recomputed after virtual entries (embedded media, e.g. a cache
+        record's "Source URL") are injected, not just at load."""
+        data = self.full_metadata if data is None else data
+        self._meta_col_keys = tuple(
+            k for k in _META_COL_HEADERS
+            if any(v.get(k) for v in data.values() if v))
 
     def _open_log_folder(self):
         d = startup_log.log_dir()
@@ -12106,8 +12156,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         virtual_paths: set[str] = set()
         containers: set[str] = set()
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                cache_sources = load_cache_record_sources(db)
+        except Exception:
+            cache_sources = {}
+        cache_children: set[str] = set()
         for container, container_hits in by_container.items():
             used_names: dict[str, int] = {}
+            container_meta = self.full_metadata.get(container) or {}
             children = []
             total_size = 0
             for h in container_hits:
@@ -12123,12 +12180,31 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 virtual_paths.add(vpath)
                 children.append(vpath)
                 total_size += h['byte_length']
-                self.full_metadata[vpath] = {
+                child = {
                     'size':                    h['byte_length'],
                     '_display_name':           name,
                     '_embedded_media_source':  h['extracted_path'],
                     'mtime':                   None,
                 }
+                if h['source_kind'] == 'cache':
+                    # A Simple Cache record holds exactly one cached response,
+                    # so the record file's own times ARE this media's times
+                    # (owner decision, 2026-10-22): every time field the
+                    # archive format provides is passed through unchanged —
+                    # all four on GrayKey, mtime only on Cellebrite Android.
+                    # Never done for database/plist hits, whose container
+                    # times describe the whole container, not one item.
+                    for key, value in container_meta.items():
+                        if key.endswith('time'):
+                            child[key] = value
+                    child['source_url'] = (cache_sources.get(container) or {}).get('url') or ''
+                    child['_cache_record'] = container
+                    cache_children.add(vpath)
+                self.full_metadata[vpath] = child
+                # Typed from the bytes the sweep classified, as a fallback
+                # for a name whose extension says nothing.
+                self._header_type_overrides.setdefault(
+                    vpath, 'Video' if h['media_kind'] == 'video' else 'Picture')
             self.folder_map[container] = children
             self._auto_tick_new_tree_entries(container, children)
             containers.add(container)
@@ -12144,6 +12220,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         self._embedded_media_containers = frozenset(containers)
         self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_paths)
+        self._cache_media_children = frozenset(cache_children)
+        self._recompute_meta_col_keys()
 
     def _on_embedded_media_scan_injected(self):
         """Runs when ProcessDialog's embedded-media scan finishes (see

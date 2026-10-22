@@ -556,6 +556,16 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_embedded_media_hits_source
         ON embedded_media_hits (source_ui_path)
     ''')
+    # One row per Chromium Simple Cache record (any app) whose body the
+    # embedded-media sweep extracted as media: the URL it was fetched from,
+    # shown as "Source URL" on that media child (2026-10-22, owner request).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS cache_record_sources (
+            source_ui_path TEXT PRIMARY KEY,
+            url            TEXT,
+            content_type   TEXT
+        )
+    ''')
     # Migration: display_name added 2026-09-22, the same day as the table
     # itself — a real case_dir could already have this table from before
     # this column existed (the table was shipped and exercised the same
@@ -1442,6 +1452,20 @@ def save_embedded_media_hits(conn: 'sqlite3.Connection', hits: list) -> None:
         hits,
     )
     conn.commit()
+
+
+def save_cache_record_sources(conn: 'sqlite3.Connection', rows: list) -> None:
+    """rows: [(source_ui_path, url, content_type)] — see the
+    cache_record_sources table."""
+    conn.executemany('INSERT OR REPLACE INTO cache_record_sources '
+                     '(source_ui_path, url, content_type) VALUES (?, ?, ?)', rows)
+    conn.commit()
+
+
+def load_cache_record_sources(conn: 'sqlite3.Connection') -> dict:
+    """{source_ui_path: {'url':, 'content_type':}}."""
+    return {p: {'url': u, 'content_type': c} for p, u, c in conn.execute(
+        'SELECT source_ui_path, url, content_type FROM cache_record_sources')}
 
 
 def load_embedded_media_hits(conn: 'sqlite3.Connection') -> list:

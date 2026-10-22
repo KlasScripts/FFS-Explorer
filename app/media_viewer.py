@@ -1658,9 +1658,14 @@ class MediaViewerMixin:
         correction: it duplicated this already-working, already-UI-
         wired mechanism rather than surfacing it."""
         prefixes = self._user_media_include_prefixes()
+        # Media extracted from web cache records (cached site images, ads,
+        # thumbnails) isn't user-created content — left out of User Media by
+        # owner decision, 2026-10-22; still visible inside each record.
+        cache_children = getattr(self, '_cache_media_children', frozenset())
         return sorted(
             p for p in self.full_metadata
             if p not in self.folder_map
+            and p not in cache_children
             and self._is_media_file(p)
             and self._is_user_media_path(p, prefixes)
         )

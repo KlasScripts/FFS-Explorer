@@ -153,9 +153,26 @@ class ZipReader:
         """Yield successive chunks of an entry.
 
         stop_fn() is checked before each chunk — return True to abort.
-        Opens its own file handle so it can be called from threads.
+        A worker thread reuses its own handle (thread_handle) and seeks
+        before EVERY chunk, since this generator pauses between chunks and
+        the caller may read something else on the same thread meanwhile;
+        the main thread opens its own.
         """
         if size <= 0:
+            return
+        shared = thread_handle(self.zip_path)
+        if shared is not None:
+            pos = 0
+            while pos < size:
+                if stop_fn and stop_fn():
+                    return
+                read_len = min(chunk_size, size - pos)
+                shared.seek(offset + pos)
+                chunk = shared.read(read_len)
+                if not chunk:
+                    return
+                yield chunk
+                pos += read_len
             return
         with open(self.zip_path, 'rb') as fh:
             fh.seek(offset)

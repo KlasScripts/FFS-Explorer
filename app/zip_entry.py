@@ -11,6 +11,8 @@ read strategies so callers never have to know which one applies:
 import struct
 import zipfile
 
+from zip_reader import thread_handle
+
 
 class ZipEntry:
     """A handle to one file inside a zip archive."""
@@ -47,8 +49,12 @@ class ZipEntry:
         Computed once from the local file header
         (header_offset + 30 + filename_len + extra_len)."""
         if self._data_offset is None:
-            with open(self.zip_path, 'rb') as f:
-                self._resolve_data_offset(f)
+            fh = thread_handle(self.zip_path)
+            if fh is not None:
+                self._resolve_data_offset(fh)
+            else:
+                with open(self.zip_path, 'rb') as f:
+                    self._resolve_data_offset(f)
         return self._data_offset
 
     def _resolve_data_offset(self, f) -> int:
@@ -69,6 +75,13 @@ class ZipEntry:
         zipfile decompression for compressed entries."""
         size = self._file_size if limit is None else min(self._file_size, limit)
         if self.is_stored:
+            # A worker thread reuses its own handle (zip_reader.thread_handle:
+            # one open per thread, not per file — the cost that made bulk
+            # stages slow on Windows); seeks every time, so it's safe.
+            fh = thread_handle(self.zip_path)
+            if fh is not None:
+                fh.seek(self._resolve_data_offset(fh))
+                return fh.read(size)
             with open(self.zip_path, 'rb') as f:
                 f.seek(self._resolve_data_offset(f))
                 return f.read(size)
@@ -83,6 +96,10 @@ class ZipEntry:
         Used by the hex viewer to page in additional data on scroll."""
         if not self.is_stored:
             raise ValueError("read_at requires a ZIP_STORED entry")
+        fh = thread_handle(self.zip_path)
+        if fh is not None:
+            fh.seek(self._resolve_data_offset(fh) + offset)
+            return fh.read(limit)
         with open(self.zip_path, 'rb') as f:
             f.seek(self._resolve_data_offset(f) + offset)
             return f.read(limit)

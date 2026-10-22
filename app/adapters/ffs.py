@@ -527,6 +527,29 @@ class FfsAdapter:
 
     # ── Candidate-path generators ─────────────────────────────────────────────
 
+    def ui_path_for(self, path: str, zip_names=None) -> str:
+        """Turn a location written the Cellebrite iOS way ('mobile/Library/SMS',
+        'preferences') into this archive's real ui_path. Only GrayKey iOS
+        differs: its ui_paths keep the 'private/var/' prefix Cellebrite drops,
+        so 'mobile/...' becomes 'private/var/mobile/...' — but only when that
+        path really exists in *zip_names* (physical names), which also leaves
+        Android locations ('data/data/...') and anything already starting
+        'private/' untouched. Without *zip_names* the path is returned as is.
+        Added 2026-10-22: report paths built from 'mobile/...' matched nothing
+        on GrayKey iOS (SMS attachments, Photos), so they could neither open
+        nor link (ASSUMPTIONS.md A-41)."""
+        path = path.strip('/')
+        if (self.format != self.FORMAT_GRAYKEY or not path
+                or path.startswith('private/') or zip_names is None):
+            return path
+        physical = f"/private/var/{path}"
+        if physical in zip_names or physical + '/' in zip_names:
+            return f"private/var/{path}"
+        prefix = physical + '/'
+        if any(n.startswith(prefix) for n in zip_names):
+            return f"private/var/{path}"
+        return path
+
     def user_candidates(self, *suffixes: str) -> list[str]:
         """Return ordered candidate zip paths for user-partition files.
 

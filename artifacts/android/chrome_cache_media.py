@@ -61,6 +61,9 @@ existence_check_paths = ["cache/Cache/Cache_Data/index"]
 
 core_fields = ["url", "content_type", "referenced_by_page_titles", "referenced_by_pages", "response_date_epoch"]
 media_fields = ["decoded_media_path"]
+# The thumbnail column above is a decoded copy on disk; Linked Report links
+# the cache entry file in the archive it came from (ASSUMPTIONS.md A-41).
+link_fields = ["raw_ui_path"]
 timestamp_fields = {"response_date_epoch": "s"}
 
 

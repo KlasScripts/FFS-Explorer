@@ -753,6 +753,21 @@ order.** *Decision, 2026-10-12; the numbering is Code only.*
   - the other 30 parsers declare none; any that reference files need it.
   Tracked in IDEAS.md idea 4; the rule for new parsers is in
   WRITING_ARTIFACT_PARSERS.md (`media_fields`).
+- *Fixed 2026-10-22, verified on all six test archives:*
+  - GrayKey iOS: paths built from `mobile/...` (SMS attachments, Photos)
+    didn't exist there (`private/var/mobile/...`), so they neither opened
+    nor linked. `FfsAdapter.ui_path_for` now translates; the runner passes
+    the translated `_app_base_ui_path` and `_ui_path_for` to parsers.
+    IOS18: Photos 0/6 → 6/6, SMS 0/1 → 1/1.
+  - New optional `link_fields`: the column holding the archive file a row
+    came from, when `media_fields` points at a decoded copy on disk. Chrome
+    cache media and pages link `raw_ui_path` (0 → all, e.g. 14,860 on
+    Android 15 CTF25); Chrome favicons declare `[]` (one database, no
+    per-row file).
+- *Not a bug:* Photos rows whose original isn't in the extraction (IOS17 10
+  of 567, CTF23 146 of 1,918). None are in Recently Deleted; each has a
+  same-named file under PhotoData, likely a derivative (e.g. iCloud
+  "Optimise Storage"). Unverified beyond the name match.
 
 **A-69. Duplicate detection.** *Decision; Confirmed (real) on CTF26,
 2026-10-16.*

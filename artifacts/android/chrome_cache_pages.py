@@ -91,6 +91,9 @@ existence_check_paths = ["cache/Cache/Cache_Data/index"]
 
 core_fields = ["url", "title", "content_type", "response_date_epoch", "render_note"]
 media_fields = ["reconstructed_mhtml_path"]
+# The thumbnail column above is a decoded copy on disk; Linked Report links
+# the cache entry file in the archive it came from (ASSUMPTIONS.md A-41).
+link_fields = ["raw_ui_path"]
 # reconstructed_mhtml_path is an .mhtml PAGE, not a still image -- a plain
 # image/video decode (media_viewer.ThumbnailWorker) can't produce a
 # meaningful thumbnail for it. Declaring this routes it through an actual

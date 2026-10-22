@@ -149,6 +149,7 @@ def _parse_attributed_body(blob):
 
 
 def run(paths):
+    mobile_root = paths.get('_ui_path_for', lambda p: p)('mobile')
     from artifact_runner import missing_ref_label, open_db_readonly, resolve_path_after_marker
 
     conn = open_db_readonly(paths["sms"])
@@ -218,10 +219,11 @@ def run(paths):
             # every attachment on the row regardless of count. 'mobile' is
             # the device root (attachment.filename's leading '~/' is the
             # mobile user's HOME directory, not this module's own app_path
-            # — 'mobile/Library/SMS' — so the literal device root is
-            # passed here, not _app_base_ui_path).
+            # — 'mobile/Library/SMS' — so the device root is passed here,
+            # not _app_base_ui_path), translated to this archive's own
+            # layout ('private/var/mobile' on GrayKey iOS).
             attachment_path = resolve_path_after_marker(
-                'mobile', atts[0]["filename"], '~/')
+                mobile_root, atts[0]["filename"], '~/')
 
         entry = {
             "conversation": conversation,

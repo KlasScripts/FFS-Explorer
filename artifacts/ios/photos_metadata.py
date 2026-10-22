@@ -336,6 +336,8 @@ def _load_classifications(psi_path: str) -> dict:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(paths):
+    # 'mobile/Media' in this archive's own layout ('private/var/...' on GrayKey iOS).
+    media_root = paths.get('_ui_path_for', lambda p: p)('mobile/Media')
     db = open_db_readonly(paths["photos_db"])
     try:
         tables = _tables(db)
@@ -439,7 +441,7 @@ def run(paths):
                 camera = md or mk
             out.append({
                 "asset_path":       f"{directory}/{filename}",
-                "attachment_path":  f"mobile/Media/{directory}/{filename}",
+                "attachment_path":  f"{media_root}/{directory}/{filename}",
                 "Original Name": orig_name or '',
                 "Album":         albums.get(pk, ''),
                 "Origin":        _origin(importedby, imported_by, imp_bundle),

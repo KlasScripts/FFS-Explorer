@@ -771,8 +771,14 @@ class ArtifactRunnerWorker(QThread):
         try:
             from artifact_db import build_attachment_links
             from db_utils import save_attachment_links
-            media_fields = getattr(module, 'media_fields', None)
-            links = build_attachment_links(script_name, rows, media_fields, label)
+            # link_fields names the column holding the ARCHIVE file a row
+            # came from, when media_fields points at a decoded copy on disk
+            # instead (Chrome cache parsers); [] means "no per-row archive
+            # file, don't link". Absent: media_fields, as before.
+            link_fields = getattr(module, 'link_fields', None)
+            if link_fields is None:
+                link_fields = getattr(module, 'media_fields', None)
+            links = build_attachment_links(script_name, rows, link_fields, label)
             save_attachment_links(case_conn, script_name, links)
             if links:
                 self.log.emit(f"  Linked {len(links)} attachment(s) to this report.")

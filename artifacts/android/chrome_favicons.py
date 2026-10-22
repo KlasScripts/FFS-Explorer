@@ -88,6 +88,9 @@ timestamp_fields = {"last_updated": "webkit_us", "last_requested": "webkit_us"}
 # first to find it.
 core_fields = ["page_url", "icon_type_label", "last_updated", "history_coverage"]
 media_fields = ["icon_image_path"]
+# No per-row file in the archive (every icon comes out of the one Favicons
+# database), so nothing to show in the File Browser's Linked Report column.
+link_fields = []
 
 record_source = {
     "label": "icon_mapping",

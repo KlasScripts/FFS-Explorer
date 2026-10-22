@@ -1325,7 +1325,17 @@ def run_artifact(
         # display time via the app's normal zip-reading path, never copied
         # to disk by the parser itself. See media_fields on the module and
         # artifacts/ios/whatsapp.py's `attachment_path` for the convention.
-        paths['_app_base_ui_path'] = app_base
+        # Translated to this archive's real ui_path (GrayKey iOS keeps the
+        # 'private/var/' prefix the Cellebrite-style app_path omits), and the
+        # translator itself for paths a parser builds outside its own base
+        # (e.g. SMS attachments under the device's 'mobile' home). Finding
+        # the parser's own files needs neither — user_candidates() already
+        # tries every layout — but any path written INTO a report does.
+        _name_set = set(zip_names)
+        def _ui_path_for(p, _names=_name_set):
+            return adapter.ui_path_for(p, _names) if adapter is not None else p.strip('/')
+        paths['_app_base_ui_path'] = _ui_path_for(app_base)
+        paths['_ui_path_for'] = _ui_path_for
 
         # Reserved keys for a parser that needs to enumerate/read MANY
         # files by name rather than a fixed/globbed files/optional_files

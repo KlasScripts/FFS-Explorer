@@ -167,6 +167,14 @@ Check the links on a real case before shipping: run the parser, then
 confirm in the File Browser that a linked file's "Linked Report" names the
 right row.
 
+If `media_fields` points at something you decoded to disk rather than at the
+archive file itself, also declare `link_fields = ["<column with the archive
+ui_path>"]` (Chrome cache parsers use `raw_ui_path`), or `link_fields = []`
+when rows have no per-row archive file. Build any archive path with
+`paths['_ui_path_for']('mobile/...')` or from `paths['_app_base_ui_path']`,
+never a hard-coded `'mobile/...'`: GrayKey iOS keeps the `private/var/`
+prefix.
+
 ```python
 attachment_path = f"{paths['_app_base_ui_path']}/{row['media_column']}"
 ```

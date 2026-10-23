@@ -90,6 +90,7 @@ from zip_cd_cache import (CachedZipView, is_valid as _cd_cache_valid,
 from ffs_metadata import (_build_folder_tree, _compute_folder_sizes,
                           _find_metadata_only_folders, _find_missing_plists,
                           _UUID_RE, parse_archive_metadata, persist_result,
+                          repair_guid_map,
                           _parse_child as _ffs_parse_child,
                           pack_snapshot, unpack_snapshot,
                           SNAPSHOT_KEY as _SNAPSHOT_KEY,
@@ -1937,6 +1938,9 @@ class ZipMetadataWorker(QThread):
         except Exception:
             return False
 
+        guid_to_bundle = repair_guid_map(
+            self.zip_path, self.case_dir, ffs_adapter, folder_map, zip_names,
+            guid_to_bundle, status_cb=self.status_update.emit)
         missing_plist_paths = _find_missing_plists(folder_map, ffs_adapter, guid_to_bundle)
         self.metadata_ready.emit(
             ui_metadata, folder_map, guid_to_bundle, zip_names,
@@ -2039,6 +2043,10 @@ class ZipMetadataWorker(QThread):
         folder_map   = result['folder_map']
         guid_to_bundle = result['guid_to_bundle']
         folder_sizes   = result['folder_sizes']
+        guid_to_bundle = repair_guid_map(
+            self.zip_path, self.case_dir, ffs_adapter, folder_map, zip_names,
+            guid_to_bundle, status_cb=self.status_update.emit)
+        result['guid_to_bundle'] = guid_to_bundle
         missing_plist_paths = _find_missing_plists(
             folder_map, ffs_adapter, guid_to_bundle)
 
@@ -2198,6 +2206,9 @@ class ZipMetadataWorker(QThread):
             folder_map = _build_folder_tree(ui_metadata, status_cb=self.status_update.emit)
             time.sleep(0)   # yield GIL after folder tree build
 
+            guid_to_bundle = repair_guid_map(
+                self.zip_path, self.case_dir, ffs_adapter, folder_map, zip_names,
+                guid_to_bundle, status_cb=self.status_update.emit)
             missing_plist_paths = _find_missing_plists(
                 folder_map, ffs_adapter, guid_to_bundle)
 

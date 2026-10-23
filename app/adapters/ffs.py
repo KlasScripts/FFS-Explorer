@@ -104,9 +104,44 @@ def _detect_system_prefix(zip_names: frozenset) -> str:
 
 # ── GUID → bundle-ID mapping ─────────────────────────────────────────────────
 
+def _mcm_identifier_at(rf, data_offset: int, file_size: int,
+                       header_offset: int) -> tuple[str | None, str]:
+    """Read one MCM metadata plist and return (MCMMetadataIdentifier, '')
+    or (None, reason). If the plist doesn't parse at the derived offset,
+    the entry's own local header is read and the plist retried at the
+    offset it gives: before v0.45.0 a wrong derived offset made valid
+    plists fail silently and their container lost its name."""
+    def _parse(off):
+        rf.seek(off)
+        return plistlib.loads(rf.read(file_size)).get("MCMMetadataIdentifier")
+    try:
+        bid = _parse(data_offset)
+        if bid:
+            return bid, ''
+        reason = 'no MCMMetadataIdentifier'
+    except Exception as e:
+        reason = f'unreadable plist ({type(e).__name__})'
+    try:
+        rf.seek(header_offset)
+        h = rf.read(30)
+        if h[:4] != b'PK\x03\x04':
+            return None, reason + '; local header not found'
+        name_len, extra_len = struct.unpack_from('<HH', h, 26)
+        true_off = header_offset + 30 + name_len + extra_len
+        if true_off == data_offset:
+            return None, reason
+        bid = _parse(true_off)
+        if bid:
+            return bid, ''
+        return None, reason + '; also failed at the local-header offset'
+    except Exception as e:
+        return None, reason + f'; header retry failed ({type(e).__name__})'
+
+
 def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
                            z: zipfile.ZipFile | None = None,
-                           container_prefix: str = "") -> dict:
+                           container_prefix: str = "",
+                           failures: list | None = None) -> dict:
     """Return {guid: bundle_id} by reading MCM metadata plists in parallel.
 
     Uses the already-open ZipFile *z* (if provided) solely to look up data
@@ -117,7 +152,13 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
     *container_prefix*, when set, limits the scan to entries under that path
     (e.g. 'filesystem2/mobile/Containers/') so that system-partition and other
     unrelated entries are rejected by a cheap startswith before the 57-char
-    endswith is evaluated."""
+    endswith is evaluated.
+
+    Nothing is dropped silently any more: a plist that fails at the derived
+    offset is retried at its local header's offset, a worker that can't
+    open the zip falls back to opening it per entry, and every plist that
+    still yields no identifier is appended to *failures* (if given) as
+    (zip_name, reason)."""
     meta_name = ".com.apple.mobile_container_manager.metadata.plist"
     if container_prefix:
         meta_files = [f for f in zip_names
@@ -127,9 +168,9 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
     if not meta_files:
         return {}
 
-    # Collect (guid, data_offset, file_size) using the already-open ZipFile
-    # (or open one temporarily if z was not supplied).
-    entries: list[tuple[str, int, int]] = []
+    # Collect (guid, data_offset, file_size, header_offset, name) using the
+    # already-open ZipFile (or open one temporarily if z was not supplied).
+    entries: list[tuple[str, int, int, int, str]] = []
     _close = z is None
     _z = zipfile.ZipFile(zip_path, 'r') if _close else z
     assert _z is not None
@@ -144,6 +185,8 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
             try:
                 info = _z.getinfo(entry)
             except KeyError:
+                if failures is not None:
+                    failures.append((entry, 'not in the zip directory'))
                 continue
             infos.append(info)
             guid_by_filename[info.filename] = entry.split('/')[-2]
@@ -151,7 +194,10 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
         for info in infos:
             data_offset = offsets.get(info.filename)
             if data_offset is not None:
-                entries.append((guid_by_filename[info.filename], data_offset, info.file_size))
+                entries.append((guid_by_filename[info.filename], data_offset,
+                                info.file_size, info.header_offset, info.filename))
+            elif failures is not None:
+                failures.append((info.filename, 'no data offset'))
     finally:
         if _close:
             _z.close()
@@ -159,28 +205,43 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
     if not entries:
         return {}
 
-    def _read_batch(batch: list[tuple[str, int, int]]) -> dict:
+    def _read_batch(batch) -> tuple[dict, list]:
         result: dict = {}
+        failed: list = []
+
+        def _one(rf, guid, data_offset, file_size, header_offset, name):
+            bid, reason = _mcm_identifier_at(rf, data_offset, file_size, header_offset)
+            if bid:
+                result[guid] = bid
+            else:
+                failed.append((name, reason))
+
         try:
             with open(zip_path, 'rb') as rf:
-                for guid, data_offset, file_size in batch:
-                    try:
-                        rf.seek(data_offset)
-                        bid = plistlib.loads(rf.read(file_size)).get("MCMMetadataIdentifier")
-                        if bid:
-                            result[guid] = bid
-                    except Exception:
-                        pass
+                for e in batch:
+                    _one(rf, *e)
         except OSError:
-            pass
-        return result
+            # The shared open failed (network drive, antivirus lock...):
+            # retry each remaining entry with its own open, so one failure
+            # can't drop a whole batch of containers.
+            for e in batch:
+                if e[0] in result or any(f[0] == e[4] for f in failed):
+                    continue
+                try:
+                    with open(zip_path, 'rb') as rf:
+                        _one(rf, *e)
+                except OSError as err:
+                    failed.append((e[4], f'could not open the zip ({err})'))
+        return result, failed
 
     n = min(8, len(entries))
     batch_size = max(1, (len(entries) + n - 1) // n)
     out: dict = {}
     with ThreadPoolExecutor(max_workers=n) as pool:
-        for batch_result in pool.map(_read_batch, batched(entries, batch_size)):
+        for batch_result, batch_failed in pool.map(_read_batch, batched(entries, batch_size)):
             out.update(batch_result)
+            if failures is not None:
+                failures.extend(batch_failed)
     return out
 
 
@@ -681,6 +742,13 @@ class FfsAdapter:
         rows = _extract_app_registry_from_launchservices(store)
         guid_map = _guid_map_from_app_registry_rows(rows)
         group_paths = _resolve_app_group_paths(store)
+        # Shared/AppGroup folder GUIDs too, so a group whose metadata plist
+        # couldn't be read still gets its name (the plist's
+        # MCMMetadataIdentifier IS the group id). Checked 2026-10-23: all
+        # 307 groups on three real iOS archives (GrayKey IOS18, Cellebrite
+        # IOS17 and CTF23) match their plist, 0 differ.
+        for gid, guid in group_paths.items():
+            guid_map.setdefault(guid, gid)
         for r in rows:
             r['app_group_paths'] = {gid: group_paths[gid] for gid in r['app_group_ids']
                                     if gid in group_paths}

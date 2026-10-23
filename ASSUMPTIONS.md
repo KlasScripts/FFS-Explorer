@@ -186,7 +186,9 @@ other tools such as Griffeye; see `ios_path_candidates` in
   each container's
   `.com.apple.mobile_container_manager.metadata.plist`.
   - The csstore was confirmed sometimes needed because the per-container
-    plists are missing on GrayKey extractions.
+    plists are missing on GrayKey extractions. *Unverified since
+    2026-10-23:* before v0.45.0 a plist could be read at the wrong offset
+    and fail silently, which looks the same as a missing plist; see A-76.
   - A GUID is specific to one installation. Anything stored across cases must
     use the bundle id: `FfsAdapter.canonical_app_path()`.
 - Android (C, D1, D2) uses `data/data/<package>` directly, with no mapping.
@@ -889,6 +891,35 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
   of 15,976 chunks match their CRC-32; every complete video plays.
 - Cache files are typed **Web Cache**: by name (`<16 hex>_0`/`_1`/`_s`) and
   by the format's magic in the header scan.
+
+**A-76. Container folders are never left unnamed silently.**
+*Decision (owner) + Confirmed (real), 2026-10-23.*
+- Report: on a GrayKey iOS case processed at work (Windows 11), some
+  `Shared/AppGroup` folders had no bundle id although their metadata
+  plists looked valid. Not reproduced on our GrayKey iOS archive (all
+  1,169 container folders named with the current code). Most likely
+  cause, not proven on the work archive:
+  - before v0.45.0 the offset of every plist was guessed from 5 random
+    plists; on a GrayKey zip, plists either side of 4 GiB need different
+    header sizes, so one side was read at the wrong place and dropped
+    silently (simulated on IOS18: 38 of 40 runs lost the 12 plists past
+    4 GiB);
+  - the map is cached, so the gap stayed on every later open;
+  - the LaunchServices fallback (A-8) never covered `Shared/AppGroup`: its
+    App Group GUIDs went only to the Apps report.
+- Fixes:
+  - a plist that doesn't parse is retried at its own local header's
+    offset; a worker that can't open the zip retries per entry; whatever
+    still fails is listed in the startup log with the reason;
+  - App Group GUIDs from LaunchServices name `Shared/AppGroup` folders
+    (all 307 on three real iOS archives match their plist, 0 differ);
+  - on every open (`ffs_metadata.repair_guid_map`), an unnamed container
+    folder is filled from the saved App Group GUIDs, then by re-reading
+    its plist if the zip has one; the result is saved to the case cache.
+- Verified on IOS18 (GrayKey) and IOS17 (Cellebrite): with half the plist
+  offsets deliberately 12 bytes wrong, all 1,181 / 1,221 containers are
+  still named; a cached map missing 131 / 171 folders (every App Group
+  plus 30 apps) is fully repaired on open, 0 wrong names.
 
 ## 11. In-app format decoding
 

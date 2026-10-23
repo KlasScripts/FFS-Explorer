@@ -299,6 +299,81 @@ def _find_missing_plists(folder_map: dict, ffs_adapter, guid_to_bundle: dict) ->
     ]
 
 
+_MCM_PLIST = ".com.apple.mobile_container_manager.metadata.plist"
+
+
+def repair_guid_map(zip_path: str, case_dir: str | None, ffs_adapter,
+                    folder_map: dict, zip_names: frozenset,
+                    guid_to_bundle: dict, status_cb=None) -> dict:
+    """Fill container folders that have no bundle id, on every open.
+
+    The guid map is built once and cached, so a container whose metadata
+    plist failed to read (e.g. the wrong-offset bug fixed in v0.45.0, or a
+    worker that couldn't open the zip) stayed unnamed on every later open.
+    For each unnamed container folder, in order:
+      1. the Shared/AppGroup GUIDs LaunchServices records, already saved
+         in this case's app registry (no reads);
+      2. its own metadata plist, re-read with the hardened reader
+         (adapters.ffs._build_guid_bundle_map), only for folders whose
+         plist is in the zip.
+    Anything filled is saved back to casecache.db. Plists that still give
+    no identifier are written to the startup log with the reason.
+    Returns the (possibly extended) map; never raises."""
+    try:
+        missing = _find_missing_plists(folder_map, ffs_adapter, guid_to_bundle)
+    except Exception:
+        return guid_to_bundle
+    if not missing:
+        return guid_to_bundle
+    found: dict = {}
+    try:
+        if case_dir:
+            from db_utils import load_app_registry
+            with closing(_open_cache_db(case_dir)) as db:
+                rows = load_app_registry(db)
+            for r in rows:
+                for gid, guid in (r.get('app_group_paths') or {}).items():
+                    found.setdefault(guid, gid)
+        missing_names = {p.rsplit('/', 1)[-1] for p in missing}
+        found = {g: b for g, b in found.items() if g in missing_names}
+        plists = []
+        for p in missing:
+            if p.rsplit('/', 1)[-1] in found:
+                continue
+            raw = ffs_adapter.resolve(f"{p}/{_MCM_PLIST}")
+            if raw in zip_names:
+                plists.append(raw)
+        failures: list = []
+        if plists and case_dir:
+            if status_cb:
+                status_cb(f"Re-reading {len(plists):,} container metadata plist(s)…")
+            from adapters.ffs import _build_guid_bundle_map
+            infos = _cd_cache_load(zip_path, case_dir)
+            if infos is not None:
+                found.update(_build_guid_bundle_map(
+                    zip_path, frozenset(plists), z=CachedZipView(zip_path, infos),
+                    failures=failures))
+        if failures:
+            import startup_log
+            startup_log.message('warning',
+                f"{len(failures)} container metadata plist(s) still unreadable "
+                f"in {zip_path}; those folders show without a bundle id:")
+            for name, reason in failures[:50]:
+                startup_log.message('warning', f"  {name}: {reason}")
+        if found:
+            import startup_log
+            startup_log.message('warning',
+                f"Named {len(found)} container folder(s) missing from the cached "
+                f"bundle-id map ({len(missing) - len(found)} still unnamed).")
+            guid_to_bundle = {**guid_to_bundle, **found}
+            if case_dir:
+                with closing(_open_cache_db(case_dir)) as db:
+                    save_guid_bundle_map(db, guid_to_bundle)
+    except Exception:
+        pass
+    return guid_to_bundle
+
+
 def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
     """Build and return folder_map from ui_metadata paths."""
     if status_cb:

@@ -4702,10 +4702,19 @@ class SingleFileEmbeddedMediaWorker(QThread):
             except Exception:
                 wal_bytes = None
 
+        partner = None
+        if kind == 'cache' and self._ui_path.endswith('_s'):
+            # a sparse cache file's Content-Type is in its '_0' record
+            try:
+                partner = z.open(self._adapter.resolve(self._ui_path[:-2] + '_0')).read()
+            except Exception:
+                partner = None
+
         scan_dir = os.path.join(self._case_dir, 'embedded_media')
         os.makedirs(scan_dir, exist_ok=True)
         rows = ems.scan_container(kind, self._ui_path, raw, scan_dir,
-                                  'manual_single_file', wal_bytes=wal_bytes)
+                                  'manual_single_file', wal_bytes=wal_bytes,
+                                  partner_bytes=partner)
 
         counts = {'live_pictures': 0, 'live_videos': 0,
                  'recovered_pictures': 0, 'recovered_videos': 0}
@@ -4718,6 +4727,10 @@ class SingleFileEmbeddedMediaWorker(QThread):
             try:
                 with closing(_open_results_db(self._case_dir)) as db:
                     save_embedded_media_hits(db, rows)
+                    sources = [(r['source_ui_path'], r.get('source_url'), r.get('content_type_hint'))
+                               for r in rows if r.get('source_kind') == 'cache']
+                    if sources:
+                        save_cache_record_sources(db, sources)
             except Exception:
                 pass
 
@@ -4802,8 +4815,8 @@ class SingleFileEmbeddedMediaDialog(QDialog):
             f"recovery.\n\n"
             f"Its real content was checked directly (not just its name or "
             f"extension) and identified as: {detected_type}.\n\n"
-            f"Embedded media recovery only supports SQLite databases and "
-            f"property lists (binary or XML).")
+            f"Embedded media recovery supports SQLite databases, property "
+            f"lists (binary or XML) and web cache records.")
         self._close_btn.setEnabled(True)
 
     def show_already_processed(self, entry: dict):

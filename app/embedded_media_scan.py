@@ -704,7 +704,7 @@ def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES):
 #    both that and the bulk EmbeddedMediaScanWorker use ──────────────
 
 def classify_container_type(raw: bytes) -> str | None:
-    """'sqlite' | 'plist' | None, from the file's OWN real magic bytes —
+    """'sqlite' | 'plist' | 'cache' | None, from the file's OWN real magic bytes —
     ignoring any pre-existing extension/Type label entirely. Added
     2026-09-23 for the manual, single-file "Search for Embedded Media"
     context-menu action (ffs-explorer.py), which deliberately re-checks
@@ -730,6 +730,12 @@ def classify_container_type(raw: bytes) -> str | None:
     head = raw[:512].lstrip()
     if head[:5] == b'<?xml' and b'<plist' in head:
         return 'plist'
+    # A Chromium Simple Cache record or sparse file (any app, any name):
+    # its own magic number (2026-10-23 — the manual action used to turn
+    # web cache records away as unsupported).
+    import chrome_cache
+    if chrome_cache.looks_like_record(raw):
+        return 'cache'
     return None
 
 

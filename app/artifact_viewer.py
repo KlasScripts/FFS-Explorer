@@ -1897,6 +1897,19 @@ class ArtifactViewerMixin:
             self._art_tree_view.setCurrentIndex(
                 self._art_tree_model.indexFromItem(group_item))
 
+        # Opening the report starts its default filter in a background
+        # ArtifactFilterWorker; when that finishes it resets the table's rows,
+        # which wiped a selection made here first (found 2026-10-23: the row
+        # was selected, then cleared one event-loop pass later). Select once
+        # the filter is done instead.
+        if self._art_filter_worker is not None and self._art_filter_worker.isRunning():
+            self._art_pending_jump = report_rowid
+            return
+        self._art_select_report_rowid(report_rowid)
+
+    def _art_select_report_rowid(self, report_rowid) -> None:
+        """Select and scroll to the open report's row *report_rowid*; see
+        _art_jump_to_report_row."""
         # The target row may be present in the report's own full row set
         # (_all_ids) but hidden by the default "Hide likely false
         # positives" filter _art_show_report just applied (checked by
@@ -2812,6 +2825,7 @@ class ArtifactViewerMixin:
 
     def _art_show_report(self, script_name: str):
         self._cancel_art_filter_worker()
+        self._art_pending_jump = None    # a jump into a previous report is void
         table = f'artifact_{script_name}'
         try:
             conn = _open_results_db(self._case_dir)
@@ -3322,6 +3336,10 @@ class ArtifactViewerMixin:
         total = self._art_table_model.total_rows
         self._art_row_label.setText(f"{len(rowids):,} of {total:,} rows")
         self._art_filter_btn.setEnabled(True)
+        pending = getattr(self, '_art_pending_jump', None)
+        if pending is not None:          # a jump waiting for this filter
+            self._art_pending_jump = None
+            self._art_select_report_rowid(pending)
 
     def _cancel_art_filter_worker(self):
         if self._art_filter_worker and self._art_filter_worker.isRunning():

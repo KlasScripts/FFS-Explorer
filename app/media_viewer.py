@@ -3017,6 +3017,16 @@ class MediaViewerMixin:
         if not paths:
             return
         menu = QMenu(self._media_view)
+        # Jump to the report row(s) that mention the clicked item (2026-10-23,
+        # owner request) — the same links as the File Browser's "Linked
+        # Report" column. With Hide Duplicates on, *paths* already includes
+        # the item's hidden copies, so a copy's links are offered too.
+        if index.isValid():
+            clicked = index.data(Qt.ItemDataRole.DisplayRole)
+            group = [p for p, _ in paths] if len(self._media_view.selectionModel().selectedIndexes()) == 1 \
+                else [clicked]
+            if self._add_report_link_actions(menu, group):
+                menu.addSeparator()
         self._bookmark_submenu(menu, paths)
         menu.exec(self._media_view.viewport().mapToGlobal(pos))
 

@@ -10656,20 +10656,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # across several message rows) opens a submenu naming each by
         # its own row_id, since the File Browser cell itself only shows
         # a count, not which specific rows.
-        links = self._attachment_links.get(ui_path) if ui_path else None
-        if links:
-            if len(links) == 1:
-                link = links[0]
-                show_act = QAction(f"🔗 Show in Artifact Report ({link['label']})", self)
-                show_act.triggered.connect(
-                    partial(self._art_jump_to_report_row, link['script_name'], link['row_id']))
-                menu.addAction(show_act)
-            else:
-                show_menu = menu.addMenu("🔗 Show in Artifact Report")
-                for link in links:
-                    act = show_menu.addAction(f"{link['label']} — row {link['row_id']}")
-                    act.triggered.connect(
-                        partial(self._art_jump_to_report_row, link['script_name'], link['row_id']))
+        self._add_report_link_actions(menu, [ui_path] if ui_path else [])
 
         if ui_path and '/' in ui_path:
             parent_path = ui_path.rsplit('/', 1)[0]
@@ -12366,6 +12353,35 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_paths)
         self._cache_media_children = frozenset(cache_children)
         self._recompute_meta_col_keys()
+
+    def _add_report_link_actions(self, menu, paths: list) -> bool:
+        """Add "🔗 Show in Artifact Report" to *menu* for every report row
+        linked to any of *paths* (File Browser: the clicked file; Media
+        Browser: the clicked item and, with Hide Duplicates on, its hidden
+        copies). One link jumps directly; several open a submenu naming
+        each. Returns True if anything was added."""
+        links, seen = [], set()
+        for p in paths:
+            for link in self._attachment_links.get(p) or ():
+                key = (link['script_name'], link['row_id'])
+                if key not in seen:
+                    seen.add(key)
+                    links.append(link)
+        if not links:
+            return False
+        if len(links) == 1:
+            link = links[0]
+            act = QAction(f"🔗 Show in Artifact Report ({link['label']})", menu)
+            act.triggered.connect(
+                partial(self._art_jump_to_report_row, link['script_name'], link['row_id']))
+            menu.addAction(act)
+        else:
+            sub = menu.addMenu("🔗 Show in Artifact Report")
+            for link in links:
+                act = sub.addAction(f"{link['label']} — row {link['row_id']}")
+                act.triggered.connect(
+                    partial(self._art_jump_to_report_row, link['script_name'], link['row_id']))
+        return True
 
     def _migrate_embedded_media_names(self, renamed: list, moves: dict) -> None:
         """Save the new names of *renamed* hits and move every path-keyed

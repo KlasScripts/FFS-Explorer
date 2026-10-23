@@ -921,6 +921,27 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
   still named; a cached map missing 131 / 171 folders (every App Group
   plus 30 apps) is fully repaired on open, 0 wrong names.
 
+**A-77. Deleted SQLite media larger than one page is recovered by
+following its overflow chain.** *Decision (owner) + Confirmed (real),
+2026-10-23.*
+- A result is "complete" only if every chain page is still free (main
+  file), no live data overlaps the record's on-page bytes or pointer, and
+  the chain gives exactly the declared length ending in a 0 pointer. WAL
+  pages are read as of the frame's commit. Otherwise it is a labelled
+  PARTIAL prefix (`-carved-partial`) or nothing.
+- Ground truth (real images, real SQLite, known deletes): no wrong bytes;
+  partials all true prefixes; nothing under `secure_delete`; exactly the
+  records SQLite had not overwritten were recovered (4/4 intact of 15 in a
+  plain delete, 15/15 with the history in the WAL).
+- Stitching without a pointer was rejected: the gap is lost bytes, not
+  just a lost pointer.
+- The live scan includes the `-wal` (IOS17: +149 live pictures).
+- IOS17: 12 newly recovered deleted images, all open fully; sweep 36 s
+  (was 28 s).
+- Known limit: after an in-place delete, a record whose image starts on
+  an overflow page (other long columns first) is found only through freed
+  or WAL pages.
+
 ## 11. In-app format decoding
 
 **A-42. Binary plists:** decoded with `plistlib`, with NSKeyedArchiver

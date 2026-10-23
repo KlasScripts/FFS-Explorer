@@ -18,6 +18,11 @@ How it stays small:
   snapshot of every thread showing exactly where startup is stuck. One
   previous copy is kept as `crash.prev.log`.
 
+Started on the first lines of ffs-explorer.py, before the heavy imports,
+so a stall while loading modules is logged too (2026-10-23). If the
+per-user folder can't be written, the temp folder and then a 'logs'
+folder next to the exe are tried; the first line then says so.
+
 Qt-free on purpose: it is set up before QApplication exists. Every call is
 wrapped so a logging failure can never stop the app from starting.
 """
@@ -60,22 +65,49 @@ def log_dir() -> str:
     return os.path.join(base, 'FFS Explorer', 'logs')
 
 
-def setup() -> str | None:
-    """Start logging for this session. Returns the log folder, or None if it
-    couldn't be created (the app then simply runs without a log)."""
-    global _log_dir, _crash_file
+def _candidate_dirs() -> list[str]:
+    """Where to try writing the log, in order: the normal per-user folder,
+    then the temp folder, then next to the exe (a locked-down PC can refuse
+    the first)."""
+    out = [log_dir()]
     try:
-        d = log_dir()
-        os.makedirs(d, exist_ok=True)
-        handler = logging.handlers.RotatingFileHandler(
-            os.path.join(d, LOG_NAME), maxBytes=MAX_BYTES,
-            backupCount=BACKUPS, encoding='utf-8')
+        import tempfile
+        out.append(os.path.join(tempfile.gettempdir(), 'FFS Explorer', 'logs'))
+    except Exception:
+        pass
+    out.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'logs'))
+    return out
+
+
+def active_log_dir() -> str | None:
+    """The folder this session is actually logging to (None before setup
+    or if no folder could be written)."""
+    return _log_dir
+
+
+def setup() -> str | None:
+    """Start logging for this session. Returns the log folder, or None if no
+    candidate folder could be written (the app then runs without a log).
+    Safe to call more than once; later calls return the same folder."""
+    global _log_dir, _crash_file
+    if _log_dir is not None:
+        return _log_dir
+    d = None
+    for cand in _candidate_dirs():
+        try:
+            os.makedirs(cand, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                os.path.join(cand, LOG_NAME), maxBytes=MAX_BYTES,
+                backupCount=BACKUPS, encoding='utf-8')
+        except Exception:
+            continue
         handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)-7s %(message)s'))
         _logger.addHandler(handler)
         _logger.setLevel(logging.INFO)
         _logger.propagate = False
-        _log_dir = d
-    except Exception:
+        d = _log_dir = cand
+        break
+    if d is None:
         return None
     try:
         crash = os.path.join(d, CRASH_NAME)
@@ -91,6 +123,8 @@ def setup() -> str | None:
     _logger.info('=' * 60)
     _logger.info('FFS Explorer starting  pid=%s', os.getpid())
     _logger.info('%s', _environment())
+    if d != log_dir():
+        _logger.warning('could not write to %s; logging here instead', log_dir())
     return d
 
 

@@ -232,8 +232,32 @@ exe = EXE(
     icon='resources/icon.ico' if sys.platform == 'win32' else 'resources/icon.icns',
 )
 
+# Same program with a console window, sharing every file in the folder.
+# Added 2026-10-23 for a Windows 11 PC where ffs-explorer.exe showed no
+# window and wrote no log: run ffs-explorer-console.exe from a Command
+# Prompt and any error during startup is printed there.
+exe_console = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='ffs-explorer-console',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=_UPX_EXCLUDE,
+    console=True,
+    disable_windowed_traceback=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon='resources/icon.ico' if sys.platform == 'win32' else 'resources/icon.icns',
+)
+
 coll = COLLECT(
     exe,
+    exe_console,
     a.binaries,
     a.zipfiles,
     a.datas,

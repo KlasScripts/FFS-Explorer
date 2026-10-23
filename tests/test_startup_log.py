@@ -95,3 +95,22 @@ def startup_log_name():
     sys.path.insert(0, APP)
     import startup_log
     return startup_log.LOG_NAME
+
+
+def test_falls_back_when_normal_folder_cannot_be_written(tmp_path):
+    blocker = tmp_path / 'not_a_folder'
+    blocker.write_text('x')                      # the normal log folder sits "under" a file
+    tmp = tmp_path / 'tmp'
+    tmp.mkdir()
+    env = dict(os.environ, HOME=str(blocker), LOCALAPPDATA=str(blocker),
+               XDG_STATE_HOME=str(blocker), TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp))
+    code = (f"import sys; sys.path.insert(0, {APP!r})\nimport startup_log\n"
+            "d = startup_log.setup(); assert startup_log.setup() == d\n"
+            "startup_log.step('hello from the fallback'); print(d)")
+    out = subprocess.run([sys.executable, '-c', code], env=env, timeout=60,
+                         capture_output=True, text=True)
+    d = out.stdout.strip()
+    assert d.startswith(str(tmp)), out.stderr
+    log = _read(d, startup_log_name())
+    assert 'hello from the fallback' in log and 'logging here instead' in log
+    assert log.count('FFS Explorer starting') == 1

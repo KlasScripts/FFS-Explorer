@@ -1,5 +1,14 @@
 import sys
 import os
+# Startup log before anything heavy is imported: on one Windows 11 PC
+# (build 26300, 2026-10-23) the exe sat in Task Manager with no window and
+# no log at all, because setup() only ran after every import below. Not in
+# a spawned worker (it re-runs this file with --multiprocessing-fork).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app'))
+import startup_log
+if __name__ == '__main__' and '--multiprocessing-fork' not in sys.argv:
+    startup_log.setup()
+    startup_log.step('loading modules')
 import re
 import io
 import time
@@ -116,6 +125,7 @@ from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, 
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
                              qInstallMessageHandler, QtMsgType)
 from PySide6.QtCore import QSettings as _QSettings
+startup_log.step('Qt and app modules loaded')
 
 FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface responsive at 60 fps while the tree builds
 
@@ -11742,7 +11752,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if any(v.get(k) for v in data.values() if v))
 
     def _open_log_folder(self):
-        d = startup_log.log_dir()
+        d = startup_log.active_log_dir() or startup_log.log_dir()
         try:
             os.makedirs(d, exist_ok=True)
         except OSError:

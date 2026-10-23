@@ -148,6 +148,10 @@ def _parse_attributed_body(blob):
     return None
 
 
+# Artifact Viewer "Chat Groups" folder: one entry per conversation with its
+# sent/received media and message counts (see ArtifactViewerMixin._art_chat_groups).
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"]}
+
 def run(paths):
     mobile_root = paths.get('_ui_path_for', lambda p: p)('mobile')
     from artifact_runner import missing_ref_label, open_db_readonly, resolve_path_after_marker

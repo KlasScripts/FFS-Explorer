@@ -486,8 +486,9 @@ class ArtifactFilterWorker(QThread):
 
     def __init__(self, db_path: str, table: str, columns: list,
                  term: str, col_idx: int, exclude_low_confidence: bool = False,
-                 parent=None):
+                 scope: tuple | None = None, parent=None):
         super().__init__(parent)
+        self._scope   = scope    # (where, args) always applied, e.g. one chat
         self._db_path = db_path
         self._table   = table
         self._columns = columns
@@ -507,6 +508,9 @@ class ArtifactFilterWorker(QThread):
     def run(self) -> None:
         p = self._pattern
         conditions, args = [], []
+        if self._scope:
+            conditions.append(f'({self._scope[0]})')
+            args.extend(self._scope[1])
         if self._term:
             if self._col_idx < 0:
                 conditions.append('(' + ' OR '.join(f'"{c}" LIKE ?' for c in self._columns) + ')')
@@ -546,6 +550,8 @@ _ART_SCRIPT = "__art_script__:"
 _ART_SOURCE = "__art_source__:"
 _ART_FILES  = "__art_files__:"
 _ART_VALIDATION = "__art_validation__:"
+_ART_CHATS = "__art_chats__:"      # "Chat Groups (N)" folder: shows the whole report
+_ART_CHAT  = "__art_chat__:"       # one chat: <script>\x1f<key> — the report scoped to it
 
 
 class _RecordingZipView:
@@ -1789,6 +1795,17 @@ class ArtifactViewerMixin:
             group.appendRow(_item("Source in ZIP",  _ART_SOURCE + script_name))
             group.appendRow(_item("Exported Files", _ART_FILES  + script_name))
             group.appendRow(_item("Validation",     _ART_VALIDATION + script_name))
+            decl = getattr(mod, 'chat_groups', None) if mod else None
+            if decl:
+                chats = self._art_chat_groups(script_name, decl)
+                if chats:
+                    folder = _item(f"Chat Groups ({len(chats):,})", _ART_CHATS + script_name)
+                    for key, name, sent_m, recv_m, n in chats:
+                        folder.appendRow(_item(
+                            f"{name} (M{sent_m:,}S/{recv_m:,}R) - {n:,} "
+                            f"{'Message' if n == 1 else 'Messages'}",
+                            f"{_ART_CHAT}{script_name}\x1f{key}"))
+                    group.insertRow(0, [folder])
             return group
 
         # A parser opts into a shared parent tree node (instead of sitting
@@ -2376,6 +2393,79 @@ class ArtifactViewerMixin:
         overflow_note = "  (record continues on an overflow page, not shown)" if loc.get('overflows') else ""
         self.status_bar.showMessage(f"{ui_path}  —  offset: {loc['abs_offset']:,}{overflow_note}")
 
+    def _art_chat_groups(self, script_name: str, decl: dict) -> list:
+        """[(key, name, sent_media, received_media, messages)] for a messaging
+        report's `chat_groups` declaration (owner request, 2026-10-23):
+          key            column identifying the conversation (exact match)
+          name           column(s); the first non-empty one per row, most
+                         common across the chat = its display name (remote
+                         party or group name)
+          direction/sent column and the value(s) meaning sent by the user
+          media          column(s) that are non-empty on a media message
+          media_prefixes message-text prefixes marking a media message
+          message        the message-text column (default "message")
+        Sorted by name. Empty if the report table can't be read."""
+        import collections
+        key_col = decl['key']
+        names = decl.get('name') or [key_col]
+        names = [names] if isinstance(names, str) else list(names)
+        dir_col = decl.get('direction', 'direction')
+        sent = set(decl.get('sent', ('Sent', 'Outgoing')))
+        media_cols = list(decl.get('media', ()))
+        prefixes = tuple(decl.get('media_prefixes', ()))
+        msg_col = decl.get('message', 'message')
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                cols = {r[1] for r in conn.execute(f'PRAGMA table_info("artifact_{script_name}")')}
+                want = [c for c in [key_col, dir_col, msg_col, *names, *media_cols] if c in cols]
+                if key_col not in cols:
+                    return []
+                rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in dict.fromkeys(want))
+                                    + f' FROM "artifact_{script_name}"').fetchall()
+                want = list(dict.fromkeys(want))
+        except Exception:
+            return []
+        at = {c: i for i, c in enumerate(want)}
+        chats: dict = {}
+        for r in rows:
+            key = r[at[key_col]] or ''
+            c = chats.setdefault(key, {'names': collections.Counter(), 's': 0, 'r': 0, 'n': 0})
+            c['n'] += 1
+            name = next((r[at[n]] for n in names if n in at and r[at[n]]), '')
+            if name:
+                c['names'][name] += 1
+            text = (r[at[msg_col]] or '') if msg_col in at else ''
+            is_media = (any(r[at[m]] for m in media_cols if m in at)
+                        or (prefixes and text.startswith(prefixes)))
+            if is_media:
+                if dir_col in at and r[at[dir_col]] in sent:
+                    c['s'] += 1
+                else:
+                    c['r'] += 1
+        out = []
+        for key, c in chats.items():
+            name = c['names'].most_common(1)[0][0] if c['names'] else (key or '[no conversation]')
+            out.append((key, name, c['s'], c['r'], c['n']))
+        out.sort(key=lambda t: str(t[1]).casefold())
+        return out
+
+    def _art_show_chat(self, script_name: str, key: str, label: str) -> None:
+        """The report limited to one conversation (exact match on the
+        declared key column); typed filters and sorting stay within it."""
+        from artifact_runner import list_artifacts
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+        decl = getattr(mod, 'chat_groups', None) or {}
+        col = decl.get('key')
+        if not col:
+            self._art_show_report(script_name)
+            return
+        if key:
+            where, args = f'"{col}" = ?', [key]
+        else:
+            where, args = f'("{col}" IS NULL OR "{col}" = \'\')', []
+        self._art_show_report(script_name, scope=(where, args, f"Chat: {label.rsplit(' (M', 1)[0]}"))
+
     def _on_art_tree_clicked(self, index):
         self._clear_art_hex()
         role_val = index.data(Qt.ItemDataRole.UserRole)
@@ -2404,6 +2494,11 @@ class ArtifactViewerMixin:
             self._art_show_files(role_val[len(_ART_FILES):])
         elif role_val.startswith(_ART_VALIDATION):
             self._art_show_validation(role_val[len(_ART_VALIDATION):])
+        elif role_val.startswith(_ART_CHATS):
+            self._art_show_report(role_val[len(_ART_CHATS):])
+        elif role_val.startswith(_ART_CHAT):
+            script_name, key = role_val[len(_ART_CHAT):].split('\x1f', 1)
+            self._art_show_chat(script_name, key, index.data())
 
     # ── Report display ────────────────────────────────────────────────────────
 
@@ -2823,9 +2918,12 @@ class ArtifactViewerMixin:
             self._art_ai_summary_view.setMarkdown(summary["text"])
         self._art_stack.setCurrentIndex(5)
 
-    def _art_show_report(self, script_name: str):
+    def _art_show_report(self, script_name: str, scope: tuple | None = None):
+        """*scope*: (where, args, label) limiting the report to a subset,
+        e.g. one chat (see _art_show_chat); kept under any typed filter."""
         self._cancel_art_filter_worker()
         self._art_pending_jump = None    # a jump into a previous report is void
+        self._art_scope = scope
         table = f'artifact_{script_name}'
         try:
             conn = _open_results_db(self._case_dir)
@@ -3300,7 +3398,8 @@ class ArtifactViewerMixin:
         hide_lowconf = (self._art_hide_lowconf_checkbox.isVisible()
                        and self._art_hide_lowconf_checkbox.isChecked())
 
-        if not term and not hide_lowconf:
+        scope = getattr(self, '_art_scope', None)
+        if not term and not hide_lowconf and not scope:
             self._cancel_art_filter_worker()
             self._art_table_model.clear_filter()
             self._art_row_label.setText(f"{total:,} rows")
@@ -3326,6 +3425,7 @@ class ArtifactViewerMixin:
             self._art_table_model._columns,
             term, col_idx,
             exclude_low_confidence=hide_lowconf,
+            scope=(scope[0], scope[1]) if scope else None,
         )
         worker.done.connect(self._on_art_filter_done)
         self._art_filter_worker = worker
@@ -3334,7 +3434,9 @@ class ArtifactViewerMixin:
     def _on_art_filter_done(self, rowids: list, where: str, wargs: list):
         self._art_table_model.apply_rowids(rowids, where, wargs)
         total = self._art_table_model.total_rows
-        self._art_row_label.setText(f"{len(rowids):,} of {total:,} rows")
+        scope = getattr(self, '_art_scope', None)
+        prefix = f"{scope[2]} — " if scope and len(scope) > 2 else ""
+        self._art_row_label.setText(f"{prefix}{len(rowids):,} of {total:,} rows")
         self._art_filter_btn.setEnabled(True)
         pending = getattr(self, '_art_pending_jump', None)
         if pending is not None:          # a jump waiting for this filter

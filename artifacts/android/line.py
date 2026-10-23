@@ -76,6 +76,10 @@ def _parse_call_params(parameter):
     return dict(zip(parts[0::2], parts[1::2]))
 
 
+# Artifact Viewer "Chat Groups" folder: one entry per conversation with its
+# sent/received media and message counts (see ArtifactViewerMixin._art_chat_groups).
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Image]"]}
+
 def run(paths):
     from artifact_runner import missing_ref_label, open_db_readonly
 

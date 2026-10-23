@@ -73,6 +73,10 @@ timestamp_fields = {"timestamp": "ms", "dateCreated": "ms"}
 link_fields = ["media_link"]
 hidden_fields = ["media_link"]
 
+# Artifact Viewer "Chat Groups" folder: one entry per conversation with its
+# sent/received media and message counts (see ArtifactViewerMixin._art_chat_groups).
+chat_groups = {"key": "conversation", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"]}
+
 def run(paths):
     from artifact_runner import missing_ref_label, open_db_readonly
 

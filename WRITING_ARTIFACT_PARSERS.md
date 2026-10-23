@@ -195,6 +195,19 @@ row["thumbnail_link"] = embedded_media_path(paths, "msgstore", "message_thumbnai
                                             "thumbnail", message_id, blob)
 ```
 
+**Messaging reports: `chat_groups`.** Declare it and the Artifact Viewer adds a
+"Chat Groups (N)" folder under the report: one entry per conversation,
+`Name (M<sent media>S/<received media>R) - <n> Messages`; clicking one shows the
+report limited to that conversation (filters and sorting stay within it).
+
+```python
+chat_groups = {"key": "raw_chat_id",          # column identifying the conversation
+               "name": ["conversation"],      # first non-empty = remote party / group name
+               "sent": ["Sent"],              # direction value(s) meaning sent by the user
+               "media": ["attachment_path"],  # non-empty on a media message
+               "media_prefixes": ["[Media]"]} # and/or message-text prefixes
+```
+
 **Files named some other way.** Turn what the database stores into an archive
 path, and only link it if `archive_has(paths, ui_path)`:
 - an Android device path or `file://` URI: `device_path_to_ui_path(p)`

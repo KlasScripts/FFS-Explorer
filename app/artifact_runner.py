@@ -585,9 +585,93 @@ def open_db_readonly(db_path: str) -> sqlite3.Connection:
     connect/row_factory ceremony, and this is the ONE place every
     SQL-based parser's live-query connect should go through, Chrome or
     not — see chrome_shared.py's own module docstring."""
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                           factory=_NamedConnection)
+    conn._db_label = _db_label(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# ── Database errors name their file ──────────────────────────────────────────
+# Added 2026-10-23 (owner request): a parser reading several databases
+# (Chrome Favicons reads Favicons, History and ukm_db) failed with a bare
+# "attempt to write a readonly database", with no way to tell which file.
+# Every sqlite3 error raised through an open_db_readonly connection now
+# starts with the file's name and lists the sidecars next to it, e.g.
+#   Favicons [Favicons-journal 16,928 B]: attempt to write a readonly database
+# The exception type is unchanged, so callers catching sqlite3.Error still do.
+
+def _db_label(db_path: str) -> str:
+    name = os.path.basename(db_path)
+    sidecars = []
+    for suffix in ('-wal', '-shm', '-journal'):
+        try:
+            sidecars.append(f"{name}{suffix} {os.path.getsize(db_path + suffix):,} B")
+        except OSError:
+            pass
+    return f"{name} [{', '.join(sidecars)}]" if sidecars else name
+
+
+def _name_error(label: str, exc: sqlite3.Error) -> sqlite3.Error:
+    msg = str(exc)
+    if msg.startswith(label):
+        return exc
+    try:
+        named = type(exc)(f"{label}: {msg}")
+    except Exception:
+        return exc
+    for attr in ('sqlite_errorcode', 'sqlite_errorname'):
+        if hasattr(exc, attr):
+            try:
+                setattr(named, attr, getattr(exc, attr))
+            except Exception:
+                pass
+    return named
+
+
+class _NamedCursor(sqlite3.Cursor):
+    def _call(self, fn, *a):
+        try:
+            return fn(*a)
+        except sqlite3.Error as e:
+            raise _name_error(self.connection._db_label, e) from e
+
+    def execute(self, *a):
+        return self._call(super().execute, *a)
+
+    def executemany(self, *a):
+        return self._call(super().executemany, *a)
+
+    def executescript(self, *a):
+        return self._call(super().executescript, *a)
+
+    def fetchone(self):
+        return self._call(super().fetchone)
+
+    def fetchmany(self, *a):
+        return self._call(super().fetchmany, *a)
+
+    def fetchall(self):
+        return self._call(super().fetchall)
+
+    def __next__(self):
+        return self._call(super().__next__)
+
+
+class _NamedConnection(sqlite3.Connection):
+    _db_label = ''
+
+    def cursor(self, factory=_NamedCursor):
+        return super().cursor(factory)
+
+    def execute(self, *a):
+        return self.cursor().execute(*a)
+
+    def executemany(self, *a):
+        return self.cursor().executemany(*a)
+
+    def executescript(self, *a):
+        return self.cursor().executescript(*a)
 
 
 def open_leveldb(paths: dict, relative_dir: str, extract_subdir: str | None = None):

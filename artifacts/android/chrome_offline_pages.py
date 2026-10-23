@@ -74,10 +74,9 @@ record_source = {
 
 
 def run(paths):
-    import sqlite3
+    from artifact_runner import open_db_readonly
 
-    conn = sqlite3.connect(f'file:{paths["metadata_db"]}?mode=ro', uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = open_db_readonly(paths["metadata_db"])
     rows = conn.execute("""
         SELECT offline_id, title, online_url, original_url, file_path,
                file_size, creation_time, last_access_time, access_count,

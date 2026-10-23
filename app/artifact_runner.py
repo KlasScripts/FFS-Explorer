@@ -643,6 +643,85 @@ def embedded_media_path(paths: dict, file_key: str, table: str, column: str,
     return f"{db_ui}/{name}"
 
 
+# Android storage paths as an app records them -> this archive's ui_path.
+_ANDROID_PATH_PREFIXES = (
+    ('/storage/emulated/0/', 'data/media/0/'),
+    ('/sdcard/', 'data/media/0/'),
+    ('/mnt/sdcard/', 'data/media/0/'),
+    ('/data/media/0/', 'data/media/0/'),
+    ('/data/user/0/', 'data/data/'),
+    ('/data/data/', 'data/data/'),
+)
+
+
+def device_path_to_ui_path(device_path: str) -> str:
+    """The archive ui_path for an Android on-device file path (or a
+    file:// URI): '/storage/emulated/0/Download/x.png' ->
+    'data/media/0/Download/x.png'. '' for a path outside known storage."""
+    if not device_path:
+        return ''
+    p = str(device_path)
+    if p.startswith('file://'):
+        from urllib.parse import unquote
+        p = unquote(p[len('file://'):])
+    for prefix, ui in _ANDROID_PATH_PREFIXES:
+        if p.startswith(prefix):
+            return ui + p[len(prefix):]
+    return ''
+
+
+def archive_has(paths: dict, ui_path: str) -> bool:
+    """True if *ui_path* is a file in this archive (parser-side check,
+    so a link is only written for a file the File Browser can show)."""
+    if not ui_path:
+        return False
+    names = paths.get('_zip_name_set')
+    if names is None:
+        names = paths['_zip_name_set'] = frozenset(paths.get('_zip_names') or ())
+    adapter = paths.get('_adapter')
+    physical = adapter.resolve(ui_path) if adapter is not None else ui_path
+    return physical in names or physical.lstrip('/') in names
+
+
+def resolve_mediastore_uri(paths: dict, uri: str) -> str:
+    """The archive ui_path of the file an Android MediaStore URI
+    ('content://media/external/images/media/1000000684') points at, from
+    MediaStore's own database (com.google.android.providers.media.module/
+    databases/external.db, files._id -> _data), read from the archive once
+    per parser run. '' if the URI isn't a MediaStore one or the id is not
+    in the database. Verified 2026-10-23 on Android 14 JoshHickman: both
+    Viber media ids resolved to files present in the archive."""
+    import re
+    m = re.match(r'^content://media/[^?#]*?/(\d+)(?:[?#].*)?$', uri or '')
+    if not m:
+        return ''
+    cache = paths.get('_mediastore')
+    if cache is None:
+        cache = paths['_mediastore'] = {}
+        try:
+            names = [n for n in (paths.get('_zip_names') or ())
+                     if n.endswith('com.google.android.providers.media.module/databases/external.db')]
+            names.sort(key=lambda n: (0 if '/data/data/' in n else 1, len(n)))
+            read = paths.get('_read_zip_bytes')
+            if names and read:
+                import tempfile
+                tmp = tempfile.mkdtemp(prefix='ffs_mediastore_')
+                for sfx in ('', '-wal'):
+                    data = read(names[0] + sfx)
+                    if data:
+                        with open(os.path.join(tmp, 'external.db' + sfx), 'wb') as f:
+                            f.write(data)
+                conn = open_db_readonly(os.path.join(tmp, 'external.db'))
+                try:
+                    cache.update({r[0]: r[1] for r in conn.execute(
+                        "SELECT _id, _data FROM files WHERE _data IS NOT NULL")})
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+    return device_path_to_ui_path(cache.get(int(m.group(1)), ''))
+
+
 def log_note(text: str) -> None:
     """Write one line to the parser run log (after the parser finishes),
     e.g. that an optional table was absent and why nothing was read from

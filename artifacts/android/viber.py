@@ -50,7 +50,35 @@ timestamp_fields = {"timestamp": "ms", "msg_date": "ms"}
 # number, already folded into the visible sender/conversation fields) is
 # similarly not given its own entry — reaching it needs a second hop
 # (participants.participant_info_id) not currently carried per output row.
-hidden_fields = ["raw_participant_id"]
+hidden_fields = ["raw_participant_id", "media_link"]
+# Linked Report: the media file a message refers to. messages.extra_uri is
+# either a MediaStore URI or Viber's own internal_files URI wrapping one in
+# base64; it is resolved to the file through MediaStore's database
+# (artifact_runner.resolve_mediastore_uri). Verified 2026-10-23 on Android
+# 14 JoshHickman: message 19 -> Download/Imgur/3qaBztA.png (Viber's own
+# msg_info FileName for it), message 21 -> Pictures/Viber/IMG-...-V.jpg.
+link_fields = ["media_link"]
+
+
+def _media_uri(extra_uri):
+    """The MediaStore/file URI inside messages.extra_uri, or ''."""
+    import base64
+    import re
+    if not extra_uri:
+        return ''
+    if extra_uri.startswith(('content://media/', 'file://')):
+        return extra_uri
+    m = re.match(r'^content://com\.viber\.voip\.provider\.internal_files/message/\w+/([A-Za-z0-9_=-]+)', extra_uri)
+    if m:
+        token = m.group(1)
+        try:
+            inner = base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)).decode('utf-8')
+        except Exception:
+            return ''
+        if inner.startswith(('content://media/', 'file://')):
+            return inner
+    return ''
+
 record_source = [
     {"label": "Message", "file_key": "viber_messages", "table": "messages",
      "rowid_fields": ["raw_message_id", "_id"]},
@@ -91,6 +119,7 @@ def run(paths):
         members_by_convo.setdefault(r["conversation_id"], []).append(name)
         name_by_participant_row[r["participant_row_id"]] = name
 
+    has_extra_uri = any(c[1] == "extra_uri" for c in conn.execute("PRAGMA table_info(messages)"))
     rows = conn.execute("""
         SELECT
             m._id             AS id,
@@ -105,10 +134,11 @@ def run(paths):
             m.location_lng,
             m.likes_count,
             m.my_reaction,
-            m.deleted
+            m.deleted,
+            {extra_uri}
         FROM messages m
         ORDER BY m.conversation_id, m.msg_date, m._id
-    """).fetchall()
+    """.replace("{extra_uri}", "m.extra_uri" if has_extra_uri else "NULL AS extra_uri")).fetchall()
     # Sender resolution deliberately does NOT use messages.user_id: in this
     # database user_id holds the *peer's* member_id on every row of a 1:1
     # conversation regardless of direction (confirmed against real data —
@@ -164,7 +194,16 @@ def run(paths):
             "raw_message_id": r["id"],
             "raw_conversation_id": r["conversation_id"],
             "raw_participant_id": r["participant_id"],
+            "media_link": _media_link(paths, r["extra_uri"]),
             "recovered": False,
             "source_table": "messages",
         })
     return out
+
+
+def _media_link(paths, extra_uri):
+    from artifact_runner import device_path_to_ui_path, resolve_mediastore_uri
+    uri = _media_uri(extra_uri)
+    if uri.startswith('content://media/'):
+        return resolve_mediastore_uri(paths, uri)
+    return device_path_to_ui_path(uri)

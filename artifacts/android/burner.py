@@ -69,6 +69,10 @@ record_source = {
 timestamp_fields = {"timestamp": "ms", "dateCreated": "ms"}
 
 
+# Linked Report: the cached copy of a message's media (see run()).
+link_fields = ["media_link"]
+hidden_fields = ["media_link"]
+
 def run(paths):
     from artifact_runner import missing_ref_label, open_db_readonly
 
@@ -120,7 +124,19 @@ def run(paths):
         else:
             body = r["text"] or ""
 
+        media_link = ""
+        if r["mediaUrl"]:
+            # The app's Glide image cache names each download by the SHA-256
+            # of its URL + ".0" (verified 2026-10-23 on Android 14
+            # JoshHickman: both media URLs have their PNG/JPEG there).
+            import hashlib
+            from artifact_runner import archive_has
+            cached = (f"{paths.get('_app_base_ui_path', 'data/data/com.adhoclabs.burner')}"
+                      f"/cache/image_manager_disk_cache/"
+                      f"{hashlib.sha256(r['mediaUrl'].encode('utf-8')).hexdigest()}.0")
+            media_link = cached if archive_has(paths, cached) else ""
         out.append({
+            "media_link": media_link,
             "conversation": contact_names.get(r["contactId"], r["contactId"]),
             "timestamp": r["dateCreated"],
             "sender": party,

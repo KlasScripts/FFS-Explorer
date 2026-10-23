@@ -134,7 +134,14 @@ def build_attachment_links(script_name: str, rows: list[dict],
     for i, row in enumerate(rows):
         row_id = i + 1
         for field in media_fields:
-            path = row.get(field)
-            if path:
-                links.append({'ui_path': path, 'row_id': row_id, 'label': label})
+            value = row.get(field)
+            if not value:
+                continue
+            # one path, or several (a list, or one path per line: report
+            # cells are stored as text) — e.g. every face crop of a photo
+            values = value if isinstance(value, (list, tuple)) else str(value).split('\n')
+            for path in values:
+                path = path.strip() if isinstance(path, str) else path
+                if path:
+                    links.append({'ui_path': path, 'row_id': row_id, 'label': label})
     return links

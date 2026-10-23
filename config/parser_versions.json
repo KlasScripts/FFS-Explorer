@@ -15,8 +15,8 @@
         "3": "Use shared missing_ref_label() instead of inline f-string for the no-burner-record fallback (no output change).",
         "4": "record_source gained an explicit label ('Burner Message'), same reason as chrome_autofill.py -- the combo no longer hides for a single entry."
       },
-      "hash": "dc43c336963fc456",
-      "version": 5
+      "hash": "30b2076fdda891ee",
+      "version": 6
     },
     "android:burner_messageentity": {
       "changelog": {},
@@ -66,8 +66,8 @@
       "changelog": {
         "6": "record_source gained an explicit label ('Download'), same reason as chrome_autofill.py."
       },
-      "hash": "1f2ad4f535f00cdc",
-      "version": 7
+      "hash": "7978c54e0647b4e5",
+      "version": 8
     },
     "android:chrome_favicons": {
       "changelog": {},
@@ -229,8 +229,8 @@
       "changelog": {
         "2": "Removed local _display_name() in favor of shared first_nonempty(default=...); use shared missing_ref_label() for the no-participant-record fallbacks (no output change)."
       },
-      "hash": "569ec9b8a3fda06b",
-      "version": 3
+      "hash": "bb98ec1de3d918b5",
+      "version": 4
     },
     "android:whatsapp": {
       "changelog": {
@@ -264,8 +264,8 @@
     },
     "ios:photos_metadata": {
       "changelog": {},
-      "hash": "ce2aa4f3a1334610",
-      "version": 5
+      "hash": "96c95894d1181827",
+      "version": 6
     },
     "ios:sms_messages": {
       "changelog": {
@@ -278,8 +278,8 @@
       "changelog": {
         "3": "Use shared missing_ref_label() instead of inline f-string for the no-chat-record fallback (no output change)."
       },
-      "hash": "60ecfe163f691ab9",
-      "version": 4
+      "hash": "1d924f0807dd3b44",
+      "version": 5
     },
     "ios:wifi_known_networks": {
       "changelog": {

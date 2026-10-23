@@ -95,7 +95,11 @@ record_source = [
 # columns) — so they're kept out of the Report table. raw_message_id and
 # source_table stay visible: raw_message_id is the row's OWN id, not a
 # joined table's, and source_table is a citation label, not a raw key.
-hidden_fields = ["raw_chat_id", "raw_group_member_id", "raw_media_item_id"]
+hidden_fields = ["raw_chat_id", "raw_group_member_id", "raw_media_item_id", "thumbnail_link"]
+# Linked Report: the media file, and its separate .thumb file when the row
+# also has a full-size file (ZXMPPTHUMBPATH; all 12 on IOS17 and 7 on CTF23
+# exist in the archive, 2026-10-23).
+link_fields = ["attachment_path", "thumbnail_link"]
 
 # Declarative only — no recovery code belongs here; see description above
 # for what was actually found.
@@ -207,6 +211,9 @@ def run(paths):
             "direction": "Sent" if r["is_from_me"] else "Received",
             "message": body,
             "attachment_path": attachment_path,
+            "thumbnail_link": (f"{app_base}/Message/{r['media_thumb_path']}"
+                               if app_base and r["media_thumb_path"]
+                               and r["media_thumb_path"] != local_path else ""),
             "raw_message_id": r["message_id"],
             "raw_chat_id": r["chat_id"],
             "raw_group_member_id": r["group_member_row_id"],

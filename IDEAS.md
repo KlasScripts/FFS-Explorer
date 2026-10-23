@@ -141,8 +141,10 @@ with a path in a declared `media_fields` column is linked
 |---|---|---|
 | iOS `sms_messages` | yes | yes (one run, 2026-10-12) |
 | Android `whatsapp` (message thumbnails inside msgstore.db), `chrome_favicons` (icons inside Favicons), via `embedded_media_path` | yes | yes (A15 CTF25, 2026-10-23: 2,575/2,575 thumbnails, 53/53 icons) |
-| iOS `whatsapp`, `photos_metadata`; Android `google_messages`, `whatsapp` (attachment files), `chrome_cache_pages`, `chrome_cache_media`, `chrome_offline_pages` | yes | no |
-| The other 30 parsers (iOS 4, Android 26) | none | n/a |
+| Android `google_messages` (25/25 A14, 21/21 A15), `chrome_offline_pages` (4/4, 2/2, 4/4), `viber` (MediaStore, 2/2 A14), `burner` (Glide cache, 2/2 A14); iOS `sms_messages` (19/19, 22/22), `whatsapp` (+ .thumb, 16/16 IOS17), `photos_metadata` (file + thumbnail + face crops: all thumbnails, 1 + 8 face crops; 10/146 iCloud originals not on the phone) | yes | yes (2026-10-23) |
+| Android `chrome_downloads` (target_path) | yes | no: no download rows on any test image |
+| Android `chrome_cache_pages`, `chrome_cache_media`, Android `whatsapp` attachment files | yes | no |
+| Not linkable from the data: `groupme` (web URLs; cache naming not matched), `line` (no path stored on the test image), iOS `instagram` (web URLs). The rest have no file or image references (settings, history, cookies, logins...). | n/a | checked 2026-10-23 |
 
 **Work.**
 1. Run each of the 8 unchecked parsers on a real case that has the app;

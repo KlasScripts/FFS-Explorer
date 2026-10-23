@@ -195,6 +195,20 @@ row["thumbnail_link"] = embedded_media_path(paths, "msgstore", "message_thumbnai
                                             "thumbnail", message_id, blob)
 ```
 
+**Files named some other way.** Turn what the database stores into an archive
+path, and only link it if `archive_has(paths, ui_path)`:
+- an Android device path or `file://` URI: `device_path_to_ui_path(p)`
+  (`/storage/emulated/0/...` -> `data/media/0/...`, `/data/user/0/...` ->
+  `data/data/...`): `chrome_downloads.py`;
+- a MediaStore URI (`content://media/.../<id>`): `resolve_mediastore_uri(paths,
+  uri)`, through MediaStore's own `external.db`: `viber.py`;
+- a cache keyed by the URL: build the cache file name (e.g. Glide's
+  `image_manager_disk_cache/<sha256(url)>.0`): `burner.py`.
+A link column can hold several paths, one per line (e.g. every face crop of a
+photo in `photos_metadata.py`). Don't guess a mapping you haven't confirmed on
+real data: GroupMe's image cache didn't match any URL hash tried, so its URLs
+stay unlinked.
+
 **Check what the database column actually points at before assuming it's
 a usable local path** — some apps store a remote URL (nothing local to
 show), or a `content://` URI (meaningless outside a live device). Both are

@@ -159,7 +159,20 @@ record_source = [
 # OWN id, not a joined table's, and source_table is a citation label, not
 # a raw key.
 hidden_fields = ["raw_additional_attrs_id", "raw_media_analysis_id",
-                 "raw_extended_attrs_id"]
+                 "raw_extended_attrs_id", "thumbnail_link", "face_crop_links"]
+# Linked Report: the asset's file, its on-device thumbnail
+# (PhotoData/Thumbnails/V2/<dir>/<file>/5005.JPG — the only copy of an
+# iCloud photo whose original isn't on the phone: 10 of 567 assets on
+# IOS17, 146 of 1,918 on CTF23, all with a 5005.JPG), and every face crop
+# the embedded-media sweep shows inside Photos.sqlite (ZFACECROP.
+# ZRESOURCEDATA, one per line). Verified 2026-10-23.
+link_fields = ["attachment_path", "thumbnail_link", "face_crop_links"]
+
+
+def _thumbnail_link(paths, media_root, directory, filename):
+    from artifact_runner import archive_has
+    thumb = f"{media_root}/PhotoData/Thumbnails/V2/{directory}/{filename}/5005.JPG"
+    return thumb if archive_has(paths, thumb) else ""
 
 
 # ── Schema discovery helpers ──────────────────────────────────────────────────
@@ -412,6 +425,16 @@ def run(paths):
         """
         albums    = _load_albums(db, tables)
         face_ages = _load_face_ages(db, tables)
+        face_crops: dict = {}
+        if 'ZFACECROP' in tables and {'ZASSET', 'ZRESOURCEDATA'} <= _columns(db, 'ZFACECROP'):
+            from artifact_runner import embedded_media_path
+            for crop_pk, crop_asset, data in db.execute(
+                    'SELECT Z_PK, ZASSET, ZRESOURCEDATA FROM ZFACECROP '
+                    'WHERE ZRESOURCEDATA IS NOT NULL'):
+                link = embedded_media_path(paths, 'photos_db', 'ZFACECROP',
+                                           'ZRESOURCEDATA', crop_pk, data)
+                if link:
+                    face_crops.setdefault(crop_asset, []).append(link)
         labels    = (_load_classifications(paths['psi_db'])
                      if paths.get('psi_db') else {})
 
@@ -462,6 +485,8 @@ def run(paths):
                 "raw_additional_attrs_id": aa_pk,
                 "raw_media_analysis_id":   ma_pk,
                 "raw_extended_attrs_id":   ext_pk,
+                "thumbnail_link":  _thumbnail_link(paths, media_root, directory, filename),
+                "face_crop_links": "\n".join(face_crops.get(pk, ())),
             })
         return out
     finally:

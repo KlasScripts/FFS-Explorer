@@ -39,6 +39,12 @@ timestamp_fields = {"start_time": "webkit_us", "end_time": "webkit_us", "last_ac
 # download record; tab_url/danger_type/interrupt_reason/byte counts are
 # useful detail, not needed for a first pass.
 core_fields = ["start_time", "target_path", "state"]
+# Linked Report: the downloaded file itself, target_path mapped from the
+# device path (/storage/emulated/0/...) to the archive's data/media/0/...,
+# when it is still in the archive. NOT verified on real data: the four test
+# Android images have no rows in downloads (2026-10-23).
+link_fields = ["download_link"]
+hidden_fields = ["download_link"]
 
 # downloads.id is confirmed "INTEGER PRIMARY KEY" in the real schema (a
 # genuine rowid alias).
@@ -156,5 +162,12 @@ def run(paths):
             "received_bytes": r["received_bytes"],
             "total_bytes": r["total_bytes"],
             "raw_download_id": r["id"],
+            "download_link": _download_link(paths, r["target_path"]),
         })
     return out
+
+
+def _download_link(paths, target_path):
+    from artifact_runner import archive_has, device_path_to_ui_path
+    ui = device_path_to_ui_path(target_path)
+    return ui if archive_has(paths, ui) else ""

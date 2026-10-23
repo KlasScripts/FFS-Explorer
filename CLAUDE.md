@@ -129,7 +129,8 @@ Shared helpers in `app/artifact_runner.py` (import directly):
 `open_db_readonly` (the only way to open an evidence SQLite file),
 `log_note` (a line in the parser run log, e.g. why an optional table was
 skipped), `embedded_media_path` (File Browser path of a BLOB image the sweep
-extracts, for `link_fields`), `open_leveldb`, `decode_plist_blob`, `text_plausible`,
+extracts, for `link_fields`), `device_path_to_ui_path` / `resolve_mediastore_uri`
+/ `archive_has` (Android paths and MediaStore URIs to archive paths), `open_leveldb`, `decode_plist_blob`, `text_plausible`,
 `parse_chromium_dom_storage_key` / `resolve_chromium_session_storage_names`,
 `decompress_http_body`, `first_nonempty`, `missing_ref_label`,
 `resolve_path_after_marker`. Add a helper only when a second real parser

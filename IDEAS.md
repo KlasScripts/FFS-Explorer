@@ -140,7 +140,8 @@ with a path in a declared `media_fields` column is linked
 | Parsers | `media_fields` | Links checked on real data |
 |---|---|---|
 | iOS `sms_messages` | yes | yes (one run, 2026-10-12) |
-| iOS `whatsapp`, `photos_metadata`; Android `google_messages`, `whatsapp`, `chrome_cache_pages`, `chrome_cache_media`, `chrome_favicons`, `chrome_offline_pages` | yes | no |
+| Android `whatsapp` (message thumbnails inside msgstore.db), `chrome_favicons` (icons inside Favicons), via `embedded_media_path` | yes | yes (A15 CTF25, 2026-10-23: 2,575/2,575 thumbnails, 53/53 icons) |
+| iOS `whatsapp`, `photos_metadata`; Android `google_messages`, `whatsapp` (attachment files), `chrome_cache_pages`, `chrome_cache_media`, `chrome_offline_pages` | yes | no |
 | The other 30 parsers (iOS 4, Android 26) | none | n/a |
 
 **Work.**

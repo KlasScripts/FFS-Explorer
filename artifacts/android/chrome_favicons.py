@@ -88,9 +88,11 @@ timestamp_fields = {"last_updated": "webkit_us", "last_requested": "webkit_us"}
 # first to find it.
 core_fields = ["page_url", "icon_type_label", "last_updated", "history_coverage"]
 media_fields = ["icon_image_path"]
-# No per-row file in the archive (every icon comes out of the one Favicons
-# database), so nothing to show in the File Browser's Linked Report column.
-link_fields = []
+# Linked Report: the icon as the embedded-media sweep shows it inside the
+# Favicons database (favicon_bitmaps.image_data, rowid = bitmap id) — not
+# icon_image_path, which is this parser's own decoded copy on disk.
+link_fields = ["icon_link"]
+hidden_fields = ["icon_link"]
 
 record_source = {
     "label": "icon_mapping",
@@ -143,6 +145,7 @@ def _history_coverage(page_url, history_urls, ukm_urls) -> str:
 def run(paths):
     import os
     import chrome_shared
+    from artifact_runner import embedded_media_path
 
     favicons_by_id = {
         r["id"]: (r["url"], r["icon_type"])
@@ -181,11 +184,14 @@ def run(paths):
                 "last_updated": None,
                 "last_requested": None,
                 "icon_image_path": "",
+                "icon_link": "",
                 "history_coverage": coverage,
                 "raw_mapping_id": m["id"],
             })
             continue
         for b in bitmaps:
+            icon_link = embedded_media_path(paths, "favicons_db", "favicon_bitmaps",
+                                            "image_data", b["id"], b["image_data"])
             icon_image_path = ""
             if parser_dir and b["image_data"]:
                 dest = os.path.join(
@@ -205,6 +211,7 @@ def run(paths):
                 "last_updated": b["last_updated"],
                 "last_requested": b["last_requested"],
                 "icon_image_path": icon_image_path,
+                "icon_link": icon_link,
                 "history_coverage": coverage,
                 "raw_mapping_id": m["id"],
             })

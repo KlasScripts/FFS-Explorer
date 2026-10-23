@@ -179,6 +179,22 @@ prefix.
 attachment_path = f"{paths['_app_base_ui_path']}/{row['media_column']}"
 ```
 
+**Images stored inside a database (BLOB columns).** The embedded-media sweep
+shows them as children of the database, named
+`<db>-<table>-<column>-<rowid><ext>`. To link a report row to one, put
+`artifact_runner.embedded_media_path(paths, file_key, table, column, rowid,
+blob)` in a column and list that column in `link_fields` (and
+`hidden_fields`: it is plumbing). It uses the sweep's own naming code, so
+the two can't drift; the link resolves once the sweep has run on that
+database. Examples: `whatsapp.py` (Android, `message_thumbnail`, rowid =
+message `_id`), `chrome_favicons.py` (`favicon_bitmaps.image_data`).
+
+```python
+from artifact_runner import embedded_media_path
+row["thumbnail_link"] = embedded_media_path(paths, "msgstore", "message_thumbnail",
+                                            "thumbnail", message_id, blob)
+```
+
 **Check what the database column actually points at before assuming it's
 a usable local path** — some apps store a remote URL (nothing local to
 show), or a `content://` URI (meaningless outside a live device). Both are

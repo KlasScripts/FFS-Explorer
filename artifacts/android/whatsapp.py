@@ -172,6 +172,7 @@ hidden_fields = [
     "chat_mapped_jid_id", "sender_mapped_jid_id",
     "chat_contact_id", "sender_contact_id",
     "chat_mapped_contact_id", "sender_mapped_contact_id",
+    "thumbnail_link",
 ]
 
 # Declarative only — no recovery code belongs here; see description above
@@ -200,6 +201,11 @@ timestamp_fields = {"sent_time": "ms", "timestamp": "ms"}
 # guid_to_bundle.
 _MEDIA_BASE = "data/media/0/Android/media/com.whatsapp/WhatsApp"
 media_fields = ["attachment_path"]
+# Linked Report: the attachment file, and the message's thumbnail in
+# msgstore.db's message_thumbnail (rowid = message _id), which the
+# embedded-media sweep shows inside msgstore.db: image/video previews and
+# link previews of shared URLs (2026-10-23, verified on A14/A15 data).
+link_fields = ["attachment_path", "thumbnail_link"]
 
 
 def run(paths):
@@ -279,6 +285,10 @@ def run(paths):
 
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    try:   # older msgstore.db schemas have no message_thumbnail table
+        thumbs = dict(conn.execute("SELECT message_row_id, thumbnail FROM message_thumbnail"))
+    except Exception:
+        thumbs = {}
     conn.close()
 
     records = []
@@ -358,4 +368,10 @@ def run(paths):
             "source_table":     "message",
         })
 
+    from artifact_runner import embedded_media_path
+    for rec in records:
+        mid = rec.get("message_id")
+        rec["thumbnail_link"] = (embedded_media_path(paths, "msgstore", "message_thumbnail",
+                                                     "thumbnail", mid, thumbs.get(mid))
+                                 if mid in thumbs else "")
     return records

@@ -618,6 +618,31 @@ _open_notes: list[str] = []
 _temp_dirs: list[str] = []
 
 
+def embedded_media_path(paths: dict, file_key: str, table: str, column: str,
+                        rowid, blob) -> str:
+    """The File Browser path of the image the embedded-media sweep extracts
+    from this database value: '<db ui_path>/<db>-<table>-<column>-<rowid><ext>',
+    built with the sweep's own naming code and size limit, so a report row
+    can name it in a `link_fields` column and the File Browser's Linked
+    Report column / right-click jump work for it. '' if the value isn't
+    media the sweep would extract. The link resolves once the sweep has run
+    on that database (before that it names a file that doesn't exist yet,
+    which shows nothing). *file_key* is the parser's own files/
+    optional_files key for the database."""
+    import embedded_media_scan as ems
+    db_ui = (paths.get('_ui_paths') or {}).get(file_key)
+    if not db_ui or rowid is None or not isinstance(blob, (bytes, bytearray)):
+        return ''
+    if len(blob) < ems.MIN_MEDIA_BYTES:
+        return ''
+    got = ems.classify_media_blob(bytes(blob))
+    if got is None:
+        return ''
+    name = ems.compute_display_name(db_ui, 'sqlite', '', {
+        'table': table, 'column': column, 'rowid': rowid, 'ext': got[1]})
+    return f"{db_ui}/{name}"
+
+
 def log_note(text: str) -> None:
     """Write one line to the parser run log (after the parser finishes),
     e.g. that an optional table was absent and why nothing was read from
@@ -1608,6 +1633,7 @@ def run_artifact(
             if not _extract_candidate(candidates, zip_path, dest_path, zip_obj):
                 return [], f"{script_name}: file not found: {ui_path}"
             paths[key] = dest_path
+            paths.setdefault('_ui_paths', {})[key] = _ui_path_for(ui_path)
         for key, subpath in getattr(module, 'optional_files', {}).items():
             resolved = _resolve_glob_subpath(app_base, subpath, adapter, zip_names)
             if resolved is None:
@@ -1617,6 +1643,7 @@ def run_artifact(
             dest_path  = os.path.join(dest_dir, os.path.basename(resolved))
             if _extract_candidate(candidates, zip_path, dest_path, zip_obj):
                 paths[key] = dest_path
+                paths.setdefault('_ui_paths', {})[key] = _ui_path_for(ui_path)
         try:
             rows = module.run(paths) or []
         except Exception as exc:

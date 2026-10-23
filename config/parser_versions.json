@@ -71,8 +71,8 @@
     },
     "android:chrome_favicons": {
       "changelog": {},
-      "hash": "0ea6a91c678745ad",
-      "version": 5
+      "hash": "277cd3fb0b091ca4",
+      "version": 6
     },
     "android:chrome_history": {
       "changelog": {},
@@ -238,8 +238,8 @@
         "3": "record_source expanded from 2 entries (Message, Chat) to 12: every other joined table's rowid status was checked against real WhatsApp casework (jid/message_media/message_location/wa_contacts all confirmed genuine INTEGER PRIMARY KEY rowid aliases -- wa_contacts specifically was previously flagged unconfirmed, now resolved). New SELECT columns added for the four wa_contacts joins' own _id (jid/media/location needed none -- media/location's rowid is provably identical to the already-captured message_id). New entries: Chat/Sender JID + their Mapped (LID) variants, Media, Location, Chat/Sender Contact + Mapped variants -- all newly-added id fields kept out of the Report table via hidden_fields (plumbing only, already resolved into visible columns).",
         "4": "Media/Location record_source entries gained presence_fields (media_path / latitude) -- their reused rowid (message_id) is always populated regardless of whether that LEFT JOIN matched, so it alone couldn't tell the Hex panel's per-row combo whether to list them; now correctly hidden for a row whose join found nothing."
       },
-      "hash": "5b009f566681d3ec",
-      "version": 5
+      "hash": "20dd9868dec54087",
+      "version": 6
     },
     "ios:app_report": {
       "changelog": {

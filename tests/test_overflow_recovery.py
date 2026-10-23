@@ -119,3 +119,24 @@ def test_live_names_include_the_table():
     assert ems.live_sqlite_display_name('a/msgstore.db', 'message_thumbnail.thumbnail (rowid=3896)',
                                         '.jpg') == 'msgstore.db-message_thumbnail-thumbnail-3896.jpg'
     assert ems.live_sqlite_display_name('a/x.db', 'rowid=4 (page 9, freed_page)', '.jpg') is None
+
+
+def test_report_link_path_matches_the_sweep(tmp_path):
+    """embedded_media_path (what a parser puts in link_fields) must equal the
+    File Browser path the sweep gives the same database value."""
+    from artifact_runner import embedded_media_path
+    img = _images(1)[0]
+    db = str(tmp_path / 'msgstore.db')
+    c = sqlite3.connect(db)
+    c.execute('create table message_thumbnail(message_row_id integer primary key, thumbnail blob)')
+    c.execute('insert into message_thumbnail values (161, ?)', (img,))
+    c.commit()
+    c.close()
+    ui = 'data/data/com.whatsapp/databases/msgstore.db'
+    rows = ems.scan_container('sqlite', ui, open(db, 'rb').read(), tempfile.mkdtemp(), 'test')
+    swept = {f"{ui}/{r['display_name']}" for r in rows}
+    link = embedded_media_path({'_ui_paths': {'msgstore': ui}}, 'msgstore',
+                               'message_thumbnail', 'thumbnail', 161, img)
+    assert link in swept
+    assert embedded_media_path({'_ui_paths': {'msgstore': ui}}, 'msgstore',
+                               'message_thumbnail', 'thumbnail', 1, b'too small') == ''

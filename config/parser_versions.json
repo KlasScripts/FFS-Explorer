@@ -49,13 +49,13 @@
     },
     "android:chrome_cache_media": {
       "changelog": {},
-      "hash": "eaf333726ef9788c",
-      "version": 2
+      "hash": "26461540b008a245",
+      "version": 3
     },
     "android:chrome_cache_pages": {
       "changelog": {},
-      "hash": "1536c35966b2f5f8",
-      "version": 2
+      "hash": "fdcba70ad86fcde8",
+      "version": 3
     },
     "android:chrome_cookies": {
       "changelog": {},
@@ -71,8 +71,8 @@
     },
     "android:chrome_favicons": {
       "changelog": {},
-      "hash": "71e3db5cbd1fee7d",
-      "version": 4
+      "hash": "0ea6a91c678745ad",
+      "version": 5
     },
     "android:chrome_history": {
       "changelog": {},
@@ -264,15 +264,15 @@
     },
     "ios:photos_metadata": {
       "changelog": {},
-      "hash": "bcfe01dfcbb37fbd",
-      "version": 4
+      "hash": "ce2aa4f3a1334610",
+      "version": 5
     },
     "ios:sms_messages": {
       "changelog": {
         "2": "Use shared missing_ref_label()/resolve_path_after_marker() instead of inline f-strings/startswith logic for the no-chat/no-handle-record fallbacks and attachment path resolution (no output change)."
       },
-      "hash": "18c06a706b0458ed",
-      "version": 3
+      "hash": "9485bc0e363ec556",
+      "version": 4
     },
     "ios:whatsapp": {
       "changelog": {

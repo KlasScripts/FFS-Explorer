@@ -13417,8 +13417,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     continue
                 if is_empty_dir and self._hide_empty_folders:
                     continue
-                name = p.split('/')[-1]
-                item = QStandardItem(self._display_name(name))
+                item = QStandardItem(self._tree_label(p))
                 item.setData(p, Qt.ItemDataRole.UserRole)
                 item.setEditable(False)
                 item.setCheckable(True)
@@ -14921,8 +14920,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             child = parent_item.child(row)
             if child.data(Qt.ItemDataRole.UserRole) == ui_path:
                 return child
-        name = ui_path.split('/')[-1]
-        item = QStandardItem(self._display_name(name))
+        item = QStandardItem(self._tree_label(ui_path))
         item.setData(ui_path, Qt.ItemDataRole.UserRole)
         item.setEditable(False)
         item.setCheckable(True)
@@ -14932,12 +14930,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             placeholder = QStandardItem()
             placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
             item.appendRow(placeholder)
+        # In sorted position (the order _populate_tree_children_batched uses),
+        # not at the end: a container found by a sweep in a folder with
+        # thousands of subfolders was easy to miss at the bottom.
+        row = parent_item.rowCount()
+        for r in range(parent_item.rowCount()):
+            other = parent_item.child(r).data(Qt.ItemDataRole.UserRole)
+            if isinstance(other, str) and other != _TREE_PLACEHOLDER and other > ui_path:
+                row = r
+                break
         self._tree_populating = True
         try:
-            parent_item.appendRow(item)
+            parent_item.insertRow(row, [item])
         finally:
             self._tree_populating = False
         return item
+
+    def _tree_label(self, ui_path: str) -> str:
+        """A folder-tree node's text: its display name, plus " (EM)" for a
+        database/plist/web cache record with embedded media inside (owner
+        request, 2026-10-23), matching its "(EM)" type in the file list."""
+        label = self._display_name(ui_path.split('/')[-1])
+        if ui_path in self._embedded_media_containers:
+            label += ' (EM)'
+        return label
 
     def _select_file_by_path(self, path: str) -> None:
         """Select and scroll to the file-browser row for *path*, if visible."""
@@ -15908,7 +15924,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                         break
                     if cur_path not in created:
                         parent_item = created[parent_path]
-                        item = QStandardItem(self._display_name(part))
+                        item = QStandardItem(self._tree_label(cur_path))
                         item.setData(cur_path, Qt.ItemDataRole.UserRole)
                         item.setEditable(False)
                         if cur_path in self.folder_map:

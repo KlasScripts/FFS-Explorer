@@ -7501,6 +7501,24 @@ def _do_path_change_check(
     return passed
 
 
+def _disambiguated_names(container_hits: list, base_of) -> list[str]:
+    """The child names of one container's embedded-media hits, in order:
+    each hit's base name, with " (2)", " (3)"... before the extension for a
+    repeat (the convention any file manager uses)."""
+    used: dict[str, int] = {}
+    out = []
+    for h in container_hits:
+        base = base_of(h) or h['extracted_path'].rsplit('/', 1)[-1]
+        if base in used:
+            used[base] += 1
+            stem, ext = os.path.splitext(base)
+            out.append(f"{stem} ({used[base]}){ext}")
+        else:
+            used[base] = 1
+            out.append(base)
+    return out
+
+
 class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, SqliteViewerMixin, SegbViewerMixin, LevelDbViewerMixin, TimestampDisplayMixin):  # type: ignore[reportIncompatibleMethodOverride]
     def __init__(self):
         super().__init__()
@@ -12243,9 +12261,33 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not hits:
             return
 
+        # Live SQLite hits saved under an older name get
+        # '<db>-<table>-<column>-<rowid>' (2026-10-23), once; anything
+        # keyed by their path (bookmarks, Not Relevant, seen, cached
+        # thumbnails/EXIF) is moved to the new path in the same step.
+        import embedded_media_scan as _ems
+        renamed = []
+        for h in hits:
+            if h['source_kind'] == 'sqlite' and not h['recovered']:
+                new = _ems.live_sqlite_display_name(
+                    h['source_ui_path'], h['location'], os.path.splitext(h['display_name'])[1])
+                if new and new != h['display_name']:
+                    h['_old_display_name'] = h['display_name']
+                    h['display_name'] = new
+                    renamed.append(h)
+
         by_container: dict[str, list] = {}
         for h in hits:
             by_container.setdefault(h['source_ui_path'], []).append(h)
+        if renamed:
+            moves = {}
+            for container, container_hits in by_container.items():
+                old = _disambiguated_names(container_hits, lambda h: h.get('_old_display_name') or h['display_name'])
+                new = _disambiguated_names(container_hits, lambda h: h['display_name'])
+                for a, b in zip(old, new):
+                    if a != b:
+                        moves[f"{container}/{a}"] = f"{container}/{b}"
+            self._migrate_embedded_media_names(renamed, moves)
 
         virtual_paths: set[str] = set()
         containers: set[str] = set()
@@ -12256,19 +12298,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             cache_sources = {}
         cache_children: set[str] = set()
         for container, container_hits in by_container.items():
-            used_names: dict[str, int] = {}
             container_meta = self.full_metadata.get(container) or {}
             children = []
             total_size = 0
-            for h in container_hits:
-                base = h['display_name'] or h['extracted_path'].rsplit('/', 1)[-1]
-                if base in used_names:
-                    used_names[base] += 1
-                    stem, ext = os.path.splitext(base)
-                    name = f"{stem} ({used_names[base]}){ext}"
-                else:
-                    used_names[base] = 1
-                    name = base
+            names = _disambiguated_names(container_hits, lambda h: h['display_name'])
+            for h, name in zip(container_hits, names):
                 vpath = f"{container}/{name}"
                 virtual_paths.add(vpath)
                 children.append(vpath)
@@ -12319,6 +12353,34 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_paths)
         self._cache_media_children = frozenset(cache_children)
         self._recompute_meta_col_keys()
+
+    def _migrate_embedded_media_names(self, renamed: list, moves: dict) -> None:
+        """Save the new names of *renamed* hits and move every path-keyed
+        record from the old child path to the new one (*moves*: old -> new).
+        UPDATE OR IGNORE: if a record already exists under the new path it
+        is kept, and the old one stays where it was."""
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                db.executemany('UPDATE embedded_media_hits SET display_name=? WHERE id=?',
+                               [(h['display_name'], h['id']) for h in renamed])
+                for old, new in moves.items():
+                    db.execute('UPDATE OR IGNORE bookmark_entries SET ui_path=?, display_name='
+                               'CASE WHEN display_name=? THEN ? ELSE display_name END '
+                               'WHERE ui_path=?', (new, old.rsplit('/', 1)[-1],
+                                                   new.rsplit('/', 1)[-1], old))
+                    for table in ('media_seen', 'search_scope_files', 'artifact_attachment_links'):
+                        db.execute(f'UPDATE OR IGNORE {table} SET ui_path=? WHERE ui_path=?', (new, old))
+                db.commit()
+            with closing(_open_cache_db(self._case_dir)) as db:
+                for old, new in moves.items():
+                    for table in ('thumbnails', 'header_types', 'media_metadata', 'duplicate_files'):
+                        db.execute(f'UPDATE OR IGNORE {table} SET ui_path=? WHERE ui_path=?', (new, old))
+                db.commit()
+            startup_log.message('warning',
+                f"Renamed {len(renamed)} embedded database image(s) to include the "
+                f"table ({len(moves)} path(s) moved, with their bookmarks/marks).")
+        except Exception as exc:
+            startup_log.message('error', f"Renaming embedded database images failed: {exc}")
 
     def _on_embedded_media_scan_injected(self):
         """Runs when ProcessDialog's embedded-media scan finishes (see

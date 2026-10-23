@@ -109,3 +109,13 @@ def test_sweep_names_and_wal_aware_live_scan(tmp_path):
     names = {r['display_name'] for r in rows if r['recovered']}
     assert any(n.startswith('w.db-carved') for n in names)
     assert all('-carved-partial' in r['display_name'] for r in rows if 'PARTIAL' in (r['recovery_source'] or ''))
+
+
+def test_live_names_include_the_table():
+    hit = {'table': 'message_thumbnail', 'column': 'thumbnail', 'rowid': 3896, 'ext': '.jpg'}
+    assert ems.compute_display_name('a/msgstore.db', 'sqlite', '', hit) == \
+        'msgstore.db-message_thumbnail-thumbnail-3896.jpg'
+    # a hit saved under the older naming gets the same name back from its location
+    assert ems.live_sqlite_display_name('a/msgstore.db', 'message_thumbnail.thumbnail (rowid=3896)',
+                                        '.jpg') == 'msgstore.db-message_thumbnail-thumbnail-3896.jpg'
+    assert ems.live_sqlite_display_name('a/x.db', 'rowid=4 (page 9, freed_page)', '.jpg') is None

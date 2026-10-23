@@ -398,11 +398,30 @@ def compute_display_name(ui_path: str, source_kind: str, location: str,
         elif hit.get('recovered'):
             name = f"{dbname}-carved{ext}"
         else:
+            # <db>-<table>-<column>-<rowid>: the table is part of the name
+            # (owner request, 2026-10-23) because a rowid only means
+            # something within its table — e.g. msgstore.db's
+            # message_thumbnail rowid IS a message _id, but the legacy
+            # message_thumbnails table (same 'thumbnail' column) is keyed by
+            # message key, so its rowid matches no message.
             column = hit.get('column') or 'value'
+            table = hit.get('table')
             rowid = hit.get('rowid')
             rowid = rowid if rowid is not None else '?'
-            name = f"{dbname}-{column}-{rowid}{ext}"
+            name = (f"{dbname}-{table}-{column}-{rowid}{ext}" if table
+                    else f"{dbname}-{column}-{rowid}{ext}")
     return name.replace('/', '∕')
+
+
+def live_sqlite_display_name(ui_path: str, location: str, ext: str) -> str | None:
+    """The current name for a live SQLite hit saved under an older naming,
+    rebuilt from its saved location ('<table>.<column> (rowid=N)'). None if
+    the location isn't that shape."""
+    m = re.match(r'^([^.]+)\.(.+) \(rowid=(.*)\)$', location or '')
+    if not m:
+        return None
+    dbname = ui_path.rsplit('/', 1)[-1] or 'database'
+    return f"{dbname}-{m.group(1)}-{m.group(2)}-{m.group(3)}{ext}".replace('/', '∕')
 
 
 # ── SQLite: live content (real SQL query — overflow handled by SQLite

@@ -77,3 +77,11 @@ def test_errors_name_the_database(tmp_path):
         f.write(b'not a database' * 100)
     with pytest.raises(sqlite3.DatabaseError, match=r'^History: file is not a database'):
         open_db_readonly(db)
+
+
+def test_log_note_reaches_the_run_log():
+    from artifact_runner import log_note
+    take_open_notes()
+    log_note('Account Web Data has no autofill table')
+    assert take_open_notes() == ['  Note: Account Web Data has no autofill table']
+    assert take_open_notes() == []

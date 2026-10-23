@@ -134,7 +134,19 @@ def run(paths):
 
     out = _autofill_rows(paths["web_data"], "Web Data")
     if "account_web_data" in paths:
-        out += _autofill_rows(paths["account_web_data"], "Account Web Data (synced)")
+        # Account Web Data doesn't always have an autofill table: absent on
+        # Android 15 CTF25 (schema 141), present but empty on CTF26 (145)
+        # and Android 14 JoshHickman (122). A missing table used to fail
+        # the whole parser, losing the Web Data rows too.
+        tables = {r["name"] for r in chrome_shared.query_rows(
+            paths["account_web_data"], "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "autofill" in tables:
+            out += _autofill_rows(paths["account_web_data"], "Account Web Data (synced)")
+        else:
+            from artifact_runner import log_note
+            log_note("Account Web Data has no autofill table on this device "
+                     "(Chrome doesn't always create it), so no synced-account "
+                     "autofill entries could be read; Web Data was read as normal.")
 
     history_events = chrome_shared.history_visits(paths["history"]) if "history" in paths else None
     for row in out:

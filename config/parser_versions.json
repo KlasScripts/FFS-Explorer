@@ -32,8 +32,8 @@
       "changelog": {
         "3": "record_source gained an explicit label ('Autofill Entry') -- the Hex panel's joined-record combo is now always visible even for a single entry, so an undeclared label would otherwise surface as a bare '?'."
       },
-      "hash": "9a5aa84107aacb66",
-      "version": 5
+      "hash": "acbbebdab1c89c16",
+      "version": 6
     },
     "android:chrome_bookmarks": {
       "changelog": {},
@@ -117,8 +117,8 @@
       "changelog": {
         "5": "record_source gained an explicit label ('Offline Page'), same reason as chrome_autofill.py."
       },
-      "hash": "437e32f8214d30be",
-      "version": 5
+      "hash": "e1d0710574f443bd",
+      "version": 6
     },
     "android:chrome_omnibox_shortcuts": {
       "changelog": {},

@@ -127,7 +127,8 @@ Declarations a parser can set:
 
 Shared helpers in `app/artifact_runner.py` (import directly):
 `open_db_readonly` (the only way to open an evidence SQLite file),
-`open_leveldb`, `decode_plist_blob`, `text_plausible`,
+`log_note` (a line in the parser run log, e.g. why an optional table was
+skipped), `open_leveldb`, `decode_plist_blob`, `text_plausible`,
 `parse_chromium_dom_storage_key` / `resolve_chromium_session_storage_names`,
 `decompress_http_body`, `first_nonempty`, `missing_ref_label`,
 `resolve_path_after_marker`. Add a helper only when a second real parser

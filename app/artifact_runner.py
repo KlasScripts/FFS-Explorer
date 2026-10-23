@@ -618,6 +618,14 @@ _open_notes: list[str] = []
 _temp_dirs: list[str] = []
 
 
+def log_note(text: str) -> None:
+    """Write one line to the parser run log (after the parser finishes),
+    e.g. that an optional table was absent and why nothing was read from
+    it. For a parser to explain a skip instead of failing or staying
+    silent."""
+    _open_notes.append(f"  Note: {text}")
+
+
 def take_open_notes() -> list[str]:
     """Notes about databases read from a temporary copy since the last call."""
     notes = list(_open_notes)

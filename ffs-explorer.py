@@ -5552,7 +5552,7 @@ class ProcessDialog(QDialog):
         # just extracted above is already visible to this scan by the time
         # it runs, never missed because it ran first.
         self._chk_embedded_media = QCheckBox(
-            "Scan databases and property lists for embedded media")
+            "Scan databases, property lists and web cache records for embedded media")
         self._chk_embedded_media.setChecked(False)
         self._chk_embedded_media.setToolTip(
             "Finds image/video content embedded inside SQLite BLOB cells and "
@@ -5560,6 +5560,9 @@ class ProcessDialog(QDialog):
             "in the archive (or just app/user-accessible areas, per the scope "
             "below) — including content recovered from freed pages, in-page "
             "freeblocks, and WAL history, not just what's currently live.\n"
+            "Also opens browser web cache records (Chrome and other Chromium "
+            "apps: <hash>_0 and <hash>_s files) and shows the cached picture "
+            "or video as a child of the record, with its Source URL.\n"
             "Runs AFTER archive extraction above, so a database or plist that "
             "only existed inside a nested archive is included too.")
         layout.addWidget(self._chk_embedded_media)
@@ -6191,6 +6194,19 @@ class ProcessDialog(QDialog):
         self._embedded_skip_list_btn.setVisible(checked)
         if checked:
             self._update_embedded_scope_label()
+            self._grow_to_fit()
+
+    def _grow_to_fit(self):
+        """Ticking the embedded-media scan shows four more rows; at the
+        dialog's fixed height Qt squashed the tier radios to a few pixels
+        each. Grow to the preferred height instead (never shrink, never
+        past the screen)."""
+        self.layout().activate()
+        want = self.sizeHint().height()
+        screen = self.screen().availableGeometry().height() if self.screen() else want
+        want = min(want, screen - 40)
+        if self.height() < want:
+            self.resize(self.width(), want)
 
     def _update_embedded_scope_label(self):
         """Direct instruction: "clearly indicate the current head tier
@@ -6200,10 +6216,10 @@ class ProcessDialog(QDialog):
         content recovery (freed pages/freeblocks/WAL history) is always
         included regardless of scope, never a separate silent toggle."""
         if self._rb_embedded_scope_all.isChecked():
-            text = ("Covers: every SQLite database and plist in the entire "
-                    "archive, including OS/system areas.")
+            text = ("Covers: every SQLite database, plist and web cache "
+                    "record in the entire archive, including OS/system areas.")
         else:
-            text = ("Covers: SQLite databases and plists inside app/user-"
+            text = ("Covers: SQLite databases, plists and web cache records inside app/user-"
                     "accessible areas only — the same areas the header "
                     "scan's own Tier 1/2 restrict to.")
         text += (" Includes content recovered from freed pages, in-page "

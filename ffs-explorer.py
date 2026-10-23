@@ -9258,17 +9258,26 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         ui_path = self.file_model.index(source.row(), 0).data(Qt.ItemDataRole.UserRole)
         if ui_path in self.folder_map:
             self.navigate_tree_to_path(ui_path)
-            import embedded_media_scan as _ems
-            if (ui_path in self._embedded_media_containers
-                    and _ems.is_simple_cache_record(ui_path)):
-                # A web cache record: go inside it (its media child) AND
-                # show the record's own information in the Text tab (owner
-                # request, 2026-10-22). After the navigation settles, so
-                # the folder change can't clear it again.
-                def _show_record(p=ui_path):
+            if ui_path in self._embedded_media_containers:
+                # A database, plist or web cache record with embedded media:
+                # go inside it (the media) AND show the container itself in
+                # the preview below — Database tab for SQLite, Text tab for a
+                # plist or cache record (owner request, 2026-10-22/23).
+                if self._view_path != ui_path:
+                    # The tree jump didn't land (e.g. the container isn't
+                    # in the current tree scope): open it in the list anyway.
+                    self._view_path = ui_path
+                    self._view_folder_recursive = False
+                    self._view_is_recursive = False
+                    self._refresh_folder_view(preserve_filter=False)
+                def _show_container(p=ui_path):
                     self._load_file_preview(p)
-                    self.preview_tabs.setCurrentIndex(1)   # Text
-                QTimer.singleShot(0, _show_record)
+                    if self.preview_tabs.currentIndex() not in (
+                            self._sql_tab_index, self._segb_tab_index):
+                        self.preview_tabs.setCurrentIndex(1)   # Text
+                # After the navigation settles, so the folder change can't
+                # clear the preview again.
+                QTimer.singleShot(0, _show_container)
         elif ui_path in self._nested_virtual_paths:
             self._load_virtual_entry_preview(ui_path)
         elif ui_path and self._in_zip(ui_path):
@@ -9985,7 +9994,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if path in self._leveldb_folder_map:
                 return 'LevelDB', False, False  # decoded LevelDB, records browseable as folder
             if path in self._embedded_media_containers:
-                return 'Embedded Media', False, False  # db/plist with found media, browseable as folder
+                # A database/plist/web cache record with media found inside:
+                # its own type plus "(EM)" (owner request, 2026-10-23), so it
+                # stays filterable as a database etc. and is distinguishable
+                # from one without embedded media. Browseable as a folder.
+                ft = _get_file_type(name)
+                if ft == 'Other':
+                    ft = self._header_type_overrides.get(path, 'Other')
+                return f'{ft} (EM)', False, False
             if self._should_hide_folder(path):
                 return None, None, True
             if path in self._metadata_only_folders:

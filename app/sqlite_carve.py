@@ -28,8 +28,10 @@ below/around what that API can see.
 """
 
 import contextlib
+import hashlib
 import os
 import sqlite3
+import re
 import struct
 import tempfile
 import time
@@ -2072,3 +2074,408 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None,
             conn.close()
     except Exception:
         return []
+
+
+# ── Deleted records whose payload spilled onto overflow pages ────────────────
+#
+# Added 2026-10-23 (owner request). Every carving path above reads only a
+# cell's on-page ("local") bytes and skips a record that doesn't fit, so a
+# deleted BLOB bigger than about one page (a full-size photo) was never
+# recovered. SQLite stores such a payload as: the local part on the leaf
+# page, ending in a 4-byte page number; then a chain of overflow pages,
+# each [4-byte next page][usable_size - 4 bytes of payload], the last one
+# with next page 0. Deleting the row puts those overflow pages on the
+# freelist without zeroing them, so the chain can usually be followed.
+#
+# What makes a recovered payload trustworthy ("complete"):
+#   - every page in the chain is free now (main db: not used by any live
+#     b-tree page, live overflow chain or freelist trunk — a page reused
+#     since holds someone else's bytes);
+#   - the chain yields exactly the payload length the record header
+#     declares, and its last page's next pointer is 0.
+# A chain that breaks after at least one good overflow page gives a
+# "partial" payload (a prefix of the original, cut where the reused page
+# starts). A chain whose FIRST page is in use is dropped: the page has
+# been reused (or the cell is a stale copy of a still-live record whose
+# media the live scan already has).
+
+def usable_size(header: dict) -> int:
+    return header['page_size'] - header.get('reserved_bytes', 0)
+
+
+def _index_local_size(payload_len: int, usable: int) -> int:
+    x = ((usable - 12) * 64) // 255 - 23
+    if payload_len <= x:
+        return payload_len
+    m = ((usable - 12) * 32) // 255 - 23
+    k = m + (payload_len - m) % (usable - 4)
+    return k if k <= x else m
+
+
+def _chain_pages(get_page, first: int, remaining: int, usable: int, n_pages: int) -> list[int]:
+    """Page numbers of a LIVE overflow chain (trusted, no validation)."""
+    pages = []
+    pg = first
+    while remaining > 0 and 2 <= pg <= n_pages and pg not in pages:
+        pages.append(pg)
+        page = get_page(pg)
+        remaining -= usable - 4
+        pg = struct.unpack('>I', page[0:4])[0] if len(page) >= 4 else 0
+    return pages
+
+
+def allocated_pages(raw: bytes, header: dict) -> set[int]:
+    """Every page the live database is using: b-tree pages of every table
+    and index (and sqlite_master), the overflow chains of their live cells,
+    freelist trunk pages and, with auto-vacuum, pointer-map pages. Pages
+    NOT in this set are free (freelist leaves, or orphaned)."""
+    page_size = header['page_size']
+    usable = usable_size(header)
+    n_pages = len(raw) // page_size
+    get_page = lambda pn: _page_bytes(raw, page_size, pn)
+    used: set[int] = {1}
+    roots = [1]
+    try:
+        with _readonly_connection(raw) as conn:
+            roots += [r[0] for r in conn.execute(
+                "SELECT rootpage FROM sqlite_master WHERE rootpage > 0")]
+    except Exception:
+        pass
+    for root in roots:
+        for pn in _walk_all_btree_pages(raw, page_size, root):
+            used.add(pn)
+            page = get_page(pn)
+            ho = 100 if pn == 1 else 0
+            if len(page) < ho + 8:
+                continue
+            kind = page[ho]
+            if kind not in (_LEAF_TABLE_PAGE, _LEAF_INDEX_PAGE, _INTERIOR_INDEX_PAGE):
+                continue
+            n_cells = struct.unpack('>H', page[ho + 3:ho + 5])[0]
+            ptrs = ho + (12 if kind == _INTERIOR_INDEX_PAGE else 8)
+            for i in range(n_cells):
+                try:
+                    off = struct.unpack('>H', page[ptrs + 2 * i:ptrs + 2 * i + 2])[0]
+                    if kind == _INTERIOR_INDEX_PAGE:
+                        off += 4
+                    plen, c = read_varint(page, off)
+                    off += c
+                    if kind == _LEAF_TABLE_PAGE:
+                        _, c = read_varint(page, off)
+                        off += c
+                        local, overflows = _cell_local_payload_size(plen, usable)
+                    else:
+                        local = _index_local_size(plen, usable)
+                        overflows = local < plen
+                    if overflows:
+                        first = struct.unpack('>I', page[off + local:off + local + 4])[0]
+                        used.update(_chain_pages(get_page, first, plen - local, usable, n_pages))
+                except (ValueError, struct.error, IndexError):
+                    continue
+    trunk = header['first_freelist_trunk']
+    seen = set()
+    while trunk and trunk not in seen and trunk <= n_pages:
+        seen.add(trunk)
+        used.add(trunk)
+        trunk = struct.unpack('>I', get_page(trunk)[0:4])[0]
+    if len(raw) >= 56 and struct.unpack('>I', raw[52:56])[0]:   # auto-vacuum: pointer maps
+        pm = 2
+        while pm <= n_pages:
+            used.add(pm)
+            pm += usable // 5 + 1
+    return used
+
+
+def follow_overflow_chain(get_page, first: int, remaining: int, usable: int,
+                          n_pages: int, free_pages: set | None) -> tuple[bytes, str, list]:
+    """Assemble up to *remaining* bytes from the overflow chain starting at
+    *first*. Returns (data, status, pages): status 'complete' (exact length
+    and the last page's next pointer is 0), or why it stopped: 'page in use',
+    'bad pointer', 'loop', 'last pointer not 0'. *free_pages* None skips the
+    in-use check (WAL history, where it doesn't apply)."""
+    data = bytearray()
+    pages: list[int] = []
+    sizes: list[int] = []
+
+    def suspect(status):
+        # The last page read holds the invalid pointer, so it may not be
+        # this record's page at all: leave its bytes out. (A pointer to a
+        # page that is in use now is still valid: that page was ours and
+        # has since been reused.)
+        if pages and status != 'page in use':
+            pages.pop()
+            del data[len(data) - sizes.pop():]
+        return bytes(data), status, pages
+
+    pg = first
+    while remaining > 0:
+        if not 2 <= pg <= n_pages:
+            return suspect('bad pointer')
+        if pg in pages:
+            return suspect('loop')
+        if free_pages is not None and pg not in free_pages:
+            return suspect('page in use')
+        page = get_page(pg)
+        if len(page) < usable:
+            return suspect('bad pointer')
+        pages.append(pg)
+        chunk = page[4:usable][:remaining]
+        sizes.append(len(chunk))
+        data += chunk
+        remaining -= len(chunk)
+        pg = struct.unpack('>I', page[0:4])[0]
+    if pg != 0:
+        return suspect('last pointer not 0')
+    return bytes(data), 'complete', pages
+
+
+def _record_payload_len(page: bytes, at: int) -> tuple[list, int, int] | None:
+    """(serial_types, header_len, payload_len) for a record header at *at*,
+    or None. payload_len is what the header declares (header + body)."""
+    try:
+        types, header_len = parse_record_header(page, at)
+    except ValueError:
+        return None
+    body = 0
+    for t in types:
+        size = _serial_type_size(t)
+        if size < 0:
+            return None
+        body += size
+    return types, header_len, header_len + body
+
+
+def _clobbered_starts(page: bytes, header_offset: int) -> list[tuple[int, int]]:
+    """Byte ranges of *page* that no deleted record's bytes can have
+    survived in: the page header and cell-pointer array, every live cell
+    (its full on-page extent), and each freeblock's 4-byte link header.
+    Real case behind it (2026-10-23 ground-truth test): after a delete,
+    SQLite moved a live row into the freed space and overwrote the end of
+    a deleted record's on-page bytes INCLUDING its overflow pointer; the
+    bytes found there were the live row's pointer, leading to a different
+    image's chain."""
+    out = []
+    n_cells = struct.unpack('>H', page[header_offset + 3:header_offset + 5])[0]
+    ptr_end = header_offset + 8 + 2 * n_cells
+    out.append((0, ptr_end))
+    usable = len(page)
+    for i in range(n_cells):
+        p = header_offset + 8 + 2 * i
+        try:
+            off = struct.unpack('>H', page[p:p + 2])[0]
+            plen, c1 = read_varint(page, off)
+            _, c2 = read_varint(page, off + c1)
+            local, overflows = _cell_local_payload_size(plen, usable)
+            out.append((off, off + c1 + c2 + local + (4 if overflows else 0)))
+        except (ValueError, struct.error, IndexError):
+            continue
+    for fb_off, _ in iter_freeblocks(page, header_offset):
+        out.append((fb_off - 4, fb_off))
+    return out
+
+
+def _first_clobbered(ranges, lo: int, hi: int) -> int | None:
+    """Lowest offset in [lo, hi) covered by any of *ranges*, else None."""
+    hit = None
+    for a, b in ranges:
+        if a < hi and b > lo:
+            x = max(a, lo)
+            hit = x if hit is None else min(hit, x)
+    return hit
+
+
+def _overflow_record(page: bytes, payload_start: int, payload_len: int, usable: int,
+                     get_page, n_pages: int, free_pages, page_no: int, rowid, source: str,
+                     clobbered=()):
+    local, overflows = _cell_local_payload_size(payload_len, usable)
+    if not overflows or payload_start + local + 4 > usable:
+        return None
+    cut = _first_clobbered(clobbered, payload_start, payload_start + local + 4)
+    if cut is not None:
+        # part of the on-page bytes (and with them the overflow pointer) has
+        # been overwritten: only the bytes before *cut* are this record's
+        if cut - payload_start < 1:
+            return None
+        return {'page': page_no, 'offset': payload_start, 'rowid': rowid, 'source': source,
+                'payload': bytes(page[payload_start:min(cut, payload_start + local)]),
+                'payload_len': payload_len, 'status': 'on-page bytes overwritten',
+                'overflow_pages': []}
+    first = struct.unpack('>I', page[payload_start + local:payload_start + local + 4])[0]
+    tail, status, pages = follow_overflow_chain(
+        get_page, first, payload_len - local, usable, n_pages, free_pages)
+    if not pages:
+        return None               # first overflow page reused / invalid: nothing of ours left
+    return {'page': page_no, 'offset': payload_start, 'rowid': rowid, 'source': source,
+            'payload': bytes(page[payload_start:payload_start + local]) + tail,
+            'payload_len': payload_len, 'status': status, 'overflow_pages': pages}
+
+
+# Start bytes of the media the sweep looks for (JPEG, PNG, GIF, the ISO
+# 'ftyp' box of HEIC/MP4/MOV, RIFF for WebP/AVI, an HTTP-wrapped body).
+# Only the byte-by-byte search of FREE SPACE for a lost record header (the
+# expensive part: 10x the sweep time on IOS17 without it) is limited to
+# ranges holding one of these, and to offsets before it. Known cost: a
+# deleted record whose BLOB starts on an overflow page (other long columns
+# first) is found in free space only via its cell pointer, i.e. on freed
+# or WAL pages, not after an in-place delete. Cell-pointer reads are cheap
+# and never filtered.
+_MEDIA_START = re.compile(rb'\xff\xd8\xff|\x89PNG|GIF8[79]a|ftyp|RIFF|HTTP/1\.')
+
+
+def _overflow_records_in_page(page: bytes, page_no: int, header_offset: int, usable: int,
+                              get_page, n_pages: int, free_pages, source: str,
+                              whole_page_cells: bool, min_blob: int) -> list[dict]:
+    out = []
+    starts_done = set()
+    if callable(free_pages):
+        free_pages = free_pages()
+    clobbered = None                  # worked out once per page, when first needed
+    if whole_page_cells:          # an intact (freed or WAL) leaf page: its cell pointers
+        n_cells = struct.unpack('>H', page[header_offset + 3:header_offset + 5])[0]
+        for i in range(n_cells):
+            p = header_offset + 8 + 2 * i
+            try:
+                off = struct.unpack('>H', page[p:p + 2])[0]
+                plen, c1 = read_varint(page, off)
+                rowid, c2 = read_varint(page, off + c1)
+            except (ValueError, struct.error, IndexError):
+                continue
+            if not _cell_local_payload_size(plen, usable)[1]:
+                continue                  # fits on the page: the other carving paths' job
+            if clobbered is None:
+                clobbered = _clobbered_starts(page, header_offset)
+            start = off + c1 + c2
+            # every cell's own extent is in *clobbered*; leave this one's out
+            own = [r for r in clobbered if r[0] != off]
+            rec = _overflow_record(page, start, plen, usable, get_page, n_pages,
+                                   free_pages, page_no, _to_signed_rowid(rowid), source, own)
+            if rec:
+                starts_done.add(start)
+                out.append(rec)
+    # Free space: a deleted cell's first 4 bytes (payload length, rowid) are
+    # overwritten by the freeblock link, but its record header usually
+    # survives, and it declares the payload length.
+    for lo, hi, kind in _free_byte_ranges(page, header_offset):
+        last = None
+        for m in _MEDIA_START.finditer(page, lo, hi):
+            last = m.start()
+        if last is None:
+            continue
+        if clobbered is None:
+            clobbered = _clobbered_starts(page, header_offset)
+        for at in range(lo, last):     # the record header comes before the media
+            if at in starts_done:
+                continue
+            parsed = _record_payload_len(page, at)
+            if not parsed:
+                continue
+            types, header_len, plen = parsed
+            if not any(t >= 12 and t % 2 == 0 and (t - 12) // 2 >= min_blob for t in types):
+                continue
+            rec = _overflow_record(page, at, plen, usable, get_page, n_pages,
+                                   free_pages, page_no, None, f'{source}/{kind}', clobbered)
+            if rec:
+                starts_done.add(at)
+                out.append(rec)
+    return out
+
+
+def carve_overflowing_records(raw: bytes, wal: bytes | None = None,
+                              min_blob: int = 256) -> list[dict]:
+    """Deleted records whose payload continued on overflow pages, from the
+    main database (freed leaf pages, free space on live leaf pages) and, if
+    given, every WAL frame's leaf page. Each result has the assembled
+    'payload' (record header + body), 'payload_len', 'status' ('complete'
+    or why the chain stopped), 'source', 'page', 'rowid' (None if lost)."""
+    try:
+        header = parse_db_header(raw)
+    except ValueError:
+        return []
+    page_size = header['page_size']
+    usable = usable_size(header)
+    n_pages = len(raw) // page_size
+    freelist = set(iter_freelist_pages(raw, page_size, header))
+    get_page = lambda pn: _page_bytes(raw, page_size, pn)
+    cache: dict = {}
+
+    def used():                     # worked out once, and only if a page needs it
+        if 'used' not in cache:
+            cache['used'] = allocated_pages(raw, header)
+        return cache['used']
+
+    def free_pages():
+        if 'free' not in cache:
+            cache['free'] = set(range(1, n_pages + 1)) - used()
+        return cache['free']
+
+    out = []
+    for pn in range(1, n_pages + 1):
+        page = get_page(pn)
+        ho = 100 if pn == 1 else 0
+        if len(page) < ho + 8 or page[ho] != _LEAF_TABLE_PAGE:
+            continue
+        if pn in freelist:
+            out += _overflow_records_in_page(page, pn, ho, usable, get_page, n_pages,
+                                             free_pages, 'freed_page', True, min_blob)
+        elif pn in used():
+            out += _overflow_records_in_page(page, pn, ho, usable, get_page, n_pages,
+                                             free_pages, 'live_page', False, min_blob)
+    if wal:
+        frames = list(iter_wal_frames(wal, page_size))
+        n = max([n_pages] + [f['page'] for f in frames])
+        # Frame index of the commit that ends each frame's transaction: the
+        # pages of one transaction (a leaf and its new overflow pages) can be
+        # written in any order, so a page is looked up as of that commit.
+        commit_at = [None] * len(frames)
+        nxt = None
+        for k in range(len(frames) - 1, -1, -1):
+            if frames[k]['is_commit']:
+                nxt = k
+            commit_at[k] = nxt
+        by_page: dict[int, list[int]] = {}
+        for k, f in enumerate(frames):
+            by_page.setdefault(f['page'], []).append(k)
+        seen_images: set = set()
+        for i, frame in enumerate(frames):
+            image = frame['image']
+            ho = 100 if frame['page'] == 1 else 0
+            if len(image) < ho + 8 or image[ho] != _LEAF_TABLE_PAGE:
+                continue
+            upto = commit_at[i] if commit_at[i] is not None else i
+            key = (frame['page'], hashlib.blake2b(image, digest_size=16).digest(), upto)
+            if key in seen_images:      # the same page image again in a later frame
+                continue
+            seen_images.add(key)
+
+            def wal_page(pn, upto=upto):
+                # the page as of this frame's commit: its latest frame up to
+                # that commit, else the main database
+                for k in reversed(by_page.get(pn, ())):
+                    if k <= upto:
+                        return frames[k]['image']
+                return _page_bytes(raw, page_size, pn)
+            for rec in _overflow_records_in_page(image, frame['page'], ho, usable, wal_page,
+                                                 n, None, 'wal_frame', True, min_blob):
+                rec['wal_frame_offset'] = frame['frame_offset']
+                out.append(rec)
+    return out
+
+
+def blob_columns(payload: bytes, min_blob: int = 256) -> list[tuple[int, bytes, int]]:
+    """(column_index, bytes_present, declared_size) for each BLOB column of
+    at least *min_blob* declared bytes in an assembled record payload;
+    bytes_present is shorter than declared_size when the payload is partial."""
+    try:
+        types, header_len = parse_record_header(payload, 0)
+    except ValueError:
+        return []
+    out = []
+    pos = header_len
+    for i, t in enumerate(types):
+        size = _serial_type_size(t)
+        if size < 0:
+            return out
+        if t >= 12 and t % 2 == 0 and size >= min_blob and pos < len(payload):
+            out.append((i, payload[pos:pos + size], size))
+        pos += size
+    return out

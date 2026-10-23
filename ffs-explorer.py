@@ -9508,6 +9508,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 "cache record file that contains it (a record holds exactly one "
                 "cached download), passed through as the archive records them.",
                 ui_path)
+        elif meta.get('_em_container'):
+            # Where a database/plist hit came from, and for a deleted one how
+            # it was recovered: whole, or a PARTIAL prefix and why it stops.
+            loc = meta.get('_em_location') or ''
+            lines = [f"Media found inside: {meta['_em_container']}", ""]
+            if meta.get('_em_kind') == 'plist':
+                lines.append(f"Plist field: {loc}")
+            elif not meta.get('_em_recovered'):
+                lines.append(f"Live database value: {loc}")
+            else:
+                lines.append(f"Recovered from deleted data: {loc}")
+                if 'PARTIAL' in loc:
+                    lines += ["", "PARTIAL: only the start of the original survives. "
+                              "The rest was overwritten by SQLite or reused for other "
+                              "data, so the file is cut off where it stops."]
+                elif 'overflow chain' in loc and 'wal_frame' in loc:
+                    lines += ["", "Recovered whole from the database's -wal history: "
+                              "the page versions saved there for that transaction give "
+                              "exactly the length its record declares, ending correctly."]
+                elif 'overflow chain' in loc:
+                    lines += ["", "Recovered whole: its overflow pages were all still "
+                              "free and gave exactly the length its record declares, "
+                              "ending correctly."]
+            self._load_text_preview("\n".join(lines), ui_path)
 
     def _load_nested_entry_preview(self, ui_path: str) -> None:
         """Read an entry from an extracted nested archive and display it."""
@@ -12254,6 +12278,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     '_display_name':           name,
                     '_embedded_media_source':  h['extracted_path'],
                     'mtime':                   None,
+                    '_em_container':           container,
+                    '_em_kind':                h['source_kind'],
+                    '_em_location':            h.get('location') or '',
+                    '_em_recovered':           bool(h.get('recovered')),
                 }
                 if h['source_kind'] == 'cache':
                     # A Simple Cache record holds exactly one cached response,

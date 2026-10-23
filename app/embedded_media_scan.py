@@ -43,29 +43,29 @@ carving primitives (carve_freed_pages, carve_unallocated_region,
 decode_leaf_page_cells applied directly to WAL frame images) completely
 unmodified. Those primitives were built for recovering ordinary rows,
 where a record that doesn't fully decode on-page is correctly treated as
-untrustworthy and skipped (see decode_leaf_page_cells's own docstring:
-"large BLOBs/long TEXT may come back truncated ... " and its caller
-`continue`s past a truncated result rather than trusting a partial
-decode). That means, in this first version, a DELETED blob big enough to
-have needed an overflow page when it was written is NOT recovered at
-all — not partially, not corrupted, just silently absent from this
-sweep's results, the same way it's silently absent from every other
-recoverable_tables-based recovery in this project today. What DOES get
-recovered from freed/freeblock/WAL space is any deleted media small
-enough to fit entirely within one page's local payload (SQLite's own
-overflow threshold is roughly page_size - 35 bytes) — real, common
-categories like small thumbnails, stickers, and highly-compressed tiny
-images, not full-size photos. Recovering an overflowing DELETED blob by
-following its own overflow-page pointer chain is a real, separate,
-higher-risk piece of new low-level parsing (the pointer chain can be
-partially overwritten once its pages are freed) that was deliberately
-NOT attempted in this pass — flagged here, not silently undersold,
-as the concrete next enhancement.
+untrustworthy and skipped (see decode_leaf_page_cells's own docstring).
+Those paths therefore only recover deleted media small enough to fit in
+one page's local payload (roughly page_size - 35 bytes): thumbnails,
+stickers, tiny images.
+
+Since 2026-10-23, scan_sqlite_overflow covers the rest: a deleted record
+whose payload continued on overflow pages has its chain followed
+(sqlite_carve.carve_overflowing_records). A result is "complete" (the
+exact original bytes) only if every chain page is still free, nothing
+on the leaf page overwrote the record's own bytes or pointer, and the
+chain gives exactly the declared length ending in a 0 pointer; otherwise
+it is a labelled PARTIAL prefix ("-carved-partial"), or nothing. Ground
+truth (real images, real SQLite, known deletes): every complete result
+was byte-identical to a deleted original and every partial a true
+prefix; recovered = exactly the deleted records whose bytes SQLite had
+not since overwritten (4 of 15 in a plain delete test, the rest having
+had part of their bytes reused by SQLite's own page reorganising).
 """
 
 import hashlib
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 
@@ -393,7 +393,9 @@ def compute_display_name(ui_path: str, source_kind: str, location: str,
         name = f"{segment}{ext}"
     else:
         dbname = ui_path.rsplit('/', 1)[-1] or 'database'
-        if hit.get('recovered'):
+        if hit.get('partial'):
+            name = f"{dbname}-carved-partial{ext}"
+        elif hit.get('recovered'):
             name = f"{dbname}-carved{ext}"
         else:
             column = hit.get('column') or 'value'
@@ -572,6 +574,55 @@ def scan_sqlite_deleted(raw: bytes, wal_bytes: bytes | None = None,
 
     if wal_bytes:
         yield from _scan_wal_frames_for_media(wal_bytes, page_size, min_size)
+
+
+def scan_sqlite_overflow(raw: bytes, wal_bytes: bytes | None = None,
+                         min_size: int = MIN_MEDIA_BYTES, known: list | None = None):
+    """Deleted media too big for one page: the record's overflow chain is
+    followed (sqlite_carve.carve_overflowing_records, which checks every
+    chain page is still free and nothing on the page overwrote the record).
+    - complete: the exact original bytes ('recovery_source' ends
+      'overflow chain');
+    - partial: a true prefix, cut where the record's bytes were overwritten
+      or its chain reached a reused page; flagged 'partial', named
+      '-carved-partial', kept only if it still starts as media.
+    Media identical to (or, for a partial, a prefix of) *known* live media
+    or an earlier result is skipped: e.g. WAL history repeats live rows."""
+    known = list(known or [])
+    seen = {hashlib.sha256(b).digest() for b in known}
+    partials = []
+    for rec in sc.carve_overflowing_records(raw, wal_bytes, min_blob=min_size):
+        for _col, blob, size in sc.blob_columns(rec['payload'], min_size):
+            complete = rec['status'] == 'complete' and len(blob) == size
+            if len(blob) < min_size:
+                continue
+            got = classify_media_blob(blob)
+            if got is None:
+                continue
+            kind, ext, http_headers = got
+            if complete:
+                digest = hashlib.sha256(blob).digest()
+                if digest in seen:
+                    continue
+                seen.add(digest)
+                known.append(blob)
+                source = f"{rec['source']}, overflow chain"
+            else:
+                partials.append((rec, blob, size, kind, ext, http_headers))
+                continue
+            yield {'rowid': rec['rowid'], 'blob': blob, 'kind': kind, 'ext': ext,
+                   'http_headers': http_headers, 'recovered': True,
+                   'recovery_source': source, 'page': rec['page']}
+    kept: list[bytes] = []
+    for rec, blob, size, kind, ext, http_headers in sorted(partials, key=lambda p: -len(p[1])):
+        if any(k.startswith(blob) for k in known + kept):
+            continue                  # a copy of media already found whole (or longer)
+        kept.append(blob)
+        yield {'rowid': rec['rowid'], 'blob': blob, 'kind': kind, 'ext': ext,
+               'http_headers': http_headers, 'recovered': True, 'partial': True,
+               'recovery_source': (f"{rec['source']}, overflow chain, PARTIAL "
+                                   f"{len(blob):,} of {size:,} bytes: {rec['status']}"),
+               'page': rec['page']}
 
 
 # ── plist: recursive NSData walk, including a nested embedded bplist
@@ -754,27 +805,51 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
         return rows
 
     # kind == 'sqlite'
-    tmp_path = None
+    seen_blobs: list[bytes] = []          # live media, to skip recovered copies of it
+    tmp_dir = tempfile.mkdtemp(prefix='ffs_em_')
+    tmp_path = os.path.join(tmp_dir, 'db.sqlite')
     try:
-        fd, tmp_path = tempfile.mkstemp(suffix='.sqlite')
-        with os.fdopen(fd, 'wb') as f:
+        with open(tmp_path, 'wb') as f:
             f.write(raw)
-        for hit in scan_sqlite_live(tmp_path):
+        # Live = what SQLite itself shows, which includes rows committed in
+        # the -wal but not yet copied into the main file (2026-10-23: the
+        # -wal used to be left out, so such media was missed). If the db
+        # can't be opened with its -wal, scan it without, as before.
+        live: list[dict] = []
+        if wal_bytes:
+            with open(tmp_path + '-wal', 'wb') as f:
+                f.write(wal_bytes)
+            try:
+                live = list(scan_sqlite_live(tmp_path))
+            except Exception:
+                live = []
+                for sfx in ('-wal', '-shm'):
+                    try:
+                        os.unlink(tmp_path + sfx)
+                    except OSError:
+                        pass
+        if not live:
+            live = list(scan_sqlite_live(tmp_path))
+        for hit in live:
             location = f"{hit['table']}.{hit['column']} (rowid={hit['rowid']})"
             rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
+            seen_blobs.append(hit['blob'])
     except Exception:
         pass
     finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     try:
         for hit in scan_sqlite_deleted(raw, wal_bytes=wal_bytes):
             location = (f"rowid={hit.get('rowid')} (page {hit.get('page')}, "
                        f"{hit.get('recovery_source')})")
+            rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
+    except Exception:
+        pass
+    try:
+        for hit in scan_sqlite_overflow(raw, wal_bytes=wal_bytes, known=seen_blobs):
+            location = (f"rowid={hit.get('rowid')} (page {hit.get('page')}, "
+                        f"{hit.get('recovery_source')})")
             rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
     except Exception:
         pass

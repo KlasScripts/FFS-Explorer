@@ -585,10 +585,78 @@ def open_db_readonly(db_path: str) -> sqlite3.Connection:
     connect/row_factory ceremony, and this is the ONE place every
     SQL-based parser's live-query connect should go through, Chrome or
     not — see chrome_shared.py's own module docstring."""
+    label = _db_label(db_path)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
                            factory=_NamedConnection)
-    conn._db_label = _db_label(db_path)
+    conn._db_label = label
+    try:
+        conn.execute("PRAGMA schema_version").fetchone()   # opens the file now
+    except sqlite3.OperationalError as e:
+        if getattr(e, 'sqlite_errorname', '') not in _NEEDS_WRITE_TO_OPEN:
+            raise
+        conn.close()
+        conn = _open_recovered_copy(db_path, label, e.sqlite_errorname)
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ── A database SQLite must write to before it can be read ────────────────────
+# Real evidence, 2026-10-23: an Android Chrome Favicons database acquired
+# while Chrome was mid-write (a hot -journal; reproduced as
+# SQLITE_READONLY_ROLLBACK). SQLite will not read it until that unfinished
+# change is undone, which needs a write, so every read-only open failed
+# with "attempt to write a readonly database" while other SQLite tools
+# (opening read-write) silently undid it. Same for a WAL that needs its
+# index rebuilt. Such a file is copied with its sidecars to a temporary
+# folder and opened there, letting SQLite finish exactly as the app would
+# on its next start; the extracted copy (which carving reads) is never
+# touched. Each case is reported via take_open_notes() in the parser log.
+
+_NEEDS_WRITE_TO_OPEN = {'SQLITE_READONLY_ROLLBACK', 'SQLITE_READONLY_RECOVERY',
+                        'SQLITE_READONLY_CANTINIT', 'SQLITE_READONLY_CANTLOCK'}
+_open_notes: list[str] = []
+_temp_dirs: list[str] = []
+
+
+def take_open_notes() -> list[str]:
+    """Notes about databases read from a temporary copy since the last call."""
+    notes = list(_open_notes)
+    _open_notes.clear()
+    return notes
+
+
+def _cleanup_temp_dirs() -> None:
+    import shutil
+    for d in _temp_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+    _temp_dirs.clear()
+
+
+def _open_recovered_copy(db_path: str, label: str, reason: str) -> sqlite3.Connection:
+    import atexit
+    import shutil
+    import tempfile
+    if not _temp_dirs:
+        atexit.register(_cleanup_temp_dirs)
+    tmp = tempfile.mkdtemp(prefix='ffs_db_')
+    _temp_dirs.append(tmp)
+    name = os.path.basename(db_path)
+    copy = os.path.join(tmp, name)
+    for suffix in ('', '-journal', '-wal', '-shm'):
+        if os.path.exists(db_path + suffix):
+            shutil.copyfile(db_path + suffix, copy + suffix)
+    conn = sqlite3.connect(copy, factory=_NamedConnection)
+    conn._db_label = label
+    conn.execute("PRAGMA schema_version").fetchone()   # SQLite finishes here
+    conn.execute("PRAGMA query_only = 1")
+    what = ("an unfinished change in its -journal (the app was writing when "
+            "the device was acquired)" if reason == 'SQLITE_READONLY_ROLLBACK'
+            else "a -wal whose index had to be rebuilt")
+    _open_notes.append(
+        f"  Note: {label} had {what}. SQLite won't read it without first "
+        f"undoing/finishing that, so it was read from a temporary copy "
+        f"where SQLite did so, as the app itself would on its next start. "
+        f"The extracted copy is unchanged. ({reason})")
     return conn
 
 

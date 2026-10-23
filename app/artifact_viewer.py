@@ -679,6 +679,9 @@ class ArtifactRunnerWorker(QThread):
                 if earlier:
                     for line in _earlier_capture_warnings(reader.touched, earlier):
                         self.log.emit(line)
+                from artifact_runner import take_open_notes
+                for line in take_open_notes():
+                    self.log.emit(line)
                 if error:
                     self.log.emit(f"  Error: {error}")
                 else:

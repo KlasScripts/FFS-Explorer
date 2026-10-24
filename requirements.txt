@@ -53,3 +53,7 @@ uvicorn
 # dialog. Lazy-imported only inside that module's own xlsx-reading
 # function, same optional-but-listed convention as brotli/zstandard above.
 openpyxl
+# Parser notes pages (artifacts/<platform>/<script>.notes.md), rendered in
+# the Artifact Viewer's Report Notes (artifact_viewer._notes_markdown_html).
+# Pure Python; the app falls back to Qt's own Markdown renderer without it.
+markdown

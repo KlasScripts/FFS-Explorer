@@ -550,6 +550,71 @@ _ART_SCRIPT = "__art_script__:"
 _ART_SOURCE = "__art_source__:"
 _ART_FILES  = "__art_files__:"
 _ART_VALIDATION = "__art_validation__:"
+def _notes_markdown_path(platform: str, script_name: str) -> str | None:
+    """artifacts/<platform>/<script>.notes.md, if the parser has one."""
+    from artifact_runner import _ARTIFACTS_DIR
+    path = os.path.join(_ARTIFACTS_DIR, platform, f"{script_name}.notes.md")
+    return path if os.path.isfile(path) else None
+
+
+_NOTES_CSS = """
+body { font-size: 13px; line-height: 140%; }
+h1 { font-size: 22px; margin: 4px 0 10px 0; }
+h2 { font-size: 18px; margin: 22px 0 8px 0; color: #1f3a5f; }
+h3 { font-size: 15px; margin: 16px 0 6px 0; }
+h4 { font-size: 13px; margin: 14px 0 4px 0; color: #2e6b30; }
+p  { margin: 6px 0 8px 0; }
+li { margin: 3px 0; }
+th { background-color: #eef2f7; font-weight: 600; text-align: left; }
+td, th { padding: 6px 8px; vertical-align: top; }
+code { font-family: Menlo, Consolas, monospace; background-color: #f2f2f2; }
+blockquote { background-color: #f6f8fa; margin: 8px 0; padding: 6px 10px; }
+a { color: #1a5fb4; }
+"""
+
+
+def _notes_markdown_html(text: str) -> str:
+    """Render a parser's notes Markdown to HTML for QTextBrowser: headings
+    get ids (so "#deleted-messages" links jump to the section), tables get
+    visible borders and padding. Uses the Python `markdown` package (tables,
+    toc); without it, Qt's own GitHub-dialect renderer is used and anchors
+    are added by hand."""
+    import re as _re
+    # GitHub-style lists may follow a line of text directly; Python-Markdown
+    # needs a blank line first, so add it rather than make writers remember.
+    lines, prev = [], ''
+    for line in text.splitlines():
+        if (_re.match(r'\s*([-*]|\d+\.)\s', line) and prev.strip()
+                and not _re.match(r'\s*([-*]|\d+\.)\s', prev) and not prev.lstrip().startswith('|')):
+            lines.append('')
+        lines.append(line)
+        prev = line
+    text = '\n'.join(lines)
+    try:
+        import markdown as _md
+        body = _md.markdown(text, extensions=['tables', 'toc', 'sane_lists'])
+    except Exception:
+        from PySide6.QtGui import QTextDocument
+        doc = QTextDocument()
+        doc.setMarkdown(text, QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
+        body = doc.toHtml()
+
+        def _anchor(m):
+            inner = _re.sub(r'<[^>]+>', '', m.group(2))
+            slug = _re.sub(r'[^a-z0-9]+', '-', inner.lower()).strip('-')
+            return f'{m.group(1)}<a name="{slug}"></a>{m.group(2)}{m.group(3)}'
+        body = _re.sub(r'(<h[1-4][^>]*>)(.*?)(</h[1-4]>)', _anchor, body, flags=_re.S)
+    # QTextBrowser scrolls to <a name>, not to id= — give every id an anchor
+    body = _re.sub(r'(<h[1-4][^>]*\bid="([^"]+)"[^>]*>)', r'\1<a name="\2"></a>', body)
+    body = _re.sub(r'<table[^>]*>',
+                   '<table border="1" cellspacing="0" cellpadding="6" width="100%" '
+                   'style="border-collapse: collapse; border-color: #cfd6de; margin: 4px 0 12px 0;">',
+                   body)
+    body = _re.sub(r'<hr\s*/?>', '', body)          # headings already separate sections
+    body = body.replace('<td>', '<td style="border-bottom: 1px solid #e3e7ec;">')
+    return f'<html><head><style>{_NOTES_CSS}</style></head><body>{body}</body></html>'
+
+
 def _duration_seconds(label) -> int | None:
     """'Off' -> 0, '7 days' -> 604800, '24 hours' -> 86400, '90 seconds' -> 90."""
     import re as _re
@@ -1719,6 +1784,21 @@ class ArtifactViewerMixin:
         _notes_scroll.setWidgetResizable(True)
         _notes_scroll.setWidget(self._art_notes_label)
         _notes_scroll.setStyleSheet("QScrollArea { border: none; }")
+        # A parser's own notes page (artifacts/<platform>/<script>.notes.md,
+        # owner request 2026-10-24): a readable write-up with a "what could
+        # catch you out" table, a section per risk and a Validation part —
+        # rendered here instead of the plain description when it exists.
+        self._art_notes_browser = QTextBrowser()
+        self._art_notes_browser.setOpenExternalLinks(True)
+        self._art_notes_browser.setOpenLinks(True)
+        self._art_notes_browser.document().setDocumentMargin(18)
+        _notes_page = QWidget()
+        _notes_layout = QVBoxLayout(_notes_page)
+        _notes_layout.setContentsMargins(0, 0, 0, 0)
+        _notes_layout.addWidget(_notes_scroll)
+        _notes_layout.addWidget(self._art_notes_browser)
+        self._art_notes_browser.setVisible(False)
+        self._art_notes_scroll = _notes_scroll
 
         # Validation page — diffs this parser's current schema/folder
         # structure against a recorded GTD baseline (see
@@ -1780,7 +1860,7 @@ class ArtifactViewerMixin:
         self._art_stack.addWidget(self._art_placeholder)  # 0
         self._art_stack.addWidget(report_page)             # 1
         self._art_stack.addWidget(self._art_script_view)  # 2
-        self._art_stack.addWidget(_notes_scroll)           # 3
+        self._art_stack.addWidget(_notes_page)             # 3
         self._art_stack.addWidget(validation_page)          # 4
         self._art_stack.addWidget(ai_summary_page)          # 5
         self._art_stack.addWidget(document_page)            # 6
@@ -3533,6 +3613,23 @@ class ArtifactViewerMixin:
         mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
         description = getattr(mod, 'description', '') if mod else ''
         warning     = getattr(mod, 'warning', '') if mod else ''
+
+        notes_md = _notes_markdown_path(platform, script_name)
+        if notes_md:
+            try:
+                with open(notes_md, encoding='utf-8') as f:
+                    text = f.read()
+            except OSError:
+                text = None
+            if text is not None:
+                self._art_notes_browser.setSearchPaths([os.path.dirname(notes_md)])
+                self._art_notes_browser.setHtml(_notes_markdown_html(text))
+                self._art_notes_scroll.setVisible(False)
+                self._art_notes_browser.setVisible(True)
+                self._art_stack.setCurrentIndex(3)
+                return
+        self._art_notes_browser.setVisible(False)
+        self._art_notes_scroll.setVisible(True)
 
         if warning:
             parts = [

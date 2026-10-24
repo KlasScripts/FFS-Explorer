@@ -116,6 +116,31 @@ verified vs. inferred, and any known gap. Shows in the Report's "Notes"
 page. Write it as if a different examiner has to trust your report without
 reading your code — because that's exactly the situation.
 
+### Notes page: `<script>.notes.md` (recommended for any report with interpreted values)
+
+Next to the parser, `artifacts/<platform>/<script>.notes.md` is shown, rendered,
+as the report's **Report Notes/Warning** page instead of `description` (owner
+request, 2026-10-24). Write it for a digital forensics examiner with about a
+year's experience: plain sentences, bullets and tables, with no wall of text.
+Structure (see `artifacts/ios/whatsapp.notes.md`):
+
+1. **Title and 2–3 sentences**: what the report is, and which columns are
+   interpreted (those are the ones that can mislead).
+2. **"What could catch you out"**: a table of ⚠️ risk, what it means for the
+   examiner, and a link to its section (`[Deleted messages](#deleted-messages)`).
+3. **One section per risk or decision** (deleted messages, disappearing
+   messages, who "Me" is...): how it works, how it shows in FFS Explorer, and
+   a worked example from a test image.
+4. **End every section with "#### ✅ Validation"**: published / verified on
+   ground truth / observed only / not tested, each with its basis.
+5. **Interpreted values get a table**: value, meaning, how the report shows
+   it, confidence, basis. A column copied straight from the database needs
+   nothing.
+6. **Not in this report**, then **Sources**.
+
+Images can sit next to the file and be referenced relatively. Editing the
+notes doesn't change the parser's version (only the `.py` is hashed).
+
 ### `timestamp_fields` (recommended if there's a timestamp)
 
 ```python

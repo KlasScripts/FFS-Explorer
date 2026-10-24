@@ -161,6 +161,10 @@ a = Analysis(
         # for every other pip dependency here.
         'nska_deserialize',
         'biplist',
+        # Report Notes pages (artifact_viewer._notes_markdown_html) import
+        # markdown lazily, and its extensions load by name at runtime.
+        'markdown', 'markdown.extensions.tables', 'markdown.extensions.toc',
+        'markdown.extensions.sane_lists',
     ] + collect_submodules('blackboxprotobuf')
       + collect_submodules('ccl_segb')
       # sms_messages.py imports this lazily (attributedBody typedstream

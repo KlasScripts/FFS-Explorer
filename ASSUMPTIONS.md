@@ -942,6 +942,42 @@ following its overflow chain.** *Decision (owner) + Confirmed (real),
   an overflow page (other long columns first) is found only through freed
   or WAL pages.
 
+**A-78. Messaging reports list chat members, never per-message
+recipients.** *Decision (owner), 2026-10-24.*
+- Apps keep group membership as at extraction, and members join and leave,
+  so a recipients list per message could name someone who wasn't in the
+  group when it was sent.
+- Each messaging parser records the chat's members (the owner first, from
+  the app's own data) as a hidden column. Only the Chat Groups summary
+  shows them, labelled "as at extraction".
+
+**A-79. iOS WhatsApp: deletion and disappearing-messages activity.**
+*Decision (owner) + Confirmed (real), 2026-10-24.*
+- **Gaps:** a missing `ZSORT` number in a chat is a message removed on
+  this device with no placeholder. Published (Belkasoft); verified against
+  the iOS 17 "delete for me" at sort 24.
+- **Counter:** `ZWACHATSESSION.ZMESSAGECOUNTER` is a running total, not
+  reduced by deletion. Published (Belkasoft) and observed.
+- **Deleted for everyone:** message type 14 is the placeholder
+  (WhatsApp-Chat-Exporter; one CTF23 example).
+- **Expiry:** `ZWAMESSAGE.ZMESSAGEERRORSTATUS` is a message's
+  disappearing-messages expiry, 0 = none. Published (Heath et al. 2023,
+  Fig. 5); observed on CTF23 at exactly +90 days.
+- **Setting change:** message type 28. `ZISFROMME` on it says who made the
+  change, and field 36 of its media item's `ZMETADATA` is the timer in
+  seconds. Observed only (two CTF23 examples); not published, and not
+  decoded by iLEAPP or ALEAPP. A "turned off" event has not been seen.
+- **How the Chat Groups summary judges missing messages:**
+  - for gaps, "consistent with timer" is certain, because the next
+    surviving message bounds the send time;
+  - for messages missing at the end, it's only consistent, because their
+    send time is unknown;
+  - "not explained" means no timer applied.
+- **Not tested:** "Clear chat" and "Delete chat".
+- **Rejected:** attributing gaps to the user without checking for a timer.
+  On CTF23, Felix Davey's 6 missing messages are explained by the 7-day
+  timer Felix set.
+
 ## 11. In-app format decoding
 
 **A-42. Binary plists:** decoded with `plistlib`, with NSKeyedArchiver

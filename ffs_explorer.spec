@@ -56,6 +56,12 @@ a = Analysis(
         # keeping the single source of truth in the committed JSON
         # rather than a second, possibly-drifting copy in Python code.
         ('config/file_browser_presets.json', '.'),
+        # The embedded-media skip list ships as a SEED under _internal/config
+        # (PyInstaller 6 puts every datas= file under _internal/, even with
+        # dest='.'; tested 2026-10-24). embedded_media_skip_list.
+        # _merge_bundled_seed() adds its entries to the editable list next
+        # to the exe, once each, so removals by the examiner stick.
+        ('config/embedded_media_skip_list_ios.json', 'config'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),
         # Artifact parser scripts — loaded dynamically so PyInstaller can't

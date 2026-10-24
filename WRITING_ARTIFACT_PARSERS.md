@@ -211,8 +211,26 @@ chat_groups = {"key": "raw_chat_id",          # column identifying the conversat
                "media": ["attachment_path"],  # non-empty on a media message
                "media_prefixes": ["[Media]"], # and/or message-text prefixes
                "message": "message",          # message-text column (default)
-               "time": "timestamp"}           # unit taken from timestamp_fields
+               "time": "timestamp",           # unit taken from timestamp_fields
+               "recipients": "recipients",    # who each message went to (see below)
+               "type": "chat_type",           # "Group" / "1:1" / "Channel"... per row
+               "deleted": {"recovered": ["True"], "deleted_at": "*"},
+               "call_pattern": r"^\[Call\]"}  # regex on the text; omit if no calls
 ```
+
+The summary table's columns: Chat, Type, Participants (senders + recipients,
+device owner excluded), Messages, Incoming, Outgoing, Media In, Media Out,
+Deleted, Calls (blank when the report holds no calls), Links, Bookmarked (rows
+whose linked files are bookmarked), Last 30 Days (before the acquisition time
+when known, else the newest message), First Message, Last Received, Last Sent.
+
+**Recipients column.** Every messaging parser writes `recipients`: the other
+person (1:1, sent), `Me (<owner's number>)` (received), or the other members
+(group). Take membership and the owner's identity from the app's own database
+or settings, never guess; write one person the same way in `sender` and
+`recipients` (so the summary counts them once); write "[group members not
+recorded]" when the member table is empty; and say in `description` that
+group membership is as at extraction, not at the time of the message.
 
 **Files named some other way.** Turn what the database stores into an archive
 path, and only link it if `archive_has(paths, ui_path)`:

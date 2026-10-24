@@ -7,7 +7,8 @@ description = ("Messages from Viber's local database (viber_messages, table "
               "genuinely absent — not present as bytes anywhere in the main "
               "db, WAL, or SHM files, checked rather than assumed. Field-by-"
               "field validated against documented ground truth; no known "
-              "reliability issues.")
+              "reliability issues."
+              " Recipients (added 2026-10-24): who each message went to, from participants (participant_type 0 is the device owner). Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
 app_path = "data/data/com.viber.voip"
 files = {
     "viber_messages": "databases/viber_messages",
@@ -99,7 +100,7 @@ _CALL_LABELS = {
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"]}
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "deleted": {"recovered": ["True"]}, "call_pattern": r"^\[(Outgoing|Incoming|Missed) (audio|video) call", "type": "chat_type"}
 
 def run(paths):
     from artifact_runner import first_nonempty, missing_ref_label, open_db_readonly
@@ -111,17 +112,35 @@ def run(paths):
     member_rows = conn.execute("""
         SELECT p.conversation_id AS conversation_id,
                p._id             AS participant_row_id,
+               pi._id            AS info_id,
+               {ptype}           AS participant_type,
                pi.contact_name, pi.viber_name, pi.number, pi.member_id
         FROM participants p
         JOIN participants_info pi ON pi._id = p.participant_info_id
-    """).fetchall()
+    """.replace("{ptype}", "pi.participant_type" if any(
+        c[1] == "participant_type" for c in conn.execute("PRAGMA table_info(participants_info)"))
+        else "NULL")).fetchall()
     members_by_convo = {}
     name_by_participant_row = {}
+    info_by_participant_row = {}
+    convo_others = {}
+    owner_info = set()
+    owner_label = "Me"
     for r in member_rows:
         name = first_nonempty(r["contact_name"], r["viber_name"], r["number"],
                               r["member_id"], default="[unresolved participant]")
         members_by_convo.setdefault(r["conversation_id"], []).append(name)
         name_by_participant_row[r["participant_row_id"]] = name
+        # Recipients (2026-10-24): conversation members from participants
+        # (at extraction); participant_type 0 is the device owner (A14:
+        # Liz Dehner, +19199282177 — the owner on this image's other apps too).
+        info_by_participant_row[r["participant_row_id"]] = r["info_id"]
+        if r["participant_type"] == 0:
+            owner_label = f"Me ({r['number']})" if r["number"] else "Me"
+            owner_info.add(r["info_id"])
+        else:
+            others = convo_others.setdefault(r["conversation_id"], {})
+            others.setdefault(r["info_id"], name)
 
     has_extra_uri = any(c[1] == "extra_uri" for c in conn.execute("PRAGMA table_info(messages)"))
     rows = conn.execute("""
@@ -188,11 +207,19 @@ def run(paths):
             body = f"{body}  (liked x{r['likes_count']})" if body else f"(liked x{r['likes_count']})"
 
         direction = {0: "Incoming", 1: "Outgoing"}.get(r["send_type"], r["send_type"])
+        others = convo_others.get(r["conversation_id"], {})
+        if r["send_type"] == 1:
+            recipients = ", ".join(others.values()) or "[conversation members not recorded]"
+        else:
+            sender_info = info_by_participant_row.get(r["participant_id"])
+            recipients = ", ".join([owner_label] + [n for i, n in others.items() if i != sender_info])
 
         out.append({
             "conversation": conversation,
             "timestamp": r["msg_date"],
             "sender": sender,
+            "recipients": recipients,
+            "chat_type": "Group" if len(convo_others.get(r["conversation_id"], {})) > 1 else "1:1",
             "direction": direction,
             "message": body,
             "raw_message_id": r["id"],

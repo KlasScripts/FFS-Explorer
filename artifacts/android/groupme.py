@@ -6,7 +6,8 @@ description = ("Messages from GroupMe's local database (groupme.db, table "
               "was built against there's no WAL for this database and carving "
               "its live pages found nothing recoverable; a real negative, not "
               "an unexamined gap. Field-by-field validated against documented "
-              "ground truth; no known reliability issues.")
+              "ground truth; no known reliability issues."
+              " Recipients (added 2026-10-24): who each message went to, from members (groups) and chats (DMs); the owner is the sender id seen in DMs. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
 app_path = "data/data/com.groupme.android"
 files = {
     "groupme": "databases/groupme.db",
@@ -57,7 +58,7 @@ record_source = [
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "system": ["System"]}
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "system": ["System"], "deleted": {"recovered": ["True"], "deleted_at": "*"}, "call_pattern": r"\bstarted a call\b|^\[call event\]$", "type": "chat_type"}
 
 def run(paths):
     import json as _json
@@ -127,6 +128,26 @@ def run(paths):
         """).fetchone()
         self_id = fallback["sender_id"] if fallback else None
 
+    # Recipients (2026-10-24): group members from `members` (at extraction;
+    # A14: DFIR Two, This Is DFIR, Liz Dehner), a DM's peer from `chats`;
+    # the device owner is self_id (worked out above).
+    group_members = {}
+    for gid, uid, nick in conn.execute("SELECT group_id, user_id, nickname FROM members"):
+        group_members.setdefault(gid, []).append((uid, nick or f"[user_id {uid}]"))
+    me = next((f"Me ({nick})" for g in group_members.values() for uid, nick in g
+               if uid == self_id), "Me")
+
+    def _recipients(r, direction):
+        if direction == "System":
+            return ""
+        cid = r["conversation_id"]
+        if cid in dm_peer_ids:
+            return me if direction == "Incoming" else convo_label.get(cid, cid)
+        members = [(u, n) for u, n in group_members.get(cid, []) if u != self_id]
+        if direction == "Outgoing":
+            return ", ".join(n for _, n in members) or "[group members not recorded]"
+        return ", ".join([me] + [n for u, n in members if u != r["sender_id"]])
+
     rows = conn.execute("""
         SELECT _id, conversation_id, message_id, created_at, sender_id, sender_type,
                name, message_text, is_system, favorited_by, photo_url,
@@ -178,6 +199,8 @@ def run(paths):
             "conversation": conversation,
             "timestamp": r["created_at"],
             "sender": r["name"] or missing_ref_label("name", "sender_id", r["sender_id"]),
+            "recipients": _recipients(r, direction),
+            "chat_type": "1:1" if r["conversation_id"] in dm_peer_ids else "Group",
             "direction": direction,
             "message": body,
             "raw_message_id": r["_id"],

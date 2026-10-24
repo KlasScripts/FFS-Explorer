@@ -44,7 +44,8 @@ description = ("Messages from iOS's SMS/iMessage database (sms.db, table "
               "documented-unsent message on this extraction. It never "
               "entered chat_recoverable_message_join, so it does not get "
               "Delete's 30-40 day recovery window at all; the original "
-              "text is gone the moment it's unsent, not gradually.")
+              "text is gone the moment it's unsent, not gradually."
+              " Recipients (added 2026-10-24): who each message went to, from chat_handle_join; the owner's number from message.destination_caller_id. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
 app_path = "mobile/Library/SMS"
 files = {
     "sms": "sms.db",
@@ -150,7 +151,7 @@ def _parse_attributed_body(blob):
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"]}
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "deleted": {"recovered": ["True"]}, "type": "chat_type"}
 
 def run(paths):
     mobile_root = paths.get('_ui_path_for', lambda p: p)('mobile')
@@ -174,10 +175,26 @@ def run(paths):
         SELECT ROWID, guid, text, attributedBody, handle_id, is_from_me, date,
                date_edited, date_retracted, associated_message_type,
                associated_message_guid, service,
-               is_sent, is_delivered, is_read, date_delivered, date_read
+               is_sent, is_delivered, is_read, date_delivered, date_read,
+               {dest}
         FROM message
         ORDER BY date
-    """).fetchall()
+    """.replace("{dest}", "destination_caller_id" if any(
+        c[1] == "destination_caller_id" for c in conn.execute("PRAGMA table_info(message)"))
+        else "NULL AS destination_caller_id")).fetchall()
+
+    # Recipients (2026-10-24): a chat's members are chat_handle_join (current
+    # membership, at extraction); the device owner's own number/address is
+    # an incoming message's destination_caller_id (IOS17 +19195794674,
+    # CTF23 +12065937224), else the most common one.
+    import collections
+    chat_members = {}
+    for chat_id_, handle_id_ in conn.execute("SELECT chat_id, handle_id FROM chat_handle_join"):
+        if handle_id_ in handles:
+            chat_members.setdefault(chat_id_, []).append(handles[handle_id_])
+    owner_ids = collections.Counter(r["destination_caller_id"] for r in rows
+                                    if not r["is_from_me"] and r["destination_caller_id"])
+    default_owner = owner_ids.most_common(1)[0][0] if owner_ids else None
 
     # message_id -> list of {name, mime_type, size, filename, rowid} for
     # inline attachment info.
@@ -209,6 +226,13 @@ def run(paths):
 
         sender = "Me" if r["is_from_me"] else handles.get(
             r["handle_id"], missing_ref_label("handle record", "handle_id", r["handle_id"]))
+        owner = r["destination_caller_id"] or default_owner
+        members = chat_members.get(chat_id) or ([chat["chat_identifier"]] if chat else [])
+        if r["is_from_me"]:
+            recipients = ", ".join(members)
+        else:
+            others = [m for m in members if m != handles.get(r["handle_id"])]
+            recipients = ", ".join([f"Me ({owner})" if owner else "Me"] + others)
 
         body = r["text"] or _parse_attributed_body(r["attributedBody"])
 
@@ -233,6 +257,8 @@ def run(paths):
             "conversation": conversation,
             "timestamp": cocoa_ts(r["date"]),
             "sender": sender,
+            "recipients": recipients,
+            "chat_type": "Group" if len(members) > 1 else "1:1",
             "direction": "Sent" if r["is_from_me"] else "Received",
             "message": body,
             "attachment_path": attachment_path,

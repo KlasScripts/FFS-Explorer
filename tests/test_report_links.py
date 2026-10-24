@@ -46,3 +46,31 @@ def test_viber_extra_uri_decoding():
         'content://media/external_primary/images/media/1000000684'
     assert viber._media_uri('content://com.viber.voip.provider.internal_files/newmedia?dlid=0-02') == ''
     assert viber._media_uri(None) == ''
+
+
+def test_ios_whatsapp_recipients():
+    wa = _parser('ios', 'whatsapp')
+    names = {'111@s.whatsapp.net': 'Liz', '222@s.whatsapp.net': 'Ed'}
+    members = {7: [('999@s.whatsapp.net', 1), ('111@s.whatsapp.net', 1), ('222@s.whatsapp.net', 0)]}
+    base = {'chat_id': 7, 'contact_jid': None, 'to_jid': None, 'group_member_jid': None}
+    one = {**base, 'session_type': 0, 'contact_jid': '111@s.whatsapp.net'}
+    assert wa._recipients({**one, 'is_from_me': 1}, '999@s.whatsapp.net', names, members) == \
+        'Liz (111@s.whatsapp.net)'
+    assert wa._recipients({**one, 'is_from_me': 0}, '999@s.whatsapp.net', names, members) == \
+        'Me (999@s.whatsapp.net)'
+    group = {**base, 'session_type': 1}
+    assert wa._recipients({**group, 'is_from_me': 1}, '999@s.whatsapp.net', names, members) == \
+        'Liz (111@s.whatsapp.net), Ed (222@s.whatsapp.net) (inactive)'
+    assert wa._recipients({**group, 'is_from_me': 0, 'group_member_jid': '111@s.whatsapp.net'},
+                          '999@s.whatsapp.net', names, members) == \
+        'Me (999@s.whatsapp.net), Ed (222@s.whatsapp.net) (inactive)'
+    assert wa._recipients({**group, 'chat_id': 8, 'is_from_me': 1}, None, names, members) == \
+        '[group members not recorded]'
+
+
+def test_android_whatsapp_chat_type():
+    wa = _parser('android', 'whatsapp')
+    assert wa._chat_type('120363196890904472@newsletter') == 'Channel'
+    assert wa._chat_type('628976424828-1512149678@g.us') == 'Group'
+    assert wa._chat_type('19199282177@s.whatsapp.net') == '1:1'
+    assert wa._chat_type(None) == ''

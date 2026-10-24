@@ -2397,8 +2397,11 @@ class ArtifactViewerMixin:
           key            column identifying the conversation (exact match)
           name           column(s); first non-empty per row, most common
                          across the chat = its name (group or remote party)
-          participants   column(s) naming the sender of an incoming message;
-                         every distinct one, most frequent first
+          participants   column(s) naming the sender of an incoming message
+          recipients     column listing who a message went to (", "-separated;
+                         the device owner's own entry starts with "Me");
+                         Participants = senders + recipients, owner excluded,
+                         most frequent first
           direction/sent column and the value(s) meaning sent by the user
           system         direction value(s) of app/system events: counted
                          in Messages only, never as incoming or a participant
@@ -2406,10 +2409,20 @@ class ArtifactViewerMixin:
           media_prefixes message-text prefixes marking a media message
           message        message-text column (default "message")
           time           message time column (unit from timestamp_fields)
-        Keys of each dict: key, name, participants, messages, incoming,
-        outgoing, media_in, media_out, first, last_in, last_out (epoch
-        seconds or None). Sorted by name. [] if the table can't be read."""
+          deleted        {column: [values] or "*"}: a row counts as deleted
+                         if any column has one of the values ("*" = any
+                         non-empty value other than False/0)
+          type           column saying "Group"/"1:1"/... per row (most common
+                         value per chat); without it, >1 other person = group
+          call_pattern   regex on the message text marking a call event;
+                         absent = the report holds no calls (Calls blank)
+        Keys of each dict: key, name, participants, people (count), messages,
+        incoming, outgoing, media_in, media_out, deleted, calls (None if the
+        report has no call events), links, bookmarked, times (epoch seconds
+        of every message), first, last_in, last_out (epoch seconds or None).
+        Sorted by name. [] if the table can't be read."""
         import collections
+        import re
         from sqlite_carve import _epoch_seconds
         from artifact_runner import list_artifacts
         platform = 'android' if self._is_android_archive() else 'ios'
@@ -2421,6 +2434,7 @@ class ArtifactViewerMixin:
         key_col = decl['key']
         names = _cols(decl.get('name')) or [key_col]
         senders = _cols(decl.get('participants'))
+        recip_col = decl.get('recipients')
         dir_col = decl.get('direction', 'direction')
         sent = set(decl.get('sent', ('Sent', 'Outgoing')))
         system = set(decl.get('system', ()))
@@ -2429,13 +2443,25 @@ class ArtifactViewerMixin:
         msg_col = decl.get('message', 'message')
         time_col = decl.get('time')
         unit = units.get(time_col) if time_col else None
+        deleted = decl.get('deleted') or {}
+        type_col = decl.get('type')
+        call_re = re.compile(decl['call_pattern']) if decl.get('call_pattern') else None
+        url_re = re.compile(r'https?://', re.IGNORECASE)
+        link_cols = _cols(getattr(mod, 'link_fields', None) or getattr(mod, 'media_fields', None))
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                bookmarked = {r[0] for r in conn.execute("SELECT ui_path FROM bookmark_entries")}
+        except Exception:
+            bookmarked = set()
         try:
             with closing(_open_results_db(self._case_dir)) as conn:
                 cols = {r[1] for r in conn.execute(f'PRAGMA table_info("artifact_{script_name}")')}
                 if key_col not in cols:
                     return []
                 want = [c for c in dict.fromkeys(
-                    [key_col, dir_col, msg_col, time_col, *names, *senders, *media_cols]) if c in cols]
+                    [key_col, dir_col, msg_col, time_col, recip_col, *names, *senders,
+                     *media_cols, *deleted, *link_cols, type_col])
+                        if c and c in cols]
                 rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in want)
                                     + f' FROM "artifact_{script_name}"').fetchall()
         except Exception:
@@ -2450,8 +2476,26 @@ class ArtifactViewerMixin:
             c = chats.setdefault(key, {
                 'names': collections.Counter(), 'people': collections.Counter(),
                 'messages': 0, 'incoming': 0, 'outgoing': 0, 'media_in': 0, 'media_out': 0,
-                'first': None, 'last_in': None, 'last_out': None})
+                'deleted': 0, 'calls': 0 if call_re else None, 'links': 0, 'bookmarked': 0,
+                'types': collections.Counter(),
+                'times': [], 'first': None, 'last_in': None, 'last_out': None})
             c['messages'] += 1
+            if _get(r, type_col):
+                c['types'][_get(r, type_col)] += 1
+            text_all = str(_get(r, msg_col) or '')
+            for col, vals in deleted.items():
+                v = _get(r, col)
+                if (vals == '*' and v not in (None, '', 'False', '0', 0, False)) or \
+                        (vals != '*' and str(v) in vals):
+                    c['deleted'] += 1
+                    break
+            if call_re and call_re.search(text_all):
+                c['calls'] += 1
+            if url_re.search(text_all):
+                c['links'] += 1
+            if bookmarked and any(p.strip() in bookmarked
+                                  for lc in link_cols for p in str(_get(r, lc) or '').split('\n') if p.strip()):
+                c['bookmarked'] += 1
             name = next((_get(r, n) for n in names if _get(r, n)), '')
             if name:
                 c['names'][name] += 1
@@ -2461,13 +2505,17 @@ class ArtifactViewerMixin:
             c['outgoing' if out else 'incoming'] += 1
             if not out:
                 who = next((_get(r, n) for n in senders if _get(r, n)), '')
-                if who:
+                if who and not str(who).startswith('['):
+                    c['people'][who] += 1
+            for who in str(_get(r, recip_col) or '').split(', ') if recip_col else ():
+                if who and not who.startswith(('Me', '[')):
                     c['people'][who] += 1
             text = str(_get(r, msg_col) or '')
             if (any(_get(r, m) for m in media_cols) or (prefixes and text.startswith(prefixes))):
                 c['media_out' if out else 'media_in'] += 1
             ts = _epoch_seconds(_get(r, time_col), unit) if unit else None
             if ts:
+                c['times'].append(ts)
                 c['first'] = ts if c['first'] is None else min(c['first'], ts)
                 k = 'last_out' if out else 'last_in'
                 c[k] = ts if c[k] is None else max(c[k], ts)
@@ -2477,8 +2525,11 @@ class ArtifactViewerMixin:
                 'key': key,
                 'name': c['names'].most_common(1)[0][0] if c['names'] else (key or '[no conversation]'),
                 'participants': ', '.join(p for p, _ in c['people'].most_common()),
+                'people': len(c['people']),
+                'type': c['types'].most_common(1)[0][0] if c['types'] else None,
                 **{k: c[k] for k in ('messages', 'incoming', 'outgoing', 'media_in',
-                                     'media_out', 'first', 'last_in', 'last_out')}})
+                                     'media_out', 'deleted', 'calls', 'links', 'bookmarked',
+                                     'times', 'first', 'last_in', 'last_out')}})
         result.sort(key=lambda d: str(d['name']).casefold())
         return result
 
@@ -2493,11 +2544,38 @@ class ArtifactViewerMixin:
         decl = getattr(mod, 'chat_groups', None) or {}
         chats = self._art_chat_groups(script_name, decl) if decl else []
         fmt = lambda ts: self.format_ts(ts) if ts else ''
-        columns = ["Chat", "Participants", "Messages", "Incoming", "Outgoing",
-                   "Media In", "Media Out", "First Message", "Last Received", "Last Sent"]
-        rows = [(c['name'], c['participants'], c['messages'], c['incoming'], c['outgoing'],
-                 c['media_in'], c['media_out'], fmt(c['first']), fmt(c['last_in']),
-                 fmt(c['last_out'])) for c in chats]
+        # "Last 30 Days" is counted back from the acquisition time when the
+        # case has one (Cellebrite .ufd), else from the newest message.
+        ref, ref_label = None, ''
+        try:
+            import device_timezone
+            got = device_timezone.detect_acquisition_offset(self.zip_path) if self.zip_path else None
+            if got:
+                offset_h, acquired_local = got
+                from datetime import timezone as _tz, timedelta as _td
+                ref = (acquired_local - _td(hours=offset_h)).replace(tzinfo=_tz.utc).timestamp()
+                ref_label = f"30 days before acquisition ({fmt(ref)})"
+        except Exception:
+            ref = None
+        if ref is None:
+            newest = max((t for c in chats for t in c['times']), default=None)
+            if newest:
+                ref, ref_label = newest, f"30 days before the newest message ({fmt(newest)})"
+        columns = ["Chat", "Type", "Participants", "Messages", "Incoming", "Outgoing",
+                   "Media In", "Media Out", "Deleted", "Calls", "Links", "Bookmarked",
+                   "Last 30 Days", "First Message", "Last Received", "Last Sent"]
+        rows = []
+        for c in chats:
+            recent = (sum(1 for t in c['times'] if ref - 30 * 86400 <= t <= ref)
+                      if ref else '')
+            kind = c['type'] or ("Group" if c['people'] > 1 else "1:1")
+            if kind == "Group" and c['people']:
+                kind = f"Group ({c['people']})"
+            rows.append((c['name'], kind, c['participants'], c['messages'], c['incoming'],
+                         c['outgoing'], c['media_in'], c['media_out'], c['deleted'],
+                         '' if c['calls'] is None else c['calls'], c['links'],
+                         c['bookmarked'], recent, fmt(c['first']), fmt(c['last_in']),
+                         fmt(c['last_out'])))
         self._cancel_art_filter_worker()
         self._art_scope = None
         self._art_table_model.load_rows(columns, rows)
@@ -2505,7 +2583,8 @@ class ArtifactViewerMixin:
         self._art_resize_columns()
         label = getattr(mod, 'name', script_name) if mod else script_name
         self._art_row_label.setText(
-            f"{label}: {len(rows):,} {'chat' if len(rows) == 1 else 'chats'} — double-click one to open it")
+            f"{label}: {len(rows):,} {'chat' if len(rows) == 1 else 'chats'} — double-click one "
+            f"to open it" + (f" — Last 30 Days = {ref_label}" if ref_label else ""))
         self._art_stack.setCurrentIndex(1)
         self._art_chat_summary = (script_name, [(c['key'], c['name']) for c in chats])
 

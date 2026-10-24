@@ -15,7 +15,8 @@ description = ("Messages from Google Messages' local database (bugle_db, "
               "(deleted conversations)\" report, which recovers "
               "conversation-level metadata (who, when) for a fully "
               "deleted conversation through a different mechanism — "
-              "surviving audit-log tables, not byte carving.")
+              "surviving audit-log tables, not byte carving."
+              " Recipients (added 2026-10-24): who each message went to, from conversation_participants; the owner's own number per message from messages.self_id. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
 app_path = "data/data/com.google.android.apps.messaging"
 files = {
     "bugle_db": "databases/bugle_db",
@@ -89,7 +90,7 @@ record_source = [
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "date", "participants": ["sender"], "message": "body"}
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "date", "participants": ["sender"], "recipients": "recipients", "message": "body", "deleted": {}, "type": "chat_type"}
 
 def run(paths):
     from artifact_runner import first_nonempty, open_db_readonly, resolve_path_after_marker
@@ -104,6 +105,7 @@ def run(paths):
             m.conversation_id,
             m.sender_id,
             m.received_timestamp AS ts,
+            m.self_id         AS self_id,
             c.name            AS conv_name,
             sender.sub_id     AS sender_sub_id,
             sender.full_name  AS sender_full_name,
@@ -129,6 +131,30 @@ def run(paths):
 
     # Group part rows by message — a message can have several parts (text +
     # one or more attachments, e.g. a caption plus an image).
+    # Recipients (2026-10-24): a conversation's members are
+    # conversation_participants (at extraction); the device owner's own
+    # entries are participants with sub_id != -2 (the same test the
+    # direction uses), and messages.self_id names which of the owner's
+    # numbers a message used (A15: +19843761898 and +447578947805).
+    people = {}
+    for pid, sub, full, disp, norm in conn.execute(
+            "SELECT _id, sub_id, full_name, display_destination, normalized_destination FROM participants"):
+        people[pid] = (sub, full or disp or norm or f"[participant {pid}]", norm or disp)
+    conv_members = {}
+    for cid, pid in conn.execute("SELECT conversation_id, participant_id FROM conversation_participants"):
+        if pid in people and people[pid][0] == -2:
+            conv_members.setdefault(cid, []).append(pid)
+    own_numbers = [v[2] for v in people.values() if v[0] != -2 and v[2]]
+    default_me = f"Me ({own_numbers[0]})" if own_numbers else "Me"
+
+    def _recipients(r, direction):
+        members = conv_members.get(r["conversation_id"], [])
+        if direction == "Sent":
+            return ", ".join(people[p][1] for p in members) or "[conversation members not recorded]"
+        own = people.get(r["self_id"])
+        me = f"Me ({own[2]})" if own and own[2] else default_me
+        return ", ".join([me] + [people[p][1] for p in members if p != r["sender_id"]])
+
     by_message = {}
     order = []
     for r in rows:
@@ -198,6 +224,8 @@ def run(paths):
             "conversation": r["conv_name"],
             "sender": sender_name,
             "sender_destination": r["sender_dest"],   # raw number/handle — citation, not just resolved name
+            "recipients": _recipients(r, direction),
+            "chat_type": "Group" if len(conv_members.get(r["conversation_id"], [])) > 1 else "1:1",
             "direction": direction,
             "attachment_path": attachment_path,
             "body": body,

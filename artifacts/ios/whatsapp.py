@@ -31,7 +31,8 @@ description = ("Messages from WhatsApp's local iOS store (ChatStorage.sqlite, "
               "audio/video call mentioned in ground truth (a strong "
               "pattern) but isn't independently confirmed the way Apple's "
               "own documented iMessage reaction-type enum was for the SMS "
-              "report.")
+              "report."
+              " Recipients (added 2026-10-24): who each message went to, from ZWAGROUPMEMBER (\"(inactive)\" = ZISACTIVE 0); the owner's JID from incoming messages' ZTOJID. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
 # WhatsApp's own container (Containers/Data/Application/<GUID>/…) does not
 # hold ChatStorage.sqlite — it lives in the app's SHARED container instead
 # (confirmed against a real extraction's guid_to_bundle map). This exact
@@ -148,7 +149,66 @@ _MESSAGE_TYPE_LABELS = {
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"]}
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "deleted": {"recovered": ["True"]}, "type": "chat_type"}
+
+def _recipient_context(conn):
+    """Who a message went to, from ChatStorage itself (2026-10-24):
+    - the device owner's own JID: the ZTOJID of incoming 1:1 messages
+      (most common value; 19195794674 on IOS17, 12065937224 on CTF23);
+    - names: 1:1 sessions' ZPARTNERNAME by ZCONTACTJID, group members'
+      ZCONTACTNAME/ZFIRSTNAME, ZWAPROFILEPUSHNAME push names;
+    - members per session from ZWAGROUPMEMBER, with ZISACTIVE (membership
+      at extraction, NOT at the time of the message)."""
+    import collections
+    owner = collections.Counter(
+        r[0] for r in conn.execute(
+            "SELECT m.ZTOJID FROM ZWAMESSAGE m JOIN ZWACHATSESSION c ON c.Z_PK = m.ZCHATSESSION "
+            "WHERE m.ZISFROMME = 0 AND c.ZSESSIONTYPE = 0 AND m.ZTOJID IS NOT NULL"))
+    owner_jid = owner.most_common(1)[0][0] if owner else None
+    names = {}
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "ZWAPROFILEPUSHNAME" in tables:
+        for jid, push in conn.execute("SELECT ZJID, ZPUSHNAME FROM ZWAPROFILEPUSHNAME"):
+            if jid and push:
+                names[jid] = push
+    members = {}
+    for session, jid, cname, fname, active in conn.execute(
+            "SELECT ZCHATSESSION, ZMEMBERJID, ZCONTACTNAME, ZFIRSTNAME, ZISACTIVE FROM ZWAGROUPMEMBER"):
+        if jid and (cname or fname):
+            names[jid] = cname or fname
+        if jid:
+            members.setdefault(session, []).append((jid, active))
+    for jid, partner, stype in conn.execute(
+            "SELECT ZCONTACTJID, ZPARTNERNAME, ZSESSIONTYPE FROM ZWACHATSESSION"):
+        if jid and partner and stype == 0:
+            names[jid] = partner
+    return owner_jid, names, members
+
+
+def _who(jid, names, fallback=None):
+    """One form for a person in both the sender and recipients columns:
+    "Name (jid)" when a name is known, else the jid."""
+    name = names.get(jid) or fallback
+    if jid and name:
+        return f"{name} ({jid})"
+    return jid or name or ""
+
+
+def _recipients(r, owner_jid, names, members):
+    def who(jid):
+        return _who(jid, names)
+    me = f"Me ({owner_jid})" if owner_jid else "Me"
+    if r["session_type"] == 0:                       # 1:1
+        return me if not r["is_from_me"] else who(r["contact_jid"] or r["to_jid"] or "")
+    listed = [(j, a) for j, a in members.get(r["chat_id"], []) if j != owner_jid]
+    sender = r["group_member_jid"]
+    others = [who(j) + ("" if a else " (inactive)") for j, a in listed if j != sender]
+    if not r["is_from_me"]:
+        return ", ".join([me] + others)
+    if listed:
+        return ", ".join(others)
+    return "[group members not recorded]" if r["session_type"] == 1 else ""
+
 
 def run(paths):
     from artifact_runner import first_nonempty, missing_ref_label, open_db_readonly
@@ -156,6 +216,7 @@ def run(paths):
     app_base = paths.get("_app_base_ui_path")
 
     conn = open_db_readonly(paths["chatstorage"])
+    owner_jid, jid_names, members = _recipient_context(conn)
 
     rows = conn.execute("""
         SELECT
@@ -191,10 +252,10 @@ def run(paths):
         if r["is_from_me"]:
             sender = "Me"
         elif r["session_type"] == 1:   # group chat
-            sender = (r["group_member_name"] or r["group_member_jid"]
+            sender = (_who(r["group_member_jid"], jid_names, r["group_member_name"])
                       or "[group member unresolved]")
         else:
-            sender = r["from_jid"] or r["contact_jid"] or "[unknown sender]"
+            sender = _who(r["from_jid"] or r["contact_jid"], jid_names) or "[unknown sender]"
 
         body = r["text"] or _MESSAGE_TYPE_LABELS.get(
             r["message_type"], f"[No text — message type {r['message_type']}]")
@@ -212,6 +273,8 @@ def run(paths):
             "conversation": conversation,
             "timestamp": r["msg_date"],
             "sender": sender,
+            "recipients": _recipients(r, owner_jid, jid_names, members),
+            "chat_type": {0: "1:1", 1: "Group", 2: "Broadcast", 3: "Status"}.get(r["session_type"], ""),
             "direction": "Sent" if r["is_from_me"] else "Received",
             "message": body,
             "attachment_path": attachment_path,

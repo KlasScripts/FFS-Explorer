@@ -15,7 +15,8 @@ description = ("Messages from LINE's local database (naver_line, table "
               "conversation it belongs to: see the \"LINE — Recovered "
               "(full-text search index)\" report. Field-by-field validated "
               "against documented ground truth; no known reliability "
-              "issues on the fields this report does carry.")
+              "issues on the fields this report does carry."
+              " Recipients (added 2026-10-24): who each message went to, from chat_member for groups; a 1:1 chat's id is the peer; the owner has no id in this database, so \"Me\". Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
 app_path = "data/data/jp.naver.line.android"
 files = {
     "naver_line": "databases/naver_line",
@@ -78,7 +79,16 @@ def _parse_call_params(parameter):
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Image]"], "time": "timestamp", "participants": ["sender"]}
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Image]"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "deleted": {"recovered": ["True"]}, "call_pattern": r"^\[(Incoming|Outgoing|Missed|Canceled|Cancelled|No answer)?[^\]]*\bcall\]", "type": "chat_type"}
+
+def _line_recipients(r, incoming, chat_members, chat_names, contact_names):
+    cid = r["chat_id"]
+    members = [m for m in chat_members.get(cid, []) if m]
+    is_group = bool(members) and members != [cid]
+    if not is_group:
+        return "Me" if incoming else (chat_names.get(cid) or contact_names.get(cid) or cid)
+    names = [contact_names.get(m) or m for m in members if m != r["from_mid"]]
+    return ", ".join((["Me"] if incoming else []) + names)
 
 def run(paths):
     from artifact_runner import missing_ref_label, open_db_readonly
@@ -92,6 +102,12 @@ def run(paths):
     # correct bytes, not a guess.
     chat_rows = conn.execute("SELECT rowid, chat_id, chat_name FROM chat").fetchall()
     chat_names = {r["chat_id"]: r["chat_name"] for r in chat_rows}
+    # Recipients (2026-10-24): a 1:1 chat's chat_id IS the peer's mid; a
+    # group's members are chat_member (at extraction). The local user has no
+    # mid in this database (from_mid is blank on their messages), so "Me".
+    chat_members = {}
+    for cid, mid in conn.execute("SELECT chat_id, mid FROM chat_member"):
+        chat_members.setdefault(cid, []).append(mid)
     chat_rowid_by_chat_id = {r["chat_id"]: r["rowid"] for r in chat_rows}
     # contacts.m_id -> display name; empty on the extraction this was built
     # against (no contacts synced), but joined for cases where it isn't.
@@ -169,6 +185,9 @@ def run(paths):
             "conversation": conversation,
             "timestamp": r["created_time"],
             "sender": sender,
+            "recipients": _line_recipients(r, incoming, chat_members, chat_names, contact_names),
+            "chat_type": ("Group" if [m for m in chat_members.get(r["chat_id"], []) if m]
+                          not in ([], [r["chat_id"]]) else "1:1"),
             "direction": direction,
             "message": body,
             "raw_message_id": r["id"],

@@ -7850,14 +7850,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._header_scan_banner.setStyleSheet(
             f"color: {ACTIVE_COLOR}; font-weight: bold; font-size: 12px; padding: 2px 6px;")
         self._header_scan_banner.setVisible(False)
+        # Wraps rather than setting the window width (its stale-scan warning
+        # forced a 1,283 px minimum on the IOS17 case); see _art_row_label.
+        self._header_scan_banner.setWordWrap(True)
+        self._header_scan_banner.setMinimumWidth(1)
         banner_row = QHBoxLayout()
         banner_row.setSpacing(4)
         banner_row.addWidget(timestamp_banner)
         banner_sep = QLabel("|")
         banner_sep.setStyleSheet("color: palette(mid);")
         banner_row.addWidget(banner_sep)
-        banner_row.addWidget(self._header_scan_banner)
-        banner_row.addStretch()
+        banner_row.addWidget(self._header_scan_banner, 1)
         layout.addLayout(banner_row)
 
         _section_style = (
@@ -9884,6 +9887,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._update_tree_column()
         if obj is self.tree_view.viewport() and event.type() == event.Type.MouseButtonPress:
             self._tree_click_hpos = self.tree_view.horizontalScrollBar().value()
+        self._hex_event_filter(obj, event)
         return super().eventFilter(obj, event)
 
     def _update_tree_column(self):

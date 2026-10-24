@@ -1646,9 +1646,17 @@ class ArtifactViewerMixin:
         self._art_columns_script_name: str | None = None
         self._art_columns_all: list = []
         self._art_columns_core: list = []
+        # Wraps, and an explicit minimum width of 1 stops its text setting
+        # the window's width: a one-line label is at least as wide as its
+        # text, and Qt grows the whole window to fit it (and never shrinks
+        # it back). Found 2026-10-24: the Chat Groups summary line pushed
+        # the window to 2,179 px on a 1,710 px screen, dropping it out of
+        # full screen and off the left edge.
         self._art_row_label = QLabel()
+        self._art_row_label.setWordWrap(True)
+        self._art_row_label.setMinimumWidth(1)
         report_columns_row = QHBoxLayout()
-        report_columns_row.addWidget(self._art_row_label)
+        report_columns_row.addWidget(self._art_row_label, 1)
         report_columns_row.addStretch()
         self._art_columns_all_btn = QPushButton("All")
         self._art_columns_all_btn.clicked.connect(

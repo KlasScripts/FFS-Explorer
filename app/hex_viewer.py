@@ -257,10 +257,15 @@ class HexViewerMixin:
 
     # ── Event filter ─────────────────────────────────────────────────────────
 
-    def eventFilter(self, obj: object, event: object) -> bool:
-        if obj is self.hex_view.viewport() and event.type() == QEvent.Type.Resize:
+    def _hex_event_filter(self, obj: object, event: object) -> None:
+        """Refit the hex font when the view resizes. Called from
+        FastZipBrowser.eventFilter: an eventFilter defined here is never
+        reached, because QMainWindow comes before the mixins in
+        FastZipBrowser's MRO and Qt's own eventFilter doesn't chain on.
+        (Until 2026-10-24 it was, and the font was never refitted.)"""
+        hex_view = getattr(self, 'hex_view', None)   # events arrive before it exists
+        if hex_view is not None and obj is hex_view.viewport() and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._fit_hex_font)
-        return super().eventFilter(obj, event)
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -639,10 +644,24 @@ class HexViewerMixin:
                 return
             doc_margin    = self.hex_view.document().documentMargin()
             content_width = text_width + 2 * doc_margin
-            new_size      = self._HEX_REF_SIZE * (vp_width / content_width)
+            # 2% spare: glyph advances don't scale exactly linearly with
+            # point size, and a fit that's a few px over hides the last
+            # ASCII column behind a scrollbar.
+            new_size      = self._HEX_REF_SIZE * (vp_width / content_width) * 0.98
             new_size      = max(6.0, min(new_size, 32.0))
             ref_font.setPointSizeF(new_size)
+            # Keep the line at the top where it is: the font change and the
+            # layout reset below both move the view back to line 0.
+            top_line = self.hex_view.verticalScrollBar().value()
             self.hex_view.setFont(ref_font)
+            # QPlainTextEdit's layout remembers the widest line it has ever
+            # laid out, so after the font shrinks it keeps a horizontal
+            # scroll range over empty space. Switching wrap mode and back is
+            # the one reset found to work (markContentsDirty and
+            # setDefaultFont don't; tested 2026-10-24).
+            self.hex_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            self.hex_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            self.hex_view.verticalScrollBar().setValue(top_line)
         finally:
             self._fitting_hex_font = False
 

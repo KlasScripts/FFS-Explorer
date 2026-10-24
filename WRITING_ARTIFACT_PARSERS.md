@@ -197,15 +197,21 @@ row["thumbnail_link"] = embedded_media_path(paths, "msgstore", "message_thumbnai
 
 **Messaging reports: `chat_groups`.** Declare it and the Artifact Viewer adds a
 "Chat Groups (N)" folder under the report: one entry per conversation,
-`Name (M<sent media>S/<received media>R) - <n> Messages`; clicking one shows the
+`Name (<messages>)`. Clicking the folder shows a summary table (chat,
+participants, messages, incoming, outgoing, media in/out, first message, last
+received, last sent; double-click a row to open it); clicking a chat shows the
 report limited to that conversation (filters and sorting stay within it).
 
 ```python
 chat_groups = {"key": "raw_chat_id",          # column identifying the conversation
                "name": ["conversation"],      # first non-empty = remote party / group name
+               "participants": ["sender"],    # sender of an incoming message
                "sent": ["Sent"],              # direction value(s) meaning sent by the user
+               "system": ["System"],          # direction value(s) of app events (optional)
                "media": ["attachment_path"],  # non-empty on a media message
-               "media_prefixes": ["[Media]"]} # and/or message-text prefixes
+               "media_prefixes": ["[Media]"], # and/or message-text prefixes
+               "message": "message",          # message-text column (default)
+               "time": "timestamp"}           # unit taken from timestamp_fields
 ```
 
 **Files named some other way.** Turn what the database stores into an archive

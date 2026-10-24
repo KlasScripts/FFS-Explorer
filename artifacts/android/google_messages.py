@@ -87,9 +87,9 @@ record_source = [
 ]
 
 
-# Artifact Viewer "Chat Groups" folder: one entry per conversation with its
-# sent/received media and message counts (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"]}
+# Artifact Viewer "Chat Groups": one entry per conversation, and a summary
+# table of them (see ArtifactViewerMixin._art_chat_groups).
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "date", "participants": ["sender"], "message": "body"}
 
 def run(paths):
     from artifact_runner import first_nonempty, open_db_readonly, resolve_path_after_marker

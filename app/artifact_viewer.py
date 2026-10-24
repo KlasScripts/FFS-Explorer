@@ -1800,11 +1800,9 @@ class ArtifactViewerMixin:
                 chats = self._art_chat_groups(script_name, decl)
                 if chats:
                     folder = _item(f"Chat Groups ({len(chats):,})", _ART_CHATS + script_name)
-                    for key, name, sent_m, recv_m, n in chats:
-                        folder.appendRow(_item(
-                            f"{name} (M{sent_m:,}S/{recv_m:,}R) - {n:,} "
-                            f"{'Message' if n == 1 else 'Messages'}",
-                            f"{_ART_CHAT}{script_name}\x1f{key}"))
+                    for c in chats:
+                        folder.appendRow(_item(f"{c['name']} ({c['messages']:,})",
+                                               f"{_ART_CHAT}{script_name}\x1f{c['key']}"))
                     group.insertRow(0, [folder])
             return group
 
@@ -2394,60 +2392,122 @@ class ArtifactViewerMixin:
         self.status_bar.showMessage(f"{ui_path}  —  offset: {loc['abs_offset']:,}{overflow_note}")
 
     def _art_chat_groups(self, script_name: str, decl: dict) -> list:
-        """[(key, name, sent_media, received_media, messages)] for a messaging
-        report's `chat_groups` declaration (owner request, 2026-10-23):
+        """One dict per conversation of a messaging report, from its
+        `chat_groups` declaration (owner request, 2026-10-23/24):
           key            column identifying the conversation (exact match)
-          name           column(s); the first non-empty one per row, most
-                         common across the chat = its display name (remote
-                         party or group name)
+          name           column(s); first non-empty per row, most common
+                         across the chat = its name (group or remote party)
+          participants   column(s) naming the sender of an incoming message;
+                         every distinct one, most frequent first
           direction/sent column and the value(s) meaning sent by the user
-          media          column(s) that are non-empty on a media message
+          system         direction value(s) of app/system events: counted
+                         in Messages only, never as incoming or a participant
+          media          column(s) non-empty on a media message
           media_prefixes message-text prefixes marking a media message
-          message        the message-text column (default "message")
-        Sorted by name. Empty if the report table can't be read."""
+          message        message-text column (default "message")
+          time           message time column (unit from timestamp_fields)
+        Keys of each dict: key, name, participants, messages, incoming,
+        outgoing, media_in, media_out, first, last_in, last_out (epoch
+        seconds or None). Sorted by name. [] if the table can't be read."""
         import collections
+        from sqlite_carve import _epoch_seconds
+        from artifact_runner import list_artifacts
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+        units = getattr(mod, 'timestamp_fields', {}) or {}
+
+        def _cols(v):
+            return [v] if isinstance(v, str) else list(v or ())
         key_col = decl['key']
-        names = decl.get('name') or [key_col]
-        names = [names] if isinstance(names, str) else list(names)
+        names = _cols(decl.get('name')) or [key_col]
+        senders = _cols(decl.get('participants'))
         dir_col = decl.get('direction', 'direction')
         sent = set(decl.get('sent', ('Sent', 'Outgoing')))
-        media_cols = list(decl.get('media', ()))
+        system = set(decl.get('system', ()))
+        media_cols = _cols(decl.get('media'))
         prefixes = tuple(decl.get('media_prefixes', ()))
         msg_col = decl.get('message', 'message')
+        time_col = decl.get('time')
+        unit = units.get(time_col) if time_col else None
         try:
             with closing(_open_results_db(self._case_dir)) as conn:
                 cols = {r[1] for r in conn.execute(f'PRAGMA table_info("artifact_{script_name}")')}
-                want = [c for c in [key_col, dir_col, msg_col, *names, *media_cols] if c in cols]
                 if key_col not in cols:
                     return []
-                rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in dict.fromkeys(want))
+                want = [c for c in dict.fromkeys(
+                    [key_col, dir_col, msg_col, time_col, *names, *senders, *media_cols]) if c in cols]
+                rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in want)
                                     + f' FROM "artifact_{script_name}"').fetchall()
-                want = list(dict.fromkeys(want))
         except Exception:
             return []
         at = {c: i for i, c in enumerate(want)}
+
+        def _get(r, c):
+            return r[at[c]] if c in at else None
         chats: dict = {}
         for r in rows:
-            key = r[at[key_col]] or ''
-            c = chats.setdefault(key, {'names': collections.Counter(), 's': 0, 'r': 0, 'n': 0})
-            c['n'] += 1
-            name = next((r[at[n]] for n in names if n in at and r[at[n]]), '')
+            key = _get(r, key_col) or ''
+            c = chats.setdefault(key, {
+                'names': collections.Counter(), 'people': collections.Counter(),
+                'messages': 0, 'incoming': 0, 'outgoing': 0, 'media_in': 0, 'media_out': 0,
+                'first': None, 'last_in': None, 'last_out': None})
+            c['messages'] += 1
+            name = next((_get(r, n) for n in names if _get(r, n)), '')
             if name:
                 c['names'][name] += 1
-            text = (r[at[msg_col]] or '') if msg_col in at else ''
-            is_media = (any(r[at[m]] for m in media_cols if m in at)
-                        or (prefixes and text.startswith(prefixes)))
-            if is_media:
-                if dir_col in at and r[at[dir_col]] in sent:
-                    c['s'] += 1
-                else:
-                    c['r'] += 1
-        out = []
+            if _get(r, dir_col) in system:
+                continue
+            out = _get(r, dir_col) in sent
+            c['outgoing' if out else 'incoming'] += 1
+            if not out:
+                who = next((_get(r, n) for n in senders if _get(r, n)), '')
+                if who:
+                    c['people'][who] += 1
+            text = str(_get(r, msg_col) or '')
+            if (any(_get(r, m) for m in media_cols) or (prefixes and text.startswith(prefixes))):
+                c['media_out' if out else 'media_in'] += 1
+            ts = _epoch_seconds(_get(r, time_col), unit) if unit else None
+            if ts:
+                c['first'] = ts if c['first'] is None else min(c['first'], ts)
+                k = 'last_out' if out else 'last_in'
+                c[k] = ts if c[k] is None else max(c[k], ts)
+        result = []
         for key, c in chats.items():
-            name = c['names'].most_common(1)[0][0] if c['names'] else (key or '[no conversation]')
-            out.append((key, name, c['s'], c['r'], c['n']))
-        out.sort(key=lambda t: str(t[1]).casefold())
-        return out
+            result.append({
+                'key': key,
+                'name': c['names'].most_common(1)[0][0] if c['names'] else (key or '[no conversation]'),
+                'participants': ', '.join(p for p, _ in c['people'].most_common()),
+                **{k: c[k] for k in ('messages', 'incoming', 'outgoing', 'media_in',
+                                     'media_out', 'first', 'last_in', 'last_out')}})
+        result.sort(key=lambda d: str(d['name']).casefold())
+        return result
+
+    def _art_show_chat_summary(self, script_name: str) -> None:
+        """The "Chat Groups" folder's page: one row per conversation with
+        its participants, message and media counts in/out, and first /
+        last received / last sent times. Double-click a row to open that
+        chat (the report limited to it)."""
+        from artifact_runner import list_artifacts
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+        decl = getattr(mod, 'chat_groups', None) or {}
+        chats = self._art_chat_groups(script_name, decl) if decl else []
+        fmt = lambda ts: self.format_ts(ts) if ts else ''
+        columns = ["Chat", "Participants", "Messages", "Incoming", "Outgoing",
+                   "Media In", "Media Out", "First Message", "Last Received", "Last Sent"]
+        rows = [(c['name'], c['participants'], c['messages'], c['incoming'], c['outgoing'],
+                 c['media_in'], c['media_out'], fmt(c['first']), fmt(c['last_in']),
+                 fmt(c['last_out'])) for c in chats]
+        self._cancel_art_filter_worker()
+        self._art_scope = None
+        self._art_table_model.load_rows(columns, rows)
+        self._setup_report_filter_ui(columns)
+        self._art_resize_columns()
+        label = getattr(mod, 'name', script_name) if mod else script_name
+        self._art_row_label.setText(
+            f"{label}: {len(rows):,} {'chat' if len(rows) == 1 else 'chats'} — double-click one to open it")
+        self._art_stack.setCurrentIndex(1)
+        self._art_chat_summary = (script_name, [(c['key'], c['name']) for c in chats])
 
     def _art_show_chat(self, script_name: str, key: str, label: str) -> None:
         """The report limited to one conversation (exact match on the
@@ -2464,10 +2524,11 @@ class ArtifactViewerMixin:
             where, args = f'"{col}" = ?', [key]
         else:
             where, args = f'("{col}" IS NULL OR "{col}" = \'\')', []
-        self._art_show_report(script_name, scope=(where, args, f"Chat: {label.rsplit(' (M', 1)[0]}"))
+        self._art_show_report(script_name, scope=(where, args, f"Chat: {label.rsplit(' (', 1)[0]}"))
 
     def _on_art_tree_clicked(self, index):
         self._clear_art_hex()
+        self._art_chat_summary = None
         role_val = index.data(Qt.ItemDataRole.UserRole)
         if not role_val:
             return
@@ -2495,7 +2556,7 @@ class ArtifactViewerMixin:
         elif role_val.startswith(_ART_VALIDATION):
             self._art_show_validation(role_val[len(_ART_VALIDATION):])
         elif role_val.startswith(_ART_CHATS):
-            self._art_show_report(role_val[len(_ART_CHATS):])
+            self._art_show_chat_summary(role_val[len(_ART_CHATS):])
         elif role_val.startswith(_ART_CHAT):
             script_name, key = role_val[len(_ART_CHAT):].split('\x1f', 1)
             self._art_show_chat(script_name, key, index.data())
@@ -2924,6 +2985,7 @@ class ArtifactViewerMixin:
         self._cancel_art_filter_worker()
         self._art_pending_jump = None    # a jump into a previous report is void
         self._art_scope = scope
+        self._art_chat_summary = None
         table = f'artifact_{script_name}'
         try:
             conn = _open_results_db(self._case_dir)
@@ -3192,6 +3254,13 @@ class ArtifactViewerMixin:
         row selection changes, instead of it blocking the report table —
         a second double-click while one is already open reuses that same
         window (load_content + raise) rather than stacking another."""
+        summary = getattr(self, '_art_chat_summary', None)
+        if summary is not None and index.isValid():
+            script_name, keys = summary
+            row = self._art_table_model._rowids[index.row()]
+            key, name = keys[row]
+            self._art_show_chat(script_name, key, f"{name} (")
+            return
         if index.column() not in self._art_table_model.media_columns():
             return
         ui_path = self._art_table_model.data(index) or ''

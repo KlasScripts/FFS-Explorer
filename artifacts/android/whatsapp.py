@@ -208,9 +208,9 @@ media_fields = ["attachment_path"]
 link_fields = ["attachment_path", "thumbnail_link"]
 
 
-# Artifact Viewer "Chat Groups" folder: one entry per conversation with its
-# sent/received media and message counts (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "chat_id", "name": ["chat_subject", "remote_name", "chat_jid"], "sent": ["Sent"], "media": ["attachment_path"], "message": "text"}
+# Artifact Viewer "Chat Groups": one entry per conversation, and a summary
+# table of them (see ArtifactViewerMixin._art_chat_groups).
+chat_groups = {"key": "chat_id", "name": ["chat_subject", "remote_name", "chat_jid"], "sent": ["Sent"], "media": ["attachment_path"], "message": "text", "time": "sent_time", "participants": ["group_sender", "remote_name", "remote_party_jid"]}
 
 def run(paths):
     from artifact_runner import missing_ref_label, open_db_readonly

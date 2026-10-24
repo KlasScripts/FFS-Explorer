@@ -15,8 +15,8 @@
         "3": "Use shared missing_ref_label() instead of inline f-string for the no-burner-record fallback (no output change).",
         "4": "record_source gained an explicit label ('Burner Message'), same reason as chrome_autofill.py -- the combo no longer hides for a single entry."
       },
-      "hash": "e109bd50234fcccf",
-      "version": 7
+      "hash": "a8ef311c79269e46",
+      "version": 8
     },
     "android:burner_messageentity": {
       "changelog": {},
@@ -191,8 +191,8 @@
       "changelog": {
         "2": "Removed local _display_name()/_resolve_cache_path() in favor of shared first_nonempty(default=...)/resolve_path_after_marker() (no output change)."
       },
-      "hash": "2940555266143ef3",
-      "version": 4
+      "hash": "f7949c324bfbb470",
+      "version": 5
     },
     "android:google_messages_deleted_conversations": {
       "changelog": {},
@@ -203,15 +203,15 @@
       "changelog": {
         "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat/group-record and no-name fallbacks (no output change)."
       },
-      "hash": "62a8da3b4bb529fc",
-      "version": 4
+      "hash": "bd3891f426c50eec",
+      "version": 6
     },
     "android:line": {
       "changelog": {
         "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat-name and no-contact-record fallbacks (no output change)."
       },
-      "hash": "49a33c71fee8d98d",
-      "version": 4
+      "hash": "9789307be58f3cc0",
+      "version": 5
     },
     "android:line_fts": {
       "changelog": {},
@@ -229,8 +229,8 @@
       "changelog": {
         "2": "Removed local _display_name() in favor of shared first_nonempty(default=...); use shared missing_ref_label() for the no-participant-record fallbacks (no output change)."
       },
-      "hash": "81a381c9e73914ed",
-      "version": 5
+      "hash": "b1bebbd7c03f3753",
+      "version": 6
     },
     "android:whatsapp": {
       "changelog": {
@@ -238,8 +238,8 @@
         "3": "record_source expanded from 2 entries (Message, Chat) to 12: every other joined table's rowid status was checked against real WhatsApp casework (jid/message_media/message_location/wa_contacts all confirmed genuine INTEGER PRIMARY KEY rowid aliases -- wa_contacts specifically was previously flagged unconfirmed, now resolved). New SELECT columns added for the four wa_contacts joins' own _id (jid/media/location needed none -- media/location's rowid is provably identical to the already-captured message_id). New entries: Chat/Sender JID + their Mapped (LID) variants, Media, Location, Chat/Sender Contact + Mapped variants -- all newly-added id fields kept out of the Report table via hidden_fields (plumbing only, already resolved into visible columns).",
         "4": "Media/Location record_source entries gained presence_fields (media_path / latitude) -- their reused rowid (message_id) is always populated regardless of whether that LEFT JOIN matched, so it alone couldn't tell the Hex panel's per-row combo whether to list them; now correctly hidden for a row whose join found nothing."
       },
-      "hash": "bae384f1df2097ae",
-      "version": 7
+      "hash": "0e32ab44ffcd6f18",
+      "version": 8
     },
     "ios:app_report": {
       "changelog": {
@@ -271,15 +271,15 @@
       "changelog": {
         "2": "Use shared missing_ref_label()/resolve_path_after_marker() instead of inline f-strings/startswith logic for the no-chat/no-handle-record fallbacks and attachment path resolution (no output change)."
       },
-      "hash": "b2651c506d536124",
-      "version": 5
+      "hash": "37dab46cba9bf27b",
+      "version": 6
     },
     "ios:whatsapp": {
       "changelog": {
         "3": "Use shared missing_ref_label() instead of inline f-string for the no-chat-record fallback (no output change)."
       },
-      "hash": "0540236cddd28ab1",
-      "version": 6
+      "hash": "112d4d8b1089cf4a",
+      "version": 7
     },
     "ios:wifi_known_networks": {
       "changelog": {

@@ -40,15 +40,14 @@ a = Analysis(
         # since _MEIPASS is only ever set in a real frozen process.
         ('config/scan_rules_ios.json', 'config'),
         ('config/scan_rules_android.json', 'config'),
-        # user_media_ignore_list.py's store_path() instead reads this
-        # DIRECTLY next to the exe (no 'config' subfolder, dest='.') —
-        # it's examiner-EDITABLE at runtime (Add/Remove via the GUI),
-        # unlike scan_rules above, so this bundled copy is only ever the
-        # real, already-curated starting point (the six real "UI
-        # Graphics" wildcard entries — see CLAUDE.md), not baked-in
-        # read-only reference data; an examiner's own later edits land
-        # in this exact same file, in place.
-        ('config/user_media_ignore_list.json', '.'),
+        # The User Media ignore list is examiner-EDITABLE (read and saved
+        # next to the exe), so this bundled copy is the curated starting
+        # point (the "UI Graphics" wildcard entries), shipped as a seed
+        # under _internal/config and merged into the editable list by
+        # config_seed.merge_seed. Until 2026-10-24 it shipped with
+        # dest='.', which PyInstaller 6 also puts under _internal/, where
+        # the frozen build never read it, so the list started empty.
+        ('config/user_media_ignore_list.json', 'config'),
         # file_browser_presets.py's own store_path() is the same
         # dest='.' convention — unlike the two above, its load() already
         # self-heals a missing file via default_presets() with
@@ -56,11 +55,8 @@ a = Analysis(
         # keeping the single source of truth in the committed JSON
         # rather than a second, possibly-drifting copy in Python code.
         ('config/file_browser_presets.json', '.'),
-        # The embedded-media skip list ships as a SEED under _internal/config
-        # (PyInstaller 6 puts every datas= file under _internal/, even with
-        # dest='.'; tested 2026-10-24). embedded_media_skip_list.
-        # _merge_bundled_seed() adds its entries to the editable list next
-        # to the exe, once each, so removals by the examiner stick.
+        # The embedded-media skip list: same seed arrangement as
+        # user_media_ignore_list.json above (config_seed.py).
         ('config/embedded_media_skip_list_ios.json', 'config'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),

@@ -89,7 +89,10 @@ import json
 import os
 import sys
 
+import config_seed
+
 _cache = {"stat": None, "data": None}
+_seed_merged = False
 
 KNOWN_PATTERN_LABELS = {
     "*@2x.png*": "UI Graphics (@2x)",
@@ -118,10 +121,29 @@ def store_path() -> str:
     return os.path.join(root, "config", "user_media_ignore_list.json")
 
 
+def bundled_seed_path() -> str | None:
+    """The copy shipped inside a frozen build (see config_seed.py)."""
+    return config_seed.bundled_seed_path("user_media_ignore_list.json")
+
+
+def _merge_bundled_seed() -> None:
+    """Once per run: add shipped entries this install hasn't been given
+    before (see config_seed.merge_seed). Until 2026-10-24 the list shipped
+    with dest='.', which PyInstaller 6 puts under _internal/, so the
+    frozen build never read it and started with an empty list."""
+    global _seed_merged
+    if _seed_merged:
+        return
+    _seed_merged = True
+    config_seed.merge_seed(bundled_seed_path(), store_path(),
+                           lambda entries, seeded: _write(entries, seeded))
+
+
 def load() -> list:
     """Return the sorted list of ignored ui_paths, cached by file
     mtime+size — a missing file (never created, or deleted) is simply an
     empty list, not an error."""
+    _merge_bundled_seed()
     path = store_path()
     try:
         st = os.stat(path)
@@ -143,9 +165,11 @@ def load() -> list:
     return data
 
 
-def _write(entries: set) -> None:
+def _write(entries: set, seeded: set | None = None) -> None:
     path = store_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if seeded is None:      # keep the record of shipped entries already given
+        seeded = config_seed.seeded_entries(path)
     doc = {
         "_note": ("Folders/files excluded from the Media Browser's own "
                  "\"User Media\" filter -- hand-maintained via that "
@@ -155,6 +179,8 @@ def _write(entries: set) -> None:
         "version": 1,
         "entries": sorted(entries),
     }
+    if seeded:
+        doc[config_seed.SEEDED_KEY] = sorted(seeded)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)

@@ -44,3 +44,26 @@ def test_removed_entry_stays_removed_and_upgrade_adds_new(tmp_path, monkeypatch)
 def test_not_frozen_uses_config_and_no_seed():
     assert sl.bundled_seed_path('ios') is None
     assert sl.store_path('ios').endswith(os.path.join('config', 'embedded_media_skip_list_ios.json'))
+
+
+def test_user_media_ignore_list_seed(tmp_path, monkeypatch):
+    import user_media_ignore_list as ul
+    exe_dir = tmp_path / 'ffs-explorer'
+    seed_dir = exe_dir / '_internal' / 'config'
+    seed_dir.mkdir(parents=True)
+    (seed_dir / 'user_media_ignore_list.json').write_text(
+        json.dumps({'version': 1, 'entries': ['*@2x.png*', '*.9.png']}))
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(sys, '_MEIPASS', str(exe_dir / '_internal'), raising=False)
+    monkeypatch.setattr(sys, 'executable', str(exe_dir / 'ffs-explorer.exe'))
+
+    def restart():
+        monkeypatch.setattr(ul, '_seed_merged', False)
+        ul._cache.update(stat=None, data=None)
+
+    restart()
+    assert ul.load() == ['*.9.png', '*@2x.png*']        # new install
+    ul.remove_entry('*.9.png')
+    ul.add_entries(['private/var/mine'])
+    restart()
+    assert ul.load() == ['*@2x.png*', 'private/var/mine']   # removal sticks

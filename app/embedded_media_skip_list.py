@@ -64,6 +64,8 @@ import os
 import re
 import sys
 
+import config_seed
+
 _PLATFORMS = ('android', 'ios')
 _cache = {p: {"stat": None, "data": None} for p in _PLATFORMS}
 _seed_merged = {p: False for p in _PLATFORMS}
@@ -89,54 +91,19 @@ def store_path(platform: str) -> str:
 
 
 def bundled_seed_path(platform: str) -> str | None:
-    """The copy of the list shipped inside a frozen build
-    (<_MEIPASS>/config/), or None when not frozen. PyInstaller 6 puts
-    every datas= file under _internal/, never next to the exe where
-    store_path() reads (tested 2026-10-24), so the shipped list is a seed
-    that _merge_bundled_seed() copies into the editable file."""
-    if not getattr(sys, "frozen", False):
-        return None
-    base = getattr(sys, "_MEIPASS", None)
-    if not base:
-        return None
-    return os.path.join(base, "config", f"embedded_media_skip_list_{_check_platform(platform)}.json")
-
-
-def _read_doc(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            doc = json.load(f)
-        return doc if isinstance(doc, dict) else {}
-    except Exception:
-        return {}
+    """The copy shipped inside a frozen build (see config_seed.py)."""
+    return config_seed.bundled_seed_path(
+        f"embedded_media_skip_list_{_check_platform(platform)}.json")
 
 
 def _merge_bundled_seed(platform: str) -> None:
-    """Once per run: add every shipped entry this install hasn't been
-    given before to the editable list next to the exe. A new install gets
-    the whole shipped list, an upgrade gets only entries new in that
-    release, and an entry the examiner removed stays removed — the file
-    records which shipped entries it has already been given
-    ("seeded_from_install"). Owner request 2026-10-24: "i want this list
-    to be with every install"."""
+    """Once per run: add shipped entries this install hasn't been given
+    before (see config_seed.merge_seed)."""
     if _seed_merged[platform]:
         return
     _seed_merged[platform] = True
-    seed_path = bundled_seed_path(platform)
-    if not seed_path or not os.path.exists(seed_path):
-        return
-    shipped = {e.strip() for e in _read_doc(seed_path).get("entries", [])
-               if isinstance(e, str) and e.strip()}
-    doc = _read_doc(store_path(platform))
-    given = {e for e in doc.get("seeded_from_install", []) if isinstance(e, str)}
-    new = shipped - given
-    if not new:
-        return
-    entries = {e.strip() for e in doc.get("entries", []) if isinstance(e, str) and e.strip()}
-    try:
-        _write(platform, entries | new, seeded=given | shipped)
-    except OSError:
-        pass   # e.g. a read-only install folder: the list just stays as it was
+    config_seed.merge_seed(bundled_seed_path(platform), store_path(platform),
+                           lambda entries, seeded: _write(platform, entries, seeded))
 
 
 def load(platform: str) -> list:
@@ -171,7 +138,7 @@ def _write(platform: str, entries: set, seeded: set | None = None) -> None:
     path = store_path(platform)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if seeded is None:      # keep the record of shipped entries already given
-        seeded = set(_read_doc(path).get("seeded_from_install", []))
+        seeded = config_seed.seeded_entries(path)
     doc = {
         "_note": ("Databases/plists confirmed not worth scanning for "
                  "embedded media, on this ONE platform -- hand-maintained "
@@ -183,7 +150,7 @@ def _write(platform: str, entries: set, seeded: set | None = None) -> None:
         "entries": sorted(entries),
     }
     if seeded:
-        doc["seeded_from_install"] = sorted(seeded)
+        doc[config_seed.SEEDED_KEY] = sorted(seeded)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)

@@ -163,6 +163,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `embedded_media_skip_list.py` | Known-noise database skip list for the sweep. |
 | `media_metadata_scan.py` | EXIF/video container metadata extraction (`_LazyZipSlice`, `extract_image_exif`, `extract_video_metadata`). |
 | `user_media_ignore_list.py` | Global exclusion list for the "User Media" filter. |
+| `config_seed.py` | Ships an examiner-editable config list with every install: seed in `_internal/config`, merged once per entry into the file next to the exe. Qt-free. |
 | `file_browser_presets.py` | Shared filter+sort presets (File Browser dropdown, Media Browser buttons). |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers; no business logic. |
 | `startup_log.py` | Bounded startup/error log + crash/stall snapshot (`Tools → Open Log Folder`). Qt-free. |

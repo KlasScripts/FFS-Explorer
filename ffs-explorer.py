@@ -85,7 +85,7 @@ from segb_viewer import SegbViewerMixin, is_segb
 from leveldb_viewer import LevelDbViewerMixin, _looks_like_leveldb_dir
 from timestamp_display import TimestampDisplayMixin
 import startup_log
-from dialog_helpers import (button_row, error_label, note_label, show_item_checkboxes,
+from dialog_helpers import (FlowLayout, button_row, error_label, note_label, show_item_checkboxes,
                             WARNING_STYLE, ACTIVE_COLOR, ERROR_COLOR)
 import research_store as _research
 from artifact_db import load_artifact_results
@@ -8057,8 +8057,24 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.file_view.doubleClicked.connect(self.handle_table_double_click)
         self.file_view.clicked.connect(self.on_file_selected)
 
-        filter_bar = QHBoxLayout()
-        filter_bar.setContentsMargins(0, 2, 0, 2)
+        # The filter controls sit in four groups in a FlowLayout, which
+        # wraps a group onto the next line when the window is narrow. As one
+        # QHBoxLayout this row needed 1,241 px and forced a 1,610 px window
+        # minimum (wider than a MacBook screen); see FlowLayout's docstring.
+        self.filter_bar_widget = QWidget()
+        filter_flow = FlowLayout(self.filter_bar_widget, h_spacing=10, v_spacing=2)
+        filter_flow.setContentsMargins(0, 2, 0, 2)
+
+        def _filter_group(expanding=False):
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            if expanding:
+                w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            filter_flow.addWidget(w)
+            return lay
+
+        filter_bar = _filter_group(expanding=True)
         filter_bar.addWidget(QLabel("Filter:"))
         filter_bar.addSpacing(6)
 
@@ -8071,7 +8087,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.filter_input.setMinimumWidth(150)
         self.filter_input.returnPressed.connect(self._apply_filter)
         filter_bar.addWidget(self.filter_input, 1)
-        filter_bar.addSpacing(10)
+
+        filter_bar = _filter_group()
 
         # Date range — applied to the timestamp column chosen in the combo
         self.filter_date_enable = QCheckBox("Date")
@@ -8092,7 +8109,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         filter_bar.addWidget(QLabel("–"))
         filter_bar.addWidget(self.filter_date_to)
         self._set_date_filter_enabled(False)
-        filter_bar.addSpacing(10)
+
+        filter_bar = _filter_group()
 
         # Type — multi-select menu of the types present in the current view
         self._type_filter_selected: set | None = None   # None = all types
@@ -8112,7 +8130,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.filter_clear_btn.clicked.connect(self._clear_filter)
         filter_bar.addWidget(self.filter_go_btn)
         filter_bar.addWidget(self.filter_clear_btn)
-        filter_bar.addSpacing(10)
+
+        filter_bar = _filter_group()
 
         # Preset — saved multi-column filter+sort combinations, added
         # 2026-10-11 (see app/file_browser_presets.py's own docstring).
@@ -8170,7 +8189,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         sel_bar.addStretch()
         sel_bar.addWidget(self.columns_btn)
         file_tab_layout.addLayout(sel_bar)
-        file_tab_layout.addLayout(filter_bar)
+        file_tab_layout.addWidget(self.filter_bar_widget)
         file_tab_layout.addWidget(self.file_view)
 
         # ── Media Browser tab ───────────────────────────────────────────────

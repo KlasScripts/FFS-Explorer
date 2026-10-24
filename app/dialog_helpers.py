@@ -13,7 +13,8 @@ Pure Qt-widget construction — no case/business logic — so any dialog
 anywhere in the app can use these with no dependency on case state.
 """
 
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QStyleFactory
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QLayout, QPushButton, QSizePolicy, QStyleFactory
 
 WARNING_COLOR = "#b8860b"   # amber — matches research_store.py's REVIEW_COLOR
 ERROR_COLOR   = "#c62828"   # red — matches research_store.py's OUTCOME_COLORS["no_value"]
@@ -101,3 +102,91 @@ def button_row(dlg: QDialog, ok_text: str = "OK", cancel_text: str = "Cancel",
     layout.addWidget(cancel_btn)
     layout.addWidget(ok_btn)
     return layout, cancel_btn, ok_btn
+
+
+_GROWS = (QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+
+
+class FlowLayout(QLayout):
+    """Lays its items out left to right and wraps onto further lines when
+    the width runs out (after Qt's own Flow Layout example). Added
+    2026-10-24 for the File Browser's filter bar: as one QHBoxLayout its 15
+    controls needed 1,241 px, and since a QTabWidget is as wide as its widest
+    page, that forced the whole window to a 1,610 px minimum — wider than a
+    MacBook screen, so maximising clipped the right of every tab."""
+
+    def __init__(self, parent=None, h_spacing=8, v_spacing=4):
+        super().__init__(parent)
+        self._items = []
+        self._h, self._v = h_spacing, v_spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, apply=True)
+
+    def sizeHint(self):
+        w = sum(i.sizeHint().width() for i in self._items) + self._h * max(0, len(self._items) - 1)
+        h = max((i.sizeHint().height() for i in self._items), default=0)
+        m = self.contentsMargins()
+        return QSize(w + m.left() + m.right(), h + m.top() + m.bottom())
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, apply):
+        """Place items line by line; returns the height used. On each line,
+        spare width goes to items whose widget expands horizontally (the
+        filter text box), so a wide window still gets a wide text box."""
+        m = self.contentsMargins()
+        r = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        lines, line, used = [], [], 0
+        for item in self._items:
+            w = item.sizeHint().width()
+            if line and used + self._h + w > r.width():
+                lines.append(line)
+                line, used = [], 0
+            used += (self._h if line else 0) + w
+            line.append(item)
+        if line:
+            lines.append(line)
+        y = r.y()
+        for line in lines:
+            hints = [i.sizeHint() for i in line]
+            spare = max(0, r.width() - sum(h.width() for h in hints) - self._h * (len(line) - 1))
+            grow = [n for n, i in enumerate(line) if i.widget() is not None and
+                    i.widget().sizePolicy().horizontalPolicy() in _GROWS]
+            line_h = max(h.height() for h in hints)
+            x = r.x()
+            for n, (item, hint) in enumerate(zip(line, hints)):
+                w = hint.width() + (spare // len(grow) if n in grow else 0)
+                if apply:
+                    item.setGeometry(QRect(QPoint(x, y + (line_h - hint.height()) // 2), QSize(w, hint.height())))
+                x += w + self._h
+            y += line_h + self._v
+        return (y - self._v if lines else y) - rect.y() + m.bottom()

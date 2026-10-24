@@ -186,14 +186,14 @@ def get_chat_prompt(script_name: str) -> str:
     unless the examiner saved their own)."""
     import ai_summary
     saved = load().get("reports", {}).get(script_name, {})
-    return saved.get("chat_prompt") or ai_summary.CHAT_PROMPT
+    return saved.get("chat_findings_prompt") or ai_summary.CHAT_PROMPT
 
 
 def set_chat_prompt(script_name: str, prompt: str) -> None:
     data = load()
     reports = dict(data.get("reports", {}))
     saved = dict(reports.get(script_name, {}))
-    saved["chat_prompt"] = prompt
+    saved["chat_findings_prompt"] = prompt
     reports[script_name] = saved
     data["reports"] = reports
     save(data)

@@ -1327,8 +1327,11 @@ class AISummaryDialog(QDialog):
         self._chat_mode_note = note_label(
             "This is a messaging report, so it is summarised one chat at a time. "
             "Each summary appears in the bottom Text tab when you open that chat "
-            "(or all of them when you open Chat Groups). Every point must cite "
-            "message numbers; the app checks them and marks any it can't match ⚠.")
+            "(or all of them when you open Chat Groups). The model fills in a fixed "
+            "checklist (picture requests, meeting or calls, delete/hide/don't tell, "
+            "sex/age/money/drugs/threats) with quoted words and message numbers; "
+            "the app checks every entry, works out who sent media itself, and adds "
+            "its own word scan as a safety net.")
         form.addWidget(self._chat_mode_note)
         self._only_missing_check = QCheckBox(
             "Only chats without an up-to-date summary (skip unchanged chats)")

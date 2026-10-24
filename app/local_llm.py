@@ -16,7 +16,8 @@ import urllib.request
 
 
 def call_chat(endpoint: str, api_key: str, model: str, prompt: str,
-              timeout: float = 240.0, max_tokens: int = 2048) -> dict:
+              timeout: float = 240.0, max_tokens: int = 2048,
+              temperature: float = 0.2, response_format: dict | None = None) -> dict:
     """POST one chat-completion request. Returns {'text': str} on success
     or {'error': str} on any failure — never raises. A local model server
     being unreachable, misconfigured, or slow is an ordinary, expected
@@ -49,12 +50,17 @@ def call_chat(endpoint: str, api_key: str, model: str, prompt: str,
     2048 is generous for a multi-paragraph narrative (this project's own
     real reduce narratives run well under that) while still bounding a
     runaway generation to a finite amount of work."""
-    payload = json.dumps({
+    # *response_format* (e.g. {"type": "json_schema", ...}) makes the server
+    # constrain the answer to a fixed structure; LM Studio supports it.
+    body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
+        "temperature": temperature,
         "max_tokens": max_tokens,
-    }).encode("utf-8")
+    }
+    if response_format is not None:
+        body["response_format"] = response_format
+    payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(endpoint, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
     if api_key:

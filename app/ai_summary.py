@@ -641,34 +641,77 @@ def run_summary(case_dir: str, script_name: str, platform: str = "android",
 
 # ── Per-chat summaries (owner request 2026-10-24) ─────────────────────────
 # One summary per conversation of a report that declares `chat_groups`,
-# shown in the bottom Text tab when the chat is opened. The prompt is kept
-# deliberately short (owner: "the prompt is too complex for a local
-# model"); the checking is done here in code, not asked of the model:
-# every point must cite message numbers that exist in the chat, and a
-# point naming a speaker must cite at least one message from them. Points
-# that fail are marked, never hidden (A-51); the summary only ever uses
-# the report's words (A-52).
+# shown in the bottom Text tab when the chat is opened.
+#
+# Built from side-by-side tests on IOS17 WhatsApp plus a synthetic
+# warning-sign chat with qwen3-vl-8b (2026-10-24):
+#   - free-text bullet points mixed up speakers and changed format every
+#     run, so their citations couldn't be checked reliably;
+#   - telling the model to look for "crime" made it give verdicts ("no
+#     criminal behaviour detected") it has no grounds for; it is never
+#     asked to judge;
+#   - a short checklist answered in a FIXED JSON STRUCTURE (the server's
+#     json_schema response format), speaker chosen from the chat's real
+#     speakers, quoted words, temperature 0, gave identical runs and
+#     caught picture requests, meeting plans, "delete"/"don't tell", age
+#     and drugs mentions — but still missed an indirect request ("send one
+#     without your hoodie").
+# So the model only does the reading; the app does what it can do with
+# certainty (who sent media, empty chats) and checks every finding (the
+# number exists, the speaker sent it, the quoted words are in it), and a
+# plain word scan lists what a small model may miss. A-51/A-52 apply.
 
 CHAT_PROMPT = (
-    "Summarise this chat for an investigator. Each line is: "
-    "#number [time] speaker: text. \"Me\" is the phone's owner.\n"
-    "Write 3 to 6 short bullet points about what was said.\n"
-    "Each point is about ONE speaker. Start it with who said it, and end it "
-    "with the message numbers in brackets, like [#4, #9].\n"
-    "Use only what the messages say. Do not guess.\n\n{data}"
+    "Read this chat for an investigator. Each line is: #number [time] speaker: text. "
+    "\"Me\" is the phone's owner. [MEDIA] means a photo, video or file was sent.\n"
+    "Fill in each list. Each entry: who, the key words quoted from their message, and the "
+    "message numbers. One entry per message: list every matching message separately. "
+    "Leave a list empty if nothing fits. Use only what the messages say.\n"
+    "- asked_for_pictures: someone asks the other to send a picture or media "
+    "(an offer to send is not a request)\n"
+    "- meet_or_call: plans to meet in person, or to call\n"
+    "- delete_hide_or_dont_tell: asks to delete or hide messages, keep a secret, or not tell someone\n"
+    "- sex_age_money_drugs_threats: mentions of sex, body, age, money, gifts, drugs or threats\n"
+    "- topics: one short line on what else the chat is about\n\n{data}"
 )
-_CHAT_COMBINE_PROMPT = (
-    "These are partial summaries of ONE chat, in order. Merge them into one "
-    "list of 3 to 8 bullet points. Keep each speaker name and the message "
-    "numbers in brackets exactly as they are. Do not add anything new.\n\n{data}"
+_FINDING_LISTS = (
+    ("asked_for_pictures", "Asked for pictures"),
+    ("meet_or_call", "Meet or call"),
+    ("delete_hide_or_dont_tell", "Delete / hide / don't tell"),
+    ("sex_age_money_drugs_threats", "Sex, age, money, drugs, threats"),
 )
+_CHAT_SCHEMA_VERSION = "findings-v1"
 _CHAT_BLOCK_MAX_CHARS = 12000      # data per call; see _REDUCE_BATCH_MAX_CHARS
-_CHAT_MAX_TOKENS = 700
+_CHAT_MAX_TOKENS = 900
 _CHAT_TEXT_MAX = 300
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
-_CITE_RE = re.compile(r"#(\d+)(?:\s*[-–]\s*#?(\d+))?")
 _JID_SUFFIX_RE = re.compile(r"^(.+?)\s+\([^()]*\)$")
-_OWNER_RE = re.compile(r"\b(?:phone(?:'s|’s)? owner|the owner|device owner)\b", re.I)
+_NO_TEXT_RE = re.compile(r"^\[No text — message type (\d+)\]$")
+
+# The app's own word scan, a safety net for what a small model misses (it
+# never reads "send one without your hoodie" as a picture request). Hits
+# are listed as "words to check", not findings. Stems match word starts.
+WATCH_WORDS = (
+    # Each term is a whole word or phrase; "word*" also matches longer
+    # words starting with it (delete -> deleted).
+    ("Pictures / media", ("pic", "pics", "picture*", "photo*", "selfie*", "video*", "send*",
+                          "sent", "nude*", "naked", "undress*", "without")),
+    ("Age / school / family", ("how old", "years old", "age", "school", "mum", "mom", "dad",
+                               "parent*")),
+    ("Secrecy / deleting", ("delet*", "secret*", "don't tell", "dont tell", "hide",
+                            "between us")),
+    ("Meeting", ("meet*", "address", "where do you live", "come over", "pick you up",
+                 "hotel", "my place")),
+    ("Money / gifts / drugs", ("money", "pay", "paid", "cash", "gift*", "vape*", "weed",
+                               "drug*", "alcohol", "beer")),
+    ("Threats", ("kill", "hurt", "threat*", "or else", "expose", "leak*")),
+)
+
+
+def _watch_regex(terms):
+    return re.compile("|".join(
+        rf"\b{re.escape(t[:-1])}\w*" if t.endswith("*") else rf"\b{re.escape(t)}\b"
+        for t in terms), re.I)
 
 
 def _short_speaker(value) -> str:
@@ -676,6 +719,26 @@ def _short_speaker(value) -> str:
     s = str(value or "").strip()
     m = _JID_SUFFIX_RE.match(s)
     return m.group(1) if m else s
+
+
+def _is_placeholder(text: str) -> bool:
+    return not text or (text.startswith("[") and text.endswith("]"))
+
+
+def _prompt_text(m: dict) -> str:
+    """A message as the model sees it: media as [MEDIA] (plus any caption),
+    the parsers' long placeholders shortened."""
+    text = m["text"] or ""
+    nt = _NO_TEXT_RE.match(text)
+    if m["media"]:
+        if nt:      # e.g. WhatsApp type 5 (contact card or location): not a picture
+            return f"[MEDIA, type {nt.group(1)}]"
+        return "[MEDIA]" + ("" if _is_placeholder(text) else " " + text)
+    if text.startswith("[System event, type 59"):
+        return "[call event]"
+    if nt:
+        return f"[no text, type {nt.group(1)}]"
+    return text or "[no text]"
 
 
 def load_chat_messages(case_dir: str, script_name: str, decl: dict, units: dict) -> dict:
@@ -744,7 +807,7 @@ def format_chat_lines(messages: list) -> list:
     """One prompt line per message, numbered from 1 in time order."""
     lines = []
     for n, m in enumerate(messages, 1):
-        text = m["text"] or "[no text]"
+        text = _prompt_text(m)
         if len(text) > _CHAT_TEXT_MAX:
             text = text[:_CHAT_TEXT_MAX] + "…"
         when = (m["time"] or "").replace(" UTC", "")[:16]
@@ -752,72 +815,142 @@ def format_chat_lines(messages: list) -> list:
     return lines
 
 
-def _cited_numbers(line: str) -> list:
-    nums = []
-    for a, b in _CITE_RE.findall(line):
-        a = int(a)
-        if b and int(b) >= a and int(b) - a <= 50:
-            nums.extend(range(a, int(b) + 1))
-        else:
-            nums.append(a)
-    return nums
+def has_content(messages: list) -> bool:
+    """False for a chat holding only system events / placeholders (nothing
+    for a model to read; no call is made)."""
+    return any(m["media"] or not _is_placeholder(m["text"] or "") for m in messages)
 
 
-def check_chat_points(text: str, messages: list) -> tuple:
-    """Mark each line of a model summary that can't be traced to the chat.
-    Returns (annotated_text, points, flagged, cited_numbers). Checks, done
-    in code rather than asked of the model:
-      - the point cites at least one message number;
-      - every cited number exists in this chat;
-      - if the point names a speaker of this chat, at least one cited
-        message is from one of the speakers it names (catches "X said..."
-        citing only Y's messages, the commonest local-model mistake)."""
-    speakers = sorted({m["speaker"] for m in messages if m["speaker"]}, key=len, reverse=True)
+def _norm_words(text: str) -> str:
+    text = (text or "").lower().replace("’", "'").replace("‘", "'")
+    return " ".join(re.findall(r"[a-z0-9']+", text))
+
+
+def _quote_in(quote: str, text: str) -> bool:
+    q, t = _norm_words(quote), _norm_words(text)
+    if not q:
+        return True
+    if q in t:
+        return True
+    words = q.split()           # tolerate a dropped/changed word in a longer quote
+    return len(words) >= 4 and sum(w in t.split() for w in words) / len(words) >= 0.8
+
+
+def check_findings(findings: dict, messages: list) -> dict:
+    """Check every finding the model returned, in code:
+      - each cited number exists in the chat;
+      - the speaker named sent at least one cited message;
+      - the quoted words are in a cited message; if they are found in a
+        different message by the same speaker, the number is corrected
+        and that is said.
+    Returns {list_key: [{who, what, messages, problems, note}]} plus
+    'topics', 'points' and 'flagged'."""
     n_msgs = len(messages)
-    out, points, flagged, cited_all = [], 0, 0, set()
-    for line in text.splitlines():
-        s = line.strip()
-        if not s or (s.endswith(":") and len(s) < 40) or s.startswith("#") and not _CITE_RE.match(s):
-            out.append(line)
-            continue
-        points += 1
-        nums = _cited_numbers(s)
-        problems = []
-        if not nums:
-            problems.append("no message cited")
-        bad = sorted({n for n in nums if n < 1 or n > n_msgs})
-        if bad:
-            problems.append("cites " + ", ".join(f"#{n}" for n in bad) + ", not in this chat")
-        good = [n for n in nums if 1 <= n <= n_msgs]
-        cited_all.update(good)
-        named = [sp for sp in speakers
-                 if (re.search(rf"\b{re.escape(sp)}\b", s) if sp == "Me"
-                     else re.search(rf"\b{re.escape(sp)}\b", s, re.I))]
-        if "Me" in speakers and "Me" not in named and _OWNER_RE.search(s):
-            named.append("Me")          # models often write "the phone owner"
-        if named and good and not ({messages[n - 1]["speaker"] for n in good} & set(named)):
-            problems.append(f"names {', '.join(named)}, but none of the cited messages is from them")
-        if problems:
-            flagged += 1
-            out.append(f"{line}   ⚠ {'; '.join(problems)}")
-        else:
-            out.append(line)
-    return "\n".join(out), points, flagged, sorted(cited_all)
+    out = {"topics": str(findings.get("topics") or "").strip(), "points": 0, "flagged": 0}
+    for key, _label in _FINDING_LISTS:
+        checked = []
+        for it in findings.get(key) or []:
+            if not isinstance(it, dict):
+                continue
+            who = str(it.get("who") or "")
+            what = str(it.get("what") or "").strip()
+            nums = []
+            for n in it.get("messages") or []:
+                try:
+                    nums.append(int(n))
+                except (TypeError, ValueError):
+                    pass
+            problems, note = [], ""
+            bad = sorted({n for n in nums if n < 1 or n > n_msgs})
+            good = [n for n in dict.fromkeys(nums) if 1 <= n <= n_msgs]
+            if what and not any(_quote_in(what, messages[n - 1]["text"]) for n in good):
+                found = [i for i, m in enumerate(messages, 1)
+                         if m["speaker"] == who and _quote_in(what, m["text"])]
+                if found:
+                    note = (f"number corrected from {', '.join(f'#{n}' for n in nums) or 'none'} "
+                            f"to #{found[0]} (where these words are)")
+                    good, bad = [found[0]], []
+                elif good:
+                    problems.append("quoted words not found in the cited message(s)")
+            if bad:
+                problems.append("cites " + ", ".join(f"#{n}" for n in bad) + ", not in this chat")
+            if not good:
+                problems.append("no valid message cited")
+            elif who and who not in {messages[n - 1]["speaker"] for n in good}:
+                problems.append(f"none of the cited messages is from {who}")
+            out["points"] += 1
+            out["flagged"] += bool(problems)
+            checked.append({"who": who, "what": what, "messages": good,
+                            "problems": problems, "note": note})
+        out[key] = checked
+    return out
 
 
-def _call(conn_settings: dict, prompt: str) -> dict:
-    result = local_llm.call_chat(conn_settings["endpoint"], conn_settings["api_key"],
-                                 conn_settings["model"], prompt, max_tokens=_CHAT_MAX_TOKENS)
-    if "text" in result:
-        result["text"] = _THINK_RE.sub("", result["text"]).strip()
-    return result
+def media_facts(messages: list) -> list:
+    """[(speaker, ["#n" or "#n (type N)"])] of media messages, from the data;
+    a media row the parser couldn't name (e.g. WhatsApp type 5, contact
+    card or location) carries its type so it isn't read as a picture."""
+    by = {}
+    for n, m in enumerate(messages, 1):
+        if m["media"]:
+            nt = _NO_TEXT_RE.match(m["text"] or "")
+            by.setdefault(m["speaker"], []).append(f"#{n}" + (f" (type {nt.group(1)})" if nt else ""))
+    return sorted(by.items(), key=lambda kv: kv[0] != "Me")
+
+
+def watch_word_hits(messages: list) -> list:
+    """[(category, [(number, matched word)])] from the app's word scan."""
+    hits = []
+    for label, spec in WATCH_WORDS:
+        rx = _watch_regex(spec)
+        found = []
+        for n, m in enumerate(messages, 1):
+            text = (m["text"] or "").replace("’", "'")
+            if _is_placeholder(text):
+                continue
+            mm = rx.search(text)
+            if mm:
+                found.append((n, mm.group(0)))
+        if found:
+            hits.append((label, found))
+    return hits
+
+
+def _schema(speakers: list) -> dict:
+    item = {"type": "object",
+            "properties": {"who": {"type": "string", "enum": speakers},
+                           "what": {"type": "string"},
+                           "messages": {"type": "array", "items": {"type": "integer"}}},
+            "required": ["who", "what", "messages"]}
+    props = {key: {"type": "array", "items": item} for key, _ in _FINDING_LISTS}
+    props["topics"] = {"type": "string"}
+    return {"type": "json_schema",
+            "json_schema": {"name": "chat_findings", "strict": True,
+                            "schema": {"type": "object", "properties": props,
+                                       "required": list(props)}}}
+
+
+def _parse_json(text: str) -> dict | None:
+    import json
+    text = _THINK_RE.sub("", text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    a, b = text.find("{"), text.rfind("}")
+    if a >= 0 and b > a:
+        try:
+            return json.loads(text[a:b + 1])
+        except Exception:
+            return None
+    return None
 
 
 def summarise_chat(messages: list, conn_settings: dict, prompt: str, progress=None) -> dict:
-    """Summary of one chat: one call when it fits in _CHAT_BLOCK_MAX_CHARS,
-    else one call per consecutive block plus one merge call. Numbers stay
-    those of the whole chat, so citations survive the merge. Returns
-    {text, calls, seconds} or {error}."""
+    """Findings for one chat: one structured call per block of at most
+    _CHAT_BLOCK_MAX_CHARS (numbers are those of the whole chat, so blocks
+    merge by simply joining their lists). Returns {findings, calls,
+    seconds} or {error}."""
     lines = format_chat_lines(messages)
     blocks, cur, size = [], [], 0
     for ln in lines:
@@ -828,60 +961,106 @@ def summarise_chat(messages: list, conn_settings: dict, prompt: str, progress=No
         size += len(ln) + 1
     if cur:
         blocks.append(cur)
-    t0, parts = time.time(), []
+    fmt = _schema(sorted({m["speaker"] for m in messages}))
+    merged = {key: [] for key, _ in _FINDING_LISTS}
+    topics = []
+    t0 = time.time()
     for i, block in enumerate(blocks, 1):
         if len(blocks) > 1:
             _emit(progress, f"    part {i}/{len(blocks)} ({len(block)} messages)…")
-        r = _call(conn_settings, prompt.replace("{data}", "\n".join(block)))
+        r = local_llm.call_chat(conn_settings["endpoint"], conn_settings["api_key"],
+                                conn_settings["model"], prompt.replace("{data}", "\n".join(block)),
+                                max_tokens=_CHAT_MAX_TOKENS, temperature=0, response_format=fmt)
+        if "error" in r and ("response_format" in r["error"] or "json_schema" in r["error"]):
+            # a server without structured output: ask plainly and parse
+            r = local_llm.call_chat(conn_settings["endpoint"], conn_settings["api_key"],
+                                    conn_settings["model"],
+                                    prompt.replace("{data}", "\n".join(block))
+                                    + "\n\nAnswer with one JSON object with exactly those keys.",
+                                    max_tokens=_CHAT_MAX_TOKENS, temperature=0)
         if "error" in r:
             return {"error": r["error"]}
-        parts.append(r["text"])
-    text, calls = parts[0], len(blocks)
-    if len(parts) > 1:
-        _emit(progress, f"    merging {len(parts)} parts…")
-        r = _call(conn_settings, _CHAT_COMBINE_PROMPT.replace("{data}", "\n\n".join(parts)))
-        if "error" in r:
-            return {"error": r["error"]}
-        text, calls = r["text"], calls + 1
-    return {"text": text, "calls": calls, "seconds": time.time() - t0}
+        data = _parse_json(r["text"])
+        if not isinstance(data, dict):
+            return {"error": "the model did not return the expected structure"}
+        for key, _ in _FINDING_LISTS:
+            merged[key].extend(x for x in (data.get(key) or []) if isinstance(x, dict))
+        if data.get("topics"):
+            topics.append(str(data["topics"]).strip())
+    merged["topics"] = "; ".join(topics)
+    return {"findings": merged, "calls": len(blocks), "seconds": time.time() - t0}
 
 
 def _chat_hash(lines: list, prompt: str, model: str) -> str:
     import hashlib
     h = hashlib.sha1()
-    for part in (model, prompt, *lines):
+    for part in (_CHAT_SCHEMA_VERSION, model, prompt, *lines):
         h.update(part.encode("utf-8", "replace") + b"\n")
     return h.hexdigest()
 
 
-def render_chat_report(name: str, messages: list, raw_text: str, model: str,
-                       generated_at: str, calls: int, seconds: float) -> tuple:
-    """The Text-tab report for one chat. Returns (report, points, flagged)."""
-    annotated, points, flagged, cited = check_chat_points(raw_text, messages)
-    media = sum(1 for m in messages if m["media"])
-    lines = [
-        f"AI SUMMARY — {name}",
-        "Written by a local AI model: a reading aid, not evidence. Check every point "
-        "against the cited messages listed below.",
-        "",
-        f"Model: {model} · generated {generated_at} UTC · {calls} call(s), {seconds:.0f} s",
-        f"Sent: all {len(messages)} message(s) in this chat as listed in the report"
-        + (f"; {media} media message(s), whose pictures/files the model cannot see" if media else "")
-        + ". Deleted messages are not in the report, so they are not summarised.",
-        f"Checks: {points - flagged} of {points} point(s) cite messages that exist and match "
-        "the speaker named." + (f" ⚠ marks {flagged} to treat with care." if flagged else ""),
-        "",
-        "SUMMARY",
-        annotated.strip() or "(the model returned no text)",
-        "",
-        "CITED MESSAGES",
-    ]
-    for n in cited:
+def _date_range(messages: list) -> str:
+    days = [m["time"][:10] for m in messages if m["time"]]
+    if not days:
+        return ""
+    first, last = min(days), max(days)
+    return first if first == last else f"{first} – {last}"
+
+
+def render_chat_report(name: str, messages: list, checked: dict | None, model: str,
+                       generated_at: str, calls: int, seconds: float) -> str:
+    """The Text-tab report for one chat. *checked* is check_findings()
+    output, or None for a chat with nothing to summarise."""
+    def nums(ns):
+        return ", ".join(f"#{n}" for n in ns)
+    rng = _date_range(messages)
+    out = [f"AI SUMMARY — {name} ({len(messages)} message(s){', ' + rng if rng else ''})"]
+    if checked is None:
+        out += ["", "No messages with text or media in this chat — only system events — "
+                    "so there is nothing to summarise. (No AI model was used.)"]
+        return "\n".join(out)
+    out += ["Written by a local AI model, checked by the app: a reading aid, not evidence. "
+            "Check every point against the messages it cites.", ""]
+    media = media_facts(messages)
+    out.append("Media (from the data):  " + (" · ".join(
+        f"{who} sent {len(ns)} [{', '.join(ns)}]" for who, ns in media) if media else "none"))
+    cited = set()
+    for key, label in _FINDING_LISTS:
+        items = checked.get(key) or []
+        if not items:
+            out.append(f"{label}:  none found")
+            continue
+        out.append(f"{label}:")
+        for it in items:
+            cited.update(it["messages"])
+            line = f"  - {it['who']} — \"{it['what']}\" [{nums(it['messages'])}]"
+            if it["note"]:
+                line += f"   (app: {it['note']})"
+            if it["problems"]:
+                line += "   ⚠ " + "; ".join(it["problems"])
+            out.append(line)
+    if checked.get("topics"):
+        out.append(f"Other:  {checked['topics']}")
+    hits = watch_word_hits(messages)
+    if hits:
+        out += ["", "Words to check (the app's own word scan, not the model — "
+                    "a safety net for what the model may miss):"]
+        for label, found in hits:
+            out.append(f"  {label}: " + ", ".join(f"#{n} \"{w}\"" for n, w in found))
+            cited.update(n for n, _ in found)
+    flagged = checked["flagged"]
+    out += ["", f"Checks: {checked['points'] - flagged} of {checked['points']} finding(s) cite "
+                f"messages that exist, are from the person named and contain the quoted words."
+                + (f" ⚠ marks {flagged} to treat with care." if flagged else ""),
+            f"Model: {model} · generated {generated_at} UTC · {calls} call(s), {seconds:.0f} s · "
+            f"all {len(messages)} message(s) sent; the model cannot see pictures or files; "
+            "deleted messages are not in the report.", "", "MESSAGES REFERRED TO ABOVE"]
+    for n in sorted(cited):
         m = messages[n - 1]
-        lines.append(f"#{n}  {m['time']}  {m['speaker']}: {m['text'] or '[no text]'}")
+        out.append(f"#{n}  {m['time']}  {m['speaker']}: {m['text'] or '[no text]'}")
     if not cited:
-        lines.append("(none)")
-    return "\n".join(lines), points, flagged
+        out.append("(none)")
+    return "\n".join(out)
 
 
 def _chat_table(conn) -> None:
@@ -934,9 +1113,12 @@ def run_chat_summaries(case_dir: str, script_name: str, decl: dict, units: dict,
                        only_missing: bool = True, progress=None, should_stop=None) -> dict:
     """Summarise every chat of a chat_groups report, smallest first so
     results arrive quickly; each is saved as soon as it is done, so a stop
-    or a failure keeps what was finished. With *only_missing*, a chat whose
-    messages, prompt and model are unchanged since its saved summary is
-    skipped. Returns {done, skipped, failed, flagged, seconds} or {error}."""
+    or a failure keeps what was finished. A chat with nothing but system
+    events gets a short "nothing to summarise" report without a model
+    call. With *only_missing*, a chat whose messages, prompt and model are
+    unchanged since its saved summary is skipped. Returns {done, skipped,
+    failed, flagged, seconds, chats} or {error}."""
+    import json
     conn_settings = ai_summary_store.get_connection()
     if not conn_settings["model"]:
         return {"error": "no model chosen — pick one under Local LLM connection"}
@@ -961,23 +1143,30 @@ def run_chat_summaries(case_dir: str, script_name: str, decl: dict, units: dict,
         if only_missing and existing.get(key, {}).get("content_hash") == digest:
             skipped += 1
             continue
-        _emit(progress, f"[{i}/{len(order)}] {chat['name']} ({len(msgs)} messages)…")
-        r = summarise_chat(msgs, conn_settings, prompt, progress)
-        if "error" in r:
-            failed += 1
-            _emit(progress, f"    failed: {r['error']}")
-            continue
         at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
-        report, points, n_flag = render_chat_report(chat["name"], msgs, r["text"],
-                                                    conn_settings["model"], at,
-                                                    r["calls"], r["seconds"])
+        if not has_content(msgs):
+            report, raw, points, n_flag, model = (
+                render_chat_report(chat["name"], msgs, None, "", at, 0, 0), "", 0, 0, "")
+            _emit(progress, f"[{i}/{len(order)}] {chat['name']}: only system events, no model call")
+        else:
+            _emit(progress, f"[{i}/{len(order)}] {chat['name']} ({len(msgs)} messages)…")
+            r = summarise_chat(msgs, conn_settings, prompt, progress)
+            if "error" in r:
+                failed += 1
+                _emit(progress, f"    failed: {r['error']}")
+                continue
+            checked = check_findings(r["findings"], msgs)
+            points, n_flag, model = checked["points"], checked["flagged"], conn_settings["model"]
+            report = render_chat_report(chat["name"], msgs, checked, model, at,
+                                        r["calls"], r["seconds"])
+            raw = json.dumps(r["findings"], ensure_ascii=False)
+            _emit(progress, f"    done in {r['seconds']:.0f} s — {points} finding(s)"
+                            + (f", {n_flag} flagged ⚠" if n_flag else ""))
         _save_chat_summary(case_dir, script_name, key, {
-            "chat_name": chat["name"], "report": report, "raw_text": r["text"],
-            "model": conn_settings["model"], "message_count": len(msgs), "points": points,
-            "flagged": n_flag, "content_hash": digest, "generated_at": at})
+            "chat_name": chat["name"], "report": report, "raw_text": raw, "model": model,
+            "message_count": len(msgs), "points": points, "flagged": n_flag,
+            "content_hash": digest, "generated_at": at})
         done += 1
         flagged += n_flag
-        _emit(progress, f"    done in {r['seconds']:.0f} s — {points} point(s)"
-                        + (f", {n_flag} flagged ⚠" if n_flag else ""))
     return {"done": done, "skipped": skipped, "failed": failed, "flagged": flagged,
             "seconds": time.time() - t_all, "chats": len(order)}

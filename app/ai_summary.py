@@ -637,3 +637,347 @@ def run_summary(case_dir: str, script_name: str, platform: str = "android",
         "text": final_text, "total_rows": total, "chunk_count": len(row_chunks),
         "chunks": chunk_results, "columns_sent": columns, "prompt_used": reduce_prompt,
     }
+
+
+# ── Per-chat summaries (owner request 2026-10-24) ─────────────────────────
+# One summary per conversation of a report that declares `chat_groups`,
+# shown in the bottom Text tab when the chat is opened. The prompt is kept
+# deliberately short (owner: "the prompt is too complex for a local
+# model"); the checking is done here in code, not asked of the model:
+# every point must cite message numbers that exist in the chat, and a
+# point naming a speaker must cite at least one message from them. Points
+# that fail are marked, never hidden (A-51); the summary only ever uses
+# the report's words (A-52).
+
+CHAT_PROMPT = (
+    "Summarise this chat for an investigator. Each line is: "
+    "#number [time] speaker: text. \"Me\" is the phone's owner.\n"
+    "Write 3 to 6 short bullet points about what was said.\n"
+    "Each point is about ONE speaker. Start it with who said it, and end it "
+    "with the message numbers in brackets, like [#4, #9].\n"
+    "Use only what the messages say. Do not guess.\n\n{data}"
+)
+_CHAT_COMBINE_PROMPT = (
+    "These are partial summaries of ONE chat, in order. Merge them into one "
+    "list of 3 to 8 bullet points. Keep each speaker name and the message "
+    "numbers in brackets exactly as they are. Do not add anything new.\n\n{data}"
+)
+_CHAT_BLOCK_MAX_CHARS = 12000      # data per call; see _REDUCE_BATCH_MAX_CHARS
+_CHAT_MAX_TOKENS = 700
+_CHAT_TEXT_MAX = 300
+_THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+_CITE_RE = re.compile(r"#(\d+)(?:\s*[-–]\s*#?(\d+))?")
+_JID_SUFFIX_RE = re.compile(r"^(.+?)\s+\([^()]*\)$")
+_OWNER_RE = re.compile(r"\b(?:phone(?:'s|’s)? owner|the owner|device owner)\b", re.I)
+
+
+def _short_speaker(value) -> str:
+    """'Liz Dehner (19199282177@s.whatsapp.net)' -> 'Liz Dehner'."""
+    s = str(value or "").strip()
+    m = _JID_SUFFIX_RE.match(s)
+    return m.group(1) if m else s
+
+
+def load_chat_messages(case_dir: str, script_name: str, decl: dict, units: dict) -> dict:
+    """{chat_key: {'name', 'messages': [{'rowid', 'ts', 'time', 'speaker',
+    'text', 'media'}]}} from the report table, grouped exactly as the
+    Chat Groups list groups them (decl['key']), oldest message first."""
+    import collections
+
+    def _cols(v):
+        return [v] if isinstance(v, str) else list(v or ())
+    key_col = decl["key"]
+    names = _cols(decl.get("name")) or [key_col]
+    senders = _cols(decl.get("participants"))
+    dir_col = decl.get("direction", "direction")
+    sent = set(decl.get("sent", ("Sent", "Outgoing")))
+    system = set(decl.get("system", ()))
+    media_cols = _cols(decl.get("media"))
+    prefixes = tuple(decl.get("media_prefixes", ()))
+    msg_col = decl.get("message", "message")
+    time_col = decl.get("time")
+    unit = units.get(time_col) if time_col else None
+    path = os.path.join(case_dir, "caseresults.db")
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    try:
+        have = {r[1] for r in conn.execute(f'PRAGMA table_info("artifact_{script_name}")')}
+        want = [c for c in dict.fromkeys([key_col, dir_col, msg_col, time_col,
+                                          *names, *senders, *media_cols]) if c and c in have]
+        rows = conn.execute("SELECT rowid, " + ", ".join(f'"{c}"' for c in want)
+                            + f' FROM "artifact_{script_name}"').fetchall()
+    finally:
+        conn.close()
+    at = {c: i + 1 for i, c in enumerate(want)}
+
+    def get(r, c):
+        return r[at[c]] if c in at else None
+    chats: dict = {}
+    for r in rows:
+        key = get(r, key_col) or ""
+        c = chats.setdefault(key, {"names": collections.Counter(), "messages": []})
+        nm = next((get(r, n) for n in names if get(r, n)), None)
+        if nm:
+            c["names"][str(nm)] += 1
+        direction = get(r, dir_col)
+        if direction in sent:
+            speaker = "Me"
+        elif direction in system:
+            speaker = "System"
+        else:
+            speaker = _short_speaker(next((get(r, s) for s in senders if get(r, s)), "")) \
+                or "(unknown sender)"
+        text = _CONTROL_CHARS_RE.sub("", str(get(r, msg_col) or ""))
+        media = any(get(r, m) for m in media_cols) or (prefixes and text.startswith(prefixes))
+        ts = _to_epoch_seconds(get(r, time_col), unit) if time_col else None
+        c["messages"].append({"rowid": r[0], "ts": ts, "speaker": speaker, "text": text,
+                              "media": bool(media),
+                              "time": _format_timestamp(get(r, time_col), unit) if time_col else ""})
+    out = {}
+    for key, c in chats.items():
+        msgs = sorted(c["messages"], key=lambda m: (m["ts"] is None, m["ts"] or 0, m["rowid"]))
+        out[key] = {"name": c["names"].most_common(1)[0][0] if c["names"] else (key or "(no chat)"),
+                    "messages": msgs}
+    return out
+
+
+def format_chat_lines(messages: list) -> list:
+    """One prompt line per message, numbered from 1 in time order."""
+    lines = []
+    for n, m in enumerate(messages, 1):
+        text = m["text"] or "[no text]"
+        if len(text) > _CHAT_TEXT_MAX:
+            text = text[:_CHAT_TEXT_MAX] + "…"
+        when = (m["time"] or "").replace(" UTC", "")[:16]
+        lines.append(f"#{n} [{when}] {m['speaker']}: {text}")
+    return lines
+
+
+def _cited_numbers(line: str) -> list:
+    nums = []
+    for a, b in _CITE_RE.findall(line):
+        a = int(a)
+        if b and int(b) >= a and int(b) - a <= 50:
+            nums.extend(range(a, int(b) + 1))
+        else:
+            nums.append(a)
+    return nums
+
+
+def check_chat_points(text: str, messages: list) -> tuple:
+    """Mark each line of a model summary that can't be traced to the chat.
+    Returns (annotated_text, points, flagged, cited_numbers). Checks, done
+    in code rather than asked of the model:
+      - the point cites at least one message number;
+      - every cited number exists in this chat;
+      - if the point names a speaker of this chat, at least one cited
+        message is from one of the speakers it names (catches "X said..."
+        citing only Y's messages, the commonest local-model mistake)."""
+    speakers = sorted({m["speaker"] for m in messages if m["speaker"]}, key=len, reverse=True)
+    n_msgs = len(messages)
+    out, points, flagged, cited_all = [], 0, 0, set()
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or (s.endswith(":") and len(s) < 40) or s.startswith("#") and not _CITE_RE.match(s):
+            out.append(line)
+            continue
+        points += 1
+        nums = _cited_numbers(s)
+        problems = []
+        if not nums:
+            problems.append("no message cited")
+        bad = sorted({n for n in nums if n < 1 or n > n_msgs})
+        if bad:
+            problems.append("cites " + ", ".join(f"#{n}" for n in bad) + ", not in this chat")
+        good = [n for n in nums if 1 <= n <= n_msgs]
+        cited_all.update(good)
+        named = [sp for sp in speakers
+                 if (re.search(rf"\b{re.escape(sp)}\b", s) if sp == "Me"
+                     else re.search(rf"\b{re.escape(sp)}\b", s, re.I))]
+        if "Me" in speakers and "Me" not in named and _OWNER_RE.search(s):
+            named.append("Me")          # models often write "the phone owner"
+        if named and good and not ({messages[n - 1]["speaker"] for n in good} & set(named)):
+            problems.append(f"names {', '.join(named)}, but none of the cited messages is from them")
+        if problems:
+            flagged += 1
+            out.append(f"{line}   ⚠ {'; '.join(problems)}")
+        else:
+            out.append(line)
+    return "\n".join(out), points, flagged, sorted(cited_all)
+
+
+def _call(conn_settings: dict, prompt: str) -> dict:
+    result = local_llm.call_chat(conn_settings["endpoint"], conn_settings["api_key"],
+                                 conn_settings["model"], prompt, max_tokens=_CHAT_MAX_TOKENS)
+    if "text" in result:
+        result["text"] = _THINK_RE.sub("", result["text"]).strip()
+    return result
+
+
+def summarise_chat(messages: list, conn_settings: dict, prompt: str, progress=None) -> dict:
+    """Summary of one chat: one call when it fits in _CHAT_BLOCK_MAX_CHARS,
+    else one call per consecutive block plus one merge call. Numbers stay
+    those of the whole chat, so citations survive the merge. Returns
+    {text, calls, seconds} or {error}."""
+    lines = format_chat_lines(messages)
+    blocks, cur, size = [], [], 0
+    for ln in lines:
+        if cur and size + len(ln) + 1 > _CHAT_BLOCK_MAX_CHARS:
+            blocks.append(cur)
+            cur, size = [], 0
+        cur.append(ln)
+        size += len(ln) + 1
+    if cur:
+        blocks.append(cur)
+    t0, parts = time.time(), []
+    for i, block in enumerate(blocks, 1):
+        if len(blocks) > 1:
+            _emit(progress, f"    part {i}/{len(blocks)} ({len(block)} messages)…")
+        r = _call(conn_settings, prompt.replace("{data}", "\n".join(block)))
+        if "error" in r:
+            return {"error": r["error"]}
+        parts.append(r["text"])
+    text, calls = parts[0], len(blocks)
+    if len(parts) > 1:
+        _emit(progress, f"    merging {len(parts)} parts…")
+        r = _call(conn_settings, _CHAT_COMBINE_PROMPT.replace("{data}", "\n\n".join(parts)))
+        if "error" in r:
+            return {"error": r["error"]}
+        text, calls = r["text"], calls + 1
+    return {"text": text, "calls": calls, "seconds": time.time() - t0}
+
+
+def _chat_hash(lines: list, prompt: str, model: str) -> str:
+    import hashlib
+    h = hashlib.sha1()
+    for part in (model, prompt, *lines):
+        h.update(part.encode("utf-8", "replace") + b"\n")
+    return h.hexdigest()
+
+
+def render_chat_report(name: str, messages: list, raw_text: str, model: str,
+                       generated_at: str, calls: int, seconds: float) -> tuple:
+    """The Text-tab report for one chat. Returns (report, points, flagged)."""
+    annotated, points, flagged, cited = check_chat_points(raw_text, messages)
+    media = sum(1 for m in messages if m["media"])
+    lines = [
+        f"AI SUMMARY — {name}",
+        "Written by a local AI model: a reading aid, not evidence. Check every point "
+        "against the cited messages listed below.",
+        "",
+        f"Model: {model} · generated {generated_at} UTC · {calls} call(s), {seconds:.0f} s",
+        f"Sent: all {len(messages)} message(s) in this chat as listed in the report"
+        + (f"; {media} media message(s), whose pictures/files the model cannot see" if media else "")
+        + ". Deleted messages are not in the report, so they are not summarised.",
+        f"Checks: {points - flagged} of {points} point(s) cite messages that exist and match "
+        "the speaker named." + (f" ⚠ marks {flagged} to treat with care." if flagged else ""),
+        "",
+        "SUMMARY",
+        annotated.strip() or "(the model returned no text)",
+        "",
+        "CITED MESSAGES",
+    ]
+    for n in cited:
+        m = messages[n - 1]
+        lines.append(f"#{n}  {m['time']}  {m['speaker']}: {m['text'] or '[no text]'}")
+    if not cited:
+        lines.append("(none)")
+    return "\n".join(lines), points, flagged
+
+
+def _chat_table(conn) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ai_chat_summaries ("
+        "script_name TEXT, chat_key TEXT, chat_name TEXT, report TEXT, raw_text TEXT, "
+        "model TEXT, message_count INTEGER, points INTEGER, flagged INTEGER, "
+        "content_hash TEXT, generated_at TEXT, PRIMARY KEY (script_name, chat_key))")
+
+
+def load_chat_summaries(case_dir: str, script_name: str) -> dict:
+    """{chat_key: {chat_name, report, model, message_count, points,
+    flagged, content_hash, generated_at}}; {} if none yet."""
+    path = os.path.join(case_dir, "caseresults.db")
+    if not os.path.isfile(path):
+        return {}
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='ai_chat_summaries'").fetchone():
+            return {}
+        rows = conn.execute(
+            "SELECT chat_key, chat_name, report, model, message_count, points, flagged, "
+            "content_hash, generated_at FROM ai_chat_summaries WHERE script_name = ?",
+            (script_name,)).fetchall()
+    finally:
+        conn.close()
+    keys = ("chat_name", "report", "model", "message_count", "points", "flagged",
+            "content_hash", "generated_at")
+    return {r[0]: dict(zip(keys, r[1:])) for r in rows}
+
+
+def _save_chat_summary(case_dir: str, script_name: str, key: str, rec: dict) -> None:
+    conn = sqlite3.connect(os.path.join(case_dir, "caseresults.db"), timeout=10)
+    try:
+        _chat_table(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO ai_chat_summaries (script_name, chat_key, chat_name, "
+            "report, raw_text, model, message_count, points, flagged, content_hash, "
+            "generated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (script_name, key, rec["chat_name"], rec["report"], rec["raw_text"], rec["model"],
+             rec["message_count"], rec["points"], rec["flagged"], rec["content_hash"],
+             rec["generated_at"]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def run_chat_summaries(case_dir: str, script_name: str, decl: dict, units: dict,
+                       only_missing: bool = True, progress=None, should_stop=None) -> dict:
+    """Summarise every chat of a chat_groups report, smallest first so
+    results arrive quickly; each is saved as soon as it is done, so a stop
+    or a failure keeps what was finished. With *only_missing*, a chat whose
+    messages, prompt and model are unchanged since its saved summary is
+    skipped. Returns {done, skipped, failed, flagged, seconds} or {error}."""
+    conn_settings = ai_summary_store.get_connection()
+    if not conn_settings["model"]:
+        return {"error": "no model chosen — pick one under Local LLM connection"}
+    prompt = ai_summary_store.get_chat_prompt(script_name)
+    if "{data}" not in prompt:
+        return {"error": "the prompt has no {data} placeholder — nothing would be sent"}
+    try:
+        chats = load_chat_messages(case_dir, script_name, decl, units)
+    except Exception as exc:
+        return {"error": f"could not read the report: {exc}"}
+    existing = load_chat_summaries(case_dir, script_name) if only_missing else {}
+    order = sorted(chats.items(), key=lambda kv: len(kv[1]["messages"]))
+    done = skipped = failed = flagged = 0
+    t_all = time.time()
+    for i, (key, chat) in enumerate(order, 1):
+        if should_stop and should_stop():
+            _emit(progress, "Stopped — summaries finished so far are saved.")
+            break
+        msgs = chat["messages"]
+        lines = format_chat_lines(msgs)
+        digest = _chat_hash(lines, prompt, conn_settings["model"])
+        if only_missing and existing.get(key, {}).get("content_hash") == digest:
+            skipped += 1
+            continue
+        _emit(progress, f"[{i}/{len(order)}] {chat['name']} ({len(msgs)} messages)…")
+        r = summarise_chat(msgs, conn_settings, prompt, progress)
+        if "error" in r:
+            failed += 1
+            _emit(progress, f"    failed: {r['error']}")
+            continue
+        at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        report, points, n_flag = render_chat_report(chat["name"], msgs, r["text"],
+                                                    conn_settings["model"], at,
+                                                    r["calls"], r["seconds"])
+        _save_chat_summary(case_dir, script_name, key, {
+            "chat_name": chat["name"], "report": report, "raw_text": r["text"],
+            "model": conn_settings["model"], "message_count": len(msgs), "points": points,
+            "flagged": n_flag, "content_hash": digest, "generated_at": at})
+        done += 1
+        flagged += n_flag
+        _emit(progress, f"    done in {r['seconds']:.0f} s — {points} point(s)"
+                        + (f", {n_flag} flagged ⚠" if n_flag else ""))
+    return {"done": done, "skipped": skipped, "failed": failed, "flagged": flagged,
+            "seconds": time.time() - t_all, "chats": len(order)}

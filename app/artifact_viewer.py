@@ -1196,6 +1196,40 @@ class AISummaryWorker(QThread):
         self.done.emit(result)
 
 
+class ChatSummaryWorker(QThread):
+    """Runs ai_summary.run_chat_summaries() off the GUI thread: one local-LLM
+    summary per chat of a chat_groups report, each saved as it finishes.
+    stop() ends the run after the chat in progress."""
+
+    done = Signal(dict)
+    progress = Signal(str)
+
+    def __init__(self, case_dir: str, script_name: str, platform: str,
+                 only_missing: bool, parent=None):
+        super().__init__(parent)
+        self._case_dir = case_dir
+        self._script_name = script_name
+        self._platform = platform
+        self._only_missing = only_missing
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        import ai_summary
+        from artifact_runner import list_artifacts
+        try:
+            mod = {sn: m for sn, m in list_artifacts(self._platform)}.get(self._script_name)
+            result = ai_summary.run_chat_summaries(
+                self._case_dir, self._script_name, getattr(mod, 'chat_groups', None) or {},
+                getattr(mod, 'timestamp_fields', {}) or {}, only_missing=self._only_missing,
+                progress=self.progress.emit, should_stop=lambda: self._stop)
+        except Exception as exc:
+            result = {"error": str(exc)}
+        self.done.emit(result)
+
+
 class ModelListWorker(QThread):
     """GET .../models against the configured local LLM server — a plain
     network call (local_llm.list_models), but still off the GUI thread:
@@ -1287,13 +1321,29 @@ class AISummaryDialog(QDialog):
         form.addLayout(report_row)
 
         # ── Columns to send ────────────────────────────────────────────
+        # Per-chat mode (2026-10-24): a report declaring chat_groups is
+        # summarised one chat at a time, shown in the Text tab when the
+        # chat is opened; columns/chunking don't apply there.
+        self._chat_mode_note = note_label(
+            "This is a messaging report, so it is summarised one chat at a time. "
+            "Each summary appears in the bottom Text tab when you open that chat "
+            "(or all of them when you open Chat Groups). Every point must cite "
+            "message numbers; the app checks them and marks any it can't match ⚠.")
+        form.addWidget(self._chat_mode_note)
+        self._only_missing_check = QCheckBox(
+            "Only chats without an up-to-date summary (skip unchanged chats)")
+        self._only_missing_check.setChecked(True)
+        form.addWidget(self._only_missing_check)
+
         columns_group = QGroupBox("Columns to send")
+        self._columns_group = columns_group
         self._columns_layout = QVBoxLayout(columns_group)
         self._columns_layout.setSpacing(2)
         form.addWidget(columns_group)
 
         # ── Chunking ───────────────────────────────────────────────────
         chunk_group = QGroupBox("Chunking")
+        self._chunk_group = chunk_group
         chunk_group_layout = QVBoxLayout(chunk_group)
         chunk_row = QHBoxLayout()
         chunk_row.addWidget(QLabel("Rows per chunk (max):"))
@@ -1365,11 +1415,16 @@ class AISummaryDialog(QDialog):
         self._save_btn.clicked.connect(self._on_save_settings)
         self._generate_btn = QPushButton("Generate Summary")
         self._generate_btn.clicked.connect(self._on_generate)
+        self._stop_btn = QPushButton("Stop")
+        self._stop_btn.setToolTip("Stop after the chat being summarised now; finished ones are kept")
+        self._stop_btn.clicked.connect(self._on_stop)
+        self._stop_btn.setVisible(False)
         self._close_btn = QPushButton("Close")
         self._close_btn.clicked.connect(self.reject)
         btn_row.addWidget(self._save_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._generate_btn)
+        btn_row.addWidget(self._stop_btn)
         btn_row.addWidget(self._close_btn)
         outer.addLayout(btn_row)
 
@@ -1425,6 +1480,11 @@ class AISummaryDialog(QDialog):
     def _current_script_name(self):
         return self._report_combo.currentData()
 
+    def _is_chat_report(self, script_name) -> bool:
+        from artifact_runner import list_artifacts
+        mod = {sn: m for sn, m in list_artifacts(self._platform)}.get(script_name)
+        return bool(getattr(mod, 'chat_groups', None))
+
     def _rebuild_column_checks(self, all_columns: list, selected: set) -> None:
         while self._columns_layout.count():
             item = self._columns_layout.takeAt(0)
@@ -1462,7 +1522,17 @@ class AISummaryDialog(QDialog):
         self._rebuild_column_checks(settings["all_columns"], set(settings["columns"]))
         self._chunk_size_spin.setValue(settings["chunk_size"])
         self._max_gap_spin.setValue(settings["max_gap_minutes"])
-        self._prompt_edit.setPlainText(settings["prompt"])
+        self._chat_mode = self._is_chat_report(script_name)
+        for w in (self._columns_group, self._chunk_group):
+            w.setVisible(not self._chat_mode)
+        for w in (self._chat_mode_note, self._only_missing_check):
+            w.setVisible(self._chat_mode)
+        self._show_chunks_check.setVisible(not self._chat_mode)
+        if self._chat_mode:
+            self._show_chunks_check.setChecked(False)
+        self._generate_btn.setText("Summarise Chats" if self._chat_mode else "Generate Summary")
+        self._prompt_edit.setPlainText(ai_summary_store.get_chat_prompt(script_name)
+                                       if self._chat_mode else settings["prompt"])
         self._prompt_error.setText("")
 
         conn = ai_summary_store.get_connection()
@@ -1484,6 +1554,16 @@ class AISummaryDialog(QDialog):
         import ai_summary_store
         if not self._validate_prompt():
             return False
+        if getattr(self, '_chat_mode', False):
+            ai_summary_store.set_chat_prompt(self._current_script_name(),
+                                             self._prompt_edit.toPlainText())
+            ai_summary_store.set_connection(
+                endpoint=self._endpoint_edit.text().strip(),
+                api_key=self._api_key_edit.text(),
+                model=self._model_combo.currentText().strip(),
+            )
+            self._status_label.setText("Settings saved.")
+            return True
         columns = self._collect_selected_columns()
         if not columns:
             self._prompt_error.setText("Select at least one column to send.")
@@ -1538,6 +1618,9 @@ class AISummaryDialog(QDialog):
     def _on_generate(self) -> None:
         if not self._on_save_settings():
             return
+        if getattr(self, '_chat_mode', False):
+            self._on_generate_chats()
+            return
         script_name = self._current_script_name()
         self._generating_script_name = script_name
         for w in (self._generate_btn, self._save_btn, self._report_combo, self._close_btn):
@@ -1576,6 +1659,47 @@ class AISummaryDialog(QDialog):
 
         import ai_summary
         ai_summary.save_summary(self._case_dir, self._generating_script_name, result)
+
+    def _on_generate_chats(self) -> None:
+        script_name = self._current_script_name()
+        self._generating_script_name = script_name
+        for w in (self._generate_btn, self._save_btn, self._report_combo, self._close_btn):
+            w.setEnabled(False)
+        self._stop_btn.setVisible(True)
+        self._stop_btn.setEnabled(True)
+        self._output_edit.clear()
+        self._log_edit.clear()
+        self._status_label.setText("Summarising chats, smallest first; each is saved as it finishes.")
+        self._worker = ChatSummaryWorker(self._case_dir, script_name, self._platform,
+                                         self._only_missing_check.isChecked())
+        self._worker.progress.connect(self._log_edit.appendPlainText)
+        self._worker.done.connect(self._on_chats_done)
+        self._worker.start()
+
+    def _on_stop(self) -> None:
+        if self._worker is not None and isinstance(self._worker, ChatSummaryWorker):
+            self._worker.stop()
+            self._stop_btn.setEnabled(False)
+            self._status_label.setText("Stopping after the current chat…")
+
+    def _on_chats_done(self, result: dict) -> None:
+        for w in (self._generate_btn, self._save_btn, self._report_combo, self._close_btn):
+            w.setEnabled(True)
+        self._stop_btn.setVisible(False)
+        if "error" in result:
+            self._status_label.setText(f"Error: {result['error']}")
+            return
+        self._status_label.setText(
+            f"{result['done']} chat(s) summarised, {result['skipped']} unchanged, "
+            f"{result['failed']} failed, in {result['seconds']:.0f} s"
+            + (f" — {result['flagged']} point(s) flagged ⚠" if result['flagged'] else "")
+            + ". Open a chat to read its summary in the Text tab.")
+        self._output_edit.setPlainText(
+            "Summaries are shown in the bottom Text tab: open a chat under Chat Groups, "
+            "or the Chat Groups folder for all of them.")
+        parent = self.parent()
+        if parent is not None and hasattr(parent, '_art_refresh_chat_summary_text'):
+            parent._art_refresh_chat_summary_text()
 
     @staticmethod
     def _render_chunks(chunks: list) -> str:
@@ -2957,6 +3081,41 @@ class ArtifactViewerMixin:
             + (f" — Last 30 Days = {ref_label}" if ref_label else ""))
         self._art_stack.setCurrentIndex(1)
         self._art_chat_summary = (script_name, [(c['key'], c['name']) for c in chats])
+        self._art_show_chat_summary_text(script_name, None)
+
+    def _art_show_chat_summary_text(self, script_name: str, key: str | None) -> None:
+        """Put the saved AI chat summary in the bottom Text tab: one chat's
+        (*key*), or every chat's when *key* is None (the Chat Groups
+        folder). Says so plainly when there is none yet."""
+        import ai_summary
+        self._art_summary_text_target = (script_name, key)
+        try:
+            saved = ai_summary.load_chat_summaries(self._case_dir, script_name)
+        except Exception:
+            saved = {}
+        how = ("No AI summary yet. To make one: AI Summary (bottom of the Device "
+               "Artifacts list) → choose this report → Summarise Chats.")
+        if key is not None:
+            rec = saved.get(key)
+            text = rec["report"] if rec else how
+            name = rec["chat_name"] if rec else "this chat"
+            self._load_text_preview(text, f"AI summary — {name}")
+            return
+        if not saved:
+            self._load_text_preview(how, "AI chat summaries")
+            return
+        recs = sorted(saved.values(), key=lambda r: (r["chat_name"] or "").lower())
+        sep = "\n\n" + "═" * 70 + "\n\n"
+        self._load_text_preview(sep.join(r["report"] for r in recs),
+                                f"AI chat summaries — {len(recs)} chat(s)")
+
+    def _art_refresh_chat_summary_text(self) -> None:
+        """Re-show the summary for whatever chat/folder is open (after a run)."""
+        target = getattr(self, '_art_summary_text_target', None)
+        showing_chat = (getattr(self, '_art_scope', None) is not None
+                        or getattr(self, '_art_chat_summary', None) is not None)
+        if target and showing_chat and self._art_stack.currentIndex() == 1:
+            self._art_show_chat_summary_text(*target)
 
     def _art_show_chat(self, script_name: str, key: str, label: str) -> None:
         """The report limited to one conversation (exact match on the
@@ -2974,6 +3133,7 @@ class ArtifactViewerMixin:
         else:
             where, args = f'("{col}" IS NULL OR "{col}" = \'\')', []
         self._art_show_report(script_name, scope=(where, args, f"Chat: {label.rsplit(' (', 1)[0]}"))
+        self._art_show_chat_summary_text(script_name, key)
 
     def _on_art_tree_clicked(self, index):
         self._clear_art_hex()

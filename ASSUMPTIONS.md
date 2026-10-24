@@ -1182,8 +1182,22 @@ Tools menu when AI access was off once hid every other Tools action too.
 - **Config files must be listed:** a config file is shipped only if listed
   in `datas=`, and the destination must match its module's `store_path()`.
   - `scan_rules.py` reads from `config/` → destination `'config'`.
-  - `user_media_ignore_list.py` and `file_browser_presets.py` read next to
-    the exe → destination `'.'`.
+  - **PyInstaller 6 puts every `datas=` file under `_internal/`**
+    (`sys._MEIPASS`), even with destination `'.'`; nothing lands next to
+    the exe. *Confirmed 2026-10-24* with a throwaway one-folder build
+    (`--add-data seed.json:.` → `dist/hello/_internal/seed.json`). The
+    earlier text here said `'.'` put a file next to the exe; that was
+    wrong, and the User Media ignore list shipped that way was never read
+    by the frozen build.
+  - **Lists the examiner can edit** (`user_media_ignore_list.py`,
+    `embedded_media_skip_list.py`) are read and saved next to the exe, so
+    they ship as a *seed* (destination `'config'`) that
+    `config_seed.merge_seed` copies into the editable file, once per
+    entry: a new install gets the whole list, an upgrade only new
+    entries, and an entry the examiner removed stays removed.
+  - `file_browser_presets.py` still ships with `'.'`, so its copy isn't
+    read either; harmless, because a missing presets file is rebuilt from
+    identical built-in defaults.
   - Missing the scan-rules files once shipped an exe with nothing in scope
     for the header scan or User Media. Dev runs can't catch this.
 

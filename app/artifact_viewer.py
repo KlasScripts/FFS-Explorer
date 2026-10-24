@@ -2754,6 +2754,20 @@ class ArtifactViewerMixin:
         result.sort(key=lambda d: str(d['name']).casefold())
         return result
 
+    def _art_reset_list_presentation(self) -> None:
+        """Clear what a report left on the shared table before a list view
+        (chat summary, exported files) loads into it: the media-column
+        thumbnail delegates and the model's media/timestamp/byte columns.
+        Without this a summary column at the same position as the last
+        report's attachment column was painted as an (empty) thumbnail —
+        found 2026-10-24: "Media In" showed a square instead of a count."""
+        self._art_table_model.set_media_columns([])
+        self._art_table_model.set_timestamp_formatting({}, None)
+        self._art_table_model.set_byte_columns([])
+        for col in range(self._art_table_model.columnCount()):
+            self._art_report_view.setItemDelegateForColumn(col, self._art_highlight_delegate)
+        self._art_report_view.verticalHeader().setDefaultSectionSize(28)
+
     def _art_show_chat_summary(self, script_name: str) -> None:
         """The "Chat Groups" folder's page: one row per conversation with
         its participants, message and media counts in/out, and first /
@@ -2804,6 +2818,7 @@ class ArtifactViewerMixin:
         self._cancel_art_filter_worker()
         self._art_scope = None
         self._art_table_model.load_rows(columns, rows)
+        self._art_reset_list_presentation()
         self._setup_report_filter_ui(columns)
         self._art_resize_columns()
         label = getattr(mod, 'name', script_name) if mod else script_name
@@ -3917,6 +3932,7 @@ class ArtifactViewerMixin:
                 rows.append((entry.name, f"{st.st_size:,}", mtime, entry.path))
 
         self._art_table_model.load_rows(columns, rows)
+        self._art_reset_list_presentation()
         self._setup_report_filter_ui(columns)
         self._art_resize_columns()
         self._art_row_label.setText(f"{len(rows)} file(s)")

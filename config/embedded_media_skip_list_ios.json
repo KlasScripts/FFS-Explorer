@@ -1,0 +1,8 @@
+{
+  "_note": "Databases/plists confirmed not worth scanning for embedded media, on this ONE platform -- hand-maintained via the Process Case dialog's own 'View/Edit List' button, or a file's right-click menu. See embedded_media_skip_list.py.",
+  "version": 1,
+  "platform": "ios",
+  "entries": [
+    "com.toyopagroup.picaboo/Documents/gallery_data_object/*/scdb-27.sqlite3.mom"
+  ]
+}

@@ -1793,6 +1793,8 @@ class ArtifactViewerMixin:
         self._art_record_source_sticky: dict = {}
         self._art_update_worker = None
         self._art_report_view.doubleClicked.connect(self._on_art_report_double_clicked)
+        self._art_report_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._art_report_view.customContextMenuRequested.connect(self._on_art_report_context_menu)
         self._art_report_view.selectionModel().currentRowChanged.connect(
             self._on_art_report_row_selected)
 
@@ -3687,6 +3689,46 @@ class ArtifactViewerMixin:
         self._art_webpage_thumb_renderer = renderer
         renderer.start()
 
+    def _on_art_report_context_menu(self, pos) -> None:
+        """Right-click on the report table. Only the Chat Groups summary
+        has an action so far: Go to Chat."""
+        index = self._art_report_view.indexAt(pos)
+        if getattr(self, '_art_chat_summary', None) is None or not index.isValid():
+            return
+        menu = QMenu(self._art_report_view)
+        go = menu.addAction("Go to Chat")
+        go.setToolTip("Select this chat under Chat Groups and show its messages")
+        go.triggered.connect(lambda _=False, ix=index: self._art_go_to_chat_at(ix))
+        menu.exec(self._art_report_view.viewport().mapToGlobal(pos))
+
+    def _art_go_to_chat_at(self, index) -> None:
+        """Open the chat on *index*'s row of the Chat Groups summary: select
+        it in the Device Artifacts tree (unfolding the sidebar and expanding
+        its Chat Groups folder) and show its messages in the table. Owner
+        request 2026-10-24; double-click does the same."""
+        summary = getattr(self, '_art_chat_summary', None)
+        if summary is None or not index.isValid():
+            return
+        script_name, keys = summary
+        key, name = keys[self._art_table_model._rowids[index.row()]]
+        if not self._art_sidebar_open.isVisible():
+            self._set_art_sidebar_folded(False)
+        role = f"{_ART_CHAT}{script_name}\x1f{key}"
+        m = self._art_tree_model
+        hits = m.match(m.index(0, 0), Qt.ItemDataRole.UserRole, role, 1,
+                       Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
+        label = f"{name} ("
+        if hits:
+            tree_ix = hits[0]
+            parent = tree_ix.parent()
+            while parent.isValid():
+                self._art_tree_view.expand(parent)
+                parent = parent.parent()
+            self._art_tree_view.setCurrentIndex(tree_ix)
+            self._art_tree_view.scrollTo(tree_ix)
+            label = tree_ix.data()
+        self._art_show_chat(script_name, key, label)
+
     def _on_art_report_double_clicked(self, index):
         """Open the full-size image / video-player dialog for a
         media-column cell, and switch the Hex panel's toggle to
@@ -3701,12 +3743,8 @@ class ArtifactViewerMixin:
         row selection changes, instead of it blocking the report table —
         a second double-click while one is already open reuses that same
         window (load_content + raise) rather than stacking another."""
-        summary = getattr(self, '_art_chat_summary', None)
-        if summary is not None and index.isValid():
-            script_name, keys = summary
-            row = self._art_table_model._rowids[index.row()]
-            key, name = keys[row]
-            self._art_show_chat(script_name, key, f"{name} (")
+        if getattr(self, '_art_chat_summary', None) is not None and index.isValid():
+            self._art_go_to_chat_at(index)
             return
         if index.column() not in self._art_table_model.media_columns():
             return

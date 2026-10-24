@@ -215,8 +215,20 @@ chat_groups = {"key": "raw_chat_id",          # column identifying the conversat
                "members": "chat_members",     # everyone in the chat (see below)
                "type": "chat_type",           # "Group" / "1:1" / "Channel"... per row
                "deleted": {"recovered": ["True"], "deleted_at": "*"},
-               "call_pattern": r"^\[Call\]"}  # regex on the text; omit if no calls
+               "call_pattern": r"^\[Call\]",  # regex on the text; omit if no calls
+               # deletion / disappearing messages (iOS WhatsApp declares these):
+               "sort": "chat_sort", "issued": "chat_issued",   # position + chat counter
+               "setting": "disappearing_setting",               # "Off" / "7 days" on change rows
+               "expires": "disappears_at",                      # per-message expiry
+               "deleted_for_everyone": "deleted_for_everyone"}  # "... (by me)" / "(by them)"
 ```
+
+With `sort`/`issued`/`setting`, the summary adds: Issued / Present, Missing
+(Gaps), Missing At End, Deletion Windows, Deleted For Everyone (Me/Them),
+Disappearing, Set By, Set At, Setting History, Missing Consistent With Timer,
+Missing Not Explained. State each field's validation status (published /
+observed / not published) in the parser's `description`, as `ios/whatsapp.py`
+does.
 
 The summary table's columns: Chat, Type, Participants (the device owner, then
 everyone in the chat), Messages, Incoming, Outgoing, Media In, Media Out,

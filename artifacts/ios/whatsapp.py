@@ -32,7 +32,8 @@ description = ("Messages from WhatsApp's local iOS store (ChatStorage.sqlite, "
               "pattern) but isn't independently confirmed the way Apple's "
               "own documented iMessage reaction-type enum was for the SMS "
               "report."
-              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from ZWAGROUPMEMBER (\"(inactive)\" = ZISACTIVE 0); the owner's JID from incoming messages' ZTOJID. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from ZWAGROUPMEMBER (\"(inactive)\" = ZISACTIVE 0); the owner's JID from incoming messages' ZTOJID. This is membership as at extraction, not at the time of any message, so no message row claims who received it."
+              " Validation of the deletion / disappearing-messages fields (2026-10-24): [PUBLISHED + VERIFIED] chat_sort (ZSORT) is the message's position in its chat; a missing number means a message removed on this device with no placeholder (Belkasoft; matches the documented 'delete for me' on the IOS17 test image exactly). [PUBLISHED + OBSERVED] chat_issued (ZWACHATSESSION.ZMESSAGECOUNTER) is the number of messages ever numbered in the chat (Belkasoft: 'the number of messages exchanged'); it was not reduced by the IOS17 deletion. Behaviour after 'Clear chat' is NOT tested. [PUBLISHED + OBSERVED] disappears_at (ZWAMESSAGE.ZMESSAGEERRORSTATUS) is the message's expiry time when disappearing messages applied (Heath et al. 2023, Forensic Science International: Digital Investigation 46, Fig. 5; on CTF23 every message after the setting change expires exactly 90 days after it was sent). [COMMUNITY TOOL + OBSERVED] message type 14 is a 'deleted for everyone' placeholder (WhatsApp-Chat-Exporter; one CTF23 example followed by 'Sorry wrong pic'). [OBSERVED ONLY — NOT PUBLISHED] message type 28 is a disappearing-messages setting change, ZISFROMME on it says who made it, and field 36 of its media item's ZMETADATA is the timer in seconds: seen twice on CTF23 (90 days by the owner, 7 days by the contact), consistent with the expiry times and with the contact's later messages having expired before acquisition; no paper, blog, iLEAPP or ALEAPP decodes it, and a 'turned off' event has not been seen. In the Chat Groups summary, 'Missing Consistent With Timer' is certain for gaps (the surviving message after a gap bounds when the missing ones were sent) but only 'consistent with' for messages missing at the end, whose send time is unknown; 'Missing Not Explained' means no timer applied, i.e. removed on this device by other means.")
 # WhatsApp's own container (Containers/Data/Application/<GUID>/…) does not
 # hold ChatStorage.sqlite — it lives in the app's SHARED container instead
 # (confirmed against a real extraction's guid_to_bundle map). This exact
@@ -96,7 +97,8 @@ record_source = [
 # columns) — so they're kept out of the Report table. raw_message_id and
 # source_table stay visible: raw_message_id is the row's OWN id, not a
 # joined table's, and source_table is a citation label, not a raw key.
-hidden_fields = ["chat_members", "raw_chat_id", "raw_group_member_id", "raw_media_item_id", "thumbnail_link"]
+hidden_fields = ["chat_members", "raw_chat_id", "raw_group_member_id", "raw_media_item_id", "thumbnail_link",
+                 "chat_sort", "chat_issued"]
 # Linked Report: the media file, and its separate .thumb file when the row
 # also has a full-size file (ZXMPPTHUMBPATH; all 12 on IOS17 and 7 on CTF23
 # exist in the archive, 2026-10-23).
@@ -113,7 +115,7 @@ recoverable_tables = ["ZWAMESSAGE"]
 # Core Data TIMESTAMP columns are Cocoa/Mac epoch SECONDS (not iOS SMS's
 # nanosecond variant — that's message.date specifically, not a general
 # Core Data convention).
-timestamp_fields = {"timestamp": "cocoa_s", "ZMESSAGEDATE": "cocoa_s"}
+timestamp_fields = {"timestamp": "cocoa_s", "ZMESSAGEDATE": "cocoa_s", "disappears_at": "cocoa_s"}
 
 # "attachment_path" holds an archive ui_path (never a filesystem path) to
 # the message's media file, painted as a thumbnail in the Report table and
@@ -141,6 +143,7 @@ media_fields = ["attachment_path"]
 # table, drawn from Apple's own documented enum).
 _MESSAGE_TYPE_LABELS = {
     1: "[Media attachment — no caption text stored in this table]",
+    14: "[Deleted for everyone — content not kept]",
     59: "[System event, type 59 — in this dataset always immediately "
         "adjacent to a call mentioned in ground truth, but not "
         "independently confirmed against a documented enum]",
@@ -149,7 +152,57 @@ _MESSAGE_TYPE_LABELS = {
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"]}, "type": "chat_type"}
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"], "deleted_for_everyone": "*"}, "type": "chat_type",
+               # deletion / disappearing-messages activity (see description: Validation)
+               "sort": "chat_sort", "issued": "chat_issued", "expires": "disappears_at",
+               "setting": "disappearing_setting", "deleted_for_everyone": "deleted_for_everyone"}
+
+
+def _duration_label(seconds):
+    if not seconds:
+        return "Off"
+    for n, unit in ((86400, "day"), (3600, "hour")):
+        if seconds % n == 0:
+            k = seconds // n
+            return f"{k} {unit}{'s' if k != 1 else ''}"
+    return f"{seconds} seconds"
+
+
+def _metadata_field(blob, field):
+    """Varint *field* from a ZMETADATA protobuf blob, or None."""
+    if not isinstance(blob, (bytes, bytearray)):
+        return None
+    pos, end = 0, len(blob)
+
+    def varint(p):
+        v, shift = 0, 0
+        while p < end:
+            b = blob[p]; p += 1
+            v |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return v, p
+            shift += 7
+        raise ValueError
+    try:
+        while pos < end:
+            tag, pos = varint(pos)
+            num, wire = tag >> 3, tag & 7
+            if wire == 0:
+                v, pos = varint(pos)
+                if num == field:
+                    return v
+            elif wire == 2:
+                n, pos = varint(pos)
+                pos += n
+            elif wire == 1:
+                pos += 8
+            elif wire == 5:
+                pos += 4
+            else:
+                return None
+    except (ValueError, IndexError):
+        return None
+    return None
 
 def _recipient_context(conn):
     """Who a message went to, from ChatStorage itself (2026-10-24):
@@ -225,6 +278,10 @@ def run(paths):
             m.ZMESSAGETYPE  AS message_type,
             m.ZGROUPEVENTTYPE AS group_event_type,
             m.ZMESSAGEDATE  AS msg_date,
+            m.ZSORT         AS zsort,
+            m.ZMESSAGEERRORSTATUS AS expires_at,
+            c.ZMESSAGECOUNTER AS chat_counter,
+            med.ZMETADATA   AS media_metadata,
             m.ZFROMJID      AS from_jid,
             m.ZTOJID        AS to_jid,
             m.ZTEXT         AS text,
@@ -258,6 +315,11 @@ def run(paths):
 
         body = r["text"] or _MESSAGE_TYPE_LABELS.get(
             r["message_type"], f"[No text — message type {r['message_type']}]")
+        if r["message_type"] == 28:
+            secs = _metadata_field(r["media_metadata"], 36)
+            body = (f"[Disappearing messages {'turned off' if secs == 0 else 'set to ' + _duration_label(secs)}"
+                    f" by {'me' if r['is_from_me'] else 'the other party'} — decoded, see Validation]"
+                    if secs is not None else "[Disappearing-messages setting change — timer not decoded]")
 
         # ZXMPPTHUMBPATH fallback: confirmed on a real extraction as a
         # genuine, complete JPEG under the same "Message/" base as the
@@ -280,6 +342,15 @@ def run(paths):
             "thumbnail_link": (f"{app_base}/Message/{r['media_thumb_path']}"
                                if app_base and r["media_thumb_path"]
                                and r["media_thumb_path"] != local_path else ""),
+            # Deletion / disappearing-messages activity — validation status
+            # of each field is in `description` (Validation section).
+            "disappears_at": r["expires_at"] if r["expires_at"] else None,
+            "disappearing_setting": (_duration_label(_metadata_field(r["media_metadata"], 36) or 0)
+                                     if r["message_type"] == 28 else ""),
+            "deleted_for_everyone": ((f"Deleted for everyone (by {'me' if r['is_from_me'] else 'them'})")
+                                     if r["message_type"] == 14 else ""),
+            "chat_sort": r["zsort"],
+            "chat_issued": r["chat_counter"],
             "raw_message_id": r["message_id"],
             "raw_chat_id": r["chat_id"],
             "raw_group_member_id": r["group_member_row_id"],

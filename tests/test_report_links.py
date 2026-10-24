@@ -71,3 +71,29 @@ def test_android_whatsapp_chat_type():
     assert wa._chat_type('628976424828-1512149678@g.us') == 'Group'
     assert wa._chat_type('19199282177@s.whatsapp.net') == '1:1'
     assert wa._chat_type(None) == ''
+
+
+def test_ios_whatsapp_disappearing_metadata():
+    wa = _parser('ios', 'whatsapp')
+    # the two real CTF23 ZMETADATA blobs on message type 28
+    assert wa._metadata_field(bytes.fromhex('a00280ceda03'), 36) == 90 * 86400
+    assert wa._metadata_field(bytes.fromhex('a00280f524e80200'), 36) == 7 * 86400
+    assert wa._metadata_field(b'not protobuf \xff', 36) is None
+    assert wa._duration_label(7 * 86400) == '7 days' and wa._duration_label(0) == 'Off'
+
+
+def test_deletion_activity_columns():
+    import os
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    from artifact_viewer import _deletion_activity
+    fmt = lambda t: str(t)
+    day = 86400
+    base = {'dfe_me': 0, 'dfe_them': 0, 'expiry_seen': False, 'has_sort': True, 'has_setting': True}
+    # IOS17 Liz Dehner shape: one gap, no timer -> not explained
+    liz = {**base, 'seq': [(22, 100), (23, 200), (25, 300)], 'issued': 26, 'settings': []}
+    r = _deletion_activity(liz, 10 * day, fmt, 'Liz')
+    assert r[0] == '26 / 3' and r[1] == 1 and r[2] == 0 and r[9] == 0 and r[10] == 1
+    # CTF23 Felix Davey shape: 7-day timer set by the other party, 6 missing at end
+    felix = {**base, 'seq': [(1, 0), (2, 0)], 'issued': 9, 'settings': [(0, False, 7 * day)]}
+    r = _deletion_activity(felix, 26 * day, fmt, 'Felix')
+    assert r[2] == 6 and r[5] == 'On (7 days)' and r[6] == 'Other party' and r[9] == 6 and r[10] == 0

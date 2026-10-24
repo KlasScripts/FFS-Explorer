@@ -550,6 +550,109 @@ _ART_SCRIPT = "__art_script__:"
 _ART_SOURCE = "__art_source__:"
 _ART_FILES  = "__art_files__:"
 _ART_VALIDATION = "__art_validation__:"
+def _duration_seconds(label) -> int | None:
+    """'Off' -> 0, '7 days' -> 604800, '24 hours' -> 86400, '90 seconds' -> 90."""
+    import re as _re
+    text = str(label or '').strip()
+    if text.lower() == 'off':
+        return 0
+    m = _re.match(r'^(\d+)\s+(day|hour|second)s?$', text)
+    if not m:
+        return None
+    return int(m.group(1)) * {'day': 86400, 'hour': 3600, 'second': 1}[m.group(2)]
+
+
+def _deletion_activity(c, ref, fmt, name) -> tuple:
+    """The Chat Groups summary's deletion / disappearing-messages columns
+    for one chat (owner request, 2026-10-24). Blank where the report has no
+    such data (only iOS WhatsApp declares sort/issued).
+
+    - Missing (Gaps): numbers absent between surviving messages; each gap's
+      window = the surviving messages either side.
+    - Missing At End: issued - 1 - highest surviving number (the counter is
+      the next number to use; observed, not tested after "Clear chat").
+    - Missing Consistent With Timer: for a gap, disappearing messages was on
+      (same setting) at both ends of its window and even a message sent at
+      the window's end would have expired by *ref* (the acquisition time,
+      else the newest message) — the window bounds the send time, so this
+      holds for every message in the gap. For Missing At End there is no
+      such bound (a message sent just before acquisition would not have
+      expired yet): counted here when the timer was on after the last
+      surviving message and that message's own expiry is before *ref* —
+      consistent with expiry, not proof of it.
+    - Missing Not Explained: the timer was off at both ends (or, at the end,
+      off after the last message with no later change): removed on this
+      device by other means (e.g. "delete for me"). Anything else is left
+      out of both columns."""
+    def timer_at(t):
+        val, who, when = 0, None, None
+        for st, out, secs in sorted((x for x in c['settings'] if x[0] is not None), key=lambda x: x[0]):
+            if t is None or st <= t:
+                val, who, when = secs or 0, out, st
+        return val, who, when
+
+    dfe = f"{c['dfe_me']}/{c['dfe_them']}" if (c['dfe_me'] or c['dfe_them']) else ''
+    settings = sorted((x for x in c['settings'] if x[0] is not None), key=lambda x: x[0])
+    if settings:
+        cur, who, when = settings[-1][2], settings[-1][1], settings[-1][0]
+        disappearing = 'Off' if not cur else f"On ({_duration_label(cur)})"
+        set_by, set_at = ('Me' if who else 'Other party'), fmt(when)
+        history = '; '.join(f"{fmt(t)} {'Me' if o else 'Other party'}: "
+                            f"{'Off' if not v else _duration_label(v)}" for t, o, v in settings)
+    elif c.get('expiry_seen'):
+        disappearing, set_by, set_at, history = 'On (from expiry times; change not found)', '', '', ''
+    elif c.get('has_setting'):
+        disappearing, set_by, set_at, history = 'No change recorded', '', '', ''
+    else:
+        disappearing = set_by = set_at = history = ''
+    if not c.get('has_sort'):
+        return ('', '', '', '', dfe, disappearing, set_by, set_at, history, '', '')
+
+    seq = sorted(c['seq'])
+    present = len(seq)
+    issued = c['issued']
+    explained = unexplained = 0
+    gaps, windows = 0, []
+
+    def judge(n, t1, t2):
+        nonlocal explained, unexplained
+        d1, _, _ = timer_at(t1)
+        d2, _, _ = timer_at(t2)
+        if d1 and d1 == d2 and ref and t2 is not None and t2 + d1 <= ref:
+            explained += n
+        elif not d1 and not d2:
+            unexplained += n
+    for (s1, t1), (s2, t2) in zip(seq, seq[1:]):
+        if s2 - s1 > 1:
+            n = s2 - s1 - 1
+            gaps += n
+            windows.append(f"{n} between {fmt(t1)} and {fmt(t2)}")
+            judge(n, t1, t2)
+    at_end = ''
+    if issued and seq:
+        at_end = max(0, issued - 1 - seq[-1][0])
+        if at_end:
+            last_t = seq[-1][1]
+            d, _, _ = timer_at(last_t)
+            if d and ref and last_t is not None and last_t + d <= ref:
+                explained += at_end
+            elif not d and not any(x[0] and last_t and x[0] > last_t for x in settings):
+                unexplained += at_end
+    shown = '; '.join(windows[:3]) + (f"; … {len(windows) - 3} more" if len(windows) > 3 else '')
+    return (f"{issued or '?'} / {present}", gaps, at_end, shown, dfe, disappearing, set_by,
+            set_at, history, explained, unexplained)
+
+
+def _duration_label(seconds) -> str:
+    if not seconds:
+        return 'Off'
+    for n, unit in ((86400, 'day'), (3600, 'hour')):
+        if seconds % n == 0:
+            k = seconds // n
+            return f"{k} {unit}{'s' if k != 1 else ''}"
+    return f"{seconds} seconds"
+
+
 _ART_CHATS = "__art_chats__:"      # "Chat Groups (N)" folder: shows the whole report
 _ART_CHAT  = "__art_chat__:"       # one chat: <script>\x1f<key> — the report scoped to it
 
@@ -2415,6 +2518,14 @@ class ArtifactViewerMixin:
                          non-empty value other than False/0)
           type           column saying "Group"/"1:1"/... per row (most common
                          value per chat); without it, >1 other person = group
+          sort / issued  per-message position in its chat and the chat's
+                         "messages ever numbered" counter (iOS WhatsApp):
+                         gaps, missing-at-end and deletion windows
+          setting        column with a disappearing-messages change on that
+                         row ("Off" / "7 days" ...); its direction = who
+          expires        column with a message's expiry time (unit from
+                         timestamp_fields)
+          deleted_for_everyone  placeholder text "... (by me)" / "(by them)"
           call_pattern   regex on the message text marking a call event;
                          absent = the report holds no calls (Calls blank)
         Keys of each dict: key, name, participants, people (count), messages,
@@ -2446,6 +2557,9 @@ class ArtifactViewerMixin:
         unit = units.get(time_col) if time_col else None
         deleted = decl.get('deleted') or {}
         type_col = decl.get('type')
+        sort_col, issued_col = decl.get('sort'), decl.get('issued')
+        setting_col, expires_col = decl.get('setting'), decl.get('expires')
+        dfe_col = decl.get('deleted_for_everyone')
         call_re = re.compile(decl['call_pattern']) if decl.get('call_pattern') else None
         url_re = re.compile(r'https?://', re.IGNORECASE)
         link_cols = _cols(getattr(mod, 'link_fields', None) or getattr(mod, 'media_fields', None))
@@ -2461,7 +2575,8 @@ class ArtifactViewerMixin:
                     return []
                 want = [c for c in dict.fromkeys(
                     [key_col, dir_col, msg_col, time_col, members_col, *names, *senders,
-                     *media_cols, *deleted, *link_cols, type_col])
+                     *media_cols, *deleted, *link_cols, type_col, sort_col, issued_col,
+                     setting_col, expires_col, dfe_col])
                         if c and c in cols]
                 rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in want)
                                     + f' FROM "artifact_{script_name}"').fetchall()
@@ -2479,6 +2594,8 @@ class ArtifactViewerMixin:
                 'messages': 0, 'incoming': 0, 'outgoing': 0, 'media_in': 0, 'media_out': 0,
                 'deleted': 0, 'calls': 0 if call_re else None, 'links': 0, 'bookmarked': 0,
                 'types': collections.Counter(), 'me': {}, 'notes': {},
+                'seq': [], 'issued': None, 'settings': [], 'dfe_me': 0, 'dfe_them': 0,
+                'expiry_seen': False,
                 'times': [], 'first': None, 'last_in': None, 'last_out': None})
             c['messages'] += 1
             if _get(r, type_col):
@@ -2519,6 +2636,22 @@ class ArtifactViewerMixin:
             if (any(_get(r, m) for m in media_cols) or (prefixes and text.startswith(prefixes))):
                 c['media_out' if out else 'media_in'] += 1
             ts = _epoch_seconds(_get(r, time_col), unit) if unit else None
+            if sort_col:
+                try:
+                    c['seq'].append((int(_get(r, sort_col)), ts))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    c['issued'] = max(c['issued'] or 0, int(_get(r, issued_col)))
+                except (TypeError, ValueError):
+                    pass
+            if setting_col and _get(r, setting_col):
+                c['settings'].append((ts, out, _duration_seconds(_get(r, setting_col))))
+            if expires_col and _get(r, expires_col) not in (None, '', '0'):
+                c['expiry_seen'] = True
+            dfe = str(_get(r, dfe_col) or '') if dfe_col else ''
+            if dfe:
+                c['dfe_me' if '(by me)' in dfe else 'dfe_them'] += 1
             if ts:
                 c['times'].append(ts)
                 c['first'] = ts if c['first'] is None else min(c['first'], ts)
@@ -2535,7 +2668,9 @@ class ArtifactViewerMixin:
                 'type': c['types'].most_common(1)[0][0] if c['types'] else None,
                 **{k: c[k] for k in ('messages', 'incoming', 'outgoing', 'media_in',
                                      'media_out', 'deleted', 'calls', 'links', 'bookmarked',
-                                     'times', 'first', 'last_in', 'last_out')}})
+                                     'times', 'first', 'last_in', 'last_out', 'seq', 'issued',
+                                     'settings', 'dfe_me', 'dfe_them', 'expiry_seen')},
+                'has_sort': bool(sort_col), 'has_setting': bool(setting_col)})
         result.sort(key=lambda d: str(d['name']).casefold())
         return result
 
@@ -2569,7 +2704,10 @@ class ArtifactViewerMixin:
                 ref, ref_label = newest, f"30 days before the newest message ({fmt(newest)})"
         columns = ["Chat", "Type", "Participants", "Messages", "Incoming", "Outgoing",
                    "Media In", "Media Out", "Deleted", "Calls", "Links", "Bookmarked",
-                   "Last 30 Days", "First Message", "Last Received", "Last Sent"]
+                   "Last 30 Days", "First Message", "Last Received", "Last Sent",
+                   "Issued / Present", "Missing (Gaps)", "Missing At End", "Deletion Windows",
+                   "Deleted For Everyone (Me/Them)", "Disappearing", "Set By", "Set At",
+                   "Setting History", "Missing Consistent With Timer", "Missing Not Explained"]
         rows = []
         for c in chats:
             recent = (sum(1 for t in c['times'] if ref - 30 * 86400 <= t <= ref)
@@ -2577,11 +2715,12 @@ class ArtifactViewerMixin:
             kind = c['type'] or ("Group" if c['people'] > 1 else "1:1")
             if kind == "Group" and c['people']:
                 kind = f"Group ({c['people']})"
+            act = _deletion_activity(c, ref, fmt, c['name'])
             rows.append((c['name'], kind, c['participants'], c['messages'], c['incoming'],
                          c['outgoing'], c['media_in'], c['media_out'], c['deleted'],
                          '' if c['calls'] is None else c['calls'], c['links'],
                          c['bookmarked'], recent, fmt(c['first']), fmt(c['last_in']),
-                         fmt(c['last_out'])))
+                         fmt(c['last_out']), *act))
         self._cancel_art_filter_worker()
         self._art_scope = None
         self._art_table_model.load_rows(columns, rows)
@@ -2591,6 +2730,8 @@ class ArtifactViewerMixin:
         self._art_row_label.setText(
             f"{label}: {len(rows):,} {'chat' if len(rows) == 1 else 'chats'} — double-click one "
             f"to open it — Participants = everyone in the chat as at extraction"
+            + (" — Deletion/disappearing columns: validation status in this report's Notes"
+               if decl.get('sort') or decl.get('setting') else "")
             + (f" — Last 30 Days = {ref_label}" if ref_label else ""))
         self._art_stack.setCurrentIndex(1)
         self._art_chat_summary = (script_name, [(c['key'], c['name']) for c in chats])

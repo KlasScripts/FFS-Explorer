@@ -8,7 +8,7 @@ description = ("Messages from Viber's local database (viber_messages, table "
               "db, WAL, or SHM files, checked rather than assumed. Field-by-"
               "field validated against documented ground truth; no known "
               "reliability issues."
-              " Recipients (added 2026-10-24): who each message went to, from participants (participant_type 0 is the device owner). Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from participants (participant_type 0 is the device owner). This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.viber.voip"
 files = {
     "viber_messages": "databases/viber_messages",
@@ -51,7 +51,7 @@ timestamp_fields = {"timestamp": "ms", "msg_date": "ms"}
 # number, already folded into the visible sender/conversation fields) is
 # similarly not given its own entry — reaching it needs a second hop
 # (participants.participant_info_id) not currently carried per output row.
-hidden_fields = ["raw_participant_id", "media_link"]
+hidden_fields = ["chat_members", "raw_participant_id", "media_link"]
 # Linked Report: the media file a message refers to. messages.extra_uri is
 # either a MediaStore URI or Viber's own internal_files URI wrapping one in
 # base64; it is resolved to the file through MediaStore's database
@@ -100,7 +100,7 @@ _CALL_LABELS = {
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "deleted": {"recovered": ["True"]}, "call_pattern": r"^\[(Outgoing|Incoming|Missed) (audio|video) call", "type": "chat_type"}
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"]}, "call_pattern": r"^\[(Outgoing|Incoming|Missed) (audio|video) call", "type": "chat_type"}
 
 def run(paths):
     from artifact_runner import first_nonempty, missing_ref_label, open_db_readonly
@@ -208,17 +208,14 @@ def run(paths):
 
         direction = {0: "Incoming", 1: "Outgoing"}.get(r["send_type"], r["send_type"])
         others = convo_others.get(r["conversation_id"], {})
-        if r["send_type"] == 1:
-            recipients = ", ".join(others.values()) or "[conversation members not recorded]"
-        else:
-            sender_info = info_by_participant_row.get(r["participant_id"])
-            recipients = ", ".join([owner_label] + [n for i, n in others.items() if i != sender_info])
+        # everyone in the conversation (Chat Groups summary only), as at extraction
+        chat_members = ", ".join([owner_label] + list(others.values()))
 
         out.append({
             "conversation": conversation,
             "timestamp": r["msg_date"],
             "sender": sender,
-            "recipients": recipients,
+            "chat_members": chat_members,
             "chat_type": "Group" if len(convo_others.get(r["conversation_id"], {})) > 1 else "1:1",
             "direction": direction,
             "message": body,

@@ -32,7 +32,7 @@ description = ("Messages from WhatsApp's local iOS store (ChatStorage.sqlite, "
               "pattern) but isn't independently confirmed the way Apple's "
               "own documented iMessage reaction-type enum was for the SMS "
               "report."
-              " Recipients (added 2026-10-24): who each message went to, from ZWAGROUPMEMBER (\"(inactive)\" = ZISACTIVE 0); the owner's JID from incoming messages' ZTOJID. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from ZWAGROUPMEMBER (\"(inactive)\" = ZISACTIVE 0); the owner's JID from incoming messages' ZTOJID. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 # WhatsApp's own container (Containers/Data/Application/<GUID>/…) does not
 # hold ChatStorage.sqlite — it lives in the app's SHARED container instead
 # (confirmed against a real extraction's guid_to_bundle map). This exact
@@ -96,7 +96,7 @@ record_source = [
 # columns) — so they're kept out of the Report table. raw_message_id and
 # source_table stay visible: raw_message_id is the row's OWN id, not a
 # joined table's, and source_table is a citation label, not a raw key.
-hidden_fields = ["raw_chat_id", "raw_group_member_id", "raw_media_item_id", "thumbnail_link"]
+hidden_fields = ["chat_members", "raw_chat_id", "raw_group_member_id", "raw_media_item_id", "thumbnail_link"]
 # Linked Report: the media file, and its separate .thumb file when the row
 # also has a full-size file (ZXMPPTHUMBPATH; all 12 on IOS17 and 7 on CTF23
 # exist in the archive, 2026-10-23).
@@ -149,7 +149,7 @@ _MESSAGE_TYPE_LABELS = {
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "deleted": {"recovered": ["True"]}, "type": "chat_type"}
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"]}, "type": "chat_type"}
 
 def _recipient_context(conn):
     """Who a message went to, from ChatStorage itself (2026-10-24):
@@ -186,7 +186,7 @@ def _recipient_context(conn):
 
 
 def _who(jid, names, fallback=None):
-    """One form for a person in both the sender and recipients columns:
+    """One form for a person in both the sender column and the chat member list:
     "Name (jid)" when a name is known, else the jid."""
     name = names.get(jid) or fallback
     if jid and name:
@@ -194,20 +194,19 @@ def _who(jid, names, fallback=None):
     return jid or name or ""
 
 
-def _recipients(r, owner_jid, names, members):
-    def who(jid):
-        return _who(jid, names)
+def _chat_members(r, owner_jid, names, members):
+    """Everyone in the chat (for the Chat Groups summary only): the device
+    owner, then the 1:1 partner or every ZWAGROUPMEMBER of the session
+    ("(inactive)" = ZISACTIVE 0) — membership as at extraction, never a
+    claim about who received a particular message."""
     me = f"Me ({owner_jid})" if owner_jid else "Me"
     if r["session_type"] == 0:                       # 1:1
-        return me if not r["is_from_me"] else who(r["contact_jid"] or r["to_jid"] or "")
+        partner = r["contact_jid"] or r["to_jid"]
+        return ", ".join([me] + ([_who(partner, names)] if partner else []))
     listed = [(j, a) for j, a in members.get(r["chat_id"], []) if j != owner_jid]
-    sender = r["group_member_jid"]
-    others = [who(j) + ("" if a else " (inactive)") for j, a in listed if j != sender]
-    if not r["is_from_me"]:
-        return ", ".join([me] + others)
-    if listed:
-        return ", ".join(others)
-    return "[group members not recorded]" if r["session_type"] == 1 else ""
+    if not listed:
+        return f"{me}, [group members not recorded]" if r["session_type"] == 1 else me
+    return ", ".join([me] + [_who(j, names) + ("" if a else " (inactive)") for j, a in listed])
 
 
 def run(paths):
@@ -273,7 +272,7 @@ def run(paths):
             "conversation": conversation,
             "timestamp": r["msg_date"],
             "sender": sender,
-            "recipients": _recipients(r, owner_jid, jid_names, members),
+            "chat_members": _chat_members(r, owner_jid, jid_names, members),
             "chat_type": {0: "1:1", 1: "Group", 2: "Broadcast", 3: "Status"}.get(r["session_type"], ""),
             "direction": "Sent" if r["is_from_me"] else "Received",
             "message": body,

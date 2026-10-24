@@ -48,24 +48,21 @@ def test_viber_extra_uri_decoding():
     assert viber._media_uri(None) == ''
 
 
-def test_ios_whatsapp_recipients():
+def test_ios_whatsapp_chat_members():
+    """Everyone in the chat, as at extraction (no per-message recipients)."""
     wa = _parser('ios', 'whatsapp')
     names = {'111@s.whatsapp.net': 'Liz', '222@s.whatsapp.net': 'Ed'}
     members = {7: [('999@s.whatsapp.net', 1), ('111@s.whatsapp.net', 1), ('222@s.whatsapp.net', 0)]}
     base = {'chat_id': 7, 'contact_jid': None, 'to_jid': None, 'group_member_jid': None}
     one = {**base, 'session_type': 0, 'contact_jid': '111@s.whatsapp.net'}
-    assert wa._recipients({**one, 'is_from_me': 1}, '999@s.whatsapp.net', names, members) == \
-        'Liz (111@s.whatsapp.net)'
-    assert wa._recipients({**one, 'is_from_me': 0}, '999@s.whatsapp.net', names, members) == \
-        'Me (999@s.whatsapp.net)'
+    for from_me in (0, 1):     # the same for every message of the chat
+        assert wa._chat_members({**one, 'is_from_me': from_me}, '999@s.whatsapp.net', names, members) == \
+            'Me (999@s.whatsapp.net), Liz (111@s.whatsapp.net)'
     group = {**base, 'session_type': 1}
-    assert wa._recipients({**group, 'is_from_me': 1}, '999@s.whatsapp.net', names, members) == \
-        'Liz (111@s.whatsapp.net), Ed (222@s.whatsapp.net) (inactive)'
-    assert wa._recipients({**group, 'is_from_me': 0, 'group_member_jid': '111@s.whatsapp.net'},
-                          '999@s.whatsapp.net', names, members) == \
-        'Me (999@s.whatsapp.net), Ed (222@s.whatsapp.net) (inactive)'
-    assert wa._recipients({**group, 'chat_id': 8, 'is_from_me': 1}, None, names, members) == \
-        '[group members not recorded]'
+    assert wa._chat_members(group, '999@s.whatsapp.net', names, members) == \
+        'Me (999@s.whatsapp.net), Liz (111@s.whatsapp.net), Ed (222@s.whatsapp.net) (inactive)'
+    assert wa._chat_members({**group, 'chat_id': 8}, None, names, members) == \
+        'Me, [group members not recorded]'
 
 
 def test_android_whatsapp_chat_type():

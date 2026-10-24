@@ -15,7 +15,7 @@ description = ("Messages from Burner's primary local message store "
               "already lost entirely — reported separately, not here, because "
               "it's a genuinely different source with a different confidence "
               "level: see the \"Burner — Recovered (MessageEntity)\" report."
-              " Recipients (added 2026-10-24): who each message went to, from always 1:1: the contact, or the burner number the message arrived on. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from always 1:1: the contact, or the burner number the message arrived on. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.adhoclabs.burner"
 files = {
     "messages": "databases/com.adhoclabs.burner.messages.db",
@@ -72,11 +72,11 @@ timestamp_fields = {"timestamp": "ms", "dateCreated": "ms"}
 
 # Linked Report: the cached copy of a message's media (see run()).
 link_fields = ["media_link"]
-hidden_fields = ["media_link"]
+hidden_fields = ["chat_members", "media_link"]
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "conversation", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "deleted": {}, "call_pattern": r"^\[Call\]", "type": "chat_type"}
+chat_groups = {"key": "conversation", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {}, "call_pattern": r"^\[Call\]", "type": "chat_type"}
 
 def run(paths):
     from artifact_runner import missing_ref_label, open_db_readonly
@@ -140,15 +140,13 @@ def run(paths):
                       f"/cache/image_manager_disk_cache/"
                       f"{hashlib.sha256(r['mediaUrl'].encode('utf-8')).hexdigest()}.0")
             media_link = cached if archive_has(paths, cached) else ""
-        # Recipients (2026-10-24): always 1:1 — the contact, or the burner
-        # number the message arrived on (BurnerEntity, by burnerId).
-        if outgoing:
-            recipients = contact_names.get(r["contactId"], r["contactId"] or "[unknown contact]")
-        else:
-            num = own_numbers.get(r["burnerId"])
-            recipients = f"Me (burner {num})" if num else "Me"
+        # Everyone in the chat (Chat Groups summary only): always 1:1 — the
+        # burner number used (BurnerEntity, by burnerId) and the contact.
+        num = own_numbers.get(r["burnerId"])
+        chat_members = ", ".join([f"Me (burner {num})" if num else "Me",
+                                  contact_names.get(r["contactId"], r["contactId"] or "[unknown contact]")])
         out.append({
-            "recipients": recipients,
+            "chat_members": chat_members,
             "chat_type": "1:1",
             "media_link": media_link,
             "conversation": contact_names.get(r["contactId"], r["contactId"]),

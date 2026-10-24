@@ -212,25 +212,27 @@ chat_groups = {"key": "raw_chat_id",          # column identifying the conversat
                "media_prefixes": ["[Media]"], # and/or message-text prefixes
                "message": "message",          # message-text column (default)
                "time": "timestamp",           # unit taken from timestamp_fields
-               "recipients": "recipients",    # who each message went to (see below)
+               "members": "chat_members",     # everyone in the chat (see below)
                "type": "chat_type",           # "Group" / "1:1" / "Channel"... per row
                "deleted": {"recovered": ["True"], "deleted_at": "*"},
                "call_pattern": r"^\[Call\]"}  # regex on the text; omit if no calls
 ```
 
-The summary table's columns: Chat, Type, Participants (senders + recipients,
-device owner excluded), Messages, Incoming, Outgoing, Media In, Media Out,
+The summary table's columns: Chat, Type, Participants (the device owner, then
+everyone in the chat), Messages, Incoming, Outgoing, Media In, Media Out,
 Deleted, Calls (blank when the report holds no calls), Links, Bookmarked (rows
 whose linked files are bookmarked), Last 30 Days (before the acquisition time
 when known, else the newest message), First Message, Last Received, Last Sent.
 
-**Recipients column.** Every messaging parser writes `recipients`: the other
-person (1:1, sent), `Me (<owner's number>)` (received), or the other members
-(group). Take membership and the owner's identity from the app's own database
-or settings, never guess; write one person the same way in `sender` and
-`recipients` (so the summary counts them once); write "[group members not
-recorded]" when the member table is empty; and say in `description` that
-group membership is as at extraction, not at the time of the message.
+**Chat members, not recipients (owner decision, 2026-10-24).** Don't write a
+per-message "recipients" column: group membership changes over time and the
+app's member table is as at extraction, so it can't say who received a given
+message. Write a hidden `chat_members` column instead (the same value on every
+row of a chat): `Me (<owner's number>)` first, then the 1:1 partner or every
+member from the app's own membership data, or "[group members not recorded]".
+Take the owner's identity from the app's database or settings, never guess;
+write each person the same way as in `sender`, so the summary lists them once;
+say in `description` that membership is as at extraction.
 
 **Files named some other way.** Turn what the database stores into an archive
 path, and only link it if `archive_has(paths, ui_path)`:

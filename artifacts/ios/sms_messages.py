@@ -45,7 +45,7 @@ description = ("Messages from iOS's SMS/iMessage database (sms.db, table "
               "entered chat_recoverable_message_join, so it does not get "
               "Delete's 30-40 day recovery window at all; the original "
               "text is gone the moment it's unsent, not gradually."
-              " Recipients (added 2026-10-24): who each message went to, from chat_handle_join; the owner's number from message.destination_caller_id. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from chat_handle_join; the owner's number from message.destination_caller_id. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "mobile/Library/SMS"
 files = {
     "sms": "sms.db",
@@ -107,7 +107,7 @@ media_fields = ["attachment_path"]
 # never really there. Attachment cites only the FIRST attachment on a
 # message with more than one, matching the same "first attachment only"
 # precedent this file's own attachment_path/media_fields already follows.
-hidden_fields = ["raw_attachment_rowid"]
+hidden_fields = ["chat_members", "raw_attachment_rowid"]
 record_source = [
     {"label": "Message", "file_key": "sms", "table": "message",
      "rowid_fields": ["raw_message_id", "ROWID"]},
@@ -151,7 +151,7 @@ def _parse_attributed_body(blob):
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "deleted": {"recovered": ["True"]}, "type": "chat_type"}
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"]}, "type": "chat_type"}
 
 def run(paths):
     mobile_root = paths.get('_ui_path_for', lambda p: p)('mobile')
@@ -226,13 +226,8 @@ def run(paths):
 
         sender = "Me" if r["is_from_me"] else handles.get(
             r["handle_id"], missing_ref_label("handle record", "handle_id", r["handle_id"]))
-        owner = r["destination_caller_id"] or default_owner
         members = chat_members.get(chat_id) or ([chat["chat_identifier"]] if chat else [])
-        if r["is_from_me"]:
-            recipients = ", ".join(members)
-        else:
-            others = [m for m in members if m != handles.get(r["handle_id"])]
-            recipients = ", ".join([f"Me ({owner})" if owner else "Me"] + others)
+        everyone = ", ".join([f"Me ({default_owner})" if default_owner else "Me"] + members)
 
         body = r["text"] or _parse_attributed_body(r["attributedBody"])
 
@@ -257,7 +252,7 @@ def run(paths):
             "conversation": conversation,
             "timestamp": cocoa_ts(r["date"]),
             "sender": sender,
-            "recipients": recipients,
+            "chat_members": everyone,
             "chat_type": "Group" if len(members) > 1 else "1:1",
             "direction": "Sent" if r["is_from_me"] else "Received",
             "message": body,

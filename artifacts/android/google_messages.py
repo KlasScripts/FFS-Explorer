@@ -16,7 +16,7 @@ description = ("Messages from Google Messages' local database (bugle_db, "
               "conversation-level metadata (who, when) for a fully "
               "deleted conversation through a different mechanism — "
               "surviving audit-log tables, not byte carving."
-              " Recipients (added 2026-10-24): who each message went to, from conversation_participants; the owner's own number per message from messages.self_id. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from conversation_participants; the owner's own number per message from messages.self_id. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.google.android.apps.messaging"
 files = {
     "bugle_db": "databases/bugle_db",
@@ -75,7 +75,7 @@ media_fields = ["attachment_path"]
 # same "first cached attachment" precedent this file's own attachment_path
 # already follows; hidden since it's the specific representative part
 # chosen for citation, not a standalone identifier for the row as a whole.
-hidden_fields = ["raw_first_part_id"]
+hidden_fields = ["chat_members", "raw_first_part_id"]
 record_source = [
     {"label": "Message", "file_key": "bugle_db", "table": "messages",
      "rowid_fields": ["raw_message_id", "_id"]},
@@ -90,7 +90,7 @@ record_source = [
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "date", "participants": ["sender"], "recipients": "recipients", "message": "body", "deleted": {}, "type": "chat_type"}
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "date", "participants": ["sender"], "members": "chat_members", "message": "body", "deleted": {}, "type": "chat_type"}
 
 def run(paths):
     from artifact_runner import first_nonempty, open_db_readonly, resolve_path_after_marker
@@ -146,14 +146,20 @@ def run(paths):
             conv_members.setdefault(cid, []).append(pid)
     own_numbers = [v[2] for v in people.values() if v[0] != -2 and v[2]]
     default_me = f"Me ({own_numbers[0]})" if own_numbers else "Me"
+    own_by_conv = {}
+    for cid, sid in conn.execute("SELECT DISTINCT conversation_id, self_id FROM messages"):
+        own = people.get(sid)
+        if own and own[2]:
+            own_by_conv.setdefault(cid, {})[f"Me ({own[2]})"] = None
 
-    def _recipients(r, direction):
+    def _chat_members(r):
+        """Everyone in the conversation (Chat Groups summary only): the
+        owner's number(s) used in it, then conversation_participants — as
+        at extraction, never a claim about one message's recipients."""
         members = conv_members.get(r["conversation_id"], [])
-        if direction == "Sent":
-            return ", ".join(people[p][1] for p in members) or "[conversation members not recorded]"
-        own = people.get(r["self_id"])
-        me = f"Me ({own[2]})" if own and own[2] else default_me
-        return ", ".join([me] + [people[p][1] for p in members if p != r["sender_id"]])
+        mine = own_by_conv.get(r["conversation_id"]) or ([default_me] if default_me else ["Me"])
+        return ", ".join(list(mine) + [people[p][1] for p in members]
+                         or ["[conversation members not recorded]"])
 
     by_message = {}
     order = []
@@ -224,7 +230,7 @@ def run(paths):
             "conversation": r["conv_name"],
             "sender": sender_name,
             "sender_destination": r["sender_dest"],   # raw number/handle — citation, not just resolved name
-            "recipients": _recipients(r, direction),
+            "chat_members": _chat_members(r),
             "chat_type": "Group" if len(conv_members.get(r["conversation_id"], [])) > 1 else "1:1",
             "direction": direction,
             "attachment_path": attachment_path,

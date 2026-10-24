@@ -20,7 +20,7 @@ description = ("Messages from WhatsApp's local database (msgstore.db, "
               "everyone\" tombstone table) was empty on this extraction — "
               "the one documented deletion here was a local-only delete, "
               "which WhatsApp does not appear to route through that table."
-              " Recipients (added 2026-10-24): who each message went to, from group members from group_participant_user; the owner's number from shared_prefs/com.whatsapp_preferences_light.xml (registration_jid). Where a group's member list is empty it says so. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from group members from group_participant_user; the owner's number from shared_prefs/com.whatsapp_preferences_light.xml (registration_jid). Where a group's member list is empty it says so. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.whatsapp"
 files    = {
     "msgstore": "databases/msgstore.db",
@@ -172,7 +172,7 @@ record_source = [
 # message_id and source_table stay visible: message_id is the row's OWN
 # id, not a joined table's, and source_table is a citation label, not a
 # raw key.
-hidden_fields = [
+hidden_fields = ["chat_members", 
     "chat_id", "chat_jid_id", "sender_jid_id",
     "chat_mapped_jid_id", "sender_mapped_jid_id",
     "chat_contact_id", "sender_contact_id",
@@ -215,7 +215,7 @@ link_fields = ["attachment_path", "thumbnail_link"]
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "chat_id", "name": ["chat_subject", "remote_name", "chat_jid"], "sent": ["Sent"], "media": ["attachment_path"], "message": "text", "time": "sent_time", "participants": ["remote_name", "remote_party_jid", "group_sender"], "recipients": "recipients", "deleted": {"recovered": ["True"], "deleted_for_everyone": "*"}, "type": "chat_type"}
+chat_groups = {"key": "chat_id", "name": ["chat_subject", "remote_name", "chat_jid"], "sent": ["Sent"], "media": ["attachment_path"], "message": "text", "time": "sent_time", "participants": ["remote_name", "remote_party_jid", "group_sender"], "members": "chat_members", "deleted": {"recovered": ["True"], "deleted_for_everyone": "*"}, "type": "chat_type"}
 
 def _owner(paths):
     """({own jids}, "Me (<number>)") from com.whatsapp_preferences_light.xml
@@ -275,24 +275,20 @@ def _chat_type(jid):
     return {"g.us": "Group", "newsletter": "Channel", "broadcast": "Broadcast",
             "status": "Status"}.get(server, "1:1")
 
-def _recipients(r, is_group, is_sent, members, owner_jids, owner_label):
+def _chat_members(r, is_group, members, owner_jids, owner_label):
+    """Everyone in the chat (for the Chat Groups summary only): the device
+    owner, then the 1:1 partner or every group_participant_user member —
+    membership as at extraction, never a claim about who received a
+    particular message."""
     if not is_group:
-        if not is_sent:
-            return owner_label
-        return (r["chat_mapped_contact_name"] or r["chat_contact_name"]
-                or (f"{r['chat_mapped_jid_raw']} ({r['chat_mapped_jid_id']})" if r["chat_mapped_jid_raw"] else None)
-                or (f"{r['chat_jid_raw']} ({r['chat_jid_id']})" if r["chat_jid_raw"] else None)
-                or "[chat not recorded]")
-    listed = members.get(r["chat_jid_id"], [])
-    sender_ids = {r["sender_jid_id"], r["sender_mapped_jid_id"]} - {None}
-    sender_jids = {r["sender_jid_raw"], r["sender_mapped_jid_raw"]} - {None}
-    others = [label for uid, jids, label in listed
-              if not (jids & owner_jids) and uid not in sender_ids and not (jids & sender_jids)]
-    if is_sent:
-        return ", ".join(others) if listed else "[group members not recorded]"
+        partner = (r["chat_mapped_contact_name"] or r["chat_contact_name"]
+                   or (f"{r['chat_mapped_jid_raw']} ({r['chat_mapped_jid_id']})" if r["chat_mapped_jid_raw"] else None)
+                   or (f"{r['chat_jid_raw']} ({r['chat_jid_id']})" if r["chat_jid_raw"] else None))
+        return ", ".join([owner_label] + ([partner] if partner else []))
+    listed = [label for uid, jids, label in members.get(r["chat_jid_id"], []) if not (jids & owner_jids)]
     if not listed:
-        return f"{owner_label}, [other group members not recorded]"
-    return ", ".join([owner_label] + others)
+        return f"{owner_label}, [group members not recorded]"
+    return ", ".join([owner_label] + listed)
 
 
 def run(paths):
@@ -421,7 +417,7 @@ def run(paths):
             # it instead of silently dropping the row or leaving a blank subject.
             chat_subject = missing_ref_label("chat record", "chat_row_id", r["raw_chat_row_id"])
 
-        recipients = _recipients(r, is_group, is_sent, members, owner_jids, owner_label)
+        chat_members = _chat_members(r, is_group, members, owner_jids, owner_label)
         records.append({
             "message_id":       r["message_id"],
             "chat_id":          r["chat_id"],
@@ -431,7 +427,7 @@ def run(paths):
             "group_sender":     group_sender,
             "remote_party_jid": remote_jid,
             "remote_name":      remote_name,
-            "recipients":       recipients,
+            "chat_members":     chat_members,
             "chat_type":        _chat_type(r["chat_jid_raw"]),
             # message_type 15 = "deleted for everyone" (a message_revoked
             # row for each one: 204/204 on A15, 2026-10-24)

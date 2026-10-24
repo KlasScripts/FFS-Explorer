@@ -7,7 +7,7 @@ description = ("Messages from GroupMe's local database (groupme.db, table "
               "its live pages found nothing recoverable; a real negative, not "
               "an unexamined gap. Field-by-field validated against documented "
               "ground truth; no known reliability issues."
-              " Recipients (added 2026-10-24): who each message went to, from members (groups) and chats (DMs); the owner is the sender id seen in DMs. Group membership is as at extraction, not at the time of the message: someone who joined later is listed, someone who left may not be.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from members (groups) and chats (DMs); the owner is the sender id seen in DMs. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.groupme.android"
 files = {
     "groupme": "databases/groupme.db",
@@ -47,7 +47,7 @@ timestamp_fields = {"timestamp": "s", "created_at": "s", "deleted_at": "s"}
 # conversation_id itself, and conversation_table (set to "chats" or
 # "groups" per row, since which table conversation_id resolved against
 # varies per message) tells it which table to jump into.
-hidden_fields = ["raw_conversation_rowid", "conversation_table"]
+hidden_fields = ["chat_members", "raw_conversation_rowid", "conversation_table"]
 record_source = [
     {"label": "Message", "file_key": "groupme", "table": "messages",
      "rowid_fields": ["raw_message_id", "_id"]},
@@ -58,7 +58,7 @@ record_source = [
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "recipients": "recipients", "system": ["System"], "deleted": {"recovered": ["True"], "deleted_at": "*"}, "call_pattern": r"\bstarted a call\b|^\[call event\]$", "type": "chat_type"}
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "system": ["System"], "deleted": {"recovered": ["True"], "deleted_at": "*"}, "call_pattern": r"\bstarted a call\b|^\[call event\]$", "type": "chat_type"}
 
 def run(paths):
     import json as _json
@@ -137,16 +137,14 @@ def run(paths):
     me = next((f"Me ({nick})" for g in group_members.values() for uid, nick in g
                if uid == self_id), "Me")
 
-    def _recipients(r, direction):
-        if direction == "System":
-            return ""
+    def _chat_members(r):
+        """Everyone in the conversation (Chat Groups summary only), as at
+        extraction: the owner, then the DM peer or the group's members."""
         cid = r["conversation_id"]
         if cid in dm_peer_ids:
-            return me if direction == "Incoming" else convo_label.get(cid, cid)
-        members = [(u, n) for u, n in group_members.get(cid, []) if u != self_id]
-        if direction == "Outgoing":
-            return ", ".join(n for _, n in members) or "[group members not recorded]"
-        return ", ".join([me] + [n for u, n in members if u != r["sender_id"]])
+            return f"{me}, {convo_label.get(cid, cid)}"
+        members = [n for u, n in group_members.get(cid, []) if u != self_id]
+        return ", ".join([me] + (members or ["[group members not recorded]"]))
 
     rows = conn.execute("""
         SELECT _id, conversation_id, message_id, created_at, sender_id, sender_type,
@@ -199,7 +197,7 @@ def run(paths):
             "conversation": conversation,
             "timestamp": r["created_at"],
             "sender": r["name"] or missing_ref_label("name", "sender_id", r["sender_id"]),
-            "recipients": _recipients(r, direction),
+            "chat_members": _chat_members(r),
             "chat_type": "1:1" if r["conversation_id"] in dm_peer_ids else "Group",
             "direction": direction,
             "message": body,

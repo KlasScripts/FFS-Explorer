@@ -2398,10 +2398,11 @@ class ArtifactViewerMixin:
           name           column(s); first non-empty per row, most common
                          across the chat = its name (group or remote party)
           participants   column(s) naming the sender of an incoming message
-          recipients     column listing who a message went to (", "-separated;
-                         the device owner's own entry starts with "Me");
-                         Participants = senders + recipients, owner excluded,
-                         most frequent first
+          members        column listing everyone in the chat (", "-separated,
+                         the device owner's own entry starts with "Me"), as at
+                         extraction — a property of the chat, not of a message
+                         (owner decision 2026-10-24: no per-message recipients).
+                         Participants = the owner, then members + senders
           direction/sent column and the value(s) meaning sent by the user
           system         direction value(s) of app/system events: counted
                          in Messages only, never as incoming or a participant
@@ -2434,7 +2435,7 @@ class ArtifactViewerMixin:
         key_col = decl['key']
         names = _cols(decl.get('name')) or [key_col]
         senders = _cols(decl.get('participants'))
-        recip_col = decl.get('recipients')
+        members_col = decl.get('members')
         dir_col = decl.get('direction', 'direction')
         sent = set(decl.get('sent', ('Sent', 'Outgoing')))
         system = set(decl.get('system', ()))
@@ -2459,7 +2460,7 @@ class ArtifactViewerMixin:
                 if key_col not in cols:
                     return []
                 want = [c for c in dict.fromkeys(
-                    [key_col, dir_col, msg_col, time_col, recip_col, *names, *senders,
+                    [key_col, dir_col, msg_col, time_col, members_col, *names, *senders,
                      *media_cols, *deleted, *link_cols, type_col])
                         if c and c in cols]
                 rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in want)
@@ -2477,7 +2478,7 @@ class ArtifactViewerMixin:
                 'names': collections.Counter(), 'people': collections.Counter(),
                 'messages': 0, 'incoming': 0, 'outgoing': 0, 'media_in': 0, 'media_out': 0,
                 'deleted': 0, 'calls': 0 if call_re else None, 'links': 0, 'bookmarked': 0,
-                'types': collections.Counter(),
+                'types': collections.Counter(), 'me': {}, 'notes': {},
                 'times': [], 'first': None, 'last_in': None, 'last_out': None})
             c['messages'] += 1
             if _get(r, type_col):
@@ -2507,9 +2508,13 @@ class ArtifactViewerMixin:
                 who = next((_get(r, n) for n in senders if _get(r, n)), '')
                 if who and not str(who).startswith('['):
                     c['people'][who] += 1
-            for who in str(_get(r, recip_col) or '').split(', ') if recip_col else ():
-                if who and not who.startswith(('Me', '[')):
+            for who in str(_get(r, members_col) or '').split(', ') if members_col else ():
+                if who.startswith('Me'):
+                    c['me'][who] = None
+                elif who and not who.startswith('['):
                     c['people'][who] += 1
+                elif who:
+                    c['notes'][who] = None
             text = str(_get(r, msg_col) or '')
             if (any(_get(r, m) for m in media_cols) or (prefixes and text.startswith(prefixes))):
                 c['media_out' if out else 'media_in'] += 1
@@ -2524,7 +2529,8 @@ class ArtifactViewerMixin:
             result.append({
                 'key': key,
                 'name': c['names'].most_common(1)[0][0] if c['names'] else (key or '[no conversation]'),
-                'participants': ', '.join(p for p, _ in c['people'].most_common()),
+                'participants': ', '.join(list(c['me']) + [p for p, _ in c['people'].most_common()]
+                                          + list(c['notes'])),
                 'people': len(c['people']),
                 'type': c['types'].most_common(1)[0][0] if c['types'] else None,
                 **{k: c[k] for k in ('messages', 'incoming', 'outgoing', 'media_in',
@@ -2584,7 +2590,8 @@ class ArtifactViewerMixin:
         label = getattr(mod, 'name', script_name) if mod else script_name
         self._art_row_label.setText(
             f"{label}: {len(rows):,} {'chat' if len(rows) == 1 else 'chats'} — double-click one "
-            f"to open it" + (f" — Last 30 Days = {ref_label}" if ref_label else ""))
+            f"to open it — Participants = everyone in the chat as at extraction"
+            + (f" — Last 30 Days = {ref_label}" if ref_label else ""))
         self._art_stack.setCurrentIndex(1)
         self._art_chat_summary = (script_name, [(c['key'], c['name']) for c in chats])
 

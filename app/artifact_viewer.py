@@ -16,8 +16,9 @@ from PySide6.QtWidgets import (
     QProgressDialog, QMenu, QSpinBox, QDoubleSpinBox, QGroupBox,
     QTextBrowser, QListWidget, QListWidgetItem, QAbstractItemView,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
+from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex, QSettings, QSize
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter
+from PySide6.QtWidgets import QAbstractButton, QSizePolicy, QToolButton
 
 from db_utils import _open_results_db, start_run_log, complete_run_log, load_last_run
 from zip_cd_cache import CachedZipView, load as _zcd_load, is_capture_alias, capture_marker
@@ -1595,6 +1596,55 @@ class AISummaryDialog(QDialog):
             super().closeEvent(event)
 
 
+# Local copy of ffs-explorer.py's QSettings names (app/ modules never import
+# the top-level script; see media_viewer.py's copy).
+_SETTINGS_ORG = "KlasScripts"
+_SETTINGS_APP = "FFS Explorer"
+_SIDEBAR_FOLDED_KEY = 'artifact_sidebar_folded'
+
+
+class _VerticalTab(QAbstractButton):
+    """The folded Device Artifacts sidebar: a full-height strip with »
+    at the top and "Device Artifacts" reading down; click to unfold."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Show Device Artifacts")
+
+    def sizeHint(self) -> QSize:
+        fm = self.fontMetrics()
+        return QSize(fm.height() + 12, fm.horizontalAdvance(self.text()) + 48)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self.sizeHint().width(), 40)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        pal = self.palette()
+        bg = pal.color(pal.ColorRole.Midlight if self.underMouse() else pal.ColorRole.Button)
+        p.fillRect(self.rect(), bg)
+        p.setPen(pal.color(pal.ColorRole.Mid))
+        p.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        p.setPen(pal.color(pal.ColorRole.ButtonText))
+        p.drawText(0, 6, self.width(), 20, Qt.AlignmentFlag.AlignCenter, "»")
+        p.translate(self.width(), 0)
+        p.rotate(90)      # text runs top to bottom, like a book spine
+        p.drawText(32, 0, self.height() - 40, self.width(),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text())
+        p.end()
+
+    def enterEvent(self, event) -> None:
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.update()
+        super().leaveEvent(event)
+
+
 class ArtifactViewerMixin:
     """Mixin providing the Artifact Viewer tab and runner dialog for FastZipBrowser."""
 
@@ -1607,9 +1657,9 @@ class ArtifactViewerMixin:
         self._art_tree_view.setModel(self._art_tree_model)
         self._art_tree_view.setEditTriggers(QTreeView.EditTrigger.NoEditTriggers)
         self._art_tree_view.setSelectionBehavior(QTreeView.SelectionBehavior.SelectRows)
-        self._art_tree_view.setHeaderHidden(False)
-        self._art_tree_view.setMinimumWidth(200)
-        self._art_tree_view.setMaximumWidth(320)
+        # Its title sits in the fold-away row above it (see
+        # _build_art_sidebar), so the tree's own header is hidden.
+        self._art_tree_view.setHeaderHidden(True)
         self._art_tree_view.clicked.connect(self._on_art_tree_clicked)
 
         # ── Right side: stacked widget ────────────────────────────────────────
@@ -1874,15 +1924,82 @@ class ArtifactViewerMixin:
         self._art_stack.addWidget(document_page)            # 6
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._art_tree_view)
+        splitter.addWidget(self._build_art_sidebar())
         splitter.addWidget(self._art_stack)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        self._art_splitter = splitter
+        try:
+            folded = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(
+                _SIDEBAR_FOLDED_KEY, False, type=bool)
+        except Exception:
+            folded = False
+        self._set_art_sidebar_folded(bool(folded), save=False)
 
         tab = QWidget()
         QHBoxLayout(tab).addWidget(splitter)
         tab.layout().setContentsMargins(4, 4, 4, 4)
         return tab
+
+    def _build_art_sidebar(self) -> QWidget:
+        """The Device Artifacts list, foldable to a thin vertical strip to
+        give the report the width (owner request 2026-10-24). Open: a title
+        row with a « button above the tree. Folded: _VerticalTab only."""
+        self._art_sidebar_open = QWidget()
+        open_layout = QVBoxLayout(self._art_sidebar_open)
+        open_layout.setContentsMargins(0, 0, 0, 0)
+        open_layout.setSpacing(2)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(4, 0, 0, 0)
+        title_row.addWidget(QLabel("<b>Device Artifacts</b>"))
+        title_row.addStretch()
+        fold_btn = QToolButton()
+        fold_btn.setText("«")
+        fold_btn.setAutoRaise(True)
+        fold_btn.setToolTip("Fold away Device Artifacts to give the report more room")
+        fold_btn.clicked.connect(lambda: self._set_art_sidebar_folded(True))
+        title_row.addWidget(fold_btn)
+        open_layout.addLayout(title_row)
+        open_layout.addWidget(self._art_tree_view)
+
+        self._art_sidebar_strip = _VerticalTab("Device Artifacts")
+        self._art_sidebar_strip.clicked.connect(lambda: self._set_art_sidebar_folded(False))
+
+        sidebar = QWidget()
+        lay = QHBoxLayout(sidebar)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._art_sidebar_open)
+        lay.addWidget(self._art_sidebar_strip)
+        self._art_sidebar = sidebar
+        self._art_sidebar_width = 240
+        return sidebar
+
+    def _set_art_sidebar_folded(self, folded: bool, save: bool = True) -> None:
+        """Fold or unfold the Device Artifacts sidebar; remembered across
+        sessions. The open width the examiner dragged to is kept."""
+        splitter = self._art_splitter
+        sizes = splitter.sizes()
+        if folded and self._art_sidebar_open.isVisible() and sizes[0] > 0:
+            self._art_sidebar_width = sizes[0]
+        self._art_sidebar_open.setVisible(not folded)
+        self._art_sidebar_strip.setVisible(folded)
+        if folded:
+            w = self._art_sidebar_strip.sizeHint().width()
+            self._art_sidebar.setMinimumWidth(w)
+            self._art_sidebar.setMaximumWidth(w)
+        else:
+            w = self._art_sidebar_width
+            self._art_sidebar.setMinimumWidth(200)
+            self._art_sidebar.setMaximumWidth(320)
+        total = sum(sizes)
+        if total > 0:
+            splitter.setSizes([w, max(total - w, 1)])
+        if save:
+            try:
+                QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(_SIDEBAR_FOLDED_KEY, folded)
+            except Exception:
+                pass
 
     def _finish_artifact_hex_wiring(self) -> None:
         """Connect the shared hex panel's Record/Attachment toggle and the

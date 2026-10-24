@@ -346,6 +346,7 @@ import plistlib
 import re
 import sqlite3
 import sys
+import threading
 import zipfile
 import zlib
 
@@ -506,6 +507,50 @@ def _read_binary_plist_tolerantly(data: bytes):
         return None
 
 
+# nska_deserialize copies an object in again at every reference, stopping
+# only at a loop back to an object it is already inside, so a densely
+# cross-linked archive grows exponentially and never finishes (a Core Data
+# .mom, e.g. Snapchat's scdb-27.sqlite3.mom: 595 objects, still running
+# after minutes; found 2026-10-24). A normal archive needs about one
+# expansion step per object, so a run is stopped once it passes
+# _NSKA_STEPS_PER_OBJECT x its object count (at least _NSKA_MIN_STEPS,
+# about 4 s at the measured ~50,000 steps/s).
+_NSKA_STEPS_PER_OBJECT = 20
+_NSKA_MIN_STEPS = 200_000
+# The library keeps its recursion state in module globals, so only one
+# thread may use it at a time.
+_nska_lock = threading.Lock()
+
+
+class NskaTooComplex(Exception):
+    """An NSKeyedArchiver archive whose expansion went over the budget."""
+
+
+def deserialize_nska_budgeted(data: bytes, n_objects: int):
+    """nska_deserialize.deserialize_plist_from_string with a step budget;
+    raises NskaTooComplex when it runs over."""
+    budget = max(_NSKA_MIN_STEPS, _NSKA_STEPS_PER_OBJECT * n_objects)
+    with _nska_lock:
+        original = nska_deserialize._recurse_create_plist
+        steps = [0]
+
+        def counted(*args):
+            steps[0] += 1
+            if steps[0] > budget:
+                raise NskaTooComplex(f"over {budget:,} expansion steps")
+            return original(*args)
+
+        nska_deserialize._recurse_create_plist = counted
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return nska_deserialize.deserialize_plist_from_string(data)
+        finally:
+            nska_deserialize._recurse_create_plist = original
+            # a run stopped part-way leaves its loop-detection stack behind
+            nska_deserialize.rec_uids = []
+            nska_deserialize.rec_depth = 0
+
+
 def decode_plist_blob(data: bytes):
     """Decode a plist BLOB, transparently unarchiving it first if it's an
     NSKeyedArchiver payload (Apple's standard Objective-C object-archive
@@ -550,9 +595,11 @@ def decode_plist_blob(data: bytes):
         if content is None:
             return None
     if isinstance(content, dict) and content.get('$archiver') == 'NSKeyedArchiver':
+        # None for an archive too cross-linked to expand (see
+        # _NSKA_STEPS_PER_OBJECT); call deserialize_nska_budgeted directly
+        # to tell that apart (NskaTooComplex).
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                return nska_deserialize.deserialize_plist_from_string(data)
+            return deserialize_nska_budgeted(data, len(content.get('$objects') or ()))
         except Exception:
             return None
     return content

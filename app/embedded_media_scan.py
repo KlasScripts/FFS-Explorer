@@ -63,6 +63,7 @@ had part of their bytes reused by SQLite's own page reorganising).
 """
 
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -70,7 +71,8 @@ import sqlite3
 import tempfile
 
 import sqlite_carve as sc
-from artifact_runner import decode_plist_blob, decompress_http_body, open_db_readonly
+from artifact_runner import (NskaTooComplex, decode_plist_blob, decompress_http_body,
+                             deserialize_nska_budgeted, open_db_readonly)
 import header_scan
 
 # Below this, a blob is essentially never a real photo/video — cuts out
@@ -679,13 +681,55 @@ def _walk_plist_values(obj, path: tuple = (), _depth: int = 0):
             yield from _walk_plist_values(v, path + (str(k),), _depth + 1)
 
 
-def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES):
+_log = logging.getLogger('ffs_explorer.startup.embedded_media')
+
+
+def _nska_object_table_values(raw: bytes):
+    """(path, bytes) for every binary value in an NSKeyedArchiver plist's
+    flat $objects table, without expanding the object graph. Used when
+    the archive is too cross-linked to expand (NskaTooComplex): each blob
+    is found exactly once, labelled $objects[N]."""
+    import plistlib
+    try:
+        objects = plistlib.loads(raw).get('$objects') or []
+    except Exception:
+        return
+    for i, obj in enumerate(objects):
+        if isinstance(obj, dict) and isinstance(obj.get('NS.data'), (bytes, bytearray)):
+            obj = obj['NS.data']          # NSMutableData is archived as a dict
+        if isinstance(obj, (bytes, bytearray)):
+            yield from _walk_plist_values(bytes(obj), (f'$objects[{i}]',))
+
+
+def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES, label: str = ''):
     """Yields dicts for every NSData-shaped value in *raw* (a whole
     plist FILE's bytes, binary or XML) that classifies as genuine media."""
-    content = decode_plist_blob(raw)
-    if content is None:
-        return
-    for path, value in _walk_plist_values(content):
+    values = None
+    import plistlib
+    try:
+        top = plistlib.loads(raw)
+    except Exception:
+        top = None
+    if isinstance(top, dict) and top.get('$archiver') == 'NSKeyedArchiver':
+        try:
+            content = deserialize_nska_budgeted(raw, len(top.get('$objects') or ()))
+        except NskaTooComplex as exc:
+            # e.g. a Core Data .mom: expanding it never finishes (see
+            # artifact_runner._NSKA_STEPS_PER_OBJECT), but its blobs can
+            # still be read straight from the object table.
+            _log.info('embedded media: %s: NSKeyedArchiver plist too cross-linked to unpack '
+                      '(%s, %d objects); scanned its object table directly instead',
+                      label or 'plist', exc, len(top.get('$objects') or ()))
+            values = _nska_object_table_values(raw)
+        except Exception:
+            return
+    else:
+        content = decode_plist_blob(raw)
+    if values is None:
+        if content is None:
+            return
+        values = _walk_plist_values(content)
+    for path, value in values:
         if len(value) < min_size:
             continue
         result = classify_media_blob(value)
@@ -824,7 +868,7 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
         rows.append(row)
         return rows
     if kind == 'plist':
-        for hit in scan_plist_bytes(raw):
+        for hit in scan_plist_bytes(raw, label=ui_path):
             rows.append(_build_hit_row(ui_path, 'plist', hit['plist_path'],
                                        scan_dir, hit, scan_scope))
         return rows

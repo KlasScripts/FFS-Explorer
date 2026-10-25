@@ -48,12 +48,16 @@ def test_wrong_speaker_and_missing_quote_are_flagged():
     assert any('#99, not in this chat' in p for p in it['problems'])
 
 
-def test_media_facts_and_word_scan():
+def test_media_facts_and_keyword_hits():
     assert a.media_facts(MSGS) == [('Me', ['#4', '#6 (type 5)'])]
     hits = dict(a.watch_word_hits(MSGS))
-    assert (5, 'send') in hits['Pictures / media']          # the request the model missed
-    assert (1, 'how old') in hits['Age / school / family']
-    assert not any(n == 7 for n, _ in hits.get('Age / school / family', []))   # "moment" is not "mom"
+    labels = ' | '.join(hits)
+    assert (1, 'how old are you', 'exact') in hits['Grooming / sexual exploitation: Age / risk checks / sexual experience'], labels
+    assert any(n == 3 for n, _, _ in hits['Grooming / sexual exploitation: Pictures / camera']), labels
+    # "send one without your hoodie" (#5) is a paraphrase no research list covers:
+    # the meaning layer, not the keyword lists, is meant to catch it
+    assert not any(n == 5 for found in hits.values() for n, _, _ in found)
+    assert not any(n == 7 for found in hits.values() for n, _, _ in found)   # "moment" is not "mom"
 
 
 def test_system_only_chat_needs_no_model():

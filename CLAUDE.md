@@ -163,6 +163,9 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `embedded_media_skip_list.py` | Known-noise database skip list for the sweep. |
 | `media_metadata_scan.py` | EXIF/video container metadata extraction (`_LazyZipSlice`, `extract_image_exif`, `extract_video_metadata`). |
 | `user_media_ignore_list.py` | Global exclusion list for the "User Media" filter. |
+| `keyword_lists.py` | Grooming/drug keyword lists: shipped baseline (with sources) + the examiner's own terms and on/off choices (`keyword_lists_user.json`). Qt-free. |
+| `keyword_lists_dialog.py` | Tools ▸ Keyword Lists window. |
+| `term_matcher.py` | Tolerant keyword matching (number/symbol swaps, stretched/spaced letters, text-speak, typos with a dictionary guard). Qt-free. |
 | `config_seed.py` | Ships an examiner-editable config list with every install: seed in `_internal/config`, merged once per entry into the file next to the exe. Qt-free. |
 | `file_browser_presets.py` | Shared filter+sort presets (File Browser dropdown, Media Browser buttons). |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers; no business logic. |

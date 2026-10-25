@@ -688,32 +688,6 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
 _JID_SUFFIX_RE = re.compile(r"^(.+?)\s+\([^()]*\)$")
 _NO_TEXT_RE = re.compile(r"^\[No text — message type (\d+)\]$")
 
-# The app's own word scan, a safety net for what a small model misses (it
-# never reads "send one without your hoodie" as a picture request). Hits
-# are listed as "words to check", not findings. Stems match word starts.
-WATCH_WORDS = (
-    # Each term is a whole word or phrase; "word*" also matches longer
-    # words starting with it (delete -> deleted).
-    ("Pictures / media", ("pic", "pics", "picture*", "photo*", "selfie*", "video*", "send*",
-                          "sent", "nude*", "naked", "undress*", "without")),
-    ("Age / school / family", ("how old", "years old", "age", "school", "mum", "mom", "dad",
-                               "parent*")),
-    ("Secrecy / deleting", ("delet*", "secret*", "don't tell", "dont tell", "hide",
-                            "between us")),
-    ("Meeting", ("meet*", "address", "where do you live", "come over", "pick you up",
-                 "hotel", "my place")),
-    ("Money / gifts / drugs", ("money", "pay", "paid", "cash", "gift*", "vape*", "weed",
-                               "drug*", "alcohol", "beer")),
-    ("Threats", ("kill", "hurt", "threat*", "or else", "expose", "leak*")),
-)
-
-
-def _watch_regex(terms):
-    return re.compile("|".join(
-        rf"\b{re.escape(t[:-1])}\w*" if t.endswith("*") else rf"\b{re.escape(t)}\b"
-        for t in terms), re.I)
-
-
 def _short_speaker(value) -> str:
     """'Liz Dehner (19199282177@s.whatsapp.net)' -> 'Liz Dehner'."""
     s = str(value or "").strip()
@@ -898,22 +872,26 @@ def media_facts(messages: list) -> list:
     return sorted(by.items(), key=lambda kv: kv[0] != "Me")
 
 
-def watch_word_hits(messages: list) -> list:
-    """[(category, [(number, matched word)])] from the app's word scan."""
-    hits = []
-    for label, spec in WATCH_WORDS:
-        rx = _watch_regex(spec)
-        found = []
-        for n, m in enumerate(messages, 1):
-            text = (m["text"] or "").replace("’", "'")
-            if _is_placeholder(text):
-                continue
-            mm = rx.search(text)
-            if mm:
-                found.append((n, mm.group(0)))
-        if found:
-            hits.append((label, found))
-    return hits
+def watch_word_hits(messages: list, matcher=None) -> list:
+    """[(label, [(number, matched text, how)])] from the app's keyword lists
+    (keyword_lists.py, matched tolerantly by term_matcher.py): a safety net
+    for what a small model misses, labelled "<list>: <category>"."""
+    if matcher is None:
+        import keyword_lists
+        import term_matcher
+        matcher = term_matcher.Matcher(keyword_lists.enabled_terms())
+    import keyword_lists
+    groups: dict = {}
+    for n, m in enumerate(messages, 1):
+        text = m["text"] or ""
+        if _is_placeholder(text):
+            continue
+        for h in matcher.find(text):
+            t = h["term"]
+            cat = (t.get("category") or "").replace("Drug name: ", "")
+            label = f"{keyword_lists.LIST_LABELS.get(t.get('list'), t.get('list', ''))}: {cat}"
+            groups.setdefault(label, []).append((n, h["matched"], h["how"]))
+    return list(groups.items())
 
 
 def _schema(speakers: list) -> dict:
@@ -1043,11 +1021,12 @@ def render_chat_report(name: str, messages: list, checked: dict | None, model: s
         out.append(f"Other:  {checked['topics']}")
     hits = watch_word_hits(messages)
     if hits:
-        out += ["", "Words to check (the app's own word scan, not the model — "
-                    "a safety net for what the model may miss):"]
+        out += ["", "Keyword hits (the app's keyword lists, Tools ▸ Keyword Lists — not the "
+                    "model; a safety net for what the model may miss):"]
         for label, found in hits:
-            out.append(f"  {label}: " + ", ".join(f"#{n} \"{w}\"" for n, w in found))
-            cited.update(n for n, _ in found)
+            out.append(f"  {label}: " + ", ".join(
+                f"#{n} \"{w}\"" + ("" if how == "exact" else f" ({how})") for n, w, how in found))
+            cited.update(n for n, _, _ in found)
     flagged = checked["flagged"]
     out += ["", f"Checks: {checked['points'] - flagged} of {checked['points']} finding(s) cite "
                 f"messages that exist, are from the person named and contain the quoted words."

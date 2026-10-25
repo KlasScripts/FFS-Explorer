@@ -7647,6 +7647,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._import_bookmarks_act.setEnabled(False)   # needs an open case
         self._import_bookmarks_act.triggered.connect(self._open_import_bookmarks_dialog)
         self._tools_menu.addAction(self._import_bookmarks_act)
+        keyword_lists_act = QAction("Keyword Lists…", self)
+        keyword_lists_act.setToolTip("The grooming and drug keyword lists used to flag chats.")
+        keyword_lists_act.triggered.connect(self._open_keyword_lists_dialog)
+        self._tools_menu.addAction(keyword_lists_act)
         self._tools_menu.addSeparator()
         log_act = QAction("Open Log Folder", self)
         log_act.setToolTip("Startup steps, errors and crash snapshots "
@@ -11066,6 +11070,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.update_dropdown_ui()
             self._populate_recent_menu()
             self._apply_ai_pref_visibility()
+
+    def _open_keyword_lists_dialog(self) -> None:
+        from keyword_lists_dialog import KeywordListsDialog
+        KeywordListsDialog(self).exec()
 
     def _open_import_bookmarks_dialog(self):
         dlg = ImportBookmarksDialog(self, parent=self)

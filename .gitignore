@@ -6,3 +6,4 @@ config/ai_summary_settings.json
 __pycache__/
 *.pyc
 .DS_Store
+config/keyword_lists_user.json

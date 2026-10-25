@@ -1,0 +1,1583 @@
+{
+"list": "grooming",
+"version": 1,
+"built": "2026-10-25",
+"sources": {
+"LDK2019": "Lorenzo-Dus, N. & Kinzel, A. (2019). 'So is your mom as cute as you?': examining patterns of language use by online sexual groomers. Journal of Corpora and Discourse Studies 2(1). doi:10.18573/jcads.31 (CC-BY 4.0). Corpus: >600 Perverted Justice chat logs, 3.3M words, convicted offenders talking to adult decoys.",
+"BLACK2015": "Black, P.J., Wollis, M., Woodworth, M. & Hancock, J.T. (2015). A linguistic analysis of grooming strategies of online child sex offenders. Child Abuse & Neglect 44, 140-149. doi:10.1016/j.chiabu.2014.12.004. 44 Perverted Justice transcripts.",
+"CG2017_18": "Chiang, E. & Grant, T. (2017, 2018): online grooming moves incl. overt persuasion and extortion — as summarised in LDK2019 (secondary; original not read).",
+"OWNER": "FFS Explorer owner's case focus (sharing sexual images), 2026-10-25 — not from the research; to be validated on real cases."
+},
+"terms": [
+{
+"term": "sex",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "sexy",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "naked",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "pussy",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "cum",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "horny",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "fuck",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "dick",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "pregnant",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "cock",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "virgin",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "fucking",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "sexual",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "clit",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "boobs",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "porn",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "nude",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "penis",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "sexually",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "fucked",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "tits",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "condom",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "orgasm",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "masturbate",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "condoms",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "gay",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "breast",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "breasts",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "cumming",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "screwed",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "blowjob",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "vagina",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "passion",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "erotic",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "perv",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "nipple",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "sexiest",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "lover",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "rape",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "bi",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "screw",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "pervert",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "masturbating",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "pubic",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "slut",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "lovers",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "cums",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "sexier",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "foreplay",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "perverted",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2a: top 50 sexual words in the corpus",
+"everyday": false,
+"everyday_reason": "sexual word",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "suck",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2: frequent sexual words not in the LIWC sexual list",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "touch",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2: frequent sexual words not in the LIWC sexual list",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "ass",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2: frequent sexual words not in the LIWC sexual list",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "wet",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2: frequent sexual words not in the LIWC sexual list",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "lick",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Table 2: frequent sexual words not in the LIWC sexual list",
+"everyday": true,
+"everyday_reason": "common non-sexual meaning (judgement)",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "touch yourself",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Excerpt 2 'you ever touch yourself?'; touch+yourself top collocate (Table 4)",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "touch urself",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "spelling variant of 'touch yourself' (LDK2019 Excerpt 2) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "down there",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Excerpt 3 'did he touch u down there'",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "every inch",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Excerpt 6 'kiss u all over every inch'",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "sugar daddy",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Excerpt 12 'i'll be your sugar daddy'",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "daddy wants",
+"category": "Sexual words",
+"source": "LDK2019",
+"evidence": "Excerpt 13 'Daddy wants it nice and smooth'",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "mom home",
+"category": "Who is around / supervision",
+"source": "LDK2019",
+"evidence": "collocation mom+home; Excerpt 7 'is your mom home with you now'",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "mom work",
+"category": "Who is around / supervision",
+"source": "LDK2019",
+"evidence": "collocation mom+work; Excerpt 8 'ur mom work every tues and weds?'",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "mom gone",
+"category": "Who is around / supervision",
+"source": "LDK2019",
+"evidence": "collocation mom+gone",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "dad home",
+"category": "Who is around / supervision",
+"source": "LDK2019",
+"evidence": "family word + home (by analogy with mom+home) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "parents home",
+"category": "Who is around / supervision",
+"source": "BLACK2015",
+"evidence": "strategy: inquiring about the target's parents' schedule (68% by segment 2) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "parents work",
+"category": "Who is around / supervision",
+"source": "BLACK2015",
+"evidence": "strategy: parents' schedule — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "home alone",
+"category": "Who is around / supervision",
+"source": "BLACK2015",
+"evidence": "strategy: parents' schedule / risk assessment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "are you alone",
+"category": "Who is around / supervision",
+"source": "LDK2019",
+"evidence": "isolation: requests to talk privately and alone — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "anyone home",
+"category": "Who is around / supervision",
+"source": "BLACK2015",
+"evidence": "strategy: parents' schedule — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "when does your mom",
+"category": "Who is around / supervision",
+"source": "BLACK2015",
+"evidence": "strategy: parents' schedule — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "when do your parents",
+"category": "Who is around / supervision",
+"source": "BLACK2015",
+"evidence": "strategy: parents' schedule — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "delete this",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "delete the chat",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "delete our chat",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "delete these messages",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "delete the messages",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "delete it after",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "clear the chat",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "don't tell",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "dont tell",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "do not tell",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "our secret",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "our little secret",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "keep it secret",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "keep this between us",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "just between us",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "nobody can know",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "no one can know",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "talk privately",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "private chat",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "delet*",
+"category": "Secrecy / deleting",
+"source": "LDK2019",
+"evidence": "isolation process: 'instructing him/her to delete any trace of his/her interaction with them', talk privately and alone (Lorenzo-Dus et al. 2016 model, as described in LDK2019) — phrasing by Claude",
+"everyday": true,
+"everyday_reason": "matches every form of delete; noisy",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "where do you live",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "where u live",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "what's your address",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "whats your address",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "your address",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "meet up",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "meet me",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "come over",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "pick you up",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "pick u up",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "i can drive",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "how far are you",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "what school",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "which school",
+"category": "Location / meeting",
+"source": "BLACK2015",
+"evidence": "strategy: assessing the target's location / plans to meet — used by all 44 offenders, most often in the first segment — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "how old are you",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "O'Connell stage 1 as summarised: gathering information such as the target's age — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "how old r u",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "spelling variant — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "how old are u",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "spelling variant — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "what grade",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "friendship stage: school/age information — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "are you a cop",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: asking whether the target is an undercover police officer / a sting (13 offenders)",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "r u a cop",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "spelling variant of 'are you a cop' — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "is this a sting",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: probing whether it is a sting",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "this is wrong",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: remarking that his behaviour/the relationship was inappropriate, to gauge reaction — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "get in trouble",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: behaviour inappropriate / risk of being caught — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "go to jail",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: behaviour inappropriate / risk of being caught — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "are you a virgin",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: broaching the target's past sexual experience (29 of 44) — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "ever had sex",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: past sexual experience — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "ever done it",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: past sexual experience — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "ever been kissed",
+"category": "Age / risk checks / sexual experience",
+"source": "BLACK2015",
+"evidence": "strategy: past sexual experience — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "so cute",
+"category": "Flattery / love",
+"source": "BLACK2015",
+"evidence": "strategies: flattery (39 of 44) and expressing love and trust — phrasing by Claude",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "so pretty",
+"category": "Flattery / love",
+"source": "BLACK2015",
+"evidence": "strategies: flattery (39 of 44) and expressing love and trust — phrasing by Claude",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "so beautiful",
+"category": "Flattery / love",
+"source": "BLACK2015",
+"evidence": "strategies: flattery (39 of 44) and expressing love and trust — phrasing by Claude",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "so sexy",
+"category": "Flattery / love",
+"source": "BLACK2015",
+"evidence": "strategies: flattery (39 of 44) and expressing love and trust — phrasing by Claude",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "i love you",
+"category": "Flattery / love",
+"source": "BLACK2015",
+"evidence": "strategies: flattery (39 of 44) and expressing love and trust — phrasing by Claude",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "trust me",
+"category": "Flattery / love",
+"source": "BLACK2015",
+"evidence": "strategies: flattery (39 of 44) and expressing love and trust — phrasing by Claude",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "i'll buy you",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "ill buy you",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "gift card",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "send you money",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "or else",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "i will post",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "ill post",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "expose you",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "everyone will see",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "tell everyone",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "send it to your",
+"category": "Gifts / threats / extortion",
+"source": "CG2017_18",
+"evidence": "moves: overt persuasion (material offers, threats) and extortion — phrasing by Claude",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "send nudes",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "send me nudes",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "nudes",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "send me a pic",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "send pics",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "send me pics",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "pic of you",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "pics of you",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "without clothes",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "no clothes",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "take it off",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "show me",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "pic",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "pics",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "picture",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "photo",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "selfie",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "webcam",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": false,
+"everyday_reason": "phrase",
+"enabled": true,
+"origin": "baseline"
+},
+{
+"term": "cam",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+},
+{
+"term": "video call",
+"category": "Pictures / camera",
+"source": "OWNER",
+"evidence": "owner's case focus: requests for and sharing of images — not from the research",
+"everyday": true,
+"everyday_reason": "very common in ordinary chats",
+"enabled": false,
+"origin": "baseline"
+}
+]
+}

@@ -27,11 +27,16 @@ SESSION_GAP_S = 2 * 3600
 REQUEST_MEDIA_S = 30 * 60
 MIN_CHATS_FOR_RARITY = 10
 _PICTURE_CATEGORY = "Pictures / camera"
+_MEANING = "Similar to known grooming messages"
+OPENER_MIN_CHATS = 3
+OPENER_MIN_CHARS = 8
 
 
 def _category(term: dict) -> str:
     """Scoring category of a matched term."""
     cat = term.get("category") or ""
+    if term.get("list") == "meaning":
+        return cat
     if term.get("list") == "drugs":
         if cat.startswith("Drug name"):
             return "Drugs"
@@ -67,12 +72,18 @@ def level(score: float) -> str:
     return ""
 
 
-def score_chats(chats: dict, matcher, unexplained_missing: dict | None = None) -> dict:
+def score_chats(chats: dict, matcher, unexplained_missing: dict | None = None,
+                meaning: dict | None = None) -> dict:
     """*chats*: {key: {'name', 'messages': [{speaker, text, media, ts, time}]}}
     (ai_summary.load_chat_messages). Returns {key: {score, level, categories,
     reasons, evidence: [(n, category, matched, how, speaker)], key_messages,
-    window, rarity_note}}."""
+    window, rarity_note}}. *meaning*: meaning_check.chat_meaning() output;
+    a message whose meaning resembles a known grooming message counts as the
+    category "Similar to known grooming messages" in its session."""
     unexplained_missing = unexplained_missing or {}
+    meaning = meaning or {}
+    bank = meaning.get("_bank") or []
+    import meaning_check
     hits_by_chat = {}
     chats_with_term: dict = {}
     for key, chat in chats.items():
@@ -87,11 +98,43 @@ def score_chats(chats: dict, matcher, unexplained_missing: dict | None = None) -
             per_msg.append(hs)
             for h in hs:
                 seen_terms.add(id(h["term"]))
+        mk = meaning.get(key)
+        if mk:
+            for i, (sc, j) in enumerate(zip(mk["scores"], mk["nearest"])):
+                if sc > 0 and j is not None and i < len(per_msg):
+                    ex = bank[j]
+                    per_msg[i] = per_msg[i] + [{
+                        "term": {"term": ex["text"], "category": meaning_check.CATEGORY,
+                                 "list": "meaning", "source": ex.get("source", "")},
+                        "matched": (chat["messages"][i].get("text") or "")[:80],
+                        "how": f"meaning score {sc:.2f}, like \"{ex['text']}\" ({ex.get('source', '')})",
+                        "start": 0, "end": 0}]
         hits_by_chat[key] = per_msg
         for t in seen_terms:
             chats_with_term[t] = chats_with_term.get(t, 0) + 1
     n_chats = len(chats)
     use_rarity = n_chats >= MIN_CHATS_FOR_RARITY
+    # The owner's opening messages, compared across chats: the same opener
+    # sent to many contacts is how a groomer works through targets. (The
+    # same opener FROM many contacts is usually spam, so only "Me" counts.)
+    import term_matcher
+    openers: dict = {}
+    first_by_chat: dict = {}
+    for key, chat in chats.items():
+        n = 0
+        for i, m in enumerate(chat["messages"]):
+            if m.get("speaker") != "Me":
+                continue
+            t = (m.get("text") or "").strip()
+            if not t or (t.startswith("[") and t.endswith("]")):
+                continue
+            norm = " ".join(term_matcher._canon_phrase(t))
+            if len(norm) >= OPENER_MIN_CHARS:
+                openers.setdefault(norm, set()).add(key)
+                first_by_chat.setdefault(key, []).append((norm, i + 1, t))
+            n += 1
+            if n >= 3:
+                break
 
     def weight(term) -> float:
         if not use_rarity:
@@ -145,6 +188,14 @@ def score_chats(chats: dict, matcher, unexplained_missing: dict | None = None) -
                            + ", ".join(f"#{a} → #{b}" for a, b in pairs[:5]))
             for a, b in pairs:
                 key_msgs += [a, b]
+        shared = [(norm, num, t) for norm, num, t in first_by_chat.get(key, [])
+                  if len(openers.get(norm, ())) >= OPENER_MIN_CHATS]
+        if shared:
+            norm, num, t = max(shared, key=lambda x: len(openers[x[0]]))
+            score += 1.5
+            reasons.append(f"same opening message from Me in {len(openers[norm])} chats: "
+                           f"#{num} \"{t[:60]}\"")
+            key_msgs.append(num)
         n_media = sum(1 for m in msgs if m.get("media"))
         if n_media >= 10 and n_media >= len(msgs) / 2:
             score += 1
@@ -217,10 +268,14 @@ def report_text(name: str, messages: list, r: dict, context: int = 2) -> str:
             shown.add(k)
             m = messages[k - 1]
             text = m.get("text") or "[no text]"
-            for matched, _c, _h in marks.get(k, []):
-                text = text.replace(matched, f"»{matched}«", 1)
+            for matched, c, _h in marks.get(k, []):
+                if c != _MEANING:
+                    text = text.replace(matched, f"»{matched}«", 1)
             arrow = "▶" if k in key_set or k in marks else " "
             out.append(f"{arrow} #{k}  {m.get('time', '')[:16]}  {m.get('speaker', '')}: {text}")
             for matched, cat, how in marks.get(k, []):
-                out.append(f"        {cat}: »{matched}«" + ("" if how == "exact" else f" ({how})"))
+                if cat == _MEANING:
+                    out.append(f"        {cat}: {how}")
+                else:
+                    out.append(f"        {cat}: »{matched}«" + ("" if how == "exact" else f" ({how})"))
     return "\n".join(out)

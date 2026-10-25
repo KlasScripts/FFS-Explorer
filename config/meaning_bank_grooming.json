@@ -1,0 +1,207 @@
+{
+ "bank": "grooming",
+ "version": 1,
+ "built": "2026-10-25",
+ "note": "Examples of harmful messages for the meaning check (meaning_check.py). Quoted lines are offender messages reported in the cited paper; the rest are short example phrasings of strategies the papers describe, written by Claude and marked as such. The harmless side is the phone's own messages.",
+ "sources": {
+  "LDK2019": "Lorenzo-Dus & Kinzel (2019), Journal of Corpora and Discourse Studies 2(1), doi:10.18573/jcads.31 (CC-BY 4.0) — offender excerpts",
+  "LDK2019_MODEL": "Lorenzo-Dus et al. (2016) online grooming discourse model, as described in Lorenzo-Dus & Kinzel (2019): isolation",
+  "BLACK2015": "Black et al. (2015), Child Abuse & Neglect 44, 140-149 — manually coded grooming strategies",
+  "CG2017_18": "Chiang & Grant (2017, 2018) moves, as summarised in Lorenzo-Dus & Kinzel (2019)",
+  "OWNER": "FFS Explorer owner's case focus (requests for images), 2026-10-25"
+ },
+ "examples": [
+  {
+   "text": "is your mom home with you now",
+   "source": "LDK2019",
+   "evidence": "Excerpt 7 (quoted)",
+   "category": "Who is around / supervision"
+  },
+  {
+   "text": "ur mom work every tues and weds?",
+   "source": "LDK2019",
+   "evidence": "Excerpt 8 (quoted)",
+   "category": "Who is around / supervision"
+  },
+  {
+   "text": "you ever touch yourself?",
+   "source": "LDK2019",
+   "evidence": "Excerpt 2 (quoted)",
+   "category": "Sexual"
+  },
+  {
+   "text": "did he touch u down there",
+   "source": "LDK2019",
+   "evidence": "Excerpt 3 (quoted)",
+   "category": "Sexual"
+  },
+  {
+   "text": "would u touch my penis if u could?",
+   "source": "LDK2019",
+   "evidence": "Excerpt 1 (quoted)",
+   "category": "Sexual"
+  },
+  {
+   "text": "Would u let me lick u and kiss u all over every inch",
+   "source": "LDK2019",
+   "evidence": "Excerpt 6 (quoted)",
+   "category": "Sexual"
+  },
+  {
+   "text": "do you forgive your mom for she has done to you and your brother?",
+   "source": "LDK2019",
+   "evidence": "Excerpt 9 (quoted)",
+   "category": "Isolation"
+  },
+  {
+   "text": "well i don't think your mom would like that if i got you pregnant",
+   "source": "LDK2019",
+   "evidence": "Excerpt 10 (quoted)",
+   "category": "Sexual"
+  },
+  {
+   "text": "so is your mom as cute as you?",
+   "source": "LDK2019",
+   "evidence": "Excerpt 11 (quoted)",
+   "category": "Sexual"
+  },
+  {
+   "text": "i'll be your sugar daddy",
+   "source": "LDK2019",
+   "evidence": "Excerpt 12 (quoted)",
+   "category": "Sexual"
+  },
+  {
+   "text": "where do you live",
+   "source": "BLACK2015",
+   "evidence": "strategy: location / travel to meet (all 44 offenders) — phrasing by Claude",
+   "category": "Location / meeting"
+  },
+  {
+   "text": "i can come pick you up after school",
+   "source": "BLACK2015",
+   "evidence": "strategy: travel to meet — phrasing by Claude",
+   "category": "Location / meeting"
+  },
+  {
+   "text": "want to meet up this weekend, just us",
+   "source": "BLACK2015",
+   "evidence": "strategy: travel to meet — phrasing by Claude",
+   "category": "Location / meeting"
+  },
+  {
+   "text": "when do your parents get home",
+   "source": "BLACK2015",
+   "evidence": "strategy: parents' schedule — phrasing by Claude",
+   "category": "Who is around / supervision"
+  },
+  {
+   "text": "are you home alone right now",
+   "source": "BLACK2015",
+   "evidence": "strategy: parents' schedule — phrasing by Claude",
+   "category": "Who is around / supervision"
+  },
+  {
+   "text": "you're not a cop are you",
+   "source": "BLACK2015",
+   "evidence": "strategy: checking the target is not police / a sting — phrasing by Claude",
+   "category": "Risk checks"
+  },
+  {
+   "text": "i know this is wrong but i really like you",
+   "source": "BLACK2015",
+   "evidence": "strategy: saying the relationship is inappropriate to gauge reaction — phrasing by Claude",
+   "category": "Risk checks"
+  },
+  {
+   "text": "i could get in big trouble for talking to you",
+   "source": "BLACK2015",
+   "evidence": "strategy: behaviour inappropriate — phrasing by Claude",
+   "category": "Risk checks"
+  },
+  {
+   "text": "you should be careful who you talk to online",
+   "source": "BLACK2015",
+   "evidence": "strategy: dangers of the internet — phrasing by Claude",
+   "category": "Risk checks"
+  },
+  {
+   "text": "you are so mature for your age",
+   "source": "BLACK2015",
+   "evidence": "strategy: flattery — phrasing by Claude",
+   "category": "Flattery / love"
+  },
+  {
+   "text": "you can trust me, i love you",
+   "source": "BLACK2015",
+   "evidence": "strategy: expressing love and trust — phrasing by Claude",
+   "category": "Flattery / love"
+  },
+  {
+   "text": "have you ever done anything with a boy",
+   "source": "BLACK2015",
+   "evidence": "strategy: past sexual experience — phrasing by Claude",
+   "category": "Sexual"
+  },
+  {
+   "text": "are you still a virgin",
+   "source": "BLACK2015",
+   "evidence": "strategy: past sexual experience — phrasing by Claude",
+   "category": "Sexual"
+  },
+  {
+   "text": "delete our messages after you read them",
+   "source": "LDK2019_MODEL",
+   "evidence": "isolation: deleting any trace of the interaction — phrasing by Claude",
+   "category": "Secrecy / deleting"
+  },
+  {
+   "text": "don't tell anyone about us, they wouldn't understand",
+   "source": "LDK2019_MODEL",
+   "evidence": "isolation / exclusivity — phrasing by Claude",
+   "category": "Secrecy / deleting"
+  },
+  {
+   "text": "this has to stay just between you and me",
+   "source": "LDK2019_MODEL",
+   "evidence": "isolation / exclusivity — phrasing by Claude",
+   "category": "Secrecy / deleting"
+  },
+  {
+   "text": "can we talk somewhere more private",
+   "source": "LDK2019_MODEL",
+   "evidence": "isolation: talking privately — phrasing by Claude",
+   "category": "Secrecy / deleting"
+  },
+  {
+   "text": "send me a picture of you",
+   "source": "OWNER",
+   "evidence": "owner's case focus: requests for images — phrasing by Claude",
+   "category": "Pictures"
+  },
+  {
+   "text": "send me a picture without your clothes on",
+   "source": "OWNER",
+   "evidence": "owner's case focus: requests for sexual images — phrasing by Claude",
+   "category": "Pictures"
+  },
+  {
+   "text": "show me what you look like under that",
+   "source": "OWNER",
+   "evidence": "owner's case focus: requests for sexual images — phrasing by Claude",
+   "category": "Pictures"
+  },
+  {
+   "text": "i'll buy you a new phone if you do it",
+   "source": "CG2017_18",
+   "evidence": "move: material offers — phrasing by Claude",
+   "category": "Gifts / threats"
+  },
+  {
+   "text": "if you don't i'll send your pics to everyone",
+   "source": "CG2017_18",
+   "evidence": "move: extortion / threats — phrasing by Claude",
+   "category": "Gifts / threats"
+  }
+ ]
+}

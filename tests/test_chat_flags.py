@@ -49,3 +49,25 @@ def test_report_text_marks_words_and_context():
     text = cf.report_text('Alex', CHATS['grooming']['messages'], r['grooming'])
     assert '»send me a pic«' in text and '▶ #3' in text and 'not a finding' in text
     assert cf.report_text('Sam', [], {'score': 0}).startswith('RED FLAGS — Sam\nNone found')
+
+
+def test_same_opener_from_me_in_many_chats():
+    chats = {f'k{i}': {'name': f'kid {i}', 'messages': [_m('Me', 'hey u from round here? ', 1), _m(f'k{i}', 'yeah', 2)]}
+             for i in range(3)}
+    chats['spam1'] = {'name': 'x', 'messages': [_m('bot', 'You won a prize click here', 1)]}
+    chats['spam2'] = {'name': 'y', 'messages': [_m('bot', 'You won a prize click here', 1)]}
+    chats['spam3'] = {'name': 'z', 'messages': [_m('bot', 'You won a prize click here', 1)]}
+    r = cf.score_chats(chats, tm.Matcher([]))
+    assert r['k0']['score'] == 1.5 and 'same opening message from Me in 3 chats' in r['k0']['reasons'][0]
+    assert r['spam1']['score'] == 0
+
+
+def test_meaning_hits_count_as_a_category():
+    chats = {'a': CHATS['grooming'], 'b': CHATS['friends']}
+    bank = [{'text': 'send me a picture without your clothes on', 'source': 'OWNER'}]
+    meaning = {'_bank': bank, 'a': {'scores': [0, 0, 0, 0, 0, 0, 0.06], 'nearest': [None] * 6 + [0], 'skew': None},
+               'b': {'scores': [0, 0], 'nearest': [None, None], 'skew': None}}
+    r = cf.score_chats(chats, tm.Matcher(T), meaning=meaning)
+    assert 'Similar to known grooming messages' in r['a']['categories']
+    text = cf.report_text('Alex', CHATS['grooming']['messages'], r['a'])
+    assert 'meaning score 0.06, like "send me a picture without your clothes on" (OWNER)' in text

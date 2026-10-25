@@ -1230,6 +1230,51 @@ class ChatSummaryWorker(QThread):
         self.done.emit(result)
 
 
+class MeaningCheckWorker(QThread):
+    """Embeds every message of a chat_groups report with the local embedding
+    model (meaning_check.run), caching vectors in casecache.db."""
+
+    done = Signal(dict)
+    progress = Signal(str)
+
+    def __init__(self, case_dir: str, script_name: str, platform: str, model: str, parent=None):
+        super().__init__(parent)
+        self._case_dir, self._script_name = case_dir, script_name
+        self._platform, self._model = platform, model
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        import ai_summary
+        import ai_summary_store
+        import meaning_check
+        from artifact_runner import list_artifacts
+        try:
+            # every messaging report: the phone's own messages are the
+            # harmless side of the comparison, so all of them are needed
+            from artifact_db import list_completed_artifacts
+            mods = {sn: m for sn, m in list_artifacts(self._platform)}
+            with closing(_open_results_db(self._case_dir)) as conn:
+                done = list_completed_artifacts(conn)
+            chats = {}
+            for sn in done:
+                mod = mods.get(sn)
+                if mod is None or not getattr(mod, 'chat_groups', None):
+                    continue
+                for k, c in ai_summary.load_chat_messages(
+                        self._case_dir, sn, mod.chat_groups,
+                        getattr(mod, 'timestamp_fields', {}) or {}).items():
+                    chats[f"{sn}\x1f{k}"] = c
+            result = meaning_check.run(self._case_dir, chats, ai_summary_store.get_connection(),
+                                       self._model, progress=self.progress.emit,
+                                       should_stop=lambda: self._stop)
+        except Exception as exc:
+            result = {"error": str(exc)}
+        self.done.emit(result)
+
+
 class ModelListWorker(QThread):
     """GET .../models against the configured local LLM server — a plain
     network call (local_llm.list_models), but still off the GUI thread:
@@ -1337,6 +1382,21 @@ class AISummaryDialog(QDialog):
             "Only chats without an up-to-date summary (skip unchanged chats)")
         self._only_missing_check.setChecked(True)
         form.addWidget(self._only_missing_check)
+        self._meaning_row = QWidget()
+        meaning_lay = QHBoxLayout(self._meaning_row)
+        meaning_lay.setContentsMargins(0, 0, 0, 0)
+        meaning_lay.addWidget(QLabel("Embedding model (meaning check):"))
+        self._embed_combo = QComboBox()
+        self._embed_combo.setEditable(True)
+        meaning_lay.addWidget(self._embed_combo, 1)
+        self._meaning_btn = QPushButton("Run Meaning Check")
+        self._meaning_btn.setToolTip(
+            "Turn every message into a meaning vector with the local embedding model, so Red "
+            "Flags can also find messages that mean something like known grooming messages in "
+            "other words. Each message is only embedded once.")
+        self._meaning_btn.clicked.connect(self._on_meaning_check)
+        meaning_lay.addWidget(self._meaning_btn)
+        form.addWidget(self._meaning_row)
 
         columns_group = QGroupBox("Columns to send")
         self._columns_group = columns_group
@@ -1528,8 +1588,10 @@ class AISummaryDialog(QDialog):
         self._chat_mode = self._is_chat_report(script_name)
         for w in (self._columns_group, self._chunk_group):
             w.setVisible(not self._chat_mode)
-        for w in (self._chat_mode_note, self._only_missing_check):
+        for w in (self._chat_mode_note, self._only_missing_check, self._meaning_row):
             w.setVisible(self._chat_mode)
+        if self._chat_mode and not self._embed_combo.currentText():
+            self._embed_combo.addItem(ai_summary_store.get_embedding_model())
         self._show_chunks_check.setVisible(not self._chat_mode)
         if self._chat_mode:
             self._show_chunks_check.setChecked(False)
@@ -1608,6 +1670,14 @@ class AISummaryDialog(QDialog):
             self._connection_status.setText(f"Could not reach server: {result['error']}")
             return
         models = result.get("models", [])
+        embed_models = [m for m in models if "embed" in m.lower()]
+        if embed_models:
+            cur_embed = self._embed_combo.currentText()
+            self._embed_combo.clear()
+            self._embed_combo.addItems(embed_models)
+            if cur_embed:
+                self._embed_combo.setCurrentText(cur_embed)
+        models = [m for m in models if "embed" not in m.lower()] or models
         current = self._model_combo.currentText()
         self._model_combo.clear()
         self._model_combo.addItems(models)
@@ -1679,8 +1749,46 @@ class AISummaryDialog(QDialog):
         self._worker.done.connect(self._on_chats_done)
         self._worker.start()
 
+    def _on_meaning_check(self) -> None:
+        import ai_summary_store
+        if not self._on_save_settings():
+            return
+        model = self._embed_combo.currentText().strip()
+        if not model:
+            self._status_label.setText("Choose an embedding model (Refresh Models lists them).")
+            return
+        ai_summary_store.set_embedding_model(model)
+        for w in (self._generate_btn, self._save_btn, self._report_combo, self._close_btn,
+                  self._meaning_btn):
+            w.setEnabled(False)
+        self._stop_btn.setVisible(True)
+        self._stop_btn.setEnabled(True)
+        self._log_edit.clear()
+        self._status_label.setText("Meaning check: embedding messages (each only once)…")
+        self._worker = MeaningCheckWorker(self._case_dir, self._current_script_name(),
+                                          self._platform, model)
+        self._worker.progress.connect(self._log_edit.appendPlainText)
+        self._worker.done.connect(self._on_meaning_done)
+        self._worker.start()
+
+    def _on_meaning_done(self, result: dict) -> None:
+        for w in (self._generate_btn, self._save_btn, self._report_combo, self._close_btn,
+                  self._meaning_btn):
+            w.setEnabled(True)
+        self._stop_btn.setVisible(False)
+        if "error" in result:
+            self._status_label.setText(f"Meaning check failed: {result['error']}")
+            return
+        self._status_label.setText(
+            f"Meaning check done: {result.get('embedded', 0):,} message(s) embedded now, "
+            f"{result.get('cached', 0):,} already done. Red Flags now include meaning.")
+        parent = self.parent()
+        if parent is not None and hasattr(parent, '_art_refresh_chat_summary_text'):
+            parent._art_flags_cache = None
+            parent._art_refresh_chat_summary_text()
+
     def _on_stop(self) -> None:
-        if self._worker is not None and isinstance(self._worker, ChatSummaryWorker):
+        if self._worker is not None and isinstance(self._worker, (ChatSummaryWorker, MeaningCheckWorker)):
             self._worker.stop()
             self._stop_btn.setEnabled(False)
             self._status_label.setText("Stopping after the current chat…")
@@ -3097,6 +3205,34 @@ class ArtifactViewerMixin:
                 ref, ref_label = newest, f"30 days before the newest message ({fmt(newest)})"
         return ref, ref_label
 
+    def _art_all_chat_messages(self) -> dict:
+        """{"<script>\x1f<chat key>": chat} for every chat_groups report run in
+        this case: the phone's own messaging, the harmless side of the
+        meaning check."""
+        import ai_summary
+        from artifact_db import list_completed_artifacts
+        from artifact_runner import list_artifacts
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mods = {sn: m for sn, m in list_artifacts(platform)}
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                done = list_completed_artifacts(conn)
+        except Exception:
+            done = []
+        out = {}
+        for sn in done:
+            mod = mods.get(sn)
+            decl = getattr(mod, 'chat_groups', None) if mod else None
+            if not decl:
+                continue
+            try:
+                chats = ai_summary.load_chat_messages(self._case_dir, sn, decl,
+                                                      getattr(mod, 'timestamp_fields', {}) or {})
+            except Exception:
+                continue
+            out.update({f"{sn}\x1f{k}": c for k, c in chats.items()})
+        return out
+
     def _art_red_flags(self, script_name: str) -> tuple:
         """({chat key: chat_flags result}, {chat key: messages}) for a
         chat_groups report, cached until the report or the keyword lists
@@ -3109,7 +3245,8 @@ class ArtifactViewerMixin:
             import term_matcher
             from artifact_runner import list_artifacts
             stamp = []
-            for path in (os.path.join(self._case_dir, 'caseresults.db'), keyword_lists.user_path(),
+            for path in (os.path.join(self._case_dir, 'caseresults.db'),
+                         os.path.join(self._case_dir, 'casecache.db'), keyword_lists.user_path(),
                          *[keyword_lists.baseline_path(n) for n in keyword_lists.LISTS]):
                 try:
                     st = os.stat(path)
@@ -3136,7 +3273,22 @@ class ArtifactViewerMixin:
                     missing[c['key']] = act[10]
             msgs = ai_summary.load_chat_messages(self._case_dir, script_name, decl, units)
             matcher = term_matcher.Matcher(keyword_lists.enabled_terms())
-            flags = chat_flags.score_chats(msgs, matcher, missing)
+            meaning = {}
+            try:
+                import ai_summary_store
+                import meaning_check
+                everything = self._art_all_chat_messages()
+                own = {f"{script_name}\x1f{k}": c for k, c in msgs.items()}
+                meaning = meaning_check.chat_meaning(
+                    self._case_dir, own, ai_summary_store.get_embedding_model(), everything)
+                meaning = {(k.split("\x1f", 1)[1] if "\x1f" in k else k): v for k, v in meaning.items()}
+            except Exception:
+                meaning = {}
+            flags = chat_flags.score_chats(msgs, matcher, missing, meaning)
+            for f in flags.values():
+                f['meaning'] = ('complete' if meaning.get('_complete') else
+                                'partial' if meaning else 'not run')
+                f['meaning_pool'] = meaning.get('_harmless', 0)
             self._art_flags_cache = (ck, flags, msgs)
             return flags, msgs
         except Exception as exc:
@@ -3193,6 +3345,18 @@ class ArtifactViewerMixin:
             note = next((f["rarity_note"] for f in flags.values() if f.get("rarity_note")), "")
             if note:
                 lines += ["", f"Note: {note}."]
+            first = next(iter(flags.values()), {})
+            state = first.get("meaning", "not run")
+            pool = first.get("meaning_pool", 0)
+            import meaning_check
+            if state != "not run" and pool < meaning_check.MIN_HARMLESS:
+                lines += ["", f"Meaning check: the phone has only {pool} message(s) to compare with, "
+                              "so meaning scores are less reliable here."]
+            if state != "complete":
+                lines += ["", "Meaning check: " + ("only partly run" if state == "partial" else "not run")
+                          + " — it finds messages that MEAN something like known grooming messages "
+                            "in other words. Run it from AI Summary → this report → Run Meaning "
+                            "Check (needs LM Studio with an embedding model)."]
             parts.append("\n".join(lines))
         if saved:
             recs = sorted(saved.values(), key=lambda r: (r["chat_name"] or "").lower())

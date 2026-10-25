@@ -66,6 +66,8 @@ a = Analysis(
         ('config/keyword_list_grooming.json', 'config'),
         ('config/keyword_list_drugs.json', 'config'),
         ('config/english_words.txt.gz', 'config'),
+        # Harmful example bank for the meaning check (meaning_check.py).
+        ('config/meaning_bank_grooming.json', 'config'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),
         # Artifact parser scripts — loaded dynamically so PyInstaller can't

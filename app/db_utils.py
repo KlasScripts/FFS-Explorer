@@ -347,6 +347,19 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         ON processing_registry (capability)
     ''')
 
+    # Message embeddings for the meaning check (meaning_check.py), keyed by
+    # embedding model + text hash, so a message is only embedded once.
+    # Additive (CREATE TABLE IF NOT EXISTS): no schema version bump needed.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS text_embeddings (
+            model     TEXT NOT NULL,
+            text_hash TEXT NOT NULL,
+            dim       INTEGER NOT NULL,
+            vec       BLOB NOT NULL,
+            PRIMARY KEY (model, text_hash)
+        )
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_CACHE_SCHEMA_VERSION}')
     conn.commit()
     return conn

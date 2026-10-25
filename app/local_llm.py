@@ -120,3 +120,37 @@ def list_models(endpoint_base: str, api_key: str, timeout: float = 10.0) -> dict
     except Exception as exc:
         return {"error": str(exc)}
     return {"models": [m.get("id") for m in body.get("data", [])]}
+
+
+def embed(endpoint: str, api_key: str, model: str, texts: list, timeout: float = 120.0) -> dict:
+    """POST texts to an OpenAI-compatible /v1/embeddings endpoint (LM Studio).
+    *endpoint* may be the chat-completions URL; its /embeddings sibling is
+    used. Returns {'vectors': [[float, ...], ...]} in input order, or
+    {'error': str} — never raises."""
+    url = endpoint
+    if url.endswith("/chat/completions"):
+        url = url[: -len("/chat/completions")]
+    url = url.rstrip("/") + "/embeddings"
+    payload = json.dumps({"model": model, "input": list(texts)}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        raw = pool.submit(lambda: urllib.request.urlopen(req, timeout=timeout).read()).result(timeout=timeout)
+        body = json.loads(raw.decode("utf-8"))
+        data = sorted(body["data"], key=lambda d: d.get("index", 0))
+        return {"vectors": [d["embedding"] for d in data]}
+    except concurrent.futures.TimeoutError:
+        return {"error": f"timed out after {timeout:.0f}s"}
+    except urllib.error.HTTPError as exc:
+        try:
+            msg = json.loads(exc.read().decode("utf-8")).get("error", {}).get("message")
+        except Exception:
+            msg = exc.reason
+        return {"error": f"HTTP {exc.code}: {msg}"}
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        pool.shutdown(wait=False)

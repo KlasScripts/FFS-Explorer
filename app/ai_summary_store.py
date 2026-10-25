@@ -197,3 +197,19 @@ def set_chat_prompt(script_name: str, prompt: str) -> None:
     reports[script_name] = saved
     data["reports"] = reports
     save(data)
+
+
+DEFAULT_EMBEDDING_MODEL = "text-embedding-nomic-embed-text-v1.5"
+
+
+def get_embedding_model() -> str:
+    """The local embedding model for the meaning check (meaning_check.py)."""
+    return (load().get("connection") or {}).get("embedding_model") or DEFAULT_EMBEDDING_MODEL
+
+
+def set_embedding_model(model: str) -> None:
+    data = load()
+    conn = dict(data.get("connection", {}))
+    conn["embedding_model"] = model
+    data["connection"] = conn
+    save(data)

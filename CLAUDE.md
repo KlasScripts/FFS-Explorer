@@ -166,6 +166,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `keyword_lists.py` | Grooming/drug keyword lists: shipped baseline (with sources) + the examiner's own terms and on/off choices (`keyword_lists_user.json`). Qt-free. |
 | `keyword_lists_dialog.py` | Tools ▸ Keyword Lists window. |
 | `chat_flags.py` | Red flags: ranks a messaging report's chats by a pattern (categories in one session, request→media, media-heavy, unexplained deletions; rare terms weigh more) with reasons and key messages. Qt-free. |
+| `meaning_check.py` | Meaning check (Roblox Sentinel-style, re-implemented): messages vs a harmful example bank and the phone's own messages, via a local embedding model; vectors cached in `casecache.db` `text_embeddings`. Qt-free. |
 | `term_matcher.py` | Tolerant keyword matching (number/symbol swaps, stretched/spaced letters, text-speak, typos with a dictionary guard). Qt-free. |
 | `config_seed.py` | Ships an examiner-editable config list with every install: seed in `_internal/config`, merged once per entry into the file next to the exe. Qt-free. |
 | `file_browser_presets.py` | Shared filter+sort presets (File Browser dropdown, Media Browser buttons). |

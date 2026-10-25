@@ -38,3 +38,19 @@ def test_bank_has_sources():
     bank = mc.load_bank()
     assert len(bank['examples']) >= 20
     assert all(e['source'] in bank['sources'] for e in bank['examples'])
+
+
+def test_fast_score_matches_full_calculation():
+    import random
+    rnd = random.Random(7)
+    def rv():
+        return _v(*[rnd.gauss(0, 1) for _ in range(12)])
+    harmful = [rv() for _ in range(8)]
+    harmless = [rv() for _ in range(300)]
+    for _ in range(300):
+        v = rv() if rnd.random() < 0.7 else [a + 0.3 * b for a, b in zip(harmful[rnd.randrange(8)], rv())]
+        n = math.sqrt(sum(x * x for x in v)); v = [x / n for x in v]
+        skip = set(rnd.sample(range(300), 5))
+        fast = mc.score_vector(v, harmful, harmless, skip)
+        full = mc._score_vector_full(v, harmful, harmless, skip)
+        assert abs(fast[0] - full[0]) < 1e-9 and fast[1] == full[1]

@@ -157,7 +157,45 @@ def _top_mean_exp(vec, bank, k: int, skip=None) -> tuple:
 def score_vector(vec, harmful: list, harmless: list, skip=None) -> tuple:
     """(score, index of the nearest harmful example) — Sentinel's contrastive
     log-ratio, clipped at 0 and below MIN_SCORE. *skip*: indexes of
-    *harmless* to leave out (the chat's own messages)."""
+    *harmless* to leave out (the chat's own messages).
+
+    Exact early exit: with the single closest harmful example at h, the
+    score can only reach MIN_SCORE if fewer than TOP_K_HARMLESS harmless
+    messages have similarity > h - MIN_SCORE (each such message raises the
+    harmless mean of e^sim above e^(h - MIN_SCORE)). So the scan stops as
+    soon as that many are found; most messages stop almost at once. Same
+    result as the full calculation (tested), far less work."""
+    pos, nearest = _top_mean_exp(vec, harmful, TOP_K_HARMFUL)
+    if pos <= 0:
+        return 0.0, nearest
+    h = math.log(pos)                      # TOP_K_HARMFUL == 1: the best similarity
+    bar = h - MIN_SCORE
+    top = []                               # the TOP_K_HARMLESS best so far
+    above = 0
+    sumprod = math.sumprod
+    for j, b in enumerate(harmless):
+        if skip is not None and j in skip:
+            continue
+        sim = sumprod(vec, b)
+        if sim > bar:
+            above += 1
+            if above >= TOP_K_HARMLESS:
+                return 0.0, nearest
+        if len(top) < TOP_K_HARMLESS:
+            top.append(sim)
+            top.sort()
+        elif sim > top[0]:
+            top[0] = sim
+            top.sort()
+    if not top:
+        return 0.0, nearest
+    neg = sum(math.exp(x) for x in top) / len(top)
+    lr = math.log(pos / neg)
+    return (lr if lr >= MIN_SCORE else 0.0), nearest
+
+
+def _score_vector_full(vec, harmful: list, harmless: list, skip=None) -> tuple:
+    """The plain calculation, kept for the test that the fast one matches it."""
     pos, nearest = _top_mean_exp(vec, harmful, TOP_K_HARMFUL)
     neg, _ = _top_mean_exp(vec, harmless, TOP_K_HARMLESS, skip)
     if pos <= 0 or neg <= 0:

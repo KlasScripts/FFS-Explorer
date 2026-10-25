@@ -924,12 +924,16 @@ def _parse_json(text: str) -> dict | None:
     return None
 
 
-def summarise_chat(messages: list, conn_settings: dict, prompt: str, progress=None) -> dict:
+def summarise_chat(messages: list, conn_settings: dict, prompt: str, progress=None,
+                   focus: tuple | None = None) -> dict:
     """Findings for one chat: one structured call per block of at most
     _CHAT_BLOCK_MAX_CHARS (numbers are those of the whole chat, so blocks
     merge by simply joining their lists). Returns {findings, calls,
-    seconds} or {error}."""
+    seconds} or {error}. *focus*: (first, last) message numbers to send
+    instead of the whole chat; numbers stay those of the whole chat."""
     lines = format_chat_lines(messages)
+    if focus:
+        lines = lines[max(0, focus[0] - 1):focus[1]]
     blocks, cur, size = [], [], 0
     for ln in lines:
         if cur and size + len(ln) + 1 > _CHAT_BLOCK_MAX_CHARS:
@@ -986,7 +990,8 @@ def _date_range(messages: list) -> str:
 
 
 def render_chat_report(name: str, messages: list, checked: dict | None, model: str,
-                       generated_at: str, calls: int, seconds: float) -> str:
+                       generated_at: str, calls: int, seconds: float,
+                       focus: tuple | None = None) -> str:
     """The Text-tab report for one chat. *checked* is check_findings()
     output, or None for a chat with nothing to summarise."""
     def nums(ns):
@@ -1032,7 +1037,9 @@ def render_chat_report(name: str, messages: list, checked: dict | None, model: s
                 f"messages that exist, are from the person named and contain the quoted words."
                 + (f" ⚠ marks {flagged} to treat with care." if flagged else ""),
             f"Model: {model} · generated {generated_at} UTC · {calls} call(s), {seconds:.0f} s · "
-            f"all {len(messages)} message(s) sent; the model cannot see pictures or files; "
+            + (f"messages #{focus[0]}–#{focus[1]} sent (the strongest red-flag session of "
+             f"{len(messages)}); " if focus else f"all {len(messages)} message(s) sent; ")
+            + "the model cannot see pictures or files; "
             "deleted messages are not in the report.", "", "MESSAGES REFERRED TO ABOVE"]
     for n in sorted(cited):
         m = messages[n - 1]
@@ -1088,15 +1095,21 @@ def _save_chat_summary(case_dir: str, script_name: str, key: str, rec: dict) -> 
         conn.close()
 
 
+FOCUS_OVER = 150     # longer chats: summarise only their strongest red-flag session
+
+
 def run_chat_summaries(case_dir: str, script_name: str, decl: dict, units: dict,
-                       only_missing: bool = True, progress=None, should_stop=None) -> dict:
+                       only_missing: bool = True, progress=None, should_stop=None,
+                       keys: list | None = None, focus: dict | None = None) -> dict:
     """Summarise every chat of a chat_groups report, smallest first so
     results arrive quickly; each is saved as soon as it is done, so a stop
     or a failure keeps what was finished. A chat with nothing but system
     events gets a short "nothing to summarise" report without a model
     call. With *only_missing*, a chat whose messages, prompt and model are
-    unchanged since its saved summary is skipped. Returns {done, skipped,
-    failed, flagged, seconds, chats} or {error}."""
+    unchanged since its saved summary is skipped. *keys*: only these chats,
+    in this order (e.g. by Red Flag score); *focus*: {key: (first, last)}
+    message numbers to summarise for chats longer than FOCUS_OVER. Returns
+    {done, skipped, failed, flagged, seconds, chats} or {error}."""
     import json
     conn_settings = ai_summary_store.get_connection()
     if not conn_settings["model"]:
@@ -1109,7 +1122,11 @@ def run_chat_summaries(case_dir: str, script_name: str, decl: dict, units: dict,
     except Exception as exc:
         return {"error": f"could not read the report: {exc}"}
     existing = load_chat_summaries(case_dir, script_name) if only_missing else {}
-    order = sorted(chats.items(), key=lambda kv: len(kv[1]["messages"]))
+    if keys is not None:
+        order = [(k, chats[k]) for k in keys if k in chats]
+    else:
+        order = sorted(chats.items(), key=lambda kv: len(kv[1]["messages"]))
+    focus = focus or {}
     done = skipped = failed = flagged = 0
     t_all = time.time()
     for i, (key, chat) in enumerate(order, 1):
@@ -1117,8 +1134,9 @@ def run_chat_summaries(case_dir: str, script_name: str, decl: dict, units: dict,
             _emit(progress, "Stopped — summaries finished so far are saved.")
             break
         msgs = chat["messages"]
+        f = focus.get(key) if len(msgs) > FOCUS_OVER else None
         lines = format_chat_lines(msgs)
-        digest = _chat_hash(lines, prompt, conn_settings["model"])
+        digest = _chat_hash(lines + [f"focus:{f}"], prompt, conn_settings["model"])
         if only_missing and existing.get(key, {}).get("content_hash") == digest:
             skipped += 1
             continue
@@ -1129,7 +1147,7 @@ def run_chat_summaries(case_dir: str, script_name: str, decl: dict, units: dict,
             _emit(progress, f"[{i}/{len(order)}] {chat['name']}: only system events, no model call")
         else:
             _emit(progress, f"[{i}/{len(order)}] {chat['name']} ({len(msgs)} messages)…")
-            r = summarise_chat(msgs, conn_settings, prompt, progress)
+            r = summarise_chat(msgs, conn_settings, prompt, progress, focus=f)
             if "error" in r:
                 failed += 1
                 _emit(progress, f"    failed: {r['error']}")
@@ -1137,7 +1155,7 @@ def run_chat_summaries(case_dir: str, script_name: str, decl: dict, units: dict,
             checked = check_findings(r["findings"], msgs)
             points, n_flag, model = checked["points"], checked["flagged"], conn_settings["model"]
             report = render_chat_report(chat["name"], msgs, checked, model, at,
-                                        r["calls"], r["seconds"])
+                                        r["calls"], r["seconds"], focus=f)
             raw = json.dumps(r["findings"], ensure_ascii=False)
             _emit(progress, f"    done in {r['seconds']:.0f} s — {points} finding(s)"
                             + (f", {n_flag} flagged ⚠" if n_flag else ""))

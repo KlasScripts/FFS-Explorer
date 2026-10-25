@@ -217,6 +217,7 @@ def score_chats(chats: dict, matcher, unexplained_missing: dict | None = None,
             "categories": sorted(cats or {}, key=lambda c: -(cats or {})[c]),
             "reasons": reasons, "evidence": [e[:5] for e in evidence],
             "key_messages": key_msgs[:6], "window": window if cats else "",
+            "session": (sess[0] + 1, sess[-1] + 1) if (sess and cats) else None,
             "rarity_note": ("" if use_rarity else
                             f"only {n_chats} chat(s): too few to tell which terms are common on this phone"),
         }

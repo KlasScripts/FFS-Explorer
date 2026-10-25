@@ -63,3 +63,25 @@ def test_media_facts_and_keyword_hits():
 def test_system_only_chat_needs_no_model():
     assert not a.has_content([{'speaker': 'x', 'text': '[No text — message type 6]', 'media': False}])
     assert a.has_content(MSGS)
+
+
+def test_focus_sends_only_the_session_but_keeps_numbers(monkeypatch):
+    sent = {}
+
+    def fake_call(endpoint, key, model, prompt, **kw):
+        sent['prompt'] = prompt
+        return {'text': '{"asked_for_pictures": [], "meet_or_call": [], "delete_hide_or_dont_tell": [],'
+                        ' "sex_age_money_drugs_threats": [], "topics": "x"}'}
+    monkeypatch.setattr(a.local_llm, 'call_chat', fake_call)
+    r = a.summarise_chat(MSGS, {'endpoint': '', 'api_key': '', 'model': 'm'}, a.CHAT_PROMPT, focus=(3, 5))
+    assert 'calls' in r
+    assert '#3 [' in sent['prompt'] and '#5 [' in sent['prompt']
+    assert '#1 [' not in sent['prompt'] and '#6 [' not in sent['prompt']
+
+
+def test_report_renders_with_and_without_focus():
+    checked = a.check_findings({k: [] for k, _ in a._FINDING_LISTS}, MSGS)
+    full = a.render_chat_report('Alex', MSGS, checked, 'm', 'now', 1, 1.0)
+    part = a.render_chat_report('Alex', MSGS, checked, 'm', 'now', 1, 1.0, focus=(3, 5))
+    assert 'all 7 message(s) sent' in full
+    assert 'messages #3–#5 sent (the strongest red-flag session of 7)' in part

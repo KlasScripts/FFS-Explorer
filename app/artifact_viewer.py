@@ -1205,12 +1205,13 @@ class ChatSummaryWorker(QThread):
     progress = Signal(str)
 
     def __init__(self, case_dir: str, script_name: str, platform: str,
-                 only_missing: bool, parent=None):
+                 only_missing: bool, parent=None, keys=None, focus=None):
         super().__init__(parent)
         self._case_dir = case_dir
         self._script_name = script_name
         self._platform = platform
         self._only_missing = only_missing
+        self._keys, self._focus = keys, focus
         self._stop = False
 
     def stop(self) -> None:
@@ -1224,7 +1225,8 @@ class ChatSummaryWorker(QThread):
             result = ai_summary.run_chat_summaries(
                 self._case_dir, self._script_name, getattr(mod, 'chat_groups', None) or {},
                 getattr(mod, 'timestamp_fields', {}) or {}, only_missing=self._only_missing,
-                progress=self.progress.emit, should_stop=lambda: self._stop)
+                progress=self.progress.emit, should_stop=lambda: self._stop,
+                keys=self._keys, focus=self._focus)
         except Exception as exc:
             result = {"error": str(exc)}
         self.done.emit(result)
@@ -1382,6 +1384,19 @@ class AISummaryDialog(QDialog):
             "Only chats without an up-to-date summary (skip unchanged chats)")
         self._only_missing_check.setChecked(True)
         form.addWidget(self._only_missing_check)
+        self._which_row = QWidget()
+        which_lay = QHBoxLayout(self._which_row)
+        which_lay.setContentsMargins(0, 0, 0, 0)
+        which_lay.addWidget(QLabel("Which chats:"))
+        self._which_combo = QComboBox()
+        self._which_combo.addItem("Chats with red flags, highest first", "flagged")
+        self._which_combo.addItem("Top 10 by red flags", "top10")
+        self._which_combo.addItem("All chats", "all")
+        self._which_combo.setToolTip(
+            "Red-flagged chats first, so the model spends its time where it matters. Chats over "
+            "150 messages are summarised around their strongest red-flag session.")
+        which_lay.addWidget(self._which_combo, 1)
+        form.addWidget(self._which_row)
         self._meaning_row = QWidget()
         meaning_lay = QHBoxLayout(self._meaning_row)
         meaning_lay.setContentsMargins(0, 0, 0, 0)
@@ -1588,7 +1603,7 @@ class AISummaryDialog(QDialog):
         self._chat_mode = self._is_chat_report(script_name)
         for w in (self._columns_group, self._chunk_group):
             w.setVisible(not self._chat_mode)
-        for w in (self._chat_mode_note, self._only_missing_check, self._meaning_row):
+        for w in (self._chat_mode_note, self._only_missing_check, self._meaning_row, self._which_row):
             w.setVisible(self._chat_mode)
         if self._chat_mode and not self._embed_combo.currentText():
             self._embed_combo.addItem(ai_summary_store.get_embedding_model())
@@ -1742,9 +1757,29 @@ class AISummaryDialog(QDialog):
         self._stop_btn.setEnabled(True)
         self._output_edit.clear()
         self._log_edit.clear()
-        self._status_label.setText("Summarising chats, smallest first; each is saved as it finishes.")
+        self._status_label.setText("Summarising chats (red-flagged first); each is saved as it finishes.")
+        keys, focus = None, None
+        parent = self.parent()
+        which = self._which_combo.currentData()
+        if parent is not None and hasattr(parent, '_art_red_flags'):
+            flags, _msgs = parent._art_red_flags(script_name)
+            ranked = sorted(flags, key=lambda k: -flags[k].get('score', 0))
+            focus = {k: f['session'] for k, f in flags.items() if f.get('session')}
+            if which == "flagged":
+                keys = [k for k in ranked if flags[k].get('score')]
+            elif which == "top10":
+                keys = [k for k in ranked if flags[k].get('score')][:10]
+            else:
+                keys = ranked
+            if not keys:
+                self._status_label.setText("No chats have red flags with the current keyword "
+                                           "lists — choose \"All chats\" to summarise them anyway.")
+                for w in (self._generate_btn, self._save_btn, self._report_combo, self._close_btn):
+                    w.setEnabled(True)
+                self._stop_btn.setVisible(False)
+                return
         self._worker = ChatSummaryWorker(self._case_dir, script_name, self._platform,
-                                         self._only_missing_check.isChecked())
+                                         self._only_missing_check.isChecked(), keys=keys, focus=focus)
         self._worker.progress.connect(self._log_edit.appendPlainText)
         self._worker.done.connect(self._on_chats_done)
         self._worker.start()

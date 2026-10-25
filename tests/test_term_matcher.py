@@ -44,3 +44,9 @@ def test_real_english_words_are_never_typos():
     assert m.find('Double Your Money Event') == []          # real false hit on IOS17 before the guard
     assert [h['how'] for h in m.find('ketamin')] == ['one letter different']
     assert tm.is_english_word('named') and tm.is_english_word('kidding') and not tm.is_english_word('xnaax')
+
+
+def test_text_speak_in_a_term_matches_the_full_word():
+    m = tm.Matcher([{'term': 'send me a pic', 'everyday': False}])
+    assert [h['matched'] for h in m.find('Send me a picture please.')] == ['Send me a picture']
+    assert [h['matched'] for h in m.find('send me a pic')] == ['send me a pic']

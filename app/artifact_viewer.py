@@ -3033,24 +3033,10 @@ class ArtifactViewerMixin:
         decl = getattr(mod, 'chat_groups', None) or {}
         chats = self._art_chat_groups(script_name, decl) if decl else []
         fmt = lambda ts: self.format_ts(ts) if ts else ''
-        # "Last 30 Days" is counted back from the acquisition time when the
-        # case has one (Cellebrite .ufd), else from the newest message.
-        ref, ref_label = None, ''
-        try:
-            import device_timezone
-            got = device_timezone.detect_acquisition_offset(self.zip_path) if self.zip_path else None
-            if got:
-                offset_h, acquired_local = got
-                from datetime import timezone as _tz, timedelta as _td
-                ref = (acquired_local - _td(hours=offset_h)).replace(tzinfo=_tz.utc).timestamp()
-                ref_label = f"30 days before acquisition ({fmt(ref)})"
-        except Exception:
-            ref = None
-        if ref is None:
-            newest = max((t for c in chats for t in c['times']), default=None)
-            if newest:
-                ref, ref_label = newest, f"30 days before the newest message ({fmt(newest)})"
-        columns = ["Chat", "Type", "Participants", "Messages", "Incoming", "Outgoing",
+        ref, ref_label = self._art_chat_ref(chats)
+        flags, _msgs = self._art_red_flags(script_name)
+        import chat_flags
+        columns = ["Chat", "Red Flags", "Red Flag Score", "Type", "Participants", "Messages", "Incoming", "Outgoing",
                    "Media In", "Media Out", "Deleted", "Calls", "Links", "Bookmarked",
                    "Last 30 Days", "First Message", "Last Received", "Last Sent",
                    "Issued / Present", "Missing (Gaps)", "Missing At End", "Deletion Windows",
@@ -3064,7 +3050,8 @@ class ArtifactViewerMixin:
             if kind == "Group" and c['people']:
                 kind = f"Group ({c['people']})"
             act = _deletion_activity(c, ref, fmt, c['name'])
-            rows.append((c['name'], kind, c['participants'], c['messages'], c['incoming'],
+            fl = flags.get(c['key']) or {}
+            rows.append((c['name'], chat_flags.flags_label(fl), fl.get('score', 0), kind, c['participants'], c['messages'], c['incoming'],
                          c['outgoing'], c['media_in'], c['media_out'], c['deleted'],
                          '' if c['calls'] is None else c['calls'], c['links'],
                          c['bookmarked'], recent, fmt(c['first']), fmt(c['last_in']),
@@ -3084,33 +3071,135 @@ class ArtifactViewerMixin:
             + (f" — Last 30 Days = {ref_label}" if ref_label else ""))
         self._art_stack.setCurrentIndex(1)
         self._art_chat_summary = (script_name, [(c['key'], c['name']) for c in chats])
+        if any(f.get('score') for f in flags.values()):
+            self._art_report_view.sortByColumn(2, Qt.SortOrder.DescendingOrder)   # where to look first
         self._art_show_chat_summary_text(script_name, None)
+
+    def _art_chat_ref(self, chats: list) -> tuple:
+        """(reference time, label) for "Last 30 Days" and timer checks: the
+        acquisition time when the case has one (Cellebrite .ufd), else the
+        newest message."""
+        fmt = lambda ts: self.format_ts(ts) if ts else ''
+        ref, ref_label = None, ''
+        try:
+            import device_timezone
+            got = device_timezone.detect_acquisition_offset(self.zip_path) if self.zip_path else None
+            if got:
+                offset_h, acquired_local = got
+                from datetime import timezone as _tz, timedelta as _td
+                ref = (acquired_local - _td(hours=offset_h)).replace(tzinfo=_tz.utc).timestamp()
+                ref_label = f"30 days before acquisition ({fmt(ref)})"
+        except Exception:
+            ref = None
+        if ref is None:
+            newest = max((t for c in chats for t in c['times']), default=None)
+            if newest:
+                ref, ref_label = newest, f"30 days before the newest message ({fmt(newest)})"
+        return ref, ref_label
+
+    def _art_red_flags(self, script_name: str) -> tuple:
+        """({chat key: chat_flags result}, {chat key: messages}) for a
+        chat_groups report, cached until the report or the keyword lists
+        change. ({}, {}) if it can't be worked out (never breaks the page)."""
+        import os
+        try:
+            import ai_summary
+            import chat_flags
+            import keyword_lists
+            import term_matcher
+            from artifact_runner import list_artifacts
+            stamp = []
+            for path in (os.path.join(self._case_dir, 'caseresults.db'), keyword_lists.user_path(),
+                         *[keyword_lists.baseline_path(n) for n in keyword_lists.LISTS]):
+                try:
+                    st = os.stat(path)
+                    stamp.append((st.st_mtime_ns, st.st_size))
+                except OSError:
+                    stamp.append(None)
+            ck = (self._case_dir, script_name, tuple(stamp))
+            cache = getattr(self, '_art_flags_cache', None)
+            if cache and cache[0] == ck:
+                return cache[1], cache[2]
+            platform = 'android' if self._is_android_archive() else 'ios'
+            mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+            decl = getattr(mod, 'chat_groups', None) or {}
+            if not decl:
+                return {}, {}
+            units = getattr(mod, 'timestamp_fields', {}) or {}
+            summary_chats = self._art_chat_groups(script_name, decl)
+            ref, _ = self._art_chat_ref(summary_chats)
+            fmt = lambda ts: self.format_ts(ts) if ts else ''
+            missing = {}
+            for c in summary_chats:
+                act = _deletion_activity(c, ref, fmt, c['name'])
+                if isinstance(act[10], int) and act[10] > 0:
+                    missing[c['key']] = act[10]
+            msgs = ai_summary.load_chat_messages(self._case_dir, script_name, decl, units)
+            matcher = term_matcher.Matcher(keyword_lists.enabled_terms())
+            flags = chat_flags.score_chats(msgs, matcher, missing)
+            self._art_flags_cache = (ck, flags, msgs)
+            return flags, msgs
+        except Exception as exc:
+            try:
+                import startup_log
+                startup_log.message('warning', f"red flags for {script_name} failed: {exc}")
+            except Exception:
+                pass
+            return {}, {}
 
     def _art_show_chat_summary_text(self, script_name: str, key: str | None) -> None:
         """Put the saved AI chat summary in the bottom Text tab: one chat's
         (*key*), or every chat's when *key* is None (the Chat Groups
         folder). Says so plainly when there is none yet."""
         import ai_summary
+        import chat_flags
         self._art_summary_text_target = (script_name, key)
         try:
             saved = ai_summary.load_chat_summaries(self._case_dir, script_name)
         except Exception:
             saved = {}
+        flags, msgs = self._art_red_flags(script_name)
+        sep = "\n\n" + "═" * 70 + "\n\n"
         how = ("No AI summary yet. To make one: AI Summary (bottom of the Device "
                "Artifacts list) → choose this report → Summarise Chats.")
         if key is not None:
+            chat = msgs.get(key) or {}
             rec = saved.get(key)
-            text = rec["report"] if rec else how
-            name = rec["chat_name"] if rec else "this chat"
-            self._load_text_preview(text, f"AI summary — {name}")
+            name = (rec or {}).get("chat_name") or chat.get("name") or "this chat"
+            parts = []
+            if chat:
+                parts.append(chat_flags.report_text(name, chat["messages"], flags.get(key)))
+            parts.append(rec["report"] if rec else how)
+            self._load_text_preview(sep.join(parts), f"Red flags and AI summary — {name}")
             return
-        if not saved:
-            self._load_text_preview(how, "AI chat summaries")
-            return
-        recs = sorted(saved.values(), key=lambda r: (r["chat_name"] or "").lower())
-        sep = "\n\n" + "═" * 70 + "\n\n"
-        self._load_text_preview(sep.join(r["report"] for r in recs),
-                                f"AI chat summaries — {len(recs)} chat(s)")
+        ranked = sorted((k for k in flags if flags[k].get("score")),
+                        key=lambda k: -flags[k]["score"])
+        parts = []
+        if flags:
+            lines = ["WHERE TO LOOK FIRST — chats ranked by red flags (a ranking aid, not a finding)",
+                     "Open a chat to see its key messages with context.", ""]
+            for i, k in enumerate(ranked[:25], 1):
+                f = flags[k]
+                lines.append(f"{i:2}. {f['level']}  {msgs[k]['name']}  (score {f['score']:g})"
+                             + (f"  — {f['window']}" if f['window'] else ""))
+                for r in f["reasons"]:
+                    lines.append(f"       • {r}")
+            if not ranked:
+                lines.append("No red flags with the current keyword lists (Tools ▸ Keyword Lists). "
+                             "That is not proof nothing is there.")
+            elif len(ranked) > 25:
+                lines.append(f"… and {len(ranked) - 25} more with lower scores (sort the Red Flag "
+                             "Score column to see them all).")
+            note = next((f["rarity_note"] for f in flags.values() if f.get("rarity_note")), "")
+            if note:
+                lines += ["", f"Note: {note}."]
+            parts.append("\n".join(lines))
+        if saved:
+            recs = sorted(saved.values(), key=lambda r: (r["chat_name"] or "").lower())
+            parts += [r["report"] for r in recs]
+        else:
+            parts.append(how)
+        self._load_text_preview(sep.join(parts), "Red flags and AI chat summaries")
 
     def _art_refresh_chat_summary_text(self) -> None:
         """Re-show the summary for whatever chat/folder is open (after a run)."""

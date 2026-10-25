@@ -164,6 +164,9 @@ def _how(raw: str, term: str, spaced: bool, typo: bool) -> str:
     if any(w in _TEXTSPEAK for w in re.findall(r"[a-z]+", r)) and \
             not any(w in _TEXTSPEAK for w in re.findall(r"[a-z]+", t)):
         ways.append("text-speak")
+    t_words = re.findall(r"[a-z]+", t)
+    if any(w in _TEXTSPEAK and _TEXTSPEAK[w] in re.findall(r"[a-z]+", r) for w in t_words):
+        ways.append("text-speak written out")
     if "'" in t and "'" not in r:
         ways.append("no apostrophe")
     return ", ".join(ways) or "same word, different form"
@@ -192,6 +195,14 @@ class Matcher:
             words = _canon_phrase(raw.rstrip("*"))
             if not words:
                 continue
+            # a term written in text-speak also matches the full word
+            # ("send me a pic" -> "send me a picture"), as text does
+            full = [_TEXTSPEAK.get(w, w) for w in words]
+            if full != words and not stem:
+                if len(full) == 1:
+                    self.single.setdefault(full[0], []).append(t)
+                else:
+                    self.phrases.setdefault(tuple(full[:_MAX_PHRASE]), []).append(t)
             if stem and len(words) == 1:
                 self.stems.append((words[0], t))
             elif len(words) == 1:

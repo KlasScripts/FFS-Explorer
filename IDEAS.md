@@ -157,3 +157,51 @@ with a path in a declared `media_fields` column is linked
    against the real schema first (WRITING_ARTIFACT_PARSERS.md).
 3. Mark each parser's status here (or in VERIFICATION_STATUS.md) as it's
    done.
+
+## 5. Measure Red Flags on reviewed jobs without sharing case data
+
+*Owner idea, 2026-10-25. Parked until the owner has used Red Flags,
+keyword lists and the meaning check on real jobs.*
+
+**Problem.** Red Flags were measured on PAN12 (decoys, 2000s chat), not on
+real phones. Real cases hold illegal content and personal data, so they
+can't be shared for tuning.
+
+**Sketch: measure where the data lives, share only numbers.**
+1. *Answer key per reviewed job.* Chat Groups → right-click "Mark as
+   evidence chat (for measuring)", pre-filled where a bookmarked file was
+   sent/received in the chat (bookmarks are file-level only, so this is a
+   suggestion the examiner confirms). Alternative: import tagged
+   chats/contacts from another tool's report export (PA / AXIOM), matched
+   locally.
+2. *Measure Red Flags* produces:
+   - **Local report** (contains case data, never leaves the machine): rank
+     of each evidence chat, which signals fired, evidence chats with no
+     signal (with their bookmarked messages), candidate words
+     over-represented in evidence chats (suggestions for the examiner's
+     own list only).
+   - **Shareable numbers-only file** (plain text, examiner reads it first):
+     chats to open before the first evidence chat; evidence chats in top
+     10/25/50; per category and per *baseline* term (shipped list, not
+     personal data): hits in evidence vs other chats; meaning-hit rates;
+     app and list versions. No message text, names, numbers, paths, chat
+     titles, or text of user-added terms (count only). A test should fail
+     the build if the export contains anything else.
+3. *Improve across jobs.* Down-weight or switch off baseline terms that
+   only hit normal chats; weight categories that pick out evidence chats
+   (on PAN12: supervision, meeting, secrecy); check the provisional
+   meaning threshold (0.05); release, then re-measure the same jobs
+   (versions in the export make before/after comparable).
+4. *Stays local.* Examiner-added terms (marked as theirs) and an optional
+   local meaning example bank built from bookmarked messages.
+
+**Cautions.** Reviewed jobs were found with current methods, so recall will
+look better than it is (the "no signal" list is the counter). Even
+numbers-only files describe real cases: check with information governance
+/ DPO before sharing.
+
+**Baseline to compare against (PAN12 test set, ties shuffled):** Red Flags
+top 10 / 50 / 100 = 100% / 86% / 55% predator threads vs 0% / 26% / 26%
+for raw keyword-hit count; on threads of 5+ messages, keywords AP 0.47,
+keywords + meaning AP 0.52, meaning alone flags 2% of normal threads vs
+28% for keywords.

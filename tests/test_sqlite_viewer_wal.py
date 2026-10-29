@@ -85,7 +85,9 @@ def test_deleted_row_in_free_space_is_carved(tmp_path):
         assert not result["has_wal"]
         _cols, rows, n = v._compute_table_diff("note")
         assert n["carved"] == 1 and n["deleted"] == 0
-        carved = [r for s, r, _ in rows if s == "CARVED"]
+        # An ordinary delete loses the rowid, so the row is found by its
+        # record pattern, and says so.
+        carved = [r for s, r, _ in rows if s == "CARVED (pattern)"]
         assert carved[0][1:] == [1, lines[3][2]]
         assert carved[0][0] is None          # no rowid survives an ordinary delete
     finally:
@@ -161,7 +163,9 @@ def test_wal_view_keeps_before_after_and_history(tmp_path):
         model.load(_cols, rows)
         tips = {model.data(model.index(i, 0)): model.data(model.index(i, 0), Qt.ItemDataRole.ToolTipRole)
                 for i in range(model.rowCount())}
-        assert tips["WAL HISTORY"].startswith("Earlier version found in the WAL")
+        assert tips["WAL HISTORY"].startswith("Older version in a WAL frame")
+        import sqlite_viewer
+        assert "Table not certain" in sqlite_viewer._DIFF_TIP["CARVED (freed page)"]
         assert tips[""] is None
         assert all(len(t.split()) <= 10 for t in tips.values() if t)
         assert model.data(model.index(0, 1), Qt.ItemDataRole.ToolTipRole) is None
@@ -180,3 +184,49 @@ def test_wal_view_keeps_before_after_and_history(tmp_path):
         assert open(result["before_path"], "rb").read() == raw
     finally:
         shutil.rmtree(result["tmpdir"], ignore_errors=True)
+
+
+def test_export_keeps_the_stored_number_beside_a_converted_time(tmp_path, monkeypatch):
+    """A guessed date column is exported twice: the stored number under the
+    column's own name, then the converted text. A wrong guess can then never
+    replace the stored value in a CSV."""
+    import csv
+    from PySide6.QtWidgets import QApplication, QFileDialog
+    QApplication.instance() or QApplication([])
+    from sqlite_viewer import SqliteViewerMixin, SqlitePreviewWorker
+    from PySide6.QtWidgets import QWidget
+
+    class Viewer(QWidget, SqliteViewerMixin):
+        pass
+
+    db = tmp_path / "times.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE ev (_id INTEGER PRIMARY KEY, t INTEGER, note TEXT)")
+    con.executemany("INSERT INTO ev VALUES (?,?,?)",
+                    [(1, 1793265311042, "a"), (2, 1793265400000, "b")])
+    con.commit()
+    con.close()
+    v = Viewer()
+    tab = v._setup_sqlite_tab()          # keep the widgets alive
+    v._sql_ui_path = "data/data/example/databases/times.db"
+    result = {}
+    worker = SqlitePreviewWorker(open(db, "rb").read(), "times.db", None, None, None)
+    worker.done.connect(result.update)
+    worker.run()
+    v._on_sqlite_preview_ready(result)
+    out = tmp_path / "out.csv"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
+    v._export_sql_table_csv()
+    rows = list(csv.reader(open(out, encoding="utf-8")))
+    header = rows[0]
+    assert "t" in header
+    i = header.index("t")
+    assert "converted" in header[i + 1]
+    assert rows[1][i] == "1793265311042"
+    assert rows[1][i + 1] != rows[1][i]
+    v._clear_sqlite_preview()
+
+
+def test_pattern_carved_row_marks_missing_columns(tmp_path):
+    from sqlite_viewer import _CUT_OFF
+    assert _CUT_OFF == "[cut off]"

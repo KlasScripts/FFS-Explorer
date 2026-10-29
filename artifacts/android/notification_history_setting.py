@@ -39,7 +39,9 @@ def run(paths):
         raw = handle.read()
     try:
         root = _xml_root(raw)
-    except Exception:
+    except Exception as exc:
+        from artifact_runner import log_note
+        log_note(f"{paths['settings_secure']} could not be parsed ({exc}); nothing read from it")
         return []
 
     stored = None

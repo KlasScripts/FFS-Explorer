@@ -58,7 +58,7 @@ record_source = [
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "system": ["System"], "deleted": {"recovered": ["True"], "deleted_at": "*"}, "call_pattern": r"\bstarted a call\b|^\[call event\]$", "type": "chat_type"}
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media": ["photo_url"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "system": ["System"], "deleted": {"recovered": ["True"], "deleted_at": "*"}, "call_pattern": r"^Call started", "call_field": "event", "type": "chat_type"}
 
 def run(paths):
     import json as _json
@@ -167,31 +167,30 @@ def run(paths):
         else:
             direction = "Incoming"
 
-        body = r["message_text"] or ""
+        # message is message_text exactly as stored. This report's own
+        # labels go in event; location, photo and likes in their own columns.
+        body = r["message_text"]
+        event = ""
         if r["system_event_type"] in ("group.call.started", "group.call.ended"):
-            # message_text is already a human-formatted call event string
-            # ("X started a call" / "Call ended 1m 38s"); pull the precise
-            # duration in seconds out of the accompanying event JSON too —
-            # call_duration is milliseconds. No audio-vs-video distinction
-            # is recoverable from this table; do not claim one.
+            # message_text is the app's own call line ("X started a call" /
+            # "Call ended 1m 38s"). call_duration in the event JSON is
+            # milliseconds. No audio-vs-video distinction is recoverable
+            # from this table; do not claim one.
             dur_s = None
             if r["event"]:
                 try:
                     dur_s = _json.loads(r["event"])["data"]["call_duration"] / 1000
                 except Exception:
                     dur_s = None
-            body = body or "[call event]"
+            event = ("Call started" if r["system_event_type"] == "group.call.started"
+                     else "Call ended")
             if dur_s:
-                body = f"{body} ({dur_s:.1f}s)"
+                event = f"{event}, {dur_s:.1f} s"
         elif r["location_lat"] or r["location_lng"]:
-            loc = r["location_name"] or ""
-            body = f"[Location] {loc}  {r['location_lat']}, {r['location_lng']}".strip()
+            event = "Location"
         elif r["photo_url"]:
-            body = f"[Media] {r['photo_url']}" + (f"  {body}" if body else "")
-
-        if r["favorited_by"]:
-            likers = [x for x in r["favorited_by"].split(",") if x]
-            body = f"{body}  (liked by raw user_id(s) {', '.join(likers)})"
+            event = "Photo"
+        likers = [x for x in (r["favorited_by"] or "").split(",") if x]
 
         entry = {
             "conversation": conversation,
@@ -201,6 +200,12 @@ def run(paths):
             "chat_type": "1:1" if r["conversation_id"] in dm_peer_ids else "Group",
             "direction": direction,
             "message": body,
+            "event": event,
+            "photo_url": r["photo_url"] or "",
+            "location_name": r["location_name"] or "",
+            "latitude": r["location_lat"],
+            "longitude": r["location_lng"],
+            "liked_by": ", ".join(f"raw user_id {x}" for x in likers),
             "raw_message_id": r["_id"],
             "raw_conversation_id": r["conversation_id"],
             "raw_conversation_rowid": convo_rowid.get(r["conversation_id"]),

@@ -4,6 +4,15 @@ This report lists WhatsApp messages from `msgstore.db` (table `message`). One ro
 
 Most columns are copied from the database. A few are interpreted. The one that matters for a cleared chat is below: **this report counts messages that are still there.** It does not say how many were removed.
 
+
+## Text and Event
+
+**Text** is exactly what the database stores for the message (`message.text_data`; for a template message, the wording in `message_template`). This report never writes its own words into it, so a search, a keyword list, or a quote from Text only finds what is stored.
+
+**Event** is this report's own label for what kind of row it is: a call ("Video call, Not answered"), a system line ("Encryption notice"), a media kind (Photo, GIF, Sticker), a location kind, "Poll", or "Unknown message type N" for an empty row of a type not named here. The tables below give the rules. Chat Groups counts calls from Event, not from Text, so a typed "video call later?" is not a call.
+
+**Poll Options** and **Poll Votes** are the option names from `message_poll_option` and the number of vote rows. The voters are on the WhatsApp Poll Votes report.
+
 ## What could catch you out
 
 | ⚠️ Watch out for | What it means for you | Read |
@@ -15,7 +24,16 @@ Most columns are copied from the database. A few are interpreted. The one that m
 | **A LID is not a phone number** | An address ending in `@lid` is a privacy id. The phone number is a different address, ending in `@s.whatsapp.net`, and only when `jid_map` links the two. They are separate columns. A chat with no name is titled with the phone JID when that link exists. | [Phone JID and LID](#phone-jid-and-lid) |
 | **There is no gap counter on this page** | Android `msgstore.db` has no per-message sequence and no disappearing-message setting column. Those headers are left off this page. A blank cell is not standing in for them. | [Chat Groups columns](#chat-groups-columns) |
 | **A reaction notifies like a message** | A reaction posts a notification for the chat, but it is not a message row. It is in the Reactions column of the message it was added to. | [Reactions](#reactions) |
+| **A system line is not something the owner did** | System rows (type 7: joined, left, removed, made an admin, group created) are **System** in Direction. The database stores `from_me` 1 on them, including groups dated years before the phone's first message, so `from_me` does not show who acted. | [Direction](#direction) |
 | **A pin is not always where the phone was** | Coordinates with no place name are what "Send your current location" stored. A place picked from the list stores a name, an address, and a link. Those coordinates are the place the user chose. | [Current location and a selected place](#current-location-and-a-selected-place) |
+
+## Direction
+
+**Sent** and **Received** come from `message.from_me` (1 is sent). A system row, message type 7, is **System** instead, and is not counted as incoming or outgoing on Chat Groups. The `from_me` column shows the stored value on every row.
+
+The reason: on the Pixel 7a test image all 165 system rows store `from_me` 1. They include 88 "Removed from the group" rows in two groups named "Crypto market9" and "179Crypto market" (21 and 22 March 2024, UTC), and "created" rows for three groups dated 2017 to 2019, earlier than any of that phone's stored messages (the first is 30 January 2024). Shown as Sent, those rows would read as the phone's owner removing 88 people or creating those groups. Nothing on a system row says who acted, so this report does not say. A group line names only the person it is about (`message_system_chat_participant`).
+
+Call rows (type 90) keep Sent and Received. On the linked phone the message direction and the call-log direction matched on all 126 joined calls.
 
 ---
 
@@ -41,7 +59,7 @@ This report does not read `sort_timestamp`. The 13:06 time is not in the report 
 
 WhatsApp wrote a new system row at **26 October 2026, 17:46:13 UTC**, the moment Clear chat was pressed. On screen that row is the encryption notice. It is not a column named "cleared at."
 
-This report shows that row as one ordinary sent message with no text, timed 17:46. It does not label it as a clear, and it does not show the 13:06 last-message time.
+This report lists that row at 17:46. It does not label it as a clear, and it does not show the 13:06 last-message time.
 
 #### ✅ Validation
 
@@ -51,7 +69,7 @@ This report shows that row as one ordinary sent message with no text, timed 17:4
 | Either direction | Same column, other chats on that phone | **Observed only. Not fully checked.** | 74 of 80 chats matched the newest stored message (51 incoming, 23 outgoing). 6 mismatches not examined. |
 | Clear time | Timestamp of the new system row (encryption notice) | **Observed only. Limited test.** | Same single clear. The time matches when Clear chat was pressed. |
 | Previous message count | Not stored after the clear | **Observed only. Limited test.** | 38 rows in a database taken before the clear. None of those ids remained. |
-| Shown in this report | — | **Not shown** | The report lists the one system row at 17:46 and does not list `sort_timestamp`. |
+| Shown in this report | — | **Not shown** | The report lists the one row at 17:46, not labelled as a clear, and does not list `sort_timestamp`. |
 
 ---
 
@@ -108,14 +126,14 @@ This page shows a column only when the Android report has that data. `msgstore.d
 - Issued / Present, Missing (Gaps), Missing At End, Deletion Windows
 - Deleted For Everyone (Me/Them). A type 15 row still counts in **Deleted**. The Android row does not say who deleted it.
 - Disappearing, Set By, Set At, Setting History, Missing Consistent With Timer, Missing Not Explained
-- The Calls count on this page is the voice and video calls written into the message text. It is not a separate call log.
+- The Calls count on this page counts rows whose **Event** is a voice or video call (call messages, type 90). Typed words in Text are never counted. It is not a separate call log.
 - **Icon** is the group picture. WhatsApp keeps it as `files/Avatars/<group jid>.j` (a JPEG with a `.j` name). The cell shows that picture when the extraction contains the file. A copy that only has the databases leaves the cell blank. A one-to-one chat has no icon here, because that file name is a phone address.
 
 ## Chat members
 
 The Chat Groups summary lists who was in each conversation when the phone was acquired: group members from `group_participant_user`, and this phone from `registration_jid` in `com.whatsapp_preferences_light.xml`. When `self_user_name` is set, that username is written next to the phone on the Me entry (`Me (+number @name)`). If the preference is missing, the same username is read from `lid_display_name` on this phone's own `@lid`. A member stored as a LID is shown by contact name, then by the mapped phone JID, then by the LID. The `lid_me` slot is this phone, not an extra member. An empty group list is reported as empty. That list is not who received a particular message.
 
-A poll's question stays in the message text. The option names from `message_poll_option` are added after it, in the order the rows were stored. When votes are stored, the text ends with the number of vote rows, for example `2 votes`. That number matches **WhatsApp Poll Votes**. The voter names are not in this report.
+A poll's question is in Text, as stored. The option names from `message_poll_option` are in **Poll Options**, in the order the rows were stored, and the number of vote rows is in **Poll Votes**. That number matches **WhatsApp Poll Votes**. The voter names are not in this report.
 
 ## Reactions
 
@@ -187,16 +205,16 @@ The other source is IPED, the open-source tool from the Brazilian Federal Police
 | `call_result` 4 | **result 4** | A third call outcome. IPED calls it refused. This session did not produce one. | IPED only |
 | `call_result` 6 | **result 6** | One incoming voice row, duration 0, same chat, about ten seconds after the video call. Not on the screen we read. | Not named |
 | Action 4, `is_me_joined` 1 | **You were added** | "You" is the account on this phone. The group opened on the words "You were added". | This VM |
-| Action 6, `message_system_photo_change` | **Group icon changed** | The group showed "You changed this group's icon". The text column held the flag `dirty`, which is not shown. | This VM |
+| Action 6, `message_system_photo_change` | **Group icon changed** | The group showed "You changed this group's icon". Text holds the stored flag `dirty`, which is a flag, not a caption. | This VM |
 | Action 67 | **Encryption notice** | The notice at the start of the group, without the word "now". | This VM |
 | Action 69, privacy type 1 | **Encryption notice** | The same group, later: "Messages and calls are now end-to-end encrypted." | This VM |
 | Action 118 | **Message pinned** | Pinning `GTD-PIN` for 24 hours wrote action 118 and the line "You pinned a message". There is no subtype table. An older action 118 on this phone was not opened. It gets the same label because it is the same code. | This VM, for the new row |
-| Action 5 | **Left the group** | An older group that held only this row showed a phone number and the word "left", plus the encryption notice. The number is not copied into the report. All nine action 5 rows on this phone are `is_me_joined` 0. Nobody was asked to leave the family group. | This VM |
-| Action 14 | **Removed from the group** | In Minecraft lovers this phone removed a member. The line was "You removed" and the member's name. IPED lists actions 7 and 14 as removed. This phone has action 14 only. Action 7 has no row here. | This VM |
-| Message type 1, file `image/jpeg` | **Photo** | The picture in Minecraft lovers was "Enlarge photo" and "Forward image". A blank type 1 row says Photo. A caption is kept. One older type 1 row has no file. | This VM |
-| Action 11, empty text | **You created this group** | Two groups this phone created, shown as "Group · Only you", had that sentence. | This VM |
+| Action 5 | **Left the group**, then the person stored for that row | An older group that held only this row showed a phone number and the word "left", plus the encryption notice. The person comes from `message_system_chat_participant`; this phone's own address is the Me label. All nine action 5 rows on this phone are `is_me_joined` 0. Nobody was asked to leave the family group. | This VM |
+| Action 14 | **Removed from the group**, then the person stored for that row | Who did the removing is not stored on the row, so the label does not say. In Minecraft lovers this phone removed a member. The line was "You removed" and the member's name. IPED lists actions 7 and 14 as removed. This phone has action 14 only. Action 7 has no row here. | This VM |
+| Message type 1, file `image/jpeg` | **Photo** | The picture in Minecraft lovers was "Enlarge photo" and "Forward image". Event says Photo. A caption stays in Text. One older type 1 row has no file. | This VM |
+| Action 11, empty text | **Group created** | Two groups this phone created, shown as "Group · Only you", had the sentence "You created this group". Who created a group is not stored on the row, and a group created by someone else was not tested, so the label does not name a person. | This VM |
 | Action 11 with stored text | **Unknown system action 11**, then the stored name | The family-group row stores the group name. The top of that chat showed "You were added" and no created line, so a named action 11 is not labelled as created. | This VM |
-| Action 15 | **You're now an admin** | Two older groups that held only this row showed that sentence. | This VM |
+| Action 15 | **Made an admin**, then the person stored for that row | Two older groups that held only this row showed "You're now an admin". Whether another member's promotion writes the same action was not tested, so the label names the person in `message_system_chat_participant`, not "you". | This VM |
 | Action 69, privacy type 2 | **Business secure service** | A chat whose newest row is this code showed "This business is now using a secure service from Meta to manage this chat." | This VM |
 | Action 56, `setting_duration` 86400 | **Message timer updated, 24 hours** | In a group that contains only this phone, the timer was set to 24 hours. The line was "You updated the message timer. New messages will disappear from this chat 24 hours after they're sent, except when kept." | This VM |
 | Action 56, `setting_duration` 0 | **Disappearing messages off** | The same group was set back to Off. The line was "You turned off disappearing messages." The group's timer column ended at 0. An older action 56 row also stores duration 0 and gets the same label. | This VM, for the new row |
@@ -206,13 +224,13 @@ The other source is IPED, the open-source tool from the Brazilian Federal Police
 
 The first disappearing-message toggle was in the family group, where this phone is not an admin. It left the timer Off and wrote no message. The toggle that wrote action 56 was in a group that contains only this phone. It did not write message type 36. Opening the older one-message groups also wrote a fresh action 69, privacy type 1, which is the encryption notice already on those screens.
 
-A stored name on an unknown system row is kept after the unknown label. The words `true`, `false`, and `dirty` are flags, not the notice, and they are not shown.
+Text on a system row is what the row stores: a group name on some rows, or one of the flags `true`, `false`, `dirty`. A flag is not the words on screen. Event gives the label.
 
-Message type 27 leaves the message text column blank. The wording is in `message_template`: the content, then the footer when one is stored, then each button label from `message_template_button` in stored order. The report shows that text. The bubble was not opened on the phone.
+Message type 27 leaves `message.text_data` blank. The wording is in `message_template`: the content, then the footer when one is stored, then each button label from `message_template_button` in stored order. Text shows that stored wording. The bubble was not opened on the phone.
 
 ## Seen on this phone, still unknown
 
-A blank message of one of these codes now says **Unknown message type** and the number, or **Unknown system action** and the number. A row that already has text keeps that text. The code is still listed here. Counts are this companion on 27 October 2026, after the group and call tests.
+For a row of one of these codes, Event says **Unknown message type** and the number (when Text is empty), or **Unknown system action** and the number. Text always keeps what is stored. The code is still listed here. Counts are this companion on 27 October 2026, after the group and call tests.
 
 | Code | Rows | Where else a name was offered | Used here |
 |---|---|---|---|
@@ -228,9 +246,9 @@ A blank message of one of these codes now says **Unknown message type** and the 
 | Message type 99 | 21, all blank | IPED: message association. Baileys describes an album on the wire protocol, which is a different numbering. `message_album` stores image and video counts. | No |
 | Message type 116 | 6, all blank | IPED: nothing is shown in the app. | No |
 | Message type 118 | 1, blank | Not the pin. The pin is system action 118 on a type 7 row. No name found for message type 118. | No |
-| Message type empty | 1 | No name found. | The row says **Unknown message** |
+| Message type empty | 1 | No name found. | Event says **Unknown message** |
 | System action 4, `is_me_joined` 0 | 2 | IPED: someone was added. The rows with `is_me_joined` 1 were opened and say **You were added**. Searching that chat for "added" did not show a system line. | No |
-| System action 11 with stored text | 2 | IPED: group created. Both rows store the group name. The family chat did not show a created line. Minecraft lovers did show "You created this group", but the row has the same shape, so it is not labelled from that sentence. Empty action 11 rows are **You created this group**. | No. The stored name is kept after **Unknown system action 11** |
+| System action 11 with stored text | 2 | IPED: group created. Both rows store the group name. The family chat did not show a created line. Minecraft lovers did show "You created this group", but the row has the same shape, so it is not labelled from that sentence. Empty action 11 rows are **Group created**. | No. Event is **Unknown system action 11**; Text keeps the stored name |
 | `call_result` 4 | 7 calls | IPED: refused. The app counts the code and does not name it. The hang-up test wrote result 2, not 4. | No. The report says **result 4** |
 | `call_result` 6 | 1 call | No name found. Incoming voice, duration 0, not on the screen we read. | No. The report says **result 6** |
 
@@ -246,7 +264,7 @@ IPED (`ExtractorAndroidNew.java`, Brazilian Federal Police) is the source that m
 
 Message type 7 is a system row. `message_system.action_type` is a number.
 
-| Where it is stored | Report text |
+| Where it is stored | Event |
 |---|---|
 | `message_system_initial_privacy_provider`, and action 69 when privacy type is 1 | Encryption notice |
 | `message_system_block_contact` | Contact blocked, or Contact unblocked |
@@ -255,10 +273,10 @@ Message type 7 is a system row. `message_system.action_type` is a number.
 | `message_system_photo_change` | Group icon changed |
 | Action 118 | Message pinned |
 | Action 4 with `is_me_joined` 1 | You were added |
-| Action 5 | Left the group |
-| Action 11 with no stored text | You created this group |
-| Action 14 | Removed from the group |
-| Action 15 | You're now an admin |
+| Action 5 | Left the group, and the person stored for it |
+| Action 11 with no stored text | Group created |
+| Action 14 | Removed from the group, and the person stored for it |
+| Action 15 | Made an admin, and the person stored for it |
 | Action 69 when privacy type is 2 | Business secure service |
 | Action 56, duration 0 | Disappearing messages off |
 | Action 56, duration 24 hours, 7 days, or 90 days | Message timer updated, and that duration |
@@ -274,7 +292,7 @@ Photo, GIF, and sticker are labelled above. Every other message type that has no
 - A count of messages removed by "Clear chat".
 - Status updates, and older versions of an edited message.
 - Calls that are in `call_log` but have no chat message. On the copy taken before 27 October 2026 that was 67 of 193 calls.
-- Who voted, and which option. The poll row shows the question, the options, and the vote count. The names are in **WhatsApp Poll Votes**.
+- Who voted, and which option. The poll row shows the question (Text), the options (Poll Options), and the vote count (Poll Votes). The names are in **WhatsApp Poll Votes**.
 - Whether a disappearing-message timer has removed a file. The shortest timer on this build is 24 hours. It was switched on for one chat and a file was sent. The deletion itself has not been observed.
 
 ---

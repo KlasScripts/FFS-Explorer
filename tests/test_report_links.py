@@ -88,23 +88,23 @@ def test_android_whatsapp_chat_type():
     assert wa._owner_label('447700900123', None) == 'Me (+447700900123)'
     assert wa._owner_label(None, 'k.example') == 'Me (@k.example)'
     assert wa._owner_label(None, None) == 'Me'
-    assert wa._with_poll_options('GTD-OUT-POLL', ['Alpha', 'Beta']) == 'GTD-OUT-POLL — Alpha | Beta'
-    assert wa._with_poll_options('', ['Alpha']) == 'Alpha'
-    assert wa._with_poll_options('hello', []) == 'hello'
-    assert wa._with_poll_options(None, None) == ''
-    assert wa._with_vote_count('GTD-OUT-POLL — Alpha | Beta', 0) == 'GTD-OUT-POLL — Alpha | Beta'
-    assert wa._with_vote_count('GTD-OUT-POLL — Alpha | Beta', 1) == 'GTD-OUT-POLL — Alpha | Beta · 1 vote'
-    assert wa._with_vote_count('GTD-OUT-POLL — Alpha | Beta', 2) == 'GTD-OUT-POLL — Alpha | Beta · 2 votes'
-    assert wa._with_vote_count('', 1) == '1 vote'
-    assert wa._location_fields(None, 59.9, 10.7, None, None, None, None) == (
-        'Current location', 'Current location')
-    assert wa._location_fields(None, 59.9, 10.7, 'Sentrum Scene', 'An address', 'http://example.test', None) == (
-        'Selected place: Sentrum Scene', 'Selected place')
-    assert wa._location_fields('meet here', 59.9, 10.7, None, None, None, None) == (
-        'meet here — Current location', 'Current location')
-    assert wa._location_fields(None, None, None, None, None, None, None) == ('', '')
-    assert wa._location_fields(None, 59.9, 10.7, None, None, None, 900) == (
-        'Live location', 'Live location')
+    assert wa._location_kind(59.9, 10.7, None, None, None, None) == 'Current location'
+    assert wa._location_kind(59.9, 10.7, 'Sentrum Scene', 'An address', 'http://example.test', None) == 'Selected place'
+    assert wa._location_kind(None, None, None, None, None, None) == ''
+    assert wa._location_kind(59.9, 10.7, None, None, None, 900) == 'Live location'
+    # Event is the report's own words; it never reuses or alters the stored text.
+    assert wa._event_label(1, None) == 'Photo'
+    assert wa._event_label(1, 'look at this') == 'Photo'
+    assert wa._event_label(0, 'meet here', location_kind='Current location') == 'Current location'
+    assert wa._event_label(0, 'Video call tonight?') == ''
+    assert wa._event_label(90, None, call='Video call, Not answered') == 'Video call, Not answered'
+    assert wa._event_label(7, 'Crypto market9', action=11) == 'Unknown system action 11'
+    assert wa._event_label(7, 'true', system='Message pinned', action=118) == 'Message pinned'
+    assert wa._event_label(36, None, timer=86400) == 'Message timer updated, 24 hours'
+    assert wa._event_label(0, 'Which day?', is_poll=True) == 'Poll'
+    assert wa._event_label(99, None) == 'Unknown message type 99'
+    assert wa._event_label(0, None) == ''
+    assert wa._event_label(15, None) == ''
     assert wa._call_phrase(0, 5, 125) == 'Voice call, Answered, 2 min 5 sec'
     assert wa._call_phrase(1, 2, 0) == 'Video call, Not answered'
     assert wa._call_phrase(1, 4, 0) == 'Video call, result 4'
@@ -119,10 +119,17 @@ def test_android_whatsapp_chat_type():
     assert wa._system_phrase('business', privacy_type=1) == 'Encryption notice'
     assert wa._system_phrase('business', privacy_type=2) == 'Business secure service'
     assert wa._system_phrase('group', action=5) == 'Left the group'
-    assert wa._system_phrase('group', action=11, text='') == 'You created this group'
+    assert wa._system_phrase('group', action=11, text='') == 'Group created'
     assert wa._system_phrase('group', action=11, text='Family') == ''
     assert wa._system_phrase('group', action=14) == 'Removed from the group'
-    assert wa._system_phrase('group', action=15) == "You're now an admin"
+    assert wa._system_phrase('group', action=15) == 'Made an admin'
+    me = {'447700900123@s.whatsapp.net'}
+    assert wa._who_suffix('Made an admin', ['447700900123@s.whatsapp.net'], me, 'Me (+447700900123)') == \
+        'Made an admin: Me (+447700900123)'
+    assert wa._who_suffix('Made an admin', ['447700900999@s.whatsapp.net'], me, 'Me') == \
+        'Made an admin: 447700900999@s.whatsapp.net'
+    assert wa._who_suffix('Left the group', ['lid_me'], me, 'Me') == 'Left the group: Me'
+    assert wa._who_suffix('Left the group', [], me, 'Me') == 'Left the group'
     assert wa._system_phrase('group', action=56, duration=86400) == 'Message timer updated, 24 hours'
     assert wa._system_phrase('group', action=56, duration=604800) == 'Message timer updated, 7 days'
     assert wa._system_phrase('group', action=56, duration=7776000) == 'Message timer updated, 90 days'
@@ -451,13 +458,26 @@ def test_gboard_clipboard_leaves_out_the_seeded_instructions():
                 (item_type, text, item_type))
         conn.execute(
             "INSERT INTO clips VALUES (99, 'GTD-CLIP-REAL', NULL, 1, 0, 1740695200000, NULL, '', NULL)")
+        base = "data/data/com.google.android.inputmethod.latin"
+        conn.execute(
+            "INSERT INTO clips VALUES (100, '', NULL, 2, 0, 1740695300000, NULL, "
+            "'content://x/clipboard_image/here.png', NULL)")
+        conn.execute(
+            "INSERT INTO clips VALUES (101, '', NULL, 2, 0, 1740695400000, NULL, "
+            "'content://x/clipboard_image/gone.png', NULL)")
         conn.commit()
         conn.close()
         rows = gboard.run({
             "clipboard_db": db,
-            "_app_base_ui_path": "data/data/com.google.android.inputmethod.latin",
+            "_app_base_ui_path": base,
+            "_zip_names": [f"{base}/files/clipboard_image/here.png"],
         })
-    assert [row["text"] for row in rows] == ["GTD-CLIP-REAL"]
+    assert [row["text"] for row in rows] == ["GTD-CLIP-REAL", "", ""]
+    # An image path only for a file that is in the extraction; the other says why not.
+    assert rows[1]["image_path"] == f"{base}/files/clipboard_image/here.png"
+    assert rows[1]["image_missing"] == ""
+    assert rows[2]["image_path"] == ""
+    assert rows[2]["image_missing"] == f"not in extraction: {base}/files/clipboard_image/gone.png"
 
 
 def _varint(value):

@@ -47,7 +47,9 @@ def run(paths):
         raw = handle.read()
     try:
         root = _xml_root(raw)
-    except Exception:
+    except Exception as exc:
+        from artifact_runner import log_note
+        log_note(f"{paths['notification_policy']} could not be parsed ({exc}); nothing read from it")
         return []
 
     ui_path = f"{paths['_app_base_ui_path']}/notification_policy.xml"

@@ -3102,6 +3102,9 @@ class ArtifactViewerMixin:
           deleted_for_everyone  placeholder text "... (by me)" / "(by them)"
           call_pattern   regex on the message text marking a call event;
                          absent = the report holds no calls (Calls blank)
+          call_field     column call_pattern is matched against instead of
+                         the message text (a report that keeps calls in
+                         their own column, so typed words never count)
         Keys of each dict: key, name, participants, people (count), messages,
         incoming, outgoing, media_in, media_out, deleted, calls (None if the
         report has no call events), links, bookmarked, times (epoch seconds
@@ -3136,6 +3139,7 @@ class ArtifactViewerMixin:
         setting_col, expires_col = decl.get('setting'), decl.get('expires')
         dfe_col = decl.get('deleted_for_everyone')
         call_re = re.compile(decl['call_pattern']) if decl.get('call_pattern') else None
+        call_col = decl.get('call_field')
         url_re = re.compile(r'https?://', re.IGNORECASE)
         link_cols = _cols(getattr(mod, 'link_fields', None) or getattr(mod, 'media_fields', None))
         try:
@@ -3151,7 +3155,7 @@ class ArtifactViewerMixin:
                 want = [c for c in dict.fromkeys(
                     [key_col, dir_col, msg_col, time_col, members_col, *names, *senders,
                      *media_cols, *deleted, *link_cols, type_col, sort_col, issued_col,
-                     setting_col, expires_col, dfe_col, icon_col])
+                     setting_col, expires_col, dfe_col, icon_col, decl.get('call_field')])
                         if c and c in cols]
                 rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in want)
                                     + f' FROM "artifact_{script_name}"').fetchall()
@@ -3185,7 +3189,8 @@ class ArtifactViewerMixin:
                         (vals != '*' and str(v) in vals):
                     c['deleted'] += 1
                     break
-            if call_re and call_re.search(text_all):
+            call_text = str(_get(r, call_col) or '') if call_col else text_all
+            if call_re and call_re.search(call_text):
                 c['calls'] += 1
             if url_re.search(text_all):
                 c['links'] += 1

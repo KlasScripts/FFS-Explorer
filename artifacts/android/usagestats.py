@@ -4,8 +4,10 @@ The files under data/system_ce/<user>/usagestats/ (and the older
 data/system/usagestats/<user>/) are interval protobufs. Package and class
 names are tokens. The names live in the mappings file beside them. A stored
 time is an offset from the interval file's numeric name, which is the
-interval start in milliseconds. A negative stored time is already an
-absolute time.
+interval start in milliseconds. The offset can be negative: AOSP's
+UsageStatsProtoV2.writeOffsetTimestamp keeps events up to one hour before
+the interval start (rollover), and its reader always adds the offset to
+the start (beginTime + stored).
 
 The same event is written into the daily file and again into the weekly,
 monthly, and yearly files. This report keeps one row, from the finest
@@ -203,10 +205,9 @@ def _mappings(data: bytes) -> dict[int, list[str]]:
 
 
 def _event_time(stored: int, interval_begin: int) -> int:
-    signed = _i64(stored)
-    if signed < 0:
-        return abs(signed)
-    return interval_begin + signed
+    """Interval start plus the stored offset, as AOSP reads it. A negative
+    offset is an event shortly before the interval start."""
+    return interval_begin + _i64(stored)
 
 
 def _events_from_proto(data: bytes, interval_begin: int, packages: dict[int, list[str]]) -> list[dict]:
@@ -273,6 +274,8 @@ def _user(root: str) -> str:
 
 
 def run(paths):
+    from artifact_runner import log_note
+
     read = paths.get("_read_zip_bytes")
     names = paths.get("_zip_names") or []
     if read is None:
@@ -299,8 +302,10 @@ def run(paths):
                 continue
             try:
                 packages = _mappings(read(name))
-            except Exception:
+            except Exception as exc:
                 packages = {}
+                log_note(f"{ui}: mappings file could not be read ({exc}); "
+                         f"package names under {root} are blank")
             break
         user = _user(root)
         for name in members:
@@ -311,7 +316,8 @@ def run(paths):
             interval = _interval(ui, root)
             try:
                 events = _read_events(read(name), int(file_name), packages)
-            except Exception:
+            except Exception as exc:
+                log_note(f"{ui}: not read ({exc}); its events are not in this report")
                 continue
             rank = _INTERVAL_RANK.get(interval, 9)
             for event in events:

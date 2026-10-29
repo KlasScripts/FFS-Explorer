@@ -2,13 +2,13 @@
 
 This report lists votes on polls that are still in `msgstore.db`. One row is one selected option. Filter **Question** to see one poll's result.
 
-The poll itself stays in **WhatsApp Messages**. That row has the question, the option names, and a count such as `2 votes`. The count is the number of rows here for that poll. The names are only here.
+The poll itself stays in **WhatsApp Messages**. That row has the question (Text), the option names (Poll Options), and **Poll Votes**, the number of rows here for that poll. The names are only here.
 
 ## What could catch you out
 
 | ⚠️ Watch out for | What it means for you | Read |
 |---|---|---|
-| **Two options from one person are two rows** | The count on the poll counts rows, so one person who picks two options adds two. | [What a row is](#what-a-row-is) |
+| **Two options from one person are two rows** | Poll Votes counts rows, so one person who picks two options adds two. | [What a row is](#what-a-row-is) |
 | **A 1:1 vote often has no sender address** | The other person's vote names the chat. It does not carry a separate sender id. | [Who the voter is](#who-the-voter-is) |
 | **A blank Option is a vote with no choice stored** | The person is still listed. The option cell is empty. | [What a row is](#what-a-row-is) |
 
@@ -42,7 +42,7 @@ The poll itself stays in **WhatsApp Messages**. That row has the question, the o
 
 | What we read | Status | Basis |
 |---|---|---|
-| This phone's vote, option known beforehand | **Observed. Controlled.** | One poll in a 1:1 chat, linked Android phone, 27 October 2026. The vote row is `from_me` 1, sender id −1, and the selected option is the option tapped on screen. The poll text ends with `1 vote`. |
+| This phone's vote, option known beforehand | **Observed. Controlled.** | One poll in a 1:1 chat, linked Android phone, 27 October 2026. The vote row is `from_me` 1, sender id −1, and the selected option is the option tapped on screen. One vote row for that poll (Poll Votes 1). |
 | The other person in a 1:1 chat | **Observed only.** | Same phone, 26 October 2026. A vote on a 1:1 poll has `from_me` 0 and no sender id, and the selected option is stored. That poll was not the lab poll. The other person's vote on the lab poll was not in the copies kept after the chat was cleared. |
 | A group voter | **Observed only. Not a staged poll.** | Same phone. Group votes store a sender LID, mapped to a phone, with a selected option. None of those polls was created for this test. |
 | `hide_participant_names` | **Not seen set.** | Unset on the polls checked. This report shows the sender the vote row stores. |

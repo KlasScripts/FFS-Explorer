@@ -100,7 +100,7 @@ _CALL_LABELS = {
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"]}, "call_pattern": r"^\[(Outgoing|Incoming|Missed) (audio|video) call", "type": "chat_type"}
+chat_groups = {"key": "raw_conversation_id", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link", "media_uri"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"]}, "call_pattern": r"^(Outgoing|Incoming|Missed) (audio|video) call|^Call\b", "call_field": "event", "type": "chat_type"}
 
 def run(paths):
     from artifact_runner import first_nonempty, missing_ref_label, open_db_readonly
@@ -191,20 +191,21 @@ def run(paths):
         conversation = (", ".join(convo_members) if convo_members
                        else missing_ref_label("participant records", "conversation_id", r["conversation_id"]))
 
+        # message is messages.body exactly as stored (on a call row that is
+        # Viber's own token, such as "outgoing_call"). The call, location
+        # and media labels go in event; details in their own columns.
         if r["extra_mime"] == _MIME_CALL:
-            label = _CALL_LABELS.get(r["body"], r["body"] or "[call event]")
+            event = _CALL_LABELS.get(r["body"], "Call")
             dur = r["extra_duration"] or 0
-            body = f"[{label}] {dur // 60}:{dur % 60:02d}" if dur else f"[{label}]"
+            if dur:
+                event = f"{event}, {dur // 60}:{dur % 60:02d}"
         elif r["location_lat"] or r["location_lng"]:
-            # location_lat/lng are stored as degrees * 1e7 (fixed-point int).
-            body = f"[Location] {r['location_lat'] / 1e7:.6f}, {r['location_lng'] / 1e7:.6f}"
+            event = "Location"
         elif r["body"] and r["body"].startswith("content://"):
-            body = f"[Media] {r['body']}"
+            event = "Media"
         else:
-            body = r["body"] or ""
-
-        if r["likes_count"]:
-            body = f"{body}  (liked x{r['likes_count']})" if body else f"(liked x{r['likes_count']})"
+            event = ""
+        has_location = bool(r["location_lat"] or r["location_lng"])
 
         direction = {0: "Incoming", 1: "Outgoing"}.get(r["send_type"], r["send_type"])
         others = convo_others.get(r["conversation_id"], {})
@@ -218,11 +219,17 @@ def run(paths):
             "chat_members": chat_members,
             "chat_type": "Group" if len(convo_others.get(r["conversation_id"], {})) > 1 else "1:1",
             "direction": direction,
-            "message": body,
+            "message": r["body"],
+            "event": event,
+            # location_lat/lng are stored as degrees * 1e7 (fixed-point int).
+            "latitude": r["location_lat"] / 1e7 if has_location and r["location_lat"] is not None else None,
+            "longitude": r["location_lng"] / 1e7 if has_location and r["location_lng"] is not None else None,
+            "likes": r["likes_count"] or "",
             "raw_message_id": r["id"],
             "raw_conversation_id": r["conversation_id"],
             "raw_participant_id": r["participant_id"],
             "media_link": _media_link(paths, r["extra_uri"]),
+            "media_uri": r["body"] if (r["body"] or "").startswith("content://") else "",
             "recovered": False,
             "source_table": "messages",
         })

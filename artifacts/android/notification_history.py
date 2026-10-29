@@ -153,6 +153,8 @@ def _rows_from_proto(data: bytes, source_path: str) -> list[dict]:
 
 
 def run(paths):
+    from artifact_runner import log_note
+
     read = paths.get("_read_zip_bytes")
     if read is None:
         return []
@@ -166,7 +168,8 @@ def run(paths):
         try:
             data = read(name)
             rows.extend(_rows_from_proto(data, ui))
-        except Exception:
+        except Exception as exc:
+            log_note(f"{ui}: not read ({exc}); its notifications are not in this report")
             continue
     rows.sort(key=lambda row: (row["posted_time"] if isinstance(row["posted_time"], int) else 0, row["source_path"]))
     return rows

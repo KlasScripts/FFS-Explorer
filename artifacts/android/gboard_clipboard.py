@@ -10,7 +10,8 @@ are left out. item_type and entity_type are reported as stored. Their
 meanings are not established.
 
 An image path is the archive path of the clipboard file named by the last
-segment of uri. The path is reported even when that file was not pulled.
+segment of uri, given only when that file is in the extraction. When it is
+not, image_missing names the expected path.
 """
 
 name = "Gboard Clipboard"
@@ -58,7 +59,7 @@ def _image_path(app_base: str, uri: str) -> str:
 
 
 def run(paths):
-    from artifact_runner import open_db_readonly
+    from artifact_runner import archive_has, open_db_readonly
 
     conn = open_db_readonly(paths["clipboard_db"])
     try:
@@ -77,13 +78,16 @@ def run(paths):
         if text in _SEEDED_CLIPS:
             continue
         uri = row["uri"] or ""
+        expected = _image_path(app_base, uri)
+        present = archive_has(paths, expected)
         out.append({
             "clip_id": row["_id"],
             "timestamp": row["timestamp"],
             "text": text,
             "html_text": row["html_text"] or "",
             "uri": uri,
-            "image_path": _image_path(app_base, uri),
+            "image_path": expected if present else "",
+            "image_missing": "" if present or not expected else f"not in extraction: {expected}",
             "item_type": row["item_type"],
             "entity_type": row["entity_type"],
             "raw_ui_path": ui_path,

@@ -184,7 +184,9 @@ def _first_unlocks(paths) -> list[int]:
     """USER_UNLOCKED times (ms) from Usage Stats in the same extraction."""
     try:
         events = _usage_stats().run(paths)
-    except Exception:
+    except Exception as exc:
+        from artifact_runner import log_note
+        log_note(f"Usage Stats could not be read ({exc}); Seconds After First Unlock is blank")
         return []
     return sorted(
         row["event_time"] for row in events
@@ -214,6 +216,8 @@ def _mark(rows: list[dict], unlocks: list[int]) -> list[dict]:
 
 
 def run(paths):
+    from artifact_runner import log_note
+
     read = paths.get("_read_zip_bytes")
     if read is None:
         return []
@@ -228,13 +232,15 @@ def run(paths):
         app, conversation_id = found
         try:
             data = read(name)
-        except Exception:
+        except Exception as exc:
+            log_note(f"{ui}: not read ({exc}); its notifications are not in this report")
             continue
         if not data:
             continue
         try:
             rows.extend(_posted(data, app, conversation_id, ui))
-        except ValueError:
+        except ValueError as exc:
+            log_note(f"{ui}: not decoded ({exc}); its notifications are not in this report")
             continue
     rows = _collapse(rows)
     return _mark(rows, _first_unlocks(paths)) if rows else rows

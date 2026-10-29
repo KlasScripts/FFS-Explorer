@@ -703,6 +703,13 @@ def _prompt_text(m: dict) -> str:
     """A message as the model sees it: media as [MEDIA] (plus any caption),
     the parsers' long placeholders shortened."""
     text = m["text"] or ""
+    event = m.get("event") or ""
+    if event.startswith("System event, type 59"):
+        return "[call event]"
+    if not text and event:
+        # A report label, not words anyone wrote: always in brackets, and
+        # never part of m["text"], which the quote check reads.
+        text = f"[{event}]"
     nt = _NO_TEXT_RE.match(text)
     if m["media"]:
         if nt:      # e.g. WhatsApp type 5 (contact card or location): not a picture
@@ -732,13 +739,16 @@ def load_chat_messages(case_dir: str, script_name: str, decl: dict, units: dict)
     media_cols = _cols(decl.get("media"))
     prefixes = tuple(decl.get("media_prefixes", ()))
     msg_col = decl.get("message", "message")
+    # The report's own label for a row (a call, a system line). Never part
+    # of the text: shown to the model in brackets when there is no text.
+    event_col = decl.get("event", "event")
     time_col = decl.get("time")
     unit = units.get(time_col) if time_col else None
     path = os.path.join(case_dir, "caseresults.db")
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
     try:
         have = {r[1] for r in conn.execute(f'PRAGMA table_info("artifact_{script_name}")')}
-        want = [c for c in dict.fromkeys([key_col, dir_col, msg_col, time_col,
+        want = [c for c in dict.fromkeys([key_col, dir_col, msg_col, time_col, event_col,
                                           *names, *senders, *media_cols]) if c and c in have]
         rows = conn.execute("SELECT rowid, " + ", ".join(f'"{c}"' for c in want)
                             + f' FROM "artifact_{script_name}"').fetchall()
@@ -767,6 +777,7 @@ def load_chat_messages(case_dir: str, script_name: str, decl: dict, units: dict)
         media = any(get(r, m) for m in media_cols) or (prefixes and text.startswith(prefixes))
         ts = _to_epoch_seconds(get(r, time_col), unit) if time_col else None
         c["messages"].append({"rowid": r[0], "ts": ts, "speaker": speaker, "text": text,
+                              "event": str(get(r, event_col) or ""),
                               "media": bool(media),
                               "time": _format_timestamp(get(r, time_col), unit) if time_col else ""})
     out = {}
@@ -867,7 +878,8 @@ def media_facts(messages: list) -> list:
     by = {}
     for n, m in enumerate(messages, 1):
         if m["media"]:
-            nt = _NO_TEXT_RE.match(m["text"] or "")
+            label = m["text"] or (f"[{m['event']}]" if m.get("event") else "")
+            nt = _NO_TEXT_RE.match(label)
             by.setdefault(m["speaker"], []).append(f"#{n}" + (f" (type {nt.group(1)})" if nt else ""))
     return sorted(by.items(), key=lambda kv: kv[0] != "Me")
 

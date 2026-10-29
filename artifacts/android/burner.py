@@ -76,7 +76,7 @@ hidden_fields = ["chat_members", "media_link"]
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "conversation", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link"], "media_prefixes": ["[Media]"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {}, "call_pattern": r"^\[Call\]", "type": "chat_type"}
+chat_groups = {"key": "conversation", "name": ["conversation"], "sent": ["Outgoing"], "media": ["media_link", "media_url"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {}, "call_pattern": r"^Call\b", "call_field": "event", "type": "chat_type"}
 
 def run(paths):
     from artifact_runner import missing_ref_label, open_db_readonly
@@ -117,17 +117,19 @@ def run(paths):
         else:
             party = contact_names.get(r["contactId"], r["contactId"] or "[unknown contact]")
 
+        # message is DbMessage.text exactly as stored. A call or a media
+        # message is named in event, not written into the text.
         if r["type"] == "Voice":
             # No call-duration column exists anywhere in this schema — per
             # the test image's own documentation, Burner calls are placed
             # through the native phone app, not tracked end-to-end by
             # Burner's own database. `state` (e.g. "CallCompleted") is
             # passed through as stored rather than invented.
-            body = f"[Call] {r['state']}"
+            event = f"Call, {r['state']}" if r["state"] else "Call"
         elif r["mediaUrl"]:
-            body = f"[Media] {r['mediaUrl']}" + (f"  {r['text']}" if r["text"] else "")
+            event = "Media"
         else:
-            body = r["text"] or ""
+            event = ""
 
         media_link = ""
         if r["mediaUrl"]:
@@ -153,7 +155,9 @@ def run(paths):
             "timestamp": r["dateCreated"],
             "sender": party,
             "direction": direction,
-            "message": body,
+            "message": r["text"],
+            "event": event,
+            "media_url": r["mediaUrl"] or "",
             "read": bool(r["isRead"]),
             "raw_message_id": r["id"],
             "raw_contact_id": r["contactId"],

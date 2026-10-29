@@ -11,8 +11,12 @@ added / deleted / modified highlighted in place. Below those come recovered
 versions that are not in the live table: WAL HISTORY (an older version in a
 WAL frame, such as a row added and deleted again, or an earlier edit),
 JOURNAL (a page as it was before a change, from a rollback journal), and
-CARVED (a deleted record still in the main file's free space or freed
-pages). A table the WAL dropped is still listed, its rows DELETED. A
+CARVED (a deleted record still in free space on this table's own pages).
+CARVED (freed page) comes from a page no table owns any more: it is placed
+in this table only because the column count matches, so the table is not
+certain. CARVED (pattern) was found by its record-header pattern, has no
+rowid, and shows [cut off] for columns that were not recovered (never a
+blank that could be read as NULL). A table the WAL dropped is still listed, its rows DELETED. A
 database with no WAL shows the plain paged table unless a table has
 JOURNAL or CARVED rows.
 
@@ -61,6 +65,8 @@ _DIFF_BG = {
     'WAL HISTORY (older WAL)': QColor(66, 133, 244, 30),
     'JOURNAL':  QColor(0, 150, 136, 50),     # teal
     'CARVED':   QColor(156, 39, 176, 45),    # purple
+    'CARVED (freed page)': QColor(156, 39, 176, 25),
+    'CARVED (pattern)':    QColor(156, 39, 176, 25),
 }
 _DIFF_CELL_CHANGED = QColor(255, 193, 7, 130)   # stronger amber for changed cells
 
@@ -69,13 +75,19 @@ _DIFF_TIP = {
     'ADDED':    "Only in the WAL, not yet in the main file.",
     'DELETED':  "In the main file, removed by the WAL.",
     'MODIFIED': "Changed by the WAL. Cells show old → new.",
-    'WAL HISTORY': "Earlier version found in the WAL, later changed or deleted.",
-    'WAL HISTORY (older WAL)': "Leftover from an earlier WAL round. Less certain.",
-    'JOURNAL':  "Older version from the rollback journal, before a change.",
-    'CARVED':   "Deleted record recovered from free space in the main file.",
+    'WAL HISTORY': "Older version in a WAL frame of this table's page.",
+    'WAL HISTORY (older WAL)': "Earlier WAL round. Page may have held another table.",
+    'JOURNAL':  "Older page from rollback journal. May be another table's.",
+    'CARVED':   "Deleted record from free space on this table's pages.",
+    'CARVED (freed page)': "Freed page. Table not certain: matched by column count.",
+    'CARVED (pattern)': "Found by record pattern, no rowid. [cut off] = missing.",
 }
 
 _JOURNAL_MAGIC = b'\xd9\xd5\x05\xf9\x20\xa1\x63\xd7'
+
+# A column a pattern-carved record was cut off before. Not NULL: the value
+# was not recovered, so the cell must not look like a stored empty value.
+_CUT_OFF = '[cut off]'
 
 
 def _journal_pages(data: bytes) -> list[tuple[int, bytes]]:
@@ -541,7 +553,7 @@ class SqliteViewerMixin:
         self._sql_affected_check.setVisible(False)
 
         self._sql_filter_input = QLineEdit()
-        self._sql_filter_input.setPlaceholderText("Filter rows…")
+        self._sql_filter_input.setPlaceholderText("Filter rows (stored values: a date column is searched as its raw number)…")
         self._sql_filter_input.setClearButtonEnabled(True)
         self._sql_filter_timer = QTimer(self)
         self._sql_filter_timer.setSingleShot(True)
@@ -1123,16 +1135,25 @@ class SqliteViewerMixin:
             try:
                 cells = carve_unallocated_region(raw, page_size, own_leaves)
                 own_header = parse_db_header(raw)
-                cells += carve_freed_pages(raw, page_size, own_header)
+                # A freed page is no longer any table's: its rows are
+                # placed here only because the column count matches.
+                cells += [dict(c, _status='CARVED (freed page)')
+                          for c in carve_freed_pages(raw, page_size, own_header)]
             except Exception:
                 continue
             for cell in cells:
-                keep('CARVED', cell, carved=True)
+                keep(cell.get('_status', 'CARVED'), cell, carved=True)
 
         # No rowid survives these, so compare everything except the id.
         def without_id(vals):
             return tuple(v for i, v in enumerate(vals) if i != id_idx)
-        known = {without_id(v) for v in list(before_map.values()) + list(after_map.values())}
+        live_rows = list(before_map.values()) + list(after_map.values())
+        prefixes: dict = {}
+
+        def known_prefix(n):
+            if n not in prefixes:
+                prefixes[n] = {without_id(list(v)[:n]) for v in live_rows}
+            return prefixes[n]
         for raw, own_leaves in raws:
             try:
                 signature = sample_header_signature(raw, page_size, own_leaves)
@@ -1141,16 +1162,22 @@ class SqliteViewerMixin:
                 continue
             for cell in cells:
                 values = list(cell['values'])[:ncols]
-                values += [None] * (ncols - len(values))
+                read = len(values)
+                values += [None] * (ncols - read)
                 if empty(values) or any(isinstance(v, str) and not _text_plausible(v) for v in values):
                     continue
                 if id_idx is not None:
                     values[id_idx] = None
-                version = without_id(values)
-                if version in known or ('sig', version) in seen:
+                # A cut-off record matches a live row when the columns it
+                # has agree; the missing ones are not compared.
+                version = without_id(values[:read])
+                if version in known_prefix(read) or ('sig', read, version) in seen:
                     continue
-                seen.add(('sig', version))
-                out.append(('CARVED', values, set()))
+                seen.add(('sig', read, version))
+                values[read:] = [_CUT_OFF] * (ncols - read)
+                if id_idx is not None and id_idx >= read:
+                    values[id_idx] = None
+                out.append(('CARVED (pattern)', values, set()))
         return out
 
     def _compute_table_diff(self, table: str):
@@ -1403,12 +1430,29 @@ class SqliteViewerMixin:
     # ── Export ─────────────────────────────────────────────────────────────────
 
     def _export_sql_table_csv(self) -> None:
+        """Write the table as shown. A column shown as a date and time is
+        written twice: the stored number under the column's own name, then
+        the converted text under its labelled header, so a wrong conversion
+        never replaces the stored value in an exported file."""
         model = self._sql_table_view.model()
-        # Header text as shown, so a converted time column says so.
-        cols = [model.headerData(c, Qt.Orientation.Horizontal) or ''
-                for c in range(model.columnCount())]
-        if not cols:
+        if model is None or not model.columnCount():
             return
+        diff = model is self._sql_diff_model
+        names, converted = [], []
+        for c in range(model.columnCount()):
+            if diff:
+                name = model._columns[c]
+            else:
+                real = model._real_col(c)
+                name = model._columns[real] if real is not None else ''
+            units = model._ts_units
+            names.append(name)
+            converted.append(name in units)
+        header = []
+        for c, name in enumerate(names):
+            header.append(name)
+            if converted[c]:
+                header.append(model.headerData(c, Qt.Orientation.Horizontal) or name)
         table = self._sql_table_combo.currentData() or 'table'
         default = f"{table}_wal_changes.csv" if self._sql_diff_mode else f"{table}.csv"
         path, _ = QFileDialog.getSaveFileName(
@@ -1416,15 +1460,27 @@ class SqliteViewerMixin:
         if not path:
             return
 
+        def stored(row, c):
+            if diff:
+                if c == 0:
+                    return model.data(model.index(row, 0))
+                _status, vals, _changed = model._rows[model._view[row]]
+                v = vals[c - 1] if c - 1 < len(vals) else None
+                return str(v) if isinstance(v, CellChange) else v
+            return model.row_dict(row).get(names[c])
+
         nrows = model.rowCount()
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(cols)
+                writer.writerow(header)
                 for row in range(nrows):
-                    writer.writerow([
-                        model.data(model.index(row, c)) for c in range(len(cols))
-                    ])
+                    out = []
+                    for c in range(len(names)):
+                        out.append(stored(row, c) if converted[c] else model.data(model.index(row, c)))
+                        if converted[c]:
+                            out.append(model.data(model.index(row, c)))
+                    writer.writerow(out)
         except Exception as exc:
             self._sql_status_label.setText(f"Export failed: {exc}")
             return

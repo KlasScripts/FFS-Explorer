@@ -2,7 +2,11 @@
 every finding in code (number exists, speaker sent it, quoted words are in
 it, number corrected when the words are in another message), works out
 media itself, and runs its own word scan."""
+import os
+
 import ai_summary as a
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MSGS = [
     {'speaker': 'Alex', 'time': '2024-03-01 19:06:00 UTC', 'text': 'how old are you btw', 'media': False},
@@ -85,3 +89,45 @@ def test_report_renders_with_and_without_focus():
     part = a.render_chat_report('Alex', MSGS, checked, 'm', 'now', 1, 1.0, focus=(3, 5))
     assert 'all 7 message(s) sent' in full
     assert 'messages #3–#5 sent (the strongest red-flag session of 7)' in part
+
+
+def test_report_labels_reach_the_model_in_brackets_and_never_as_text():
+    """Event is the parser's own label. The model sees it in brackets when a
+    row has no text; it is never in m["text"], which the quote check reads."""
+    import ai_summary
+    call = {"text": "", "event": "Video call, Not answered", "media": False}
+    assert ai_summary._prompt_text(call) == "[Video call, Not answered]"
+    typed = {"text": "video call later?", "event": "", "media": False}
+    assert ai_summary._prompt_text(typed) == "video call later?"
+    ios59 = {"text": "", "event": "System event, type 59 — adjacent to a call", "media": False}
+    assert ai_summary._prompt_text(ios59) == "[call event]"
+    card = {"text": "", "event": "No text — message type 5", "media": True, "speaker": "Me"}
+    assert ai_summary.media_facts([card]) == [("Me", ["#1 (type 5)"])]
+
+
+def test_chat_parsers_keep_their_own_words_out_of_the_message():
+    """Every chat parser that counts calls reads a separate column, and none
+    finds media by a prefix the parser wrote into the text."""
+    import importlib.util
+    for platform, name in (("android", "whatsapp"), ("android", "groupme"), ("android", "burner"),
+                           ("android", "line"), ("android", "viber")):
+        path = os.path.join(ROOT, "artifacts", platform, f"{name}.py")
+        spec = importlib.util.spec_from_file_location(f"{platform}_{name}_decl", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        decl = mod.chat_groups
+        assert decl.get("call_field") == "event", name
+        assert not decl.get("media_prefixes"), name
+
+
+def test_chat_parsers_with_system_rows_declare_a_system_direction():
+    """App events (WhatsApp group lines, LINE type 33, iOS WhatsApp type 6)
+    are Direction System, so Chat Groups and the AI never count them as sent."""
+    import importlib.util
+    for platform, name in (("android", "whatsapp"), ("android", "line"),
+                           ("android", "groupme"), ("ios", "whatsapp")):
+        path = os.path.join(ROOT, "artifacts", platform, f"{name}.py")
+        spec = importlib.util.spec_from_file_location(f"{platform}_{name}_sys", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert "System" in mod.chat_groups.get("system", ()), (platform, name)

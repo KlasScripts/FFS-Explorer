@@ -21,7 +21,8 @@ description = ("Messages from WhatsApp's local database (msgstore.db, "
               "the one documented deletion here was a local-only delete, "
               "which WhatsApp does not appear to route through that table."
               " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from group members from group_participant_user; the owner's number from shared_prefs/com.whatsapp_preferences_light.xml (registration_jid). Where a group's member list is empty it says so. This is membership as at extraction, not at the time of any message, so no message row claims who received it."
-              " Reactions (2026-10-29): message_add_on type 56 with its emoji in message_add_on_reaction, shown on the message that was reacted to as \"emoji person time\", comma separated; that time is written in UTC. Last Reaction Time is the newest one.")
+              " Reactions (2026-10-29): message_add_on type 56 with its emoji in message_add_on_reaction, shown on the message that was reacted to as \"emoji person time\", comma separated; that time is written in UTC. Last Reaction Time is the newest one."
+              " Text and Event (2026-10-29): Text is exactly what the database stores. This report's own labels (calls, system lines, Photo/GIF/Sticker, location kind, Poll, unknown types) are in Event, never in Text. Group lines name the person message_system_chat_participant stores, not \"you\". Direction of a system row (type 7) is System, not Sent: the database stores from_me 1 on every system row, including groups dated years before the phone's first message (Pixel 7a image), so it does not show who acted. from_me is a column as stored.")
 app_path = "data/data/com.whatsapp"
 files    = {
     "msgstore": "databases/msgstore.db",
@@ -221,10 +222,11 @@ link_fields = ["attachment_path", "thumbnail_link"]
 # No sort/issued/setting. Android msgstore has no per-message sequence
 # counter and no disappearing-message setting column, so the Chat Groups
 # page does not show those headers. call_pattern counts the voice and
-# video call rows this report writes into the message text.
+# video call rows by the Event column (call_field), never by the message
+# text, so a typed "video call later?" is not counted as a call.
 # icon: the group picture, files/Avatars/<jid>.j, shown on the Chat
 # Groups page. Only written when that file is in the extraction.
-chat_groups = {"key": "chat_id", "name": ["chat_subject", "remote_name", "phone_jid", "chat_jid"], "sent": ["Sent"], "media": ["attachment_path"], "message": "text", "time": "sent_time", "participants": ["remote_name", "phone_jid", "lid"], "members": "chat_members", "deleted": {"recovered": ["True"], "deleted_for_everyone": "*"}, "type": "chat_type", "call_pattern": r"Voice call|Video call", "icon": "group_icon"}
+chat_groups = {"key": "chat_id", "name": ["chat_subject", "remote_name", "phone_jid", "chat_jid"], "sent": ["Sent"], "system": ["System"], "media": ["attachment_path"], "message": "text", "time": "sent_time", "participants": ["remote_name", "phone_jid", "lid"], "members": "chat_members", "deleted": {"recovered": ["True"], "deleted_for_everyone": "*"}, "type": "chat_type", "call_pattern": r"^(Voice|Video) call\b", "call_field": "event", "icon": "group_icon"}
 
 _AVATAR_DIR = "data/data/com.whatsapp/files/Avatars"
 
@@ -296,56 +298,55 @@ def _username_for_lid(conn, self_lid):
     return row[0] if row else None
 
 
-def _with_poll_options(text, options):
-    """Poll question plus option names from message_poll_option, in row order.
-    A poll with no question still lists the options."""
-    names = [o for o in (options or []) if o]
-    body = text or ""
-    if not names:
-        return body
-    extra = " | ".join(names)
-    return f"{body} — {extra}" if body else extra
-
-
-def _with_vote_count(text, count):
-    """How many vote rows belong to this poll. The names are on the
-    WhatsApp Poll Votes report. Zero stays as the question and options."""
-    n = int(count or 0)
-    if n <= 0:
-        return text or ""
-    extra = "1 vote" if n == 1 else f"{n} votes"
-    body = text or ""
-    return f"{body} · {extra}" if body else extra
-
-
 def _fmt_jid(jid, jid_id):
     return f"{jid} ({jid_id})" if jid and jid_id is not None else ""
 
 
-def _location_fields(text, latitude, longitude, place_name, place_address, url, live_duration):
-    """(bubble text, location_kind) for one message_location row.
+def _location_kind(latitude, longitude, place_name, place_address, url, live_duration):
+    """Which kind of location message this was, from message_location.
 
     A current-location send stores coordinates and leaves the place name,
     address, and link empty. A place picked from the list stores those
     three. The coordinates alone do not say which one it was. A live
     share sets live_location_share_duration; that value was not present
-    on the rows this was checked against.
+    on the rows this was checked against. '' when there is no location.
     """
-    name = (place_name or "").strip()
-    address = (place_address or "").strip()
-    link = (url or "").strip()
-    has_point = latitude is not None or longitude is not None
     if live_duration:
-        kind, extra = "Live location", "Live location"
-    elif name or address or link:
-        kind = "Selected place"
-        extra = f"Selected place: {name}" if name else "Selected place"
-    elif has_point:
-        kind, extra = "Current location", "Current location"
-    else:
-        return text or "", ""
-    body = text or ""
-    return (f"{body} — {extra}" if body else extra), kind
+        return "Live location"
+    if any((v or "").strip() for v in (place_name, place_address, url)):
+        return "Selected place"
+    if latitude is not None or longitude is not None:
+        return "Current location"
+    return ""
+
+
+def _event_label(message_type, text, *, call=None, system=None, action=None,
+                 timer=None, location_kind="", is_poll=False):
+    """The Event column: what kind of message a row is, in this report's
+    words. It is never copied into text, so text stays what the database
+    stores and a search or a quote of text never finds these words.
+
+    A call row is its call phrase. A type 7 row is its system phrase, or
+    "Unknown system action N". Type 36 is the one-to-one timer line. A
+    media kind confirmed on the test phone (photo, GIF, sticker), a
+    location kind, and a poll are named. Any other type with no stored
+    text is "Unknown message type N". Type 0 and type 15 (named in
+    Deleted For Everyone) stay blank.
+    """
+    if call:
+        return call
+    if message_type == 7:
+        return system or _unknown_label(7, action)
+    if message_type == 36:
+        span = _timer_span(timer)
+        return f"Message timer updated, {span}" if span else "Message timer"
+    parts = [p for p in (_kind_phrase(message_type), location_kind,
+                         "Poll" if is_poll else "") if p]
+    if parts:
+        return ", ".join(parts)
+    if (text is None or str(text).strip() == "") and message_type not in (0, 15):
+        return _unknown_label(message_type, action)
+    return ""
 
 
 def _duration_clock(seconds):
@@ -418,12 +419,16 @@ def _system_phrase(kind, blocked=None, action=None, joined=None,
     if kind == "group" and action == 5:
         return "Left the group"
     # A created-group row that stores a name was not shown as "created".
+    # Who created it is not stored on the row, so the label does not say.
     if kind == "group" and action == 11 and not (text or "").strip():
-        return "You created this group"
+        return "Group created"
     if kind == "group" and action == 14:
         return "Removed from the group"
+    # Seen on this phone as "You're now an admin", but whether another
+    # member's promotion uses the same action was not tested. The person
+    # is taken from message_system_chat_participant (see _who_suffix).
     if kind == "group" and action == 15:
-        return "You're now an admin"
+        return "Made an admin"
     # Action 56 is the timer line. Duration 0 was "You turned off
     # disappearing messages". A positive duration was "You updated the
     # message timer", and the screen named the 24-hour choice.
@@ -609,6 +614,38 @@ def _load_system_phrases(conn):
         if phrase:
             out[mid] = phrase
     return out
+
+
+def _load_system_participants(conn):
+    """{message_id: [user jid raw string, ...]} from
+    message_system_chat_participant: the person a group line is about
+    (who left, was removed, was made an admin). {} when the table is absent.
+    """
+    out = {}
+    try:
+        for mid, raw, server in conn.execute("""
+            SELECT p.message_row_id, j.raw_string, j.server
+            FROM message_system_chat_participant p
+            JOIN jid j ON j._id = p.user_jid_row_id
+            ORDER BY p.message_row_id, p.rowid
+        """):
+            out.setdefault(mid, []).append("lid_me" if server == "lid_me" else raw)
+    except Exception:
+        return {}
+    return out
+
+
+def _who_suffix(phrase, people, owner_jids, owner_label):
+    """The group line with the person it is about, as stored. This phone's
+    own address (or the lid_me row) is the Me label; anyone else is their
+    stored address. No stored person leaves the line as it is."""
+    names = []
+    for raw in people or []:
+        if raw == "lid_me" or raw in owner_jids:
+            names.append(owner_label or "Me")
+        elif raw:
+            names.append(raw)
+    return f"{phrase}: {', '.join(names)}" if names else phrase
 
 
 def _addon_people(conn, owner_label, addon_type):
@@ -1013,6 +1050,7 @@ def run(paths):
     members = _group_members(conn)
     call_phrases = _load_call_phrases(conn)
     system_phrases = _load_system_phrases(conn)
+    participants = _load_system_participants(conn)
     templates = _load_template_text(conn)
     try:
         timer_durations = dict(conn.execute(
@@ -1065,42 +1103,26 @@ def run(paths):
             chat_subject = missing_ref_label("chat record", "chat_row_id", r["raw_chat_row_id"])
 
         chat_members = _chat_members(r, is_group, members, owner_jids, owner_label)
-        phrase = system_phrases.get(r["message_id"]) if r["message_type"] == 7 else None
-        raw = (r["text"] or "").strip()
-        # Type 27 stores the wording on message_template, not text_data.
-        if not raw:
-            raw = templates.get(r["message_id"]) or ""
-        flags = ("true", "false", "dirty")
-        if r["message_id"] in call_phrases:
-            body = call_phrases[r["message_id"]]
-        elif phrase:
-            # true/false/dirty are the subtype flag written into text_data,
-            # not a caption. A real leftover, such as a group name, stays.
-            if raw and raw.lower() not in flags:
-                body = f"{phrase}: {raw}"
-            else:
-                body = phrase
-        elif r["message_type"] == 7:
-            label = _unknown_label(7, system_actions.get(r["message_id"]))
-            if raw and raw.lower() not in flags:
-                body = f"{label}: {raw}"
-            else:
-                body = label
-        else:
-            body = raw or _kind_phrase(r["message_type"])
-            # Type 36 is the one-to-one timer line. A chat whose only
-            # message was this type showed the 90-day sentence.
-            if r["message_type"] == 36 and not body:
-                span = _timer_span(timer_durations.get(r["message_id"]))
-                if span:
-                    body = f"Message timer updated, {span}"
-        location_text, location_kind = _location_fields(
-            body, r["latitude"], r["longitude"],
-            r["place_name"], r["place_address"], r["location_url"], r["live_duration"])
-        # Type 0 is an ordinary blank message. Type 15 is named in
-        # deleted_for_everyone. Anything else with no text is an unnamed code.
-        if not (location_text or "").strip() and r["message_type"] not in (0, 15):
-            location_text = _unknown_label(r["message_type"], system_actions.get(r["message_id"]))
+        # text is what the database stores for the message, unchanged.
+        # Type 27 keeps its wording on message_template, not text_data.
+        text = r["text"]
+        if text in (None, "") and r["message_id"] in templates:
+            text = templates[r["message_id"]]
+        system = system_phrases.get(r["message_id"]) if r["message_type"] == 7 else None
+        # Left, removed, made an admin: name the person the row stores.
+        if system and system_actions.get(r["message_id"]) in (5, 14, 15):
+            system = _who_suffix(system, participants.get(r["message_id"]), owner_jids, owner_label)
+        location_kind = _location_kind(
+            r["latitude"], r["longitude"], r["place_name"], r["place_address"],
+            r["location_url"], r["live_duration"])
+        event = _event_label(
+            r["message_type"], text,
+            call=call_phrases.get(r["message_id"]),
+            system=system,
+            action=system_actions.get(r["message_id"]),
+            timer=timer_durations.get(r["message_id"]),
+            location_kind=location_kind,
+            is_poll=r["message_id"] in polls)
         records.append({
             "message_id":       r["message_id"],
             "chat_id":          r["chat_id"],
@@ -1110,7 +1132,13 @@ def run(paths):
             # message: the sender. Both forms when the database has both.
             "phone_jid":        phone_jid,
             "lid":              lid,
-            "direction":        "Sent" if is_sent else "Received",
+            # A type 7 system row is not a message anyone sent. Its from_me
+            # is 1 even for groups other people created years before this
+            # phone (Pixel 7a image: all 165 system rows), so it is
+            # "System", never "Sent". from_me stays visible as stored.
+            "direction":        ("System" if r["message_type"] == 7
+                                 else "Sent" if is_sent else "Received"),
+            "from_me":          r["from_me"],
             "remote_name":      remote_name,
             "chat_members":     chat_members,
             "chat_type":        _chat_type(r["chat_jid_raw"]),
@@ -1118,9 +1146,12 @@ def run(paths):
             # row for each one: 204/204 on A15, 2026-10-24)
             "deleted_for_everyone": "Deleted for everyone" if r["message_type"] == 15 else "",
             "sent_time":        r["sent_time"],
-            "text":             _with_vote_count(
-                                    _with_poll_options(location_text, polls.get(r["message_id"])),
-                                    vote_counts.get(r["message_id"], 0)),
+            "text":             text,
+            # Written by this report, not stored as message text: a call,
+            # a system line, a media kind, a location kind, a poll.
+            "event":            event,
+            "poll_options":     " | ".join(polls.get(r["message_id"]) or []),
+            "poll_votes":       vote_counts.get(r["message_id"], 0) if r["message_id"] in polls else "",
             "reactions":        reactions.get(r["message_id"], ("", None))[0],
             "last_reaction_time": reactions.get(r["message_id"], ("", None))[1],
             "location_kind":    location_kind,

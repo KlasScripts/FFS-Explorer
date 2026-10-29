@@ -243,12 +243,19 @@ chat_groups = {"key": "raw_chat_id",          # column identifying the conversat
                "type": "chat_type",           # "Group" / "1:1" / "Channel"... per row
                "deleted": {"recovered": ["True"], "deleted_at": "*"},
                "call_pattern": r"^\[Call\]",  # regex on the text; omit if no calls
+               "call_field": "event",         # match call_pattern on this column instead
                # deletion / disappearing messages (iOS WhatsApp declares these):
                "sort": "chat_sort", "issued": "chat_issued",   # position + chat counter
                "setting": "disappearing_setting",               # "Off" / "7 days" on change rows
                "expires": "disappears_at",                      # per-message expiry
                "deleted_for_everyone": "deleted_for_everyone"}  # "... (by me)" / "(by them)"
 ```
+
+Keep the message-text column exactly as the app stored it. A label the
+parser writes itself (a call, a system line, "Photo") belongs in its own
+column, such as `event`, with `call_field` pointing at it, so a search, a
+keyword list or a quote of the text never finds the parser's own words, and
+a typed "video call?" is not counted as a call (see `android/whatsapp.py`).
 
 With `sort`/`issued`/`setting`, the summary adds: Issued / Present, Missing
 (Gaps), Missing At End, Deletion Windows, Deleted For Everyone (Me/Them),

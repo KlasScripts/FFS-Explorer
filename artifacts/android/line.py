@@ -16,7 +16,8 @@ description = ("Messages from LINE's local database (naver_line, table "
               "(full-text search index)\" report. Field-by-field validated "
               "against documented ground truth; no known reliability "
               "issues on the fields this report does carry."
-              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from chat_member for groups; a 1:1 chat's id is the peer; the owner has no id in this database, so \"Me\". This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
+              " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from chat_member for groups; a 1:1 chat's id is the peer; the owner has no id in this database, so \"Me\". This is membership as at extraction, not at the time of any message, so no message row claims who received it."
+              " A row with no content and no attachment (type 33, e.g. friend added) is Direction System: its from_mid is blank like a sent row, but nobody sent it. from_mid is shown as stored. Message is chat_history.content exactly as stored; calls, locations and images are named in Event.")
 app_path = "data/data/jp.naver.line.android"
 files = {
     "naver_line": "databases/naver_line",
@@ -79,7 +80,7 @@ def _parse_call_params(parameter):
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Outgoing"], "media_prefixes": ["[Image]"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"]}, "call_pattern": r"^\[(Incoming|Outgoing|Missed|Canceled|Cancelled|No answer)?[^\]]*\bcall\]", "type": "chat_type"}
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Outgoing"], "system": ["System"], "media": ["attachment", "image_uri"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"]}, "call_pattern": r"\bcall\b", "call_field": "event", "type": "chat_type"}
 
 def _line_chat_members(r, chat_members, chat_names, contact_names):
     """Everyone in the chat (Chat Groups summary only), as at extraction:
@@ -116,7 +117,7 @@ def run(paths):
                      if r["name"] or r["server_name"] or r["custom_name"]}
     # reactions.server_message_id -> chat_history.server_id (both text form
     # of the same server-assigned message id); a message can have more than
-    # one reaction (one per member), all folded into one row's body.
+    # one reaction (one per member), all listed in that row's reactions column.
     reactions_by_server_id = {}
     for r in conn.execute("SELECT server_message_id, reaction_type FROM reactions"):
         reactions_by_server_id.setdefault(str(r["server_message_id"]), []).append(r["reaction_type"])
@@ -150,36 +151,40 @@ def run(paths):
         sender = (contact_names.get(r["from_mid"], missing_ref_label("contact record", "mid", r["from_mid"]))
                  if incoming else "[local user]")
 
+        # message is chat_history.content exactly as stored. A call, a
+        # location, an image or a contentless system row is named in event;
+        # the details go in their own columns, never into the text.
+        lat = r["location_latitude"] / _LOC_SCALE if r["location_latitude"] is not None else None
+        lng = r["location_longitude"] / _LOC_SCALE if r["location_longitude"] is not None else None
         if r["type"] == _TYPE_CALL:
             params = _parse_call_params(r["parameter"])
             kind = {"A": "audio", "V": "video"}.get(params.get("TYPE"), params.get("TYPE"))
             result = params.get("RESULT")
             dur_ms = params.get("DURATION")
             dur = f"{int(dur_ms) // 60000}:{(int(dur_ms) // 1000) % 60:02d}" if dur_ms else ""
-            label = f"[{direction} {kind} call]" if kind else f"[{direction} call]"
-            body = f"{label} {dur}".strip()
+            event = f"{direction} {kind} call" if kind else f"{direction} call"
+            if dur:
+                event = f"{event}, {dur}"
             if result and result != "NORMAL":
                 # Only "NORMAL" was observed on this extraction (all 4 calls
                 # completed) — pass any other value through literally rather
                 # than inventing a missed/declined/failed label for it.
-                body = f"{body}  (result: {result})"
+                event = f"{event}, result {result}"
         elif r["attachement_type"] == _ATTACH_LOCATION:
-            addr = r["location_address"] or ""
-            lat = r["location_latitude"] / _LOC_SCALE if r["location_latitude"] is not None else None
-            lng = r["location_longitude"] / _LOC_SCALE if r["location_longitude"] is not None else None
-            body = f"[Location] {addr}  {lat}, {lng}".strip()
+            event = "Location"
         elif r["attachement_type"] == _ATTACH_IMAGE:
-            body = f"[Image] {r['attachement_local_uri']}" if r["attachement_local_uri"] else "[Image]"
-        elif r["content"]:
-            body = r["content"].strip()
-        else:
+            event = "Image"
+        elif not r["content"]:
             # type 33 rows (e.g. the friend-added system event) carry no
             # content and no attachment — surface rather than silently drop.
-            body = f"[System event, type {r['type']}]"
-
+            # Their from_mid is blank like a sent row's, but nobody sent
+            # them: Direction is System, never Outgoing.
+            event = f"System event, type {r['type']}"
+            direction = "System"
+        else:
+            event = ""
+        is_location = r["attachement_type"] == _ATTACH_LOCATION
         reacts = reactions_by_server_id.get(r["server_id"] or "")
-        if reacts:
-            body = f"{body}  (reacted: {', '.join(reacts)})"
 
         out.append({
             "conversation": conversation,
@@ -189,7 +194,19 @@ def run(paths):
             "chat_type": ("Group" if [m for m in chat_members.get(r["chat_id"], []) if m]
                           not in ([], [r["chat_id"]]) else "1:1"),
             "direction": direction,
-            "message": body,
+            "message": r["content"],
+            "event": event,
+            "from_mid": r["from_mid"] or "",
+            # "Image" on an image row even when no local file path is stored
+            # (both image rows on the Android 14 test image), so Chat Groups
+            # still counts it as media.
+            "attachment": "Image" if r["attachement_type"] == _ATTACH_IMAGE else "",
+            "image_uri": (r["attachement_local_uri"] or "") if r["attachement_type"] == _ATTACH_IMAGE else "",
+            "location_name": (r["location_name"] or "") if is_location else "",
+            "location_address": (r["location_address"] or "") if is_location else "",
+            "latitude": lat if is_location else None,
+            "longitude": lng if is_location else None,
+            "reactions": ", ".join(str(x) for x in reacts) if reacts else "",
             "raw_message_id": r["id"],
             "raw_chat_id": r["chat_id"],
             "raw_chat_rowid": chat_rowid_by_chat_id.get(r["chat_id"]),

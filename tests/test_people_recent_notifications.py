@@ -114,3 +114,17 @@ def test_sweep_after_first_unlock_is_marked_not_removed():
     assert rows[("12", 50_000)]["chats_same_second"] == 1
     assert rows[("13", 90_000)]["seconds_after_first_unlock"] is None
     assert rows[("13", 90_000)]["chats_same_second"] == 1
+
+
+def test_usage_stats_negative_offset_is_before_the_interval_start():
+    """AOSP stores an event up to an hour before the interval start as a
+    negative offset and reads it back as start + offset (not as 1970)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "usagestats_mod", os.path.join(ROOT, "artifacts", "android", "usagestats.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    begin = 1_793_000_000_000
+    stored = (1 << 64) - 600_000          # -10 minutes, as a protobuf varint
+    assert mod._event_time(stored, begin) == begin - 600_000
+    assert mod._event_time(5_000, begin) == begin + 5_000

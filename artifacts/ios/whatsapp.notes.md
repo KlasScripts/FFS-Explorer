@@ -28,7 +28,7 @@ different traces on the phone.
 | What happened | Who can do it | What's left on this phone | How it shows in FFS Explorer |
 |---|---|---|---|
 | **Delete for me** | This phone's user | Nothing. The message row is removed. | A gap in the chat's message numbers: **Missing (Gaps)** and **Deletion Windows** in the Chat Groups summary |
-| **Delete for everyone** | Whoever sent the message | A placeholder row: time, chat and sender are kept, the text isn't | `[Deleted for everyone — content not kept]`, counted in **Deleted For Everyone (Me/Them)** |
+| **Delete for everyone** | Whoever sent the message | A placeholder row: time, chat and sender are kept, the text isn't | Event: `Deleted for everyone — content not kept`, counted in **Deleted For Everyone (Me/Them)** |
 | **Delete for me on the *other* person's phone** | The other person | Nothing changes on this phone | Not visible here. The message is still in this report. |
 | **Clear chat / Delete chat** | This phone's user | *Not yet tested.* Clearing should leave the chat with its counter intact. Deleting a chat removes it entirely. | Expected as **Missing At End**, or a missing chat. Treat as unconfirmed. |
 
@@ -77,7 +77,7 @@ Before saying "the user deleted messages", check whether a timer explains them.
 | Where | Column | What it tells you |
 |---|---|---|
 | Report | **Disappears at** | When this message was due to vanish. Empty means no timer applied. |
-| Report | Message text | A setting change shows as `[Disappearing messages set to 90 days by me…]` |
+| Report | **Event** | A setting change shows as `Disappearing messages set to 90 days by me…` |
 | Chat Groups | **Disappearing** / **Set By** / **Set At** | The current setting, who chose it, and when |
 | Chat Groups | **Setting History** | Every change found, oldest first |
 | Chat Groups | **Missing Consistent With Timer** | Missing messages a timer explains |
@@ -112,18 +112,24 @@ controlled test phone before relying on them in court.*
 WhatsApp gives every message a type number (`ZMESSAGETYPE`) and doesn't document
 what the numbers mean. The table shows what this report assumes, and why.
 
-| Type | What it is | How this report shows it | Confidence | Basis |
+**Direction** comes from `ZISFROMME`, except type 6 (System, above). On type 59 and type 10 rows it is shown as stored, but whether `ZISFROMME` says who acted on those rows has not been checked (IOS17 image: type 59 is 2 Sent and 2 Received, type 10 is 7 Received). Do not read Direction on those rows as who did something.
+
+**Message** is always `ZTEXT` exactly as stored. When a row has no text, the
+label below is in the **Event** column, never in Message, so a search or a
+quote of the message never finds this report's own words.
+
+| Type | What it is | Event when there is no text | Confidence | Basis |
 |---|---|---|---|---|
 | 0 | Text | The text | High | Belkasoft |
-| 1 | Image | `[Media attachment…]` + thumbnail | High | Belkasoft |
-| 2 / 3 | Video / voice note | Caption text, or `[No text — message type N]` | High | Belkasoft |
-| 4 / 5 | Contact card / location | `[No text — message type N]` | High | Belkasoft |
-| 6 | Group event | `[No text — message type 6]` | Medium | Belkasoft ("group") |
-| 7 / 8 | Link / file | The text, or `[No text — message type N]` | High | Belkasoft |
-| **14** | **Deleted for everyone** | `[Deleted for everyone — content not kept]` | **Medium** | WhatsApp-Chat-Exporter treats 14 as "Message deleted"; one CTF23 example ("Sorry wrong pic" right after) |
-| **28** | **Disappearing-messages setting change** | `[Disappearing messages set to …]` | **Low–medium** | Observed only, see above |
-| **59** | Something next to calls | `[System event, type 59…]` | **Low** | Every iOS 17 example sits next to a documented call. Not confirmed. |
-| other | Unknown | `[No text — message type N]` | — | Shown as stored, never guessed |
+| 1 | Image | `Media attachment…` + thumbnail | High | Belkasoft |
+| 2 / 3 | Video / voice note | Caption in Message, or `No text — message type N` | High | Belkasoft |
+| 4 / 5 | Contact card / location | `No text — message type N` | High | Belkasoft |
+| 6 | Group event | `No text — message type 6`. Direction is **System**, not Sent or Received: a group event is not a message either side sent. `is_from_me` shows the stored `ZISFROMME`. | Medium | Belkasoft ("group") |
+| 7 / 8 | Link / file | The text in Message, or `No text — message type N` | High | Belkasoft |
+| **14** | **Deleted for everyone** | `Deleted for everyone — content not kept` | **Medium** | WhatsApp-Chat-Exporter treats 14 as "Message deleted"; one CTF23 example ("Sorry wrong pic" right after) |
+| **28** | **Disappearing-messages setting change** | `Disappearing messages set to …` (always, even with text) | **Low–medium** | Observed only, see above |
+| **59** | Something next to calls | `System event, type 59…` | **Low** | Every iOS 17 example sits next to a documented call. Not confirmed. |
+| other | Unknown | `No text — message type N` | — | The type number as stored, never guessed |
 
 Group events (`ZGROUPEVENTTYPE`, such as joins and leaves) are shown as stored. No
 public source decodes them (iLEAPP doesn't either).

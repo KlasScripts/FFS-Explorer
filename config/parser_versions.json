@@ -11,12 +11,13 @@
     },
     "android:burner": {
       "changelog": {
+        "12": "Message is DbMessage.text exactly as stored. Calls (Call, and the stored state) and media are named in a new Event column, and the media URL is its own column. Chat Groups counts calls from Event and media from the media columns, not from text. Re-run: the message column changes on those rows.",
         "2": "Added record_source: single-table Record-mode hex jump into DbMessage (the parser's live-query table) \u2014 the first non-WhatsApp parser wired for this feature.",
         "3": "Use shared missing_ref_label() instead of inline f-string for the no-burner-record fallback (no output change).",
         "4": "record_source gained an explicit label ('Burner Message'), same reason as chrome_autofill.py -- the combo no longer hides for a single entry."
       },
-      "hash": "6949f68e8cfbbd54",
-      "version": 11
+      "hash": "e47c857952622f17",
+      "version": 12
     },
     "android:burner_messageentity": {
       "changelog": {},
@@ -188,9 +189,11 @@
       "version": 2
     },
     "android:gboard_clipboard": {
-      "changelog": {},
-      "hash": "501748dec64ff962",
-      "version": 2
+      "changelog": {
+        "3": "Image Path is given only when that clipboard image is in the extraction. Otherwise the new Image Missing column names the expected path."
+      },
+      "hash": "8287dce3dc50d04b",
+      "version": 3
     },
     "android:google_messages": {
       "changelog": {
@@ -210,17 +213,21 @@
     },
     "android:groupme": {
       "changelog": {
+        "11": "Message is message_text exactly as stored. This report's own words moved out of it: calls are named in a new Event column (Call started / Call ended, with the duration), photos and locations too, and the photo URL, location name, latitude, longitude and likes (Liked By) are their own columns. Chat Groups counts calls from Event and media from the photo URL, not from text. Re-run: the message column changes on those rows.",
         "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat/group-record and no-name fallbacks (no output change)."
       },
-      "hash": "e1c15d00bc516993",
-      "version": 10
+      "hash": "96eab50e490fe73f",
+      "version": 11
     },
     "android:line": {
       "changelog": {
-        "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat-name and no-contact-record fallbacks (no output change)."
+        "10": "Message is chat_history.content exactly as stored, no longer trimmed. Calls (direction, audio/video, duration, any non-NORMAL result), locations, images and contentless system rows are named in a new Event column. Location name, address, latitude, longitude, image URI, attachment and reactions are their own columns. Chat Groups counts calls from Event and media from Attachment and Image URI. Re-run: the message column changes on those rows.",
+        "11": "Direction of a row with no content and no attachment (type 33, e.g. friend added) is now System, not Outgoing: its from_mid is blank like a sent row, but nobody sent it (Android 14 test image: 1 row). A new from_mid column shows the stored value. Chat Groups no longer counts it as outgoing.",
+        "2": "Use shared missing_ref_label() instead of inline f-strings for the no-chat-name and no-contact-record fallbacks (no output change).",
+        "9": "Intermediate edit while making the version 10 change; never released."
       },
-      "hash": "440143be6ef9bf38",
-      "version": 8
+      "hash": "d87a36b7f3299e0b",
+      "version": 11
     },
     "android:line_fts": {
       "changelog": {},
@@ -228,29 +235,36 @@
       "version": 1
     },
     "android:notification_history": {
-      "changelog": {},
-      "hash": "16d51985d0c22d85",
-      "version": 2
+      "changelog": {
+        "3": "A history file that cannot be read is now named in the run log instead of being skipped silently. Rows are unchanged."
+      },
+      "hash": "183e329b6e833fe2",
+      "version": 3
     },
     "android:notification_history_setting": {
-      "changelog": {},
-      "hash": "cff3a9863fb20f21",
-      "version": 1
+      "changelog": {
+        "2": "A settings file that cannot be parsed is now named in the run log instead of returning nothing silently."
+      },
+      "hash": "717db01295a1fce8",
+      "version": 2
     },
     "android:notification_snooze": {
-      "changelog": {},
-      "hash": "1fed14acf15c08e6",
-      "version": 1
+      "changelog": {
+        "2": "A notification policy file that cannot be parsed is now named in the run log instead of returning nothing silently."
+      },
+      "hash": "c385476249c16bdd",
+      "version": 2
     },
     "android:people_recent_notifications": {
       "changelog": {
         "1": "Adds Recent Message Notifications from the People recent-event files. One row is one posted conversation notification. A second post under a second later is the same notification updated, and the later time is kept. Shortcut uses and shares to a screen are not listed.",
         "2": "Adds Seconds After Startup (from Usage Stats DEVICE_STARTUP, when a minute or less) and Chats Same Second (different chats of that app posted within a second). They mark a startup sweep and remove nothing.",
         "3": "Seconds After Startup is now Seconds After First Unlock, timed from USER_UNLOCKED. One boot on the Galaxy A53 image has an unlock and no startup row.",
-        "4": "Marked experimental and lead only: the name says (Experimental) and the Notes page opens with a red warning. A row is not evidence that a message arrived."
+        "4": "Marked experimental and lead only: the name says (Experimental) and the Notes page opens with a red warning. A row is not evidence that a message arrived.",
+        "5": "An event file that cannot be read or decoded, and a Usage Stats read failure, are now named in the run log instead of being skipped silently. Rows are unchanged."
       },
-      "hash": "f26ead5c89c6da4f",
-      "version": 4
+      "hash": "3d39f19a482f4f29",
+      "version": 5
     },
     "android:settings_secure": {
       "changelog": {
@@ -262,17 +276,19 @@
     "android:usagestats": {
       "changelog": {
         "2": "Adds conversation_id: the shortcut id stored on a shortcut row and the locus id on a locus row. For Google Messages that is conversations._id. Two chats at the same moment are no longer merged into one row. Notification rows have no conversation id.",
-        "3": "Description warns that DEVICE_SHUTDOWN is not the moment the phone went off, and that the last minutes before a shutdown or seizure can be missing."
+        "3": "Description warns that DEVICE_SHUTDOWN is not the moment the phone went off, and that the last minutes before a shutdown or seizure can be missing.",
+        "4": "An event stored with a negative offset (AOSP keeps events up to an hour before the interval start) is now the interval start minus that offset, as Android reads it. It was shown as a 1970 time. A file or mappings list that cannot be read is now named in the run log instead of being skipped silently."
       },
-      "hash": "e9a8d65a051300ec",
-      "version": 3
+      "hash": "56bbfe82b96b3034",
+      "version": 4
     },
     "android:viber": {
       "changelog": {
+        "10": "Message is messages.body exactly as stored (on a call row that is Viber's own token, such as outgoing_call). Calls with duration, locations and media are named in a new Event column; latitude, longitude, likes and the media URI are their own columns. Chat Groups counts calls from Event and media from the media columns, not from text. Re-run: the message column changes on those rows.",
         "2": "Removed local _display_name() in favor of shared first_nonempty(default=...); use shared missing_ref_label() for the no-participant-record fallbacks (no output change)."
       },
-      "hash": "6ba1c434315af6e6",
-      "version": 9
+      "hash": "98b242047e4a9b22",
+      "version": 10
     },
     "android:whatsapp": {
       "changelog": {
@@ -281,11 +297,14 @@
         "2": "Use shared missing_ref_label() instead of inline f-string for the dangling-chat-FK fallback (no output change).",
         "20": "Adds Reactions on the message that was reacted to: emoji and person, comma separated, from message_add_on type 56 and message_add_on_reaction. Last Reaction Time is the newest reaction. Poll voters and reactors are named by the same code.",
         "21": "Each reaction in Reactions now ends with its time in UTC, for example \ud83d\udc4d Ada 09:15:11 29 Oct 2026 UTC.",
+        "22": "Intermediate edit while making the version 23 change; never released.",
+        "23": "Text is now exactly the stored message text. The labels this report writes (calls, system lines, Photo/GIF/Sticker, location kind, Poll, unknown types) moved to a new Event column, and poll options and vote counts to Poll Options and Poll Votes. Chat Groups counts calls from Event, so typed words such as \"video call\" are no longer counted as calls. Group lines no longer say \"You\" on one phone's evidence: an empty action 11 is \"Group created\", action 15 is \"Made an admin\", and left/removed/made-admin lines name the person stored in message_system_chat_participant. Re-run: Text of call, system, media, location and poll rows changes.",
+        "24": "Direction of a system row (message type 7) is now System, not Sent, and Chat Groups no longer counts those rows as outgoing. The database stores from_me 1 on every system row, including groups dated years before the phone's first message (Pixel 7a image: 165 of 165), so from_me does not show who acted. A new from_me column shows the stored value. Re-run: system rows change from Sent to System; Outgoing counts on Chat Groups go down.",
         "3": "record_source expanded from 2 entries (Message, Chat) to 12: every other joined table's rowid status was checked against real WhatsApp casework (jid/message_media/message_location/wa_contacts all confirmed genuine INTEGER PRIMARY KEY rowid aliases -- wa_contacts specifically was previously flagged unconfirmed, now resolved). New SELECT columns added for the four wa_contacts joins' own _id (jid/media/location needed none -- media/location's rowid is provably identical to the already-captured message_id). New entries: Chat/Sender JID + their Mapped (LID) variants, Media, Location, Chat/Sender Contact + Mapped variants -- all newly-added id fields kept out of the Report table via hidden_fields (plumbing only, already resolved into visible columns).",
         "4": "Media/Location record_source entries gained presence_fields (media_path / latitude) -- their reused rowid (message_id) is always populated regardless of whether that LEFT JOIN matched, so it alone couldn't tell the Hex panel's per-row combo whether to list them; now correctly hidden for a row whose join found nothing."
       },
-      "hash": "b03cdf673bce0bbc",
-      "version": 21
+      "hash": "f6f59c3593223777",
+      "version": 24
     },
     "android:whatsapp_poll_votes": {
       "changelog": {},
@@ -327,10 +346,12 @@
     },
     "ios:whatsapp": {
       "changelog": {
+        "14": "Message is ZTEXT exactly as stored. When a row has no text, the label for its type (media attachment, deleted for everyone, system event type 59, disappearing-message change, no text with the type number) is in a new Event column instead of the message. Re-run: the message column changes on those rows.",
+        "15": "Direction of a type 6 row (group event, per Belkasoft) is now System, not Sent or Received (IOS17 image: 6 rows, all ZISFROMME 0). A new is_from_me column shows the stored ZISFROMME. Chat Groups no longer counts them as incoming. Type 59 and type 10 keep the stored direction; the notes say it has not been checked whether that shows who acted.",
         "3": "Use shared missing_ref_label() instead of inline f-string for the no-chat-record fallback (no output change)."
       },
-      "hash": "3fa165d4fa2d0221",
-      "version": 13
+      "hash": "28ed464b11e1a846",
+      "version": 15
     },
     "ios:wifi_known_networks": {
       "changelog": {

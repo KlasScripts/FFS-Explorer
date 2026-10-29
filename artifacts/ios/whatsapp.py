@@ -142,17 +142,17 @@ media_fields = ["attachment_path"]
 # of not asserting false precision (contrast with iOS SMS's reaction-type
 # table, drawn from Apple's own documented enum).
 _MESSAGE_TYPE_LABELS = {
-    1: "[Media attachment — no caption text stored in this table]",
-    14: "[Deleted for everyone — content not kept]",
-    59: "[System event, type 59 — in this dataset always immediately "
+    1: "Media attachment — no caption text stored in this table",
+    14: "Deleted for everyone — content not kept",
+    59: "System event, type 59 — in this dataset always immediately "
         "adjacent to a call mentioned in ground truth, but not "
-        "independently confirmed against a documented enum]",
+        "independently confirmed against a documented enum",
 }
 
 
 # Artifact Viewer "Chat Groups": one entry per conversation, and a summary
 # table of them (see ArtifactViewerMixin._art_chat_groups).
-chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"], "deleted_for_everyone": "*"}, "type": "chat_type",
+chat_groups = {"key": "raw_chat_id", "name": ["conversation"], "sent": ["Sent"], "system": ["System"], "media": ["attachment_path"], "time": "timestamp", "participants": ["sender"], "members": "chat_members", "deleted": {"recovered": ["True"], "deleted_for_everyone": "*"}, "type": "chat_type",
                # deletion / disappearing-messages activity (see description: Validation)
                "sort": "chat_sort", "issued": "chat_issued", "expires": "disappears_at",
                "setting": "disappearing_setting", "deleted_for_everyone": "deleted_for_everyone"}
@@ -313,13 +313,15 @@ def run(paths):
         else:
             sender = _who(r["from_jid"] or r["contact_jid"], jid_names) or "[unknown sender]"
 
-        body = r["text"] or _MESSAGE_TYPE_LABELS.get(
-            r["message_type"], f"[No text — message type {r['message_type']}]")
+        # message is ZTEXT exactly as stored. When there is no text, the
+        # label for the row's type goes in event, never into the message.
+        event = "" if r["text"] else _MESSAGE_TYPE_LABELS.get(
+            r["message_type"], f"No text — message type {r['message_type']}")
         if r["message_type"] == 28:
             secs = _metadata_field(r["media_metadata"], 36)
-            body = (f"[Disappearing messages {'turned off' if secs == 0 else 'set to ' + _duration_label(secs)}"
-                    f" by {'me' if r['is_from_me'] else 'the other party'} — decoded, see Validation]"
-                    if secs is not None else "[Disappearing-messages setting change — timer not decoded]")
+            event = (f"Disappearing messages {'turned off' if secs == 0 else 'set to ' + _duration_label(secs)}"
+                     f" by {'me' if r['is_from_me'] else 'the other party'} — decoded, see Validation"
+                     if secs is not None else "Disappearing-messages setting change — timer not decoded")
 
         # ZXMPPTHUMBPATH fallback: confirmed on a real extraction as a
         # genuine, complete JPEG under the same "Message/" base as the
@@ -336,8 +338,13 @@ def run(paths):
             "sender": sender,
             "chat_members": _chat_members(r, owner_jid, jid_names, members),
             "chat_type": {0: "1:1", 1: "Group", 2: "Broadcast", 3: "Status"}.get(r["session_type"], ""),
-            "direction": "Sent" if r["is_from_me"] else "Received",
-            "message": body,
+            # Type 6 is a group event (Belkasoft), not a message either party
+            # sent: System, whatever ZISFROMME says. ZISFROMME stays visible.
+            "direction": ("System" if r["message_type"] == 6
+                          else "Sent" if r["is_from_me"] else "Received"),
+            "is_from_me": r["is_from_me"],
+            "message": r["text"],
+            "event": event,
             "attachment_path": attachment_path,
             "thumbnail_link": (f"{app_base}/Message/{r['media_thumb_path']}"
                                if app_base and r["media_thumb_path"]

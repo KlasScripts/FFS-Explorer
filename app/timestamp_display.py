@@ -461,6 +461,9 @@ class TimestampDisplayMixin:
         except Exception:
             pass
         self._refresh_timestamp_mode_indicator()
+        refresh_db_times = getattr(self, '_sql_refresh_times', None)
+        if callable(refresh_db_times):
+            refresh_db_times()
 
         if self._view_is_recursive:
             self._rebuild_file_view_from_checked(preserve_filter=True)

@@ -207,6 +207,9 @@ class MediaThumbnailDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmaps: dict[str, QPixmap | None] = {}
+        # Chat Groups draws the picture alone. The message report still
+        # shows the filename beside the thumbnail.
+        self.show_filename = True
 
     def set_cache(self, cache: dict) -> None:
         self._pixmaps = cache
@@ -238,7 +241,7 @@ class MediaThumbnailDelegate(QStyledItemDelegate):
             painter.drawRect(x, y, THUMB_CELL_SIZE, THUMB_CELL_SIZE)
             x += THUMB_CELL_SIZE + _PAD
 
-        if ui_path:
+        if ui_path and self.show_filename:
             name = ui_path.rsplit('/', 1)[-1]
             avail = option.rect.right() - x - _PAD
             if avail > 16:

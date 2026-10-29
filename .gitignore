@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 .DS_Store
 config/keyword_lists_user.json
+config/epoch_formats_user.json

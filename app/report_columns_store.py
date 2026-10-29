@@ -18,9 +18,11 @@ instruction — this is not an oversight, don't "fix" it into one shape:
     written to disk. Reopening the same report later in the SAME run of
     the app restores exactly what the examiner had; restarting the app
     always starts fresh — Core columns if the parser declares
-    core_fields, otherwise every column (see
-    ArtifactViewerMixin._setup_report_filter_ui in artifact_viewer.py for
-    where that default is actually applied). This is a deliberate
+    core_fields, otherwise every column. On top of that, every report
+    hides a column that is blank on every row currently on screen,
+    including one conversation opened from Chat Groups (see
+    default_visible_columns, and ArtifactViewerMixin._setup_report_filter_ui
+    in artifact_viewer.py). A stored 0 is a value, not a blank. This is a deliberate
     anti-footgun measure: a hidden-column choice that silently persisted
     forever across every future session could leave an examiner
     permanently unaware they're missing a column with material evidence
@@ -87,6 +89,105 @@ def save(data: dict) -> None:
         _cache["stat"] = None
 
 
+def cell_has_value(value) -> bool:
+    """True when a report cell is worth a column.
+
+    None and blank text are empty. A number, including 0, is a value:
+    "0 calls" is data, and latitude 0 is a real coordinate."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (bytes, bytearray)):
+        return len(value) > 0
+    return True
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def nonempty_column_names(conn, table: str, columns: list,
+                          where: str | None = None, args=()) -> set | None:
+    """Column names with at least one non-blank cell, or None if the
+    check itself failed (the caller then keeps the usual columns).
+
+    *where* limits the scan to the rows on screen, such as one chat.
+    A column filled only on other rows then counts as empty. One scan.
+    A table with no rows reports nothing, and default_visible_columns
+    then keeps the usual columns rather than hiding every header on an
+    empty report."""
+    if not columns:
+        return set()
+    exprs = []
+    for name in columns:
+        quoted = _quote_ident(name)
+        exprs.append(
+            f"MAX(CASE WHEN {quoted} IS NOT NULL AND "
+            f"TRIM(CAST({quoted} AS TEXT)) != '' THEN 1 ELSE 0 END)")
+    sql = f"SELECT {', '.join(exprs)} FROM {_quote_ident(table)}"
+    if where:
+        sql += f" WHERE {where}"
+    try:
+        row = conn.execute(sql, tuple(args)).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return set()
+    return {name for name, flag in zip(columns, row) if flag}
+
+
+def nonempty_from_rows(columns: list, rows) -> set:
+    """Same rule as nonempty_column_names, for an in-memory table."""
+    found = set()
+    ncols = len(columns)
+    for row in rows:
+        for i, name in enumerate(columns):
+            if name in found or i >= len(row):
+                continue
+            if cell_has_value(row[i]):
+                found.add(name)
+        if len(found) == ncols:
+            break
+    return found
+
+
+def default_visible_columns(all_columns: list, core_columns, populated) -> list:
+    """Columns shown the first time a report is opened this session.
+
+    Starts from core_fields when the parser declares them, otherwise
+    every column, then drops any column that is not in *populated*.
+    *populated* None (the check failed) or empty (no row has any value,
+    including a report with no rows) keeps that starting set, so the
+    table never opens with every column hidden."""
+    base = [c for c in (core_columns or all_columns) if c in all_columns]
+    if not base:
+        base = list(all_columns)
+    if not populated:
+        return base
+    narrowed = [c for c in base if c in populated]
+    return narrowed or base
+
+
+def columns_for_this_view(chosen, populated, one_chat=False, direct=False) -> list:
+    """Columns for the rows on screen.
+
+    Drops any chosen column that is blank on those rows. Inside one
+    chat, also drops chat_subject: a one-to-one row leaves it blank, and
+    a group writes the same name on every message, which is already the
+    title of this view. On a one-to-one chat, chat_jid repeats phone_jid
+    or lid, so it is dropped there only. A group keeps chat_jid: that
+    is the group address."""
+    visible = default_visible_columns(chosen, [], populated)
+    if not one_chat:
+        return visible
+    drop = {"chat_subject"}
+    if direct:
+        drop.add("chat_jid")
+    narrowed = [c for c in visible if c not in drop]
+    return narrowed or visible
+
+
 def get_visible_columns(script_name: str, all_columns: list):
     """The CURRENT-SESSION visible-column list for *script_name*,
     filtered to only names still present in *all_columns* (drops a stale
@@ -95,7 +196,8 @@ def get_visible_columns(script_name: str, all_columns: list):
     (meaning "never customized THIS session") if the examiner hasn't
     picked All/Core/None/a custom subset for this report since the app
     was last started — the caller applies the actual default (Core, or
-    every column) from that. Returns a list — possibly EMPTY, meaning
+    every column, minus columns that are blank on every row) from that.
+    Returns a list — possibly EMPTY, meaning
     "None" was deliberately chosen — otherwise; None and [] are
     deliberately different states, not the same "nothing to show" case,
     so callers must check `is None` rather than truthiness.

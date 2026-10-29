@@ -120,7 +120,9 @@ reading your code — because that's exactly the situation.
 
 Next to the parser, `artifacts/<platform>/<script>.notes.md` is shown, rendered,
 as the report's **Report Notes/Warning** page instead of `description` (owner
-request, 2026-10-24). Write it for a digital forensics examiner with about a
+request, 2026-10-24). The app puts a work-in-progress line at the top of every
+Notes page: the report should not be used in court without additional
+validation. Do not write that the report is ready for court. Write it for a digital forensics examiner with about a
 year's experience: plain sentences, bullets and tables, with no wall of text.
 Structure (see `artifacts/ios/whatsapp.notes.md`):
 

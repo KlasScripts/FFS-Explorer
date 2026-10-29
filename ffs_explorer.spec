@@ -68,6 +68,10 @@ a = Analysis(
         ('config/english_words.txt.gz', 'config'),
         # Harmful example bank for the meaning check (meaning_check.py).
         ('config/meaning_bank_grooming.json', 'config'),
+        # Built-in epoch formats for the Database tab (epoch_store.py), read
+        # in place from _internal/config; the examiner's own choices live in
+        # epoch_formats_user.json next to the exe.
+        ('config/epoch_formats.json', 'config'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),
         # Artifact parser scripts — loaded dynamically so PyInstaller can't

@@ -177,7 +177,9 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `keyword_search.py` | Search workers (main archive, nested archives, LevelDB index), `KeywordSearchMixin`, `SqlHitInterpretWorker`. |
 | `hex_viewer.py` | Hex tab; Record/Attachment toggle and record-source combo. |
 | `media_viewer.py` | Media Browser grid (`MediaFileListModel`/`MediaGridDelegate`), PyAV video decode, `MediaFullViewDialog`, `_load_qimage`, seen-tracking. |
-| `sqlite_viewer.py` | Database tab. |
+| `sqlite_viewer.py` | Database tab: live rows, WAL before/after, and recovered versions (WAL history, journal, carved), each labelled with how certain its table is. |
+| `epoch_guess.py` | Database tab: guesses which epoch format a number column holds (a quick look, not a parser). Qt-free. |
+| `epoch_store.py` | Database tab: which columns are times — the examiner's choices, then built-in `config/epoch_formats.json`, then the guess. Qt-free. |
 | `segb_viewer.py` / `segb_schemas.py` | SEGB/Biome tab and built-in stream schemas. |
 | `leveldb_viewer.py` | `LevelDbViewerMixin`: LevelDB/IndexedDB records as virtual files. |
 | `artifact_runner.py` / `artifact_db.py` / `artifact_viewer.py` | Parser plugin system: running, storing, viewing. |
@@ -233,7 +235,8 @@ File order, top to bottom:
 - `config/hardware_models.json`, `photo_flags.json`, `research_status.json`,
   `report_columns.json`, `parser_versions.json`, `parser_validation.json`,
   `embedded_media_skip_list_{android,ios}.json`, `user_media_ignore_list.json`,
-  `ai_summary_settings.json`, `scan_rules_{ios,android}.json`. All follow one
+  `ai_summary_settings.json`, `scan_rules_{ios,android}.json`,
+  `epoch_formats.json` (examiner choices in `epoch_formats_user.json`). All follow one
   convention: in `config/` in dev, next to the executable in a frozen build,
   user-editable, cached by mtime+size.
 - `user_media_ignore_list.json` and the presets file are checked into the

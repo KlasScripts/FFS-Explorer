@@ -125,6 +125,9 @@ class ArtifactTableModel(QAbstractTableModel):
         # ordinary case for most tables).
         self._ts_units:     dict = {}
         self._ts_formatter        = None
+        # Header text that replaces a column name, by real column name.
+        # Only the Database tab sets it, to say a column was converted.
+        self._header_labels: dict = {}
         # Column names (by real column name, same space as _ts_units —
         # NOT visible-index space) whose raw value is a byte count (int)
         # to be MB-formatted at display time — see set_byte_columns().
@@ -179,6 +182,7 @@ class ArtifactTableModel(QAbstractTableModel):
         self._where = ''
         self._wargs = []
         self._ts_units, self._ts_formatter = {}, None
+        self._header_labels = {}
         self._byte_cols = set()
         self._media_cols = set()
         self._visible_idx = list(range(len(self._columns)))
@@ -198,6 +202,7 @@ class ArtifactTableModel(QAbstractTableModel):
         self._where = ''
         self._wargs = []
         self._ts_units, self._ts_formatter = {}, None
+        self._header_labels = {}
         self._byte_cols = set()
         self._media_cols = set()
         self._visible_idx = list(range(len(self._columns)))
@@ -216,10 +221,16 @@ class ArtifactTableModel(QAbstractTableModel):
         self._where = ''
         self._wargs = []
         self._ts_units, self._ts_formatter = {}, None
+        self._header_labels = {}
         self._byte_cols = set()
         self._media_cols = set()
         self._visible_idx = []
         self.endResetModel()
+
+    def set_header_labels(self, labels: dict) -> None:
+        """labels: {column name: header text}. Resets on every load."""
+        self._header_labels = dict(labels) if labels else {}
+        self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, max(0, self.columnCount() - 1))
 
     def set_timestamp_formatting(self, units: dict, formatter) -> None:
         """units: {column_name: unit_code}, from the parser module's own
@@ -266,6 +277,16 @@ class ArtifactTableModel(QAbstractTableModel):
 
     def media_columns(self) -> set:
         return set(self._media_cols)
+
+    def columns_with_values(self, where=None, args=()):
+        """Column names that have at least one non-blank cell in the
+        rows *where* selects, or None if that could not be checked.
+        No *where* scans the whole table. See report_columns_store."""
+        import report_columns_store
+        if self._conn:
+            return report_columns_store.nonempty_column_names(
+                self._conn, self._table, self._columns, where, args)
+        return report_columns_store.nonempty_from_rows(self._columns, self._rows)
 
     def set_hidden_columns(self, names) -> None:
         """names: iterable of column-name strings from the parser module's
@@ -395,7 +416,10 @@ class ArtifactTableModel(QAbstractTableModel):
             return None
         if orientation == Qt.Orientation.Horizontal:
             real_col = self._real_col(section)
-            return self._columns[real_col] if real_col is not None else None
+            if real_col is None:
+                return None
+            name = self._columns[real_col]
+            return self._header_labels.get(name, name)
         return str(section + 1)
 
     def row_dict(self, model_row: int) -> dict:
@@ -574,7 +598,32 @@ a { color: #1a5fb4; }
 """
 
 
-def _notes_markdown_html(text: str) -> str:
+def _notes_court_banner() -> str:
+    """First thing on every Report Notes page. The reports are still being
+    checked, so a page must not read as something to take into court on its own."""
+    return (
+        '<div style="background:#fff4e5; border:1px solid #c47b00; border-radius:4px; '
+        'padding:8px 10px; margin:0 0 14px 0; color:#5c3b00;">'
+        '<b>Work in progress.</b> This report should not be used in court '
+        'without additional validation.'
+        '</div>'
+    )
+
+
+def _notes_warning_html(warning: str) -> str:
+    """A report's own `warning`, in red, above its Notes page."""
+    if not warning:
+        return ''
+    return (
+        '<div style="background:#fdecea; border:1px solid #d64545; border-radius:4px; '
+        'padding:8px 10px; margin:0 0 14px 0; color:#3a1414;">'
+        '<b>⚠️&nbsp; Warning</b><br>'
+        f'{_notes_html_paragraphs(warning)}'
+        '</div>'
+    )
+
+
+def _notes_markdown_html(text: str, warning: str = '') -> str:
     """Render a parser's notes Markdown to HTML for QTextBrowser: headings
     get ids (so "#deleted-messages" links jump to the section), tables get
     visible borders and padding. Uses the Python `markdown` package (tables,
@@ -613,7 +662,10 @@ def _notes_markdown_html(text: str) -> str:
                    body)
     body = _re.sub(r'<hr\s*/?>', '', body)          # headings already separate sections
     body = body.replace('<td>', '<td style="border-bottom: 1px solid #e3e7ec;">')
-    return f'<html><head><style>{_NOTES_CSS}</style></head><body>{body}</body></html>'
+    return (
+        f'<html><head><style>{_NOTES_CSS}</style></head><body>'
+        f'{_notes_court_banner()}{_notes_warning_html(warning)}{body}</body></html>'
+    )
 
 
 def _duration_seconds(label) -> int | None:
@@ -626,6 +678,44 @@ def _duration_seconds(label) -> int | None:
     if not m:
         return None
     return int(m.group(1)) * {'day': 86400, 'hour': 3600, 'second': 1}[m.group(2)]
+
+
+def _chat_summary_columns(decl) -> list:
+    """Chat Groups headers. Gap, disappearing, and "by me / by them"
+    columns are only declared by iOS WhatsApp. Calls only when the report
+    has a call_pattern. `id` puts the chat key first. An undeclared
+    column is omitted, not shown blank."""
+    columns = []
+    if decl.get('id'):
+        columns.append(decl['id'])
+    if decl.get('icon'):
+        columns.append("Icon")
+    columns += ["Chat", "Red Flags", "Red Flag Score", "Type", "Participants", "Messages",
+               "Incoming", "Outgoing", "Media In", "Media Out", "Deleted"]
+    if decl.get('call_pattern'):
+        columns.append("Calls")
+    columns += ["Links", "Bookmarked", "Last 30 Days", "First Message", "Last Received", "Last Sent"]
+    if decl.get('sort'):
+        columns += ["Issued / Present", "Missing (Gaps)", "Missing At End", "Deletion Windows"]
+    if decl.get('deleted_for_everyone'):
+        columns.append("Deleted For Everyone (Me/Them)")
+    if decl.get('setting') or decl.get('expires'):
+        columns += ["Disappearing", "Set By", "Set At", "Setting History",
+                    "Missing Consistent With Timer", "Missing Not Explained"]
+    return columns
+
+
+def _chat_summary_extra(act, decl) -> tuple:
+    """The tail of one Chat Groups row, matching _chat_summary_columns.
+    act is the 11-tuple from _deletion_activity."""
+    extra = []
+    if decl.get('sort'):
+        extra.extend(act[0:4])
+    if decl.get('deleted_for_everyone'):
+        extra.append(act[4])
+    if decl.get('setting') or decl.get('expires'):
+        extra.extend(act[5:11])
+    return tuple(extra)
 
 
 def _deletion_activity(c, ref, fmt, name) -> tuple:
@@ -987,15 +1077,19 @@ class ArtifactRunnerDialog(QDialog):
         def _mod_matches(mod):
             if getattr(mod, 'device_wide', False):
                 # Scans every app on the device rather than one app's own
-                # files — there's no single app_path/files/target_paths
-                # to check existence against, and there's nothing to
-                # check anyway: a device-wide report is always relevant
-                # for its own platform (this dialog is already filtered
-                # to iOS-only or Android-only parsers before _mod_matches
-                # ever runs), the same reasoning chrome_cache.py's own
-                # existence_check_paths fallback exists for, just with no
-                # existence check needed at all here.
-                return True
+                # files. A device-wide report stays listed on every case
+                # of its platform unless it names existence_check_paths:
+                # a substring that must occur in some archive entry, so a
+                # report whose files are absent (notification history on
+                # an image that never wrote that folder) is not offered.
+                needles = tuple(getattr(mod, 'existence_check_paths', ()) or ())
+                if not needles:
+                    return True
+                return any(
+                    needle in name
+                    for needle in needles
+                    for name in zip_names
+                )
             if hasattr(mod, 'app_path') and hasattr(mod, 'files'):
                 app_base = mod.app_path.strip('/')
                 # A parser that enumerates a whole directory itself rather
@@ -2381,7 +2475,10 @@ class ArtifactViewerMixin:
                 if chats:
                     folder = _item(f"Chat Groups ({len(chats):,})", _ART_CHATS + script_name)
                     for c in chats:
-                        folder.appendRow(_item(f"{c['name']} ({c['messages']:,})",
+                        title = f"{c['name']} ({c['messages']:,})"
+                        if decl.get('id') and c.get('key') not in (None, ''):
+                            title = f"{c['key']}  {title}"
+                        folder.appendRow(_item(title,
                                                f"{_ART_CHAT}{script_name}\x1f{c['key']}"))
                     group.insertRow(0, [folder])
             return group
@@ -3034,6 +3131,7 @@ class ArtifactViewerMixin:
         unit = units.get(time_col) if time_col else None
         deleted = decl.get('deleted') or {}
         type_col = decl.get('type')
+        icon_col = decl.get('icon')
         sort_col, issued_col = decl.get('sort'), decl.get('issued')
         setting_col, expires_col = decl.get('setting'), decl.get('expires')
         dfe_col = decl.get('deleted_for_everyone')
@@ -3053,7 +3151,7 @@ class ArtifactViewerMixin:
                 want = [c for c in dict.fromkeys(
                     [key_col, dir_col, msg_col, time_col, members_col, *names, *senders,
                      *media_cols, *deleted, *link_cols, type_col, sort_col, issued_col,
-                     setting_col, expires_col, dfe_col])
+                     setting_col, expires_col, dfe_col, icon_col])
                         if c and c in cols]
                 rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in want)
                                     + f' FROM "artifact_{script_name}"').fetchall()
@@ -3070,13 +3168,16 @@ class ArtifactViewerMixin:
                 'names': collections.Counter(), 'people': collections.Counter(),
                 'messages': 0, 'incoming': 0, 'outgoing': 0, 'media_in': 0, 'media_out': 0,
                 'deleted': 0, 'calls': 0 if call_re else None, 'links': 0, 'bookmarked': 0,
-                'types': collections.Counter(), 'me': {}, 'notes': {},
+                'types': collections.Counter(), 'icons': collections.Counter(),
+                'me': {}, 'notes': {},
                 'seq': [], 'issued': None, 'settings': [], 'dfe_me': 0, 'dfe_them': 0,
                 'expiry_seen': False,
                 'times': [], 'first': None, 'last_in': None, 'last_out': None})
             c['messages'] += 1
             if _get(r, type_col):
                 c['types'][_get(r, type_col)] += 1
+            if _get(r, icon_col):
+                c['icons'][_get(r, icon_col)] += 1
             text_all = str(_get(r, msg_col) or '')
             for col, vals in deleted.items():
                 v = _get(r, col)
@@ -3143,10 +3244,11 @@ class ArtifactViewerMixin:
                                           + list(c['notes'])),
                 'people': len(c['people']),
                 'type': c['types'].most_common(1)[0][0] if c['types'] else None,
+                'icon': c['icons'].most_common(1)[0][0] if c['icons'] else '',
                 **{k: c[k] for k in ('messages', 'incoming', 'outgoing', 'media_in',
                                      'media_out', 'deleted', 'calls', 'links', 'bookmarked',
-                                     'times', 'first', 'last_in', 'last_out', 'seq', 'issued',
-                                     'settings', 'dfe_me', 'dfe_them', 'expiry_seen')},
+                                     'times', 'first', 'last_in', 'last_out',
+                                     'seq', 'issued', 'settings', 'dfe_me', 'dfe_them', 'expiry_seen')},
                 'has_sort': bool(sort_col), 'has_setting': bool(setting_col)})
         result.sort(key=lambda d: str(d['name']).casefold())
         return result
@@ -3179,12 +3281,7 @@ class ArtifactViewerMixin:
         ref, ref_label = self._art_chat_ref(chats)
         flags, _msgs = self._art_red_flags(script_name)
         import chat_flags
-        columns = ["Chat", "Red Flags", "Red Flag Score", "Type", "Participants", "Messages", "Incoming", "Outgoing",
-                   "Media In", "Media Out", "Deleted", "Calls", "Links", "Bookmarked",
-                   "Last 30 Days", "First Message", "Last Received", "Last Sent",
-                   "Issued / Present", "Missing (Gaps)", "Missing At End", "Deletion Windows",
-                   "Deleted For Everyone (Me/Them)", "Disappearing", "Set By", "Set At",
-                   "Setting History", "Missing Consistent With Timer", "Missing Not Explained"]
+        columns = _chat_summary_columns(decl)
         rows = []
         for c in chats:
             recent = (sum(1 for t in c['times'] if ref - 30 * 86400 <= t <= ref)
@@ -3194,16 +3291,37 @@ class ArtifactViewerMixin:
                 kind = f"Group ({c['people']})"
             act = _deletion_activity(c, ref, fmt, c['name'])
             fl = flags.get(c['key']) or {}
-            rows.append((c['name'], chat_flags.flags_label(fl), fl.get('score', 0), kind, c['participants'], c['messages'], c['incoming'],
-                         c['outgoing'], c['media_in'], c['media_out'], c['deleted'],
-                         '' if c['calls'] is None else c['calls'], c['links'],
-                         c['bookmarked'], recent, fmt(c['first']), fmt(c['last_in']),
-                         fmt(c['last_out']), *act))
+            row = []
+            if decl.get('id'):
+                row.append(c['key'])
+            if decl.get('icon'):
+                row.append(c.get('icon') or '')
+            row += [c['name'], chat_flags.flags_label(fl), fl.get('score', 0), kind, c['participants'],
+                   c['messages'], c['incoming'], c['outgoing'], c['media_in'], c['media_out'], c['deleted']]
+            if decl.get('call_pattern'):
+                row.append('' if c['calls'] is None else c['calls'])
+            tail = [fmt(c['first']), fmt(c['last_in']), fmt(c['last_out'])]
+            row.extend((c['links'], c['bookmarked'], recent, *tail, *_chat_summary_extra(act, decl)))
+            rows.append(tuple(row))
         self._cancel_art_filter_worker()
         self._art_scope = None
         self._art_table_model.load_rows(columns, rows)
         self._art_reset_list_presentation()
-        self._setup_report_filter_ui(columns)
+        icon_paths = [c.get('icon') for c in chats if c.get('icon')]
+        if icon_paths:
+            self._art_table_model.set_media_columns(["Icon"])
+            self._art_media_delegate.show_filename = False
+            media_col_idx = self._art_table_model.media_columns()
+            for col in range(self._art_table_model.columnCount()):
+                self._art_report_view.setItemDelegateForColumn(
+                    col, self._art_media_delegate if col in media_col_idx
+                    else self._art_highlight_delegate)
+            self._art_report_view.verticalHeader().setDefaultSectionSize(THUMB_CELL_SIZE + 16)
+            self._start_art_media_thumbnails(icon_paths)
+        # Own key so this page's column choices do not replace the
+        # message report's. A column that is blank on every chat
+        # (the group picture, when the extract has none) starts hidden.
+        self._setup_report_filter_ui(columns, script_name=f"{script_name}#chat-groups")
         self._art_resize_columns()
         label = getattr(mod, 'name', script_name) if mod else script_name
         self._art_row_label.setText(
@@ -3215,7 +3333,8 @@ class ArtifactViewerMixin:
         self._art_stack.setCurrentIndex(1)
         self._art_chat_summary = (script_name, [(c['key'], c['name']) for c in chats])
         if any(f.get('score') for f in flags.values()):
-            self._art_report_view.sortByColumn(2, Qt.SortOrder.DescendingOrder)   # where to look first
+            self._art_report_view.sortByColumn(
+                columns.index("Red Flag Score"), Qt.SortOrder.DescendingOrder)
         self._art_show_chat_summary_text(script_name, None)
 
     def _art_chat_ref(self, chats: list) -> tuple:
@@ -3518,27 +3637,48 @@ class ArtifactViewerMixin:
         self._art_columns_all_btn.setVisible(script_name is not None)
         self._art_columns_core_btn.setVisible(
             script_name is not None and bool(self._art_columns_core))
+        import report_columns_store
+        # Every report, every time it is opened. A saved Columns choice
+        # still decides which filled columns appear. A column that is
+        # blank on every row in this view is dropped, including a column
+        # that has values in other chats. Not written back to the session
+        # store, so opening a group afterwards can show it again. All and
+        # the Columns dialog put it back for the view open now.
+        scope = getattr(self, '_art_scope', None)
+        populated = self._art_table_model.columns_with_values(
+            scope[0] if scope else None, scope[1] if scope else ())
+        chosen = (report_columns_store.get_visible_columns(
+                      script_name, self._art_columns_all)
+                  if script_name is not None else None)
+        if chosen is None:
+            chosen = report_columns_store.default_visible_columns(
+                self._art_columns_all, self._art_columns_core, None)
+        visible = report_columns_store.columns_for_this_view(
+            chosen, populated, one_chat=scope is not None,
+            direct=self._art_open_chat_is_direct(scope))
+        self._apply_art_column_visibility(visible)
         if script_name is not None:
-            import report_columns_store
-            visible = report_columns_store.get_visible_columns(
-                script_name, self._art_columns_all)
-            if visible is None and self._art_columns_core:
-                # First time this report has ever been opened (never
-                # saved either way) AND it declares core_fields: default
-                # the DISPLAY to Core rather than everything — the whole
-                # point of this feature is not overwhelming the examiner
-                # by default. Deliberately not persisted here — the store
-                # stays "never customized" until the examiner actually
-                # picks something via the row buttons or the dialog, so a
-                # later core_fields change on the parser still applies
-                # correctly to a report nobody has touched yet.
-                visible = list(self._art_columns_core)
-            self._apply_art_column_visibility(visible)
             order = report_columns_store.get_column_order(
                 script_name, self._art_columns_all)
             if order:
                 self._apply_art_column_order(order)
         self._update_art_columns_indicator()
+
+    def _art_open_chat_is_direct(self, scope) -> bool:
+        """True when the open view is one one-to-one chat.
+
+        chat_jid on those rows repeats phone_jid or lid. A group, a
+        channel, and the full report are not direct, so chat_jid stays."""
+        model = self._art_table_model
+        if not scope or model._conn is None or "chat_type" not in model._columns:
+            return False
+        try:
+            row = model._conn.execute(
+                f'SELECT "chat_type" FROM "{model._table}" WHERE {scope[0]} LIMIT 1',
+                tuple(scope[1])).fetchone()
+        except Exception:
+            return False
+        return bool(row) and row[0] == "1:1"
 
     def _apply_art_column_visibility(self, visible_names) -> None:
         """Show/hide QTableView columns per *visible_names* (a list —
@@ -4040,6 +4180,7 @@ class ArtifactViewerMixin:
         # for a thumbnail, and an async decode pass over every distinct
         # path collected above — see MediaThumbnailDelegate in
         # artifact_media.py and _start_art_media_thumbnails below.
+        self._art_media_delegate.show_filename = True
         self._art_table_model.set_media_columns(media_fields)
         media_col_idx = self._art_table_model.media_columns()
         for col in range(self._art_table_model.columnCount()):
@@ -4252,7 +4393,7 @@ class ArtifactViewerMixin:
                 text = None
             if text is not None:
                 self._art_notes_browser.setSearchPaths([os.path.dirname(notes_md)])
-                self._art_notes_browser.setHtml(_notes_markdown_html(text))
+                self._art_notes_browser.setHtml(_notes_markdown_html(text, warning))
                 self._art_notes_scroll.setVisible(False)
                 self._art_notes_browser.setVisible(True)
                 self._art_stack.setCurrentIndex(3)
@@ -4271,12 +4412,13 @@ class ArtifactViewerMixin:
                     '<hr style="border:none; border-top:1px solid #e3b3b3; margin:14px 0;">'
                     '<div style="font-weight:600; margin-bottom:6px;">Notes</div>')
                 parts.append(_notes_html_paragraphs(description))
-            html_body = ''.join(parts)
+            html_body = _notes_court_banner() + ''.join(parts)
             self._art_notes_label.setStyleSheet(
                 "background:#fdecea; border:1px solid #d64545; border-radius:4px; "
                 "padding:10px 12px; color:#3a1414;")
         else:
-            html_body = (_notes_html_paragraphs(description)
+            html_body = _notes_court_banner() + (
+                        _notes_html_paragraphs(description)
                         if description else
                         '<span style="color:#888888;">No notes declared for this report.</span>')
             self._art_notes_label.setStyleSheet(

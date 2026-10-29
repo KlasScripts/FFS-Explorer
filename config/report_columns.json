@@ -97,6 +97,31 @@
         "raw_ui_path",
         "render_note"
       ]
+    },
+    "whatsapp": {
+      "column_order": [
+        "message_id",
+        "chat_type",
+        "chat_subject",
+        "chat_jid",
+        "phone_jid",
+        "lid",
+        "remote_name",
+        "direction",
+        "deleted_for_everyone",
+        "sent_time",
+        "text",
+        "place_name",
+        "place_address",
+        "location_url",
+        "media_path",
+        "attachment_path",
+        "latitude",
+        "longitude",
+        "location_kind",
+        "recovered",
+        "source_table"
+      ]
     }
   }
 }

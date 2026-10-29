@@ -187,12 +187,21 @@
       "hash": "00034d5faf03fcd9",
       "version": 2
     },
+    "android:gboard_clipboard": {
+      "changelog": {},
+      "hash": "501748dec64ff962",
+      "version": 2
+    },
     "android:google_messages": {
       "changelog": {
-        "2": "Removed local _display_name()/_resolve_cache_path() in favor of shared first_nonempty(default=...)/resolve_path_after_marker() (no output change)."
+        "10": "Chat Groups lists conversation_id first, the same conversations primary key as the message rows.",
+        "11": "Chat Groups adds Last Incoming Notification from the People conversation list. The shortcut id is conversations._id. Hidden on message rows. Blank when the file is absent or the chat has no time.",
+        "12": "Chat Groups no longer shows Last Incoming Notification. A later re-post of an old notification moves that time, so it is not a marker for a deleted last message.",
+        "2": "Removed local _display_name()/_resolve_cache_path() in favor of shared first_nonempty(default=...)/resolve_path_after_marker() (no output change).",
+        "9": "The first column is conversation_id, the conversations primary key. That is the Chat Groups key and the id Recent Message Notifications stores for this app. It is not the SMS thread id."
       },
-      "hash": "c3d467e66daee50a",
-      "version": 8
+      "hash": "fa2a1b85ade1d82b",
+      "version": 12
     },
     "android:google_messages_deleted_conversations": {
       "changelog": {},
@@ -218,12 +227,45 @@
       "hash": "468b9ff1e9196aed",
       "version": 1
     },
+    "android:notification_history": {
+      "changelog": {},
+      "hash": "16d51985d0c22d85",
+      "version": 2
+    },
+    "android:notification_history_setting": {
+      "changelog": {},
+      "hash": "cff3a9863fb20f21",
+      "version": 1
+    },
+    "android:notification_snooze": {
+      "changelog": {},
+      "hash": "1fed14acf15c08e6",
+      "version": 1
+    },
+    "android:people_recent_notifications": {
+      "changelog": {
+        "1": "Adds Recent Message Notifications from the People recent-event files. One row is one posted conversation notification. A second post under a second later is the same notification updated, and the later time is kept. Shortcut uses and shares to a screen are not listed.",
+        "2": "Adds Seconds After Startup (from Usage Stats DEVICE_STARTUP, when a minute or less) and Chats Same Second (different chats of that app posted within a second). They mark a startup sweep and remove nothing.",
+        "3": "Seconds After Startup is now Seconds After First Unlock, timed from USER_UNLOCKED. One boot on the Galaxy A53 image has an unlock and no startup row.",
+        "4": "Marked experimental and lead only: the name says (Experimental) and the Notes page opens with a red warning. A row is not evidence that a message arrived."
+      },
+      "hash": "f26ead5c89c6da4f",
+      "version": 4
+    },
     "android:settings_secure": {
       "changelog": {
         "1": "New parser -- exercises app/ccl_abx.py's ABX decoder (including this session's own two real correctness fixes) against a real shipped parser, the ABX counterpart to ios/wifi_known_networks.py's bplist demonstration. Modeled on ALEAPP's own settingsSecure.py (android_id/bluetooth_name/bluetooth_address/mock_location), reshaped into named columns matching this project's own convention. settings_secure.xml is real ABX on all three of this project's own Android archives, and is one of the exact files that failed outright before this session's own multi-root fix. Verified: real values on all three archives; the decoded Bluetooth MAC on Android 14 JoshHickman matches that archive's own documented ground truth bt_mac exactly."
       },
       "hash": "ae402b221ee5d235",
       "version": 1
+    },
+    "android:usagestats": {
+      "changelog": {
+        "2": "Adds conversation_id: the shortcut id stored on a shortcut row and the locus id on a locus row. For Google Messages that is conversations._id. Two chats at the same moment are no longer merged into one row. Notification rows have no conversation id.",
+        "3": "Description warns that DEVICE_SHUTDOWN is not the moment the phone went off, and that the last minutes before a shutdown or seizure can be missing."
+      },
+      "hash": "e9a8d65a051300ec",
+      "version": 3
     },
     "android:viber": {
       "changelog": {
@@ -234,12 +276,21 @@
     },
     "android:whatsapp": {
       "changelog": {
+        "18": "Chat Groups adds Last Incoming Notification from the People conversation list (data/system_ce/*/people/com.whatsapp/conversations). The time is hidden on message rows. Blank when that file is absent or the chat has no time.",
+        "19": "Chat Groups no longer shows Last Incoming Notification. A later notification can move that time without a new message, so it is not shown.",
         "2": "Use shared missing_ref_label() instead of inline f-string for the dangling-chat-FK fallback (no output change).",
+        "20": "Adds Reactions on the message that was reacted to: emoji and person, comma separated, from message_add_on type 56 and message_add_on_reaction. Last Reaction Time is the newest reaction. Poll voters and reactors are named by the same code.",
+        "21": "Each reaction in Reactions now ends with its time in UTC, for example \ud83d\udc4d Ada 09:15:11 29 Oct 2026 UTC.",
         "3": "record_source expanded from 2 entries (Message, Chat) to 12: every other joined table's rowid status was checked against real WhatsApp casework (jid/message_media/message_location/wa_contacts all confirmed genuine INTEGER PRIMARY KEY rowid aliases -- wa_contacts specifically was previously flagged unconfirmed, now resolved). New SELECT columns added for the four wa_contacts joins' own _id (jid/media/location needed none -- media/location's rowid is provably identical to the already-captured message_id). New entries: Chat/Sender JID + their Mapped (LID) variants, Media, Location, Chat/Sender Contact + Mapped variants -- all newly-added id fields kept out of the Report table via hidden_fields (plumbing only, already resolved into visible columns).",
         "4": "Media/Location record_source entries gained presence_fields (media_path / latitude) -- their reused rowid (message_id) is always populated regardless of whether that LEFT JOIN matched, so it alone couldn't tell the Hex panel's per-row combo whether to list them; now correctly hidden for a row whose join found nothing."
       },
-      "hash": "79260cdf9bd97e95",
-      "version": 12
+      "hash": "b03cdf673bce0bbc",
+      "version": 21
+    },
+    "android:whatsapp_poll_votes": {
+      "changelog": {},
+      "hash": "3f74ac729853ae13",
+      "version": 1
     },
     "ios:app_report": {
       "changelog": {

@@ -1533,6 +1533,25 @@ _ACQ_HASH_HEADERS = {'sha256': 'SHA-256 (GrayKey)', 'sha1': 'SHA-1 (GrayKey)',
 _META_COL_HEADERS = {'capture': 'Capture', **_ACQ_HASH_HEADERS,
                      'source_url': 'Source URL'}   # media extracted from a web cache record
 
+
+def _meta_col_keys_for(data: dict) -> tuple:
+    """Which _META_COL_HEADERS keys *data* carries. A full scan of every
+    entry (~0.4 s on an 830k-entry archive), so ZipMetadataWorker runs it
+    before metadata_ready instead of the GUI thread (see _ui_extras)."""
+    return tuple(k for k in _META_COL_HEADERS
+                 if any(v.get(k) for v in data.values() if v))
+
+
+def _android_user_data_for(folder_map: dict) -> str:
+    """The parent path of the DCIM folder, or '' if not found. Skips paths
+    under private/, which are iOS-specific."""
+    for path in folder_map:
+        if path.startswith('private/'):
+            continue
+        if path == 'DCIM' or path.endswith('/DCIM'):
+            return path.rsplit('/DCIM', 1)[0] if '/' in path else ''
+    return ''
+
 # Cocoa/Mac epoch (2001-01-01) -> Unix epoch, seconds. photos_metadata.py's
 # Taken/Added (timestamp_fields unit "cocoa_s") store the raw value in this
 # unit; _build_entry_row converts to Unix seconds before calling format_ts.
@@ -1886,7 +1905,14 @@ class ZipMetadataWorker(QThread):
          and emit header_scan_done with the detected type overrides
     """
     status_update        = Signal(str)    # message
-    metadata_ready       = Signal(dict, dict, dict, object, object, object, dict, object, object)  # ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths, metadata_only_folders
+    # All `object`, never `dict`: PySide6 turns a `dict` signal argument
+    # into a QVariantMap, deep-copying ui_metadata (830k entries on
+    # IOS17) to C++ on emit and back on delivery. Measured in the frozen
+    # exe with py-spy: ~8 s on this thread holding the GIL, then ~10 s on
+    # the GUI thread (the reopen's two longest freezes). `object` hands over
+    # the same Python objects, so every emit site below must stop using
+    # (or pass a copy of) anything it still reads after emitting.
+    metadata_ready       = Signal(object, object, object, object, object, object, object, object, object)  # ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths, metadata_only_folders
     header_scan_progress = Signal(int)   # remaining (decreasing)
     header_scan_done     = Signal(dict)  # {ui_path: detected_type}
 
@@ -1923,6 +1949,28 @@ class ZipMetadataWorker(QThread):
                 f"Updated {len(summary['names']):,} file names from an older version "
                 f"({n:,} stored paths; see the run log). Rebuilding the folder tree…")
 
+    def _set_ui_extras(self, ui_metadata: dict, folder_map: dict,
+                       folder_counts: dict | None = None) -> None:
+        """Work on_metadata_ready needs that is too slow for the GUI thread,
+        done here before metadata_ready is emitted (read back there from
+        self.worker._ui_extras, the same hand-over as _local_extra_delta).
+        In the frozen exe on IOS17 these cost ~0.7 s of frozen window:
+        a scan of every entry for the metadata columns, and a second read
+        of the 23 MB folder_data blob for the folder counts."""
+        if folder_counts is None:
+            folder_counts = {}
+            if self.case_dir:
+                try:
+                    with closing(_open_cache_db(self.case_dir)) as db:
+                        folder_counts, _ = load_folder_data(db)
+                except Exception:
+                    folder_counts = {}
+        self._ui_extras = {
+            'file_counts':       folder_counts,
+            'meta_col_keys':     _meta_col_keys_for(ui_metadata),
+            'android_user_data': _android_user_data_for(folder_map),
+        }
+
     def _try_load_from_snapshot(self, first_load: bool = False) -> bool:
         """Fast re-open: restore the previous load's full result from casecache.db.
 
@@ -1943,7 +1991,7 @@ class ZipMetadataWorker(QThread):
                 if blob is None:
                     return False
                 with closing(blob):
-                    _, folder_sizes = load_folder_data(db)
+                    folder_counts, folder_sizes = load_folder_data(db)
                     guid_to_bundle  = load_guid_bundle_map(db)
                     if not folder_sizes:
                         return False   # sizes are required downstream — full load
@@ -1971,6 +2019,7 @@ class ZipMetadataWorker(QThread):
             self.zip_path, self.case_dir, ffs_adapter, folder_map, zip_names,
             guid_to_bundle, status_cb=self.status_update.emit)
         missing_plist_paths = _find_missing_plists(folder_map, ffs_adapter, guid_to_bundle)
+        self._set_ui_extras(ui_metadata, folder_map, folder_counts)
         self.metadata_ready.emit(
             ui_metadata, folder_map, guid_to_bundle, zip_names,
             ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
@@ -2080,9 +2129,13 @@ class ZipMetadataWorker(QThread):
             folder_map, ffs_adapter, guid_to_bundle)
 
         # Emit first — the UI tree appears immediately; DB writes follow.
+        # persist_result still reads guid_to_bundle/folder_sizes after this
+        # emit (the snapshot itself is already packed), so the GUI gets its
+        # own shallow copies of those two (str/int values only).
+        self._set_ui_extras(ui_metadata, folder_map)
         self.metadata_ready.emit(
-            ui_metadata, folder_map, guid_to_bundle, zip_names,
-            ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
+            ui_metadata, folder_map, dict(guid_to_bundle), zip_names,
+            ffs_adapter, missing_plist_paths, dict(folder_sizes), zip_ui_paths,
             set(result['metadata_only']))
         try:
             persist_result(self.case_dir, result)
@@ -2297,9 +2350,12 @@ class ZipMetadataWorker(QThread):
                     snapshot_blob = None
 
             # Emit first — UI tree appears immediately. DB and cache writes follow.
+            # guid_to_bundle/folder_sizes are saved below after this emit, so
+            # the GUI gets its own shallow copies (see metadata_ready).
+            self._set_ui_extras(ui_metadata, folder_map)
             self.metadata_ready.emit(
-                ui_metadata, folder_map, guid_to_bundle, zip_names,
-                ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
+                ui_metadata, folder_map, dict(guid_to_bundle), zip_names,
+                ffs_adapter, missing_plist_paths, dict(folder_sizes), zip_ui_paths,
                 metadata_only_folders)
 
             if self.case_dir:
@@ -10948,12 +11004,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _detect_android_user_data(self, folder_map: dict) -> str:
         """Return the parent path of the DCIM folder, or '' if not found.
         Skips paths under private/ which are iOS-specific."""
-        for path in folder_map:
-            if path.startswith('private/'):
-                continue
-            if path == 'DCIM' or path.endswith('/DCIM'):
-                return path.rsplit('/DCIM', 1)[0] if '/' in path else ''
-        return ''
+        return _android_user_data_for(folder_map)
 
     def _is_android_archive(self) -> bool:
         return self._adapter.is_android(self.folder_map)
@@ -11581,6 +11632,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def on_metadata_ready(self, data, folder_map, guid_map, zip_names, ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths=None, metadata_only_folders=None):
         self._metadata_ready_fired = True
+        # Precomputed on the worker thread (ZipMetadataWorker._set_ui_extras);
+        # each item falls back to being computed here if it's missing.
+        extras = getattr(self.worker, '_ui_extras', None) or {}
         self.full_metadata = data
         self.folder_map = folder_map
         # New case: research colors depend on this device's iOS version
@@ -11589,7 +11643,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.guid_to_bundle = guid_map
         self.zip_names = zip_names
         self._adapter = ffs_adapter
-        self._android_user_data_path = self._detect_android_user_data(folder_map)
+        self._android_user_data_path = (
+            extras['android_user_data'] if 'android_user_data' in extras
+            else self._detect_android_user_data(folder_map))
         self._missing_plist_paths = set(missing_plist_paths)
         self._folder_sizes = folder_sizes
         self._zip_ui_paths = zip_ui_paths
@@ -11600,10 +11656,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._duplicate_files = getattr(self, '_duplicate_files', {}) or {}
         self._recompute_duplicate_groups()
         self._file_count_cache = {}
-        if self._case_dir:
-            # Counts stay synchronous: one small blob unpack (~tens of ms),
-            # and row building falls back to a full recursive walk for any
-            # uncached folder — async here would reintroduce that stall.
+        if 'file_counts' in extras:
+            # Already read by the worker, which loads the same folder_data
+            # blob for the sizes anyway (23 MB on IOS17, so not "tens of ms").
+            self._file_count_cache = extras['file_counts']
+        elif self._case_dir:
+            # Counts stay synchronous: row building falls back to a full
+            # recursive walk for any uncached folder — async here would
+            # reintroduce that stall.
             try:
                 with closing(_open_cache_db(self._case_dir)) as db:
                     self._file_count_cache, _ = load_folder_data(db)
@@ -11650,7 +11710,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             for v in islice((v for v in data.values() if v), 500))
         # Not sampled: folders carry no hashes, a sample could be all
         # folders, and a repeated path is rare. any() stops at the first hit.
-        self._recompute_meta_col_keys(data)
+        if 'meta_col_keys' in extras:
+            self._meta_col_keys = extras['meta_col_keys']
+        else:
+            self._recompute_meta_col_keys(data)
         self.file_headers = (['Name'] + [h for h, _ in self._time_cols]
                              + ['Type', 'Size (Bytes)', 'Files', 'App', 'Path'])
         self._update_filter_columns(self.file_headers)
@@ -11859,9 +11922,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         recomputed after virtual entries (embedded media, e.g. a cache
         record's "Source URL") are injected, not just at load."""
         data = self.full_metadata if data is None else data
-        self._meta_col_keys = tuple(
-            k for k in _META_COL_HEADERS
-            if any(v.get(k) for v in data.values() if v))
+        self._meta_col_keys = _meta_col_keys_for(data)
 
     def _open_log_folder(self):
         d = startup_log.active_log_dir() or startup_log.log_dir()

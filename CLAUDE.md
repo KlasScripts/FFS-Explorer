@@ -65,7 +65,8 @@ separate **process** (`ffs_metadata.py`) since it is CPU-bound.
    to the physical zip path, and builds the GUID → bundle-id map for iOS
    containers. The five layouts and their path rules: `ASSUMPTIONS.md` §1–4.
 4. Zip reading goes through `zip_cd_cache.py` (a local `.zcd`
-   central-directory sidecar, so a network-hosted archive opens fast) plus
+   central-directory sidecar, so a network-hosted archive opens fast, and
+   `zip_index.py`'s mapped index built from it once per case) plus
    `app/zip_entry.ZipEntry` (direct seek, no decompression). What this
    relies on: `ASSUMPTIONS.md` §5–6.
 
@@ -155,7 +156,8 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `ffs_metadata.py` | Qt-free first-open parsing (child process); msgpack snapshot pack/unpack; `load_snapshot_from_case`. |
 | `db_utils.py` | Case DB open/schema/save-load helpers. |
 | `zip_entry.py` / `zip_reader.py` | `ZipEntry` (the archive-read handle every viewer uses), `ZipReader` (raw offset reads, thread pool), `read_nested_entry` (repacked nested archives, cached index). |
-| `zip_cd_cache.py` | `.zcd` central-directory sidecar, memoized parse + name index, `CachedZipView`, `compute_data_offsets`. Tests: `tests/test_zip_offsets.py`, `tests/test_zip_readers.py`. |
+| `zip_cd_cache.py` | `.zcd` central-directory sidecar, `load()` (entries from `zip_index`), `CachedZipView`, `compute_data_offsets`. Tests: `tests/test_zip_offsets.py`, `tests/test_zip_readers.py`. |
+| `zip_index.py` | The archive's file directory as one compact, memory-mapped index (`<zip>.ffsidx` in the case folder), built once from the `.zcd`; entries read as zipfile reads them, except a backslash in a name is kept. Qt-free. Tests: `tests/test_zip_index.py`. |
 | `header_scan.py` | Magic-byte/text file-type detection (`classify_magic`). |
 | `scan_rules.py` | Shared folder-prefix ruleset behind `FfsAdapter.scan_folders()` and friends. |
 | `embedded_media_scan.py` | The embedded-media sweep. |

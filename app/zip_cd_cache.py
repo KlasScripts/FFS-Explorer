@@ -24,6 +24,7 @@ import re
 import struct
 import zipfile
 from array import array
+from collections.abc import Mapping
 from bisect import bisect_right
 
 _MAGIC = b'ZCD\x02'   # v1 (msgpack) silently invalidated by magic mismatch
@@ -226,8 +227,15 @@ def save(zip_path: str, case_dir: str, progress_cb=None) -> bool:
 _parsed_cache: dict[str, tuple[float, int, list, dict]] = {}
 
 
-def load(zip_path: str, case_dir: str) -> list[zipfile.ZipInfo] | None:
-    """Return the cached ZipInfo list, or None if the cache is missing/corrupt.
+def load(zip_path: str, case_dir: str) -> list | None:
+    """Return the archive's entries, or None if the cache is missing/corrupt.
+
+    Since the file-index restructure the entries come from zip_index.py's
+    mapped index (<zip>.ffsidx, built once from the .zcd, so the archive
+    itself is not read again), not from parsing the .zcd with zipfile. They
+    are zip_index.IndexEntry objects with the ZipInfo fields this app reads,
+    identical entry for entry (names, capture names, offsets, sizes, CRC,
+    flags, extra fields, dates; checked on all six test archives).
 
     Memoized in-memory per .zcd file for the life of the process — see
     _parsed_cache's own comment above for why this matters and how it's
@@ -242,21 +250,63 @@ def load(zip_path: str, case_dir: str) -> list[zipfile.ZipInfo] | None:
     if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return cached[2]
 
-    try:
-        with open(path, 'rb') as fh:
-            if fh.read(4) != _MAGIC:
-                return None
-            payload = fh.read()
-        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-            infos = zf.infolist()
-            by_name = zf.NameToInfo
-    except Exception:
+    index = _open_index(zip_path, case_dir, path)
+    if index is None:
         return None
-
-    _name_repeated_captures(infos, by_name)
+    from zip_index import IndexEntry
+    infos = [IndexEntry(index, i) for i in range(len(index))]
+    by_name = _NameIndex(index, infos)
     _parsed_cache[path] = (st.st_mtime, st.st_size, infos, by_name)
     _register_layout(zip_path, infos)
     return infos
+
+
+def _open_index(zip_path: str, case_dir: str, zcd_path: str):
+    """The mapped index for this .zcd, built from it first when it is
+    missing, older than the .zcd, or of an older format. None if the .zcd
+    cannot be indexed (where zipfile would also have refused it)."""
+    import zip_index
+    path = zip_index.index_path(zip_path, case_dir)
+    try:
+        if os.path.getmtime(path) >= os.path.getmtime(zcd_path):
+            return zip_index.ZipIndex(path)
+    except (OSError, zip_index.IndexError_, ValueError, KeyError):
+        pass
+    try:
+        with open(zcd_path, 'rb') as fh:
+            if fh.read(4) != _MAGIC:
+                return None
+            payload = fh.read()
+        parsed = zip_index.parse_directory(payload)
+        zip_index.write(parsed, path, hashlib.sha256(payload).hexdigest())
+        return zip_index.ZipIndex(path)
+    except (OSError, zip_index.IndexError_, UnicodeDecodeError):
+        return None
+
+
+class _NameIndex(Mapping):
+    """{name: entry} over the index's own name table: what zipfile's
+    NameToInfo was, with the capture names (A-72), in the same order."""
+
+    def __init__(self, index, infos):
+        self._index = index
+        self._infos = infos
+
+    def __getitem__(self, name):
+        i = self._index.find(name) if isinstance(name, str) else -1
+        if i < 0:
+            raise KeyError(name)
+        return self._infos[i]
+
+    def __contains__(self, name):
+        return isinstance(name, str) and self._index.find(name) >= 0
+
+    def __iter__(self):
+        infos = self._infos
+        return (infos[i].filename for i in self._index.order)
+
+    def __len__(self):
+        return len(self._index.order)
 
 
 # ── Paths stored more than once (ASSUMPTIONS.md A-72) ─────────────────────────

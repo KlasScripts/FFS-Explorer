@@ -13648,9 +13648,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         ordinary folder browsing) is unchanged; only this COUNT needed
         fixing, not the listing it's displayed alongside."""
         seen: set[str] = set()
-        for folder in self._checked_folders:
-            for f in self._collect_files_recursive(folder):
-                seen.add(f)
+        # Only folders with no ticked folder above them: every other ticked
+        # folder lies inside one of these, so its files are already found.
+        # Walking all of them counted each file once per ticked folder above
+        # it — a 16 s frozen window after ticking the root of IOS17
+        # (179,351 folders, 830,298 entries).
+        checked = self._checked_folders
+        for folder in checked:
+            p = folder
+            while p:
+                p = p.rsplit('/', 1)[0] if '/' in p else ''
+                if p in checked:
+                    break
+            else:
+                seen.update(self._collect_files_recursive(folder))
         for path in self._checked_files:
             seen.add(path)
         return len(seen)
@@ -15647,7 +15658,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         still fires on_tree_item_changed, which harmlessly no-ops for it
         (its own `_checked_folders.discard(path)` on a path that's
         already absent) — cheap and safe, not worth adding blockSignals
-        complexity to avoid."""
+        complexity to avoid.
+
+        Many paths (ticking the root: every folder, 179,351 on IOS17) are
+        matched in one walk over the items the tree has actually loaded,
+        instead of one walk from the root per path and root (1.9 s of
+        frozen window there). Same items, same states."""
+        if len(paths) > 64:
+            wanted = paths if isinstance(paths, (set, frozenset)) else set(paths)
+            for root in (self._fs_root_item, self._selected_root_item):
+                if root is None:
+                    continue
+                stack = [root]
+                while stack:
+                    item = stack.pop()
+                    p = item.data(Qt.ItemDataRole.UserRole)
+                    if p in wanted and item.isCheckable():
+                        item.setCheckState(self._tree_check_state_for(p))
+                    stack.extend(item.child(r) for r in range(item.rowCount()))
+            return
         for p in paths:
             state = self._tree_check_state_for(p)
             for root in (self._fs_root_item, self._selected_root_item):

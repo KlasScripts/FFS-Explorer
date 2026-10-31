@@ -85,8 +85,10 @@ inherits this list from the repo) missing genuine evidence, which is why
 adding is opt-in and warned about while REMOVING an entry (undoing an
 exclusion) is always allowed regardless of the preference."""
 
+import functools
 import json
 import os
+import re
 import sys
 
 import config_seed
@@ -217,11 +219,17 @@ def _wildcard_matches(pattern: str, ui_path: str) -> bool:
     anywhere, more can follow" (e.g. "*@2x.*" — more of the real
     extension always follows "@2x.") must say so explicitly with a
     trailing '*'."""
-    import re
+    return _wildcard_regex(pattern).search(ui_path) is not None
+
+
+@functools.lru_cache(maxsize=1024)
+def _wildcard_regex(pattern: str) -> "re.Pattern":
+    """*pattern* compiled once: built per call, it cost 3.3 s of frozen
+    window on IOS17 (163,000 checks after one tick of the root)."""
     regex = '.*'.join(re.escape(part) for part in pattern.split('*'))
     if not pattern.endswith('*'):
         regex += '$'
-    return re.search(regex, ui_path) is not None
+    return re.compile(regex)
 
 
 def is_ignored(ui_path: str, entries: list | None = None) -> bool:

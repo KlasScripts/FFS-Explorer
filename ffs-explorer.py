@@ -1904,6 +1904,25 @@ class ZipMetadataWorker(QThread):
         candidates itself is what actually reads header_scan_tier."""
         return self.header_scan_tier > 0
 
+    def _update_case_names(self) -> None:
+        """Bring a case made by an older version up to the file-name rule
+        (ASSUMPTIONS.md A-80; case_names.py). Once per case; before the
+        saved folder tree is used, since that tree holds the old names."""
+        import case_names
+        import zip_cd_cache
+        try:
+            summary = case_names.migrate(
+                self.zip_path, self.case_dir,
+                lambda: zip_cd_cache.open_index(self.zip_path, self.case_dir))
+        except Exception as exc:
+            self.status_update.emit(f"Warning: could not update this case's file names: {exc}")
+            return
+        if summary:
+            n = sum(summary["paths_changed"].values())
+            self.status_update.emit(
+                f"Updated {len(summary['names']):,} file names from an older version "
+                f"({n:,} stored paths; see the run log). Rebuilding the folder tree…")
+
     def _try_load_from_snapshot(self, first_load: bool = False) -> bool:
         """Fast re-open: restore the previous load's full result from casecache.db.
 
@@ -2091,6 +2110,9 @@ class ZipMetadataWorker(QThread):
                     self.status_update.emit(
                         f"Warning: {e}")
 
+            if self.case_dir and _cd_cache_valid(self.zip_path, self.case_dir):
+                self._update_case_names()
+
             # Fast path: a previous load of this archive left a snapshot in the
             # cache DB — re-emit it and skip all archive I/O and derivations.
             # (Header scans need an open archive handle, so they take the full path.)
@@ -2116,6 +2138,7 @@ class ZipMetadataWorker(QThread):
                     _elapsed = time.monotonic() - _t0
                     self.status_update.emit(
                         f"Central directory copied to case folder in {_elapsed:.1f}s.")
+                    self._update_case_names()
 
                 # Fast path: offload the heavy parse to a child process.  It
                 # runs on its own interpreter/GIL so the CPU-bound work doesn't

@@ -157,7 +157,8 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `db_utils.py` | Case DB open/schema/save-load helpers. |
 | `zip_entry.py` / `zip_reader.py` | `ZipEntry` (the archive-read handle every viewer uses), `ZipReader` (raw offset reads, thread pool), `read_nested_entry` (repacked nested archives, cached index). |
 | `zip_cd_cache.py` | `.zcd` central-directory sidecar, `load()` (entries from `zip_index`), `CachedZipView`, `compute_data_offsets`. Tests: `tests/test_zip_offsets.py`, `tests/test_zip_readers.py`. |
-| `zip_index.py` | The archive's file directory as one compact, memory-mapped index (`<zip>.ffsidx` in the case folder), built once from the `.zcd`; entries read as zipfile reads them, except a backslash in a name is kept. Qt-free. Tests: `tests/test_zip_index.py`. |
+| `zip_index.py` | The archive's file directory as one compact, memory-mapped index (`<zip>.ffsidx` in the case folder), built once from the `.zcd`; entries read as zipfile reads them, except the name rule of ASSUMPTIONS.md A-80 (UTF-8 names without the flag; a backslash is kept), with each changed name's old form recorded. Qt-free. Tests: `tests/test_zip_index.py`. |
+| `case_names.py` | Updates a case made by an older version to the A-80 names, once per case (`case_settings.zip_name_rule`): path columns in both case DBs, saved folder tree dropped for rebuild, one `run_log` row. Called by `ZipMetadataWorker._update_case_names` before the snapshot is used. Qt-free. Tests: `tests/test_case_names.py`. |
 | `header_scan.py` | Magic-byte/text file-type detection (`classify_magic`). |
 | `scan_rules.py` | Shared folder-prefix ruleset behind `FfsAdapter.scan_folders()` and friends. |
 | `embedded_media_scan.py` | The embedded-media sweep. |

@@ -388,6 +388,25 @@ a corrupted entry.
 - Allowed exceptions: `ZipEntry`'s own compressed-entry fallback, and
   already-extracted local files (nested archives).
 
+**A-80. How a file name in the zip is read.** *Confirmed (real), 2026-10-31.*
+- A name is UTF-8 when the zip's flag bit 11 is set. When the flag is not
+  set, the name is read as UTF-8 if its bytes are valid UTF-8, else as cp437
+  (the zip standard's fallback, and what Python's zipfile always does).
+- Why: GrayKey writes UTF-8 names without setting the flag. On IOS18 CTF25,
+  all 58 non-ASCII names lack the flag and all 58 are valid UTF-8. Read as
+  cp437 they showed wrongly, e.g. "1170-├ù-2436" for "1170-×-2436".
+  Cellebrite sets the flag (CTF23, IOS17, Android 15 CTF25). The other
+  GrayKey archive (Android 14 CTF26) sets it on its 9 non-ASCII names.
+- A backslash in a name is part of the name, never a folder separator. FFS
+  zips separate folders with "/", and iOS Mail names Gmail folders
+  "[Gmail]/\Sent.imapmbox" (IOS17: 12 entries, IOS18: 4). Python's zipfile
+  on Windows turned these backslashes into "/", which made wrong paths in
+  the Windows build. `zip_index.py` keeps them.
+- Residual risk: a name genuinely in cp437 whose bytes also happen to be
+  valid UTF-8 would be read as UTF-8. Not seen on any test archive.
+- Relied on by: every path shown or stored (File Browser, exports, search,
+  bookmarks, reports).
+
 ## 6. Nested archives (embedded zip/gzip files)
 
 **A-19. Repacked nested archives are uncompressed and written once.** *Code

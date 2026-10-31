@@ -105,17 +105,36 @@ def _patch_record(raw: bytes, name: bytes, *, flags=None, extra=None):
     return bytes(out)
 
 
-def test_cp437_name_and_unicode_path_extra_field(tmp_path):
-    raw = _zip([("plain/café.txt", b"a"), ("other.txt", b"b")])
-    stored = "plain/café.txt".encode("utf-8")
-    # Clear the UTF-8 flag: zipfile now decodes the stored bytes as cp437.
+def test_utf8_name_without_the_flag_is_read_as_utf8(tmp_path):
+    """GrayKey writes UTF-8 names without flag bit 11 (A-80). zipfile reads
+    them as cp437 ("1170-├ù-2436.png"); the index reads UTF-8 and records
+    the old name for case_names."""
+    name = "Library/chronod/1170-×-2436.png"
+    raw = _patch_record(_zip([(name, b"a"), ("other.txt", b"b")]), name.encode(), flags=0)
+    ix = _index(tmp_path, _payload(raw))
+    garbled = name.encode().decode("cp437")
+    assert ix.name(0) == name and ix.orig_name(0) == name and ix.find(name) == 0
+    assert ix.find(garbled) == -1 and ix.stored_name_len[0] == len(name.encode())
+    assert ix.renames() == [(garbled, name)]
+
+
+def test_cp437_bytes_without_the_flag_stay_cp437(tmp_path):
+    """Bytes that are not valid UTF-8 are read as cp437, exactly as zipfile."""
+    raw = _zip([("plain/cafe.txt", b"a"), ("other.txt", b"b")])
+    raw = raw.replace(b"plain/cafe.txt", b"plain/caf\x82.txt")
+    raw = _patch_record(raw, b"plain/caf\x82.txt", flags=0)
+    ix = _same_as_zipfile(tmp_path, raw)
+    assert ix.name(0) == "plain/café.txt" and ix.renames() == []
+
+
+def test_unicode_path_extra_field_replaces_the_name(tmp_path):
+    raw = _zip([("plain/cafe.txt", b"a"), ("other.txt", b"b")])
+    raw = raw.replace(b"plain/cafe.txt", b"plain/caf\x82.txt")
+    stored = b"plain/caf\x82.txt"
     raw = _patch_record(raw, stored, flags=0)
-    _same_as_zipfile(tmp_path, raw)
-    # Add a Unicode Path field whose CRC matches the stored bytes: it wins.
     up = "plain/unicode-name.txt".encode("utf-8")
     field = struct.pack("<HHBL", 0x7075, 5 + len(up), 1, zlib.crc32(stored)) + up
-    raw2 = _patch_record(raw, stored, extra=field)
-    ix = _same_as_zipfile(tmp_path, raw2)
+    ix = _same_as_zipfile(tmp_path, _patch_record(raw, stored, extra=field))
     assert ix.find("plain/unicode-name.txt") >= 0
 
 
@@ -142,11 +161,15 @@ def test_zip64_extra_field_supplies_sizes_and_offset(tmp_path):
 
 def test_backslash_is_kept_on_every_platform(tmp_path):
     """iOS Mail stores Gmail folders as '[Gmail]/\\Sent.imapmbox'. zipfile on
-    Windows would turn that backslash into '/'; the index never does."""
-    name = "Library/Mail/X/[Gmail]/\\Sent.imapmbox/Info.plist"
-    payload = _payload(_zip([(name, b"p")]))
+    Windows turned that backslash into '/'; the index never does, and
+    records the Windows name (and its folder) for case_names."""
+    base = "fs/Library/Mail/X/[Gmail]/"
+    name = base + "\\Sent.imapmbox/Info.plist"
+    payload = _payload(_zip([(base + "\\Sent.imapmbox/", b""), (name, b"p")]))
     ix = _index(tmp_path, payload)
-    assert ix.name(0) == name and ix.find(name) == 0
+    assert ix.name(1) == name and ix.find(name) == 1
+    assert sorted(ix.renames()) == [(base + "/Sent.imapmbox", base + "\\Sent.imapmbox"),
+                                    (base + "/Sent.imapmbox/Info.plist", name)]
 
 
 def test_load_serves_index_entries_and_builds_the_index_once(tmp_path):

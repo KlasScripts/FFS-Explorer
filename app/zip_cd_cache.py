@@ -261,6 +261,12 @@ def load(zip_path: str, case_dir: str) -> list | None:
     return infos
 
 
+def open_index(zip_path: str, case_dir: str):
+    """The archive's mapped index (zip_index.ZipIndex), built first if
+    needed; None when there is no usable .zcd yet. The caller closes it."""
+    return _open_index(zip_path, case_dir, cache_path(zip_path, case_dir))
+
+
 def _open_index(zip_path: str, case_dir: str, zcd_path: str):
     """The mapped index for this .zcd, built from it first when it is
     missing, older than the .zcd, or of an older format. None if the .zcd
@@ -524,9 +530,13 @@ def _register_layout(zip_path: str, infos: list[zipfile.ZipInfo]) -> None:
 
 
 def _name_len(info: zipfile.ZipInfo) -> int:
-    """Byte length of the name as stored: UTF-8 when general-purpose bit 11
-    is set, else cp437 (what zipfile decoded it with). -1 if the stored bytes
-    can't be reproduced."""
+    """Byte length of the name as stored. An index entry carries it
+    (stored_name_len), whatever the name decodes to (A-80). For a ZipInfo:
+    UTF-8 when general-purpose bit 11 is set, else cp437 (what zipfile
+    decoded it with). -1 if the stored bytes can't be reproduced."""
+    stored_len = getattr(info, 'stored_name_len', None)
+    if stored_len is not None:
+        return stored_len
     name = getattr(info, 'orig_filename', None) or info.filename   # the stored name
     if name.isascii():
         return len(name)        # same bytes in either encoding — the common case

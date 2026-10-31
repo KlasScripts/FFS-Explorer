@@ -8,8 +8,8 @@ plain numbers plus pools of names and extra fields, written to one file in
 the case folder (<zip name>.ffsidx), and mapped back on every later open:
 nothing is parsed again, and the operating system loads only the pages used.
 
-Entries read the same as zipfile reads them, field by field, with one
-deliberate difference. Per CPython's zipfile (3.14):
+Entries read the same as zipfile reads them, field by field, with two
+deliberate differences (ASSUMPTIONS.md A-80). Per CPython's zipfile (3.14):
   * a name is UTF-8 when general-purpose flag bit 11 is set, else cp437;
   * a name is cut at its first NUL byte;
   * a Unicode Path extra field (0x7075, version 1) whose CRC matches the
@@ -18,11 +18,18 @@ deliberate difference. Per CPython's zipfile (3.14):
     0xFFFFFFFF or 0xFFFFFFFFFFFFFFFF), compressed size and header offset
     (when 0xFFFFFFFF), in that order;
   * date_time comes from the DOS date and time words.
-The difference: zipfile on Windows also turns every backslash in a name into
-"/". This index does not, on any platform. FFS archives always separate
-folders with "/", and a backslash is part of a real name (iOS Mail stores
-Gmail folders as "[Gmail]/\\Sent.imapmbox"), so the Windows rule turned real
-names into wrong paths. On macOS and Linux nothing changes.
+The differences:
+  * Without flag bit 11, a name whose bytes are valid UTF-8 is read as
+    UTF-8, not cp437. GrayKey writes UTF-8 names without the flag (IOS18
+    CTF25: all 58 non-ASCII names), which cp437 garbled ("1170-├ù-2436"
+    for "1170-×-2436").
+  * zipfile on Windows also turns every backslash in a name into "/". This
+    index does not, on any platform. FFS archives always separate folders
+    with "/", and a backslash is part of a real name (iOS Mail stores Gmail
+    folders as "[Gmail]/\\Sent.imapmbox"), so the Windows rule turned real
+    names into wrong paths.
+Each name these change is recorded with the name older versions gave it
+(renames()), so case_names.py can update a case made by an older version.
 
 Paths stored more than once (ASSUMPTIONS.md A-72) get the same names
 zip_cd_cache._name_repeated_captures gave them: every copy but the last
@@ -34,13 +41,14 @@ of the sidecar sees the same names and fields as before.
 
 from __future__ import annotations
 
+import json
 import mmap
 import os
 import struct
 import zlib
 from array import array
 
-_MAGIC = b"FFSIDX\x00\x02"
+_MAGIC = b"FFSIDX\x00\x03"   # 3: name rule A-80 and the renames section
 _HEADER = struct.Struct("<8sQ")              # magic, number of sections
 _SECTION = struct.Struct("<16sQQ")           # name, offset, length
 _CD_RECORD = struct.Struct("<4s6H3L5H2L")
@@ -69,6 +77,29 @@ def _sanitize(name: str) -> str:
     the module docstring): cut at the first NUL."""
     nul = name.find("\x00")
     return name[:nul] if nul >= 0 else name
+
+
+def _decode(raw: bytes, flags: int) -> str:
+    """A stored name as text (ASSUMPTIONS.md A-80): UTF-8 when flag bit 11
+    is set; without the flag, UTF-8 when the bytes are valid UTF-8 (GrayKey
+    writes UTF-8 names without the flag), else cp437."""
+    if flags & 0x800 or raw.isascii():
+        return raw.decode("utf-8")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp437")
+
+
+def _old_names(raw: bytes, flags: int, unicode_path: str | None) -> tuple[str, str]:
+    """The name older versions of this app gave an entry (zipfile's own
+    reading): (on macOS/Linux, on Windows). The Windows one also had every
+    backslash turned into "/"."""
+    if unicode_path:
+        posix = _sanitize(unicode_path)
+    else:
+        posix = _sanitize(raw.decode("utf-8" if flags & 0x800 else "cp437"))
+    return posix, posix.replace("\\", "/")
 
 
 def _cd_bounds(payload: bytes) -> tuple[int, int]:
@@ -100,6 +131,7 @@ def parse_directory(payload: bytes) -> dict:
     extras = bytearray()
     final_names: list[str] = []
     origs_list: list[str] = []
+    old: dict[int, tuple[str, str]] = {}      # entry -> its names in older versions, when different
     unpack = _CD_RECORD.unpack_from
     pos, end = 0, len(cd)
     while pos < end:
@@ -115,8 +147,9 @@ def parse_directory(payload: bytes) -> dict:
         raw_name = bytes(cd[p:p + nlen])
         p += nlen
         extra = bytes(cd[p:p + elen])
-        orig = raw_name.decode("utf-8" if flags & 0x800 else "cp437")
+        orig = _decode(raw_name, flags)
         name = _sanitize(orig)
+        unicode_path = None
         # Extra fields, as zipfile._decodeExtra reads them.
         e = extra
         name_crc = None
@@ -152,6 +185,7 @@ def parse_directory(payload: bytes) -> dict:
                         raise IndexError_("corrupt unicode path extra field (0x7075)") from None
                     if up:
                         name = _sanitize(up)
+                        unicode_path = up
             e = e[ln + 4:]
         cols["header_offset"].append(hoff)
         cols["compress_size"].append(csize)
@@ -167,14 +201,20 @@ def parse_directory(payload: bytes) -> dict:
         cols["extra_start"].append(len(extras))
         cols["extra_len"].append(elen)
         extras += extra
+        if "\\" in name or (not flags & 0x800 and not raw_name.isascii()):
+            olds = _old_names(raw_name, flags, unicode_path)
+            if olds != (name, name):
+                old[len(final_names)] = olds
         final_names.append(name)
         pos = p + elen + clen
     # zipfile's NameToInfo (last entry with a name wins, first-seen order),
     # then the capture renaming, exactly as zip_cd_cache did on ZipInfo.
+    base_names = list(final_names) if old else None
     by_name: dict[str, int] = {}
     for i, name in enumerate(final_names):
         by_name[name] = i
     _name_repeated_captures(final_names, cols["header_offset"], by_name)
+    renames = _renames(base_names, old, final_names, by_name, cols["header_offset"]) if old else []
     for i, name in enumerate(final_names):
         nb = name.encode("utf-8", "surrogatepass")
         cols["name_start"].append(len(names))
@@ -192,7 +232,52 @@ def parse_directory(payload: bytes) -> dict:
             cols["orig_in_names"].append(0)
             origs += ob
     return {"cols": cols, "names": bytes(names), "origs": bytes(origs), "extras": bytes(extras),
-            "table": _hash_table(by_name), "order": array("I", by_name.values())}
+            "table": _hash_table(by_name), "order": array("I", by_name.values()),
+            "renames": renames}
+
+
+def _renames(base_names: list[str], old: dict, final_names: list[str], by_name: dict,
+             header_offsets) -> list[tuple[str, str]]:
+    """[(name in older versions, name now)] for every entry whose name the
+    A-80 rule changed, once for the macOS/Linux reading and once for the
+    Windows one, plus each folder above it whose name changed (a folder
+    with no entry of its own is still a path in the case data). Pairs
+    are dropped when the old name is ambiguous: it is also a name some
+    entry has now, or it stood for two different names."""
+    found: dict[str, set] = {}
+    for variant in (0, 1):
+        names = list(base_names)
+        for i, pair in old.items():
+            names[i] = pair[variant]
+        names_by = {}
+        for i, name in enumerate(names):
+            names_by[name] = i
+        _name_repeated_captures(names, header_offsets, names_by)
+        for i, (was, now) in enumerate(zip(names, final_names)):
+            if was != now:
+                for a, b in _with_folders(was.rstrip("/"), now.rstrip("/")):
+                    found.setdefault(a, set()).add(b)
+    current = set(by_name)
+    current |= {n.rstrip("/") for n in by_name}
+    return sorted((a, next(iter(b))) for a, b in found.items()
+                  if len(b) == 1 and a not in current)
+
+
+def _with_folders(was: str, now: str) -> list[tuple[str, str]]:
+    """(was, now) and the changed folders above them, paired from the
+    deepest level up. A folder only in the old name (a backslash read as a
+    folder break) has no pair and is left out."""
+    k = 0
+    while k < min(len(was), len(now)) and was[k] == now[k]:
+        k += 1
+    start = was.rfind("/", 0, k) + 1          # first changed level
+    pairs = [(was, now)]
+    w_dirs = [was[:j] for j in range(start, len(was)) if was[j] == "/" and j > start]
+    n_dirs = [now[:j] for j in range(start, len(now)) if now[j] == "/" and j > start]
+    for a, b in zip(reversed(w_dirs), reversed(n_dirs)):
+        if a != b:
+            pairs.append((a, b))
+    return pairs
 
 
 def _name_repeated_captures(names: list[str], header_offsets, by_name: dict) -> None:
@@ -247,7 +332,8 @@ def write(parsed: dict, path: str, cd_sha256: str) -> None:
     leaves half an index)."""
     sections = [("cd_sha256", cd_sha256.encode("ascii")), ("names", parsed["names"]),
                 ("origs", parsed["origs"]), ("extras", parsed["extras"]),
-                ("table", parsed["table"].tobytes()), ("order", parsed["order"].tobytes())]
+                ("table", parsed["table"].tobytes()), ("order", parsed["order"].tobytes()),
+                ("renames", json.dumps(parsed["renames"], ensure_ascii=False).encode("utf-8"))]
     sections += [(name, parsed["cols"][name].tobytes()) for name, _code in _COLUMNS]
     head = _HEADER.size + _SECTION.size * len(sections)
     offset = (head + 7) & ~7
@@ -287,6 +373,7 @@ class ZipIndex:
         self._names, self._origs, self._extras = sec["names"], sec["origs"], sec["extras"]
         self._table = sec["table"].cast("i")
         self.order = sec["order"].cast("I")     # namelist order: zipfile's, then captures
+        self._renames = bytes(sec["renames"])
         self._mask = len(self._table) - 1
         self._n = len(self.header_offset)
 
@@ -319,6 +406,10 @@ class ZipIndex:
             if lens[i] == len(nb) and pool[s:s + lens[i]] == nb:
                 return i
             h = (h + 1) & self._mask
+
+    def renames(self) -> list[tuple[str, str]]:
+        """[(name in older versions of this app, name now)] (A-80)."""
+        return [tuple(p) for p in json.loads(self._renames.decode("utf-8"))]
 
     def date_time(self, i: int) -> tuple:
         t, d = self.dos_time[i], self.dos_date[i]

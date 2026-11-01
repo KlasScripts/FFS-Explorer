@@ -30,7 +30,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from functools import partial
-from itertools import islice
+from itertools import chain, islice
 from operator import itemgetter
 
 _APP_DIR             = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app')    # adapters, db_utils, etc.
@@ -10753,6 +10753,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                         break
 
             self.file_model.append_rows_batch(batch_rows)
+            # Keep the rows built so far out of later garbage-collection
+            # passes: each full pass rescanned every row, growing with the
+            # table (root tick on IOS17: 140-414 ms passes, each a frozen
+            # window). gc.freeze() is O(1); start_loading unfreezes.
+            gc.freeze()
             self.status_bar.showMessage(
                 f"Loading…  {state['count']:,} files  "
                 f"({state['idx']} of {total_folders} folders)")
@@ -11526,6 +11531,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # (frozen in on_metadata_ready) so whatever it still held can be freed.
         gc.unfreeze()
         self._user_media_last_label = None   # that count belonged to the previous case
+        self._selected_only_tree_stale = False
         self._case_dir = case_dir
         self._photo_index = {}        # rebuilt in on_metadata_ready
         self._media_exif = {}         # rebuilt in _start_case_meta_load
@@ -15807,11 +15813,18 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         entry in _checked_folders. O(path depth) per leaf — cheap even
         for the "User Media" filter's own real 10,000+-file scale."""
         partial: set = set()
-        for p in (self._checked_folders | self._checked_files):
+        checked = self._checked_folders
+        for p in chain(checked, self._checked_files):
             cur = p
             while True:
                 cur = cur.rsplit('/', 1)[0] if '/' in cur else ''
-                if cur in self._checked_folders:
+                if cur in checked:
+                    break
+                # Already reached by an earlier walk, which went on up from
+                # here exactly as this one would: stop. Same set, but each
+                # folder is walked once — 12,893 "User Media" files in a few
+                # folders each walked to the root (0.2 s of frozen window).
+                if cur in partial:
                     break
                 partial.add(cur)
                 if cur == '':
@@ -16062,8 +16075,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             that tab;
           - otherwise leaves the mode as it currently is (just refreshed,
             if it's already on — a plain instant visibility flip either
-            way, never a rebuild of the real tree)."""
-        self._rebuild_selected_only_children()
+            way, never a rebuild of the real tree).
+
+        The rebuild itself waits until the branch is shown: while it's
+        hidden it's only marked stale, and _apply_selected_only rebuilds
+        it before showing it (0.17 s of every root tick on IOS17 went on
+        rebuilding a branch nobody was looking at)."""
+        if self._selected_only_mode:
+            self._rebuild_selected_only_children()
+        else:
+            self._selected_only_tree_stale = True
         if not self._selected_only_scope:
             if self._selected_only_mode:
                 self._apply_selected_only(False)
@@ -16174,6 +16195,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         ancestor survives, nothing further happens here; the caller's
         own existing empty-scope handling (turning "Selected only" off)
         takes over in that case."""
+        self._selected_only_tree_stale = False
         root = self._selected_root_item
         if root is None:
             return
@@ -16347,6 +16369,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         calls) skips this entirely, so a redundant call never disturbs
         whatever's already correctly selected."""
         transitioning = enabled != self._selected_only_mode
+        if enabled and getattr(self, '_selected_only_tree_stale', False):
+            # Deferred by _sync_selected_only_after_scope_change while hidden;
+            # built before it's shown and before the selection carry-over.
+            self._rebuild_selected_only_children()
         if transitioning:
             self._save_tree_selection_for_carryover()
         self._selected_only_mode = enabled
@@ -16866,6 +16892,19 @@ if __name__ == "__main__":
         _stall_timer = QTimer()
         _stall_timer.timeout.connect(_stall_tick)
         _stall_timer.start(50)
+        # Full garbage-collection passes over 50 ms, so a [stall] line can
+        # be matched to one (a pass blocks every thread, the GUI included).
+        _gc_start = {}
+        def _gc_cb(phase, info):
+            if info.get('generation') != 2:
+                return
+            if phase == 'start':
+                _gc_start['t'] = time.perf_counter()
+            elif 't' in _gc_start:
+                ms = (time.perf_counter() - _gc_start.pop('t')) * 1000
+                if ms > 50:
+                    print(f"[gc] full pass {ms:.0f} ms", file=sys.stderr)
+        gc.callbacks.append(_gc_cb)
     startup_log.step('building main window')
     window = FastZipBrowser()
     startup_log.step('main window built')

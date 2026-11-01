@@ -929,7 +929,7 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
         for hit in scan_plist_bytes(raw, label=ui_path):
             rows.append(_build_hit_row(ui_path, 'plist', hit['plist_path'],
                                        scan_dir, hit, scan_scope))
-        return rows
+        return _unique_rows(rows)
 
     # kind == 'sqlite'
     seen_blobs: list[bytes] = []          # live media, to skip recovered copies of it
@@ -980,4 +980,22 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
             rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
     except Exception:
         pass
-    return rows
+    return _unique_rows(rows)
+
+
+def _unique_rows(rows: list[dict]) -> list[dict]:
+    """Each (location, media) once, the first kept — exactly the row
+    embedded_media_hits keeps (UNIQUE(source_ui_path, location, sha256),
+    INSERT OR IGNORE). Deleted media is often found again at the same place
+    (one row in several WAL frames, or in a freed page and the WAL), and the
+    sweep's counts used to include every find: on IOS17 the screen said 989
+    recovered pictures while the case held 280 (2026-11-01; Windows and Mac
+    stored byte-identical rows). The stored rows are unchanged by this."""
+    seen: set = set()
+    out = []
+    for r in rows:
+        key = (r['source_ui_path'], r['location'], r['sha256'])
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out

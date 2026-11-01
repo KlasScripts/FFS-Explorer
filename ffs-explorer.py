@@ -17231,7 +17231,12 @@ if __name__ == "__main__":
     startup_log.step(f"QApplication ready (Qt platform: {app.platformName()}, "
                      f"screens: {[s.geometry().getRect() for s in app.screens()]})")
     app.setApplicationName("FFS Explorer")
-    app.setApplicationDisplayName("FFS Explorer")
+    # With the version (app/version.py): Qt appends " - <display name>" to a
+    # window title unless the title IS the display name, so the main window
+    # (same text) reads "FFS Explorer v0.50.23" once, and dialogs read e.g.
+    # "Process Case - FFS Explorer v0.50.23". applicationName stays plain.
+    from version import window_title as _window_title
+    app.setApplicationDisplayName(_window_title())
     app.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
     if os.environ.get('FFS_STALL_DEBUG'):
         # Main-thread stall detector: a 50 ms heartbeat that reports whenever

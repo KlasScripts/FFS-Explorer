@@ -49,6 +49,9 @@ from PySide6.QtCore import (Qt, QThread, Signal, QBuffer, QIODevice,
 THUMB_SIZE         = 160   # thumbnail box size in pixels
 _THUMB_BATCH_COMMIT = 20   # inserts to accumulate before a single db.commit()
 _THUMB_DECODE_THREADS = 4  # ThumbnailWorker's decode pool (see its docstring)
+# One background thread for the archive-wide User Media list
+# (MediaViewerMixin._user_media_paths_async).
+_USER_MEDIA_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ffs-usermedia')
 _MEDIA_PAGE_SIZE_DEFAULT = 500
 
 # Deliberately a small, LOCAL copy of ffs-explorer.py's own
@@ -1687,7 +1690,7 @@ class MediaViewerMixin:
         self._media_type_all_btn.setChecked(True)
         self._start_thumbnail_load(media_paths, len(media_paths), sort_desc)
 
-    def _user_media_candidate_paths(self) -> list[str]:
+    def _user_media_candidate_paths(self, keys=None) -> list[str]:
         """Every real media file across the WHOLE archive sitting
         under one of FastZipBrowser._user_media_include_prefixes()'s
         own default user-content locations — the RAW candidate set,
@@ -1723,15 +1726,48 @@ class MediaViewerMixin:
         exact = frozenset(norm)
         starts = tuple(p + '/' for p in norm)
         folder_map = self.folder_map
+        # *keys*: a list of full_metadata's keys taken on the GUI thread, so
+        # this can run on _USER_MEDIA_POOL without iterating a dict the GUI
+        # thread may be adding to (lookups are safe; iteration isn't).
         return sorted(
-            p for p in self.full_metadata
+            p for p in (self.full_metadata if keys is None else keys)
             if (p in exact or p.startswith(starts))
             and p not in folder_map
             and p not in cache_children
             and self._is_media_file(p)
         )
 
-    def _user_media_paths(self) -> list[str]:
+    def _user_media_paths_async(self, callback, purpose: str) -> None:
+        """Build _user_media_paths() on _USER_MEDIA_POOL and call
+        callback(paths) back on the GUI thread. In the v0.50.17 exe on
+        IOS17 the synchronous build froze the window ~1.6 s at every case
+        open (the bookmark panel's count) and 1.5-2 s on a click of the
+        row. *purpose* ('panel', 'click') keeps one sequence per caller: a
+        newer request of the same purpose supersedes an older one, without
+        cancelling the other caller's. Dropped if another case was opened
+        meanwhile; built on the GUI thread instead if the background build
+        fails (e.g. the folder tree changed under it)."""
+        seqs = self.__dict__.setdefault('_user_media_seqs', {})
+        seq = seqs[purpose] = seqs.get(purpose, 0) + 1
+        metadata = self.full_metadata
+        keys = list(metadata)   # a C-level copy; ~10 ms for 830k entries
+        fut = _USER_MEDIA_POOL.submit(self._user_media_paths, keys)
+
+        def _poll():
+            if seqs.get(purpose) != seq or self.full_metadata is not metadata:
+                return
+            if not fut.done():
+                QTimer.singleShot(20, _poll)
+                return
+            try:
+                paths = fut.result()
+            except Exception:
+                paths = self._user_media_paths()
+            callback(paths)
+
+        QTimer.singleShot(5, _poll)
+
+    def _user_media_paths(self, keys=None) -> list[str]:
         """The real, shared list of every User Media LOCATION candidate
         (_user_media_candidate_paths) that is NEITHER on
         user_media_ignore_list.py's own list NOR already marked
@@ -1767,7 +1803,7 @@ class MediaViewerMixin:
         ignore_entries = user_media_ignore_list.load()
         seen_paths = self._load_seen_media_paths_fresh()
         return [
-            p for p in self._user_media_candidate_paths()
+            p for p in self._user_media_candidate_paths(keys)
             if not user_media_ignore_list.is_ignored(
                 self._canonical_user_media_entry(p), ignore_entries)
             and p not in seen_paths
@@ -1859,8 +1895,17 @@ class MediaViewerMixin:
 
         Owns the Media Browser tab-switch itself now (rather than a
         separate wrapper switching eagerly before this runs) so a
-        Cancel genuinely does nothing at all, not even change tabs."""
-        media_paths = self._user_media_paths()
+        Cancel genuinely does nothing at all, not even change tabs.
+
+        The list is built off the GUI thread (_user_media_paths_async);
+        everything above happens in _show_user_created_media_paths once
+        it lands."""
+        self.status_bar.showMessage("Finding User Media…")
+        self._user_media_paths_async(self._show_user_created_media_paths, 'click')
+
+    def _show_user_created_media_paths(self, media_paths: list) -> None:
+        """_show_user_created_media's second half, given the list."""
+        self.status_bar.clearMessage()
         if not media_paths:
             self.status_bar.showMessage(
                 "\"User Media\" has no not-yet-viewed files right now.", 4000)

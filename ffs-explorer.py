@@ -180,6 +180,12 @@ _SELECTED_FILES_SENTINEL = "__selected_files__"
 # "Selected Files" — distinguishes it from a real group's own integer
 # id the same way _SELECTED_FILES_SENTINEL does.
 _USER_MEDIA_SENTINEL = "__user_media__"
+_USER_MEDIA_TOOLTIP = (
+    "Show real pictures/videos found in known user-created "
+    "locations only (app data, DCIM, Photo Library Data) — "
+    "excludes anything on the User Media ignore list "
+    "(Preferences ▸ Media Browser). Switches to the Media "
+    "Browser tab.")
 
 _SETTINGS_ORG = "KlasScripts"
 _SETTINGS_APP = "FFS Explorer"
@@ -8183,6 +8189,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _hdr = self.file_view.horizontalHeader()
         _hdr.setSectionsMovable(True)
         _hdr.sectionMoved.connect(self._on_section_moved)
+        # resizeColumnsToContents measures this many rows per column (Qt's
+        # default is 1000); each measured cell is several Python data()
+        # calls. At 1000 it froze the window ~1.3 s after "User Media"
+        # (12,893 rows) and at the end of a root tick. A view under 250
+        # rows is sized exactly as before.
+        _hdr.setResizeContentsPrecision(250)
         # The synthetic far-left tickbox column (see
         # FileTableModel._checked_paths) — narrow and fixed-width, not
         # user-resizable, so it always reads as a checkbox gutter rather
@@ -11513,6 +11525,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Hand the previous case's objects back to the garbage collector
         # (frozen in on_metadata_ready) so whatever it still held can be freed.
         gc.unfreeze()
+        self._user_media_last_label = None   # that count belonged to the previous case
         self._case_dir = case_dir
         self._photo_index = {}        # rebuilt in on_metadata_ready
         self._media_exif = {}         # rebuilt in _start_case_meta_load
@@ -13887,32 +13900,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # fine to re-run on every panel refresh (bookmark add/delete/
         # color-change, case load — never on every tick, unlike
         # "Selected Files" own count).
-        user_media = self._user_media_paths()
-        n_user_media = len(user_media)
-        # Two values while the Media Browser's "Hide Duplicates" is on —
-        # added 2026-10-17, direct request: "make it that user media is
-        # altered by the hide duplicates... that it show the two values."
-        # N = files clicking this selects (matches "Selected Files");
-        # M = thumbnails actually left to review once duplicates collapse
-        # (the same _collapse_duplicate_paths the grid itself uses).
-        n_to_review = (len(self._collapse_duplicate_paths(user_media))
-                       if getattr(self, '_media_hide_duplicates', False)
-                       else n_user_media)
-        um_label = (f"User Media  ({n_user_media:,} · {n_to_review:,} to review)"
-                    if n_to_review != n_user_media
-                    else f"User Media  ({n_user_media:,})")
+        # The count is filled in by _apply_user_media_count once the list is
+        # built off the GUI thread (_user_media_paths_async, started below);
+        # until then the row keeps this case's last count, so refreshing the
+        # panel (a bookmark change, "Not Relevant") doesn't flicker.
+        um_label = (getattr(self, '_user_media_last_label', None)
+                    or "User Media  (counting…)")
         um_item = QListWidgetItem()
         um_item.setData(Qt.ItemDataRole.UserRole, _USER_MEDIA_SENTINEL)
-        um_item.setToolTip(
-            "Show real pictures/videos found in known user-created "
-            "locations only (app data, DCIM, Photo Library Data) — "
-            "excludes anything on the User Media ignore list "
-            "(Preferences ▸ Media Browser). Switches to the Media "
-            "Browser tab."
-            + ("\n\nWith \"Hide Duplicates\" on: the first number is "
-               "how many files get selected; \"to review\" is how many "
-               "thumbnails you'll see once identical copies are hidden."
-               if n_to_review != n_user_media else ""))
+        um_item.setToolTip(_USER_MEDIA_TOOLTIP)
+        self._user_media_item = um_item
         self._bookmark_list.addItem(um_item)
         # A real inline widget, same two-button shape as "Selected
         # Files" above — "Reset" moved HERE 2026-10-03, direct
@@ -13949,6 +13946,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # row already has there.
         self._bookmark_list.setItemWidget(um_item, um_row_widget)
         um_item.setSizeHint(um_row_widget.sizeHint())
+        self._user_media_paths_async(self._apply_user_media_count, 'panel')
         for g in groups:
             item = QListWidgetItem(f"{g['name']}  ({g['count']:,})")
             item.setData(Qt.ItemDataRole.UserRole, g['id'])
@@ -13978,6 +13976,35 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Pass the already-loaded groups so it doesn't reopen the results DB.
         if hasattr(self, 'search_scope_combo'):
             self._refresh_search_scope_combo(groups)
+
+    def _apply_user_media_count(self, user_media: list) -> None:
+        """Fill in the bookmark panel's "User Media (N)" row once
+        _user_media_paths_async has built the list off the GUI thread."""
+        n_user_media = len(user_media)
+        # Two values while the Media Browser's "Hide Duplicates" is on —
+        # added 2026-10-17, direct request: "make it that user media is
+        # altered by the hide duplicates... that it show the two values."
+        # N = files clicking this selects (matches "Selected Files");
+        # M = thumbnails actually left to review once duplicates collapse
+        # (the same _collapse_duplicate_paths the grid itself uses).
+        n_to_review = (len(self._collapse_duplicate_paths(user_media))
+                       if getattr(self, '_media_hide_duplicates', False)
+                       else n_user_media)
+        um_label = (f"User Media  ({n_user_media:,} · {n_to_review:,} to review)"
+                    if n_to_review != n_user_media
+                    else f"User Media  ({n_user_media:,})")
+        tooltip = _USER_MEDIA_TOOLTIP + (
+            "\n\nWith \"Hide Duplicates\" on: the first number is "
+            "how many files get selected; \"to review\" is how many "
+            "thumbnails you'll see once identical copies are hidden."
+            if n_to_review != n_user_media else "")
+        self._user_media_last_label = um_label
+        try:
+            self._user_media_row_btn.setText(um_label)
+            self._user_media_row_btn.setToolTip(tooltip)
+            self._user_media_item.setToolTip(tooltip)
+        except (AttributeError, RuntimeError):
+            pass   # the panel was rebuilt meanwhile; its own count is on the way
 
     def _bookmark_color_swatch(self, color: str | None) -> QPixmap:
         """A small solid-color square QPixmap for a bookmark group's own

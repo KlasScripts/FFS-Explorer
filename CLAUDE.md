@@ -176,6 +176,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `file_browser_presets.py` | Shared filter+sort presets (File Browser dropdown, Media Browser buttons). |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers; no business logic. |
 | `startup_log.py` | Bounded startup/error log + crash/stall snapshot (`Tools → Open Log Folder`). Qt-free. |
+| `version.py` | The running release (e.g. `v0.50.21`) for the window title and startup log line: `version.txt` in a frozen build (written by the spec), `git describe` in a source run. Qt-free. Tests: `tests/test_version.py`. |
 | `timestamp_display.py` | `TimestampDisplayMixin`: timestamp-mode banner, `format_ts`, Timestamp Display dialog. |
 | `device_timezone.py` | Best-effort handset/acquisition/system timezone detection. |
 | `keyword_search.py` | Search workers (main archive, nested archives, LevelDB index), `KeywordSearchMixin`, `SqlHitInterpretWorker`. |
@@ -251,6 +252,10 @@ File order, top to bottom:
 
 - CI is `.github/workflows/build-windows-exe.yml` running
   `pyinstaller ffs_explorer.spec`; that spec is the one that matters.
+  It builds only for a pushed `v*` tag (or a manual run), passing the tag as
+  `FFS_VERSION`: the release zip is named with it
+  (`ffs-explorer-windows-v0.50.21.zip`; the exe names stay fixed) and it
+  ships as `_internal/version.txt` for the window title (`app/version.py`).
 - It must bundle `app/ccl_segb` (vendored) and the config seeds.
 - New dependency or config file: read `ASSUMPTIONS.md` §16 (A-63) first
   (PyAV from source, the `excludes=` trap, `datas=` destinations).

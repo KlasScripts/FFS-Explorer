@@ -167,8 +167,13 @@ def _environment() -> str:
         built = ''
         if frozen:
             built = time.strftime('%Y-%m-%d %H:%M', time.localtime(os.path.getmtime(exe)))
-        return (f"{platform.platform()} | python {platform.python_version()} | "
-                f"{'frozen build ' + built if frozen else 'source run'} | {exe}")
+        from version import app_version
+        version = app_version() or 'version unknown'
+        # 'files dated': the exe's modified time, i.e. when it was unzipped,
+        # not when it was built; the version says which release it is.
+        return (f"FFS Explorer {version} | {platform.platform()} | "
+                f"python {platform.python_version()} | "
+                f"{'frozen, files dated ' + built if frozen else 'source run'} | {exe}")
     except Exception:
         return 'environment unavailable'
 

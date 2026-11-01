@@ -55,16 +55,26 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Build with PyInstaller
+        # The release tag is shown in the window title (ffs_explorer.spec's
+        # VERSION, app/version.py). The checkout is shallow with no tags, so
+        # the spec can't ask git here.
+        env:
+          FFS_VERSION: ${{ github.event.inputs.tag_name || github.ref_name }}
         run: |
           pyinstaller ffs_explorer.spec
 
+      # The zip's name carries the version (ffs-explorer-windows-v0.50.22.zip),
+      # so downloads of different releases don't pile up as "(1)", "(2)"...;
+      # the exes inside keep fixed names.
       - name: Zip the dist folder
+        env:
+          FFS_VERSION: ${{ github.event.inputs.tag_name || github.ref_name }}
         run: |
-          Compress-Archive -Path dist\ffs-explorer\* -DestinationPath ffs-explorer-windows.zip
+          Compress-Archive -Path dist\ffs-explorer\* -DestinationPath "ffs-explorer-windows-$env:FFS_VERSION.zip"
 
       - name: Create GitHub Release and upload asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
-          files: ffs-explorer-windows.zip
+          files: ffs-explorer-windows-${{ github.event.inputs.tag_name || github.ref_name }}.zip
           generate_release_notes: true   # auto-generates changelog from commits

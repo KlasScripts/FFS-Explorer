@@ -1,10 +1,29 @@
 # ios_ffs_browser.spec
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import subprocess
 import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
+
+# Release version, e.g. 'v0.50.21': CI passes the tag it builds as FFS_VERSION
+# (build-windows-exe.yml, which also puts it in the zip's name); a local build
+# asks git. Shipped as _internal/version.txt, which app/version.py reads for
+# the window title and the startup log line. The exe names stay fixed
+# (ffs-explorer.exe), so shortcuts survive an update.
+VERSION = os.environ.get('FFS_VERSION', '').strip()
+if not VERSION:
+    try:
+        VERSION = subprocess.run(['git', 'describe', '--tags', '--dirty'], cwd=SPECPATH,
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        VERSION = ''
+os.makedirs(os.path.join(SPECPATH, 'build'), exist_ok=True)
+_VERSION_FILE = os.path.join(SPECPATH, 'build', 'version.txt')
+with open(_VERSION_FILE, 'w', encoding='utf-8') as _f:
+    _f.write(VERSION)
 
 # app/media_viewer.py's video-thumbnail decoder (`av`/PyAV, since
 # 2026-09-14). CI currently installs the plain prebuilt PyPI wheel (see
@@ -74,6 +93,8 @@ a = Analysis(
         ('config/epoch_formats.json', 'config'),
         # Bundle the icons so resource_path() can find them at runtime
         ('resources', 'resources'),
+        # The release version (see VERSION above) -> _internal/version.txt
+        (_VERSION_FILE, '.'),
         # Artifact parser scripts — loaded dynamically so PyInstaller can't
         # detect them via import analysis; must be listed explicitly.
         ('artifacts', 'artifacts'),

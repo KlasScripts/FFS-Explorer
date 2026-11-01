@@ -104,7 +104,7 @@ def check_module_table(text: str, blocking: list):
         rel = py_file.relative_to(app_dir)
         if any(part in VENDORED for part in rel.parts) or rel.name == "__init__.py":
             continue
-        actual.add(str(rel))
+        actual.add(rel.as_posix())   # '/' as in the table, on Windows too
 
     missing_from_doc = actual - documented
     stale_in_doc = documented - actual

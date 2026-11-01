@@ -7935,7 +7935,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FFS Explorer")
+        from version import window_title
+        self.setWindowTitle(window_title())   # "FFS Explorer v0.50.21" (app/version.py)
         self.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
         self.resize(1350, 850)
 

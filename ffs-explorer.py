@@ -1543,6 +1543,11 @@ def _meta_col_keys_for(data: dict) -> tuple:
                  if any(v.get(k) for v in data.values() if v))
 
 
+# A File Browser cell counts as "no data" when blank, or '---' (a timestamp
+# that isn't set). '0' is real data (e.g. a zero-byte file's size).
+_NO_DATA_VALUES = frozenset(('', '---'))
+
+
 def _count_selected_files(checked_folders, checked_files, folder_map: dict,
                           is_folder) -> int:
     """How many distinct real files a tick selection resolves to: every
@@ -2511,6 +2516,11 @@ class FileTableModel(QAbstractTableModel):
         self._headers  = list(headers)
         self._all_rows = []   # all rows, never modified by filtering
         self._rows     = []   # currently visible (filtered) rows
+        # Columns (index into _headers, 'Name' never) with no real value in
+        # any row added so far — kept up to date per batch in
+        # append_rows_batch, the only way rows enter _all_rows, so
+        # FastZipBrowser._empty_columns needn't rescan every row at the end.
+        self._no_data_cols = {i for i, h in enumerate(self._headers) if h != 'Name'}
         self._files_col = self._headers.index('Files') if 'Files' in self._headers else -1
         self._size_col  = self._headers.index('Size (Bytes)') if 'Size (Bytes)' in self._headers else -1
         self._filter_gen = 0  # bump to cancel an in-flight filter
@@ -2694,6 +2704,11 @@ class FileTableModel(QAbstractTableModel):
         """Append rows to _all_rows; only add to _rows those passing the type filter."""
         if not rows:
             return
+        if self._no_data_cols:
+            cells = [r[0] for r in rows]
+            for i in list(self._no_data_cols):
+                if not _NO_DATA_VALUES.issuperset(map(str, map(itemgetter(i), cells))):
+                    self._no_data_cols.discard(i)
         self._all_rows.extend(rows)
         visible = [r for r in rows if (self._show_folders if r[2] >= 0 else self._show_files)]
         if visible:
@@ -8494,7 +8509,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     # A cell counts as "no data" when blank, or '---' (a timestamp that isn't
     # set). '0' is real data (e.g. a zero-byte file's size).
-    _NO_DATA_VALUES = frozenset(('', '---'))
+    _NO_DATA_VALUES = _NO_DATA_VALUES
 
     def _empty_columns(self) -> set[str]:
         """Headers with no value for ANY row the current view loaded (all
@@ -8506,18 +8521,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         rows = getattr(model, '_all_rows', None) if model is not None else None
         if not rows:
             return set()
+        # Tracked per batch as rows arrive (FileTableModel.append_rows_batch):
+        # rescanning all 830k rows here took 0.6-0.9 s of frozen window at
+        # the end of a root tick.
+        no_data_cols = getattr(model, '_no_data_cols', None)
+        if no_data_cols is not None:
+            return {model._headers[i] for i in no_data_cols}
         no_data = self._NO_DATA_VALUES
         cells = [r[0] for r in rows]
-        empty = set()
-        for i, h in enumerate(model._headers):
-            if h == 'Name':
-                continue
-            # Same test as all(str(c[i]) in no_data ...), stopping at the
-            # first real value, but looped in C: on 830k rows the generator
-            # form took 0.6 s of frozen window at the end of a root tick.
-            if no_data.issuperset(map(str, map(itemgetter(i), cells))):
-                empty.add(h)
-        return empty
+        return {h for i, h in enumerate(model._headers)
+                if h != 'Name'
+                and no_data.issuperset(map(str, map(itemgetter(i), cells)))}
 
     # ── Column ordering & per-folder layouts (persisted) ──────────────────────
 
@@ -10457,10 +10471,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # without this, this action could leave orphaned _checked_files
         # entries now redundant with (tick) or inconsistent with
         # (untick) the branch's own new _checked_folders membership.
-        for d in descendants:
-            for child in self.folder_map.get(d, []):
-                if child not in self.folder_map:
-                    self._checked_files.discard(child)
+        # Skipped when no file is ticked on its own (nothing to discard):
+        # for the root this loop visited all 830k IOS17 entries, ~0.25 s.
+        if self._checked_files:
+            for d in descendants:
+                for child in self.folder_map.get(d, []):
+                    if child not in self.folder_map:
+                        self._checked_files.discard(child)
         if not checked:
             # Demote a still-fully-checked ANCESTOR of path too, if any
             # — added 2026-10-02, same reasoning as
@@ -15247,10 +15264,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _try_collapse_full_ancestors for the actual bubble-up check."""
         descendants = self._descendant_folders(path)
         self._checked_folders.update(descendants)
-        for d in descendants:
-            for child in self.folder_map.get(d, []):
-                if child not in self.folder_map:
-                    self._checked_files.discard(child)
+        # Skipped when no file is ticked on its own (nothing to discard):
+        # for the root this loop visited all 830k IOS17 entries, ~0.25 s.
+        if self._checked_files:
+            for d in descendants:
+                for child in self.folder_map.get(d, []):
+                    if child not in self.folder_map:
+                        self._checked_files.discard(child)
         self._try_collapse_full_ancestors(path)
 
     def _try_collapse_full_ancestors(self, path: str) -> None:
@@ -15315,10 +15335,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         touched by this specific removal."""
         descendants = self._descendant_folders(path)
         self._checked_folders.difference_update(descendants)
-        for d in descendants:
-            for child in self.folder_map.get(d, []):
-                if child not in self.folder_map:
-                    self._checked_files.discard(child)
+        # Skipped when no file is ticked on its own (nothing to discard):
+        # for the root this loop visited all 830k IOS17 entries, ~0.25 s.
+        if self._checked_files:
+            for d in descendants:
+                for child in self.folder_map.get(d, []):
+                    if child not in self.folder_map:
+                        self._checked_files.discard(child)
         self._exclude_from_full_ancestor(path)
 
     def _exclude_from_full_ancestor(self, target_path: str) -> None:
@@ -16767,6 +16790,18 @@ if __name__ == "__main__":
     # the worker target instead of opening another GUI window).
     import multiprocessing
     multiprocessing.freeze_support()
+    if sys.platform == "win32":
+        # GIL hand-over: every SQLite call, file read or frozen-build import
+        # on the GUI thread releases the GIL, and while a background thread
+        # runs Python (case open: the zip index build, snapshot unpack,
+        # search index) the GUI thread waits a whole switch interval to get
+        # it back. On Windows CPython waits in whole milliseconds and the
+        # timer rounds the default 5 ms up to ~15 ms; below 1 ms it asks at
+        # once. Measured: 10 case-DB opens on the GUI thread beside one busy
+        # thread took 4.2 s at 5 ms (and at 1 ms), 0.03 s at 0.5 ms; in the
+        # v0.50.15 exe this was a 3.3 s freeze in on_metadata_ready. Cost:
+        # two CPU-bound Python threads together ran ~15% slower.
+        sys.setswitchinterval(0.0005)
     if sys.platform == "darwin":
         # Dev runs from the bare interpreter inherit Python.app's bundle, so the
         # Dock and menu bar say "Python". Patch the in-memory bundle info before

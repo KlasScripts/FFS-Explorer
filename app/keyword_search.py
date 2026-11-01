@@ -156,7 +156,11 @@ class SearchIndexWorker(QThread):
     Emits entries_ready once the list is available so the mixin can cache it
     before the first search is ever started.
     """
-    entries_ready = Signal(list)   # list of (name, data_offset, file_size)
+    # `object`, not `list`: PySide6 turns a `list` argument into a
+    # QVariantList, deep-copying ~830k tuples on emit and back on the GUI
+    # thread (same trap as ZipMetadataWorker.metadata_ready). run() returns
+    # right after emitting, so handing over the list itself is safe.
+    entries_ready = Signal(object)   # list of (name, data_offset, file_size)
 
     def __init__(self, zip_path: str,
                  case_dir: str | None = None, delta: int | None = None,
@@ -194,8 +198,19 @@ class SearchIndexWorker(QThread):
                 raw = load_blob(db, 'search_entries', _SEARCH_ENTRIES_VERSION)
             if raw is None:
                 return None
-            rows = msgpack.unpackb(raw, raw=False)
-            return [tuple(r) for r in rows] if rows else None
+            # One entry at a time rather than msgpack.unpackb(raw): a single
+            # unpackb call holds the GIL until it returns, and on IOS17 this
+            # blob is 90 MB, so the GUI thread froze for the whole unpack at
+            # every case open. Same list, with the GIL yielded every 20k rows.
+            unp = msgpack.Unpacker(raw=False, max_buffer_size=0)
+            unp.feed(raw)
+            del raw
+            rows = []
+            for i in range(unp.read_array_header()):
+                rows.append(tuple(next(unp)))
+                if i % 20000 == 19999:
+                    time.sleep(0)
+            return rows or None
         except Exception:
             return None
 

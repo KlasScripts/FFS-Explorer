@@ -16260,6 +16260,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                         past_landmark.add(cur_path)
                 if skip_rest:
                     continue
+                if scope_path == '':
+                    # The root itself is ticked: show its real top-level
+                    # folders under "Selected Only", each loading on expand
+                    # like the full tree. A placeholder here would hang off
+                    # the "Selected Only" header itself, whose UserRole is
+                    # _SELECTED_ROOT_MARKER, not a folder, so expanding it
+                    # found no children: the branch showed one blank row.
+                    full_expand.add('')
+                    pending_root_job = self._tree_pending_jobs.get('')
+                    self._populate_tree_children_batched(root, '', synchronous=True)
+                    if pending_root_job is not None:
+                        # The full tree's own '' job, if one was mid-flight.
+                        self._tree_pending_jobs.setdefault('', pending_root_job)
+                    # Known to the selection restore below, and left
+                    # collapsed (they load on expand, like the full tree).
+                    for _r in range(root.rowCount()):
+                        _top = root.child(_r)
+                        _top_path = _top.data(Qt.ItemDataRole.UserRole)
+                        if _top_path:
+                            created[_top_path] = _top
+                            full_expand.add(_top_path)
+                    continue
                 leaf_item = created.get(scope_path)
                 if leaf_item is not None and self.folder_map.get(scope_path):
                     placeholder = QStandardItem()

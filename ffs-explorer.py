@@ -11,6 +11,7 @@ if __name__ == '__main__' and '--multiprocessing-fork' not in sys.argv:
     startup_log.step('loading modules')
 import re
 import io
+import gc
 import time
 import atexit
 import zipfile
@@ -1540,6 +1541,41 @@ def _meta_col_keys_for(data: dict) -> tuple:
     before metadata_ready instead of the GUI thread (see _ui_extras)."""
     return tuple(k for k in _META_COL_HEADERS
                  if any(v.get(k) for v in data.values() if v))
+
+
+def _count_selected_files(checked_folders, checked_files, folder_map: dict,
+                          is_folder) -> int:
+    """How many distinct real files a tick selection resolves to: every
+    file at any depth under each ticked folder, plus each ticked file.
+    Reads folder_map only through .get() (no dict iteration), so it can
+    run on _BG_POOL with copies of the two tick sets — see
+    FastZipBrowser._refresh_selected_files_panel_label."""
+    seen: set[str] = set()
+    # Only folders with no ticked folder above them: every other ticked
+    # folder lies inside one of these, so its files are already found.
+    # Walking all of them counted each file once per ticked folder above
+    # it — a 16 s frozen window after ticking the root of IOS17
+    # (179,351 folders, 830,298 entries).
+    for folder in checked_folders:
+        p = folder
+        while p:
+            p = p.rsplit('/', 1)[0] if '/' in p else ''
+            if p in checked_folders:
+                break
+        else:
+            visited = {folder}
+            stack = [folder]
+            while stack:
+                for child in folder_map.get(stack.pop(), []):
+                    if child in visited:
+                        continue
+                    visited.add(child)
+                    if is_folder(child):
+                        stack.append(child)
+                    else:
+                        seen.add(child)
+    seen.update(checked_files)
+    return len(seen)
 
 
 def _android_user_data_for(folder_map: dict) -> str:
@@ -8471,11 +8507,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not rows:
             return set()
         no_data = self._NO_DATA_VALUES
+        cells = [r[0] for r in rows]
         empty = set()
         for i, h in enumerate(model._headers):
             if h == 'Name':
                 continue
-            if all(str(r[0][i]) in no_data for r in rows):
+            # Same test as all(str(c[i]) in no_data ...), stopping at the
+            # first real value, but looped in C: on 830k rows the generator
+            # form took 0.6 s of frozen window at the end of a root tick.
+            if no_data.issuperset(map(str, map(itemgetter(i), cells))):
                 empty.add(h)
         return empty
 
@@ -11453,6 +11493,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if case_dir is None:
             return   # user cancelled the dialog
         self._shutdown_mcp_server("archive changed")
+        # Hand the previous case's objects back to the garbage collector
+        # (frozen in on_metadata_ready) so whatever it still held can be freed.
+        gc.unfreeze()
         self._case_dir = case_dir
         self._photo_index = {}        # rebuilt in on_metadata_ready
         self._media_exif = {}         # rebuilt in _start_case_meta_load
@@ -11759,6 +11802,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # anything slow here is a beach ball.  Load them on the background
         # pool and repaint when they land.
         self._start_case_meta_load()
+        # The case's metadata (830k dicts on IOS17) lives for the whole
+        # session; every full garbage-collection pass rescanned all of it.
+        # Building the File Browser rows after ticking the root set off
+        # passes that froze the window ~0.5 s each in the frozen exe.
+        # gc.freeze() moves everything alive now out of those scans;
+        # reference counting still frees it, and start_loading unfreezes.
+        gc.freeze()
         # Start background precomputation of folder counts if not already cached.
         if len(self._file_count_cache) < len(self.folder_map):
             QTimer.singleShot(300, self._start_precompute_folder_counts)
@@ -11853,6 +11903,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._duplicate_files = duplicates
             self._recompute_duplicate_groups()
             self._attachment_links = links
+            gc.freeze()   # these live all session too — see on_metadata_ready
             (self._handset_zone_name, self._acquisition_zone_name,
              self._manual_zone_name,
              self._timestamp_display_mode, is_first_load) = tz
@@ -13707,25 +13758,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         itself — that method's own shallow, direct-children aggregate
         VIEW (which still shows a subfolder as a single row, matching
         ordinary folder browsing) is unchanged; only this COUNT needed
-        fixing, not the listing it's displayed alongside."""
-        seen: set[str] = set()
-        # Only folders with no ticked folder above them: every other ticked
-        # folder lies inside one of these, so its files are already found.
-        # Walking all of them counted each file once per ticked folder above
-        # it — a 16 s frozen window after ticking the root of IOS17
-        # (179,351 folders, 830,298 entries).
-        checked = self._checked_folders
-        for folder in checked:
-            p = folder
-            while p:
-                p = p.rsplit('/', 1)[0] if '/' in p else ''
-                if p in checked:
-                    break
-            else:
-                seen.update(self._collect_files_recursive(folder))
-        for path in self._checked_files:
-            seen.add(path)
-        return len(seen)
+        fixing, not the listing it's displayed alongside.
+
+        Synchronous; the "Selected Files" label itself is counted on
+        _BG_POOL instead (_refresh_selected_files_panel_label)."""
+        return _count_selected_files(self._checked_folders, self._checked_files,
+                                     self.folder_map, self._is_folder_path)
 
     def _reset_not_relevant_marks(self) -> None:
         """"Reset" — added 2026-10-03, see the button's own construction
@@ -13784,7 +13822,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # shows the aggregate (see _on_bookmark_item_clicked) — there is
         # nothing to warn about switching TO it, since it can never
         # discard anything (it already IS whatever's currently ticked).
-        n_selected = self._current_selection_item_count()
         sel_item = QListWidgetItem()
         sel_item.setData(Qt.ItemDataRole.UserRole, _SELECTED_FILES_SENTINEL)
         sel_item.setToolTip(
@@ -13822,7 +13859,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         row_layout.addWidget(self._selected_files_deselect_btn, 0)
         self._bookmark_list.setItemWidget(sel_item, row_widget)
         sel_item.setSizeHint(row_widget.sizeHint())
-        self._update_selected_files_row_display(n_selected)
+        self._refresh_selected_files_panel_label()   # counted off the GUI thread
         # "User Media" — a SECOND live, synthetic entry, right below
         # "Selected Files" and above every real saved group — moved
         # here 2026-10-03 from a Media Browser status-row button (see
@@ -15646,8 +15683,47 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _refresh_file_checked_paths (the one shared choke point every
         tick already funnels through) rather than a full
         _refresh_bookmark_panel DB round-trip, which would be pure
-        waste just to update one label's text."""
-        self._update_selected_files_row_display(self._current_selection_item_count())
+        waste just to update one label's text.
+
+        Counted on _BG_POOL when any folder is ticked: after "Recursively
+        Add All Files" on IOS17's root this count walked all 830k entries
+        on the GUI thread (1.6 s of frozen window in the frozen exe). The
+        label reads "counting…" until the result lands; a newer refresh
+        supersedes an older one still running."""
+        self._selection_count_seq = getattr(self, '_selection_count_seq', 0) + 1
+        my_seq = self._selection_count_seq
+        if not self._checked_folders:
+            self._update_selected_files_row_display(len(self._checked_files))
+            return
+        folder_map = self.folder_map
+        zip_names = self.zip_names
+        resolve = self._adapter.resolve
+
+        def _is_folder(p):   # _is_folder_path / _is_empty_folder_entry, inlined
+            return p in folder_map or (resolve(p) + "/") in zip_names
+
+        fut = _BG_POOL.submit(_count_selected_files, set(self._checked_folders),
+                              set(self._checked_files), folder_map, _is_folder)
+        btn = getattr(self, '_selected_files_btn', None)
+        if btn is not None:
+            btn.setText("Selected Files  (counting…)")
+        deselect_btn = getattr(self, '_selected_files_deselect_btn', None)
+        if deselect_btn is not None:
+            deselect_btn.setEnabled(True)   # a folder is ticked
+
+        def _poll():
+            if my_seq != self._selection_count_seq:
+                return   # superseded by a newer tick
+            if not fut.done():
+                QTimer.singleShot(20, _poll)
+                return
+            try:
+                n = fut.result()
+            except Exception:
+                n = self._current_selection_item_count()   # e.g. tree changed mid-walk
+            self._update_selected_files_row_display(n)
+
+        QTimer.singleShot(5, _poll)
 
     def _update_selected_files_row_display(self, n_selected: int) -> None:
         """The one place that renders the 'Selected Files' row's own

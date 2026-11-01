@@ -1662,12 +1662,21 @@ class MediaViewerMixin:
         # thumbnails) isn't user-created content — left out of User Media by
         # owner decision, 2026-10-22; still visible inside each record.
         cache_children = getattr(self, '_cache_media_children', frozenset())
+        # _is_user_media_path's own test, checked FIRST and in C (one set
+        # lookup + one startswith(tuple)): most entries sit outside these
+        # folders, so the costlier media check now runs only on the rest.
+        # Same list either way; on IOS17 this scan was ~1.2 s of the
+        # reopen's GUI-thread time (the bookmark panel's User Media count).
+        norm = [p.rstrip('/') for p in prefixes]
+        exact = frozenset(norm)
+        starts = tuple(p + '/' for p in norm)
+        folder_map = self.folder_map
         return sorted(
             p for p in self.full_metadata
-            if p not in self.folder_map
+            if (p in exact or p.startswith(starts))
+            and p not in folder_map
             and p not in cache_children
             and self._is_media_file(p)
-            and self._is_user_media_path(p, prefixes)
         )
 
     def _user_media_paths(self) -> list[str]:

@@ -144,6 +144,11 @@ FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface r
 # where the zip-reopen alone could occupy a slot for a long time.
 _BG_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='ffs-bg')
 
+# Worker processes for the embedded-media sweep (EmbeddedMediaScanWorker):
+# one CPU left for the GUI. Measured on IOS17's six largest databases
+# (4 CPUs): 16.0 s on one thread, 8.8 s on 4 processes.
+_EMBEDDED_MEDIA_PROCESSES = max(1, min(8, (os.cpu_count() or 2) - 1))
+
 
 def _build_cached_zip_view(zip_path: str, case_dir: str) -> "CachedZipView | None":
     """Build self._zip_handle's value off the GUI thread — see
@@ -1304,15 +1309,121 @@ def _count_header_candidates(ui_metadata: dict, ffs_adapter, tier: int = 1) -> i
     )
 
 
-def _header_scan_staleness(case_dir: str | None, ui_metadata: dict,
-                           ffs_adapter) -> tuple[int, bool, int, int] | None:
-    """Returns (complete_tier, is_stale, current_candidate_count,
-    gap_count) for whatever header-scan tier this case's own
-    case_settings claims is COMPLETE — None if no case is open, or tier
-    is 0 (nothing recorded, nothing to verify). gap_count is how many
-    MORE candidates exist now than were recorded as scanned (0 when not
-    stale; equals current_candidate_count itself for a legacy case with
-    no stored count at all, i.e. "treat the whole thing as unverified").
+def _copy_metadata(ui_metadata: dict) -> dict:
+    """A copy of ui_metadata made off the GUI thread, which may add
+    unpacked files to it meanwhile: retried if it changed mid-copy."""
+    for _ in range(5):
+        try:
+            return dict(ui_metadata)
+        except RuntimeError:     # "dictionary changed size during iteration"
+            time.sleep(0.01)
+    return dict(ui_metadata)
+
+
+def _header_tier_counts(items, ffs_adapter, z, with_tier3: bool = False) -> dict | None:
+    """How many files each header-scan tier reads, in one pass:
+    {'files': {1: n, 2: n[, 3: n]}, 'legacy': {1: n, 2: n, 3: n}}.
+
+    files[3] only *with_tier3*: it needs a zip lookup for every entry (on
+    IOS17 2.9 s against 0.75 s for tiers 1-2, and the GUI thread's Python
+    ran ~3.7x slower beside it), and Tier 3 is rarely used, so it is
+    counted only when picked or when the case already completed it.
+
+    'files' is exactly what HeaderScanWorker reads: a key whose physical
+    name is a file in the main zip (z.getinfo, the same lookup
+    _resolve_file_candidates does). Folders, metadata-only entries and
+    files unpacked from nested archives are left out; the last are typed
+    when unpacked (ASSUMPTIONS.md A-30). 'legacy' is what
+    _count_header_candidates gives (every matching key, folders included),
+    the meaning header_scan_candidate_count was stored with before
+    2026-11-01, so an older case can still be checked against it.
+
+    *items* is a list of (ui_path, meta); the caller copies it so the GUI
+    can keep changing ui_metadata. Built once per case on a background
+    thread (FastZipBrowser._start_header_tier_count): on IOS17 the dialog
+    used to count on the GUI thread at every open, 0.3 s idle but 4.5 s
+    with one busy Python thread alongside (GIL). The loop pauses every
+    2,000 entries so the GUI thread gets the GIL. None if *z* is None."""
+    if z is None:
+        return None
+    scan_folders = tuple(ffs_adapter.scan_folders())
+    excludes = tuple(ffs_adapter.scan_excludes())
+    resolve, getinfo = ffs_adapter.resolve, z.getinfo
+    files = {1: 0, 2: 0, 3: 0} if with_tier3 else {1: 0, 2: 0}
+    legacy = {1: 0, 2: 0, 3: len(items)}
+    for n, (ui_path, _meta) in enumerate(items):
+        if n % 2000 == 0:
+            time.sleep(0)
+        in_scope = _header_candidate_matches(ui_path, scan_folders, 2, excludes)
+        if not in_scope and not with_tier3:
+            continue
+        unknown = in_scope and _header_candidate_matches(ui_path, scan_folders, 1, excludes)
+        legacy[2] += in_scope
+        legacy[1] += unknown
+        try:
+            info = getinfo(resolve(ui_path))
+        except KeyError:
+            continue
+        if info.is_dir():
+            continue
+        if with_tier3:
+            files[3] += 1
+        files[2] += in_scope
+        files[1] += unknown
+    return {'files': files, 'legacy': legacy}
+
+
+def _save_header_scan_count(db, tier: int, tier_counts: dict | None,
+                            ui_metadata: dict, ffs_adapter) -> None:
+    """Store how many files *tier* covered, at the moment its scan finished
+    (see _header_scan_staleness). 'header_scan_file_count' is the files
+    count; 'header_scan_candidate_count' keeps its old meaning so an older
+    version opening this case still reads a comparable number. Without the
+    background counts yet, only the old key is written, counted here the
+    old way; the next load upgrades it (_upgrade_header_scan_count)."""
+    if tier_counts is not None and tier in tier_counts['files']:
+        save_case_setting(db, 'header_scan_file_count', str(tier_counts['files'][tier]))
+        save_case_setting(db, 'header_scan_candidate_count', str(tier_counts['legacy'][tier]))
+        return
+    save_case_setting(db, 'header_scan_candidate_count',
+                      str(_count_header_candidates(ui_metadata, ffs_adapter, tier=tier)))
+
+
+def _upgrade_header_scan_count(case_dir: str | None, tier_counts: dict | None) -> None:
+    """A case scanned before 2026-11-01 has only the old count. When that
+    old count shows no gap, store the files count alongside it, so later
+    checks use files. A case with a gap keeps the old count (and its
+    warning) until the tier is re-run, which stores both."""
+    if not case_dir or tier_counts is None:
+        return
+    try:
+        with closing(_open_results_db(case_dir)) as db:
+            if load_case_setting(db, 'header_scan_file_count', ''):
+                return
+            staleness = _header_scan_staleness(case_dir, tier_counts)
+            if staleness is None or staleness[1]:
+                return
+            save_case_setting(db, 'header_scan_file_count',
+                              str(tier_counts['files'][staleness[0]]))
+    except Exception:
+        pass
+
+
+def _header_scan_staleness(case_dir: str | None,
+                           tier_counts: dict | None) -> tuple[int, bool, int, int] | None:
+    """Returns (complete_tier, is_stale, current_file_count, gap_count)
+    for whatever header-scan tier this case's own case_settings claims is
+    COMPLETE — None if no case is open, the tier is 0 (nothing recorded,
+    nothing to verify), or *tier_counts* (_header_tier_counts) aren't
+    ready yet. gap_count is how many MORE candidates exist now than were
+    recorded as scanned (0 when not stale; equals the current file count
+    for a legacy case with no stored count at all, i.e. "treat the whole
+    thing as unverified").
+
+    Compared in files ('header_scan_file_count') when the case has that;
+    otherwise in the old unit ('header_scan_candidate_count', folders
+    included), so a gap in an older case is still caught. In the old unit
+    the gap can include folders.
 
     Added 2026-10-10, direct report: a real case's 'header_scan_
     complete_tier' claimed Tier 1 while 38,141 of its real candidates —
@@ -1330,23 +1441,31 @@ def _header_scan_staleness(case_dir: str | None, ui_metadata: dict,
     which is exactly the real case this was built for: there is no way
     to retroactively prove an old completion claim was ever accurate,
     so it isn't trusted by default."""
-    if not case_dir:
+    if not case_dir or tier_counts is None:
         return None
     try:
         with closing(_open_results_db(case_dir)) as db:
             complete_tier = int(load_case_setting(db, 'header_scan_complete_tier', '0'))
-            stored_raw = load_case_setting(db, 'header_scan_candidate_count', '')
+            files_raw = load_case_setting(db, 'header_scan_file_count', '')
+            legacy_raw = load_case_setting(db, 'header_scan_candidate_count', '')
     except Exception:
         return None
-    if complete_tier <= 0:
-        return None
-    current_count = _count_header_candidates(ui_metadata, ffs_adapter, tier=complete_tier)
+    if complete_tier not in tier_counts['files']:
+        return None   # tier 0, or Tier 3 not counted yet
+    files_now = tier_counts['files'][complete_tier]
     try:
-        stored_count = int(stored_raw)
+        stored_files = int(files_raw)
     except (TypeError, ValueError):
-        return (complete_tier, True, current_count, current_count)
-    gap = max(0, current_count - stored_count)
-    return (complete_tier, gap > 0, current_count, gap)
+        stored_files = None
+    if stored_files is not None:
+        gap = max(0, files_now - stored_files)
+        return (complete_tier, gap > 0, files_now, gap)
+    try:
+        stored_legacy = int(legacy_raw)
+    except (TypeError, ValueError):
+        return (complete_tier, True, files_now, files_now)
+    gap = max(0, tier_counts['legacy'][complete_tier] - stored_legacy)
+    return (complete_tier, gap > 0, files_now, gap)
 
 
 def _classify_header_scan_results(results: dict) -> tuple[int, int]:
@@ -4529,18 +4648,88 @@ class EmbeddedMediaScanWorker(QThread):
         self._guid_to_bundle  = guid_to_bundle or {}
         self._folder_map      = folder_map
 
-    def _read_bytes(self, z, ui_path: str) -> bytes | None:
+    def _build_jobs(self, z, candidates: list, scan_dir: str, scan_scope: str) -> list:
+        """embedded_media_scan.scan_job tuples, largest file first (so the
+        big databases don't end up running alone at the end). Each names
+        where its bytes are; the worker process reads them itself."""
+        needed = []
+        for kind, ui_path in candidates:
+            needed.append(ui_path)
+            if kind == 'sqlite':
+                needed.append(ui_path + '-wal')
+            elif kind == 'cache' and ui_path.endswith('_s'):
+                needed.append(ui_path[:-2] + '_0')   # its Content-Type is there
+        in_zip = {p: (off, size) for p, off, size in _resolve_file_candidates(
+            self._zip_path, needed, self._adapter, z=z, delta=self._delta)}
+
+        def source(ui_path):
+            loc = in_zip.get(ui_path)
+            if loc is not None:
+                return ('zip', self._zip_path, loc[0], loc[1])
+            # Not in the main zip: a file unpacked from a nested archive
+            # (including a database's -wal unpacked alongside it).
+            nested = self._unpacked.get(ui_path)
+            if nested is not None:
+                return ('nested', nested[0], nested[1])
+            return None
+
+        jobs = []
+        for kind, ui_path in candidates:
+            wal = source(ui_path + '-wal') if kind == 'sqlite' else None
+            partner = (source(ui_path[:-2] + '_0')
+                       if kind == 'cache' and ui_path.endswith('_s') else None)
+            jobs.append((kind, ui_path, scan_dir, scan_scope, source(ui_path), wal, partner))
+        jobs.sort(key=lambda j: -(self._ui_metadata.get(j[1], {}).get('size') or 0))
+        return jobs
+
+    def _run_jobs(self, jobs: list):
+        """Yield (ui_path, rows | None) as jobs finish, from a pool of
+        _EMBEDDED_MEDIA_PROCESSES worker processes (see
+        embedded_media_scan.scan_job for why processes, not threads). On
+        cancel, queued jobs are dropped and running ones stopped. Runs the
+        jobs one at a time on this thread if a pool can't be started."""
+        import embedded_media_scan as ems
+        pool = None
+        if _EMBEDDED_MEDIA_PROCESSES > 1 and len(jobs) > 1:
+            try:
+                import multiprocessing as mp
+                from concurrent.futures import ProcessPoolExecutor
+                pool = ProcessPoolExecutor(_EMBEDDED_MEDIA_PROCESSES,
+                                           mp_context=mp.get_context('spawn'))
+            except Exception as exc:
+                startup_log.message('WARNING', f'embedded media: no process pool ({exc}); '
+                                    'scanning on one thread')
+                pool = None
+        if pool is None:
+            for job in jobs:
+                if self.isInterruptionRequested():
+                    return
+                yield ems.scan_job(job)
+            return
+        from concurrent.futures import as_completed
+        cancelled = False
         try:
-            physical = self._adapter.resolve(ui_path)
-            return z.open(physical).read()
-        except Exception:
-            pass
-        # Not in the main zip: a file unpacked from a nested archive
-        # (including a database's -wal unpacked alongside it).
-        loc = self._unpacked.get(ui_path)
-        if loc is not None:
-            return read_nested_entry(loc[0], loc[1])
-        return None
+            futures = {pool.submit(ems.scan_job, job): job for job in jobs}
+            for fut in as_completed(futures):
+                if self.isInterruptionRequested():
+                    cancelled = True
+                    break
+                try:
+                    yield fut.result()
+                except Exception as exc:
+                    # e.g. a worker process died: not recorded, retried next run
+                    startup_log.message('WARNING', f'embedded media: {futures[fut][1]} '
+                                        f'not scanned ({exc})')
+                    yield futures[fut][1], None
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+            if cancelled:
+                procs = getattr(pool, '_processes', None) or {}
+                for proc in list(procs.values()):
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
 
     def run(self):
         import embedded_media_scan as ems
@@ -4582,8 +4771,8 @@ class EmbeddedMediaScanWorker(QThread):
             plist_paths = [p for p in plist_paths if not skip_check(p)]
             before_cache = len(cache_paths)
             cache_paths = [p for p in cache_paths if not skip_check(p)]
-            n_skip_listed += before_cache - len(cache_paths)
-            n_skip_listed = before - (len(sqlite_paths) + len(plist_paths))
+            n_skip_listed = (before - (len(sqlite_paths) + len(plist_paths))
+                             + before_cache - len(cache_paths))
 
         current_version = ems.scan_logic_version()
         already_scanned: set[str] = set()
@@ -4604,69 +4793,72 @@ class EmbeddedMediaScanWorker(QThread):
 
         counts = {'live_pictures': 0, 'live_videos': 0,
                  'recovered_pictures': 0, 'recovered_videos': 0}
-        rows: list[dict] = []
-        registry_entries: list[tuple[str, str, int]] = []
         all_candidates = [('plist', p) for p in plist_paths if p not in already_scanned] + \
                         [('sqlite', p) for p in sqlite_paths if p not in already_scanned] + \
                         [('cache', p) for p in cache_paths if p not in already_scanned]
         total = len(all_candidates)
+        jobs = self._build_jobs(z, all_candidates, scan_dir, scan_scope)
+        self.progress.emit(0, total, '', 0, dict(counts))
 
-        for i, (kind, ui_path) in enumerate(all_candidates):
-            if self.isInterruptionRequested():
-                break
-            # Read straight from the archive's OWN already-cached metadata
-            # (self._ui_metadata) rather than from `raw` -- emitted BEFORE
-            # the actual read/scan starts, so the size is what tells the
-            # examiner "this one's just big" while the slow part is still
-            # running, not only after it finishes. Direct request,
-            # 2026-09-23: "when you are looking for embedded media file it
-            # can take a while can you include the size so the user knows
-            # why it is taking a while to process."
-            file_size = self._ui_metadata.get(ui_path, {}).get('size', 0)
-            self.progress.emit(i, total, ui_path, file_size, dict(counts))
-            raw = self._read_bytes(z, ui_path)
-            if raw is None:
-                # A transient read failure (not "genuinely nothing here")
-                # -- deliberately NOT recorded in the registry, so it's
-                # retried next run rather than permanently skipped.
-                continue
+        n_hits = 0
+        pending_rows: list[dict] = []
+        pending_registry: list[tuple[str, str, int]] = []
+        last_save = time.monotonic()
 
-            wal_bytes = self._read_bytes(z, ui_path + '-wal') if kind == 'sqlite' else None
-            # A sparse cache file's Content-Type is in its '_0' record.
-            partner = (self._read_bytes(z, ui_path[:-2] + '_0')
-                       if kind == 'cache' and ui_path.endswith('_s') else None)
-            new_rows = ems.scan_container(kind, ui_path, raw, scan_dir, scan_scope,
-                                          wal_bytes=wal_bytes, partner_bytes=partner)
-            rows.extend(new_rows)
-            registry_entries.append((ui_path, current_version, len(new_rows)))
-            for hit_row in new_rows:
-                bucket = ('recovered' if hit_row['recovered'] else 'live') + '_' + \
-                        ('pictures' if hit_row['media_kind'] == 'image' else 'videos')
-                counts[bucket] += 1
+        def _save():
+            # Hits before the registry: after a crash between the two, the
+            # file is just scanned again (hits are INSERT OR IGNORE).
+            if not self._case_dir:
+                return
+            if pending_rows:
+                try:
+                    with closing(_open_results_db(self._case_dir)) as db:
+                        save_embedded_media_hits(db, pending_rows)
+                        sources = [(r['source_ui_path'], r.get('source_url'),
+                                    r.get('content_type_hint'))
+                                   for r in pending_rows if r.get('source_kind') == 'cache']
+                        if sources:
+                            save_cache_record_sources(db, sources)
+                except Exception:
+                    pass
+            if pending_registry:
+                try:
+                    with closing(_open_cache_db(self._case_dir)) as db:
+                        save_processing_registry_entries(
+                            db, 'embedded_media_scan', pending_registry)
+                except Exception:
+                    pass
+            pending_rows.clear()
+            pending_registry.clear()
+
+        done = 0
+        for ui_path, new_rows in self._run_jobs(jobs):
+            done += 1
+            if new_rows is not None:
+                # None = the file couldn't be read: not recorded, so the
+                # next run retries it rather than skipping it for good.
+                pending_rows.extend(new_rows)
+                pending_registry.append((ui_path, current_version, len(new_rows)))
+                n_hits += len(new_rows)
+                for hit_row in new_rows:
+                    bucket = ('recovered' if hit_row['recovered'] else 'live') + '_' + \
+                            ('pictures' if hit_row['media_kind'] == 'image' else 'videos')
+                    counts[bucket] += 1
+            # The size tells the examiner "this one's just big" (direct
+            # request, 2026-09-23). With several processes this names the
+            # file just finished, not one still running.
+            self.progress.emit(done, total, ui_path,
+                               self._ui_metadata.get(ui_path, {}).get('size', 0), dict(counts))
+            # Saved as it goes, so a crash or kill keeps what is done.
+            if len(pending_registry) >= 200 or time.monotonic() - last_save > 15:
+                _save()
+                last_save = time.monotonic()
+        _save()
 
         self.progress.emit(total, total, '', 0, dict(counts))
 
-        if rows and self._case_dir:
-            try:
-                with closing(_open_results_db(self._case_dir)) as db:
-                    save_embedded_media_hits(db, rows)
-                    sources = [(r['source_ui_path'], r.get('source_url'), r.get('content_type_hint'))
-                               for r in rows if r.get('source_kind') == 'cache']
-                    if sources:
-                        save_cache_record_sources(db, sources)
-            except Exception:
-                pass
-
-        if registry_entries and self._case_dir:
-            try:
-                with closing(_open_cache_db(self._case_dir)) as db:
-                    save_processing_registry_entries(
-                        db, 'embedded_media_scan', registry_entries)
-            except Exception:
-                pass
-
         self.finished_scan.emit({
-            'total_files': total, 'total_hits': len(rows),
+            'total_files': total, 'total_hits': n_hits,
             'already_scanned': len(already_scanned),
             'skip_listed': n_skip_listed, **counts,
         })
@@ -4693,29 +4885,47 @@ class MediaMetadataScanWorker(QThread):
     FastZipBrowser._collect_local_media_metadata_candidates) — "for the
     zips and embe[d]ded," direct request, same session."""
     progress = Signal(int)   # remaining count (combined, both sources)
-    done     = Signal(dict)  # {ui_path: {field: value, ...}}
+    done     = Signal(dict)  # {ui_path: {field: value, ...}}, already saved
 
-    def __init__(self, zip_path, zip_candidates, local_candidates):
+    def __init__(self, zip_path, case_dir, ui_metadata, ffs_adapter,
+                 header_type_overrides, local_candidates, delta=None):
         super().__init__()
         self._zip_path = zip_path
-        self._zip_candidates = zip_candidates
+        self._case_dir = case_dir
+        self._ui_metadata = ui_metadata
+        self._adapter = ffs_adapter
+        self._overrides = header_type_overrides
         self._local_candidates = local_candidates
+        self._delta = delta
 
     def run(self):
-        total = len(self._zip_candidates) + len(self._local_candidates)
+        # Finding the candidates (a pass over every entry) and saving the
+        # results happen here, not on the GUI thread (2026-11-01).
+        infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
+        z = CachedZipView(self._zip_path, infos) if infos is not None else None
+        zip_candidates = _collect_media_metadata_candidates(
+            self._zip_path, _copy_metadata(self._ui_metadata), self._adapter,
+            self._overrides, z=z, delta=self._delta)
+        total = len(zip_candidates) + len(self._local_candidates)
         if total == 0:
             self.done.emit({})
             return
         self.progress.emit(total)
         n_local = len(self._local_candidates)
         results = media_metadata_scan.scan_zip_candidates(
-            self._zip_path, self._zip_candidates,
+            self._zip_path, zip_candidates,
             progress_cb=lambda remaining: self.progress.emit(remaining + n_local),
             cancel_check=self.isInterruptionRequested)
         results.update(media_metadata_scan.scan_local_candidates(
             self._local_candidates,
             progress_cb=lambda remaining: self.progress.emit(remaining),
             cancel_check=self.isInterruptionRequested))
+        if results and self._case_dir:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as cache_db:
+                    save_media_metadata(cache_db, results)
+            except Exception:
+                pass
         self.done.emit(results)
 
 
@@ -4740,20 +4950,66 @@ class DuplicateDetectionWorker(QThread):
     bother with the md5" (confirmed a 97% reduction in actual file reads
     on a real archive)."""
     progress = Signal(int, int)    # done, total (total = real candidates only, after the free size+CRC32 filter AND the inode shortcut)
-    done     = Signal(dict, bool)  # {ui_path: {'md5':, 'size':, 'group_size':}}, complete
+    collected = Signal(int)        # number of files considered, once found
+    skipped  = Signal(str)         # reason the stage could not run at all
+    done     = Signal(dict, bool)  # {ui_path: {'md5':, 'size':, 'group_size':}} (already saved), complete
 
-    def __init__(self, zip_path, candidates, inode_trusted):
+    def __init__(self, zip_path, case_dir, ui_metadata, ffs_adapter, run_type):
         super().__init__()
         self._zip_path = zip_path
-        self._candidates = candidates
-        self._inode_trusted = inode_trusted
+        self._case_dir = case_dir
+        self._ui_metadata = ui_metadata
+        self._adapter = ffs_adapter
+        self._run_type = run_type
 
     def run(self):
+        # Candidates (on IOS17 a 2.7 s pass over every entry, plus reading
+        # the archive index), the save and the run log all happen here,
+        # not on the GUI thread (2026-11-01). The run log is started now,
+        # so it records how long the stage took.
+        infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
+        if infos is None:
+            # No raw-zipfile fallback on the main archive (Conventions):
+            # honestly skipped instead.
+            self.skipped.emit("local archive cache not available")
+            return
+        run_id = None
+        try:
+            with closing(_open_results_db(self._case_dir)) as results_db:
+                run_id = start_run_log(results_db, self._run_type)
+        except Exception:
+            pass
+        z = CachedZipView(self._zip_path, infos)
+        candidates = _collect_duplicate_candidates(self._adapter, _copy_metadata(self._ui_metadata), z)
+        # Files unpacked from nested archives join the same grouping (A-74).
+        candidates += nested_archive.unpacked_duplicate_candidates(self._case_dir)
+        self.collected.emit(len(candidates))
         results = duplicate_scan.find_duplicate_groups(
-            self._zip_path, self._candidates, inode_trusted=self._inode_trusted,
+            self._zip_path, candidates, inode_trusted=self._adapter.inode_trusted,
             progress_cb=lambda done, total: self.progress.emit(done, total),
             cancel_check=self.isInterruptionRequested)
-        self.done.emit(results, not self.isInterruptionRequested())
+        complete = not self.isInterruptionRequested()
+        n_groups = len({v['md5'] for v in results.values()})
+        try:
+            with closing(_open_cache_db(self._case_dir)) as cache_db:
+                save_duplicate_files(cache_db, results)
+        except Exception:
+            pass
+        try:
+            with closing(_open_results_db(self._case_dir)) as results_db:
+                if run_id is None:
+                    run_id = start_run_log(results_db, self._run_type)
+                results_db.execute('UPDATE run_log SET total=?, notes=? WHERE id=?',
+                                   (len(results), f"{n_groups} group(s)", run_id))
+                complete_run_log(results_db, run_id,
+                                 processed=len(results), output_rows=len(results))
+                if not complete:
+                    results_db.execute(
+                        'UPDATE run_log SET complete=0 WHERE id=?', (run_id,))
+                    results_db.commit()
+        except Exception:
+            pass
+        self.done.emit(results, complete)
 
 
 class SingleFileEmbeddedMediaWorker(QThread):
@@ -5528,10 +5784,10 @@ class ProcessDialog(QDialog):
     header_types_cleared   = Signal()   # emitted before a rescan so the main window can reset
     nested_extraction_done = Signal()   # emitted after NestedArchiveWorker finishes
     embedded_media_scan_done = Signal()   # emitted after EmbeddedMediaScanWorker finishes
-    media_metadata_scan_done = Signal()   # emitted after MediaMetadataScanWorker finishes
+    media_metadata_scan_done = Signal(dict)   # MediaMetadataScanWorker's saved results
     leveldb_indexing_started = Signal()   # emitted right before the LevelDB indexing stage starts
     leveldb_indexing_done    = Signal()   # emitted once it finishes (or is skipped as "nothing to do")
-    duplicate_detection_done = Signal()   # emitted after DuplicateDetectionWorker finishes
+    duplicate_detection_done = Signal(dict)   # DuplicateDetectionWorker's saved results
 
     _RUN_TYPE           = 'header_scan'
     _RUN_TYPE_INTEGRITY = 'integrity_check'
@@ -5544,8 +5800,14 @@ class ProcessDialog(QDialog):
                  is_android=False, guid_to_bundle=None, folder_map=None,
                  local_media_metadata_candidates_fn=None,
                  leveldb_coverage_fn=None, leveldb_index_fn=None,
-                 parent=None):
+                 tier_counts=None, request_tier3_count_fn=None, parent=None):
         super().__init__(parent)
+        # _header_tier_counts' result, built once per case in the background
+        # by the main window; None until it arrives (set_tier_counts). Never
+        # counted here: counting at open was the pause before this dialog
+        # appeared. Tier 3 is counted only on request (picking it).
+        self._tier_counts = tier_counts
+        self._request_tier3_count_fn = request_tier3_count_fn
         # Both callables only — FastZipBrowser owns the real engine
         # (_leveldb_search_coverage/_index_leveldb_folders_batched)
         # since the indexing pass deliberately shares the GUI's own zip
@@ -6030,7 +6292,10 @@ class ProcessDialog(QDialog):
 
         lines = []
         if self._selected_upgrade_tier > 0:
-            lines.append(f"<b>Files this upgrade will scan:</b> {self._candidate_count:,}")
+            if self._candidate_count is None:
+                lines.append("<b>Files this upgrade will scan:</b> counting…")
+            else:
+                lines.append(f"<b>Files this upgrade will scan:</b> {self._candidate_count:,}")
 
         if last is None:
             lines.append("No previous header scan recorded.")
@@ -6212,7 +6477,7 @@ class ProcessDialog(QDialog):
         self._current_tier_stale = False
         self._current_tier_gap_count = 0
         if self._current_tier > 0:
-            staleness = _header_scan_staleness(self._case_dir, self._ui_metadata, self._adapter)
+            staleness = _header_scan_staleness(self._case_dir, self._tier_counts)
             if staleness is not None:
                 _, self._current_tier_stale, _cur, self._current_tier_gap_count = staleness
         self._selected_upgrade_tier = 0
@@ -6347,8 +6612,36 @@ class ProcessDialog(QDialog):
         # list was tried and explicitly walked back per direct feedback:
         # the two tiers should behave the same way Tier 1 already did,
         # not gain an extra widget Tier 1 never had.
-        self._candidate_count = _count_header_candidates(
-            self._ui_metadata, self._adapter, tier=tier_id)
+        self._candidate_count = self._tier_file_count(tier_id)
+        if self._candidate_count is None and tier_id == 3 and self._request_tier3_count_fn:
+            self._request_tier3_count_fn()   # arrives through set_tier_counts
+        self._refresh_stats()
+
+    def _tier_file_count(self, tier: int) -> int | None:
+        """Files *tier* will read, or None while the background count runs
+        (or, for Tier 3, until it is asked for)."""
+        if self._tier_counts is None:
+            return None
+        return self._tier_counts['files'].get(tier)
+
+    def set_tier_counts(self, tier_counts: dict) -> None:
+        """The main window's background count arrived while this dialog was
+        open. Mid-run only the number is kept (rebuilding the radios would
+        reset the tier the run is using); otherwise the radios are rebuilt,
+        since the stale warning depends on it, and the examiner's choice is
+        put back."""
+        self._tier_counts = tier_counts
+        if not self._run_btn.isEnabled():
+            return
+        chosen = self._checked_tier_radio_id
+        self._rebuild_tier_upgrade_ui()
+        rb = self._tier_radios.get(chosen)
+        if rb is not None and rb.isEnabled() and not rb.isChecked():
+            self._tier_building_default = True   # no Tier 3 confirm: already confirmed
+            try:
+                rb.setChecked(True)
+            finally:
+                self._tier_building_default = False
         self._refresh_stats()
 
     def _on_embedded_media_toggled(self, checked: bool):
@@ -6587,13 +6880,14 @@ class ProcessDialog(QDialog):
             try:
                 with closing(_open_results_db(self._case_dir)) as results_db:
                     self._run_id = start_run_log(results_db, self._RUN_TYPE,
-                                                 total=self._candidate_count)
+                                                 total=self._candidate_count or 0)
             except Exception:
                 pass
 
         self._status_label.setText("Starting header scan…")
-        self._candidate_count = _count_header_candidates(
-            self._ui_metadata, self._adapter, tier=self._pending_upgrade_tier)
+        # None if the background count hasn't arrived: the worker's first
+        # progress signal (its full candidate count) fills it in.
+        self._candidate_count = self._tier_file_count(self._pending_upgrade_tier)
         self._scan_worker = HeaderScanWorker(
             self._zip_path, self._ui_metadata,
             self._adapter,
@@ -6606,6 +6900,8 @@ class ProcessDialog(QDialog):
         self._scan_worker.start()
 
     def _on_header_progress(self, remaining: int):
+        if self._candidate_count is None:
+            self._candidate_count = remaining   # first signal: the full count
         self._status_label.setText(
             f"Scanning headers: {remaining:,} files remaining…"
             if remaining > 0 else "Finishing header scan…"
@@ -6613,7 +6909,7 @@ class ProcessDialog(QDialog):
 
     def _on_header_done(self, results: dict):
         n_found   = len(results)
-        n_total   = self._candidate_count
+        n_total   = self._candidate_count or 0
         cancelled = self._scan_cancelled
 
         if self._case_dir:
@@ -6650,9 +6946,9 @@ class ProcessDialog(QDialog):
                                           str(self._pending_upgrade_tier))
                         # See _header_scan_staleness's own docstring for
                         # why this snapshot is stored at all.
-                        count = _count_header_candidates(
-                            self._ui_metadata, self._adapter, tier=self._pending_upgrade_tier)
-                        save_case_setting(results_db, 'header_scan_candidate_count', str(count))
+                        _save_header_scan_count(
+                            results_db, self._pending_upgrade_tier, self._tier_counts,
+                            self._ui_metadata, self._adapter)
             except Exception:
                 pass
 
@@ -7038,22 +7334,15 @@ class ProcessDialog(QDialog):
         self._continue_after_embedded_media()
 
     def _start_media_metadata_scan(self):
-        infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
-        z = CachedZipView(self._zip_path, infos) if infos is not None else None
-        zip_candidates = _collect_media_metadata_candidates(
-            self._zip_path, self._ui_metadata, self._adapter,
-            self._header_type_overrides_snapshot(), z=z, delta=self._delta)
+        # Only the cheap part here: the nested/embedded files' locations
+        # (no bytes read). The main-archive candidates are found, and
+        # everything read, on the worker.
         local_candidates = (self._local_media_metadata_candidates_fn()
                             if self._local_media_metadata_candidates_fn else [])
-        total = len(zip_candidates) + len(local_candidates)
-        if total == 0:
-            self._status_label.setText(
-                "Media metadata: no Picture/Graphic/Video files found to scan.")
-            self._continue_after_media_metadata()
-            return
-        self._status_label.setText(f"Media metadata: scanning {total:,} file(s)…")
+        self._status_label.setText("Media metadata: finding Picture/Graphic/Video files…")
         self._media_metadata_worker = MediaMetadataScanWorker(
-            self._zip_path, zip_candidates, local_candidates)
+            self._zip_path, self._case_dir, self._ui_metadata, self._adapter,
+            self._header_type_overrides_snapshot(), local_candidates, delta=self._delta)
         self._media_metadata_worker.progress.connect(self._on_media_metadata_progress)
         self._media_metadata_worker.done.connect(self._on_media_metadata_done)
         self._media_metadata_worker.start()
@@ -7064,17 +7353,11 @@ class ProcessDialog(QDialog):
             if remaining > 0 else "Finishing media metadata scan…")
 
     def _on_media_metadata_done(self, results: dict):
-        if self._case_dir:
-            try:
-                with closing(_open_cache_db(self._case_dir)) as cache_db:
-                    if results:
-                        save_media_metadata(cache_db, results)
-            except Exception:
-                pass
+        # Already saved by the worker.
         self._status_label.setText(
             f"Media metadata scan done — {len(results):,} file(s) yielded "
             "EXIF/video metadata.")
-        self.media_metadata_scan_done.emit()
+        self.media_metadata_scan_done.emit(results)
         self._continue_after_media_metadata()
 
     def _continue_after_media_metadata(self):
@@ -7088,32 +7371,27 @@ class ProcessDialog(QDialog):
             self._finish_operations()
 
     def _start_dedup_scan(self):
-        # Deliberately no raw-zipfile fallback on the main archive when the
-        # local .zcd cache isn't available — same standing convention
-        # _resolve_file_candidates' own docstring documents: honestly skip
-        # rather than open the main archive directly.
-        infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
-        if infos is None:
-            self._status_label.setText(
-                "Duplicate detection: local archive cache not available — skipped.")
+        # Candidates, save and run log are all on the worker (see
+        # DuplicateDetectionWorker.run), including the "no .zcd cache:
+        # honestly skip" check.
+        if not self._case_dir:
+            self._status_label.setText("Duplicate detection: no case folder — skipped.")
             self._finish_operations()
             return
-        z = CachedZipView(self._zip_path, infos)
-        candidates = _collect_duplicate_candidates(self._adapter, self._ui_metadata, z)
-        # Files unpacked from nested archives join the same grouping (A-74).
-        candidates += nested_archive.unpacked_duplicate_candidates(self._case_dir)
-        if not candidates:
-            self._status_label.setText("Duplicate detection: no files found to check.")
-            self._finish_operations()
-            return
-        self._status_label.setText(
-            f"Duplicate detection: checking {len(candidates):,} file(s) "
-            "for size+CRC32 matches…")
+        self._status_label.setText("Duplicate detection: listing files…")
         self._dedup_worker = DuplicateDetectionWorker(
-            self._zip_path, candidates, self._adapter.inode_trusted)
+            self._zip_path, self._case_dir, self._ui_metadata, self._adapter,
+            self._RUN_TYPE_DEDUP)
+        self._dedup_worker.collected.connect(lambda n: self._status_label.setText(
+            f"Duplicate detection: checking {n:,} file(s) for size+CRC32 matches…"))
+        self._dedup_worker.skipped.connect(self._on_dedup_skipped)
         self._dedup_worker.progress.connect(self._on_dedup_progress)
         self._dedup_worker.done.connect(self._on_dedup_done)
         self._dedup_worker.start()
+
+    def _on_dedup_skipped(self, reason: str):
+        self._status_label.setText(f"Duplicate detection: {reason} — skipped.")
+        self._finish_operations()
 
     def _on_dedup_progress(self, done: int, total: int):
         if total == 0:
@@ -7125,26 +7403,8 @@ class ProcessDialog(QDialog):
                 "candidate file(s)…")
 
     def _on_dedup_done(self, results: dict, complete: bool):
+        # Saved and logged by the worker.
         n_groups = len({v['md5'] for v in results.values()})
-        if self._case_dir:
-            try:
-                with closing(_open_cache_db(self._case_dir)) as cache_db:
-                    save_duplicate_files(cache_db, results)
-            except Exception:
-                pass
-            try:
-                with closing(_open_results_db(self._case_dir)) as results_db:
-                    run_id = start_run_log(
-                        results_db, self._RUN_TYPE_DEDUP, total=len(results),
-                        notes=f"{n_groups} group(s)")
-                    complete_run_log(results_db, run_id,
-                                     processed=len(results), output_rows=len(results))
-                    if not complete:
-                        results_db.execute(
-                            'UPDATE run_log SET complete=0 WHERE id=?', (run_id,))
-                        results_db.commit()
-            except Exception:
-                pass
         if not complete:
             self._status_label.setText(
                 f"Duplicate detection cancelled — {len(results):,} file(s) "
@@ -7153,7 +7413,7 @@ class ProcessDialog(QDialog):
             self._status_label.setText(
                 f"Duplicate detection done — {len(results):,} file(s) in "
                 f"{n_groups:,} group(s) confirmed byte-identical.")
-        self.duplicate_detection_done.emit()
+        self.duplicate_detection_done.emit(results)
         self._finish_operations()
 
     def _finish_operations(self):
@@ -7669,6 +7929,10 @@ def _disambiguated_names(container_hits: list, base_of) -> list[str]:
 
 
 class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, SqliteViewerMixin, SegbViewerMixin, LevelDbViewerMixin, TimestampDisplayMixin):  # type: ignore[reportIncompatibleMethodOverride]
+    # _header_tier_counts' result for the open case, once the background
+    # count finishes (an open Process Case dialog listens for it).
+    header_tier_counts_ready = Signal(object)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FFS Explorer")
@@ -7677,6 +7941,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         self.zip_path = ""
         self.full_metadata = {}
+        self._header_tier_counts: dict | None = None   # see _start_header_tier_count
+        self._header_tier_count_seq = 0
         self.folder_map = {}
         self.guid_to_bundle = {}
         self.zip_names: frozenset = frozenset()
@@ -11433,8 +11699,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             local_media_metadata_candidates_fn=self._collect_local_media_metadata_candidates,
             leveldb_coverage_fn=self._leveldb_search_coverage,
             leveldb_index_fn=self._index_leveldb_folders_batched,
+            tier_counts=self._header_tier_counts,
+            request_tier3_count_fn=self._request_header_tier3_count,
             parent=self,
         )
+        self.header_tier_counts_ready.connect(dlg.set_tier_counts)
         dlg.header_types_cleared.connect(self._on_header_types_cleared)
         dlg.header_scan_done.connect(self._on_header_scan_done)
         # ProcessDialog persists the new tier itself (it already owns the
@@ -11456,6 +11725,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         dlg.leveldb_indexing_done.connect(
             lambda: self.center_tabs.setTabEnabled(self._SEARCH_TAB_INDEX, True))
         dlg.exec()
+        try:
+            self.header_tier_counts_ready.disconnect(dlg.set_tier_counts)
+        except (RuntimeError, TypeError):
+            pass
         # A cancelled/never-run indexing stage must not leave the tab
         # permanently stuck disabled if the dialog closes any other way
         # (e.g. the window's own close button rather than the Cancel
@@ -11865,6 +12138,72 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if actionable:
                 self._warn_and_select_missing(actionable)
 
+    def _start_header_tier_count(self, with_tier3: bool | None = None):
+        """Count each header-scan tier's files once per case, on the
+        background pool (_header_tier_counts), for the Process Case dialog
+        and the stale-tier banner. Neither counts on the GUI thread any more:
+        the dialog's count at open was the pause before it appeared.
+
+        *with_tier3* None (case load): Tier 3 is counted only if the case
+        already completed it (its stale check needs it); True: asked for by
+        the dialog (_request_header_tier3_count), keeping the counts it has
+        until the new ones land."""
+        if with_tier3 is None:
+            self._header_tier_counts = None
+        self._header_tier_count_seq += 1
+        my_seq = self._header_tier_count_seq
+        ui_metadata, adapter = self.full_metadata, self._adapter
+        zip_path, case_dir = self.zip_path, self._case_dir
+
+        def _count():
+            tier3 = with_tier3
+            if tier3 is None:
+                tier3 = False
+                if case_dir:
+                    try:
+                        with closing(_open_results_db(case_dir)) as db:
+                            tier3 = load_case_setting(db, 'header_scan_complete_tier', '0') == '3'
+                    except Exception:
+                        pass
+            # Copied here, not on the GUI thread (see _copy_metadata).
+            items = list(_copy_metadata(ui_metadata).items())
+            infos = _cd_cache_load(zip_path, case_dir) if case_dir else None
+            z = CachedZipView(zip_path, infos) if infos is not None else None
+            return _header_tier_counts(items, adapter, z, with_tier3=tier3)
+
+        fut = _BG_POOL.submit(_count)
+
+        def _poll():
+            if my_seq != self._header_tier_count_seq:
+                return   # a newer load or Tier 3 request superseded this one
+            if not fut.done():
+                QTimer.singleShot(50, _poll)
+                return
+            try:
+                counts = fut.result()
+            except Exception:
+                counts = None
+            if counts is None:
+                return
+            self._header_tier_counts = counts
+            _upgrade_header_scan_count(self._case_dir, counts)
+            self._refresh_header_scan_indicator()
+            self.header_tier_counts_ready.emit(counts)
+
+        QTimer.singleShot(50, _poll)
+
+    def _request_header_tier3_count(self):
+        """Process Case asks for the Tier 3 count when Tier 3 is picked
+        (not counted at load, see _header_tier_counts). Ignored if it is
+        already counted or being counted."""
+        counts = self._header_tier_counts
+        if counts is not None and 3 in counts['files']:
+            return
+        if getattr(self, '_tier3_count_seq', None) == self._header_tier_count_seq:
+            return   # the running count already includes Tier 3
+        self._start_header_tier_count(with_tier3=True)
+        self._tier3_count_seq = self._header_tier_count_seq
+
     def _start_case_meta_load(self):
         """Load the heavy per-case DB extras after metadata_ready — header-
         type overrides and the photo index — on the background pool, apply
@@ -11873,6 +12212,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         case_dir = self._case_dir
         if not case_dir:
             return
+        self._start_header_tier_count()
         rules    = self._photo_flag_rules
         zip_path = self.zip_path
         adapter  = self._adapter
@@ -12266,8 +12606,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     # own docstring for why this is stored at all (without
                     # it, a later genuine growth in the candidate set is
                     # indistinguishable from "this was always fully covered").
-                    count = _count_header_candidates(self.full_metadata, self._adapter, tier=tier)
-                    save_case_setting(db, 'header_scan_candidate_count', str(count))
+                    _save_header_scan_count(db, tier, self._header_tier_counts,
+                                            self.full_metadata, self._adapter)
             except Exception:
                 pass
             self._refresh_header_scan_indicator()
@@ -12339,9 +12679,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # was built from). Never checked while a scan is already known
         # to be in progress — that's a separate, already-handled state,
         # and the candidate count would be a moving target anyway.
+        # Until the background count lands (_start_header_tier_count, which
+        # calls this again) the stale check is skipped, not guessed.
         stale = False
         if not in_progress:
-            staleness = _header_scan_staleness(self._case_dir, self.full_metadata, self._adapter)
+            staleness = _header_scan_staleness(self._case_dir, self._header_tier_counts)
             if staleness is not None:
                 _, stale, _current_count, gap_count = staleness
                 if stale:
@@ -12673,30 +13015,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 entry_path = meta.get('_display_name')
                 if not rec or not entry_path:
                     continue
-                data = read_nested_entry(rec['stored_path'], entry_path)
-                if data is None:
-                    continue
-                out.append((ui_path, data, ext))
+                # Where the bytes are, not the bytes: the worker reads each
+                # one when it gets to it (this runs on the GUI thread, and
+                # used to read every nested picture/video into memory first).
+                out.append((ui_path, ('nested', rec['stored_path'], entry_path), ext))
                 continue
             source_local = meta.get('_embedded_media_source')
             if source_local is not None:
                 out.append((ui_path, source_local, ext))
         return out
 
-    def _on_media_metadata_scan_done(self) -> None:
+    def _on_media_metadata_scan_done(self, results: dict) -> None:
         """Runs when ProcessDialog's media-metadata scan finishes (see
         MediaMetadataScanWorker/ProcessDialog.media_metadata_scan_done)
-        — reloads the saved results and refreshes the current view so
-        the new "(EXIF)" columns appear immediately, same "reload then
-        repaint" shape _on_photo_index_changed already uses for the
-        analogous Photos-metadata case."""
-        self._media_exif = {}
-        if self._case_dir:
-            try:
-                with closing(_open_cache_db(self._case_dir)) as db:
-                    self._media_exif = load_media_metadata(db)
-            except Exception:
-                pass
+        and refreshes the current view so the new "(EXIF)" columns appear
+        immediately. *results* is what the worker just saved; merged in,
+        not re-read from casecache.db on the GUI thread. Same as a re-read:
+        the save is INSERT OR REPLACE per file, so the table holds the old
+        rows with exactly these files' rows replaced."""
+        self._media_exif = {**self._media_exif, **results}
         self._refresh_current_file_view(preserve_filter=True)
 
     def _on_attachment_links_changed(self) -> None:
@@ -12719,19 +13056,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 pass
         self._refresh_current_file_view(preserve_filter=True)
 
-    def _on_duplicate_detection_done(self) -> None:
+    def _on_duplicate_detection_done(self, results: dict) -> None:
         """Runs when ProcessDialog's duplicate_detection_done fires (see
-        ProcessDialog._on_dedup_done) — reloads the File Browser's
-        "Duplicate Count"/"MD5" column data from casecache.db and
-        refreshes the current view, same "reload then repaint" shape
-        _on_attachment_links_changed above already uses."""
-        self._duplicate_files = {}
-        if self._case_dir:
-            try:
-                with closing(_open_cache_db(self._case_dir)) as db:
-                    self._duplicate_files = load_duplicate_files(db)
-            except Exception:
-                pass
+        ProcessDialog._on_dedup_done) with the results the worker just
+        saved — the whole table, since save_duplicate_files replaces it —
+        so nothing is re-read from casecache.db on the GUI thread; then
+        refreshes the File Browser's "Duplicate Count"/"MD5" columns."""
+        self._duplicate_files = results
         self._recompute_duplicate_groups()
         self._refresh_current_file_view(preserve_filter=True)
         self._refresh_bookmark_panel()   # "User Media (N · M to review)"

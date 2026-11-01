@@ -52,7 +52,8 @@ path mapping* (Cellebrite vs GrayKey, iOS vs Android) lives in
 `app/adapters/`; other code branches on `ffs_adapter.format` where behaviour
 genuinely differs, but raw format sniffing belongs only in the adapters. Long
 work runs in `QThread` workers; first-open metadata parsing runs in a
-separate **process** (`ffs_metadata.py`) since it is CPU-bound.
+separate **process** (`ffs_metadata.py`) and the embedded-media sweep in a
+**process pool** (`embedded_media_scan.scan_job`), since both are CPU-bound.
 
 ## Data flow (opening an archive)
 

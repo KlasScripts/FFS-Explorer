@@ -95,6 +95,8 @@ def test_same_size_and_crc_but_different_sha256_are_not_duplicates(monkeypatch):
 
 def test_group_with_a_member_lacking_a_hash_uses_md5(monkeypatch):
     class FakeEntry:
+        is_stored = False   # whole read, not duplicate_scan's chunked path
+
         def __init__(self, zip_path, phys, info):
             self.data = {'a': b'dup', 'b': b'dup'}[phys]
 
@@ -107,6 +109,8 @@ def test_group_with_a_member_lacking_a_hash_uses_md5(monkeypatch):
 
 def test_five_tuple_candidates_still_accepted(monkeypatch):
     class FakeEntry:
+        is_stored = False   # whole read, not duplicate_scan's chunked path
+
         def __init__(self, zip_path, phys, info):
             pass
 

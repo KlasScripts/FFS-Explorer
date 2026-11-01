@@ -357,13 +357,14 @@ def scan_local_candidates(
         plain local file, itself already a true lazy/seekable OS-level
         stream, same "only read what's needed" reasoning as
         _LazyZipSlice, just a different, already-cheap source.
-      - raw bytes (bytes) — a nested-archive entry, which lives inside
-        a REPACKAGED zip (zip_reader.read_nested_entry's own target,
-        not a plain extracted file) so the caller (ffs-explorer.py,
-        which already knows that repackaging layout) reads it first and
-        hands over the bytes directly rather than this Qt-free module
-        needing to know about nested_archives' own on-disk shape too."""
+      - ('nested', stored_path, entry_path) — a nested-archive entry,
+        which lives inside a REPACKAGED zip; read here, on the pool
+        thread, with zip_reader.read_nested_entry (since 2026-11-01: the
+        caller used to read every one into memory on the GUI thread
+        first and pass the bytes).
+      - raw bytes (bytes) — still accepted."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from zip_reader import read_nested_entry
     results: dict = {}
     total = len(candidates)
     if total == 0:
@@ -372,6 +373,10 @@ def scan_local_candidates(
     def _scan_one(item):
         ui_path, source, ext = item
         try:
+            if isinstance(source, tuple):
+                source = read_nested_entry(source[1], source[2])
+                if source is None:
+                    return ui_path, {}
             if isinstance(source, bytes):
                 return ui_path, extract_one(io.BytesIO(source), ext)
             with open(source, 'rb') as f:

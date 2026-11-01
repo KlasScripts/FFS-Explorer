@@ -34,8 +34,36 @@ schema is unchanged, so casecache.db isn't rebuilt — and the File
 Browser's own "MD5" column shows only real 32-char MD5 values."""
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from zip_entry import ZipEntry
+from zip_reader import THREAD_WORKERS
+
+# Files are hashed in chunks of this size, never read whole: a duplicated
+# multi-GB video would otherwise be held in memory in one piece, once per
+# thread.
+_CHUNK = 4 * 1024 * 1024
+
+
+def _md5_hex(zip_path, phys, zinfo, reader) -> str | None:
+    """MD5 of one file, or None if it can't be read in full (then it is
+    never reported as a duplicate). *reader* is set for a file unpacked
+    from a nested archive (see find_duplicate_groups)."""
+    if reader is not None:
+        data = reader()
+        return None if data is None else hashlib.md5(data).hexdigest()
+    entry = ZipEntry(zip_path, phys, zinfo)
+    if not entry.is_stored:
+        return hashlib.md5(entry.read()).hexdigest()
+    h = hashlib.md5()
+    pos, size = 0, entry.file_size
+    while pos < size:
+        chunk = entry.read_at(pos, min(_CHUNK, size - pos))
+        if not chunk:
+            return None      # archive shorter than its directory says
+        h.update(chunk)
+        pos += len(chunk)
+    return h.hexdigest()
 
 
 def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
@@ -131,21 +159,19 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
     if total == 0:
         return results
 
-    done = 0
-    for units in grouped_units:
+    # Hashed on THREAD_WORKERS threads: hashlib and file reads release the
+    # GIL, so they do run in parallel (IOS17, warm cache: 8 threads about
+    # 2x one). A group is added to the results only once all its units
+    # are hashed, so a cancel still never returns a half-hashed group.
+    digests: list[list] = [[None] * len(units) for units in grouped_units]
+    remaining = [len(units) for units in grouped_units]
+
+    def _finish_group(g: int) -> None:
         by_md5: dict[str, list] = {}
-        for (ui_path, phys, zinfo, inode, devid, _sha, reader), member_paths in units:
-            if cancel_check and cancel_check():
-                return results
-            data = reader() if reader is not None else ZipEntry(zip_path, phys, zinfo).read()
-            done += 1
-            if progress_cb:
-                progress_cb(done, total)
-            if data is None:
+        for ((_p, _ph, zinfo, *_rest), member_paths), digest in zip(grouped_units[g], digests[g]):
+            if digest is None:
                 continue     # unreadable: can't confirm, so never reported as a duplicate
-            digest = hashlib.md5(data).hexdigest()
-            by_md5.setdefault(digest, []).extend(
-                (p, zinfo.file_size) for p in member_paths)
+            by_md5.setdefault(digest, []).extend((p, zinfo.file_size) for p in member_paths)
         for digest, members in by_md5.items():
             if len(members) < 2:
                 continue  # CRC32 collided but MD5 didn't — not a real duplicate
@@ -155,4 +181,28 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
                     'size': size,
                     'group_size': len(members),
                 }
+
+    def _hash(g: int, u: int):
+        (_ui, phys, zinfo, _inode, _devid, _sha, reader), _members = grouped_units[g][u]
+        try:
+            return g, u, _md5_hex(zip_path, phys, zinfo, reader)
+        except (OSError, ValueError, KeyError):
+            return g, u, None     # unreadable, as above
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as pool:
+        futures = [pool.submit(_hash, g, u)
+                   for g, units in enumerate(grouped_units) for u in range(len(units))]
+        for fut in as_completed(futures):
+            if cancel_check and cancel_check():
+                pool.shutdown(wait=False, cancel_futures=True)
+                return results
+            g, u, digest = fut.result()
+            digests[g][u] = digest
+            remaining[g] -= 1
+            if remaining[g] == 0:
+                _finish_group(g)
+            done += 1
+            if progress_cb and (done % 200 == 0 or done == total):
+                progress_cb(done, total)
     return results

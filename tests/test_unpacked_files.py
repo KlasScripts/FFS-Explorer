@@ -67,6 +67,8 @@ def test_unpacked_files_group_with_main_archive_files(tmp_path, monkeypatch):
     assert {c[0] for c in unp} == {'var/pkg.zip/photo.jpg', 'var/pkg.zip/other.bin', 'var/log.gz/log'}
 
     class MainEntry:            # a main-archive file with the same content
+        is_stored = False       # whole read, not duplicate_scan's chunked path
+
         def __init__(self, *a):
             pass
 

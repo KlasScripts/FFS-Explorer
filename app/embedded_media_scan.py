@@ -346,8 +346,13 @@ def extract_media_bytes(scan_dir: str, data: bytes, ext: str) -> tuple[str, str]
     os.makedirs(sub, exist_ok=True)
     path = os.path.join(sub, digest + ext)
     if not os.path.isfile(path):
-        with open(path, 'wb') as f:
+        # Written under a temporary name, then renamed: the sweep runs in
+        # several processes (scan_job), which can find the same image at
+        # once, and a reader must never see a half-written file.
+        tmp = f'{path}.{os.getpid()}.tmp'
+        with open(tmp, 'wb') as f:
             f.write(data)
+        os.replace(tmp, path)
     return digest, path
 
 
@@ -805,6 +810,59 @@ def _build_hit_row(ui_path: str, source_kind: str, location: str,
         'content_type_hint': headers.get('content-type'),
         'scan_scope': scan_scope,
     }
+
+
+# ── one candidate per worker process (EmbeddedMediaScanWorker) ─────────
+#
+# The sweep is Python work on bytes already in memory (on IOS17's six
+# largest databases: reading 0.3 s, scanning 16 s), so threads don't help
+# (GIL: 8 threads 17.7 s against 16.0 s for one) but processes do (4
+# processes 8.8 s, start-up included). Each job names where its bytes are
+# and the worker process reads them itself, so nothing large crosses
+# between processes.
+
+_proc_handles: dict = {}
+
+
+def read_source(source) -> bytes | None:
+    """Bytes for one source: ('zip', zip_path, data_offset, size) for a
+    stored entry of the main archive (direct seek; FFS archives are never
+    compressed), ('nested', stored_path, entry_path) for a file unpacked
+    from a nested archive (zip_reader.read_nested_entry). None if absent
+    or unreadable. A process keeps one handle per archive."""
+    if source is None:
+        return None
+    try:
+        if source[0] == 'zip':
+            _, path, offset, size = source
+            fh = _proc_handles.get(path)
+            if fh is None or fh.closed:
+                fh = _proc_handles[path] = open(path, 'rb')
+            fh.seek(offset)
+            data = fh.read(size)
+            return data if len(data) == size else None
+        if source[0] == 'nested':
+            from zip_reader import read_nested_entry
+            return read_nested_entry(source[1], source[2])
+    except OSError:
+        return None
+    return None
+
+
+def scan_job(job: tuple) -> tuple[str, list | None]:
+    """Scan one candidate; the entry point for a worker process.
+
+    *job*: (kind, ui_path, scan_dir, scan_scope, main, wal, partner), each
+    of the last three a read_source() source or None. Returns (ui_path,
+    rows); rows is None when the file itself couldn't be read, so the
+    caller doesn't record it as done and the next run retries it."""
+    kind, ui_path, scan_dir, scan_scope, main, wal, partner = job
+    raw = read_source(main)
+    if raw is None:
+        return ui_path, None
+    return ui_path, scan_container(kind, ui_path, raw, scan_dir, scan_scope,
+                                   wal_bytes=read_source(wal),
+                                   partner_bytes=read_source(partner))
 
 
 def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,

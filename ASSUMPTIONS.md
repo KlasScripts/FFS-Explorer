@@ -572,6 +572,21 @@ one case claimed Tier 1 with 38,141+ candidates never scanned.*
   normal upgrade path.
 - Nested-archive and embedded-media files are unaffected: they are typed
   when extracted (1,281 real nested files checked, zero mismatches).
+- **What is counted (2026-11-01):** files the scan actually reads, i.e.
+  entries whose physical name is a file in the main zip
+  (`header_scan_file_count`). Folders, metadata-only entries and unpacked
+  nested files are left out. The old count included them: on IOS17 Tier 1
+  showed 71,520 but the scan read 42,332 (29,188 were folders); Tier 3
+  showed 830,291 against 318,860. The new counts equal the scan's own
+  candidate list on all three tiers (checked on IOS17).
+- **Older cases:** the old count (`header_scan_candidate_count`, folders
+  included) is still written and still checked in its own unit. When it
+  shows no gap, the files count is stored alongside on load; a case with a
+  gap keeps the old warning until the tier is re-run.
+- **Counted in the background, once per case** (Tier 3 only when picked or
+  already completed): counting at every Process Case open was the pause
+  before the dialog appeared (IOS17, the app's 0.5 ms switch interval:
+  0.3 s idle, up to 1.3 s beside busy threads; now 0.03 s).
 
 **A-31. PNG and GIF are type "Graphic"; TIFF and RAW are "Picture".**
 *Decision, 2026-10-11.*
@@ -1233,6 +1248,30 @@ Tools menu when AI access was off once hid every other Tools action too.
     identical built-in defaults.
   - Missing the scan-rules files once shipped an exe with nothing in scope
     for the header scan or User Media. Dev runs can't catch this.
+
+**A-81. Processes for Python work, threads for reading and hashing.**
+*Confirmed (real), IOS17 (4 CPUs), 2026-11-01.*
+- **The embedded-media sweep runs in worker processes**
+  (`embedded_media_scan.scan_job`, CPUs − 1, largest file first). Its time
+  is Python work on bytes already in memory (six largest databases:
+  reading 0.3 s, scanning 16 s), and Python runs one thread of that at a
+  time: 16.0 s on one thread, 17.7 s on 8 threads, 8.8 s on 4 processes.
+  Whole sweep 86.1 s → 32.9 s, every hit, done-marker and extracted file
+  identical. Each job names where its bytes are and the worker reads them
+  itself; nothing large crosses between processes. If a pool can't be
+  started, the sweep runs one file at a time and logs why.
+- **Duplicate hashing uses threads** (8): file reads and MD5 run in
+  parallel because both release the GIL. 124.8 s → 20.7 s, the same
+  170,324 results. Files are hashed in 4 MB chunks, never read whole.
+- **Any Python on the GUI thread slows sharply beside a busy thread**,
+  even with the 0.5 ms switch interval set at startup (the Process Case
+  dialog: 0.3 s alone, 1.3 s beside two busy threads). So work done when a
+  stage starts or ends (finding candidates, saving results) belongs on the
+  worker, and a result the worker already holds is passed to the window,
+  not re-read from the case database.
+- **Not yet confirmed in a frozen build:** the pool starts its workers the
+  same way (`spawn`, `freeze_support`) as the first-open parse, which
+  works in the exe.
 
 ## 17. Corrections needed elsewhere
 

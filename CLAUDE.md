@@ -179,7 +179,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `device_timezone.py` | Best-effort handset/acquisition/system timezone detection. |
 | `keyword_search.py` | Search workers (main archive, nested archives, LevelDB index), `KeywordSearchMixin`, `SqlHitInterpretWorker`. |
 | `hex_viewer.py` | Hex tab; Record/Attachment toggle and record-source combo. |
-| `media_viewer.py` | Media Browser grid (`MediaFileListModel`/`MediaGridDelegate`), PyAV video decode, `MediaFullViewDialog`, `_load_qimage`, seen-tracking. |
+| `media_viewer.py` | Media Browser grid (`MediaFileListModel`/`MediaGridDelegate`), `MediaFullViewDialog`, seen-tracking. Decoding (A-64): `_load_qimage` (full size), `_image_thumbnail`/`_video_thumbnail` (thumbnails, made on `ThumbnailWorker`'s decode pool, cached in `casecache.db` `thumbnails`). Tests: `tests/test_media_decode.py`. |
 | `sqlite_viewer.py` | Database tab: live rows, WAL before/after, and recovered versions (WAL history, journal, carved), each labelled with how certain its table is. |
 | `epoch_guess.py` | Database tab: guesses which epoch format a number column holds (a quick look, not a parser). Qt-free. |
 | `epoch_store.py` | Database tab: which columns are times — the examiner's choices, then built-in `config/epoch_formats.json`, then the guess. Qt-free. |

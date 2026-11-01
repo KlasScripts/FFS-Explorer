@@ -1032,13 +1032,23 @@ decode against. *Decision.*
   varint tags and wire types) and labels them, rather than showing them as
   garbled text.
 
-**A-64. Images are decoded through one function, `_load_qimage`.**
+**A-64. Images are decoded in `media_viewer.py`: `_load_qimage` for the
+full-size view, `_image_thumbnail` / `_video_thumbnail` for thumbnails.**
 *Confirmed (real).*
-- It applies EXIF/TIFF orientation through `QImageReader.setAutoTransform`.
-- Qt has no native HEIC codec on Windows, so if Qt can't decode a HEIC/HEIF
-  file it falls back to `pillow_heif`.
-- Thumbnails and the full-size viewer both go through it, so they can't
-  disagree.
+- All of them apply orientation the same way: EXIF/TIFF through
+  `QImageReader.setAutoTransform`; HEIC/HEIF where Qt has no codec (Windows)
+  through `pillow_heif`, which already rotates while decoding, so nothing
+  rotates it again (`_heif_to_qimage`); video through the stream's display
+  rotation.
+- Thumbnails are made from the file's own pixels: the decoder is asked for a
+  reduced size (JPEG decodes at 1/2–1/8 scale), and a video is read only as
+  far as its first frame. Never from an embedded EXIF or HEIC preview, which
+  can still show the picture from before an edit.
+- Checked against iOS's own PhotoData thumbnails on IOS17: HEIC 139/139,
+  JPEG 116/116, video 14/14 the right way up.
+- Until v0.50.16, HEIC photos were rotated twice on Windows (73 of 137
+  sideways) and video rotation was ignored (3 of 14 sideways). Thumbnails
+  cached before the fix are deleted once per case (`_THUMB_CACHE_LOGIC`).
 
 ## 12. Artifact parsers and SQLite evidence
 

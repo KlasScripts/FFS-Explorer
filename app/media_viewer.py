@@ -5,11 +5,14 @@ import os
 import shutil
 import sqlite3
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import batched
 
 import av
 
 from contextlib import closing
+from media_metadata_scan import _LazyZipSlice
+from zip_entry import ZipEntry
 from db_utils import (_open_cache_db, _open_results_db, load_embedded_media_hits,
                       mark_media_seen, unmark_media_seen, load_seen_media_paths,
                       load_all_bookmarked_paths, load_bookmark_colors)
@@ -45,6 +48,7 @@ from PySide6.QtCore import (Qt, QThread, Signal, QBuffer, QIODevice,
 
 THUMB_SIZE         = 160   # thumbnail box size in pixels
 _THUMB_BATCH_COMMIT = 20   # inserts to accumulate before a single db.commit()
+_THUMB_DECODE_THREADS = 4  # ThumbnailWorker's decode pool (see its docstring)
 _MEDIA_PAGE_SIZE_DEFAULT = 500
 
 # Deliberately a small, LOCAL copy of ffs-explorer.py's own
@@ -101,64 +105,6 @@ def _media_hide_seen_pref() -> bool:
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
-def _video_frame_bytes(video_data: bytes) -> bytes | None:
-    """Extract a frame from video bytes via PyAV (in-process libavcodec/
-    libavformat bindings), returning PNG bytes or None.
-
-    Replaced the previous subprocess-`ffmpeg` implementation 2026-09-14 —
-    two independent real bugs were found and fixed by this switch, not
-    just a speed/packaging win:
-
-    1. The old implementation piped video bytes to ffmpeg via `pipe:0`
-       (stdin), which is NOT seekable. Many real MOV/MP4 files (camera-
-       original iPhone video, not web-optimized "faststart" files) store
-       their index (`moov` atom) at the END of the file — ffmpeg reading
-       from a pipe cannot jump there, and failed with "Invalid data found
-       when processing input" on 13/15 real videos sampled from this
-       project's own IOS17 JoshHickman test archive, including ordinary
-       H.264 content, not just an edge case. Confirmed directly: feeding
-       the SAME bytes to ffmpeg via a real seekable temp file fixed every
-       one of those failures. `av.open(io.BytesIO(...))` gives PyAV a
-       genuinely seekable in-memory stream, the same fix in effect,
-       without needing a temp file at all.
-    2. PyAV's own official PyPI wheel (its bundled/minimal FFmpeg build)
-       cannot decode HEVC — 6/6 real HEVC test videos (Apple's default
-       recording codec since iOS 11) demuxed every packet in the file
-       with zero frames ever decoded, no exception raised, via the
-       library's own documented high-level API. Confirmed via a real
-       system FFmpeg (Homebrew, `libavcodec 63.1.101`) that the SAME
-       files decode correctly — this is a real gap in PyAV's prebuilt
-       wheel, not a fundamental HEVC limitation. Fixed by building PyAV
-       from source, linked against a real FFmpeg with a working HEVC
-       decoder, instead of installing the prebuilt wheel — see
-       `requirements.txt` and `.github/workflows/build-windows-exe.yml`
-       for the build-time FFmpeg linkage this now requires. Re-verified
-       against all 6 previously-failing real HEVC files after the
-       from-source build: exact frame counts matched (176/901/470/
-       360/360/360), byte-for-byte what the container's own metadata
-       declared.
-
-    No external ffmpeg.exe to find or bundle separately anymore — the
-    FFmpeg libraries this now depends on are linked into the compiled
-    `av` extension module itself at build time."""
-    try:
-        container = av.open(io.BytesIO(video_data))
-        try:
-            if not container.streams.video:
-                return None
-            stream = container.streams.video[0]
-            for frame in container.decode(stream):
-                img = frame.to_image()   # PIL Image, RGB
-                buf = io.BytesIO()
-                img.save(buf, format='PNG')
-                return buf.getvalue()
-            return None
-        finally:
-            container.close()
-    except Exception:
-        return None
-
-
 _heif_opener_registered = False
 
 
@@ -180,23 +126,9 @@ def _load_qimage(data: bytes, ext: str = '') -> QImage | None:
     already failed — never attempted for a format Qt already handles, so
     this changes nothing for the common case on any platform.
 
-    A real, non-obvious bug was found and fixed before this shipped, not
-    assumed correct from the library's own name alone: pillow_heif reads
-    a HEIC file's real EXIF orientation tag internally, but resets the
-    STANDARD orientation tag (0x0112) it exposes back to 1 ("no rotation
-    needed"), storing the true value separately under
-    `img.info['original_orientation']` instead — so
-    `PIL.ImageOps.exif_transpose()` (which only ever reads the standard
-    tag) silently never rotates a real portrait photo, landing every
-    portrait-orientation HEIC sideways (width/height transposed). Found
-    and confirmed by cross-checking pillow_heif's raw decode against Qt's
-    own (correct, orientation-applying) macOS decode of the SAME 20 real
-    portrait HEIC photos from this project's own IOS17 JoshHickman
-    archive: 9/20 came out transposed before this fix, 0/20 after —
-    fixed by writing the real `original_orientation` value back into the
-    image's own exif data before calling exif_transpose, so that
-    well-tested standard library code does the actual rotation rather
-    than a hand-rolled transform table."""
+    Orientation for the pillow_heif route: see _heif_to_qimage (current
+    pillow_heif rotates while decoding; rotating again, as an earlier fix
+    here did, turned 73 of 137 IOS17 portrait HEIC photos sideways)."""
     # EXIF/TIFF orientation is applied automatically here — added
     # 2026-10-04, direct request: "look at the metadata and if there is
     # information about the orinta[t]ion[,] if it is portrait[,] can [we]
@@ -226,26 +158,113 @@ def _load_qimage(data: bytes, ext: str = '') -> QImage | None:
         return img
     if ext.lower() not in ('.heic', '.heif'):
         return None
+    return _heif_to_qimage(data)
+
+
+def _heif_to_qimage(data: bytes, max_side: int | None = None) -> QImage | None:
+    """Decode HEIC/HEIF bytes via pillow_heif (Windows has no HEIC codec for
+    Qt), right way up, optionally shrunk so its longer side is *max_side*.
+
+    pillow_heif (1.x, the version bundled since at least v0.50.13) already
+    applies the file's rotation while decoding — it returns a portrait photo
+    as 3024x4032 — and records the original value in
+    info['original_orientation'] only for reference. An earlier version of
+    _load_qimage wrote that value back and ran exif_transpose, rotating
+    every rotated photo a second time: 73 of 137 IOS17 HEIC photos showed
+    sideways on Windows (checked against iOS's own PhotoData thumbnails;
+    137/137 right without the second rotation). Pinned by
+    tests/test_media_decode.py with a synthetic Orientation=6 HEIC."""
     try:
         import pillow_heif
         global _heif_opener_registered
         if not _heif_opener_registered:
             pillow_heif.register_heif_opener()
             _heif_opener_registered = True
-        from PIL import Image, ImageOps
+        from PIL import Image
 
         pil_img = Image.open(io.BytesIO(data))
-        real_orientation = pil_img.info.get('original_orientation')
-        if real_orientation and real_orientation != 1:
-            exif = pil_img.getexif()
-            exif[0x0112] = real_orientation
-            pil_img = ImageOps.exif_transpose(pil_img)
+        if max_side and max(pil_img.size) > max_side:
+            pil_img.thumbnail((max_side, max_side))
         pil_img = pil_img.convert('RGB')
         qimg = QImage(pil_img.tobytes('raw', 'RGB'), pil_img.width, pil_img.height,
                       pil_img.width * 3, QImage.Format.Format_RGB888)
         return qimg.copy()   # detach from the Python bytes object's own lifetime
     except Exception:
         return None
+
+
+def _scale_thumb(img: QImage, size: int) -> QImage:
+    return img.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                      Qt.TransformationMode.SmoothTransformation)
+
+
+def _image_thumbnail(data: bytes, ext: str, size: int) -> QImage | None:
+    """A *size*-box thumbnail of an image, from its own pixels (never an
+    embedded EXIF/HEIC preview, which can be stale after an edit), with
+    the same orientation rule as _load_qimage (ASSUMPTIONS.md A-64).
+
+    The decoder is asked for at most 2x the box (QImageReader.setScaledSize;
+    libjpeg then decodes at 1/2-1/8 scale) and the result smooth-scaled to
+    the box: 26-58 ms instead of 161-186 ms for a 12 MP JPEG, same size and
+    orientation. HEIC on Windows takes the pillow_heif route (full decode,
+    then shrunk before the Qt conversion)."""
+    reader = QImageReader()
+    buf = QBuffer()
+    buf.setData(data)
+    buf.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader.setDevice(buf)
+    reader.setAutoTransform(True)
+    src = reader.size()
+    if src.isValid() and max(src.width(), src.height()) > 2 * size:
+        f = (2 * size) / max(src.width(), src.height())
+        reader.setScaledSize(QSize(max(1, round(src.width() * f)),
+                                   max(1, round(src.height() * f))))
+    img = reader.read()
+    if img.isNull():
+        if ext.lower() not in ('.heic', '.heif'):
+            return None
+        img = _heif_to_qimage(data, max_side=2 * size)
+        if img is None:
+            return None
+    return _scale_thumb(img, size)
+
+
+def _video_thumbnail(source, size: int) -> QImage | None:
+    """A *size*-box thumbnail of a video's first decoded frame. *source* is a
+    seekable file-like (a _LazyZipSlice over the archive entry), so PyAV
+    reads only the container index and the first frame — 0.2-0.7 MB of a
+    3-102 MB IOS17 video — instead of the whole file. The frame is shrunk
+    by libswscale (no full-resolution PNG round trip) and turned by the
+    stream's display rotation: iPhone portrait video is stored 1920x1080
+    with rotation -90, and 3 of 14 IOS17 videos showed landscape without
+    it (14/14 match iOS's own thumbnails with it). ~33 ms vs ~295 ms."""
+    try:
+        container = av.open(source)
+    except Exception:
+        return None
+    try:
+        if not container.streams.video:
+            return None
+        stream = container.streams.video[0]
+        for frame in container.decode(stream):
+            w, h = frame.width, frame.height
+            f = min(1.0, (2 * size) / max(w, h))
+            small = frame.reformat(width=max(1, round(w * f)),
+                                   height=max(1, round(h * f)), format='rgb24')
+            pil = small.to_image()
+            rotation = int(getattr(frame, 'rotation', 0) or 0)
+            if rotation % 360:
+                # PIL turns counter-clockwise for a positive angle; the
+                # display matrix's -90 means "turn 90 clockwise to show".
+                pil = pil.rotate(rotation, expand=True)
+            qimg = QImage(pil.tobytes('raw', 'RGB'), pil.width, pil.height,
+                          pil.width * 3, QImage.Format.Format_RGB888).copy()
+            return _scale_thumb(qimg, size)
+        return None
+    except Exception:
+        return None
+    finally:
+        container.close()
 
 
 # ── Media grid model/delegate/view ──────────────────────────────────────────
@@ -1055,9 +1074,12 @@ class MediaFullViewDialog(QDialog):
 class ThumbnailWorker(QThread):
     """Loads thumbnails from the cache DB or the ZIP, emits (ui_path, QImage).
 
-    Single-threaded by design: QImage.loadFromData() and img.scaled() are Qt
-    Python-binding calls that hold the GIL, so a ThreadPoolExecutor would only
-    serialise them anyway while adding contention overhead."""
+    Cache hits are served from casecache.db's thumbnails table in this
+    thread. Misses are read and decoded on a small pool
+    (_THUMB_DECODE_THREADS): the decoders (Qt's image readers, libheif,
+    PyAV) do their work outside the GIL, so 4 threads made 87 IOS17
+    thumbnails in 0.78 s instead of 1.51 s. All SQLite access stays on this
+    thread. Videos are read lazily (_video_thumbnail), never whole."""
     thumbnail_ready = Signal(str, object)   # ui_path, QImage
     finished_all    = Signal()
 
@@ -1094,38 +1116,109 @@ class ThumbnailWorker(QThread):
         buf.close()
         return data
 
+    def _locate(self, ui_path, view):
+        """(physical, file_size, entry, real_path) for *ui_path*, or None.
+        entry is a ZipEntry for an archive file; real_path a local file."""
+        # A parser-generated local file (e.g. chrome_favicons.py's own
+        # extracted .png, chrome_cache.py's .mhtml) is never an archive
+        # entry -- path_resolver()/the zip's own namelist have nothing to
+        # resolve it against. Same os.path.isabs() convention
+        # hex_viewer._read_zip_bytes already uses for the identical
+        # reason. A SYNTHETIC vpath (e.g. an embedded-media hit browsed via
+        # its container's own File Browser folder) isn't itself absolute,
+        # but local_path_overrides still names its real local file —
+        # checked first since it's the more specific case.
+        real_path = self.local_path_overrides.get(ui_path)
+        if real_path is not None or os.path.isabs(ui_path):
+            real_path = real_path or ui_path
+            try:
+                return real_path, os.path.getsize(real_path), None, real_path
+            except OSError:
+                return None
+        physical = self.path_resolver(ui_path)
+        file_size = self.zip_info_map.get(physical, 0)
+        if view is None:
+            return physical, file_size, None, None
+        try:
+            info = view.getinfo(physical)
+        except KeyError:
+            return physical, file_size, None, None
+        return physical, file_size, ZipEntry(self.zip_path, physical, info), None
+
+    def _decode(self, ext, entry, real_path):
+        """Read and decode one uncached file into a thumbnail QImage, or None.
+        Runs on the decode pool."""
+        size = self.thumb_size
+        try:
+            if real_path is not None:
+                with open(real_path, 'rb') as lf:
+                    kind = sniff_media_kind(ext, b'') or sniff_media_kind(ext, lf.read(4096))
+                    if kind == 'video':
+                        lf.seek(0)
+                        return _video_thumbnail(lf, size)
+                    if kind != 'image':
+                        return None
+                    lf.seek(0)
+                    data = lf.read()
+            elif entry is not None:
+                kind = sniff_media_kind(ext, b'') or sniff_media_kind(ext, entry.read(4096))
+                if kind == 'video':
+                    if entry.is_stored:
+                        with _LazyZipSlice(self.zip_path, entry.data_offset,
+                                           entry.file_size) as source:
+                            return _video_thumbnail(source, size)
+                    return _video_thumbnail(io.BytesIO(entry.read()), size)
+                if kind != 'image':
+                    return None
+                data = entry.read()
+            else:
+                return None
+        except Exception:
+            return None
+        return _image_thumbnail(data, ext, size)
+
     def run(self):
         use_cache = bool(self.cache_dir)
         db = _open_cache_db(self.cache_dir) if use_cache else None
         _DB_BATCH = 50   # items per DB query — small so first thumbnails emit fast
 
         try:
+            if db is not None:
+                _purge_outdated_thumbnails(db)
             pending = []
-            items_list = list(self.items)
 
             # Read via the local .zcd central-directory cache only — never
             # a raw zipfile.ZipFile on the main archive (this project's
             # own standing Convention has no exception for this case,
             # even to avoid a dropped thumbnail). The main FFS archive
             # itself is never compressed, so this is a direct offset seek
-            # per entry rather than a second full central-directory
-            # read/decompress pass over what can be a large network-
-            # hosted zip. _zf stays None when cache_dir is missing or the
-            # cache isn't built yet — every real read below already goes
-            # through its own `try/except: continue` (an item without a
-            # loadable thumbnail is already a normal, handled case, e.g.
-            # a referenced-but-uncached iCloud photo), so a None _zf
-            # simply skips every item the same honest way rather than
-            # needing its own separate handling.
+            # per entry. _view stays None when cache_dir is missing or the
+            # cache isn't built yet — such an item simply gets no
+            # thumbnail, the same honest skip as any unreadable file.
             _view = None
             if self.cache_dir:
                 infos = _zcd_load(self.zip_path, self.cache_dir)
                 if infos is not None:
                     _view = CachedZipView(self.zip_path, infos)
-            _zf = _view
-            try:
-                for batch in batched(items_list, _DB_BATCH):
-                    # Query DB for just this batch
+
+            def _flush():
+                if db is not None and pending:
+                    try:
+                        db.executemany(
+                            'INSERT OR REPLACE INTO thumbnails '
+                            '(ui_path,file_size,thumb_size,data) '
+                            'VALUES (?,?,?,?)', pending)
+                        db.commit()
+                    except sqlite3.Error:
+                        pass
+                    pending.clear()
+
+            with ThreadPoolExecutor(max_workers=_THUMB_DECODE_THREADS,
+                                    thread_name_prefix='ffs-thumb') as pool:
+                for batch in batched(list(self.items), _DB_BATCH):
+                    if self._stop:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        return
                     cached = {}
                     if db is not None:
                         placeholders = ','.join('?' * len(batch))
@@ -1139,118 +1232,77 @@ class ThumbnailWorker(QThread):
                         except sqlite3.Error:
                             pass
 
+                    futures = {}
                     for ui_path in batch:
-                        if self._stop:
-                            return
-
-                        # A parser-generated local file (e.g. chrome_favicons.py's
-                        # own extracted .png, chrome_cache.py's .mhtml) is never
-                        # an archive entry -- path_resolver()/the zip's own
-                        # namelist have nothing to resolve it against. Same
-                        # os.path.isabs() convention hex_viewer._read_zip_bytes
-                        # already uses for the identical reason. A SYNTHETIC
-                        # vpath (e.g. an embedded-media hit browsed via its
-                        # container's own File Browser folder) isn't itself
-                        # absolute, but local_path_overrides still names its
-                        # real local file — checked first since it's the more
-                        # specific case.
-                        real_path = self.local_path_overrides.get(ui_path)
-                        is_local = real_path is not None or os.path.isabs(ui_path)
-                        if is_local:
-                            real_path = real_path or ui_path
-                            try:
-                                file_size = os.path.getsize(real_path)
-                            except OSError:
-                                continue
-                            physical = real_path
-                        else:
-                            physical  = self.path_resolver(ui_path)
-                            file_size = self.zip_info_map.get(physical, 0)
-                        ext       = os.path.splitext(physical)[1].lower()
-                        blob      = cached.get((ui_path, file_size))
-
+                        loc = self._locate(ui_path, _view)
+                        if loc is None:
+                            continue
+                        physical, file_size, entry, real_path = loc
+                        ext = os.path.splitext(physical)[1].lower()
+                        blob = cached.get((ui_path, file_size))
                         if blob:
-                            stale = (ext in VIDEO_THUMB_EXTENSIONS and len(blob) < 10_000)
-                            if not stale:
-                                img = QImage()
-                                if img.loadFromData(blob):
-                                    self.thumbnail_ready.emit(ui_path, img)
-                                    continue
-                            if db is not None:
-                                try:
-                                    db.execute(
-                                        'DELETE FROM thumbnails WHERE '
-                                        'ui_path=? AND file_size=? AND thumb_size=?',
-                                        (ui_path, file_size, self.thumb_size))
-                                    db.commit()
-                                except sqlite3.Error:
-                                    pass
-
-                        try:
-                            if is_local:
-                                with open(real_path, 'rb') as lf:
-                                    data = lf.read()
-                            else:
-                                # .open(...).read(), not .read(name) -- the
-                                # convenience method zipfile.ZipFile has but
-                                # CachedZipView deliberately doesn't
-                                # duplicate; .open() alone keeps this line
-                                # identical for either backing object.
-                                data = _zf.open(physical).read()
-                        except Exception:
-                            continue
-
-                        kind = sniff_media_kind(ext, data)
-                        if kind == 'video':
-                            data = _video_frame_bytes(data)
-                            if not data:
+                            img = QImage()
+                            if img.loadFromData(blob):
+                                self.thumbnail_ready.emit(ui_path, img)
                                 continue
-                        elif kind != 'image':
-                            continue
+                        fut = pool.submit(self._decode, ext, entry, real_path)
+                        futures[fut] = (ui_path, file_size)
 
-                        img = _load_qimage(data, ext)
+                    for fut in as_completed(futures):
+                        if self._stop:
+                            pool.shutdown(wait=False, cancel_futures=True)
+                            return
+                        ui_path, file_size = futures[fut]
+                        img = fut.result()
                         if img is None:
                             continue
-                        img = img.scaled(self.thumb_size, self.thumb_size,
-                                         Qt.AspectRatioMode.KeepAspectRatio,
-                                         Qt.TransformationMode.SmoothTransformation)
                         self.thumbnail_ready.emit(ui_path, img)
-
                         if db is not None:
                             jpeg = self._encode_jpeg(img)
                             if jpeg:
                                 pending.append((ui_path, file_size, self.thumb_size, jpeg))
                                 if len(pending) >= _THUMB_BATCH_COMMIT:
-                                    try:
-                                        db.executemany(
-                                            'INSERT OR REPLACE INTO thumbnails '
-                                            '(ui_path,file_size,thumb_size,data) '
-                                            'VALUES (?,?,?,?)', pending)
-                                        db.commit()
-                                    except sqlite3.Error:
-                                        pass
-                                    pending.clear()
-
-            finally:
-                # CachedZipView holds no real handle of its own (each read
-                # opens/closes its own file internally) — nothing to
-                # close here now that the raw-zipfile fallback is gone.
-                pass
-
-            if db is not None and pending:
-                try:
-                    db.executemany(
-                        'INSERT OR REPLACE INTO thumbnails '
-                        '(ui_path,file_size,thumb_size,data) '
-                        'VALUES (?,?,?,?)', pending)
-                    db.commit()
-                except sqlite3.Error:
-                    pass
-
+                                    _flush()
+            _flush()
         finally:
             if db is not None:
                 db.close()
         self.finished_all.emit()
+
+
+# Thumbnails saved before the HEIC double-rotation and video-rotation fixes
+# (v0.50.16 and earlier) can be sideways; each case drops them once so they
+# are made again. Recorded in casecache.db's processing_registry (ui_path ''),
+# so a schema rebuild — which deletes the thumbnails anyway — needs nothing.
+_THUMB_CACHE_LOGIC = '2'
+_thumb_cache_checked: set = set()
+
+
+def _purge_outdated_thumbnails(db) -> None:
+    """Delete every cached thumbnail made by an older thumbnail decoder, once
+    per case (see _THUMB_CACHE_LOGIC). Runs in a write transaction, so two
+    workers starting together can't both purge after one has refilled."""
+    key = db.execute('PRAGMA database_list').fetchone()[2]
+    if key in _thumb_cache_checked:
+        return
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute(
+            "SELECT logic_version FROM processing_registry "
+            "WHERE ui_path='' AND capability='thumbnail_cache'").fetchone()
+        if row is None or row[0] != _THUMB_CACHE_LOGIC:
+            db.execute('DELETE FROM thumbnails')
+            db.execute(
+                "INSERT OR REPLACE INTO processing_registry "
+                "(ui_path, capability, logic_version) "
+                "VALUES ('', 'thumbnail_cache', ?)", (_THUMB_CACHE_LOGIC,))
+        db.commit()
+        _thumb_cache_checked.add(key)
+    except sqlite3.Error:
+        try:
+            db.rollback()
+        except sqlite3.Error:
+            pass
 
 
 # ── Mixin ─────────────────────────────────────────────────────────────────────

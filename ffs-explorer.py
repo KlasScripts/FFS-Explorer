@@ -4325,7 +4325,7 @@ class NestedArchiveWorker(QThread):
     item_done     = Signal(str, bool)    # (ui_path, success)
     item_error    = Signal(str, str)     # (ui_path, error_message)
     types_updated = Signal(dict)         # {ui_path: "JSON — gzip", ...}
-    finished      = Signal(int, int)     # (success_count, error_count)
+    finished      = Signal(int, int, int)  # (success_count incl. already done, error_count, newly extracted)
 
     _MEM_LIMIT = 100 * 1024 * 1024   # 100 MB — larger files written to temp first
 
@@ -4390,7 +4390,7 @@ class NestedArchiveWorker(QThread):
         self.progress.emit(total, total, '')
         if gzip_types:
             self.types_updated.emit(gzip_types)
-        self.finished.emit(ok, err)
+        self.finished.emit(ok, err, ok - skipped)
 
     def _process_one(self, ui_path: str, out_dir: str) -> tuple[bool, str | None]:
         """Process one candidate.  Returns (success, compound_type_or_None).
@@ -4888,7 +4888,7 @@ class MediaMetadataScanWorker(QThread):
     done     = Signal(dict)  # {ui_path: {field: value, ...}}, already saved
 
     def __init__(self, zip_path, case_dir, ui_metadata, ffs_adapter,
-                 header_type_overrides, local_candidates, delta=None):
+                 header_type_overrides, local_candidates, delta=None, run_type=None):
         super().__init__()
         self._zip_path = zip_path
         self._case_dir = case_dir
@@ -4897,8 +4897,26 @@ class MediaMetadataScanWorker(QThread):
         self._overrides = header_type_overrides
         self._local_candidates = local_candidates
         self._delta = delta
+        self._run_type = run_type    # run_log entry; ProcessDialog's next open reads it
 
     def run(self):
+        run_id = None
+        if self._run_type and self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    run_id = start_run_log(db, self._run_type)
+            except Exception:
+                pass
+        results = self._scan()
+        if run_id is not None and not self.isInterruptionRequested():
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    complete_run_log(db, run_id, processed=len(results), output_rows=len(results))
+            except Exception:
+                pass
+        self.done.emit(results)
+
+    def _scan(self) -> dict:
         # Finding the candidates (a pass over every entry) and saving the
         # results happen here, not on the GUI thread (2026-11-01).
         infos = _cd_cache_load(self._zip_path, self._case_dir) if self._case_dir else None
@@ -4908,8 +4926,7 @@ class MediaMetadataScanWorker(QThread):
             self._overrides, z=z, delta=self._delta)
         total = len(zip_candidates) + len(self._local_candidates)
         if total == 0:
-            self.done.emit({})
-            return
+            return {}
         self.progress.emit(total)
         n_local = len(self._local_candidates)
         results = media_metadata_scan.scan_zip_candidates(
@@ -4926,7 +4943,7 @@ class MediaMetadataScanWorker(QThread):
                     save_media_metadata(cache_db, results)
             except Exception:
                 pass
-        self.done.emit(results)
+        return results
 
 
 class DuplicateDetectionWorker(QThread):
@@ -5792,6 +5809,7 @@ class ProcessDialog(QDialog):
     _RUN_TYPE           = 'header_scan'
     _RUN_TYPE_INTEGRITY = 'integrity_check'
     _RUN_TYPE_DEDUP      = 'duplicate_detection'
+    _RUN_TYPE_MEDIA_METADATA = 'media_metadata'
 
     def __init__(self, zip_path, case_dir, ffs_adapter, ui_metadata,
                  delta=None, preselect_nested=False,
@@ -6066,7 +6084,10 @@ class ProcessDialog(QDialog):
         # doesn't need anything else to have run first either.
         self._chk_leveldb = QCheckBox(
             "Index LevelDB/IndexedDB folders for Keyword Search")
-        self._chk_leveldb.setChecked(True)
+        # Ticked only until a complete indexing pass is on record (owner
+        # request, 2026-11-01: a stage done once starts unticked; tick it to
+        # redo). Re-ticked by a run that unpacks new archives.
+        self._chk_leveldb.setChecked(not self._leveldb_index_on_record())
         self._chk_leveldb.setToolTip(
             "Indexes every LevelDB/IndexedDB folder (Chrome/WebKit local "
             "storage, app caches, etc.) not already covered so Keyword "
@@ -6095,7 +6116,8 @@ class ProcessDialog(QDialog):
         # the whole file).
         self._chk_media_metadata = QCheckBox(
             "Extract media metadata (EXIF / video info) into new File Browser columns")
-        self._chk_media_metadata.setChecked(True)
+        # Same rule as LevelDB above: ticked until a complete run is on record.
+        self._chk_media_metadata.setChecked(not self._media_metadata_on_record())
         self._chk_media_metadata.setToolTip(
             "Reads EXIF (photos) and container metadata (videos) — taken "
             "date, camera, GPS, duration, dimensions, software — for "
@@ -6322,6 +6344,10 @@ class ProcessDialog(QDialog):
                 f"<b>Nested archives extracted:</b> {len(nested):,} — "
                 f"last run {last_at}"
             )
+            # Set by a run that unpacked new archives (_on_nested_done); the
+            # progress line it was first shown on is overwritten by later stages.
+            if getattr(self, '_unpacked_check_line', ''):
+                lines.append(self._unpacked_check_line)
         else:
             lines.append("No nested archives extracted yet.")
 
@@ -6367,6 +6393,47 @@ class ProcessDialog(QDialog):
         try:
             with closing(_open_cache_db(self._case_dir)) as db:
                 return count_duplicate_groups(db) > 0
+        except Exception:
+            return False
+
+    def _leveldb_index_on_record(self) -> bool:
+        """True when the last LevelDB indexing pass finished (its version
+        marker is written only then) under the current decode logic."""
+        if not self._case_dir:
+            return False
+        try:
+            from leveldb_viewer import leveldb_decode_logic_version
+            with closing(_open_cache_db(self._case_dir)) as db:
+                marker = load_blob(db, 'leveldb_search_index_version', '1')
+            return marker is not None and marker.decode() == leveldb_decode_logic_version()
+        except Exception:
+            return False
+
+    def _media_metadata_on_record(self) -> bool:
+        """True when a complete EXIF/video-metadata run is logged, or, for a
+        case processed before that was logged (2026-11-01), when results are
+        stored."""
+        if not self._case_dir:
+            return False
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                run = load_last_run(db, self._RUN_TYPE_MEDIA_METADATA)
+            if run is not None:
+                return bool(run['complete'])
+            with closing(_open_cache_db(self._case_dir)) as db:
+                return db.execute('SELECT 1 FROM media_metadata LIMIT 1').fetchone() is not None
+        except Exception:
+            return False
+
+    def _embedded_media_on_record(self) -> bool:
+        """True when this case has had an embedded-media sweep (files are
+        recorded as scanned as it goes)."""
+        if not self._case_dir:
+            return False
+        try:
+            with closing(_open_cache_db(self._case_dir)) as db:
+                return db.execute("SELECT 1 FROM processing_registry WHERE "
+                                  "capability='embedded_media_scan' LIMIT 1").fetchone() is not None
         except Exception:
             return False
 
@@ -6714,7 +6781,20 @@ class ProcessDialog(QDialog):
         else:
             self._continue_after_integrity()
 
+    # Stage order (2026-11-01): integrity -> header scan -> nested archives ->
+    # LevelDB indexing -> embedded media -> EXIF -> duplicates. Every stage
+    # that reads files comes after unpacking, so it covers the unpacked ones;
+    # LevelDB used to run before the header scan.
+
     def _continue_after_integrity(self):
+        if self._post_integrity_scan:
+            self._start_header_scan()
+        elif self._chk_nested.isChecked():
+            self._show_archive_selection()
+        else:
+            self._continue_after_nested()
+
+    def _start_leveldb_stage(self):
         if self._chk_leveldb.isChecked() and self._leveldb_coverage_fn and self._leveldb_index_fn:
             self._start_leveldb_indexing()
         else:
@@ -6750,12 +6830,10 @@ class ProcessDialog(QDialog):
                               cancel_check=lambda: self._scan_cancelled)
 
     def _continue_after_leveldb_indexing(self):
-        if self._post_integrity_scan:
-            self._start_header_scan()
-        elif self._chk_nested.isChecked():
-            self._show_archive_selection()
+        if self._chk_embedded_media.isChecked():
+            self._start_embedded_media_scan()
         else:
-            self._continue_after_nested()
+            self._continue_after_embedded_media()
 
     # ── Data integrity check ──────────────────────────────────────────────────
 
@@ -6955,6 +7033,14 @@ class ProcessDialog(QDialog):
         self.header_scan_done.emit(results)
         if not cancelled and self._pending_upgrade_tier > 0:
             self.header_scan_tier_done.emit(self._pending_upgrade_tier)
+            # More files may now be typed picture/video or database/plist:
+            # stages done before on this case that go by type run again for
+            # this run (owner request, 2026-11-01). Duplicates and LevelDB
+            # don't go by these types.
+            if self._media_metadata_on_record():
+                self._chk_media_metadata.setChecked(True)
+            if self._embedded_media_on_record():
+                self._chk_embedded_media.setChecked(True)
 
         if self._chk_nested.isChecked() and not cancelled:
             self._show_archive_selection()
@@ -7060,9 +7146,11 @@ class ProcessDialog(QDialog):
                     'mtime':     0,
                 })
 
+        # No archives, or the selection cancelled: carry on with the later
+        # stages (they used to be skipped silently: _finish_operations).
         if not new_archives and not done_archives and not failed_archives:
             self._status_label.setText("No archive files found across all scanned locations.")
-            self._finish_operations()
+            self._continue_after_nested()
             return
 
         is_android = (self._adapter.format == self._adapter.FORMAT_ZIP_EXTRAS or
@@ -7072,8 +7160,8 @@ class ProcessDialog(QDialog):
                                      done_archives=done_archives,
                                      failed_archives=failed_archives, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.selected_paths:
-            self._status_label.setText("Archive selection cancelled.")
-            self._finish_operations()
+            self._status_label.setText("Archive selection cancelled — no archives extracted.")
+            self._continue_after_nested()
             return
 
         self._start_nested_extraction(candidates=dlg.selected_paths)
@@ -7092,7 +7180,7 @@ class ProcessDialog(QDialog):
 
         if not candidates:
             self._status_label.setText("No Archive-type files found in app data.")
-            self._finish_operations()
+            self._continue_after_nested()
             return
 
         self._status_label.setText(
@@ -7122,27 +7210,58 @@ class ProcessDialog(QDialog):
     def _on_nested_error(self, ui_path: str, msg: str):
         self._nested_errors.append(f"{os.path.basename(ui_path)}: {msg}")
 
-    def _on_nested_done(self, ok: int, err: int):
+    def _on_nested_done(self, ok: int, err: int, new: int = 0):
         msg = f"Nested archives: {ok:,} extracted"
+        if ok - new:
+            msg += f" ({ok - new:,} of them already, earlier)"
         if err:
             first = self._nested_errors[0] if self._nested_errors else "unknown error"
             msg += f", {err:,} failed ({first})"
         msg += "."
-        self._status_label.setText(msg)
         # Rebuild compound gzip type overrides from the DB and push to the file
         # browser.  Done here (main thread) so it covers skipped files too and
         # avoids cross-thread signal chain issues.
         self._apply_gzip_type_overrides()
-        # New unpacked files aren't covered by duplicate results on record,
-        # and "Detect duplicate files" starts unticked once those exist —
-        # so re-tick it for this run (A-74).
-        if ok and not self._chk_dedup.isChecked():
-            self._chk_dedup.setChecked(True)
-            self._status_label.setText(
-                msg + " Duplicate detection re-enabled for this run to include "
-                "the newly unpacked files.")
+        if new:
+            self._unpacked_check_line = self._unpacked_header_check_summary()
+            msg += " " + self._unpacked_check_line
+            # Newly unpacked files are in nothing done before (owner
+            # request, 2026-11-01): LevelDB indexing, EXIF and duplicates
+            # run again for this run, and the embedded-media sweep too if
+            # this case has had one (it scans only files it hasn't seen).
+            # They come after this stage, so this run covers the new files.
+            redo = [('LevelDB indexing', self._chk_leveldb),
+                    ('EXIF/video metadata', self._chk_media_metadata),
+                    ('duplicates', self._chk_dedup)]
+            if self._embedded_media_on_record():
+                redo.append(('embedded media', self._chk_embedded_media))
+            ticked = [name for name, chk in redo if not chk.isChecked()]
+            for _name, chk in redo:
+                chk.setChecked(True)
+            if ticked:
+                msg += f" Re-ticked for the {new:,} newly unpacked archive(s): {', '.join(ticked)}."
+        self._status_label.setText(msg)
         self.nested_extraction_done.emit()
         self._continue_after_nested()
+
+    def _unpacked_header_check_summary(self) -> str:
+        """One line on the header check unpacked files got as they were
+        unpacked (nested_archive.classify_unpacked: extension first, then
+        the file's own bytes for an unknown extension, the same rule the
+        File Browser applies to the main archive). Unpacking IS that check;
+        this only reports it, so the examiner can see it happened."""
+        if not self._case_dir:
+            return ""
+        try:
+            index = nested_archive.unpacked_file_index(self._case_dir)
+        except Exception:
+            return ""
+        by_content = sum(1 for _s, entry, ft in index.values()
+                         if ft != 'Other' and _get_file_type(entry.rsplit('/', 1)[-1]) == 'Other')
+        unknown = sum(1 for _s, _e, ft in index.values() if ft == 'Other')
+        by_ext = len(index) - by_content - unknown
+        return (f"Header check of all {len(index):,} unpacked files: {by_ext:,} typed by "
+                f"extension, {by_content:,} from their content, {unknown:,} unknown.")
 
     def _apply_gzip_type_overrides(self):
         """Read all single-entry gzip-extracted archives from the DB and emit
@@ -7190,17 +7309,15 @@ class ProcessDialog(QDialog):
     # ── Embedded-media sweep ────────────────────────────────────────────────
 
     def _continue_after_nested(self):
-        """Runs after archive extraction. Files unpacked from nested
-        archives are swept too: their types come from unpacking
+        """Runs after archive extraction (or in its place), on to LevelDB
+        indexing and then the embedded-media sweep. Files unpacked from
+        nested archives are swept too: their types come from unpacking
         (nested_archive.classify_unpacked, merged in
         _header_type_overrides_snapshot) and EmbeddedMediaScanWorker reads
         them from the unpacked archive (nested_archive.unpacked_file_index).
         Before 2026-10-22 this comment claimed so, but neither was true:
         they were typed by name only and every read silently failed."""
-        if self._chk_embedded_media.isChecked():
-            self._start_embedded_media_scan()
-        else:
-            self._continue_after_embedded_media()
+        self._start_leveldb_stage()
 
     def _continue_after_embedded_media(self):
         """Media-metadata extraction (app/media_metadata_scan.py) runs
@@ -7342,7 +7459,8 @@ class ProcessDialog(QDialog):
         self._status_label.setText("Media metadata: finding Picture/Graphic/Video files…")
         self._media_metadata_worker = MediaMetadataScanWorker(
             self._zip_path, self._case_dir, self._ui_metadata, self._adapter,
-            self._header_type_overrides_snapshot(), local_candidates, delta=self._delta)
+            self._header_type_overrides_snapshot(), local_candidates, delta=self._delta,
+            run_type=self._RUN_TYPE_MEDIA_METADATA)
         self._media_metadata_worker.progress.connect(self._on_media_metadata_progress)
         self._media_metadata_worker.done.connect(self._on_media_metadata_done)
         self._media_metadata_worker.start()
@@ -7944,6 +8062,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.full_metadata = {}
         self._header_tier_counts: dict | None = None   # see _start_header_tier_count
         self._header_tier_count_seq = 0
+        self._empty_folder_entries: frozenset | None = None   # see _start_empty_folder_scan
         self.folder_map = {}
         self.guid_to_bundle = {}
         self.zip_names: frozenset = frozenset()
@@ -9317,8 +9436,51 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         return self._folder_total_size(path) == 0 or path in self._metadata_only_folders
 
     def _is_empty_folder_entry(self, ui_path) -> bool:
-        """True when the ZIP contains a bare directory entry for this path (trailing slash)."""
+        """True when the ZIP contains a bare directory entry for this path
+        (trailing slash). A set lookup once _start_empty_folder_scan has
+        listed them for the case; until then, the per-path check."""
+        empty = self._empty_folder_entries
+        if empty is not None:
+            return ui_path in empty
         return (self._adapter.resolve(ui_path) + "/") in self.zip_names
+
+    def _start_empty_folder_scan(self) -> None:
+        """List the case's empty-folder entries once, on the background pool.
+        Needed because metadata size can't tell them from files: Cellebrite
+        gives a folder its directory size (IOS17: 17,210 of 17,217 empty
+        folders have 64, 96, 128...), so _classify_entry's old "size > 0 is a
+        file" shortcut showed almost all of them as blank "Other" files.
+        Also makes _is_folder_path a set lookup: 0.55 s of the 1 s a
+        recursive "Selected Only" click on IOS17's mobile/ took."""
+        self._empty_folder_entries = None
+        self._empty_folder_seq = getattr(self, '_empty_folder_seq', 0) + 1
+        my_seq = self._empty_folder_seq
+        adapter, names, folder_map = self._adapter, self.zip_names, self.folder_map
+        keys = list(self.full_metadata)       # one C-level copy, before the GUI changes it
+
+        def _scan():
+            resolve = adapter.resolve
+            out = []
+            for n, p in enumerate(keys):
+                if n % 5000 == 0:
+                    time.sleep(0)             # let the GUI thread have the GIL
+                if p not in folder_map and (resolve(p) + '/') in names:
+                    out.append(p)
+            return frozenset(out)
+        fut = _BG_POOL.submit(_scan)
+
+        def _poll():
+            if my_seq != self._empty_folder_seq:
+                return                        # a newer archive load superseded this one
+            if not fut.done():
+                QTimer.singleShot(50, _poll)
+                return
+            try:
+                self._empty_folder_entries = fut.result()
+            except Exception:
+                return                        # stays on the per-path check
+            self._refresh_current_file_view(preserve_filter=True)
+        QTimer.singleShot(50, _poll)
 
     def _folder_total_size(self, folder_path: str) -> int:
         return self._folder_sizes.get(folder_path, 0)
@@ -10512,7 +10674,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # Directory entries in FORMAT_ZIP_EXTRAS land in zip_ui_paths with
             # their trailing slash stripped — detect them before calling
             # _get_file_type so they never appear as "Other".
-            if not size_hint and self._is_empty_folder_entry(path):
+            # The size shortcut only until the empty-folder set is ready
+            # (_start_empty_folder_scan): a Cellebrite folder has a size.
+            if ((self._empty_folder_entries is not None or not size_hint)
+                    and self._is_empty_folder_entry(path)):
                 if self._hide_empty_folders:
                     return None, None, True
                 return "Empty Folder", True, False
@@ -11809,6 +11974,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._case_dir = case_dir
         self._photo_index = {}        # rebuilt in on_metadata_ready
         self._media_exif = {}         # rebuilt in _start_case_meta_load
+        # Both belong to the previous archive; rebuilt in _start_case_meta_load.
+        self._empty_folder_entries = None
+        self._empty_folder_seq = getattr(self, '_empty_folder_seq', 0) + 1
+        self._header_tier_counts = None
+        self._header_tier_count_seq += 1
         self._attachment_links = {}   # rebuilt in _start_case_meta_load
         self._duplicate_files = {}    # rebuilt in _start_case_meta_load
         self._duplicate_groups: dict = {}   # md5 -> every member ui_path, rebuilt alongside
@@ -12214,6 +12384,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not case_dir:
             return
         self._start_header_tier_count()
+        self._start_empty_folder_scan()
         rules    = self._photo_flag_rules
         zip_path = self.zip_path
         adapter  = self._adapter
@@ -13343,12 +13514,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._adapter,
             self._local_extra_delta,
         )
-        # partial binds ui_path; the signal appends (ok, err).
+        # partial binds ui_path; the signal appends (ok, err, newly extracted).
         worker.finished.connect(partial(self._on_context_extract_done, ui_path))
         self._context_extract_worker = worker
         worker.start()
 
-    def _on_context_extract_done(self, ui_path: str, ok: int, err: int) -> None:
+    def _on_context_extract_done(self, ui_path: str, ok: int, err: int, _new: int = 0) -> None:
         if ok > 0:
             saved_checked = set(self._checked_folders)
             parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ''

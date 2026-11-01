@@ -402,6 +402,11 @@ class MediaGridDelegate(QStyledItemDelegate):
         # "seen" checkmark above so the two never overlap on the same
         # file.
         self._video_paths: set = set()
+        # ui_path -> why no thumbnail could be made (ThumbnailWorker.
+        # thumbnail_failed, 2026-11-01). Drawn in the tile, so a blank tile
+        # means only "still loading"; before, a file that never decodes
+        # stayed blank for good, indistinguishable from one still loading.
+        self._failed: dict[str, str] = {}
 
     def cell_size(self) -> QSize:
         return QSize(self._thumb_size + _GRID_CELL_MARGIN * 2,
@@ -419,8 +424,15 @@ class MediaGridDelegate(QStyledItemDelegate):
     def set_video_paths(self, paths: set) -> None:
         self._video_paths = paths
 
+    def set_failed(self, ui_path: str, reason: str) -> None:
+        self._failed[ui_path] = reason
+
     def has_pixmap(self, ui_path: str) -> bool:
         return ui_path in self._pixmaps
+
+    def has_result(self, ui_path: str) -> bool:
+        """A thumbnail, or a known reason there is none: nothing to fetch."""
+        return ui_path in self._pixmaps or ui_path in self._failed
 
     def cached_count(self) -> int:
         return len(self._pixmaps)
@@ -437,6 +449,7 @@ class MediaGridDelegate(QStyledItemDelegate):
 
     def clear(self) -> None:
         self._pixmaps.clear()
+        self._failed.clear()
 
     def sizeHint(self, option, index):
         return self.cell_size()
@@ -458,6 +471,13 @@ class MediaGridDelegate(QStyledItemDelegate):
             x = img_rect.x() + (img_rect.width() - pix.width()) // 2
             y = img_rect.y() + (img_rect.height() - pix.height()) // 2
             painter.drawPixmap(x, y, pix)
+        elif ui_path in self._failed:
+            painter.setPen(QColor('#9e9e9e'))
+            painter.setBrush(QColor(128, 128, 128, 40))
+            painter.drawRect(img_rect.adjusted(4, 4, -5, -5))
+            painter.drawText(img_rect.adjusted(10, 10, -10, -10),
+                             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                             self._failed[ui_path])
 
         # Bookmark outline (added 2026-09-25) — a colored border around
         # the thumbnail area, in the bookmarking group's own color (see
@@ -1084,7 +1104,14 @@ class ThumbnailWorker(QThread):
     thumbnails in 0.78 s instead of 1.51 s. All SQLite access stays on this
     thread. Videos are read lazily (_video_thumbnail), never whole."""
     thumbnail_ready = Signal(str, object)   # ui_path, QImage
+    thumbnail_failed = Signal(str, str)     # ui_path, why there is no thumbnail (shown in the tile)
     finished_all    = Signal()
+
+    # The texts thumbnail_failed sends.
+    WHY_UNREADABLE = "Can't be read"
+    WHY_EMPTY = "Empty file (0 bytes)"
+    WHY_NOT_MEDIA = "Not a picture or video"
+    WHY_UNDECODABLE = "Can't decode"
 
     def __init__(self, zip_path, items, path_resolver, thumb_size, zip_info_map,
                  cache_dir=None, local_path_overrides=None):
@@ -1149,36 +1176,44 @@ class ThumbnailWorker(QThread):
         return physical, file_size, ZipEntry(self.zip_path, physical, info), None
 
     def _decode(self, ext, entry, real_path):
-        """Read and decode one uncached file into a thumbnail QImage, or None.
-        Runs on the decode pool."""
+        """Read and decode one uncached file: (thumbnail QImage, None), or
+        (None, why) with one of the WHY_* texts. Runs on the decode pool."""
         size = self.thumb_size
         try:
             if real_path is not None:
+                if os.path.getsize(real_path) == 0:
+                    return None, self.WHY_EMPTY
                 with open(real_path, 'rb') as lf:
                     kind = sniff_media_kind(ext, b'') or sniff_media_kind(ext, lf.read(4096))
                     if kind == 'video':
                         lf.seek(0)
-                        return _video_thumbnail(lf, size)
+                        img = _video_thumbnail(lf, size)
+                        return img, (None if img is not None else self.WHY_UNDECODABLE)
                     if kind != 'image':
-                        return None
+                        return None, self.WHY_NOT_MEDIA
                     lf.seek(0)
                     data = lf.read()
             elif entry is not None:
+                if entry.file_size == 0:
+                    return None, self.WHY_EMPTY
                 kind = sniff_media_kind(ext, b'') or sniff_media_kind(ext, entry.read(4096))
                 if kind == 'video':
                     if entry.is_stored:
                         with _LazyZipSlice(self.zip_path, entry.data_offset,
                                            entry.file_size) as source:
-                            return _video_thumbnail(source, size)
-                    return _video_thumbnail(io.BytesIO(entry.read()), size)
+                            img = _video_thumbnail(source, size)
+                    else:
+                        img = _video_thumbnail(io.BytesIO(entry.read()), size)
+                    return img, (None if img is not None else self.WHY_UNDECODABLE)
                 if kind != 'image':
-                    return None
+                    return None, self.WHY_NOT_MEDIA
                 data = entry.read()
             else:
-                return None
+                return None, self.WHY_UNREADABLE
         except Exception:
-            return None
-        return _image_thumbnail(data, ext, size)
+            return None, self.WHY_UNREADABLE
+        img = _image_thumbnail(data, ext, size)
+        return img, (None if img is not None else self.WHY_UNDECODABLE)
 
     def run(self):
         use_cache = bool(self.cache_dir)
@@ -1239,6 +1274,7 @@ class ThumbnailWorker(QThread):
                     for ui_path in batch:
                         loc = self._locate(ui_path, _view)
                         if loc is None:
+                            self.thumbnail_failed.emit(ui_path, self.WHY_UNREADABLE)
                             continue
                         physical, file_size, entry, real_path = loc
                         ext = os.path.splitext(physical)[1].lower()
@@ -1256,8 +1292,9 @@ class ThumbnailWorker(QThread):
                             pool.shutdown(wait=False, cancel_futures=True)
                             return
                         ui_path, file_size = futures[fut]
-                        img = fut.result()
+                        img, why = fut.result()
                         if img is None:
+                            self.thumbnail_failed.emit(ui_path, why or self.WHY_UNDECODABLE)
                             continue
                         self.thumbnail_ready.emit(ui_path, img)
                         if db is not None:
@@ -2317,10 +2354,10 @@ class MediaViewerMixin:
         self._media_sort_desc   = sort_desc
         self._update_media_status_text()
 
-        self._media_zip_info_map = {
-            self._adapter.resolve(p): self.full_metadata.get(p, {}).get('size', 0)
-            for p in media_paths
-        }
+        # Built per fetched page (_media_zip_info_for), not here for every
+        # media file: 31,696 lookups (IOS17 Selected Only mobile/) were a
+        # visible part of the freeze when the grid filled.
+        self._media_zip_info_map = {}
         # Embedded-media hits browsed via their container's own File
         # Browser folder (as opposed to the standalone "Embedded Media"
         # button, which already passes real absolute paths and needs no
@@ -2660,7 +2697,7 @@ class MediaViewerMixin:
         self._media_page_prev_btn.setEnabled(page_index > 0)
         self._update_media_next_button_enabled()
 
-        to_fetch = [p for p in page_items if not self._media_delegate.has_pixmap(p)]
+        to_fetch = [p for p in page_items if not self._media_delegate.has_result(p)]
         if paginated:
             if to_fetch:
                 self._media_page_label.setText(
@@ -2674,9 +2711,10 @@ class MediaViewerMixin:
         if to_fetch:
             worker = ThumbnailWorker(
                 self.zip_path, to_fetch, self._adapter.resolve, THUMB_SIZE,
-                self._media_zip_info_map, cache_dir=self._case_dir,
+                self._media_zip_info_for(to_fetch), cache_dir=self._case_dir,
                 local_path_overrides=self._media_local_overrides)
             worker.thumbnail_ready.connect(self._on_thumbnail_ready)
+            worker.thumbnail_failed.connect(self._on_thumbnail_failed)
             worker.finished_all.connect(self._on_page_decode_finished)
             self._thumb_worker = worker
             worker.start()
@@ -2721,18 +2759,25 @@ class MediaViewerMixin:
             return   # already on the last page
         next_end = min(total, next_start + page_size)
         next_items = self._media_all_paths[next_start:next_end]
-        to_fetch = [p for p in next_items if not self._media_delegate.has_pixmap(p)]
+        to_fetch = [p for p in next_items if not self._media_delegate.has_result(p)]
         if not to_fetch:
             return
 
         self._retire_worker(self._media_page_prefetch_worker)
         worker = ThumbnailWorker(
             self.zip_path, to_fetch, self._adapter.resolve, THUMB_SIZE,
-            self._media_zip_info_map, cache_dir=self._case_dir,
+            self._media_zip_info_for(to_fetch), cache_dir=self._case_dir,
             local_path_overrides=self._media_local_overrides)
         worker.thumbnail_ready.connect(self._on_prefetch_thumbnail_ready)
+        worker.thumbnail_failed.connect(self._media_delegate.set_failed)
         self._media_page_prefetch_worker = worker
         worker.start()
+
+    def _media_zip_info_for(self, ui_paths) -> dict:
+        """{physical name: size} for the files one ThumbnailWorker fetches
+        (a page, at most _media_page_size), the cache check's size key."""
+        resolve, meta = self._adapter.resolve, self.full_metadata
+        return {resolve(p): meta.get(p, {}).get('size', 0) for p in ui_paths}
 
     def _on_prefetch_thumbnail_ready(self, ui_path, img) -> None:
         self._media_delegate.set_pixmap(ui_path, QPixmap.fromImage(img))
@@ -2981,6 +3026,15 @@ class MediaViewerMixin:
         self._media_delegate.set_pixmap(ui_path, QPixmap.fromImage(img))
         idx = self._media_model.index(row)
         self._media_model.dataChanged.emit(idx, idx)
+
+    def _on_thumbnail_failed(self, ui_path, why):
+        """No thumbnail for this file: the tile says why (see
+        MediaGridDelegate._failed) instead of staying blank."""
+        self._media_delegate.set_failed(ui_path, why)
+        row = self._media_model.row_of(ui_path)
+        if row is not None:
+            idx = self._media_model.index(row)
+            self._media_model.dataChanged.emit(idx, idx)
 
     def _on_media_item_clicked(self, index) -> None:
         """A plain click behaves as it always has (select just this one

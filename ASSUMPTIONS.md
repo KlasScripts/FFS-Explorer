@@ -891,6 +891,30 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
   with main-archive files; every member of those 403 groups shares one MD5
   (independent check); main-archive groups otherwise identical (11,875).
 - EXIF/video metadata already had its own route for unpacked files.
+- **Process Case on a later run** *(Decision, owner request, 2026-11-01;
+  checked on a copy of IOS17 with 1,018 unpacked archives).*
+  - Stage order: integrity → header scan → nested archives → LevelDB
+    indexing → embedded media → EXIF → duplicates. Every stage that reads
+    files comes after unpacking (LevelDB used to run first).
+  - A stage starts ticked only if it hasn't completed for this case (run
+    log; LevelDB's index marker; for EXIF on an older case, stored
+    results). The examiner ticks it to redo it.
+  - A run that unpacks new archives re-ticks LevelDB indexing, EXIF and
+    duplicates for that run, and the embedded-media sweep if the case has
+    had one (it scans only files it hasn't seen). A header-tier upgrade
+    re-ticks EXIF and the sweep if done before (more files may now be
+    pictures or databases).
+  - The header check of unpacked files is the typing at unpack time above;
+    the dialog reports it ("Header check of all N unpacked files: … by
+    extension, … from their content, … unknown"). It is not re-run at the
+    case's tier: everywhere in the app an extension's own type wins and the
+    header result is used only for an unknown extension, at every tier, so
+    a re-check could change no Type shown.
+  - Cancelling archive selection, or finding no archives, carries on with
+    the later stages (they used to be skipped).
+- **Not supported:** a LevelDB/IndexedDB folder inside an unpacked archive.
+  Unpacked files are shown flat under their archive, so no such folder is
+  detected, and LevelDB indexing reads only the main archive.
 
 **A-75. Web cache records (any app) show their media as children.**
 *Decision (owner) + Confirmed (real), 2026-10-22.*

@@ -65,6 +65,12 @@ def _zip(entries):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
         for name, data in entries:
+            if "\\" in name:
+                # ZipInfo turns "\" into "/" on Windows; set the name after
+                # it so the archive holds the bytes given on every platform.
+                info = zipfile.ZipInfo(name)
+                info.filename = name
+                name = info
             zf.writestr(name, data)
     return buf.getvalue()
 

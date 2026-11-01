@@ -76,7 +76,7 @@ Same grouping as CLAUDE.md's module table.
 | `device_timezone.py` | 🔴 | | |
 | `keyword_search.py` | 🔴 | | |
 | `hex_viewer.py` | 🔴 | | |
-| `media_viewer.py` | 🔴 | | |
+| `media_viewer.py` | 🔴 | | Orientation machine-checked 2026-11-01 against iOS's own PhotoData thumbnails on IOS17, on Windows and on macOS (A-64): `_image_thumbnail`, `_load_qimage` and `_video_thumbnail` right way up for every camera-roll file with an iOS thumbnail (303 of 305). Decode functions only; the Media Browser window was not clicked through. NOT yet human-reviewed |
 | `sqlite_viewer.py` | 🔴 | | |
 | `segb_viewer.py` | 🔴 | | |
 | `leveldb_viewer.py` | 🔴 | | Rearchitected 2026-09-19 (was a separate LevelDB tab, 2026-09-18) -- injects real LevelDB records as virtual files directly into the file browser (same mechanism as extracted nested archives), auto-decoded on first navigation, persists across case reopen. Machine-verified: real 9-file to 522-record decode + idempotency + reopen-persistence (fresh instance, same case_dir) + raw-files peek restore, all against the real Android 14 JoshHickman Chrome Local Storage directory; a synthetic bplist-valued record driven through the real preview method. NOT yet human-reviewed |

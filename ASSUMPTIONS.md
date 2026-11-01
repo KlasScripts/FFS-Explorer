@@ -1046,6 +1046,10 @@ full-size view, `_image_thumbnail` / `_video_thumbnail` for thumbnails.**
   can still show the picture from before an edit.
 - Checked against iOS's own PhotoData thumbnails on IOS17: HEIC 139/139,
   JPEG 116/116, video 14/14 the right way up.
+- Checked again on macOS (2026-11-01), where HEIC is decoded by the
+  system's own codec through Qt, not `pillow_heif`: thumbnail and full-size
+  view both right way up for HEIC 139/139, JPEG 116/116 and PNG 34/34;
+  video thumbnails 14/14.
 - Until v0.50.16, HEIC photos were rotated twice on Windows (73 of 137
   sideways) and video rotation was ignored (3 of 14 sideways). Thumbnails
   cached before the fix are deleted once per case (`_THUMB_CACHE_LOGIC`).

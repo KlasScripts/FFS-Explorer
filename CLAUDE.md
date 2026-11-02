@@ -151,7 +151,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 
 | File | What it is |
 |---|---|
-| `adapters/ffs.py` | `FfsAdapter`: format/platform detection, path resolution, `container_parents()`, `is_android()`, `build_app_registry()`, scan-rule accessors. |
+| `adapters/ffs.py` | `FfsAdapter`: format/platform detection, path resolution, `container_parents()`, `is_android()`, `is_ios_system_entry()` (the iOS system partition is not included, A-82), `build_app_registry()`, scan-rule accessors. |
 | `adapters/graykey.py` | GrayKey zip metadata (timestamps/xattrs from extra fields); UT/UX parsers also used for `zip_extras`. |
 | `csstore.py` | Vendored (MIT) Apple LaunchServices csstore parser, the main source of iOS's `app_registry`. |
 | `ffs_metadata.py` | Qt-free first-open parsing (child process); msgpack snapshot pack/unpack; `load_snapshot_from_case`. |

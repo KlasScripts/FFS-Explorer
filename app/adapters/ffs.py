@@ -586,6 +586,34 @@ class FfsAdapter:
             return f"{self.user_prefix}/private/var/{'/'.join(parts)}"
         return f"{self.user_prefix}/{'/'.join(parts)}"
 
+    def is_ios_system_entry(self, physical: str) -> bool:
+        """True for a zip entry in the iOS SYSTEM partition, which this app
+        does not include (owner decision, ASSUMPTIONS.md A-82): not listed,
+        not processed, not searched. Only meaningful for an iOS archive;
+        callers check the platform (an Android archive has no such rule).
+        - GrayKey: everything not under /private/var/.
+        - Cellebrite, newer layout: everything under the system partition's
+          own filesystemN/ (the user partition has its own).
+        - Cellebrite, old layout: one filesystemN/ holds both, so everything
+          in it that is not under private/var/.
+        Entries of neither partition (Cellebrite's extra/KeychainDump,
+        Log.txt, metadataN/) are not system entries."""
+        name = physical.lstrip('/')
+        if self.format == self.FORMAT_GRAYKEY:
+            return not (name.startswith('private/var/')
+                        or name.rstrip('/') in ('', 'private', 'private/var'))
+        if self.format != self.FORMAT_CELLEBRITE:
+            return False
+        if not self.old_layout:
+            return (self.sys_prefix != self.user_prefix
+                    and name.startswith(self.sys_prefix + '/'))
+        root = self.user_prefix + '/'
+        if not name.startswith(root):
+            return False
+        rest = name[len(root):]
+        return not (rest.startswith('private/var/')
+                    or rest.rstrip('/') in ('', 'private', 'private/var'))
+
     # ── Candidate-path generators ─────────────────────────────────────────────
 
     def ui_path_for(self, path: str, zip_names=None) -> str:
@@ -989,6 +1017,11 @@ class FfsAdapter:
         old-layout 'private/var/' infix.  Called by ZipMetadataWorker when a
         local .zcd cache is available so the scan runs over in-memory data
         rather than requiring a network seek.
+
+        Old layout: only entries under filesystemN/private/var/. The system
+        partition shares that filesystemN/ and is not included (A-82); it
+        used to be listed with paths resolve() could not find (IOS17:
+        356,567 entries, System/, Applications/, usr/...).
         """
         prefix    = self.user_prefix + '/'
         old_strip = (prefix + 'private/var/') if self.old_layout else None
@@ -1000,7 +1033,9 @@ class FfsAdapter:
             phys = entry.rstrip('/')
             if not phys.startswith(prefix):
                 continue
-            ui_path = (phys.removeprefix(old_strip) if old_strip and phys.startswith(old_strip)
+            if old_strip and not phys.startswith(old_strip):
+                continue    # the system partition (A-82)
+            ui_path = (phys.removeprefix(old_strip) if old_strip
                        else phys.removeprefix(prefix))
             if ui_path:
                 result[ui_path] = phys
@@ -1047,6 +1082,12 @@ class FfsAdapter:
                 _emit("Cellebrite Android archive detected — reading metadata...")
                 guid_to_bundle = {}
             ui_metadata = self.load_metadata(zip_path, z)
+            if self.format == self.FORMAT_GRAYKEY and _is_gk_ios:
+                # The iOS system partition is not included (A-82): GrayKey
+                # iOS zips carry a few hundred files of it (IOS18 CTF25: 271
+                # of 148,120 entries, e.g. Applications/MobileSMS.app/...).
+                ui_metadata = {k: v for k, v in ui_metadata.items()
+                               if not self.is_ios_system_entry(k)}
             annotate_captures(ui_metadata)
             return ui_metadata, guid_to_bundle, frozenset(ui_metadata.keys())
 

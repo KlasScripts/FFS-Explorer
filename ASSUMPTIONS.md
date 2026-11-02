@@ -155,6 +155,42 @@ appear as just `mobile` and `root`. This matters when importing paths from
 other tools such as Griffeye; see `ios_path_candidates` in
 `app/spreadsheet_import.py`.
 
+- The old layout also keeps the **system partition** in the same
+  `filesystemN/` and the same `metadata.msgpack` (no `private/var/`). It is
+  not included: see A-82.
+
+**A-82. The iOS system partition is not included.** *Decision (owner,
+2026-11-02): it seldom holds anything of forensic use. Confirmed (real) on
+IOS17 JoshHickman and IOS18 CTF25 Magnet.*
+- **Not listed, processed or searched**, on any iOS layout: it is not in the
+  File Browser, header scan, nested archives, LevelDB, embedded media, EXIF,
+  duplicates or Keyword Search ("all files").
+  `FfsAdapter.is_ios_system_entry` is the one rule.
+  - Cellebrite, newer layout: everything under the system partition's own
+    `filesystemN/` (only `metadata2`, the user partition, was ever read).
+  - Cellebrite, old layout: in the shared `filesystemN/`, everything not
+    under `private/var/` (`build_zip_entries`). Before, these were listed
+    with paths `resolve()` couldn't find: IOS17 listed 830,291 entries,
+    356,566 of them system (`System/`, `Applications/`, `Library/`,
+    `usr/`, …), shown as files that couldn't be previewed. Now 473,724.
+  - GrayKey iOS: everything not under `/private/var/` (IOS18 CTF25: 271 of
+    148,120 entries, e.g. `Applications/MobileSMS.app/…`).
+- **Not affected:**
+  - Android (GrayKey Android CTF26: all 171,462 entries still listed);
+  - Cellebrite's own extras (`extra/KeychainDump`, `Log.txt`), which stay
+    searchable;
+  - the integrity check (it hashes the whole zip);
+  - device information, which reads `System/…/SystemVersion.plist` through
+    its own lookup (`system_candidates`).
+- **Consequences:**
+  - "Tier 3" and the embedded-media "Whole user partition" scope mean the
+    whole user partition, not the whole archive (the app's wording says so).
+  - Signs of jailbreaking or sideloading kept in the system partition
+    (`/Applications/Cydia.app`, `/Library/MobileSubstrate`,
+    `/usr/bin/ssh`, `/etc/apt`) are not shown.
+  - A case processed before this keeps its old list until it is rebuilt:
+    load snapshot version 4 makes the next open re-parse once.
+
 **A-7. Cellebrite shortens some path segments in the zip itself
 ("truncation").** *Code only; the cause is not recorded anywhere (Q1).*
 - In Cellebrite iOS archives, some path segments look different in
@@ -176,7 +212,9 @@ other tools such as Griffeye; see `ios_path_candidates` in
     last group is only 12 characters.
 - Risk: any genuine filename on the device matching the pattern
   `…-<32+ hex>` would also be shortened by `resolve()`, and then not found in
-  the zip. *Unverified whether such names occur.*
+  the zip. *Confirmed (real), 2026-11-02:* IOS17 has 491 such entries, e.g.
+  Google's `CCTClearcutLogger/0/103-com.google.Maps-536876c5cd1732fafc3dcc35b94ce4d6/…`;
+  they are listed but can't be read. Not yet fixed.
 - Applies only to `cellebrite`. GrayKey and `zip_extras` paths are used as-is.
 
 **A-8. iOS app containers are GUID-named; Android ones are package-named.**

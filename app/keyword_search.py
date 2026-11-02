@@ -245,9 +245,12 @@ class KeywordSearchWorker(QThread):
     def __init__(self, zip_path: str, keyword: str,
                  entries=None, scope="all",
                  exclude_prefixes: tuple = (), case_dir: str | None = None,
-                 delta: int | None = None, parent=None):
+                 delta: int | None = None, exclude_entry=None, parent=None):
         super().__init__(parent)
         self.zip_path          = zip_path
+        # Optional callable(zip entry name) -> True to leave an entry out of
+        # an "all" search: the iOS system partition (A-82).
+        self._exclude_entry    = exclude_entry
         self.keyword           = keyword.encode('utf-8', errors='replace')
         self._stop             = threading.Event()
         self._prebuilt_entries = entries
@@ -284,10 +287,12 @@ class KeywordSearchWorker(QThread):
             self.entries = full_entries
             if self._scope == "app_data":
                 entries = [e for e in full_entries if "mobile/Containers" in e[0] or "data/data" in e[0]]
-            elif self._exclude_prefixes:
+            elif self._exclude_prefixes or self._exclude_entry:
+                skip = self._exclude_entry
                 entries = [e for e in full_entries
                            if not any(e[0].lstrip('/').startswith(p)
-                                      for p in self._exclude_prefixes)]
+                                      for p in self._exclude_prefixes)
+                           and not (skip and skip(e[0]))]
             else:
                 entries = full_entries
         self.status_update.emit(f"Index ready — {len(entries):,} files to search")
@@ -1511,20 +1516,29 @@ class KeywordSearchMixin:
             )
             return entries, nested_map, "App Data", None
 
-        # "all" — exclude Cellebrite internal metadata entries
+        # "all" — exclude Cellebrite internal metadata entries, and on iOS the
+        # system partition, which is not included anywhere (A-82)
         exclude = (
             _CELLEBRITE_META_PREFIXES
             if self._adapter.format == FfsAdapter.FORMAT_CELLEBRITE
             else ()
         )
-        if self._search_entries is not None and exclude:
+        system = self._ios_system_entry_check()
+        if self._search_entries is not None and (exclude or system):
             entries = [e for e in self._search_entries
-                       if not any(e[0].lstrip('/').startswith(p) for p in exclude)]
+                       if not any(e[0].lstrip('/').startswith(p) for p in exclude)
+                       and not (system and system(e[0]))]
         elif self._search_entries is not None:
             entries = self._search_entries
         else:
             entries = None
         return entries, nested_map, "all files", None
+
+    def _ios_system_entry_check(self):
+        """FfsAdapter.is_ios_system_entry for an iOS archive, else None."""
+        if self._adapter is None or self._adapter.is_android(getattr(self, 'folder_map', None)):
+            return None
+        return self._adapter.is_ios_system_entry
 
     def _get_ui_paths_for_search_scope(self, group_id: int) -> list:
         """Return ui_paths for all entries in a bookmark group."""
@@ -2689,6 +2703,7 @@ class KeywordSearchMixin:
             entries=scoped_entries,
             scope=worker_scope,
             exclude_prefixes=worker_exclude,
+            exclude_entry=self._ios_system_entry_check() if worker_scope == 'all' else None,
             case_dir=self._case_dir,
             delta=getattr(self, '_local_extra_delta', None))
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)

@@ -1061,7 +1061,7 @@ def _format_tool_ts_local(iso_str: str) -> str:
 _HEADER_SCAN_TIER_LABELS = {
     1: "Tier 1 — unknown-extension files, app/user-accessible areas",
     2: "Tier 2 — all files, app/user-accessible areas (includes Tier 1)",
-    3: "Tier 3 — all files, everywhere (exhaustive — can take a very long time)",
+    3: "Tier 3 — all files, whole user partition (exhaustive — can take a very long time)",
 }
 
 # Per-tier "checked" / "not checked" split, added 2026-09-22 for the
@@ -1188,7 +1188,7 @@ def _show_scan_folders_dialog(parent, adapter) -> None:
     intro = QLabel(
         "A folder-scoped scan tier only reads bytes from files inside "
         "these folders — anywhere else keeps its plain extension-based "
-        "type unless the \"all files, everywhere\" tier is used.")
+        "type unless the \"all files, whole user partition\" tier is used.")
     intro.setWordWrap(True)
     lay.addWidget(intro)
     folder_list = QListWidget()
@@ -6021,7 +6021,7 @@ class ProcessDialog(QDialog):
         embedded_scope_row.setContentsMargins(22, 0, 0, 0)
         self._embedded_scope_group = QButtonGroup(self)
         self._rb_embedded_scope_app = QRadioButton("App/user-accessible areas only")
-        self._rb_embedded_scope_all = QRadioButton("Everywhere (exhaustive)")
+        self._rb_embedded_scope_all = QRadioButton("Whole user partition (exhaustive)")
         self._rb_embedded_scope_app.setChecked(True)
         self._embedded_scope_group.addButton(self._rb_embedded_scope_app, 0)
         self._embedded_scope_group.addButton(self._rb_embedded_scope_all, 1)
@@ -12799,7 +12799,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         0: "Header scan: Off (extension-based typing only)",
         1: "Header scan: Tier 1 — unknown-extension files, app/user-accessible areas",
         2: "Header scan: Tier 2 — all files, app/user-accessible areas",
-        3: "Header scan: Tier 3 — all files, everywhere",
+        3: "Header scan: Tier 3 — all files, whole user partition",
     }
 
     # Same dict object as the module-level _HEADER_SCAN_TIER_COVERAGE

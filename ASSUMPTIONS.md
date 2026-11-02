@@ -191,31 +191,25 @@ IOS17 JoshHickman and IOS18 CTF25 Magnet.*
   - A case processed before this keeps its old list until it is rebuilt:
     load snapshot version 4 makes the next open re-parse once.
 
-**A-7. Cellebrite shortens some path segments in the zip itself
-("truncation").** *Code only; the cause is not recorded anywhere (Q1).*
-- In Cellebrite iOS archives, some path segments look different in
-  `metadata.msgpack` (the manifest) and in the zip.
-  - Manifest: `<readable part>-<32 or more hex characters>`.
-  - Zip: only the trailing hex characters.
-- `resolve()` reproduces this. Any ui_path segment containing `-` whose part
-  after the last `-` is at least 32 hex characters is cut down to that hex
-  part.
-- Consequences:
-  - The tree and the file browser are built from the **zip's** names (see
-    A-9), so the examiner sees the shortened hex form, not the readable name
-    in the manifest.
-  - To attach manifest metadata to these entries, `build_ui_metadata()` builds
-    a second index keyed by `resolve(manifest key)` (`guid_meta`).
-  - A path that already holds only the hex form passes through `resolve()`
-    unchanged.
-  - A normal iOS container GUID (`8-4-4-4-12` hex) is never shortened: its
-    last group is only 12 characters.
-- Risk: any genuine filename on the device matching the pattern
-  `…-<32+ hex>` would also be shortened by `resolve()`, and then not found in
-  the zip. *Confirmed (real), 2026-11-02:* IOS17 has 491 such entries, e.g.
-  Google's `CCTClearcutLogger/0/103-com.google.Maps-536876c5cd1732fafc3dcc35b94ce4d6/…`;
-  they are listed but can't be read. Not yet fixed.
-- Applies only to `cellebrite`. GrayKey and `zip_extras` paths are used as-is.
+**A-7. Cellebrite names ending in `-<32+ hex>` are stored in full.**
+*Confirmed (real), 2026-11-02; Decision (owner), 2026-11-02.*
+- Until 2026-11-02 `resolve()` shortened any segment `<name>-<32+ hex>` to
+  its hex part, assuming Cellebrite did the same in the zip; the cause was
+  never recorded. `build_ui_metadata()` also attached manifest metadata
+  through that shortened form (`guid_meta`).
+- Checked 2026-11-02:
+  - IOS17 (old layout): 509 such names; every one is stored in the zip under
+    its full name, none shortened.
+  - iOS 16.5 CTF23 (newer layout): 2,003 such names, the same.
+  - On both, no listed entry's metadata depended on the shortened form.
+- The shortening made 491 IOS17 entries unreadable (Google's
+  `CCTClearcutLogger/0/103-com.google.Maps-536876c5cd1732fafc3dcc35b94ce4d6/…`
+  and similar), and about 2,000 on iOS 16.5. It was removed: `resolve()`
+  now only adds the partition prefix, and `guid_meta` is gone.
+- Risk: an older Cellebrite version that did shorten would show these
+  entries with their hex name only. They would still open (the tree is built
+  from the zip's names, A-9), but would get no manifest metadata.
+- GrayKey and `zip_extras` paths were always used as-is.
 
 **A-8. iOS app containers are GUID-named; Android ones are package-named.**
 *Confirmed (real).*
@@ -1343,8 +1337,8 @@ Recorded here; not yet applied.
    `FORMAT_ZIP_EXTRAS`. That is only layout D1; layout D2 detects as
    `cellebrite` (A-2).
 2. **`FFS_processing.md`** says Cellebrite physical entries "contain
-   32-character hex suffixes". The reverse is true: the msgpack key carries
-   `<name>-<hex>`, while the zip stores only `<hex>` (A-7).
+   32-character hex suffixes". On the archives checked, the zip and the
+   msgpack both carry the full `<name>-<hex>`; nothing is shortened (A-7).
 3. **`FFS_processing.md`** refers to a `StreamingZipIndex`, which no longer
    exists in the code.
 4. **`FFS_processing.md`** says GrayKey Android gets a GUID mapping "if app
@@ -1355,9 +1349,9 @@ Recorded here; not yet applied.
 
 ## 18. Open questions for the examiner
 
-- **Q1.** Why does Cellebrite shorten `<name>-<32+ hex>` segments to the hex
-  part in the zip (A-7)? Which real folders does it apply to, and is the
-  readable part useful to show the examiner?
+- ~~**Q1.** Why does Cellebrite shorten `<name>-<32+ hex>` segments to the hex
+  part in the zip (A-7)?~~ Answered 2026-11-02: it doesn't, on IOS17 or
+  iOS 16.5 CTF23; the shortening was removed (A-7).
 - **Q2.** For a Cellebrite Android archive in the `filesystemN/` layout (D2):
   - Which `filesystemN` holds the user data?
   - Does it have a `metadata.msgpack`?

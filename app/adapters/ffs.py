@@ -555,10 +555,11 @@ class FfsAdapter:
     def resolve(self, ui_path: str) -> str:
         """Map a ui_path (as stored in metadata) to its physical zip entry path.
 
-        For GrayKey this is a simple prefix prepend.
-        For Cellebrite, GUID-style path segments (containing a 32-char hex
-        suffix after the last '-') are reduced to that suffix alone, matching
-        the physical layout inside the zip.
+        Always a plain prefix: the ui_path is the zip name minus the
+        partition prefix, so no segment is rewritten. (Until 2026-11-02
+        Cellebrite segments '<name>-<32+ hex>' were cut down to the hex part;
+        on the real archives the zip holds the full name, so those files
+        could not be read; ASSUMPTIONS.md A-7.)
         """
         if self.format == self.FORMAT_GRAYKEY:
             return "/" + ui_path
@@ -566,25 +567,9 @@ class FfsAdapter:
         if self.format == self.FORMAT_ZIP_EXTRAS:
             return f"{self.user_prefix}/{ui_path}"
 
-        # Fast path: no '-' means no GUID segments (covers ~90% of paths)
-        if '-' not in ui_path:
-            if self.old_layout:
-                return f"{self.user_prefix}/private/var/{ui_path}"
-            return f"{self.user_prefix}/{ui_path}"
-
-        parts = []
-        for part in ui_path.split("/"):
-            if "-" in part:
-                suffix = part.split("-")[-1]
-                if len(suffix) >= 32 and all(
-                    c in "0123456789abcdefABCDEF" for c in suffix
-                ):
-                    parts.append(suffix)
-                    continue
-            parts.append(part)
         if self.old_layout:
-            return f"{self.user_prefix}/private/var/{'/'.join(parts)}"
-        return f"{self.user_prefix}/{'/'.join(parts)}"
+            return f"{self.user_prefix}/private/var/{ui_path}"
+        return f"{self.user_prefix}/{ui_path}"
 
     def is_ios_system_entry(self, physical: str) -> bool:
         """True for a zip entry in the iOS SYSTEM partition, which this app
@@ -1104,19 +1089,6 @@ class FfsAdapter:
         _emit("Reading metadata.msgpack...")
         raw_data = self.load_metadata(zip_path, z)
 
-        _emit("Building GUID enrichment index…")
-        # resolve() is only needed for GUID-containing paths (those with a
-        # 32-char hex suffix after the last '-').  That's ~10k out of 500k
-        # entries.  All other ui_paths are identical to the msgpack key so
-        # raw_data can be queried directly, eliminating ~490k resolve() calls
-        # and one full in-memory copy of the metadata dict.
-        guid_meta: dict = {}
-        for i, (k, v) in enumerate(raw_data.items()):
-            if i % _YIELD_EVERY == 0:
-                time.sleep(0)
-            if '-' in k:
-                guid_meta[self.resolve(k)] = v
-
         # Pass 1 — discover: the zip central directory is the single source of
         # truth for what exists.  Directory records (entry[-1]=='/') are normalised
         # by stripping the trailing slash so they contribute folder metadata from
@@ -1134,14 +1106,10 @@ class FfsAdapter:
         # exist as far as the browser is concerned — no "Not in Zip" entries.
         _emit("Merging zip and msgpack metadata…")
         ui_metadata: dict = {}
-        for i, (ui_path, phys) in enumerate(_zip_entries.items()):
+        for i, ui_path in enumerate(_zip_entries):
             if i % _YIELD_EVERY == 0:
                 time.sleep(0)
-            ui_metadata[ui_path] = (
-                raw_data.get(ui_path)
-                or (guid_meta.get(phys) if '-' in ui_path else None)
-                or {}
-            )
+            ui_metadata[ui_path] = raw_data.get(ui_path) or {}
 
         annotate_captures(ui_metadata)
         return ui_metadata, guid_to_bundle, zip_ui_paths

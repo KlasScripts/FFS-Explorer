@@ -40,6 +40,20 @@ def test_graykey():
     assert not a.is_ios_system_entry('private')
 
 
+def test_cellebrite_name_ending_in_long_hex_is_kept_whole():
+    """A-7: IOS17 and iOS 16.5 store '<name>-<32 hex>' folders under their
+    full name; resolve() used to cut them to the hex part (491 IOS17 Google
+    Maps entries could not be read)."""
+    seg = '103-com.google.Maps-536876c5cd1732fafc3dcc35b94ce4d6'
+    ui = f'mobile/Containers/Shared/AppGroup/1CF6EE80-D14C-48ED-8CB1-AEC8FB8BE0FC/CCTClearcutLogger/0/{seg}/context'
+    old = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, 'filesystem1', 'filesystem1', old_layout=True)
+    assert old.resolve(ui) == f'filesystem1/private/var/{ui}'
+    new = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, 'filesystem2', 'filesystem1')
+    assert new.resolve(ui) == f'filesystem2/{ui}'
+    listed = old.build_zip_entries(frozenset([f'filesystem1/private/var/{ui}']))
+    assert all(old.resolve(u) == p for u, p in listed.items())
+
+
 def test_android_layout_has_no_rule():
     a = FfsAdapter(FfsAdapter.FORMAT_ZIP_EXTRAS, 'Dump', '')
     assert not a.is_ios_system_entry('Dump/system/build.prop')

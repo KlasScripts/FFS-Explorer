@@ -22,6 +22,9 @@ compare reports, per output, equal or the differences. Two runs of the same
 code give the volatile fields (run times, temp paths); compare lists any
 difference, and volatile.json in <out> names the fields to leave out, with
 the reason, so nothing is excluded silently.
+An archive whose run is missing, or has a step that failed or never ran, is
+reported NOT COMPARED, and the result is INCOMPLETE (exit 2), never
+IDENTICAL; DIFFERENT exits 1, IDENTICAL 0.
 """
 
 from __future__ import annotations
@@ -458,13 +461,42 @@ def _load(path):
         return None
 
 
-def compare(out, a, b, show=5):
+_STEPS = ("open_cold", "session", "parsers", "dump")
+
+
+def _run_problem(out, label, run_id):
+    """Why *run_id* of *label* can't be compared, or None: the run is
+    missing, or one of its steps failed or never ran (its outputs would be
+    partial, and comparing them could look like a real difference, or
+    like none)."""
+    base = os.path.join(out, label, run_id)
+    if not os.path.isdir(base):
+        return "no such run"
+    steps = (_load(os.path.join(base, "summary.json")) or {}).get("steps", {})
+    bad = [f"{s} {'did not run' if s not in steps else 'rc=' + str(steps[s]['rc'])}"
+           for s in _STEPS if steps.get(s, {}).get("rc") != 0]
+    return ", ".join(bad) or None
+
+
+def compare(out, a, b, show=5) -> int:
+    """Print the differences between runs *a* and *b* on every archive that
+    has either. Returns 0 when every such archive was compared and is
+    identical, 1 when anything differs, 2 when an archive could not be
+    compared (a run missing or incomplete) or no archive has either run;
+    nothing is reported identical that was not actually compared."""
     volatile = _load(os.path.join(out, "volatile.json")) or {}
     any_diff = False
+    compared, skipped = 0, []
     for label in sorted(os.listdir(out)):
-        da, db_ = os.path.join(out, label, a, "outputs"), os.path.join(out, label, b, "outputs")
-        if not (os.path.isdir(da) and os.path.isdir(db_)):
+        if not (os.path.isdir(os.path.join(out, label, a)) or os.path.isdir(os.path.join(out, label, b))):
             continue
+        problems = [f"{r}: {p}" for r, p in ((a, _run_problem(out, label, a)), (b, _run_problem(out, label, b))) if p]
+        if problems:
+            print(f"== {label}\n  NOT COMPARED ({'; '.join(problems)})")
+            skipped.append(label)
+            continue
+        compared += 1
+        da, db_ = os.path.join(out, label, a, "outputs"), os.path.join(out, label, b, "outputs")
         names = sorted({f for f in os.listdir(da) if f.endswith(".gz")} | {f for f in os.listdir(db_) if f.endswith(".gz")}
                        | {"reports/" + f for f in os.listdir(os.path.join(da, "reports"))}
                        | {"reports/" + f for f in os.listdir(os.path.join(db_, "reports"))})
@@ -487,7 +519,13 @@ def compare(out, a, b, show=5):
             ta, tb = _load(os.path.join(out, label, a, f"{step}.json")), _load(os.path.join(out, label, b, f"{step}.json"))
             if ta and tb:
                 print(f"  timing {step}: {_timing(ta)}  ->  {_timing(tb)}")
-    print("IDENTICAL" if not any_diff else "DIFFERENT")
+    if skipped or not compared:
+        print(f"INCOMPLETE: {compared} archive(s) compared"
+              + (f", not compared: {', '.join(skipped)}" if skipped else f"; no archive in {out} has run {a} or {b}")
+              + (" (the compared ones differ)" if any_diff else ""))
+        return 2
+    print(f"{'DIFFERENT' if any_diff else 'IDENTICAL'} ({compared} archive(s) compared)")
+    return 1 if any_diff else 0
 
 
 def _read(path, skip):
@@ -539,7 +577,7 @@ def main():
     if args.cmd == "run":
         run(os.path.expanduser(args.out), args.run, args.archive or list(ARCHIVES))
     else:
-        compare(os.path.expanduser(args.out), args.a, args.b)
+        sys.exit(compare(os.path.expanduser(args.out), args.a, args.b))
 
 
 if __name__ == "__main__":

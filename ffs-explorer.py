@@ -10442,6 +10442,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 vsb = self.tree_view.verticalScrollBar()
                 vsb.setValue(max(vsb.minimum(), vsb.value() - 1))
 
+        # A mouse click: the row is already on screen under the pointer.
+        # Moving sideways here (to show the parent's start) and then
+        # _on_tree_clicked putting the click-time position back made the
+        # view jerk left then right on every click (reported 2026-11-02).
+        if getattr(self, '_tree_mouse_press', False):
+            return
+
         parent_item = item.parent()
         if parent_item is None:
             return  # top-level root ("/ [Full Filesystem]" / "Selected Only") has no parent to show
@@ -10510,6 +10517,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._update_tree_column()
         if obj is self.tree_view.viewport() and event.type() == event.Type.MouseButtonPress:
             self._tree_click_hpos = self.tree_view.horizontalScrollBar().value()
+            # The press changes the current item synchronously, inside this
+            # same event; the flag is cleared as soon as it has been handled.
+            self._tree_mouse_press = True
+            QTimer.singleShot(0, lambda: setattr(self, '_tree_mouse_press', False))
         self._hex_event_filter(obj, event)
         return super().eventFilter(obj, event)
 

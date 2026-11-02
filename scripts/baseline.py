@@ -22,7 +22,8 @@ compare reports, per output, equal or the differences. Two runs of the same
 code give the volatile fields (run times, temp paths); compare lists any
 difference, and volatile.json in <out> names the fields to leave out, with
 the reason, so nothing is excluded silently.
-An archive whose run is missing, or has a step that failed or never ran, is
+An archive whose run is missing, or has a step that failed or never ran, or
+a stage that did not finish ("ok": false, e.g. a timed-out Process Case), is
 reported NOT COMPARED, and the result is INCOMPLETE (exit 2), never
 IDENTICAL; DIFFERENT exits 1, IDENTICAL 0.
 """
@@ -466,15 +467,25 @@ _STEPS = ("open_cold", "session", "parsers", "dump")
 
 def _run_problem(out, label, run_id):
     """Why *run_id* of *label* can't be compared, or None: the run is
-    missing, or one of its steps failed or never ran (its outputs would be
-    partial, and comparing them could look like a real difference, or
-    like none)."""
+    missing, one of its steps failed or never ran, or a GUI step exited
+    normally but a stage in it did not finish (e.g. Process Case or a search
+    hit its time limit: "ok": false in open_cold.json / session.json). Its
+    outputs would be partial, and comparing them could look like a real
+    difference, or like none."""
     base = os.path.join(out, label, run_id)
     if not os.path.isdir(base):
         return "no such run"
     steps = (_load(os.path.join(base, "summary.json")) or {}).get("steps", {})
     bad = [f"{s} {'did not run' if s not in steps else 'rc=' + str(steps[s]['rc'])}"
            for s in _STEPS if steps.get(s, {}).get("rc") != 0]
+    for step in ("open_cold", "session"):
+        if steps.get(step, {}).get("rc") != 0:
+            continue
+        stages = (_load(os.path.join(base, f"{step}.json")) or {}).get("stages")
+        if stages is None:
+            bad.append(f"{step} recorded no stages")
+            continue
+        bad += [f"{step}: {name} did not finish" for name, v in stages.items() if not v.get("ok")]
     return ", ".join(bad) or None
 
 

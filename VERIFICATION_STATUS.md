@@ -76,6 +76,7 @@ Same grouping as CLAUDE.md's module table.
 | `device_timezone.py` | 🔴 | | |
 | `keyword_search.py` | 🔴 | | |
 | `hex_viewer.py` | 🔴 | | |
+| `ios_system_check.py` (+ `_run_system_check`, `_show_system_check_dialog`) | 🔴 | | New 2026-11-02: jailbreak/sideloading signs and system-partition coverage, dialog once per iOS case. Machine-checked: no signs on the three stock test iPhones (IOS17, iOS16.5 CTF23, IOS18 CTF25; /etc/hosts stock on both Cellebrite ones), Androids skipped; synthetic signs found in all three iOS layouts; end-to-end on a synthetic jailbroken archive (dialog before Process Case, once). The path list is from OWASP MASTG plus named additions, not checked against a real jailbroken phone. NOT yet human-reviewed |
 | `media_viewer.py` | 🔴 | | Orientation machine-checked 2026-11-01 against iOS's own PhotoData thumbnails on IOS17, on Windows and on macOS (A-64): `_image_thumbnail`, `_load_qimage` and `_video_thumbnail` right way up for every camera-roll file with an iOS thumbnail (303 of 305). Decode functions only; the Media Browser window was not clicked through. NOT yet human-reviewed |
 | `sqlite_viewer.py` | 🔴 | | |
 | `segb_viewer.py` | 🔴 | | |

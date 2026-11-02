@@ -2081,6 +2081,9 @@ class ZipMetadataWorker(QThread):
     metadata_ready       = Signal(object, object, object, object, object, object, object, object, object)  # ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths, metadata_only_folders
     header_scan_progress = Signal(int)   # remaining (decreasing)
     header_scan_done     = Signal(dict)  # {ui_path: detected_type}
+    # (result dict | None, is_new): ios_system_check's result for this case
+    # (None = not iOS / not checkable); is_new when it was made this open.
+    system_check_ready   = Signal(object, bool)
 
     def __init__(self, zip_path: str, header_scan_tier: int = 0, case_dir: str | None = None):
         super().__init__()
@@ -2114,6 +2117,39 @@ class ZipMetadataWorker(QThread):
             self.status_update.emit(
                 f"Updated {len(summary['names']):,} file names from an older version "
                 f"({n:,} stored paths; see the run log). Rebuilding the folder tree…")
+
+    def _run_system_check(self) -> None:
+        """Signs of jailbreaking or sideloading, and how much of the iOS
+        system partition (not included, A-82) this extraction holds
+        (ios_system_check.py, A-83). Once per case: a stored result is
+        handed over as it is. Needs the case's zip index, so it runs once
+        the .zcd exists."""
+        import ios_system_check
+        import zip_cd_cache
+        if getattr(self, '_system_check_done', False):
+            return
+        self._system_check_done = True
+        try:
+            with closing(_open_results_db(self.case_dir)) as db:
+                stored = ios_system_check.load(db)
+            if stored is not None:
+                self.system_check_ready.emit(stored, False)
+                return
+            infos = zip_cd_cache.load(self.zip_path, self.case_dir)
+            if not infos:
+                return
+            view = zip_cd_cache.CachedZipView(self.zip_path, infos)
+            names = view.namelist()
+            adapter = FfsAdapter.detect(view, frozenset(names))
+            result = ios_system_check.check(names, adapter, lambda n: view.open(n).read())
+            if result is None:
+                self.system_check_ready.emit(None, False)
+                return
+            with closing(_open_results_db(self.case_dir)) as db:
+                ios_system_check.save(db, result)
+            self.system_check_ready.emit(result, True)
+        except Exception as exc:
+            self.status_update.emit(f"Warning: the iOS system check could not run: {exc}")
 
     def _set_ui_extras(self, ui_metadata: dict, folder_map: dict,
                        folder_counts: dict | None = None) -> None:
@@ -2331,6 +2367,7 @@ class ZipMetadataWorker(QThread):
 
             if self.case_dir and _cd_cache_valid(self.zip_path, self.case_dir):
                 self._update_case_names()
+                self._run_system_check()
 
             # Fast path: a previous load of this archive left a snapshot in the
             # cache DB — re-emit it and skip all archive I/O and derivations.
@@ -2358,6 +2395,7 @@ class ZipMetadataWorker(QThread):
                     self.status_update.emit(
                         f"Central directory copied to case folder in {_elapsed:.1f}s.")
                     self._update_case_names()
+                    self._run_system_check()
 
                 # Fast path: offload the heavy parse to a child process.  It
                 # runs on its own interpreter/GIL so the CPU-bound work doesn't
@@ -8169,6 +8207,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._import_bookmarks_act.setEnabled(False)   # needs an open case
         self._import_bookmarks_act.triggered.connect(self._open_import_bookmarks_dialog)
         self._tools_menu.addAction(self._import_bookmarks_act)
+        self._system_check_act = QAction("iOS System Check…", self)
+        self._system_check_act.setToolTip(
+            "What this case does not show (the iOS system partition) and any signs of "
+            "jailbreaking or sideloading found in the archive.")
+        self._system_check_act.setEnabled(False)   # needs an open iOS case with a result
+        self._system_check_act.triggered.connect(lambda: self._show_system_check_dialog())
+        self._tools_menu.addAction(self._system_check_act)
         keyword_lists_act = QAction("Keyword Lists…", self)
         keyword_lists_act.setToolTip("The grooming and drug keyword lists used to flag chats.")
         keyword_lists_act.triggered.connect(self._open_keyword_lists_dialog)
@@ -12123,6 +12168,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # detection events.
         self.worker.header_scan_done.connect(self._on_header_scan_done)
         self.worker.finished.connect(self._on_load_worker_finished)
+        self._ios_system_check = None
+        self._system_notice_pending = False
+        self._system_check_act.setEnabled(False)
+        self._system_check_seq = getattr(self, '_system_check_seq', 0) + 1
+        _seq = self._system_check_seq
+        self.worker.system_check_ready.connect(
+            lambda result, is_new, seq=_seq: self._on_system_check_ready(result, is_new, seq))
         self.worker.start()
 
     def _open_process_dialog_for_new_case(self) -> None:
@@ -12150,6 +12202,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         a case is created."""
         if not self.zip_path:
             return
+        if getattr(self, '_system_notice_pending', False):
+            self._show_system_check_dialog()   # what the case leaves out, first
         self._open_process_dialog(preselect_nested=True, preselect_tier1=True,
                                   preselect_embedded_media=True)
 
@@ -12475,6 +12529,73 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 self._show_timestamp_dialog_when_ready(my_seq)
 
         QTimer.singleShot(10, _poll)
+
+    def _on_system_check_ready(self, result, is_new: bool, seq: int) -> None:
+        """ios_system_check's result arrived (ZipMetadataWorker). Shown once
+        per case (case_settings NOTICE_SETTING), waiting for any other modal
+        dialog to close; on a new case _open_process_dialog_for_new_case
+        shows it before Process Case."""
+        import ios_system_check
+        if seq != getattr(self, '_system_check_seq', 0):
+            return   # a newer archive load superseded this one
+        self._ios_system_check = result
+        self._system_check_act.setEnabled(result is not None)
+        if result is None or not self._case_dir:
+            return
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                shown = load_case_setting(db, ios_system_check.NOTICE_SETTING, '')
+        except Exception:
+            shown = ''
+        if shown == ios_system_check.LOGIC_VERSION:
+            return
+        self._system_notice_pending = True
+        QTimer.singleShot(0, lambda: self._show_system_check_when_ready(seq))
+
+    def _show_system_check_when_ready(self, seq: int) -> None:
+        """Same waiting rule as _show_timestamp_dialog_when_ready: never on
+        top of another modal dialog."""
+        if seq != getattr(self, '_system_check_seq', 0) or not self._system_notice_pending:
+            return
+        if QApplication.activeModalWidget() is not None or not self._metadata_ready_fired:
+            QTimer.singleShot(200, lambda: self._show_system_check_when_ready(seq))
+            return
+        self._show_system_check_dialog()
+
+    def _show_system_check_dialog(self) -> None:
+        """What this case does not show, and the jailbreak/sideloading check
+        (ios_system_check.notice_html). Records that it was shown."""
+        import ios_system_check
+        result = getattr(self, '_ios_system_check', None)
+        if result is None:
+            QMessageBox.information(self, "iOS System Check",
+                                    "No result for this case: it is not an iOS case, "
+                                    "or the check has not run yet.")
+            return
+        self._system_notice_pending = False
+        if self._case_dir:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    save_case_setting(db, ios_system_check.NOTICE_SETTING,
+                                      ios_system_check.LOGIC_VERSION)
+            except Exception:
+                pass
+        dlg = QDialog(self)
+        dlg.setWindowTitle("iOS System Check")
+        lay = QVBoxLayout(dlg)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setHtml(ios_system_check.notice_html(result))
+        lay.addWidget(text)
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(dlg.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(ok)
+        lay.addLayout(row)
+        dlg.resize(640, 520 if ios_system_check.has_findings(result) else 440)
+        dlg.exec()
 
     def _show_timestamp_dialog_when_ready(self, seq: int):
         """Show the proactive first-load Timestamp Display dialog now that

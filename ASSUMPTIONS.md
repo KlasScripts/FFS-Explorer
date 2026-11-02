@@ -191,6 +191,27 @@ IOS17 JoshHickman and IOS18 CTF25 Magnet.*
   - A case processed before this keeps its old list until it is rebuilt:
     load snapshot version 4 makes the next open re-parse once.
 
+**A-83. iOS cases are checked once for signs of jailbreaking or
+sideloading.** *Decision (owner, 2026-11-02). Machine-checked; no real
+jailbroken test phone.*
+- Because the system partition is not included (A-82),
+  `ios_system_check.py` looks once per iOS case for a fixed list of 36
+  paths in both partitions (OWASP MASTG-KNOW-0084's indicator paths,
+  rootless jailbreak folders, the Sileo/Zebra package managers and the dpkg
+  database, TrollStore), and reads `/etc/hosts` for lines a stock phone
+  does not have.
+- A path found is reported as a **sign, not proof**, with its zip entry.
+  The result is stored in `run_log` (`ios_system_check`) and shown once per
+  case, and on demand from Tools.
+- How much of the system partition the extraction holds is reported with
+  the result, so "nothing found" in a partial extraction (GrayKey: IOS18
+  CTF25 has 271 system entries, no `/usr` or `/etc`) is not read as "not
+  jailbroken".
+- On IOS17, iOS16.5 CTF23 and IOS18 CTF25 nothing is found and
+  `/etc/hosts` is stock.
+- Not covered: traces in FSEvents (iLEAPP's "FSEvents – APT & dpkg"), and
+  the preboot volume when the extraction lacks it.
+
 **A-7. Cellebrite names ending in `-<32+ hex>` are stored in full.**
 *Confirmed (real), 2026-11-02; Decision (owner), 2026-11-02.*
 - Until 2026-11-02 `resolve()` shortened any segment `<name>-<32+ hex>` to

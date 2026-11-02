@@ -5,7 +5,7 @@ import struct
 import threading
 import zipfile
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable, Iterator
 
 THREAD_WORKERS: int = min(8, os.cpu_count() or 4)
@@ -123,6 +123,9 @@ class ZipReader:
     so a seek + read is both correct and fastest.
     """
 
+    # run_parallel's queue depth: enough to keep THREAD_WORKERS busy.
+    _IN_FLIGHT = THREAD_WORKERS * 32
+
     def __init__(self, zip_path: str) -> None:
         self.zip_path = zip_path
 
@@ -195,21 +198,46 @@ class ZipReader:
         cancel_check: Callable[[], bool] | None = None,
         batch_size: int = 200,
     ):
-        """Submit items to a thread pool, yield (item, result) as futures complete.
+        """Run work_fn on a thread pool, yield (item, result) as each finishes.
 
         work_fn(item) -> any
         progress_cb(done, total) called after each batch and once at the end.
         cancel_check() -> bool halts processing when True.
+
+        At most _IN_FLIGHT items are queued at once, topped up as they
+        finish. Queuing every item first (as before 2026-11-02) meant nothing
+        was yielded until all were queued: on IOS17 (311,798 files) a Windows
+        keyword search showed no count for its first 26 s, by which time
+        ~79,000 files were already searched, since the queuing thread
+        competes with the workers for the GIL.
         """
         total = len(items)
+        it = iter(items)
+        done = 0
         with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as pool:
-            futures = {pool.submit(work_fn, item): item for item in items}
-            for done, fut in enumerate(as_completed(futures), 1):
-                if cancel_check and cancel_check():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    break
-                yield futures[fut], fut.result()
-                if progress_cb and done % batch_size == 0:
-                    progress_cb(done, total)
+            pending = {}
+
+            def top_up():
+                for item in it:
+                    pending[pool.submit(work_fn, item)] = item
+                    if len(pending) >= self._IN_FLIGHT:
+                        break
+
+            top_up()
+            while pending:
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    item = pending.pop(fut)
+                    if cancel_check and cancel_check():
+                        for f in pending:
+                            f.cancel()
+                        pending.clear()
+                        it = iter(())
+                        break
+                    done += 1
+                    yield item, fut.result()
+                    if progress_cb and done % batch_size == 0:
+                        progress_cb(done, total)
+                top_up()
         if progress_cb:
             progress_cb(total, total)

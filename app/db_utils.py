@@ -16,6 +16,7 @@ import io
 import json
 import os
 import sqlite3
+import time
 
 import msgpack
 
@@ -1171,14 +1172,23 @@ def load_folder_data(conn: 'sqlite3.Connection') -> tuple[dict, dict]:
     raw = load_blob(conn, 'folder_data', _FOLDER_DATA_VERSION)
     if raw is None:
         return {}, {}
-    combined = msgpack.unpackb(raw, raw=False)
+    # Read entry by entry, not with one unpackb: on IOS17 (138k folders)
+    # that one call held the GIL 0.32 s and froze the window at every case
+    # open (2026-11-03). A short pause every 20k entries lets it run.
+    unp = msgpack.Unpacker(raw=False, max_buffer_size=0)
+    unp.feed(raw)
     counts: dict = {}
     sizes:  dict = {}
-    for path, value in combined.items():
+    unpack = unp.unpack
+    for i in range(unp.read_map_header()):
+        path = unpack()
+        value = unpack()
         if isinstance(value, list) and len(value) == 2:
             if value[0] != -1:   # -1 = sentinel written by save_folder_sizes before counts known
                 counts[path] = value[0]
             sizes[path] = value[1]
+        if i % 20_000 == 19_999:
+            time.sleep(0)
     return counts, sizes
 
 

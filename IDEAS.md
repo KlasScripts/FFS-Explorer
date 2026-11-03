@@ -205,3 +205,49 @@ top 10 / 50 / 100 = 100% / 86% / 55% predator threads vs 0% / 26% / 26%
 for raw keyword-hit count; on threads of 5+ messages, keywords AP 0.47,
 keywords + meaning AP 0.52, meaning alone flags 2% of normal threads vs
 28% for keywords.
+
+---
+
+## 6. Keep the case's per-file metadata in the memory-mapped index
+
+**Why.** Every case open rebuilds `full_metadata` as one Python dictionary
+per entry (IOS17: 473,724), unpacked from the load snapshot in
+`casecache.db`. That is most of the open time, several hundred MB of
+memory, the reason for the `gc.freeze()` workarounds (full garbage
+collections walking those objects froze the window), and the cost of every
+whole-archive pass (filtering, sorting, ticking the root, building File
+Browser rows), which goes through those dictionaries one at a time. The
+archive's file directory already lives in a memory-mapped file
+(`zip_index.py`, `<zip>.ffsidx`) that costs almost nothing to open.
+
+**What we already know (measured 2026-11-03, IOS17 on the PC).**
+- Opening a processed case: tree after ~7-10 s; the loading thread's
+  single large calls (snapshot chunks, folder-size table) still stall the
+  window 0.1-0.17 s at a time.
+- Step 1 of the same plan (file directory list and `zip_names` read from
+  `.ffsidx` instead of rebuilt) was done first; re-measure after it before
+  starting this.
+
+**Sketch.**
+- Columns in the index file (or a second mapped file in the case folder):
+  size, the time fields, mode, inode and the other metadata keys, per
+  ui_path, plus folder sizes and file counts.
+- A read-only mapping per entry (`full_metadata[p]` returns a small view
+  with the dict interface), so existing code keeps working while it is
+  moved over.
+- An in-memory overlay for entries the app adds itself (nested archives,
+  embedded media, LevelDB records), and for any value changed in a session.
+- Whole-archive passes (filters, File Browser rows, counts) rewritten to
+  work on whole columns where that is simpler and faster.
+
+**Open.**
+- `full_metadata` is used as a dict of dicts in hundreds of places,
+  including parser scripts (`device_wide`, `load_snapshot_from_case`):
+  which need the full dict, and which only read a few keys?
+- How much faster the whole-archive passes actually get: measure one
+  (e.g. ticking the root on IOS17) on a prototype before committing to it.
+- Snapshot versioning and old cases: rebuild from the archive once, as a
+  `SNAPSHOT_VERSION` bump does today.
+- It is a substantial rewrite with real risk of subtle breakage; each step
+  should be checked by opening every test archive to the same state
+  (as done for step 1).

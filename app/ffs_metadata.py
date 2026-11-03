@@ -84,6 +84,49 @@ def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
     return b''.join([header] + ui_parts + fm_parts)
 
 
+_STREAM_YIELD = 20_000   # list items read between yield_cb() calls
+
+
+def _stream_value(unp, yield_cb):
+    """The next msgpack value from *unp*; a list is read item by item,
+    calling yield_cb() every _STREAM_YIELD items. One unpack of the
+    snapshot header's lists (IOS17: 830k zip names, 474k ui_paths) held the
+    GIL 0.55 s and froze the window (2026-11-03); same format, read in steps."""
+    try:
+        n = unp.read_array_header()
+    except ValueError:              # not a list: left unread, read whole
+        return unp.unpack()
+    out = []
+    append, unpack = out.append, unp.unpack
+    for i in range(n):
+        append(unpack())
+        if yield_cb and i % _STREAM_YIELD == _STREAM_YIELD - 1:
+            yield_cb()
+    return out
+
+
+def frozenset_in_steps(items: list, yield_cb=None) -> frozenset:
+    """frozenset(items), built _STREAM_YIELD items at a time with
+    yield_cb() between: one frozenset() of IOS17's 830k zip names held the
+    GIL 0.1 s; the final copy of the built set takes ~0.02 s."""
+    s: set = set()
+    for i in range(0, len(items), _STREAM_YIELD):
+        s.update(items[i:i + _STREAM_YIELD])
+        if yield_cb:
+            yield_cb()
+    return frozenset(s)
+
+
+def _stream_map(unp, yield_cb):
+    """The next msgpack map, its list values read by _stream_value."""
+    n = unp.read_map_header()
+    out = {}
+    for _ in range(n):
+        key = unp.unpack()
+        out[key] = _stream_value(unp, yield_cb)
+    return out
+
+
 def unpack_snapshot(raw, yield_cb=None) -> dict:
     """Inverse of pack_snapshot.  Calls yield_cb() (if given) after each chunk
     so a caller on a worker thread can release the GIL and keep the GUI alive.
@@ -97,7 +140,7 @@ def unpack_snapshot(raw, yield_cb=None) -> dict:
     else:
         unp = msgpack.Unpacker(raw, raw=False, strict_map_key=False,
                                max_buffer_size=0)
-    header = next(unp)
+    header = _stream_map(unp, yield_cb)
     ui_metadata: dict = {}
     for _ in range(header['n_ui']):
         ui_metadata.update(next(unp))

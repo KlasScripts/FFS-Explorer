@@ -525,7 +525,13 @@ def _layout_key(zip_path: str) -> str:
 def _register_layout(zip_path: str, infos: list[zipfile.ZipInfo]) -> None:
     """Record the header-offset layout of a FULL infolist (load() only —
     a subset would make neighbouring entries look adjacent)."""
-    offs = array('Q', sorted({i.header_offset for i in infos}))
+    offs = array('Q', (i.header_offset for i in infos))
+    # A central directory lists entries in offset order, so the offsets are
+    # normally already sorted and distinct: checked in a plain loop, which
+    # lets other threads run. One sorted() of IOS17's 830k offsets held the
+    # GIL 0.26 s (2026-11-03); it is still used when the check fails.
+    if any(offs[k] >= offs[k + 1] for k in range(len(offs) - 1)):
+        offs = array('Q', sorted(set(offs)))
     _layouts[_layout_key(zip_path)] = _Layout(offs, infos)
 
 

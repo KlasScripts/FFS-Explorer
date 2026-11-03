@@ -102,7 +102,7 @@ from ffs_metadata import (_build_folder_tree, _compute_folder_sizes,
                           _UUID_RE, parse_archive_metadata, persist_result,
                           repair_guid_map,
                           _parse_child as _ffs_parse_child,
-                          pack_snapshot, unpack_snapshot,
+                          pack_snapshot, unpack_snapshot, frozenset_in_steps,
                           SNAPSHOT_KEY as _SNAPSHOT_KEY,
                           SNAPSHOT_VERSION as _SNAPSHOT_VERSION)
 from datetime import datetime, timedelta, timezone
@@ -143,6 +143,11 @@ FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface r
 # whichever was already running, worst on a slow/network-hosted archive
 # where the zip-reopen alone could occupy a slot for a long time.
 _BG_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='ffs-bg')
+# The case-open jobs (archive index, header-scan counts, empty folders, file
+# types and case results), one at a time. On _BG_POOL they ran together and
+# beside the tree build: ~4 s of work took ~12 s on IOS17 and froze the window
+# for up to 1.3 s at a time, all of them contending for the GIL (2026-11-03).
+_CASE_OPEN_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ffs-caseopen')
 
 # Worker processes for the embedded-media sweep (EmbeddedMediaScanWorker):
 # one CPU left for the GUI. Measured on IOS17's six largest databases
@@ -1668,6 +1673,84 @@ def _meta_col_keys_for(data: dict) -> tuple:
                  if any(v.get(k) for v in data.values() if v))
 
 
+def _duplicate_groups_for(duplicate_files: dict) -> dict:
+    """{md5: every member ui_path, sorted} from {ui_path: {'md5': ...}}.
+    Qt-free so the case-open load can build it off the GUI thread
+    (IOS17: 170k files, 0.06-0.15 s of frozen window, 2026-11-03)."""
+    groups: dict[str, list[str]] = {}
+    for ui_path, info in duplicate_files.items():
+        groups.setdefault(info['md5'], []).append(ui_path)
+    return {m: sorted(ps) for m, ps in groups.items()}
+
+
+def _read_nested_archives(case_dir: str):
+    """The case's unpacked nested archives, read and shaped for
+    FastZipBrowser._inject_nested_archives: [(ui_path, stored_path,
+    entries, [(vpath, metadata, file_type), ...])], or None if the case DB
+    can't be read. Qt-free, so the case-open worker runs it before
+    metadata_ready (_set_ui_extras): on the GUI thread it froze the window
+    0.27 s at every IOS17 open (2026-11-03)."""
+    try:
+        db = _open_cache_db(case_dir)
+    except Exception:
+        return None
+    out_dir = os.path.join(case_dir, 'nested_archives')
+    out = []
+    with closing(db):
+        try:
+            records = load_nested_archives(db)
+        except Exception:
+            return None
+        for rec in records:
+            ui_path = rec['ui_path']
+            stored_path = os.path.join(out_dir, rec['stored_filename'])
+            if not os.path.isfile(stored_path):
+                continue
+            try:
+                entries = load_nested_archive_entries(db, ui_path)
+            except Exception:
+                entries = []
+            rows = []
+            for e in entries:
+                ep = e['entry_path']
+                if not ep or ep.endswith('/'):
+                    continue   # skip directory entries
+                mtime = None
+                if e.get('mdate'):
+                    try:
+                        dt = datetime.strptime(e['mdate'], '%Y-%m-%d %H:%M:%S')
+                        mtime = dt.replace(tzinfo=timezone.utc).timestamp()
+                    except ValueError:
+                        pass
+                rows.append((f"{ui_path}/{ep}", {
+                    'size':          e['size'] or 0,
+                    '_display_name': ep,
+                    '_archive_path': ui_path,
+                    'mtime':         mtime,
+                }, e.get('file_type') or 'Other'))
+            out.append((ui_path, stored_path, entries, rows))
+    return out
+
+
+def _read_embedded_media(case_dir: str):
+    """(hits, cache record sources) for FastZipBrowser._inject_embedded_media,
+    or None if the case DB can't be read. Qt-free; read by the case-open
+    worker before metadata_ready, like _read_nested_archives."""
+    try:
+        with closing(_open_results_db(case_dir)) as db:
+            hits = load_embedded_media_hits(db)
+    except Exception:
+        return None
+    if not hits:
+        return hits, {}
+    try:
+        with closing(_open_results_db(case_dir)) as db:
+            sources = load_cache_record_sources(db)
+    except Exception:
+        sources = {}
+    return hits, sources
+
+
 # A File Browser cell counts as "no data" when blank, or '---' (a timestamp
 # that isn't set). '0' is real data (e.g. a zero-byte file's size).
 _NO_DATA_VALUES = frozenset(('', '---'))
@@ -2172,6 +2255,11 @@ class ZipMetadataWorker(QThread):
             'meta_col_keys':     _meta_col_keys_for(ui_metadata),
             'android_user_data': _android_user_data_for(folder_map),
         }
+        if self.case_dir:
+            # Read here, applied by on_metadata_ready (0.27 + 0.1 s of
+            # frozen window on IOS17 when read there).
+            self._ui_extras['nested_archives'] = _read_nested_archives(self.case_dir)
+            self._ui_extras['embedded_media'] = _read_embedded_media(self.case_dir)
 
     def _try_load_from_snapshot(self, first_load: bool = False) -> bool:
         """Fast re-open: restore the previous load's full result from casecache.db.
@@ -2184,6 +2272,19 @@ class ZipMetadataWorker(QThread):
         process parsed the archive, "from local cache" reads as if the parse
         was thrown away.
         """
+        # No garbage-collection passes while the snapshot's millions of
+        # objects are made: each full pass walked all of them with the GIL
+        # held (30-80 ms window stalls on IOS17, 2026-11-03). Switched back
+        # on by on_metadata_ready right after gc.freeze() has moved them out
+        # of later passes, or by _on_load_worker_finished / start_loading if
+        # that never runs; here on any failure.
+        gc.disable()
+        if not self._try_load_from_snapshot_body(first_load):
+            gc.enable()
+            return False
+        return True
+
+    def _try_load_from_snapshot_body(self, first_load: bool) -> bool:
         try:
             with closing(_open_cache_db(self.case_dir)) as db:
                 # Cheap existence/version probe first, so the status message
@@ -2208,9 +2309,10 @@ class ZipMetadataWorker(QThread):
             fmt, user_pfx, sys_pfx, old_layout = snap['adapter']
             ffs_adapter = FfsAdapter(fmt, user_pfx, sys_pfx, bool(old_layout))
             self._local_extra_delta = snap['delta']
-            zip_names = frozenset(snap['zip_names'])
+            step = lambda: time.sleep(0)
+            zip_names = frozenset_in_steps(snap['zip_names'], step)
             zui = snap['zip_ui_paths']
-            zip_ui_paths = frozenset(zui) if zui is not None else None
+            zip_ui_paths = frozenset_in_steps(zui, step) if zui is not None else None
             ui_metadata = snap['ui_metadata']
             folder_map  = snap['folder_map']
             metadata_only_folders = set(snap['metadata_only'])
@@ -5856,8 +5958,12 @@ class ProcessDialog(QDialog):
                  is_android=False, guid_to_bundle=None, folder_map=None,
                  local_media_metadata_candidates_fn=None,
                  leveldb_coverage_fn=None, leveldb_index_fn=None,
-                 tier_counts=None, request_tier3_count_fn=None, parent=None):
+                 tier_counts=None, request_tier3_count_fn=None,
+                 load_jobs_running_fn=None, parent=None):
         super().__init__(parent)
+        # () -> names of the main window's case-open jobs still running
+        # (FastZipBrowser._load_jobs_running). Run waits for them first.
+        self._load_jobs_running_fn = load_jobs_running_fn
         # _header_tier_counts' result, built once per case in the background
         # by the main window; None until it arrives (set_tier_counts). Never
         # counted here: counting at open was the pause before this dialog
@@ -6813,8 +6919,30 @@ class ProcessDialog(QDialog):
         self._status_label.setText("")
         self._post_integrity_scan = run_scan
         self._pending_upgrade_tier = upgrade_tier if run_scan else 0
+        self._run_integrity = run_integrity
+        self._wait_for_case_open()
 
-        if run_integrity:
+    def _wait_for_case_open(self):
+        """Start the first stage only once the case-open jobs are done.
+        Run pressed straight after a case opened used to start the stages
+        while those were still running (IOS17: ~12 s of Python work on four
+        background threads), so both shared one Python lock and the window
+        stalled for up to 1.3 s at a time (measured 2026-11-03)."""
+        self._waiting_for_case_open = False
+        if self._scan_cancelled:
+            self._status_label.setText("Cancelled before any stage started.")
+            self._finish_operations()
+            return
+        busy = self._load_jobs_running_fn() if self._load_jobs_running_fn else []
+        if busy:
+            self._waiting_for_case_open = True    # keeps the dialog open (closeEvent)
+            self._status_label.setText(
+                "Waiting for the case to finish opening ("
+                + ", ".join(busy) + ")…")
+            QTimer.singleShot(200, self._wait_for_case_open)
+            return
+        self._status_label.setText("")
+        if self._run_integrity:
             self._start_integrity_check()
         else:
             self._continue_after_integrity()
@@ -7588,7 +7716,8 @@ class ProcessDialog(QDialog):
                       self._embedded_media_worker.isRunning())) or
                 (bool(self._media_metadata_worker and
                       self._media_metadata_worker.isRunning())) or
-                self._leveldb_indexing_active)
+                self._leveldb_indexing_active
+                or getattr(self, '_waiting_for_case_open', False))
 
     def closeEvent(self, event):
         if self._is_scanning():
@@ -9512,7 +9641,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 if p not in folder_map and (resolve(p) + '/') in names:
                     out.append(p)
             return frozenset(out)
-        fut = _BG_POOL.submit(_scan)
+        fut = _CASE_OPEN_POOL.submit(_scan)
+        self._track_load_job('empty folders', fut)
 
         def _poll():
             if my_seq != self._empty_folder_seq:
@@ -11923,6 +12053,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             leveldb_index_fn=self._index_leveldb_folders_batched,
             tier_counts=self._header_tier_counts,
             request_tier3_count_fn=self._request_header_tier3_count,
+            load_jobs_running_fn=self._load_jobs_running,
             parent=self,
         )
         self.header_tier_counts_ready.connect(dlg.set_tier_counts)
@@ -12025,6 +12156,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Hand the previous case's objects back to the garbage collector
         # (frozen in on_metadata_ready) so whatever it still held can be freed.
         gc.unfreeze()
+        gc.enable()   # in case a previous load paused it and never finished
         self._user_media_last_label = None   # that count belonged to the previous case
         self._selected_only_tree_stale = False
         self._case_dir = case_dir
@@ -12223,6 +12355,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # Precomputed on the worker thread (ZipMetadataWorker._set_ui_extras);
         # each item falls back to being computed here if it's missing.
         extras = getattr(self.worker, '_ui_extras', None) or {}
+        # Read on the worker; used once by the _inject_* calls below.
+        self._prefetched_nested_archives = extras.get('nested_archives')
+        self._prefetched_embedded_media = extras.get('embedded_media')
         self.full_metadata = data
         self.folder_map = folder_map
         # New case: research colors depend on this device's iOS version
@@ -12290,8 +12425,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # somehow fails) -- nothing else needed to wire this up, that
         # mechanism was already there for exactly this shape of future.
         if self._case_dir:
-            self._zip_open_future = _BG_POOL.submit(
+            self._zip_open_future = _CASE_OPEN_POOL.submit(
                 _build_cached_zip_view, self.zip_path, self._case_dir)
+            self._track_load_job('archive index', self._zip_open_future)
         self._time_cols = self._detect_time_columns(data)
         self._has_link_count_data = any(
             v.get('links') is not None
@@ -12323,8 +12459,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # reflects this case's real layout" reasoning as the LevelDB
         # rescan's own comment just above.
         self._inject_embedded_media()
-        self.reload_tree_entirely()
-        self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
+        # Never left for a later re-inject (after Process Case) to pick up.
+        self._prefetched_nested_archives = self._prefetched_embedded_media = None
+        # The tree is built once the case-open jobs are done
+        # (_build_tree_when_case_ready, after _start_case_meta_load below).
         # Fetch device label and populate device_info after archive is loaded.
         # Always schedule so device_info is repopulated after a schema rebuild
         # even when the label is already cached in ffs_archives.json.
@@ -12354,6 +12492,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # gc.freeze() moves everything alive now out of those scans;
         # reference counting still frees it, and start_loading unfreezes.
         gc.freeze()
+        gc.enable()   # paused while the snapshot loaded (_try_load_from_snapshot)
         # Start background precomputation of folder counts if not already cached.
         if len(self._file_count_cache) < len(self.folder_map):
             QTimer.singleShot(300, self._start_precompute_folder_counts)
@@ -12364,7 +12503,36 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # run at the exact same moment the Process Case dialog opens for
         # a brand-new case, competing for the same CPU/UI thread as
         # whatever the examiner just asked that dialog to do.
+        self._build_tree_when_case_ready(fmt_label, missing_plist_paths)
 
+    def _build_tree_when_case_ready(self, fmt_label, missing_plist_paths):
+        """Show the folder tree only once the case-open jobs are done
+        (_load_jobs_running), so the case visibly isn't ready until it is;
+        the load bar keeps running and the status bar names what's left.
+        Before 2026-11-03 the tree came first and those jobs ran beside it
+        and beside whatever the examiner started next (Process Case), all
+        contending for one Python lock. Dropped if another case is opened
+        meanwhile."""
+        metadata = self.full_metadata
+        jobs = getattr(self, '_load_jobs', {})
+        # The User Media list belongs to the bookmark panel, not the tree.
+        waiting_for = {n: f for n, f in jobs.items() if n != 'User Media list'}
+
+        def _poll():
+            if self.full_metadata is not metadata:
+                return
+            busy = [n for n, f in waiting_for.items() if not f.done()]
+            if busy:
+                self.status_bar.showMessage(
+                    "Preparing case: " + ", ".join(busy) + "…")
+                QTimer.singleShot(50, _poll)
+                return
+            self.reload_tree_entirely()
+            self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
+            self._warn_missing_plists(missing_plist_paths)
+        _poll()
+
+    def _warn_missing_plists(self, missing_plist_paths):
         if missing_plist_paths:
             # Only warn about UUID folders that actually have content in the zip.
             # Metadata-only or empty folders have no extractable files so the
@@ -12407,7 +12575,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             z = CachedZipView(zip_path, infos) if infos is not None else None
             return _header_tier_counts(items, adapter, z, with_tier3=tier3)
 
-        fut = _BG_POOL.submit(_count)
+        fut = _CASE_OPEN_POOL.submit(_count)
+        self._track_load_job('header-scan counts', fut)
 
         def _poll():
             if my_seq != self._header_tier_count_seq:
@@ -12439,6 +12608,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return   # the running count already includes Tier 3
         self._start_header_tier_count(with_tier3=True)
         self._tier3_count_seq = self._header_tier_count_seq
+
+    def _track_load_job(self, name: str, fut) -> None:
+        """Note a case-open background job, so Process Case can wait for
+        it (_load_jobs_running). A newer job of the same name replaces it."""
+        self.__dict__.setdefault('_load_jobs', {})[name] = fut
+
+    def _load_jobs_running(self) -> list:
+        """Names of the case-open background jobs still running."""
+        return [n for n, f in self.__dict__.get('_load_jobs', {}).items() if not f.done()]
 
     def _start_case_meta_load(self):
         """Load the heavy per-case DB extras after metadata_ready — header-
@@ -12478,9 +12656,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
             tz = self._load_or_detect_timezone_settings(zip_path, adapter, case_dir)
-            return overrides, _build_photo_index(case_dir, rules), tz, media_exif, duplicates, links
+            return (overrides, _build_photo_index(case_dir, rules), tz, media_exif,
+                    (duplicates, _duplicate_groups_for(duplicates)), links)
 
-        fut = _BG_POOL.submit(_load)
+        fut = _CASE_OPEN_POOL.submit(_load)
+        self._track_load_job('file types and case results', fut)
 
         def _poll():
             if my_seq != self._case_meta_seq:
@@ -12513,8 +12693,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._reapply_leveldb_type_overrides()
             self._photo_index = photos
             self._media_exif = media_exif
-            self._duplicate_files = duplicates
-            self._recompute_duplicate_groups()
+            # Grouped on the background thread (_duplicate_groups_for).
+            self._duplicate_files, self._duplicate_groups = duplicates
             self._attachment_links = links
             gc.freeze()   # these live all session too — see on_metadata_ready
             (self._handset_zone_name, self._acquisition_zone_name,
@@ -13009,9 +13189,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         """
         if not self._case_dir:
             return
-        try:
-            db = _open_cache_db(self._case_dir)
-        except Exception:
+        prefetched = self.__dict__.pop('_prefetched_nested_archives', None)
+        archives = (prefetched if prefetched is not None
+                    else _read_nested_archives(self._case_dir))
+        if archives is None:
             return
 
         # Reset all virtual state before rebuilding.
@@ -13019,57 +13200,21 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._nested_virtual_paths  = frozenset()
         self._nested_virtual_folders = frozenset()
         virtual_paths = set()
-        out_dir = os.path.join(self._case_dir, 'nested_archives')
-
-        with closing(db):
-            try:
-                records = load_nested_archives(db)
-            except Exception:
-                return
-
-            for rec in records:
-                ui_path     = rec['ui_path']
-                stored_path = os.path.join(out_dir, rec['stored_filename'])
-                if not os.path.isfile(stored_path):
-                    continue
-                try:
-                    entries = load_nested_archive_entries(db, ui_path)
-                except Exception:
-                    entries = []
-
-                self._nested_archive_map[ui_path] = {
-                    'stored_path': stored_path,
-                    'entries':     entries,
-                }
-
-                children = []
-                for e in entries:
-                    ep = e['entry_path']
-                    if not ep or ep.endswith('/'):
-                        continue   # skip directory entries
-                    vpath = f"{ui_path}/{ep}"
-                    virtual_paths.add(vpath)
-                    children.append(vpath)
-                    mtime = None
-                    if e.get('mdate'):
-                        try:
-                            dt = datetime.strptime(e['mdate'], '%Y-%m-%d %H:%M:%S')
-                            mtime = dt.replace(tzinfo=timezone.utc).timestamp()
-                        except ValueError:
-                            pass
-                    self.full_metadata[vpath] = {
-                        'size':          e['size'] or 0,
-                        '_display_name': ep,
-                        '_archive_path': ui_path,
-                        'mtime':         mtime,
-                    }
-                    ft = e.get('file_type') or 'Other'
-                    if ft != 'Other':
-                        self._header_type_overrides[vpath] = ft
-
-                # Register archive as a navigable folder with its entries as children.
-                self.folder_map[ui_path] = children
-                self._auto_tick_new_tree_entries(ui_path, children)
+        for ui_path, stored_path, entries, rows in archives:
+            self._nested_archive_map[ui_path] = {
+                'stored_path': stored_path,
+                'entries':     entries,
+            }
+            children = []
+            for vpath, meta, ft in rows:
+                virtual_paths.add(vpath)
+                children.append(vpath)
+                self.full_metadata[vpath] = meta
+                if ft != 'Other':
+                    self._header_type_overrides[vpath] = ft
+            # Register archive as a navigable folder with its entries as children.
+            self.folder_map[ui_path] = children
+            self._auto_tick_new_tree_entries(ui_path, children)
 
         self._nested_virtual_paths = frozenset(virtual_paths)
 
@@ -13101,11 +13246,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._embedded_media_containers = frozenset()
         if not self._case_dir:
             return
-        try:
-            with closing(_open_results_db(self._case_dir)) as db:
-                hits = load_embedded_media_hits(db)
-        except Exception:
+        prefetched = self.__dict__.pop('_prefetched_embedded_media', None)
+        read = prefetched if prefetched is not None else _read_embedded_media(self._case_dir)
+        if read is None:
             return
+        hits, cache_sources = read
         if not hits:
             return
 
@@ -13139,11 +13284,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         virtual_paths: set[str] = set()
         containers: set[str] = set()
-        try:
-            with closing(_open_results_db(self._case_dir)) as db:
-                cache_sources = load_cache_record_sources(db)
-        except Exception:
-            cache_sources = {}
         cache_children: set[str] = set()
         for container, container_hits in by_container.items():
             container_meta = self.full_metadata.get(container) or {}
@@ -13200,7 +13340,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._embedded_media_containers = frozenset(containers)
         self._nested_virtual_paths = self._nested_virtual_paths | frozenset(virtual_paths)
         self._cache_media_children = frozenset(cache_children)
-        self._recompute_meta_col_keys()
+        # Only the entries injected here can add a column (e.g. a cache
+        # record's "Source URL"): checking them, not all 830k entries again,
+        # was a 0.55-1.2 s window freeze at every IOS17 open (2026-11-03).
+        have = set(getattr(self, '_meta_col_keys', ()) or ())
+        have.update(_meta_col_keys_for({p: self.full_metadata.get(p) for p in virtual_paths}))
+        self._meta_col_keys = tuple(k for k in _META_COL_HEADERS if k in have)
 
     def _add_report_link_actions(self, menu, paths: list) -> bool:
         """Add "🔗 Show in Artifact Report" to *menu* for every report row
@@ -13382,10 +13527,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         direct correction, 2026-10-17: "in the file bowser... you would
         see all files and duplicates are not hiden the hiding only
         happends when view the selected files in the media browser."""
-        groups: dict[str, list[str]] = {}
-        for ui_path, info in self._duplicate_files.items():
-            groups.setdefault(info['md5'], []).append(ui_path)
-        self._duplicate_groups = {m: sorted(ps) for m, ps in groups.items()}
+        self._duplicate_groups = _duplicate_groups_for(self._duplicate_files)
 
     def _on_nested_extraction_done(self):
         saved_checked = set(self._checked_folders)
@@ -14208,6 +14350,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         scan that ran after metadata_ready).  Hide the load bar only if the
         tree has also finished — whichever completes last."""
         self._worker_done = True
+        gc.enable()   # normally already on again (on_metadata_ready)
         if not getattr(self, '_metadata_ready_fired', False):
             # metadata_ready never fired for this load (the worker hit an
             # exception before emitting it — see ZipMetadataWorker.run's

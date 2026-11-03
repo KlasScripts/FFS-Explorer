@@ -1789,6 +1789,8 @@ class MediaViewerMixin:
         metadata = self.full_metadata
         keys = list(metadata)   # a C-level copy; ~10 ms for 830k entries
         fut = _USER_MEDIA_POOL.submit(self._user_media_paths, keys)
+        if purpose == 'panel' and hasattr(self, '_track_load_job'):
+            self._track_load_job('User Media list', fut)
 
         def _poll():
             if seqs.get(purpose) != seq or self.full_metadata is not metadata:

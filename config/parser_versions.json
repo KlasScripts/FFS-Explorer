@@ -234,6 +234,13 @@
       "hash": "468b9ff1e9196aed",
       "version": 1
     },
+    "android:media_trash": {
+      "changelog": {
+        "1": "Adds Media Trash: every media store file with an expiry date (in the trash or pending), plus trashed files only Google Photos or the media store recovery log still list. Trashed Time is the expiry minus 30 days, or the first expiry of the current trash when the recovery log shows Android extended it. Photos Trash Action, Files Open From/To and App On Screen match Google Photos' queued trash action, a Files by Google session and Usage Stats to the trash time."
+      },
+      "hash": "0fe1ef2d3be3e325",
+      "version": 1
+    },
     "android:notification_history": {
       "changelog": {
         "3": "A history file that cannot be read is now named in the run log instead of being skipped silently. Rows are unchanged."

@@ -69,6 +69,7 @@ Interaction model, per direct user request:
 
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from zip_entry import ZipEntry
@@ -963,26 +964,50 @@ def _parallel_extract(to_fetch: list) -> None:
     Reuses zip_reader.THREAD_WORKERS (min(8, cpu_count)) as the pool
     size — the same deliberately-bounded worker count already used
     elsewhere in this project specifically so a network-hosted archive
-    doesn't get hammered with an unbounded number of concurrent reads."""
-    if not to_fetch:
-        return
+    doesn't get hammered with an unbounded number of concurrent reads.
 
-    def _fetch_one(item) -> None:
+    Returns one "<physical path>: <reason>" line per file that could not
+    be read or written (2026-11-05: these were dropped, so a folder missing
+    a file decoded as if complete). Each file is written under a temporary
+    name and renamed into place, so an interrupted write never leaves a
+    short file that _already_extracted would then accept."""
+    if not to_fetch:
+        return []
+
+    def _fetch_one(item) -> str | None:
         entry, dest = item
         try:
             data = entry.read()
-        except Exception:
-            return
-        if data is None:
-            return
+        except Exception as exc:
+            return f"{entry.physical_path}: read failed ({exc})"
+        if data is None or len(data) != entry.file_size:
+            return f"{entry.physical_path}: short read"
+        tmp = f"{dest}.{os.getpid()}-{threading.get_ident()}.part"
         try:
-            with open(dest, 'wb') as f:
+            with open(tmp, 'wb') as f:
                 f.write(data)
-        except OSError:
-            pass
+            os.replace(tmp, dest)
+        except OSError as exc:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return f"{entry.physical_path}: write failed ({exc})"
+        return None
 
     with ThreadPoolExecutor(max_workers=min(THREAD_WORKERS, len(to_fetch))) as pool:
-        list(pool.map(_fetch_one, to_fetch))
+        return [e for e in pool.map(_fetch_one, to_fetch) if e]
+
+
+def _already_extracted(dest: str, entry: ZipEntry) -> bool:
+    """True when *dest* holds a file of the entry's full size — from a prior
+    open, or another decode of the same folder. Size, not just existence:
+    files written before 2026-11-05 were not renamed into place, so an
+    interrupted write could leave a short one."""
+    try:
+        return os.path.getsize(dest) == entry.file_size
+    except OSError:
+        return False
 
 
 def leveldb_decode_logic_version() -> str:
@@ -1001,6 +1026,94 @@ def leveldb_decode_logic_version() -> str:
             return hashlib.blake2b(f.read(), digest_size=8).hexdigest()
     except OSError:
         return 'unknown'
+
+
+class LevelDbIndexError(Exception):
+    """A LevelDB/IndexedDB folder that could not be read in full. Its
+    folder gets no leveldb_search_index rows, so it stays "not indexed"
+    rather than looking indexed with no records."""
+
+
+def run_leveldb_search_index(job: dict) -> list[tuple[int, str, str, str]]:
+    """The second half of LevelDbViewerMixin.index_leveldb_folder_for_search:
+    extracts *job*'s files (from plan_leveldb_search_index) and decodes
+    them. Uses no GUI state, so it runs on a worker thread
+    (LevelDbIndexWorker). Raises LevelDbIndexError when a file could not be
+    resolved, read or written, or when the store cannot be opened or its
+    records read; until 2026-11-05 each of these gave an empty result that
+    was saved as "indexed, no records"."""
+    errors = job['errors'] + _parallel_extract(job['to_fetch'])
+    if errors:
+        more = f" (and {len(errors) - 3} more)" if len(errors) > 3 else ""
+        raise LevelDbIndexError("; ".join(errors[:3]) + more)
+    ui_path, extract_dir = job['ui_path'], job['extract_dir']
+    blob_extract_dir = job['blob_extract_dir']
+    if _is_indexeddb_leveldb_dir(ui_path):
+        try:
+            records_raw, _bad_count = _iterate_indexeddb_records(extract_dir, blob_extract_dir)
+        except Exception:
+            records_raw = None
+        if records_raw is not None:
+            rows = []
+            for idx, (display_name, preview_bytes, content_type) in enumerate(records_raw):
+                if content_type != 'indexeddb':
+                    continue   # genuinely binary/undeserializable — nothing new to index
+                try:
+                    text = preview_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    continue
+                rows.append((idx, display_name, text, content_type))
+            return rows
+        # else: real decode failed — fall through to the generic path
+        # below, the identical fallback _decode_leveldb_folder itself
+        # uses for a store the real decoder can't handle.
+
+    import ccl_leveldb
+    try:
+        db = ccl_leveldb.RawLevelDb(extract_dir)
+    except Exception as exc:
+        raise LevelDbIndexError(f"not readable as a LevelDB store ({exc})") from exc
+    try:
+        records = list(db.iterate_records_raw())
+    except Exception as exc:
+        raise LevelDbIndexError(f"records could not be read ({exc})") from exc
+    finally:
+        db.close()
+
+    from artifact_runner import resolve_chromium_session_storage_names, decode_plist_blob
+    session_storage_names = resolve_chromium_session_storage_names(records)
+
+    import json as _json
+    rows = []
+    for idx, rec in enumerate(records):
+        content_type = classify_leveldb_value(rec.value)
+        if content_type == 'bplist':
+            # The generic preview pane decodes this via
+            # decode_plist_blob (FastZipBrowser._display_preview_bytes),
+            # NOT via leveldb_value_preview_bytes (which deliberately
+            # returns bplist bytes UNCHANGED — see that function's own
+            # docstring) — mirrored here so a record's real decoded
+            # plist content is searchable the same way it's already
+            # viewable.
+            content = decode_plist_blob(rec.value)
+            if content is None:
+                continue
+            try:
+                text = _json.dumps(content, indent=2, ensure_ascii=False, default=str)
+            except Exception:
+                continue
+        elif content_type in ('text', 'json', 'xml', 'plist'):
+            preview = leveldb_value_preview_bytes(rec.value or b'')
+            try:
+                text = preview.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+        else:
+            continue   # 'bin'/'empty'/'protobuf' — nothing new to index
+        _, display_name = _sanitize_record_name(
+            rec.user_key, idx, session_storage_names=session_storage_names)
+        rows.append((idx, display_name, text, content_type))
+    return rows
 
 
 class LevelDbViewerMixin:
@@ -1027,7 +1140,7 @@ class LevelDbViewerMixin:
             return None
         return ZipEntry(self.zip_path, physical, zinfo)
 
-    def _extract_leveldb_children_flat(self, real_children: list, extract_dir: str) -> None:
+    def _extract_leveldb_children_flat(self, real_children: list, extract_dir: str) -> list[str]:
         """Extract a flat LevelDB directory's own real children (no real
         subfolders — see _looks_like_leveldb_dir's own docstring) to
         extract_dir. Factored out 2026-09-19 so both the generic
@@ -1036,22 +1149,35 @@ class LevelDbViewerMixin:
         maintaining two copies. Parallelized 2026-09-26 (see
         _parallel_extract's own docstring) — this loop now only resolves
         each child (cheap, main-thread-only metadata lookups) and decides
-        what needs fetching; the actual reads run concurrently."""
+        what needs fetching; the actual reads run concurrently. Returns
+        one line per file not extracted (see _parallel_extract); browsing
+        callers ignore them, as before."""
         to_fetch: list[tuple[ZipEntry, str]] = []
+        errors = self._collect_flat_children(real_children, extract_dir, to_fetch)
+        return errors + _parallel_extract(to_fetch)
+
+    def _collect_flat_children(self, real_children: list, extract_dir: str,
+                               to_fetch: list) -> list[str]:
+        """The resolve half of _extract_leveldb_children_flat (main thread):
+        appends (entry, dest) to *to_fetch* for each child not already
+        extracted, and returns one line per child that is not an archive
+        entry."""
+        errors = []
         for child_ui_path in real_children:
             if child_ui_path in self.folder_map:
                 continue   # a subfolder — a real LevelDB directory is flat
             name = child_ui_path.rsplit('/', 1)[-1]
             dest = os.path.join(extract_dir, name)
-            if os.path.exists(dest):
-                continue   # already extracted from a prior open/session
             entry = self._resolve_archive_entry(child_ui_path)
             if entry is None:
+                errors.append(f"{child_ui_path}: not found in the archive")
                 continue
+            if _already_extracted(dest, entry):
+                continue   # already extracted from a prior open/session
             to_fetch.append((entry, dest))
-        _parallel_extract(to_fetch)
+        return errors
 
-    def _extract_tree(self, ui_path: str, extract_dir: str) -> None:
+    def _extract_tree(self, ui_path: str, extract_dir: str) -> list[str]:
         """Recursively extract ui_path's own real files/subfolders (via
         folder_map) to extract_dir — needed for IndexedDB's own external
         blob directory specifically, which (unlike an ordinary flat
@@ -1069,32 +1195,38 @@ class LevelDbViewerMixin:
         fetched in ONE batched parallel pass via _parallel_extract, rather
         than spinning up a separate thread pool per directory level."""
         to_fetch: list[tuple[ZipEntry, str]] = []
-        self._collect_extract_tree(ui_path, extract_dir, to_fetch)
-        _parallel_extract(to_fetch)
+        errors = self._collect_extract_tree(ui_path, extract_dir, to_fetch)
+        return errors + _parallel_extract(to_fetch)
 
     def _collect_extract_tree(self, ui_path: str, extract_dir: str,
-                              to_fetch: list) -> None:
+                              to_fetch: list, errors: list | None = None) -> list[str]:
         """The synchronous half of _extract_tree — walks folder_map,
         creates directories, and resolves each leaf file to a ZipEntry,
         appending (entry, dest) to *to_fetch* for _extract_tree's own
         single parallel pass. Never touches the filesystem for a leaf's
-        actual content — only os.makedirs for real subfolders."""
+        actual content — only os.makedirs for real subfolders. Returns
+        *errors* (a new list if none is given) with one line per leaf that
+        is not an archive entry."""
+        if errors is None:
+            errors = []
         children = self.folder_map.get(ui_path)
         if children is None:
-            return
+            return errors
         os.makedirs(extract_dir, exist_ok=True)
         for child_ui_path in children:
             name = child_ui_path.rsplit('/', 1)[-1]
             dest = os.path.join(extract_dir, name)
             if child_ui_path in self.folder_map:
-                self._collect_extract_tree(child_ui_path, dest, to_fetch)
-                continue
-            if os.path.exists(dest):
+                self._collect_extract_tree(child_ui_path, dest, to_fetch, errors)
                 continue
             entry = self._resolve_archive_entry(child_ui_path)
             if entry is None:
+                errors.append(f"{child_ui_path}: not found in the archive")
+                continue
+            if _already_extracted(dest, entry):
                 continue
             to_fetch.append((entry, dest))
+        return errors
 
     def _decode_indexeddb_folder(self, ui_path: str, real_children: list) -> bool:
         """Real, schema-informed decode of a Chromium IndexedDB directory
@@ -1246,83 +1378,36 @@ class LevelDbViewerMixin:
         deliberately gets none either — it's a structural SHAPE label, not
         a real decode, so there is no genuinely NEW text here beyond what
         the main archive-wide search already covers from the record's own
-        still-physically-present raw bytes."""
+        still-physically-present raw bytes.
+
+        Split in two since 2026-11-05 so the slow half can leave the GUI
+        thread: plan_leveldb_search_index (main thread) and
+        run_leveldb_search_index (any thread). Raises LevelDbIndexError when
+        the folder could not be read in full."""
+        return run_leveldb_search_index(
+            self.plan_leveldb_search_index(ui_path, real_children))
+
+    def plan_leveldb_search_index(self, ui_path: str, real_children: list) -> dict:
+        """The main-thread half of index_leveldb_folder_for_search: resolves
+        the folder's files (and an IndexedDB store's blob folder) to archive
+        entries, without reading them. The result is plain data for
+        run_leveldb_search_index."""
         safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', ui_path)
         extract_dir = os.path.join(self._case_dir, 'leveldb_browse', safe_name)
         os.makedirs(extract_dir, exist_ok=True)
-        self._extract_leveldb_children_flat(real_children, extract_dir)
-
+        to_fetch: list[tuple[ZipEntry, str]] = []
+        errors = self._collect_flat_children(real_children, extract_dir, to_fetch)
+        blob_extract_dir = None
         if _is_indexeddb_leveldb_dir(ui_path):
             blob_ui_path = _indexeddb_blob_dir_for(ui_path)
-            blob_extract_dir = None
             if blob_ui_path in self.folder_map:
                 blob_extract_dir = os.path.join(
                     self._case_dir, 'leveldb_browse',
                     re.sub(r'[^A-Za-z0-9_.-]', '_', blob_ui_path))
-                self._extract_tree(blob_ui_path, blob_extract_dir)
-            try:
-                records_raw, _bad_count = _iterate_indexeddb_records(extract_dir, blob_extract_dir)
-            except Exception:
-                records_raw = None
-            if records_raw is not None:
-                rows = []
-                for idx, (display_name, preview_bytes, content_type) in enumerate(records_raw):
-                    if content_type != 'indexeddb':
-                        continue   # genuinely binary/undeserializable — nothing new to index
-                    try:
-                        text = preview_bytes.decode('utf-8')
-                    except UnicodeDecodeError:
-                        continue
-                    rows.append((idx, display_name, text, content_type))
-                return rows
-            # else: real decode failed — fall through to the generic path
-            # below, the identical fallback _decode_leveldb_folder itself
-            # uses for a store the real decoder can't handle.
-
-        import ccl_leveldb
-        try:
-            db = ccl_leveldb.RawLevelDb(extract_dir)
-        except Exception:
-            return []
-        try:
-            records = list(db.iterate_records_raw())
-        finally:
-            db.close()
-
-        from artifact_runner import resolve_chromium_session_storage_names, decode_plist_blob
-        session_storage_names = resolve_chromium_session_storage_names(records)
-
-        import json as _json
-        rows = []
-        for idx, rec in enumerate(records):
-            content_type = classify_leveldb_value(rec.value)
-            if content_type == 'bplist':
-                # The generic preview pane decodes this via
-                # decode_plist_blob (FastZipBrowser._display_preview_bytes),
-                # NOT via leveldb_value_preview_bytes (which deliberately
-                # returns bplist bytes UNCHANGED — see that function's own
-                # docstring) — mirrored here so a record's real decoded
-                # plist content is searchable the same way it's already
-                # viewable.
-                content = decode_plist_blob(rec.value)
-                if content is None:
-                    continue
-                try:
-                    text = _json.dumps(content, indent=2, ensure_ascii=False, default=str)
-                except Exception:
-                    continue
-            elif content_type in ('text', 'json', 'xml', 'plist'):
-                preview = leveldb_value_preview_bytes(rec.value or b'')
-                try:
-                    text = preview.decode('utf-8')
-                except UnicodeDecodeError:
-                    continue
-            else:
-                continue   # 'bin'/'empty'/'protobuf' — nothing new to index
-            _, display_name = _sanitize_record_name(
-                rec.user_key, idx, session_storage_names=session_storage_names)
-            rows.append((idx, display_name, text, content_type))
-        return rows
+                self._collect_extract_tree(blob_ui_path, blob_extract_dir, to_fetch, errors)
+        return {'ui_path': ui_path, 'extract_dir': extract_dir,
+                'blob_extract_dir': blob_extract_dir,
+                'to_fetch': to_fetch, 'errors': errors}
 
     def _decode_leveldb_folder(self, ui_path: str) -> bool:
         """Extract *ui_path*'s own real files to a local scratch dir under

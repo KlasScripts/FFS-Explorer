@@ -462,12 +462,9 @@ class LevelDbSearchWorker(QThread):
     the raw archive file at all — the main archive-wide search can never
     find it no matter how thoroughly it scans.
 
-    A pure local SQLite read — no zip/network I/O at all — so unlike
-    LevelDB folder INDEXING itself (see FastZipBrowser.
-    _index_leveldb_folders_batched's own docstring for why THAT
-    deliberately runs frame-budgeted on the main thread instead of a
-    worker), running the actual SEARCH QUERY on a background QThread is
-    safe and unremarkable here: a fresh sqlite3 connection, never
+    A pure local SQLite read — no zip/network I/O at all — so running
+    the actual SEARCH QUERY on a background QThread is safe and
+    unremarkable here: a fresh sqlite3 connection, never
     touching the GUI's own shared zip reader.
 
     result_found carries (folder_ui_path, record_index, offset_in_text,

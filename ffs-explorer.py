@@ -5169,6 +5169,79 @@ class DuplicateDetectionWorker(QThread):
         self.done.emit(results, complete)
 
 
+_LEVELDB_ROWS_VERSION_KEY = 'leveldb_search_index_rows_version'
+
+
+def _leveldb_index_rows_version(db) -> str | None:
+    """The decode-logic version leveldb_search_index's rows were built
+    under. Before 2026-11-05 there was one marker, written only after a
+    full pass; a case from then has only that one."""
+    raw = (load_blob(db, _LEVELDB_ROWS_VERSION_KEY, '1')
+           or load_blob(db, 'leveldb_search_index_version', '1'))
+    return raw.decode() if raw is not None else None
+
+
+class LevelDbIndexWorker(QThread):
+    """Decodes LevelDB/IndexedDB folders for Keyword Search and saves the
+    rows to casecache.db's leveldb_search_index (the Process Case stage).
+    Each job comes from LevelDbViewerMixin.plan_leveldb_search_index, made
+    on the GUI thread; this thread reads and decodes the files
+    (leveldb_viewer.run_leveldb_search_index). Until 2026-11-05 all of it
+    ran on the GUI thread between frames, and one large folder froze the
+    window for as long as it took (Android 15 CTF25: 3.8 s).
+
+    A folder that cannot be read in full is reported and gets no rows, so
+    it stays "not indexed" (_leveldb_search_coverage) and is tried again
+    on the next run, instead of being saved as indexed with no records.
+
+    Rows already in the table from another decode-logic version are
+    cleared first, so the table never mixes versions."""
+    progress       = Signal(int, int)    # (folders done, total)
+    finished_index = Signal(list, bool)  # ([(ui_path, reason)] not indexed, cancelled)
+
+    def __init__(self, case_dir: str, jobs: list, version: str,
+                 failed: list | None = None, cancel_check=None, parent=None):
+        super().__init__(parent)
+        self._case_dir = case_dir
+        self._jobs = jobs
+        self._version = version
+        self._failed = list(failed or [])     # folders that failed while planning
+        self._cancel_check = cancel_check
+
+    def run(self):
+        from db_utils import save_leveldb_search_records, clear_leveldb_search_index
+        from leveldb_viewer import run_leveldb_search_index, LevelDbIndexError
+        failed, cancelled = self._failed, False
+        total = len(self._jobs)
+        try:
+            db = _open_cache_db(self._case_dir)
+        except Exception as exc:
+            failed += [(j['ui_path'], f"case cache could not be opened ({exc})")
+                       for j in self._jobs]
+            self.finished_index.emit(failed, False)
+            return
+        with closing(db):
+            if _leveldb_index_rows_version(db) != self._version:
+                clear_leveldb_search_index(db)
+            save_blob(db, _LEVELDB_ROWS_VERSION_KEY, '1', self._version.encode())
+            for i, job in enumerate(self._jobs):
+                if self.isInterruptionRequested() or (
+                        self._cancel_check and self._cancel_check()):
+                    cancelled = True
+                    break
+                try:
+                    rows = run_leveldb_search_index(job)
+                    save_leveldb_search_records(db, job['ui_path'], rows)
+                except Exception as exc:
+                    reason = (str(exc) if isinstance(exc, LevelDbIndexError)
+                              else f"{type(exc).__name__}: {exc}")
+                    failed.append((job['ui_path'], reason))
+                    startup_log.message(
+                        'WARNING', f"LevelDB index: {job['ui_path']} not indexed ({reason})")
+                self.progress.emit(i + 1, total)
+        self.finished_index.emit(failed, cancelled)
+
+
 class SingleFileEmbeddedMediaWorker(QThread):
     """Manual, single-file "Search for Embedded Media" context-menu
     action — added 2026-09-23, direct request: "can we make it that for
@@ -5972,11 +6045,9 @@ class ProcessDialog(QDialog):
         self._request_tier3_count_fn = request_tier3_count_fn
         # Both callables only — FastZipBrowser owns the real engine
         # (_leveldb_search_coverage/_index_leveldb_folders_batched)
-        # since the indexing pass deliberately shares the GUI's own zip
-        # reader rather than opening an independent one (see
-        # _index_leveldb_folders_batched's own docstring for why — it's
-        # the one Process Case stage that genuinely can't be a
-        # standalone QThread worker the way every other stage here is).
+        # since resolving each folder's files uses the GUI's own zip
+        # handle (see _index_leveldb_folders_batched's own docstring; the
+        # reading and decoding run on LevelDbIndexWorker since 2026-11-05).
         # Moved into an explicit, checked-by-default stage 2026-10-12,
         # direct request: "the leveldb processing that is do[ne] is
         # started after the data is loaded into the gui and at the same
@@ -6984,16 +7055,32 @@ class ProcessDialog(QDialog):
                     f"Indexing LevelDB/IndexedDB folders for search: "
                     f"{remaining:,} of {total_:,} remaining…")
 
-        def _done():
+        def _done(failed=()):
             self._leveldb_indexing_active = False
-            self._status_label.setText(
-                f"Indexed {total:,} LevelDB/IndexedDB folder(s) for search.")
+            self._leveldb_index_failed = list(failed)
+            if failed:
+                self._status_label.setText(
+                    f"Indexed {total - len(failed):,} of {total:,} LevelDB/IndexedDB "
+                    f"folder(s) for search; {self._leveldb_failed_text()}")
+            else:
+                self._status_label.setText(
+                    f"Indexed {total:,} LevelDB/IndexedDB folder(s) for search.")
             self.leveldb_indexing_done.emit()
             self._continue_after_leveldb_indexing()
 
         self._leveldb_indexing_active = True
         self._leveldb_index_fn(unindexed, on_progress=_progress, on_done=_done,
                               cancel_check=lambda: self._scan_cancelled)
+
+    def _leveldb_failed_text(self) -> str:
+        """One line on the folders the last indexing run could not read
+        (reasons are in the log). Keyword Search does not cover them; the
+        stage stays ticked so the next run tries them again."""
+        failed = getattr(self, '_leveldb_index_failed', [])
+        names = ", ".join(p.rsplit('/', 1)[-1] for p, _ in failed[:3])
+        more = f" and {len(failed) - 3:,} more" if len(failed) > 3 else ""
+        return (f"{len(failed):,} could not be read and are not covered by "
+                f"Keyword Search ({names}{more}; reasons in Tools ▸ Open Log Folder).")
 
     def _continue_after_leveldb_indexing(self):
         if self._chk_embedded_media.isChecked():
@@ -7701,6 +7788,12 @@ class ProcessDialog(QDialog):
         self._finish_operations()
 
     def _finish_operations(self):
+        if getattr(self, '_leveldb_index_failed', None):
+            # Later stages replace the status line; keep this one visible.
+            self._status_label.setText(
+                (self._status_label.text() + "\n" if self._status_label.text() else "")
+                + "LevelDB/IndexedDB: " + self._leveldb_failed_text())
+            self._leveldb_index_failed = []
         self._run_btn.setEnabled(True)
         self._close_btn.setEnabled(True)
         self._cancel_btn.setVisible(False)
@@ -11910,8 +12003,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         already_indexed: set = set()
         try:
             with closing(_open_cache_db(self._case_dir)) as db:
-                stale = load_blob(db, 'leveldb_search_index_version', '1')
-                if stale is not None and stale.decode() == current_version:
+                if _leveldb_index_rows_version(db) == current_version:
                     already_indexed = indexed_leveldb_folders(db)
         except Exception:
             already_indexed = set()
@@ -11928,104 +12020,91 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _index_leveldb_folders_batched(self, ui_paths: list, on_progress=None, on_done=None,
                                        cancel_check=None):
         """Index every path in *ui_paths* for Keyword Search coverage —
-        writes to casecache.db's leveldb_search_index table via
-        index_leveldb_folder_for_search (app/leveldb_viewer.py), which
-        deliberately never touches folder_map/full_metadata (see that
-        method's own docstring for the measured real cost that design
-        choice avoids: a real 234-folder archive would otherwise bloat
-        full_metadata by ~17x for a single search).
+        writes to casecache.db's leveldb_search_index table, which
+        deliberately never touches folder_map/full_metadata (see
+        index_leveldb_folder_for_search, app/leveldb_viewer.py, for the
+        measured real cost that design choice avoids: a real 234-folder
+        archive would otherwise bloat full_metadata by ~17x for a single
+        search).
 
-        Runs frame-budgeted on the MAIN thread (same
-        _populate_tree_children_batched idiom used for tree population)
-        rather than a background QThread — deliberate, not an oversight:
-        index_leveldb_folder_for_search reads archive bytes via
-        self._read_zip_bytes, the GUI's own shared zip reader, and this
-        project's own standing convention is that a background worker
-        must own an independent reader rather than share that one (see
-        keyword_search.py's KeywordSearchWorker/NestedArchiveSearchWorker,
-        both of which open their own zip access rather than touching
-        self._read_zip_bytes) — giving this indexing pass its own reader
-        too would be real, avoidable extra complexity given the measured
-        cost is already small (~3.4s of CPU for a real 234-folder/257,804-
-        record archive); frame-budgeting keeps the UI responsive for that
-        span the same way tree population already does for a much larger
-        one, without needing a second reader implementation at all.
+        Two halves since 2026-11-05. Resolving each folder's files to
+        archive entries (plan_leveldb_search_index) needs the GUI's zip
+        handle, so it runs here on the main thread, frame-budgeted, without
+        reading anything. Reading and decoding them runs on
+        LevelDbIndexWorker. Until then both ran here between frames, and
+        the budget was only checked between folders, so one large folder
+        froze the window: measured on the current code, Android 15 CTF25
+        (314 folders) froze for up to 3.8 s, Android 14 JoshHickman (234)
+        for up to 0.67 s, IOS17 (19) for 0.42 s.
 
-        *on_progress(done, total)* and *on_done()* are optional callbacks;
-        writes happen incrementally (one save_leveldb_search_records call
-        per folder) so a cancelled/interrupted run still leaves whatever
-        was completed usable rather than losing it all.
+        *on_progress(done, total)* and *on_done(failed)* are optional
+        callbacks, called on the main thread; *failed* is
+        [(ui_path, reason)] for each folder not indexed. Rows are written
+        per folder, so a cancelled run keeps what it finished.
 
-        *cancel_check* — added 2026-10-12 alongside moving this into an
-        explicit Process Case stage with its own Cancel button (this
-        pass previously had no cancellation hook at all, since it used
-        to run unconditionally with nothing to cancel it with). Checked
-        once per folder, same cadence as every other check here — on a
-        cancelled run, _finish() deliberately skips writing the version
-        marker: the real folders indexed so far stay usable (same as a
-        plain interruption), but the whole case must NOT be recorded as
-        "fully covered" when it demonstrably isn't yet."""
-        from db_utils import save_leveldb_search_records
+        *cancel_check* — checked once per folder, here and on the worker.
+        The 'leveldb_search_index_version' marker ("a full pass is on
+        record", _leveldb_index_on_record) is written only when every
+        folder was indexed and the run was not cancelled; until 2026-11-05
+        it was also written when folders had failed, and those had been
+        saved as indexed with no records."""
         from leveldb_viewer import leveldb_decode_logic_version
-        state = {'idx': 0, 'cancelled': False}
-        total = len(ui_paths)
         version = leveldb_decode_logic_version()
+        state = {'idx': 0}
+        total = len(ui_paths)
+        jobs: list = []
+        failed: list = []
 
-        def _step(deadline):
+        def _plan(deadline):
             while state['idx'] < total:
                 if cancel_check and cancel_check():
-                    state['cancelled'] = True
                     return True
                 ui_path = ui_paths[state['idx']]
                 state['idx'] += 1
-                # An ALREADY-decoded folder's own folder_map[ui_path] holds
-                # virtual per-record children now, not the real raw files —
-                # _leveldb_folder_map's own 'real_children' (recorded once,
-                # at the moment it was first decoded) is the one place that
-                # still has the true original listing. Falls back to
-                # folder_map for a folder that's never been decoded at all,
-                # where folder_map still correctly shows the raw files.
                 existing_entry = self._leveldb_folder_map.get(ui_path)
                 if existing_entry is not None:
                     real_children = list(existing_entry.get('real_children') or [])
                 else:
                     real_children = list(self.folder_map.get(ui_path) or [])
                 try:
-                    rows = self.index_leveldb_folder_for_search(ui_path, real_children)
-                except Exception:
-                    rows = []
-                if self._case_dir:
-                    try:
-                        with closing(_open_cache_db(self._case_dir)) as db:
-                            save_leveldb_search_records(db, ui_path, rows)
-                    except Exception:
-                        pass
-                if on_progress:
-                    on_progress(state['idx'], total)
-                if deadline is not None and time.monotonic() >= deadline:
+                    jobs.append(self.plan_leveldb_search_index(ui_path, real_children))
+                except Exception as exc:
+                    failed.append((ui_path, f"{type(exc).__name__}: {exc}"))
+                if time.monotonic() >= deadline:
                     return False
             return True
 
-        def _finish():
-            if self._case_dir and not state['cancelled']:
+        def _finished(failed_all, cancelled):
+            self._leveldb_index_worker = None
+            if (self._case_dir and not cancelled and not failed_all
+                    and state['idx'] == total):
                 try:
                     with closing(_open_cache_db(self._case_dir)) as db:
                         save_blob(db, 'leveldb_search_index_version', '1', version.encode())
-                except Exception:
-                    pass
+                except Exception as exc:
+                    startup_log.message('WARNING', f"LevelDB index: marker not saved ({exc})")
             if on_done:
-                on_done()
+                on_done(failed_all)
+
+        def _start_worker():
+            if not self._case_dir:
+                _finished([(p, "no case folder") for p in ui_paths], False)
+                return
+            worker = LevelDbIndexWorker(self._case_dir, jobs, version,
+                                        failed=failed, cancel_check=cancel_check)
+            if on_progress:
+                worker.progress.connect(on_progress)
+            worker.finished_index.connect(_finished)
+            self._leveldb_index_worker = worker
+            worker.start()
 
         def _batch():
-            if _step(time.monotonic() + FRAME_BUDGET_SECS):
-                _finish()
+            if _plan(time.monotonic() + FRAME_BUDGET_SECS):
+                _start_worker()
             else:
                 QTimer.singleShot(0, _batch)
 
-        if not ui_paths:
-            _finish()
-        else:
-            QTimer.singleShot(0, _batch)
+        QTimer.singleShot(0, _batch)
 
     _SEARCH_TAB_INDEX = 2   # matches center_tabs.addTab(search_tab, "Keyword Search")
 
@@ -17596,6 +17675,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _stop(getattr(self, 'ex_worker', None), method='cancel')
         _stop(getattr(self, '_sql_preview_worker', None), method='requestInterruption')
         _stop(getattr(self, '_single_file_embedded_worker', None))
+        _stop(getattr(self, '_leveldb_index_worker', None), method='requestInterruption')
         for w in list(getattr(self, '_retired_workers', [])):
             # Real, pre-existing bug found 2026-09-24 while verifying the
             # Media Browser's own worker restarts (a page load, or its

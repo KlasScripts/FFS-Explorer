@@ -67,9 +67,10 @@ Interaction model, per direct user request:
     (the concrete case this whole feature exists to prove) decodes
     correctly with zero special-casing here."""
 
+import hashlib
 import os
 import re
-import threading
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 
 from zip_entry import ZipEntry
@@ -91,6 +92,29 @@ _LDB_MANIFEST_PATTERN = re.compile(r'^MANIFEST-[0-9A-Fa-f]{6}$')
 # convention (see artifact_runner.run_artifact's own docstring), applied
 # to remembering WHICH real folder a given local extraction came from.
 _SOURCE_MARKER_NAME = '.ffs_leveldb_source_ui_path'
+
+# Longest case_dir/leveldb_browse/<name> folder name kept as it is.
+# The name is the whole archive path with every other character made
+# '_', so a deep iOS container path made a 194-character name: on IOS17
+# (case folder on Z:, 2026-11-05) its primary.ldb files reached Windows'
+# 260-character path limit and the folder was not indexed. A longer name
+# keeps its start and end around a hash of the full path, so two
+# folders never share a name and the store's own name stays readable.
+# Nothing turns the name back into a path (_SOURCE_MARKER_NAME does that).
+_MAX_EXTRACT_NAME = 100
+
+
+def extract_dir_name(ui_path: str) -> str:
+    """The leveldb_browse/ folder name for *ui_path*: unchanged when it
+    fits _MAX_EXTRACT_NAME (so existing cases keep their extractions),
+    else head + hash + tail of exactly that length."""
+    name = re.sub(r'[^A-Za-z0-9_.-]', '_', ui_path)
+    if len(name) <= _MAX_EXTRACT_NAME:
+        return name
+    digest = hashlib.sha1(ui_path.encode('utf-8')).hexdigest()[:12]
+    head = 30
+    tail = _MAX_EXTRACT_NAME - head - len(digest) - 2
+    return f"{name[:head]}_{digest}_{name[-tail:]}"
 
 # Characters safe to keep verbatim in a synthetic vpath segment (used as
 # an actual dict key and a literal path component elsewhere in this
@@ -982,7 +1006,9 @@ def _parallel_extract(to_fetch: list) -> None:
             return f"{entry.physical_path}: read failed ({exc})"
         if data is None or len(data) != entry.file_size:
             return f"{entry.physical_path}: short read"
-        tmp = f"{dest}.{os.getpid()}-{threading.get_ident()}.part"
+        # A random tag, not pid + thread id: two writers of one file still
+        # get different names, and the path grows by 12 characters, not 15+.
+        tmp = f"{dest}.{secrets.token_hex(3)}.part"
         try:
             with open(tmp, 'wb') as f:
                 f.write(data)
@@ -1266,7 +1292,7 @@ class LevelDbViewerMixin:
         _iterate_indexeddb_records (refactored out 2026-09-19 so
         index_leveldb_folder_for_search's own search-indexing pass can
         share the identical decode logic rather than a second copy)."""
-        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', ui_path)
+        safe_name = extract_dir_name(ui_path)
         extract_dir = os.path.join(self._case_dir, 'leveldb_browse', safe_name)
         os.makedirs(extract_dir, exist_ok=True)
         self._extract_leveldb_children_flat(real_children, extract_dir)
@@ -1276,7 +1302,7 @@ class LevelDbViewerMixin:
         if blob_ui_path in self.folder_map:
             blob_extract_dir = os.path.join(
                 self._case_dir, 'leveldb_browse',
-                re.sub(r'[^A-Za-z0-9_.-]', '_', blob_ui_path))
+                extract_dir_name(blob_ui_path))
             self._extract_tree(blob_ui_path, blob_extract_dir)
 
         try:
@@ -1392,7 +1418,7 @@ class LevelDbViewerMixin:
         the folder's files (and an IndexedDB store's blob folder) to archive
         entries, without reading them. The result is plain data for
         run_leveldb_search_index."""
-        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', ui_path)
+        safe_name = extract_dir_name(ui_path)
         extract_dir = os.path.join(self._case_dir, 'leveldb_browse', safe_name)
         os.makedirs(extract_dir, exist_ok=True)
         to_fetch: list[tuple[ZipEntry, str]] = []
@@ -1403,7 +1429,7 @@ class LevelDbViewerMixin:
             if blob_ui_path in self.folder_map:
                 blob_extract_dir = os.path.join(
                     self._case_dir, 'leveldb_browse',
-                    re.sub(r'[^A-Za-z0-9_.-]', '_', blob_ui_path))
+                    extract_dir_name(blob_ui_path))
                 self._collect_extract_tree(blob_ui_path, blob_extract_dir, to_fetch, errors)
         return {'ui_path': ui_path, 'extract_dir': extract_dir,
                 'blob_extract_dir': blob_extract_dir,
@@ -1453,7 +1479,7 @@ class LevelDbViewerMixin:
 
         import ccl_leveldb
 
-        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', ui_path)
+        safe_name = extract_dir_name(ui_path)
         extract_dir = os.path.join(self._case_dir, 'leveldb_browse', safe_name)
         os.makedirs(extract_dir, exist_ok=True)
         self._extract_leveldb_children_flat(real_children, extract_dir)

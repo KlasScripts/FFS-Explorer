@@ -71,3 +71,23 @@ def test_unreadable_store_fails_the_folder(tmp_path):
     (tmp_path / '000004.ldb').write_bytes(b'not a table')
     with pytest.raises(LevelDbIndexError):
         run_leveldb_search_index(_job(tmp_path))
+
+
+def test_extract_dir_name_short_paths_unchanged():
+    from leveldb_viewer import extract_dir_name
+    assert extract_dir_name('data/data/com.app/app_webview/Local Storage/leveldb') == \
+        'data_data_com.app_app_webview_Local_Storage_leveldb'
+
+
+def test_extract_dir_name_long_paths_capped_and_distinct():
+    """IOS17 (2026-11-05): a 194-character name put primary.ldb's files
+    over Windows' 260-character path limit."""
+    from leveldb_viewer import _MAX_EXTRACT_NAME, extract_dir_name
+    base = ('mobile/Containers/Data/Application/E81161FB-2689-4DF6-B98B-C8F95B056440/'
+            'Library/Application Support/PersistentCache/Users/7jlf2hrgerxu6n0pp8l35r5h0-user/')
+    a = extract_dir_name(base + 'primary.ldb')
+    b = extract_dir_name(base.replace('E81161FB', 'E81161FC') + 'primary.ldb')
+    assert len(a) == len(b) == _MAX_EXTRACT_NAME
+    assert a != b
+    assert a.startswith('mobile_Containers_Data_Applica') and a.endswith('_primary.ldb')
+    assert a == extract_dir_name(base + 'primary.ldb')       # stable across runs

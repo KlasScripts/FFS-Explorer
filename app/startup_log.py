@@ -113,7 +113,10 @@ def setup() -> str | None:
         crash = os.path.join(d, CRASH_NAME)
         if os.path.exists(crash) and os.path.getsize(crash) > 0:
             os.replace(crash, os.path.join(d, 'crash.prev.log'))
-        _crash_file = open(crash, 'w', encoding='utf-8')
+        # Append, not 'w': the C stderr reopened onto the same file
+        # (_route_c_stderr) appends too, and a 'w' handle would write over it.
+        _crash_file = open(crash, 'a', encoding='utf-8')
+        _route_c_stderr(crash)
         faulthandler.enable(file=_crash_file, all_threads=True)
         faulthandler.dump_traceback_later(WATCHDOG_SECONDS, repeat=False, file=_crash_file)
     except Exception:
@@ -176,6 +179,27 @@ def _environment() -> str:
                 f"{'frozen, files dated ' + built if frozen else 'source run'} | {exe}")
     except Exception:
         return 'environment unavailable'
+
+
+def _route_c_stderr(path: str) -> None:
+    """Windowed Windows exe only: reopen the C runtime's stderr onto
+    *path* (crash.log, appended to). Qt, shiboken and the C runtime print
+    the reason for an abort there; without a console it went nowhere, and
+    crash.log held only faulthandler's "Fatal Python error: Aborted" and
+    the stacks (IOS17 open, v0.50.31, 2026-11-05). Redirecting file
+    descriptor 2 is not enough: in a GUI process that stream has no
+    descriptor at all, so it is reopened by name."""
+    if sys.platform != 'win32' or sys.stderr is not None:
+        return
+    try:
+        import ctypes
+        ucrt = ctypes.CDLL('ucrtbase')
+        ucrt.__acrt_iob_func.restype = ctypes.c_void_p
+        ucrt._wfreopen.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p)
+        ucrt._wfreopen.restype = ctypes.c_void_p
+        ucrt._wfreopen(path, 'a', ucrt.__acrt_iob_func(2))
+    except Exception:
+        pass
 
 
 def _install_excepthooks() -> None:

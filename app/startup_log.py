@@ -125,6 +125,9 @@ def setup() -> str | None:
     _logger.info('=' * 60)
     _logger.info('FFS Explorer starting  pid=%s', os.getpid())
     _logger.info('%s', _environment())
+    if _crt_path or _abort_handler is not None:
+        _logger.info('crash dump on abort: %s (C runtime %s)',
+                     'on' if _abort_handler is not None else 'OFF', _crt_path or 'unknown')
     if d != log_dir():
         _logger.warning('could not write to %s; logging here instead', log_dir())
     return d
@@ -206,6 +209,34 @@ def _open_crash_file(d: str) -> str | None:
     return crash
 
 
+_crt_path: str | None = None   # which C runtime file the handlers went to
+
+
+def _system_crt(part: str):
+    """The C runtime that Python and Qt actually use, as a ctypes library
+    (*part*: 'runtime' or 'stdio').
+
+    Not ctypes.CDLL('ucrtbase'): the frozen build also ships its own
+    _internal/ucrtbase.dll, and loading by that name picked the bundled
+    copy, a second, separate C runtime. Python, faulthandler and Qt use
+    the system one (they link through the api-ms-win-crt API sets), so a
+    signal handler or stderr reopened in the bundled copy never saw
+    anything (v0.50.35, 2026-11-06: two ucrtbase.dll loaded; a forced
+    abort wrote no dump). Loading by the API-set name resolves to the same
+    copy they use."""
+    global _crt_path
+    import ctypes
+    lib = ctypes.CDLL(f'api-ms-win-crt-{part}-l1-1-0')
+    if _crt_path is None:
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            ctypes.windll.kernel32.GetModuleFileNameW(ctypes.c_void_p(lib._handle), buf, 1024)
+            _crt_path = buf.value
+        except Exception:
+            pass
+    return lib
+
+
 def _route_c_stderr(path: str) -> None:
     """Windowed Windows exe only: reopen the C runtime's stderr onto
     *path* (crash.log, appended to). Qt, shiboken and the C runtime print
@@ -218,7 +249,7 @@ def _route_c_stderr(path: str) -> None:
         return
     try:
         import ctypes
-        ucrt = ctypes.CDLL('ucrtbase')
+        ucrt = _system_crt('stdio')
         ucrt.__acrt_iob_func.restype = ctypes.c_void_p
         ucrt._wfreopen.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p)
         ucrt._wfreopen.restype = ctypes.c_void_p
@@ -250,7 +281,7 @@ def _install_abort_dump(dump_path: str) -> None:
     try:
         import ctypes
         from ctypes import wintypes
-        ucrt = ctypes.CDLL('ucrtbase')
+        ucrt = _system_crt('runtime')
         k32 = ctypes.WinDLL('kernel32')
         dbghelp = ctypes.WinDLL('dbghelp')
         k32.CreateFileW.restype = wintypes.HANDLE

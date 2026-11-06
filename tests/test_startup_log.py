@@ -137,3 +137,16 @@ def test_crash_logging_on_when_crash_log_cannot_be_rotated(tmp_path):
     assert len(others) == 1
     assert 'stuck_in_second_copy' in _read(d, others[0])
     assert _read(d, 'crash.log') == 'older crash'
+
+
+def test_c_runtime_is_the_system_copy(tmp_path):
+    """The frozen build ships its own ucrtbase.dll; the abort handler and
+    stderr must go to the C runtime Python itself uses (System32)."""
+    if sys.platform != 'win32':
+        return
+    out = subprocess.run(
+        [sys.executable, '-c',
+         f"import sys; sys.path.insert(0, {APP!r}); import startup_log\n"
+         "startup_log._system_crt('runtime'); print(startup_log._crt_path)"],
+        capture_output=True, text=True, timeout=60)
+    assert out.stdout.strip().lower().endswith(r'system32\ucrtbase.dll'), out

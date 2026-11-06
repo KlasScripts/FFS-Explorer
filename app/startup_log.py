@@ -109,18 +109,17 @@ def setup() -> str | None:
         break
     if d is None:
         return None
-    try:
-        crash = os.path.join(d, CRASH_NAME)
-        if os.path.exists(crash) and os.path.getsize(crash) > 0:
-            os.replace(crash, os.path.join(d, 'crash.prev.log'))
-        # Append, not 'w': the C stderr reopened onto the same file
-        # (_route_c_stderr) appends too, and a 'w' handle would write over it.
-        _crash_file = open(crash, 'a', encoding='utf-8')
-        _route_c_stderr(crash)
-        faulthandler.enable(file=_crash_file, all_threads=True)
-        faulthandler.dump_traceback_later(WATCHDOG_SECONDS, repeat=False, file=_crash_file)
-    except Exception:
-        _crash_file = None
+    crash = _open_crash_file(d)
+    if crash is not None:
+        try:
+            _route_c_stderr(crash)
+            # Before faulthandler: it keeps this as the handler to pass an
+            # abort on to once it has written the Python stacks.
+            _install_abort_dump(os.path.splitext(crash)[0] + '.dmp')
+            faulthandler.enable(file=_crash_file, all_threads=True)
+            faulthandler.dump_traceback_later(WATCHDOG_SECONDS, repeat=False, file=_crash_file)
+        except Exception:
+            _crash_file = None
     _install_excepthooks()
     atexit.register(_at_exit)
     _logger.info('=' * 60)
@@ -181,6 +180,32 @@ def _environment() -> str:
         return 'environment unavailable'
 
 
+def _open_crash_file(d: str) -> str | None:
+    """Open this session's crash log in folder *d* (sets `_crash_file`) and
+    return its path, or None if none could be opened.
+
+    The previous non-empty crash.log becomes crash.prev.log first. If that
+    fails (another running copy of the app holds crash.log open, as on
+    2026-11-06), this session writes to crash-<pid>.log instead: crash
+    logging used to be skipped entirely then, so a crash in the second
+    copy left no record."""
+    global _crash_file
+    crash = os.path.join(d, CRASH_NAME)
+    try:
+        if os.path.exists(crash) and os.path.getsize(crash) > 0:
+            os.replace(crash, os.path.join(d, 'crash.prev.log'))
+    except OSError:
+        crash = os.path.join(d, f'crash-{os.getpid()}.log')
+    try:
+        # Append, not 'w': the C stderr reopened onto the same file
+        # (_route_c_stderr) appends too, and a 'w' handle would write over it.
+        _crash_file = open(crash, 'a', encoding='utf-8')
+    except OSError:
+        _crash_file = None
+        return None
+    return crash
+
+
 def _route_c_stderr(path: str) -> None:
     """Windowed Windows exe only: reopen the C runtime's stderr onto
     *path* (crash.log, appended to). Qt, shiboken and the C runtime print
@@ -200,6 +225,71 @@ def _route_c_stderr(path: str) -> None:
         ucrt._wfreopen(path, 'a', ucrt.__acrt_iob_func(2))
     except Exception:
         pass
+
+
+_abort_handler = None   # kept alive: the C runtime holds only a raw pointer
+
+
+def _install_abort_dump(dump_path: str) -> None:
+    """Windows only: when the process aborts, write a small minidump
+    (thread stacks and the loaded-module list, no heap) to *dump_path*.
+
+    Why: two aborts in v0.50.31/34 (2026-11-05/06) left only "Fatal Python
+    error: Aborted" and the Python stacks; the GUI thread was at the first
+    line of an ordinary slot, so the code that called abort() was native
+    (Qt, the C++ runtime or an extension) and invisible to faulthandler.
+    The dump's stack names it.
+
+    faulthandler is enabled after this and passes SIGABRT on to the
+    previous handler, so the order on an abort is: Python stacks into
+    crash.log, then this dump, then exit (code 3, as before). Nothing runs
+    unless the process is already aborting."""
+    global _abort_handler
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        ucrt = ctypes.CDLL('ucrtbase')
+        k32 = ctypes.WinDLL('kernel32')
+        dbghelp = ctypes.WinDLL('dbghelp')
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.HANDLE)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        dbghelp.MiniDumpWriteDump.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.HANDLE,
+                                              ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                              ctypes.c_void_p)
+        handler_type = ctypes.CFUNCTYPE(None, ctypes.c_int)
+        GENERIC_WRITE, CREATE_ALWAYS = 0x40000000, 2
+        MINIDUMP_FLAGS = 0x1000   # MiniDumpWithThreadInfo; stacks only, no heap
+        invalid = wintypes.HANDLE(-1).value
+
+        def on_abort(_sig):
+            try:
+                h = k32.CreateFileW(dump_path, GENERIC_WRITE, 0, None, CREATE_ALWAYS, 0, None)
+                if h and h != invalid:
+                    ok = dbghelp.MiniDumpWriteDump(k32.GetCurrentProcess(),
+                                                   k32.GetCurrentProcessId(), h,
+                                                   MINIDUMP_FLAGS, None, None, None)
+                    k32.CloseHandle(h)
+                    if _crash_file is not None:
+                        _crash_file.write(f"\nNative stack dump {'written to' if ok else 'FAILED:'} "
+                                          f"{dump_path}\n")
+                        _crash_file.flush()
+            except Exception:
+                pass
+            ucrt._exit(3)
+
+        _abort_handler = handler_type(on_abort)
+        ucrt.signal.restype = ctypes.c_void_p
+        ucrt.signal.argtypes = (ctypes.c_int, handler_type)
+        SIGABRT = 22
+        ucrt.signal(SIGABRT, _abort_handler)
+    except Exception:
+        _abort_handler = None
 
 
 def _install_excepthooks() -> None:

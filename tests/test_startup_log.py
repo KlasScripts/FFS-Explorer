@@ -114,3 +114,26 @@ def test_falls_back_when_normal_folder_cannot_be_written(tmp_path):
     log = _read(d, startup_log_name())
     assert 'hello from the fallback' in log and 'logging here instead' in log
     assert log.count('FFS Explorer starting') == 1
+
+
+def test_crash_logging_on_when_crash_log_cannot_be_rotated(tmp_path):
+    """Another running copy holds crash.log, so it can't become
+    crash.prev.log: this copy still gets a crash log, crash-<pid>.log."""
+    d = _run(tmp_path, """
+        import os, time
+        os.makedirs(startup_log.log_dir(), exist_ok=True)
+        with open(os.path.join(startup_log.log_dir(), 'crash.log'), 'w') as f:
+            f.write('older crash')
+        def held(*a, **k):
+            raise PermissionError('in use by another process')
+        os.replace = held
+        startup_log.WATCHDOG_SECONDS = 1
+        startup_log.setup()
+        def stuck_in_second_copy():
+            time.sleep(3)
+        stuck_in_second_copy()
+    """)
+    others = [f for f in os.listdir(d) if f.startswith('crash-') and f.endswith('.log')]
+    assert len(others) == 1
+    assert 'stuck_in_second_copy' in _read(d, others[0])
+    assert _read(d, 'crash.log') == 'older crash'

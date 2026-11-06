@@ -12,8 +12,8 @@ labelled with the export before it. It is enough to see which DLL and
 which Qt / C++ runtime function called abort().
 
 The thread that aborted is the one that wrote the dump (its stack holds
-dbghelp.dll); only it is printed unless --all is given. Read it from the
-top: dbghelp and ctypes/libffi (the dump handler), then ucrtbase (abort
+dbghelp.dll or dbgcore.dll); only it is printed unless --all is given. Read it from the
+top: dbghelp/dbgcore and ctypes/libffi (the dump handler), then ucrtbase (abort
 and raise), then the code that called abort(). On Windows on ARM the
 system DLLs are ARM64X, so their names here are rough; the app's own DLLs
 (Qt, Python, PySide) name well.
@@ -165,8 +165,8 @@ def main():
                 frames.append(label)
         stacks.append((tid, frames))
     # The aborting thread is the one that ran startup_log's handler, which
-    # called dbghelp's MiniDumpWriteDump.
-    aborted = ([s for s in stacks if any(f.lower().startswith('dbghelp.dll!') for f in s[1])]
+    # called MiniDumpWriteDump (dbghelp.dll, which hands the work to dbgcore.dll).
+    aborted = ([s for s in stacks if any(f.lower().startswith(('dbghelp.dll!', 'dbgcore.dll!')) for f in s[1])]
                or [s for s in stacks if any(f.lower().startswith('ucrtbase.dll!') for f in s[1])][:1])
     show = stacks if '--all' in sys.argv else (aborted or stacks)
     for tid, frames in show:

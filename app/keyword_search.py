@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from itertools import batched
 
@@ -17,6 +18,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError, save_blo
                       save_evidence_page_map, load_evidence_page_map,
                       load_case_setting)
 from highlight_delegate import HighlightDelegate
+import keyword_scan
 from zip_cd_cache import CachedZipView, load as _zcd_load, compute_data_offsets as _compute_data_offsets
 from zip_entry import ZipEntry
 from zip_reader import ZipReader, read_nested_entry
@@ -27,25 +29,46 @@ _SEARCH_ENTRIES_VERSION = '3'   # 2: offsets past the 4 GiB ZIP64 boundary were 
 _CELLEBRITE_META_PREFIXES = ('metadata1/', 'metadata2/')
 
 
-def _make_patterns(keyword: str) -> list:
-    """Return [(lowercase_pattern, pattern_len, encoding), …] for a keyword."""
-    patterns = []
-    for enc in ('utf-8', 'utf-16-le', 'utf-16-be'):
-        pat = keyword.encode(enc, errors='replace')
-        patterns.append((pat.lower(), len(pat), enc))
-    return patterns
+_make_patterns = keyword_scan.make_patterns
+_iter_pattern_hits = keyword_scan.iter_pattern_hits
+
+# Worker processes for the main archive search: one per core. Reading is
+# not the limit (Z: on the test PC: ~2,100 MB/s from one thread), matching
+# is (~560 MB/s per core), so more processes than cores gains nothing.
+SEARCH_PROCESSES = max(1, min(8, os.cpu_count() or 1))
 
 
-def _iter_pattern_hits(data_lower: bytes, patterns: list):
-    """Yield (idx, pat_len, enc) for every pattern occurrence in data_lower."""
-    for pat, pat_len, enc in patterns:
-        idx = 0
-        while True:
-            idx = data_lower.find(pat, idx)
-            if idx == -1:
-                break
-            yield idx, pat_len, enc
-            idx += pat_len
+# Saving search results to caseresults.db: one background thread, so the
+# writes stay in order (a search's delete before its insert) without the
+# GUI thread waiting. Deleting and then saving a common word's ~380,000
+# hits on Z: froze the window ~2.5 s at each end of the search.
+_RESULTS_DB_WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ffs-search-db')
+
+
+def _write_results_db(case_dir: str, fn) -> None:
+    """Run fn(db) on the results-DB writer thread, then commit."""
+    def job():
+        try:
+            with closing(_open_results_db(case_dir)) as db:
+                fn(db)
+                db.commit()
+        except Exception as exc:
+            _log_warning(f'keyword search: results not saved to the case ({exc!r})')
+    _RESULTS_DB_WRITER.submit(job)
+
+
+def _wait_results_db_writes() -> None:
+    """Block until every queued results-DB write is done (call off the
+    GUI thread, before reading saved results)."""
+    _RESULTS_DB_WRITER.submit(lambda: None).result()
+
+
+def _log_warning(text: str) -> None:
+    try:
+        import startup_log
+        startup_log.message('warning', text)
+    except Exception:
+        pass
 
 # Separator used to encode scope into the DB cache key.
 # \x00 cannot appear in a user-typed search term.
@@ -234,13 +257,15 @@ class KeywordSearchWorker(QThread):
         finished(total_hits)
     """
 
-    result_found  = Signal(str, int, str)   # name, offset-in-file, context
+    # (name, [(offset-in-file, context), ...]) — one signal per file with
+    # hits: one per hit (379,535 on a common word) swamped the GUI thread.
+    results_found = Signal(str, list)
     progress      = Signal(int, int)        # done, total
     finished      = Signal(int, int, int, bool)  # total hits, files_done, files_total, stopped
     status_update = Signal(str)             # free-text status line
 
-    _CHUNK     = 1 * 1024 * 1024   # 1 MB read chunks
-    _CTX_BYTES = 40                # bytes either side of hit for context
+    _CHUNK     = keyword_scan.CHUNK
+    _CTX_BYTES = keyword_scan.CTX_BYTES
 
     def __init__(self, zip_path: str, keyword: str,
                  entries=None, scope="all",
@@ -297,73 +322,104 @@ class KeywordSearchWorker(QThread):
                 entries = full_entries
         self.status_update.emit(f"Index ready — {len(entries):,} files to search")
         patterns = self._patterns
-        overlap  = max(pat_len for _, pat_len, _ in patterns) - 1
         total    = len(entries)
         hits     = 0
         done     = 0
-        reader   = ZipReader(self.zip_path)
+        # Throttle progress: one queued signal per file means hundreds of
+        # thousands of GUI label repaints on a full-archive search.
+        _last_prog = 0.0
+        for names_done, file_results in self._search(entries, patterns):
+            done += names_done
+            for name, entry_results in file_results:
+                hits += len(entry_results)
+                self.results_found.emit(name, entry_results)
+            now = time.monotonic()
+            if now - _last_prog >= 0.1 or done == total:
+                _last_prog = now
+                self.progress.emit(done, total)
+        self.finished.emit(hits, done, total, self._stop.is_set())
 
-        def _decode_ctx(data: bytes, enc: str) -> str:
-            if enc == 'utf-8':
-                return data.decode('utf-8', errors='replace')
-            if len(data) % 2:
-                data = data[1:]
-            return data.decode(enc, errors='replace')
+    def _search(self, entries: list, patterns: list):
+        """Yield (files done, [(name, hits), ...]) as work finishes: on
+        SEARCH_PROCESSES worker processes (keyword_scan says why), or on
+        this process's threads if a pool can't be started."""
+        jobs = keyword_scan.make_jobs(entries)
+        pool = None
+        if SEARCH_PROCESSES > 1 and len(jobs) > 1:
+            try:
+                import multiprocessing as mp
+                from concurrent.futures import ProcessPoolExecutor
+                pool = ProcessPoolExecutor(SEARCH_PROCESSES, mp_context=mp.get_context('spawn'))
+            except Exception as exc:
+                _log_warning(f'keyword search: no process pool ({exc}); searching on threads')
+                pool = None
+        if pool is None:
+            yield from self._search_on_threads(entries, patterns)
+            return
+        from concurrent.futures import FIRST_COMPLETED, wait
+        unreadable = 0
+        cancelled = False
+        try:
+            it = iter(jobs)
+            pending = {}
+
+            def top_up():
+                for job in it:
+                    pending[pool.submit(keyword_scan.search_job, self.zip_path, job,
+                                        patterns, self._CTX_BYTES)] = job
+                    if len(pending) >= SEARCH_PROCESSES * 3:
+                        break
+
+            top_up()
+            while pending:
+                finished, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                if self._stop.is_set():
+                    cancelled = True
+                    return
+                for fut in finished:
+                    job = pending.pop(fut)
+                    try:
+                        file_results, bad = fut.result()
+                    except Exception as exc:
+                        # e.g. a worker process died: those files are
+                        # counted as not searched, never silently passed
+                        _log_warning(f'keyword search: {len(job)} files not searched ({exc})')
+                        unreadable += len(job)
+                        yield len(job), []
+                        continue
+                    unreadable += bad
+                    yield len(job), file_results
+                top_up()
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+            if cancelled:
+                for proc in list((getattr(pool, '_processes', None) or {}).values()):
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            if unreadable:
+                self.status_update.emit(f"{unreadable:,} file(s) could not be read and were not searched")
+
+    def _search_on_threads(self, entries: list, patterns: list):
+        """The fallback: this process's thread pool, one file per task."""
+        reader = ZipReader(self.zip_path)
 
         def search_entry(entry):
             _name, data_offset, file_size = entry
             if self._stop.is_set():
                 return []
-            results  = []
-            buf_start = 0
-            leftover  = b''
             try:
-                for raw in reader.read_chunked_at(data_offset, file_size,
-                                                  chunk_size=self._CHUNK,
-                                                  stop_fn=self._stop.is_set):
-                    block       = leftover + raw
-                    block_lower = block.lower()
-                    block_base  = buf_start
-                    for idx, pat_len, enc in _iter_pattern_hits(block_lower, patterns):
-                        file_offset = block_base + idx
-                        ctx_start   = max(0, idx - self._CTX_BYTES)
-                        ctx_end     = min(len(block), idx + pat_len + self._CTX_BYTES)
-                        ctx_bytes   = block[ctx_start:ctx_end]
-                        before      = ctx_bytes[:idx - ctx_start]
-                        after       = ctx_bytes[idx - ctx_start + pat_len:]
-                        hit_text    = block[idx:idx + pat_len].decode(enc, errors='replace')
-                        context     = (
-                            _decode_ctx(before, enc)
-                            + f'[{hit_text}]'
-                            + _decode_ctx(after, enc)
-                        )
-                        results.append((file_offset, context))
-                    leftover  = block[-overlap:] if overlap > 0 else b''
-                    buf_start = block_base + len(block) - len(leftover)
+                return keyword_scan.search_blocks(
+                    reader.read_chunked_at(data_offset, file_size, chunk_size=self._CHUNK,
+                                           stop_fn=self._stop.is_set),
+                    patterns, self._CTX_BYTES)
             except OSError:
-                pass
-            return results
+                return []
 
-        # Throttle progress: one queued signal per file means hundreds of
-        # thousands of GUI label repaints on a full-archive search — the main
-        # thread ends up busier than the search itself.
-        _last_prog = 0.0
         for entry, entry_results in reader.run_parallel(
                 entries, search_entry, cancel_check=self._stop.is_set):
-            done += 1
-            now = time.monotonic()
-            if now - _last_prog >= 0.1 or done == total:
-                _last_prog = now
-                self.progress.emit(done, total)
-            try:
-                name = entry[0]
-                for file_offset, context in entry_results:
-                    hits += 1
-                    self.result_found.emit(name, file_offset, context)
-            except Exception:
-                pass
-
-        self.finished.emit(hits, done, total, self._stop.is_set())
+            yield 1, ([(entry[0], entry_results)] if entry_results else [])
 
 
 # ── NestedArchiveSearchWorker ─────────────────────────────────────────────────
@@ -1089,6 +1145,7 @@ class DbSearchLoader(QThread):
 
     def run(self):
         try:
+            _wait_results_db_writes()   # a search's hits may still be saving
             with closing(_open_results_db(self._case_dir)) as db:
                 rows = db.execute(
                     'SELECT r.filename, r.offset, r.context '
@@ -1282,6 +1339,7 @@ class KeywordSearchMixin:
         self._search_incomplete_files: tuple[int,int] = (0, 0)  # (done, total)
         self._search_folder_items: dict[str, QStandardItem] = {}
         self._search_file_items:   dict[str, QStandardItem] = {}
+        self._search_reset_hit_store()
         self._recent_searches: list = []
         self._current_scope_ui_paths: list | None = None
 
@@ -1723,76 +1781,197 @@ class KeywordSearchMixin:
         own "offset" is a position within DECODED/RENDERED text, not a
         real byte offset into the archive, and showing it unlabeled
         would risk being mistaken for one.
+
+        Hit rows are made on demand (2026-11-06): the hit is kept in
+        _search_file_hits and a file's rows are built when it is expanded,
+        _SEARCH_HIT_PAGE at a time (_search_show_hits). Building four
+        cells per hit as it arrived froze the window for 128 s on a
+        379,535-hit search ("test", Android 14). The Hits counts are set
+        once per batch: callers must call _search_apply_counts() after
+        adding hits.
         """
+        file_item = self._search_ensure_file(filename, stored_path, entry_path)
+        self._search_file_hits[filename].append(
+            (offset, context, stored_path, entry_path,
+             leveldb_folder, leveldb_record_index, offset_label))
+        self._search_counted(filename, file_item, 1)
+
+    def _search_add_file_hits(self, filename: str, hits: list):
+        """All of one archive file's hits at once: *hits* is the main
+        search worker's [(offset, context), ...] list, kept as it is.
+        Per-file work only, so a common word's hundreds of thousands of
+        hits cost the GUI thread one call per file."""
+        file_item = self._search_ensure_file(filename, None, None)
+        self._search_file_hits[filename].extend(hits)
+        self._search_counted(filename, file_item, len(hits))
+
+    def _search_counted(self, filename: str, file_item: QStandardItem, n: int):
+        counts = self._search_counts
+        dirty = self._search_counts_dirty
+        counts[filename] = counts.get(filename, 0) + n
+        dirty.add(filename)
+        for a in self._search_file_ancestors[filename]:
+            counts[a] = counts.get(a, 0) + n
+            dirty.add(a)
+        # A file already showing its hits (expanded during the search)
+        # gets new ones too, up to the page it has open.
+        shown = self._search_file_shown[filename]
+        if shown and shown < self._search_file_page_end.get(filename, 0):
+            self._search_show_hits(file_item, filename, limit=None)
+
+    def _search_ensure_file(self, filename: str, stored_path, entry_path) -> QStandardItem:
+        """The results row for *filename*, made (with its folders) on its
+        first hit."""
         _PATH_ROLE = Qt.ItemDataRole.UserRole
-        _LEVELDB_FOLDER_ROLE = Qt.ItemDataRole.UserRole + 5
-        _LEVELDB_RECORD_ROLE = Qt.ItemDataRole.UserRole + 6
+        file_item = self._search_file_items.get(filename)
+        if file_item is None:
+            folder   = filename.rsplit('/', 1)[0] if '/' in filename else ''
+            basename = filename.rsplit('/', 1)[-1]
+            display_folder   = self._strip_archive_prefix(self._display_path(folder))
+            display_basename = self._display_name(basename)
+            full_file_path   = (display_folder + '/' + display_basename) if display_folder else display_basename
 
-        folder   = filename.rsplit('/', 1)[0] if '/' in filename else ''
-        basename = filename.rsplit('/', 1)[-1]
+            parent     = self.search_results_model.invisibleRootItem()
+            cumulative = ''
+            ancestors: list[str] = []
+            for seg in (display_folder.split('/') if display_folder else []):
+                cumulative = (cumulative + '/' + seg) if cumulative else seg
+                if cumulative not in self._search_folder_items:
+                    folder_item = QStandardItem(f'📁  {seg}/')
+                    folder_item.setData(cumulative + '/', _PATH_ROLE)
+                    row = [folder_item, QStandardItem('0'), QStandardItem(''), QStandardItem('')]
+                    for cell in row:
+                        cell.setEditable(False)
+                    parent.appendRow(row)
+                    self._search_folder_items[cumulative] = folder_item
+                ancestors.append(cumulative)
+                parent = self._search_folder_items[cumulative]
 
-        display_folder   = self._strip_archive_prefix(self._display_path(folder))
-        display_basename = self._display_name(basename)
-        full_file_path   = (display_folder + '/' + display_basename) if display_folder else display_basename
-
-        segments   = display_folder.split('/') if display_folder else []
-        parent     = self.search_results_model.invisibleRootItem()
-        cumulative = ''
-        ancestor_hits_cells: list[QStandardItem] = []
-
-        for seg in segments:
-            cumulative = (cumulative + '/' + seg) if cumulative else seg
-            if cumulative not in self._search_folder_items:
-                folder_item = QStandardItem(f'📁  {seg}/')
-                folder_item.setEditable(False)
-                folder_item.setData(cumulative + '/', _PATH_ROLE)
-                hits_item = QStandardItem('0')
-                hits_item.setEditable(False)
-                row = [folder_item, hits_item, QStandardItem(''), QStandardItem('')]
-                for cell in row:
-                    cell.setEditable(False)
-                parent.appendRow(row)
-                self._search_folder_items[cumulative] = folder_item
-            folder_item = self._search_folder_items[cumulative]
-            ancestor_hits_cells.append(self._hits_cell_for(folder_item))
-            parent = folder_item
-
-        if filename not in self._search_file_items:
             file_item = QStandardItem(f'📄  {display_basename}')
-            file_item.setEditable(False)
             file_item.setData(full_file_path, _PATH_ROLE)
             file_item.setData(filename, Qt.ItemDataRole.UserRole + 2)
             if stored_path:
                 file_item.setData(stored_path, Qt.ItemDataRole.UserRole + 3)
                 file_item.setData(entry_path,  Qt.ItemDataRole.UserRole + 4)
-            file_hits = QStandardItem('0')
-            file_hits.setEditable(False)
-            row = [file_item, file_hits, QStandardItem(''), QStandardItem('')]
+            row = [file_item, QStandardItem('0'), QStandardItem(''), QStandardItem('')]
             for cell in row:
                 cell.setEditable(False)
             parent.appendRow(row)
             self._search_file_items[filename] = file_item
-        file_item = self._search_file_items[filename]
+            self._search_file_hits[filename] = []
+            self._search_file_shown[filename] = 0
+            self._search_file_ancestors[filename] = ancestors
+            # One empty child so the file shows an expand arrow; replaced
+            # by real hit rows when it is first expanded.
+            file_item.appendRow(self._search_marker_row('', 'placeholder'))
 
+        return file_item
+
+    _SEARCH_HIT_PAGE = 2000
+    _SEARCH_MARKER_ROLE = Qt.ItemDataRole.UserRole + 7   # 'placeholder' | 'more'
+
+    def _search_marker_row(self, text: str, kind: str) -> list:
+        cell = QStandardItem(text)
+        cell.setData(kind, self._SEARCH_MARKER_ROLE)
+        row = [cell, QStandardItem(''), QStandardItem(''), QStandardItem('')]
+        for c in row:
+            c.setEditable(False)
+        return row
+
+    def _search_reset_hit_store(self):
+        """Forget the previous results' hits; called wherever
+        _search_file_items is cleared."""
+        self._search_file_hits: dict[str, list] = {}
+        self._search_file_shown: dict[str, int] = {}
+        self._search_file_page_end: dict[str, int] = {}
+        self._search_file_ancestors: dict[str, list] = {}
+        self._search_counts: dict[str, int] = {}
+        self._search_counts_dirty: set = set()
+
+    def _search_total_hits(self) -> int:
+        return sum(len(h) for h in self._search_file_hits.values())
+
+    def _search_apply_counts(self):
+        """Write the Hits column of every file/folder whose count changed
+        since the last call: one setText per row per batch."""
+        dirty, self._search_counts_dirty = self._search_counts_dirty, set()
+        for key in dirty:
+            item = self._search_file_items.get(key) or self._search_folder_items.get(key)
+            cell = self._hits_cell_for(item) if item is not None else None
+            if cell is not None:
+                cell.setText(str(self._search_counts.get(key, 0)))
+
+    def _search_show_hits(self, file_item: QStandardItem, filename: str,
+                          limit: int | None = _SEARCH_HIT_PAGE):
+        """Build hit rows for *file_item*: the next *limit* hits, or with
+        limit=None the hits up to the page already open (hits that
+        arrived later). A 'more' row at the end says how many are left;
+        double-clicking it shows the next page."""
+        hits = self._search_file_hits.get(filename)
+        if hits is None:
+            return
+        shown = self._search_file_shown.get(filename, 0)
+        if limit is not None:
+            self._search_file_page_end[filename] = shown + limit
+        end = min(len(hits), self._search_file_page_end.get(filename, 0))
+        n = file_item.rowCount()
+        if n and file_item.child(n - 1, 0).data(self._SEARCH_MARKER_ROLE):
+            file_item.removeRow(n - 1)   # the placeholder or the old 'more' row
+        full_file_path = file_item.data(Qt.ItemDataRole.UserRole)
+        for i in range(shown, end):
+            file_item.appendRow(self._search_hit_row(full_file_path, filename, hits[i]))
+        self._search_file_shown[filename] = max(shown, end)
+        left = len(hits) - self._search_file_shown[filename]
+        if left > 0:
+            nxt = min(left, self._SEARCH_HIT_PAGE)
+            file_item.appendRow(self._search_marker_row(
+                f'▸  {left:,} more hit{"s" if left != 1 else ""} not listed yet '
+                f'(double-click to list the next {nxt:,})', 'more'))
+
+    def _search_show_all_hits(self, filename: str):
+        file_item = self._search_file_items.get(filename)
+        hits = self._search_file_hits.get(filename)
+        if file_item is not None and hits is not None:
+            self._search_show_hits(
+                file_item, filename,
+                limit=len(hits) - self._search_file_shown.get(filename, 0))
+
+    @staticmethod
+    def _search_hit_row(full_file_path: str, filename: str, hit: tuple) -> list:
+        if len(hit) == 2:            # main-archive hit: (offset, context)
+            (offset, context), stored_path = hit, None
+            leveldb_folder = offset_label = None
+        else:
+            (offset, context, stored_path, entry_path,
+             leveldb_folder, leveldb_record_index, offset_label) = hit
         hit_item = QStandardItem('')
-        hit_item.setData(full_file_path, _PATH_ROLE)
+        hit_item.setData(full_file_path, Qt.ItemDataRole.UserRole)
         hit_item.setData(offset, Qt.ItemDataRole.UserRole + 1)
         hit_item.setData(filename, Qt.ItemDataRole.UserRole + 2)
         if stored_path:
             hit_item.setData(stored_path, Qt.ItemDataRole.UserRole + 3)
             hit_item.setData(entry_path,  Qt.ItemDataRole.UserRole + 4)
         if leveldb_folder is not None:
-            hit_item.setData(leveldb_folder,       _LEVELDB_FOLDER_ROLE)
-            hit_item.setData(leveldb_record_index, _LEVELDB_RECORD_ROLE)
-        hit_row = [hit_item, QStandardItem(''), QStandardItem(context),
-                  QStandardItem(offset_label if offset_label is not None else str(offset))]
-        for cell in hit_row:
+            hit_item.setData(leveldb_folder,       Qt.ItemDataRole.UserRole + 5)
+            hit_item.setData(leveldb_record_index, Qt.ItemDataRole.UserRole + 6)
+        row = [hit_item, QStandardItem(''), QStandardItem(context),
+               QStandardItem(offset_label if offset_label is not None else str(offset))]
+        for cell in row:
             cell.setEditable(False)
-        file_item.appendRow(hit_row)
+        return row
 
-        for hits_cell in [self._hits_cell_for(file_item)] + ancestor_hits_cells:
-            if hits_cell:
-                hits_cell.setText(str(int(hits_cell.text()) + 1))
+    def _search_materialize_index(self, idx) -> None:
+        """A file row expanded for the first time builds its first page."""
+        if idx is None or not idx.isValid():
+            return
+        item = self.search_results_model.itemFromIndex(idx.siblingAtColumn(0))
+        if item is None or item.data(Qt.ItemDataRole.UserRole + 1) is not None:
+            return
+        filename = item.data(Qt.ItemDataRole.UserRole + 2)
+        if (filename in self._search_file_hits
+                and self._search_file_items.get(filename) is item
+                and self._search_file_shown.get(filename, 0) == 0):
+            self._search_show_hits(item, filename)
 
     def _on_search_results_double_clicked(self, idx):
         col0  = idx.siblingAtColumn(0)
@@ -1806,6 +1985,12 @@ class KeywordSearchMixin:
             self._art_jump_to_report_row(script_name, report_rowid)
             return
 
+        if jump_item is not None and jump_item.data(self._SEARCH_MARKER_ROLE) == 'more':
+            file_item = jump_item.parent()
+            if file_item is not None:
+                self._search_show_hits(file_item, file_item.data(Qt.ItemDataRole.UserRole + 2))
+            return
+
         if model.rowCount(col0) == 0:
             return
         if view.isExpanded(col0):
@@ -1813,21 +1998,43 @@ class KeywordSearchMixin:
         else:
             self._expand_search_descendants(col0)
 
+    _EXPAND_ALL_ROW_BUDGET = 20000
+
     def _expand_search_descendants(self, parent_idx):
         model = self.search_results_model
         view  = self.search_results_view
         view.setUpdatesEnabled(False)
         view.expanded.disconnect(self._on_search_tree_expanded)
         try:
+            # Each file opened lists its first page of hits; past
+            # _EXPAND_ALL_ROW_BUDGET rows the remaining files stay closed
+            # (said in the status bar) rather than freezing the window.
+            budget = self._EXPAND_ALL_ROW_BUDGET
+            closed = 0
             stack = [parent_idx]
             while stack:
                 idx = stack.pop()
+                item = model.itemFromIndex(idx)
+                filename = item.data(Qt.ItemDataRole.UserRole + 2) if item is not None else None
+                if (filename in self._search_file_hits
+                        and self._search_file_items.get(filename) is item):
+                    if self._search_file_shown.get(filename, 0) == 0:
+                        if budget <= 0:
+                            closed += 1
+                            continue
+                        self._search_show_hits(item, filename)
+                    budget -= self._search_file_shown.get(filename, 0)
                 view.expand(idx)
                 for row in range(model.rowCount(idx)):
                     stack.append(model.index(row, 0, idx))
         finally:
             view.expanded.connect(self._on_search_tree_expanded)
             view.setUpdatesEnabled(True)
+        if closed:
+            self.status_bar.showMessage(
+                f"Expanded up to {self._EXPAND_ALL_ROW_BUDGET:,} hit rows; "
+                f"{closed:,} file{'s' if closed != 1 else ''} left closed — "
+                "expand them one at a time.")
         self._on_search_tree_expanded()
 
     def _collapse_search_descendants(self, parent_idx):
@@ -2134,19 +2341,14 @@ class KeywordSearchMixin:
         qualifying_keys = {k for k, v in results.items() if v}
         if not qualifying_keys:
             return
-        items = []
-        for key in qualifying_keys:
-            file_item = self._search_file_items.get(key)
-            if file_item is None:
-                continue
-            for row in range(file_item.rowCount()):
-                items.append(file_item.child(row, 0))
-        if not items:
+        n_items = sum(len(self._search_file_hits.get(k, ())) for k in qualifying_keys
+                      if k in self._search_file_items)
+        if not n_items:
             return
-        total_hits = sum(fi.rowCount() for fi in self._search_file_items.values())
+        total_hits = self._search_total_hits()
         ans = QMessageBox.question(
             self, "Interpret SQL/WAL Hits?",
-            f"{len(items):,} of these {total_hits:,} hits are inside SQLite/"
+            f"{n_items:,} of these {total_hits:,} hits are inside SQLite/"
             f"WAL files (checked by real header bytes, not just file "
             f"extension). Interpret them all now?\n\n"
             "This runs the same background \"Interpret as SQL Record\" "
@@ -2161,7 +2363,24 @@ class KeywordSearchMixin:
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
-        self._start_bulk_sql_interpret(items)
+        # Hit rows are built on demand; interpreting needs every one of
+        # these files' rows (a result is shown under its hit row).
+        items = []
+        self.search_results_view.setUpdatesEnabled(False)
+        try:
+            for key in qualifying_keys:
+                file_item = self._search_file_items.get(key)
+                if file_item is None:
+                    continue
+                self._search_show_all_hits(key)
+                for row in range(file_item.rowCount()):
+                    child = file_item.child(row, 0)
+                    if not child.data(self._SEARCH_MARKER_ROLE):
+                        items.append(child)
+        finally:
+            self.search_results_view.setUpdatesEnabled(True)
+        if items:
+            self._start_bulk_sql_interpret(items)
 
     def _start_bulk_sql_interpret(self, items: list[QStandardItem]):
         self._bulk_sql_items = items
@@ -2239,7 +2458,8 @@ class KeywordSearchMixin:
         self.navigate_tree_to_path(folder_ui_path)
         QTimer.singleShot(0, lambda: self._select_file_in_table(vpath))
 
-    def _on_search_tree_expanded(self):
+    def _on_search_tree_expanded(self, idx=None):
+        self._search_materialize_index(idx)
         for col in range(self.search_results_model.columnCount()):
             self.search_results_view.resizeColumnToContents(col)
 
@@ -2320,6 +2540,10 @@ class KeywordSearchMixin:
         scope_tag = f" in {scope_label}" if scope_label != 'all files' else ''
 
         self._set_incomplete_banner()   # always reset before loading any result
+        # A search that just finished may still be saving its hits; only
+        # then does this wait (seconds at most), so the count read below
+        # is never a half-saved one.
+        _wait_results_db_writes()
         db = self._open_results_db_conn()
         if db is None:
             return False
@@ -2362,6 +2586,7 @@ class KeywordSearchMixin:
                 ["Name", "Hits", "Context", "Offset"])
             self._search_folder_items.clear()
             self._search_file_items.clear()
+            self._search_reset_hit_store()
             if not complete:
                 self._set_incomplete_banner(files_searched, total_files)
                 self.search_status.setText(
@@ -2391,6 +2616,7 @@ class KeywordSearchMixin:
             ["Name", "Hits", "Context", "Offset"])
         self._search_folder_items.clear()
         self._search_file_items.clear()
+        self._search_reset_hit_store()
         self.search_status.setText(f"Loading '{term}'{scope_tag} from cache…")
 
         self._db_loader_term   = term
@@ -2406,6 +2632,7 @@ class KeywordSearchMixin:
         try:
             for filename, offset, context in rows:
                 self._search_add_hit(filename, offset, context)
+            self._search_apply_counts()
         finally:
             self.search_results_view.setUpdatesEnabled(True)
 
@@ -2630,6 +2857,7 @@ class KeywordSearchMixin:
             ["Name", "Hits", "Context", "Offset"])
         self._search_folder_items.clear()
         self._search_file_items.clear()
+        self._search_reset_hit_store()
         self._pending_db_hits.clear()
         self._live_hit_buffer.clear()
         self._search_hit_count = 0
@@ -2661,15 +2889,11 @@ class KeywordSearchMixin:
         db_key = _encode_search_key(term, scope_label)
         self._current_search_db_key = db_key
         self._save_recent_search(db_key)
-        db = self._open_results_db_conn()
-        if db:
-            with closing(db):
-                db.execute(
-                    'DELETE FROM search_results '
-                    'WHERE term_id=(SELECT id FROM search_index WHERE keyword=?)',
-                    (db_key,)
-                )
-                db.commit()
+        if self._case_dir:
+            _write_results_db(self._case_dir, lambda db: db.execute(
+                'DELETE FROM search_results '
+                'WHERE term_id=(SELECT id FROM search_index WHERE keyword=?)',
+                (db_key,)))
 
         # For the fallback case (entries=None, worker builds its own list) the
         # worker still needs scope/exclude_prefixes to do its own filtering.
@@ -2704,7 +2928,7 @@ class KeywordSearchMixin:
             case_dir=self._case_dir,
             delta=getattr(self, '_local_extra_delta', None))
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
-        self._search_worker.result_found.connect(self._on_search_result)
+        self._search_worker.results_found.connect(self._on_search_results)
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.finished.connect(self._on_main_search_finished)
         self._search_worker.start()
@@ -2762,12 +2986,12 @@ class KeywordSearchMixin:
         self.search_btn.setEnabled(True)
         self.search_stop_btn.setEnabled(False)
 
-    def _on_search_result(self, name: str, offset: int, context: str):
+    def _on_search_results(self, name: str, results: list):
         # Buffer hits and insert them into the tree in batches — one tree
         # insert per signal freezes the GUI on terms with many thousands of hits.
-        self._search_hit_count += 1
-        self._pending_db_hits.append((name, offset, context))
-        self._live_hit_buffer.append((name, offset, context, None, None, None, None, None))
+        self._search_hit_count += len(results)
+        self._pending_db_hits.append((name, results))   # expanded when saved
+        self._live_hit_buffer.append((name, results))
         self._schedule_live_hit_flush()
 
     def _on_nested_search_result(self, virtual_ui_path: str, offset: int,
@@ -2828,22 +3052,40 @@ class KeywordSearchMixin:
             self._live_hit_flush_scheduled = True
             QTimer.singleShot(100, self._flush_live_hits)
 
-    def _flush_live_hits(self):
+    _FLUSH_SLICE_S = 0.04   # GUI time per flush before yielding to events
+
+    def _flush_live_hits(self, drain: bool = False):
+        """Add buffered hits to the tree. Normally stops after
+        _FLUSH_SLICE_S and schedules the rest, so the window keeps
+        responding however fast hits arrive; drain=True adds them all."""
         self._live_hit_flush_scheduled = False
         if not self._live_hit_buffer:
             return
-        buf, self._live_hit_buffer = self._live_hit_buffer, []
+        buf = self._live_hit_buffer
+        deadline = time.monotonic() + self._FLUSH_SLICE_S
+        i = 0
         self.search_results_view.setUpdatesEnabled(False)
         try:
-            for (name, offset, context, stored_path, entry_path,
-                 leveldb_folder, leveldb_record_index, offset_label) in buf:
-                self._search_add_hit(name, offset, context,
-                                     stored_path=stored_path, entry_path=entry_path,
-                                     leveldb_folder=leveldb_folder,
-                                     leveldb_record_index=leveldb_record_index,
-                                     offset_label=offset_label)
+            for i, entry in enumerate(buf, 1):
+                if len(entry) == 2:      # (name, [(offset, context), ...])
+                    self._search_add_file_hits(*entry)
+                else:
+                    (name, offset, context, stored_path, entry_path,
+                     leveldb_folder, leveldb_record_index, offset_label) = entry
+                    self._search_add_hit(name, offset, context,
+                                         stored_path=stored_path, entry_path=entry_path,
+                                         leveldb_folder=leveldb_folder,
+                                         leveldb_record_index=leveldb_record_index,
+                                         offset_label=offset_label)
+                if not drain and (i & 63) == 0 and time.monotonic() >= deadline:
+                    break
+            self._search_apply_counts()
         finally:
             self.search_results_view.setUpdatesEnabled(True)
+        del buf[:i]
+        if buf:
+            self._live_hit_flush_scheduled = True
+            QTimer.singleShot(0, self._flush_live_hits)
 
     def _on_search_progress(self, done: int, total: int):
         hits = len(self._search_file_items)
@@ -2902,7 +3144,7 @@ class KeywordSearchMixin:
         TRUE combined total across all three sources, incremented by
         each one's own result handler as hits arrive — never any single
         worker's own count alone."""
-        self._flush_live_hits()   # drain any buffered hits before counting
+        self._flush_live_hits(drain=True)   # drain any buffered hits before counting
         if self._search_entries is None and self._search_worker is not None:
             self._search_entries = self._search_worker.entries or None
         self.search_btn.setEnabled(True)
@@ -2917,29 +3159,32 @@ class KeywordSearchMixin:
         files_searched = files_done  if stopped else files_total
         total_files    = files_total
 
-        db = self._open_results_db_conn()
-        if db:
-            with closing(db):
-                db.execute(
-                    'UPDATE search_index SET complete=?, files_searched=?, total_files=? '
-                    'WHERE keyword=?',
-                    (complete, files_searched, total_files, db_key)
-                )
-                term_row = db.execute(
-                    'SELECT id FROM search_index WHERE keyword=?', (db_key,)
-                ).fetchone()
-                if term_row:
-                    term_id = term_row[0]
-                    if self._pending_db_hits:
-                        db.executemany(
-                            'INSERT INTO search_results (term_id, filename, offset, context) '
-                            'VALUES (?,?,?,?)',
-                            [(term_id, f, o, c) for f, o, c in self._pending_db_hits]
-                        )
-                    if self._current_scope_ui_paths is not None:
-                        save_search_scope_files(db, term_id, self._current_scope_ui_paths)
-                db.commit()
-        self._pending_db_hits.clear()
+        # Saved on the writer thread; these lists are handed over, not
+        # cleared, so the next search can't change them mid-write.
+        pending, self._pending_db_hits = self._pending_db_hits, []
+        scope_paths = self._current_scope_ui_paths
+
+        def save(db):
+            db.execute(
+                'UPDATE search_index SET complete=?, files_searched=?, total_files=? '
+                'WHERE keyword=?',
+                (complete, files_searched, total_files, db_key)
+            )
+            term_row = db.execute(
+                'SELECT id FROM search_index WHERE keyword=?', (db_key,)
+            ).fetchone()
+            if term_row:
+                term_id = term_row[0]
+                if pending:
+                    db.executemany(
+                        'INSERT INTO search_results (term_id, filename, offset, context) '
+                        'VALUES (?,?,?,?)',
+                        ((term_id, f, o, c) for f, hits in pending for o, c in hits)
+                    )
+                if scope_paths is not None:
+                    save_search_scope_files(db, term_id, scope_paths)
+        if self._case_dir:
+            _write_results_db(self._case_dir, save)
         if self._current_scope_ui_paths is not None:
             n = len(self._current_scope_ui_paths)
             self._search_scope_files_btn.setText(f"Files searched ({n:,})")

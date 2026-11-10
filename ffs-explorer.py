@@ -12259,6 +12259,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.search_results_model.setHorizontalHeaderLabels(["Name", "Hits", "Context", "Offset"])
         self._search_folder_items.clear()
         self._search_file_items.clear()
+        self._search_reset_hit_store()
         self._pending_db_hits.clear()
         self.search_status.setText("No search running")
         self.center_tabs.setCurrentIndex(0)

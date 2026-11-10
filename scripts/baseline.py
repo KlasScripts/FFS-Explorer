@@ -285,6 +285,10 @@ def _gui(zip_path, case_dir, mode, result_path):
             os.makedirs(outputs, exist_ok=True)
             wr = Writer(outputs, f"search_tree.{re.sub(r'[^A-Za-z0-9]+', '_', term)}", case_dir)
             model = w.search_results_model
+            # Hit rows are built on demand (when a file is expanded); list
+            # them all so the tree is compared in full.
+            for key in list(getattr(w, '_search_file_hits', {})):
+                w._search_show_all_hits(key)
 
             def walk(parent_index, trail):
                 for r in range(model.rowCount(parent_index)):

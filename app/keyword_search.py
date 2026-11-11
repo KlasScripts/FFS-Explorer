@@ -2341,6 +2341,27 @@ class KeywordSearchMixin:
         qualifying_keys = {k for k, v in results.items() if v}
         if not qualifying_keys:
             return
+        # Asked only once the search's progress dialog is closed: a
+        # question opened on top of it blocks that dialog, so its Close
+        # button did nothing until the question was answered.
+        dlg = self._search_progress_dlg
+        if dlg is not None and dlg.isVisible():
+            self._sql_prompt_pending = results
+            if not getattr(self, '_sql_prompt_hooked', False):
+                self._sql_prompt_hooked = True
+                dlg.finished.connect(self._ask_pending_sql_prompt)
+            return
+        self._ask_sql_interpret(qualifying_keys)
+
+    def _ask_pending_sql_prompt(self, *_):
+        self._sql_prompt_hooked = False
+        results, self._sql_prompt_pending = getattr(self, '_sql_prompt_pending', None), None
+        if results:
+            # after the dialog's exec() has returned, not inside it
+            QTimer.singleShot(0, lambda: self._ask_sql_interpret(
+                {k for k, v in results.items() if v}))
+
+    def _ask_sql_interpret(self, qualifying_keys: set):
         n_items = sum(len(self._search_file_hits.get(k, ())) for k in qualifying_keys
                       if k in self._search_file_items)
         if not n_items:

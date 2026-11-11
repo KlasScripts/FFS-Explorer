@@ -773,22 +773,54 @@ class BulkSqlInterpretProgressDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.clicked.connect(self.cancelled.emit)
+        self._cancel_btn.clicked.connect(self._on_button)
         btn_row.addWidget(self._cancel_btn)
         layout.addLayout(btn_row)
+        self._finished = False
+        self._cancel_requested = False
+
+    def _on_button(self):
+        # Once finished the button reads "Close" and closes the dialog. It
+        # used to emit `cancelled` in every state, so "Close" did nothing.
+        if self._finished:
+            self.accept()
+            return
+        self._request_cancel()
+
+    def _request_cancel(self):
+        if self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self._cancel_btn.setEnabled(False)
+        self._label.setText("Cancelling — finishing the hit in progress…")
+        self.cancelled.emit()
+
+    def reject(self):
+        # Title-bar X / Esc while running: stop queuing hits too, so the
+        # run never carries on behind a dialog the examiner has closed.
+        if not self._finished:
+            self._request_cancel()
+        super().reject()
 
     def update_progress(self, done: int, total: int):
+        if self._cancel_requested:
+            return
         self._bar.setValue(done)
         if done < total:
             self._label.setText(f"Interpreting hit {done + 1:,} of {total:,}…")
         else:
             self._label.setText("Finishing…")
 
-    def mark_finished(self, total: int):
-        self._bar.setValue(total)
-        self._label.setText(
-            f"Done — interpreted {total:,} hit{'s' if total != 1 else ''}.")
+    def mark_finished(self, done: int, total: int | None = None):
+        self._finished = True
+        self._bar.setValue(done)
+        hits = f"{done:,} hit{'s' if done != 1 else ''}"
+        if total is not None and done < total:
+            self._label.setText(f"Cancelled — interpreted {hits} of {total:,}.")
+        else:
+            self._label.setText(f"Done — interpreted {hits}.")
         self._cancel_btn.setText("Close")
+        self._cancel_btn.setEnabled(True)
 
 
 # ── SqlHitInterpretWorker ─────────────────────────────────────────────────────
@@ -2418,7 +2450,7 @@ class KeywordSearchMixin:
     def _advance_bulk_sql_interpret(self):
         total = len(self._bulk_sql_items)
         if self._bulk_sql_cancelled or self._bulk_sql_index >= total:
-            self._bulk_sql_progress.mark_finished(self._bulk_sql_index)
+            self._bulk_sql_progress.mark_finished(self._bulk_sql_index, total)
             return
         self._bulk_sql_progress.update_progress(self._bulk_sql_index, total)
         item = self._bulk_sql_items[self._bulk_sql_index]

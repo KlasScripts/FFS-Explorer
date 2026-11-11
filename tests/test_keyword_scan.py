@@ -25,6 +25,18 @@ def test_hits_found_once_whatever_the_read_size():
         assert sorted(_offsets(ks.search_blocks(_split(data, size), pats))) == sorted(_offsets(whole)), size
 
 
+def test_repeated_character_keyword_same_hits_whatever_the_read_size():
+    # A keyword that can overlap itself ("aa" in "aaaaa") must give the
+    # same non-overlapping hits as one whole-file search, wherever the
+    # read borders fall.
+    for kw, data in (('aa', b'aaaaa'), ('aa', b'xaaaaaaay' * 3),
+                     ('0000', b'0' * 23 + b'x' + b'0' * 9), ('aba', b'abababa')):
+        pats = ks.make_patterns(kw)
+        whole = _offsets(ks.search_blocks([data], pats))
+        for size in range(1, len(data) + 1):
+            assert _offsets(ks.search_blocks(_split(data, size), pats)) == whole, (kw, size)
+
+
 def test_context_marks_the_hit():
     pats = ks.make_patterns('needle')
     [(off, ctx)] = ks.search_blocks([b'hay hay NEEDLE hay'], pats, ctx_bytes=4)

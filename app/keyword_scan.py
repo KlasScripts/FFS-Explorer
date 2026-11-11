@@ -59,14 +59,28 @@ def search_blocks(blocks, patterns: list, ctx_bytes: int = CTX_BYTES) -> list:
     results = []
     leftover = b''
     base = 0
+    # Per pattern: the file offset where its last reported match ended.
+    # Each block's search starts there, not at the block's start, so the
+    # matches are the same as one search of the whole file: a match
+    # already reported, or one overlapping it ("aa" in "aaa"), is not
+    # reported again. (Skipping only matches lying wholly inside the
+    # carried-over bytes counted a keyword like "aa" or "0000" extra
+    # times where a long run of it crossed a read border.)
+    resume = [0] * len(patterns)
     for raw in blocks:
         block = leftover + raw if leftover else raw
         block_lower = block.lower()
-        for idx, pat_len, enc in iter_pattern_hits(block_lower, patterns):
-            # A match lying wholly inside the carried-over bytes was
-            # already found in the previous block.
-            if leftover and idx + pat_len <= len(leftover):
-                continue
+        found = []
+        for i, (pat, pat_len, enc) in enumerate(patterns):
+            idx = max(0, resume[i] - base)
+            while True:
+                idx = block_lower.find(pat, idx)
+                if idx == -1:
+                    break
+                found.append((idx, pat_len, enc))
+                idx += pat_len
+                resume[i] = base + idx
+        for idx, pat_len, enc in found:
             cs = max(0, idx - ctx_bytes)
             ce = min(len(block), idx + pat_len + ctx_bytes)
             hit_text = block[idx:idx + pat_len].decode(enc, errors='replace')

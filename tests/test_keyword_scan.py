@@ -164,3 +164,54 @@ def test_windows_1252_found_and_unencodable_skipped():
 def test_each_occurrence_counted_once():
     data = ('blåbær BLÅBÆR Blåbær ' + unicodedata.normalize('NFD', 'blåbær')).encode()
     assert _count('blåbær', data) == 4
+
+
+# ── phone numbers ───────────────────────────────────────────────────────────
+
+def _ph(term, data, read_size=None):
+    blocks = _split(data, read_size) if read_size else [data]
+    return ks.search_blocks(blocks, ks.make_patterns(term), phone=ks.make_phone_patterns(term))
+
+
+def test_formats_seen_on_the_test_phones_are_found():
+    # The shapes the 2026-11-12 survey found in contacts, call logs and
+    # Google Messages (digits changed).
+    for stored in ('(912) 345-6788', '+1 912-345-6788', '+1 (912) 345-6788',
+                   '+1-912-345-6788', '+19123456788', '9123456788', '912.345.6788',
+                   '912 345 6788'):
+        hits = _ph('9123456788', f'x {stored} y'.encode())
+        assert len(hits) == 1, (stored, hits)
+
+
+def test_international_keyword_finds_national_forms():
+    for term in ('+47 912 34 567', '004791234567', '+4791234567'):
+        for stored in ('912 34 567', '+47 912 34 567', '91234567', '4791234567@s.whatsapp.net'):
+            hits = _ph(term, f'.. {stored} ..'.encode())
+            assert len(hits) == 1, (term, stored, hits)
+    assert 'country code +47' in _ph('+4791234567', b' 912 34 567 ')[0][1]
+
+
+def test_trunk_zero_dropped():
+    assert len(_ph('0412 345 678', b'"+61 412 345 678"')) == 1
+
+
+def test_reversed_last_seven_digits_only_as_a_whole_number():
+    hits = _ph('9123456788', b'min_match 8876543 end')
+    assert len(hits) == 1 and 'reversed' in hits[0][1]
+    assert _ph('9123456788', b'id 1288765439 end') == []
+
+
+def test_no_double_counts_and_read_size_independent():
+    data = (b'a (912) 345-6788 b +19123456788 c 9123456788 d 8876543 e ' * 200)
+    whole = _ph('9123456788', data)
+    assert len(whole) == 4 * 200
+    assert len({o for o, _ in whole}) == len(whole)
+    for size in (13, 100, 4096):
+        assert sorted(_offsets(_ph('9123456788', data, size))) == sorted(_offsets(whole)), size
+
+
+def test_not_a_phone_number_keyword():
+    for term in ('test', '123456', 'klas 9123456788', '2026-11-12', '12.11.2026',
+                 '11/12/26', '192.168.1.100'):
+        assert ks.make_phone_patterns(term) == [], term
+    assert ks.make_phone_patterns('912 34 567')

@@ -297,6 +297,7 @@ class KeywordSearchWorker(QThread):
         self.entries: list     = []
         self._patterns: list   = _make_patterns(keyword)
         self._b64: list        = keyword_scan.make_base64_patterns(keyword) if base64 else []
+        self._phone: list      = keyword_scan.make_phone_patterns(keyword)
 
     def stop(self):
         self._stop.set()
@@ -369,7 +370,7 @@ class KeywordSearchWorker(QThread):
                 for job in it:
                     pending[pool.submit(keyword_scan.search_job, self.zip_path, job,
                                         patterns, self._CTX_BYTES,
-                                        b64=self._b64)] = job
+                                        b64=self._b64, phone=self._phone)] = job
                     if len(pending) >= SEARCH_PROCESSES * 3:
                         break
 
@@ -416,7 +417,7 @@ class KeywordSearchWorker(QThread):
                 return keyword_scan.search_blocks(
                     reader.read_chunked_at(data_offset, file_size, chunk_size=self._CHUNK,
                                            stop_fn=self._stop.is_set),
-                    patterns, self._CTX_BYTES, self._b64)
+                    patterns, self._CTX_BYTES, self._b64, self._phone)
             except OSError:
                 return []
 
@@ -447,6 +448,7 @@ class NestedArchiveSearchWorker(QThread):
         self._stop     = threading.Event()
         self._patterns: list = _make_patterns(keyword)
         self._b64: list = keyword_scan.make_base64_patterns(keyword) if base64 else []
+        self._phone: list = keyword_scan.make_phone_patterns(keyword)
 
     def stop(self):
         self._stop.set()
@@ -485,7 +487,7 @@ class NestedArchiveSearchWorker(QThread):
             vpath = f"{archive_ui_path}/{entry_path}"
             # Same matching as the main archive search, base64 included.
             for idx, context in keyword_scan.search_blocks(
-                    [data], self._patterns, self._CTX_BYTES, self._b64):
+                    [data], self._patterns, self._CTX_BYTES, self._b64, self._phone):
                 hits += 1
                 self.result_found.emit(vpath, idx, context, stored_path, entry_path)
             done += 1

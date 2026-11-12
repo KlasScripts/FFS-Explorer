@@ -148,6 +148,93 @@ def _base64_hit(block: bytes, idx: int, pat_len: int, grid: int, kw_lower: bytes
     return None
 
 
+# ── Phone numbers ─────────────────────────────────────────────────────────
+# The same number is stored many ways: contacts keep it as the user typed
+# or as the phone formatted it ("(912) 345-6788", "+1 912-345-6788",
+# "+47 912 34 567"), call logs and messages mostly as "+19123456788", and
+# Android's contacts2.db phone_lookup.min_match as the last 7 digits
+# reversed. A keyword that looks like a phone number (PHONE_MIN_DIGITS+
+# digits, nothing but + - . ( ) / and spaces otherwise) is also searched as:
+#   - its digits with up to 3 separators between any two;
+#   - the same without its country code, when it starts with + or 00
+#     (1, 2 or 3 digits dropped, as long as 8+ digits are left);
+#   - the same without a leading trunk 0 ("0412 345 678" -> "412345678");
+#   - its last 7 digits reversed, as a whole digit run (not inside a
+#     longer number).
+# Overlapping matches count once (the longest), and a match overlapping a
+# plain hit of the keyword itself is left to the plain hit. Covered: UTF-8
+# / ASCII text. Not covered: UTF-16 text with separators, numbers stored
+# as binary integers.
+PHONE_MIN_DIGITS = 7
+_PHONE_SEP = rb'(?:[ \t\-.()/]|\xc2\xa0){0,3}'
+
+
+def make_phone_patterns(keyword: str):
+    """[(compiled regex, label, needs digit boundaries), ...] for a
+    phone-number keyword, or [] for any other keyword."""
+    import re
+    k = keyword.strip()
+    if not re.fullmatch(r'\+?[\d\s\-.()/]+', k):
+        return []
+    # Dates and IPv4 addresses have the same characters but are not numbers
+    # to reformat or reverse.
+    if (re.fullmatch(r'\d{4}[-./]\d{1,2}[-./]\d{1,2}|\d{1,2}[-./]\d{1,2}[-./]\d{2,4}', k)
+            or re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', k)):
+        return []
+    digits = re.sub(r'\D', '', k)
+    if len(digits) < PHONE_MIN_DIGITS:
+        return []
+    variants = [(digits, 'phone number, with separators')]
+    international = k.startswith('+') or digits.startswith('00')
+    if digits.startswith('00'):
+        digits = digits[2:]
+        variants.append((digits, 'phone number, with + in place of 00'))
+    if international:
+        for n in (1, 2, 3):
+            if len(digits) - n >= 8:
+                variants.append((digits[n:], f'phone number, without country code +{digits[:n]}'))
+    elif digits.startswith('0') and len(digits) - 1 >= PHONE_MIN_DIGITS:
+        variants.append((digits[1:], 'phone number, without the leading 0'))
+    out, seen = [], set()
+    for d, label in variants:
+        if d in seen:
+            continue
+        seen.add(d)
+        rx = _PHONE_SEP.join(re.escape(c.encode()) for c in d)
+        out.append((re.compile(rx), label, False))
+    rev = digits[-7:][::-1]
+    out.append((re.compile(re.escape(rev.encode())),
+                'phone number, last 7 digits reversed (Android phone_lookup.min_match)', True))
+    return out
+
+
+def _phone_hits(block: bytes, phone: list, taken: list, ctx_bytes: int, start_at: int):
+    """Phone-form matches in *block* from *start_at*, longest first where
+    they overlap, none overlapping *taken* ((start, end) of plain hits).
+    Returns [(idx, end, context), ...] sorted by idx."""
+    cands = []
+    for rx, label, bounded in phone:
+        for m in rx.finditer(block, start_at):
+            s, e = m.span()
+            if bounded and ((s > 0 and block[s - 1:s].isdigit())
+                            or block[e:e + 1].isdigit()):
+                continue
+            cands.append((s, e, label))
+    if not cands:
+        return []
+    cands.sort(key=lambda c: (c[0], -(c[1] - c[0])))
+    out, last_end = [], -1
+    for s, e, label in cands:
+        if s < last_end or any(ts < e and s < te for ts, te in taken):
+            continue
+        cs, ce = max(0, s - ctx_bytes), min(len(block), e + ctx_bytes)
+        out.append((s, e, f'{label}: ' + block[cs:s].decode('utf-8', 'replace') + '['
+                    + block[s:e].decode('utf-8', 'replace') + ']'
+                    + block[e:ce].decode('utf-8', 'replace')))
+        last_end = e
+    return out
+
+
 def iter_pattern_hits(data_lower: bytes, patterns: list):
     """Yield (idx, pat_len, enc) for every pattern occurrence in data_lower."""
     for pat, pat_len, enc in patterns:
@@ -169,13 +256,21 @@ def _decode_ctx(data: bytes, enc: str) -> str:
 
 
 def search_blocks(blocks, patterns: list, ctx_bytes: int = CTX_BYTES,
-                  b64: list | None = None) -> list:
+                  b64: list | None = None, phone: list | None = None) -> list:
     """Search one file given as successive byte blocks; returns
     [(offset in file, context), ...] in the order found. *b64* is
-    make_base64_patterns(keyword), or None for no base64 search."""
+    make_base64_patterns(keyword), *phone* make_phone_patterns(keyword);
+    None for neither."""
     b64 = b64 or []
-    overlap = max([pat_len for _, pat_len, _ in patterns] + [len(p) for p, _, _ in b64]) - 1
+    phone = phone or []
+    # A formatted number can be up to ~7 bytes per digit long (a 2-byte
+    # non-breaking space and brackets between digits).
+    phone_len = max([7 * (rx.pattern.count(_PHONE_SEP) + 1) for rx, _, _ in phone] + [0])
+    overlap = max([pat_len for _, pat_len, _ in patterns] + [len(p) for p, _, _ in b64]
+                  + [phone_len]) - 1
     b64_resume = [0] * len(b64)
+    phone_resume = 0
+    plain_spans = []            # file (start, end) of plain hits that may still overlap
     results = []
     leftover = b''
     base = 0
@@ -218,6 +313,14 @@ def search_blocks(blocks, patterns: list, ctx_bytes: int = CTX_BYTES,
                     results.append((base + idx, ctx))
                 idx += len(pat)
                 b64_resume[i] = base + idx
+        if phone:
+            plain_spans = [sp for sp in plain_spans if sp[1] > base]
+            plain_spans += [(base + i, base + i + pl) for i, pl, _ in found]
+            taken = [(s - base, e - base) for s, e in plain_spans]
+            for s, e, ctx in _phone_hits(block, phone, taken, ctx_bytes,
+                                         max(0, phone_resume - base)):
+                results.append((base + s, ctx))
+                phone_resume = base + e
         # (a block shorter than the overlap is carried whole)
         leftover = block[-overlap:] if overlap > 0 else b''
         base += len(block) - len(leftover)
@@ -241,7 +344,7 @@ def make_jobs(entries: list, job_bytes: int = JOB_BYTES, job_files: int = JOB_FI
 
 def search_job(zip_path: str, entries: list, patterns: list,
                ctx_bytes: int = CTX_BYTES, chunk: int = CHUNK,
-               b64: list | None = None) -> tuple[list, int]:
+               b64: list | None = None, phone: list | None = None) -> tuple[list, int]:
     """Worker-process entry point: search each (name, data_offset, size)
     entry of the archive. Returns ([(name, hits), ...] for files with
     hits, number of files that could not be read)."""
@@ -258,7 +361,7 @@ def search_job(zip_path: str, entries: list, patterns: list,
                     yield data
                     pos += len(data)
             try:
-                hits = search_blocks(blocks(), patterns, ctx_bytes, b64)
+                hits = search_blocks(blocks(), patterns, ctx_bytes, b64, phone)
             except OSError:
                 unreadable += 1
                 continue

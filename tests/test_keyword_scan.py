@@ -61,3 +61,106 @@ def test_search_job_reads_each_file_by_offset_only(tmp_path):
     [(name, [(off, ctx)])] = out
     # (context stops at the end of the current read: here 3 bytes)
     assert name == 'three' and off == 3 and ctx.startswith('zz [test]')
+
+
+# ── base64 ──────────────────────────────────────────────────────────────────
+
+import base64  # noqa: E402
+
+
+def _b64_hits(term, data, read_size=None):
+    blocks = _split(data, read_size) if read_size else [data]
+    return ks.search_blocks(blocks, ks.make_patterns(term), b64=ks.make_base64_patterns(term))
+
+
+def test_name_inside_base64_found_at_every_alignment():
+    # "klas" one, two and three bytes into the encoded text, so each of the
+    # three base64 alignments is used; mixed into a JSON value.
+    for prefix in ('', 'a', 'ab', 'abc', 'user=Klas Tveita', 'x' * 40):
+        text = f'{prefix}{"Klas"} sent a photo'.encode()
+        enc = base64.b64encode(text)
+        data = b'{"payload":"' + enc + b'","v":1}'
+        hits = _b64_hits('klas', data)
+        assert len(hits) == text.lower().count(b'klas'), (prefix, hits)
+        for off, ctx in hits:
+            assert ctx.startswith('base64: ') and '[Klas]' in ctx, ctx
+            assert data[off:off + 2] in enc      # the offset points into the base64
+
+
+def test_url_safe_base64_and_jwt_style_payload():
+    text = b'{"sub":"klas","name":"Klas T","iat":1700000000,"x":"\xfb\xff"}'
+    enc = base64.urlsafe_b64encode(text).rstrip(b'=')
+    data = b'eyJhbGciOiJIUzI1NiJ9.' + enc + b'.sig'
+    hits = _b64_hits('klas', data)
+    assert len(hits) == 2, hits                  # "klas" and "Klas"
+
+
+def test_chance_match_in_random_base64_is_not_reported():
+    # A base64 pattern of "klas" placed into base64 that does not decode to it.
+    pat = ks.make_base64_patterns('klas')[0][0]
+    data = b'"k":"QUJD' + pat + b'WFla"'
+    hits = _b64_hits('klas', data)
+    assert all('klas' in c.lower() for _, c in hits)
+
+
+def test_base64_hits_same_whatever_the_read_size():
+    enc = base64.b64encode(b'..' + b'hello klas, ' * 300 + b'end')
+    data = b'x' * 777 + enc + b'y' * 333
+    whole = _b64_hits('klas', data)
+    assert len(whole) == 300
+    # Same hits at the same offsets; the decoded context, like a plain hit's,
+    # stops at the edge of the read it was found in.
+    for size in (64, 100, 997, 4096):
+        part = _b64_hits('klas', data, size)
+        assert sorted(_offsets(part)) == sorted(_offsets(whole)), size
+        assert all('[klas]' in c for _, c in part)
+
+
+def test_plain_hits_unchanged_and_short_terms_skip_base64():
+    assert ks.make_base64_patterns('abc') == []           # too short to be reliable
+    data = b'plain klas here ' + base64.b64encode(b'and klas there')
+    plain = ks.search_blocks([data], ks.make_patterns('klas'))
+    both = _b64_hits('klas', data)
+    assert len(plain) == 1 and len(both) == 2
+
+
+
+# ── non-ASCII case, decomposed letters, Windows-1252 ───────────────────────
+
+import unicodedata  # noqa: E402
+
+
+def _count(term, data):
+    return len(ks.search_blocks([b'..' + data + b'..'], ks.make_patterns(term)))
+
+
+def test_ascii_keyword_patterns_unchanged():
+    assert ks.make_patterns('Test') == [
+        (b'test', 4, 'utf-8'), (b't\0e\0s\0t\0', 8, 'utf-16-le'), (b'\0t\0e\0s\0t', 8, 'utf-16-be')]
+
+
+def test_non_ascii_case_found():
+    for term, stored in (('blåbær', 'BLÅBÆR'), ('blåbær', 'Blåbær'), ('søk', 'SØK'),
+                         ('café', 'CAFÉ'), ('мама', 'МАМА'), ('BLÅBÆR', 'blåbær')):
+        for enc in ('utf-8', 'utf-16-le', 'utf-16-be'):
+            assert _count(term, stored.encode(enc)) == 1, (term, stored, enc)
+
+
+def test_decomposed_letters_found():
+    for stored in ('blåbær', 'Blåbær', 'BLÅBÆR'):
+        nfd = unicodedata.normalize('NFD', stored)
+        assert nfd != stored
+        assert _count('blåbær', nfd.encode('utf-8')) == 1, stored
+
+
+def test_windows_1252_found_and_unencodable_skipped():
+    assert _count('blåbær', 'Blåbær'.encode('cp1252')) == 1
+    assert _count('blåbær', 'BLÅBÆR'.encode('cp1252')) == 1
+    assert not any(e == 'cp1252' for _, _, e in ks.make_patterns('мама'))
+    hits = ks.search_blocks([b'x ' + 'blåbær'.encode('cp1252') + b' y'], ks.make_patterns('blåbær'))
+    assert hits[0][1] == 'x [blåbær] y'
+
+
+def test_each_occurrence_counted_once():
+    data = ('blåbær BLÅBÆR Blåbær ' + unicodedata.normalize('NFD', 'blåbær')).encode()
+    assert _count('blåbær', data) == 4

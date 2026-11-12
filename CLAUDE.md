@@ -181,7 +181,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `timestamp_display.py` | `TimestampDisplayMixin`: timestamp-mode banner, `format_ts`, Timestamp Display dialog. |
 | `device_timezone.py` | Best-effort handset/acquisition/system timezone detection. |
 | `keyword_search.py` | Search workers (main archive, nested archives, LevelDB index), `KeywordSearchMixin`, `SqlHitInterpretWorker`. Results tree builds a file's hit rows when it is expanded (`_search_show_hits`); results-DB writes go through one writer thread (`_write_results_db`). |
-| `keyword_scan.py` | Keyword Search byte matching, run in worker processes (`search_job`: a list of stored entries read by offset, hits back). Qt-free. Tests: `tests/test_keyword_scan.py`. |
+| `keyword_scan.py` | Keyword Search byte matching, run in worker processes (`search_job`: a list of stored entries read by offset, hits back), including the keyword inside base64 (`make_base64_patterns`, each candidate decoded to confirm) and, for a non-ASCII keyword, its case, decomposed (NFD) and Windows-1252 forms (`keyword_forms`). Qt-free. Tests: `tests/test_keyword_scan.py`. |
 | `hex_viewer.py` | Hex tab; Record/Attachment toggle and record-source combo. |
 | `media_viewer.py` | Media Browser grid (`MediaFileListModel`/`MediaGridDelegate`), `MediaFullViewDialog`, seen-tracking. Decoding (A-64): `_load_qimage` (full size), `_image_thumbnail`/`_video_thumbnail` (thumbnails, made on `ThumbnailWorker`'s decode pool, cached in `casecache.db` `thumbnails`). Tests: `tests/test_media_decode.py`. |
 | `sqlite_viewer.py` | Database tab: live rows, WAL before/after, and recovered versions (WAL history, journal, carved), each labelled with how certain its table is. |

@@ -109,7 +109,7 @@ def _decode_search_key(db_key: str) -> tuple:
         return term, scope_label
     return db_key, 'all files'
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QLineEdit, QPushButton, QComboBox,
+    QWidget, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
     QVBoxLayout, QHBoxLayout, QTreeView, QTableWidget, QTableWidgetItem,
     QDialog, QProgressBar, QMessageBox,
     QPlainTextEdit, QMenu,
@@ -270,7 +270,8 @@ class KeywordSearchWorker(QThread):
     def __init__(self, zip_path: str, keyword: str,
                  entries=None, scope="all",
                  exclude_prefixes: tuple = (), case_dir: str | None = None,
-                 delta: int | None = None, exclude_entry=None, parent=None):
+                 delta: int | None = None, exclude_entry=None, base64: bool = True,
+                 parent=None):
         super().__init__(parent)
         self.zip_path          = zip_path
         # Optional callable(zip entry name) -> True to leave an entry out of
@@ -295,6 +296,7 @@ class KeywordSearchWorker(QThread):
         self._delta            = delta
         self.entries: list     = []
         self._patterns: list   = _make_patterns(keyword)
+        self._b64: list        = keyword_scan.make_base64_patterns(keyword) if base64 else []
 
     def stop(self):
         self._stop.set()
@@ -366,7 +368,8 @@ class KeywordSearchWorker(QThread):
             def top_up():
                 for job in it:
                     pending[pool.submit(keyword_scan.search_job, self.zip_path, job,
-                                        patterns, self._CTX_BYTES)] = job
+                                        patterns, self._CTX_BYTES,
+                                        b64=self._b64)] = job
                     if len(pending) >= SEARCH_PROCESSES * 3:
                         break
 
@@ -413,7 +416,7 @@ class KeywordSearchWorker(QThread):
                 return keyword_scan.search_blocks(
                     reader.read_chunked_at(data_offset, file_size, chunk_size=self._CHUNK,
                                            stop_fn=self._stop.is_set),
-                    patterns, self._CTX_BYTES)
+                    patterns, self._CTX_BYTES, self._b64)
             except OSError:
                 return []
 
@@ -437,11 +440,13 @@ class NestedArchiveSearchWorker(QThread):
 
     _CTX_BYTES = 40
 
-    def __init__(self, nested_archive_map: dict, keyword: str, parent=None):
+    def __init__(self, nested_archive_map: dict, keyword: str, base64: bool = True,
+                 parent=None):
         super().__init__(parent)
         self._map      = nested_archive_map
         self._stop     = threading.Event()
         self._patterns: list = _make_patterns(keyword)
+        self._b64: list = keyword_scan.make_base64_patterns(keyword) if base64 else []
 
     def stop(self):
         self._stop.set()
@@ -477,23 +482,10 @@ class NestedArchiveSearchWorker(QThread):
                 _report()
                 continue
 
-            data_lower = data.lower()
             vpath = f"{archive_ui_path}/{entry_path}"
-            for idx, pat_len, enc in _iter_pattern_hits(data_lower, self._patterns):
-                ctx_start = max(0, idx - self._CTX_BYTES)
-                ctx_end   = min(len(data), idx + pat_len + self._CTX_BYTES)
-                ctx_bytes = data[ctx_start:ctx_end]
-                before    = ctx_bytes[:idx - ctx_start]
-                after     = ctx_bytes[idx - ctx_start + pat_len:]
-                try:
-                    hit_text = data[idx:idx + pat_len].decode(enc, errors='replace')
-                except Exception:
-                    hit_text = ''
-                context = (
-                    before.decode('utf-8', errors='replace')
-                    + f'[{hit_text}]'
-                    + after.decode('utf-8', errors='replace')
-                )
+            # Same matching as the main archive search, base64 included.
+            for idx, context in keyword_scan.search_blocks(
+                    [data], self._patterns, self._CTX_BYTES, self._b64):
                 hits += 1
                 self.result_found.emit(vpath, idx, context, stored_path, entry_path)
             done += 1
@@ -1401,12 +1393,20 @@ class KeywordSearchMixin:
         self.search_scope_combo = QComboBox()
         self.search_scope_combo.setMinimumWidth(160)
         self._refresh_search_scope_combo()
+        self.search_b64_check = QCheckBox("Base64")
+        self.search_b64_check.setChecked(True)
+        self.search_b64_check.setToolTip(
+            "Also find the keyword inside base64-encoded text (JSON values, "
+            "tokens, cookies, settings). Each match is decoded to confirm it.\n"
+            "Keywords of 4+ characters; not base64 of UTF-16 or compressed data.\n"
+            "Makes the search slower: up to about twice as long on a fast disk.")
         search_ctrl.addWidget(QLabel("Recent:"))
         search_ctrl.addWidget(self.search_recent_combo)
         search_ctrl.addSpacing(8)
         search_ctrl.addWidget(QLabel("Search:"))
         search_ctrl.addWidget(self.search_field, 1)
         search_ctrl.addWidget(self.search_scope_combo)
+        search_ctrl.addWidget(self.search_b64_check)
         search_ctrl.addWidget(self.search_btn)
         search_ctrl.addWidget(self.search_stop_btn)
         self._incomplete_banner = QLabel()
@@ -2939,6 +2939,12 @@ class KeywordSearchMixin:
             QMessageBox.information(self, "Nothing to Search", what)
             return
 
+        # A search without base64 finds fewer hits, so it is saved and
+        # listed under its own key ("..., no base64"), never mixed up with
+        # the same term searched with it.
+        search_b64 = self.search_b64_check.isChecked()
+        if not search_b64:
+            scope_label = f"{scope_label}, no base64"
         db_key = _encode_search_key(term, scope_label)
         self._current_search_db_key = db_key
         self._save_recent_search(db_key)
@@ -2979,7 +2985,8 @@ class KeywordSearchMixin:
             exclude_prefixes=worker_exclude,
             exclude_entry=self._ios_system_entry_check() if worker_scope == 'all' else None,
             case_dir=self._case_dir,
-            delta=getattr(self, '_local_extra_delta', None))
+            delta=getattr(self, '_local_extra_delta', None),
+            base64=search_b64)
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
         self._search_worker.results_found.connect(self._on_search_results)
         self._search_worker.progress.connect(self._on_search_progress)
@@ -2991,7 +2998,8 @@ class KeywordSearchMixin:
         # the full nested_archive_map).
         if scoped_nested_map:
             self._search_pending_workers.add('nested')
-            self._nested_search_worker = NestedArchiveSearchWorker(scoped_nested_map, term)
+            self._nested_search_worker = NestedArchiveSearchWorker(
+                scoped_nested_map, term, base64=search_b64)
             self._nested_search_worker.result_found.connect(self._on_nested_search_result)
             self._nested_search_worker.progress.connect(self._on_search_hits_updated)
             self._nested_search_worker.finished.connect(self._on_nested_search_finished)

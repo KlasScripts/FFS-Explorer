@@ -2119,7 +2119,7 @@ class KeywordSearchMixin:
             sql_action = menu.addAction("Interpret as SQL Record")
         chosen = menu.exec(self.search_results_view.viewport().mapToGlobal(pos))
         if chosen == action:
-            self._open_parent_folder_from_search(full_path)
+            self._open_parent_folder_from_search(self._search_row_ui_path(item), full_path)
         elif sql_action is not None and chosen == sql_action:
             self._interpret_search_hit_as_sql(item)
         elif leveldb_action is not None and chosen == leveldb_action:
@@ -2459,12 +2459,52 @@ class KeywordSearchMixin:
         self._bulk_sql_index += 1
         self._interpret_search_hit_as_sql(item, on_done=self._advance_bulk_sql_interpret)
 
-    def _open_parent_folder_from_search(self, full_file_path: str):
-        """Navigate the tree to the parent folder of *full_file_path*."""
-        folder_path = full_file_path.rsplit('/', 1)[0] if '/' in full_file_path else ''
+    def _search_row_ui_path(self, item: QStandardItem) -> str | None:
+        """The File Browser path (ui_path) of the file a results row (file
+        or hit row) belongs to. A main-archive row holds the zip entry name,
+        turned into a ui_path by the adapter; a nested-archive or LevelDB
+        row already holds one. Not the row's displayed path: that is
+        strip_display_prefix() output with iOS GUIDs shown as bundle ids,
+        which is not a tree path on old-layout Cellebrite or GrayKey iOS
+        (A-3), nor for any iOS app container."""
+        name = item.data(Qt.ItemDataRole.UserRole + 2)
+        if not name:
+            return None
+        if item.data(Qt.ItemDataRole.UserRole + 3) or item.data(Qt.ItemDataRole.UserRole + 5) is not None:
+            return name                       # nested archive / LevelDB hit: already a ui_path
+        a = self._adapter
+        if a is None:
+            return None
+        ui = a.ui_path_from_physical(name)
+        if ui is None and a.format != FfsAdapter.FORMAT_GRAYKEY and not any(
+                name.startswith(p + '/') for p in (a.user_prefix, a.sys_prefix) if p):
+            return name                       # a LevelDB file row: its name is a ui_path
+        return ui
+
+    def _open_parent_folder_from_search(self, ui_path: str | None, shown_path: str = ''):
+        """Open the File Browser on the folder of *ui_path* and highlight
+        the file there; say so in the status bar when it can't."""
+        if not ui_path:
+            self.status_bar.showMessage(
+                f"{shown_path or 'This file'} is not in the File Browser's folder tree "
+                "(outside the partition it shows).", 8000)
+            return
+        folder_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ''
         self.center_tabs.setCurrentIndex(0)
         self.navigate_tree_to_path(folder_path)
-        QTimer.singleShot(0, lambda: self._select_file_in_table(full_file_path))
+
+        def select():
+            self._select_file_in_table(ui_path)
+            cur = self.file_view.currentIndex()
+            src = self.proxy_model.mapToSource(cur) if cur.isValid() else None
+            got = (self.file_model.index(src.row(), 0).data(Qt.ItemDataRole.UserRole)
+                   if src is not None else None)
+            if got != ui_path:
+                self.status_bar.showMessage(
+                    f"Opened {self._display_path(folder_path) or '/'}, but "
+                    f"{ui_path.rsplit('/', 1)[-1]} is not listed there "
+                    "(hidden by the current filter or folder settings?).", 8000)
+        QTimer.singleShot(0, select)
 
     def _show_leveldb_hit_in_browser(self, item: QStandardItem):
         """Right-click "Show Record in File Browser" for a LevelDB/

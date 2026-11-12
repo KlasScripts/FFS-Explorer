@@ -571,6 +571,23 @@ class FfsAdapter:
             return f"{self.user_prefix}/private/var/{ui_path}"
         return f"{self.user_prefix}/{ui_path}"
 
+    def ui_path_from_physical(self, physical: str) -> str | None:
+        """The inverse of resolve(): the ui_path (folder tree / File Browser
+        path) of a physical zip entry name, or None when the entry has no
+        ui_path (outside the partition the tree shows, e.g. the old-layout
+        iOS system partition, A-82). Not strip_display_prefix(), which
+        gives the display form: on old-layout Cellebrite it keeps
+        'private/var/', on GrayKey iOS it removes it, and the ui_path is
+        the other way round in both (A-3)."""
+        name = physical.rstrip('/')
+        if self.format == self.FORMAT_GRAYKEY:
+            return name[1:] if name.startswith('/') else name
+        prefix = (f"{self.user_prefix}/private/var/" if self.old_layout
+                  else f"{self.user_prefix}/")
+        if not name.startswith(prefix):
+            return None
+        return name[len(prefix):] or None
+
     def is_ios_system_entry(self, physical: str) -> bool:
         """True for a zip entry in the iOS SYSTEM partition, which this app
         does not include (owner decision, ASSUMPTIONS.md A-82): not listed,

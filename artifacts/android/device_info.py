@@ -97,7 +97,9 @@ description = (
     "(ICCID/phone number/carrier/IMSI/MCC-MNC), the Google account signed "
     "into the device, and any Contacts entry that account's own email "
     "matches. Every field states its own real source file inline in the "
-    "report.\n\n"
+    "report. Screen Lock says whether a PIN, pattern or password file "
+    "(.pwd in data/system_de/0/spblob) exists and when the credential files "
+    "were written, from the files' own modified times.\n\n"
     "Known limits, all real rather than theoretical. There is NO IMEI: an "
     "Android extraction has no on-disk file holding it (it comes from the "
     "radio at runtime), so unlike the iOS report this one cannot show "
@@ -187,6 +189,50 @@ def _sqlite_at(paths, ui_path):
     return open_db_readonly(db_path)
 
 
+_SPBLOB = "data/system_de/0/spblob/"
+
+
+def _utc_ns(ns) -> str:
+    from datetime import datetime, timezone
+    if not ns:
+        return ""
+    return datetime.fromtimestamp(ns / 1_000_000_000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def screen_lock_lines(ui_metadata: dict) -> list[str]:
+    """Screen Lock section from the credential files' own times.
+
+    Lab run screenlock-history-001 (Android 16, 2026-11-14): setting a PIN
+    wrote <id>.pwd/.spblob/.secdis/.metrics in data/system_de/0/spblob/ at the
+    second it was confirmed; removing it deleted the .pwd file and wrote a new
+    .spblob/.secdis pair. The folder is also written at first setup.
+    locksettings.db is left out: on the real images it was modified months
+    after the PIN was set, for other reasons."""
+    files = {p: m for p, m in ui_metadata.items() if p.startswith(_SPBLOB)}
+    lines = ["## Screen Lock"]
+    if not files:
+        lines.append(f"- *No credential files ({_SPBLOB.rstrip('/')}) in this extraction.*")
+        return lines
+    pwd = {p: m for p, m in files.items() if p.endswith(".pwd")}
+    if pwd:
+        newest = max(pwd, key=lambda p: (pwd[p] or {}).get("mtime") or 0)
+        m = pwd[newest] or {}
+        lines.append(f"- **PIN, pattern or password set:** Yes (`.pwd` file present, {len(pwd)} in the folder)")
+        if m.get("mtime"):
+            changed = f", changed {_utc_ns(m['ctime'])}" if m.get("ctime") else ""
+            lines.append(f"- **Credential file written:** {_utc_ns(m['mtime'])}{changed} (`{newest}`)")
+    else:
+        lines.append("- **PIN, pattern or password set:** No (no `.pwd` file)")
+    last = max((m or {}).get("mtime") or 0 for m in files.values())
+    if last:
+        lines.append(f"- **Credential folder last written:** {_utc_ns(last)}")
+    lines.append("- *Times are the files' own modified times in the extraction. In a lab test (Android 16) "
+                 "the `.pwd` file was written at the second a PIN was set; removing the PIN deleted it and "
+                 "rewrote the folder. The folder is also written at first setup, and an extraction that does "
+                 "not keep file times shows none here.*")
+    return lines
+
+
 def run(paths):
     import os
     from artifact_runner import open_db_readonly
@@ -273,6 +319,9 @@ def run(paths):
         lines.append(f"- **SIM Type:** {'eSIM' if sim['is_embedded'] else 'Physical SIM'}")
         lines.append("")
     lines.append("- *No IMEI: an Android extraction has no on-disk file holding it.*")
+    lines.append("")
+
+    lines.extend(screen_lock_lines(ctx.get_ui_metadata() or {}))
     lines.append("")
 
     # accounts_de.db (accounts_ce.db as fallback) — type "com.google" is

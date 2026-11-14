@@ -183,10 +183,46 @@
     },
     "android:device_info": {
       "changelog": {
-        "2": "New parser -- the Android counterpart to ios/device_info.py, same four sections from entirely different sources: system/build.prop (build number, security patch level), telephony.db siminfo (every SIM: phone number, carrier, ICCID, IMSI, MCC/MNC, eSIM-vs-physical), accounts_de.db with accounts_ce.db fallback (the Google account), and contacts2.db (email cross-reference). Verified field-by-field against the Android 14 JoshHickman archive and its documented ground truth, and against a real 3-SIM device (Android 15 CTF25 Cellebrite). Reads siminfo.display_name before carrier_name and mcc_string/mnc_string rather than the legacy integer columns -- on the real Pixel 7a carrier_name is empty and mcc/mnc are both 0. States outright that an Android extraction carries no on-disk IMEI rather than leaving a silently missing field."
+        "2": "New parser -- the Android counterpart to ios/device_info.py, same four sections from entirely different sources: system/build.prop (build number, security patch level), telephony.db siminfo (every SIM: phone number, carrier, ICCID, IMSI, MCC/MNC, eSIM-vs-physical), accounts_de.db with accounts_ce.db fallback (the Google account), and contacts2.db (email cross-reference). Verified field-by-field against the Android 14 JoshHickman archive and its documented ground truth, and against a real 3-SIM device (Android 15 CTF25 Cellebrite). Reads siminfo.display_name before carrier_name and mcc_string/mnc_string rather than the legacy integer columns -- on the real Pixel 7a carrier_name is empty and mcc/mnc are both 0. States outright that an Android extraction carries no on-disk IMEI rather than leaving a silently missing field.",
+        "3": "Adds a Screen Lock section: whether a PIN, pattern or password file (.pwd in data/system_de/0/spblob) exists, the newest .pwd modified time (and changed time where the extraction keeps it), and when the credential folder was last written. From lab run screenlock-history-001 (Android 16): the .pwd file was written at the second a PIN was set; removing it deleted the .pwd and rewrote the folder. Checked on the lab zips (no PIN, folder written at the removal) and three real images; on the Android 14 JoshHickman Pixel the .pwd time is a minute after the documented Google account add at setup. locksettings.db is left out because it is modified for other reasons."
       },
-      "hash": "00034d5faf03fcd9",
-      "version": 2
+      "hash": "38ddc5bdeef154c4",
+      "version": 3
+    },
+    "android:files_by_google_index": {
+      "changelog": {
+        "1": "Adds Files by Google - Indexed Files: files_master_table with full path, media type, and times opened / last opened from file_open_info_table, linked to the file when it is in the extraction. Lab run files-app-usage-001: rows appear within seconds of a download without the app being opened."
+      },
+      "hash": "53500b7fbe79447a",
+      "version": 1
+    },
+    "android:files_by_google_opens": {
+      "changelog": {
+        "1": "Adds Files by Google - Opened Files: each open in Files by Google's viewer (file_open_info_table) with its file from the index. Lab: the stored time is 0.4-0.6 s after the viewer screen appears; Safe folder moves delete the open records (ON DELETE CASCADE)."
+      },
+      "hash": "cab00751aa915803",
+      "version": 1
+    },
+    "android:files_by_google_safe_folder": {
+      "changelog": {
+        "1": "Adds Files by Google - Safe Folder: safe_folder_metadata_table with original path, Safe folder path, and whether the copy is in the extraction. Lab: copies are unencrypted originals (Files 1.13157)."
+      },
+      "hash": "e8c08a1b2e779350",
+      "version": 1
+    },
+    "android:files_by_google_scans": {
+      "changelog": {
+        "1": "Adds Files by Google - Background Scans: scan_log_table with start, end, duration, items updated, type and result as stored. Lab: a scan follows each download by 6-14 s with the app never opened."
+      },
+      "hash": "6af34c5648292721",
+      "version": 1
+    },
+    "android:files_by_google_sessions": {
+      "changelog": {
+        "1": "Adds Files by Google - App Sessions: start and end of each screen visit from files/activityTimeLogStoreName.pb, each row linked to its bytes. Lab: rows match screen changes in the action log and Usage Stats."
+      },
+      "hash": "c6061405b9f93d0d",
+      "version": 1
     },
     "android:gboard_clipboard": {
       "changelog": {
@@ -194,6 +230,13 @@
       },
       "hash": "8287dce3dc50d04b",
       "version": 3
+    },
+    "android:google_digital_wellbeing": {
+      "changelog": {
+        "1": "Adds Digital Wellbeing (Google): app usage events Google Digital Wellbeing copied from Usage Stats (app_usage events and component_events), with the UsageEvents name for each code. Codes matched to Usage Stats at the same millisecond on the Poco X7 Pro (4,719 of 4,719) and Pixel 7a, and to live dumpsys usagestats for 47 known app openings in lab run wellbeing-usage-001. The warning says copies are made only at a sync and that the whole history moves after a clock change at the next sync."
+      },
+      "hash": "8ecfb7a5d546d153",
+      "version": 1
     },
     "android:google_messages": {
       "changelog": {
@@ -273,6 +316,20 @@
       },
       "hash": "3d39f19a482f4f29",
       "version": 5
+    },
+    "android:samsung_digital_wellbeing": {
+      "changelog": {
+        "1": "Adds Digital Wellbeing (Samsung): usage events from Samsung Digital Wellbeing's dwbCommon.db (usageEvents with foundPackages, or pkgName on newer builds), with class name and the UsageEvents name for each code. On the Galaxy A53 image all 251 events in Usage Stats' range match Usage Stats at a fixed 3,275 ms offset."
+      },
+      "hash": "a4f87636eace6752",
+      "version": 1
+    },
+    "android:samsung_digital_wellbeing_log": {
+      "changelog": {
+        "1": "Adds Digital Wellbeing (Samsung) - Log: Samsung Digital Wellbeing's Logging table, with clock set (TIME_SET), boot, boot time and time zone lines marked by kind and the computed boot time read out. Galaxy A53 image: 130 lines, 20 TIME_SET."
+      },
+      "hash": "21cffecaf64dbfa1",
+      "version": 1
     },
     "android:settings_secure": {
       "changelog": {

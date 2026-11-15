@@ -119,8 +119,9 @@ class _LazyZipSlice:
 # EXIF tag ids (PIL.ExifTags has names for these, but the raw ints are
 # used directly here so this module has no Pillow-version-specific
 # import surface beyond Image/ExifTags.GPS itself).
-_TAG_DATETIME_ORIGINAL = 0x9003
-_TAG_DATETIME          = 0x0132
+_TAG_DATETIME_ORIGINAL = 0x9003   # in the Exif sub-IFD, not IFD0
+_TAG_OFFSET_ORIGINAL   = 0x9011   # OffsetTimeOriginal (EXIF 2.31), e.g. '+02:00'
+_TAG_EXIF_IFD          = 0x8769
 _TAG_MAKE              = 0x010F
 _TAG_MODEL             = 0x0110
 _TAG_SOFTWARE          = 0x0131
@@ -163,6 +164,52 @@ def _dms_to_decimal(dms, ref: str) -> float | None:
     return value
 
 
+# Which rule produced a case's stored 'taken' values, recorded as the EXIF
+# run's run_log parser_version. 1 (unrecorded): 'taken' came from IFD0,
+# where Pillow does not put DateTimeOriginal, so it was usually DateTime
+# (when the file was last changed) and the offset was never read. 2:
+# DateTimeOriginal from the Exif sub-IFD plus its offset, or nothing.
+TAKEN_RULE = 2
+
+_OFFSET_RE = re.compile(r'^\s*([+-])(\d{2}):?(\d{2})\s*$')
+
+
+def _normalize_offset(raw) -> str | None:
+    """'+02:00' / '-0530' -> '+02:00' / '-05:30'; anything else None."""
+    m = _OFFSET_RE.match(raw) if isinstance(raw, str) else None
+    if not m or int(m.group(2)) > 14 or int(m.group(3)) > 59:
+        return None
+    return f"{m.group(1)}{m.group(2)}:{m.group(3)}"
+
+
+def taken_display(fields: dict) -> str:
+    """The "Taken (EXIF)" cell: the time as the file wrote it, with its
+    UTC offset when the file gives one. Without one it is the phone's
+    local time at an unknown offset and is labelled so, never shown or
+    used as UTC."""
+    taken = fields.get('taken') or ''
+    if not taken:
+        return ''
+    off = fields.get('taken_offset')
+    return f"{taken} {off}" if off else f"{taken} (local, offset unknown)"
+
+
+def taken_utc_seconds(fields: dict):
+    """Unix seconds (UTC) of 'taken', or None when the file gives no
+    offset (a local time can't be placed on a UTC timeline)."""
+    from datetime import datetime, timedelta, timezone
+    taken, off = fields.get('taken'), fields.get('taken_offset')
+    if not taken or not off:
+        return None
+    try:
+        naive = datetime.strptime(taken[:19], '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return None
+    sign = -1 if off[0] == '-' else 1
+    tz = timezone(sign * timedelta(hours=int(off[1:3]), minutes=int(off[4:6])))
+    return naive.replace(tzinfo=tz).timestamp()
+
+
 def _format_exif_datetime(raw: str) -> str | None:
     """EXIF DateTime strings are 'YYYY:MM:DD HH:MM:SS' — normalized to
     this project's own 'YYYY-MM-DD HH:MM:SS' display convention."""
@@ -176,8 +223,8 @@ def _format_exif_datetime(raw: str) -> str | None:
 
 
 def extract_image_exif(file_like) -> dict:
-    """{'taken', 'camera', 'gps', 'width', 'height', 'software',
-    'orientation'} — only the keys actually found (a key present with a
+    """{'taken', 'taken_offset', 'camera', 'gps', 'width', 'height',
+    'software', 'orientation'} — only the keys actually found (a key present with a
     falsy/blank value is never stored; absence IS the "not present"
     signal consumed by the File Browser column builder). *file_like*
     must support read/seek/tell (a plain local file object, or
@@ -195,10 +242,20 @@ def extract_image_exif(file_like) -> dict:
         exif = img.getexif()
         if not exif:
             return result
-        taken_raw = exif.get(_TAG_DATETIME_ORIGINAL) or exif.get(_TAG_DATETIME)
-        taken = _format_exif_datetime(taken_raw) if taken_raw else None
+        # DateTimeOriginal is in the Exif sub-IFD (Pillow does not merge it
+        # into getexif()). IFD0's DateTime is when the file was last
+        # changed, not when it was taken, so it is never used as 'taken'.
+        try:
+            exif_ifd = exif.get_ifd(_TAG_EXIF_IFD) or {}
+        except Exception:
+            exif_ifd = {}
+        taken_raw = exif_ifd.get(_TAG_DATETIME_ORIGINAL)
+        taken = _format_exif_datetime(taken_raw) if isinstance(taken_raw, str) else None
         if taken:
             result['taken'] = taken
+            off = _normalize_offset(exif_ifd.get(_TAG_OFFSET_ORIGINAL))
+            if off:
+                result['taken_offset'] = off
         make  = (exif.get(_TAG_MAKE) or '').strip()
         model = (exif.get(_TAG_MODEL) or '').strip()
         camera = f"{make} {model}".strip()
@@ -268,9 +325,13 @@ def extract_video_metadata(file_like) -> dict:
                 # column name alone doesn't carry that distinction, a
                 # real, disclosed narrow gap rather than overbuilding a
                 # second timezone-aware column pair nobody asked for).
-                taken = creation_time.replace('T', ' ')[:19].replace('T', ' ')
+                taken = creation_time.replace('T', ' ')[:19]
                 if len(taken) >= 10:
                     result['taken'] = taken
+                    # The container states UTC ('Z'); recorded as written.
+                    ct = creation_time.strip()
+                    if ct.endswith('Z') or ct.endswith('+00:00'):
+                        result['taken_offset'] = '+00:00'
 
             make  = tags.get('com.apple.quicktime.make', '')
             model = tags.get('com.apple.quicktime.model', '')

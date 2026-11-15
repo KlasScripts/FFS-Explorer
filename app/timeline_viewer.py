@@ -392,13 +392,17 @@ class TimelineViewerMixin:
 
     def _timeline_file_times(self, ui_path: str) -> list:
         """[(label, utc_ms, what)] for a file's own times (the File
-        Browser's time columns: Created/Changed/Modified/Accessed as this
-        archive has them), read from the archive metadata — never from the
-        displayed text, which is in the case's time setting."""
+        Browser's time columns: Created/Changed/Modified as this archive
+        has them), read from the archive metadata — never from the
+        displayed text, which is in the case's time setting. Accessed is
+        left out (owner decision, 2026-11-15): phones often don't update
+        it, so it is not trustworthy enough for the Timeline."""
         meta = (getattr(self, 'full_metadata', None) or {}).get(ui_path) or {}
         name = ui_path.rsplit('/', 1)[-1] if ui_path else ''
         out = []
         for header, key in getattr(self, '_time_cols', ()):
+            if key == 'atime':
+                continue
             ms = timeline.file_time_ms(meta.get(key))
             if ms:
                 out.append((header, ms, f"{header} of {name} (file system)"))

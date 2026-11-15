@@ -119,6 +119,13 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
             orientation INTEGER
         )
     ''')
+    # Migration: taken_offset, the UTC offset the file gives for 'taken'
+    # (EXIF OffsetTimeOriginal; '+00:00' for a video container's UTC
+    # creation_time). NULL: none given, so 'taken' is local time.
+    try:
+        conn.execute('ALTER TABLE media_metadata ADD COLUMN taken_offset TEXT')
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     # Size+CRC32+MD5 duplicate detection (app/duplicate_scan.py) — added
     # 2026-10-16, direct request. One row per file CONFIRMED (by MD5, not
@@ -839,7 +846,8 @@ def clear_header_types(conn: 'sqlite3.Connection') -> None:
 # ── Media metadata (EXIF / video container) ─────────────────────────────────
 
 _MEDIA_METADATA_FIELDS = ('taken', 'camera', 'gps', 'duration_s',
-                          'width', 'height', 'software', 'orientation')
+                          'width', 'height', 'software', 'orientation',
+                          'taken_offset')
 
 
 def save_media_metadata(conn: 'sqlite3.Connection', results: dict) -> None:

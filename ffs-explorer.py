@@ -5060,7 +5060,8 @@ class MediaMetadataScanWorker(QThread):
         if self._run_type and self._case_dir:
             try:
                 with closing(_open_results_db(self._case_dir)) as db:
-                    run_id = start_run_log(db, self._run_type)
+                    run_id = start_run_log(db, self._run_type,
+                                           parser_version=media_metadata_scan.TAKEN_RULE)
             except Exception:
                 pass
         results = self._scan()
@@ -6641,18 +6642,18 @@ class ProcessDialog(QDialog):
             return False
 
     def _media_metadata_on_record(self) -> bool:
-        """True when a complete EXIF/video-metadata run is logged, or, for a
-        case processed before that was logged (2026-11-01), when results are
-        stored."""
+        """True when a complete EXIF/video-metadata run under the current
+        'taken' rule (media_metadata_scan.TAKEN_RULE) is logged. A run
+        under the old rule, or a case processed before runs were logged,
+        stored the wrong EXIF time as 'taken' for some photos and no
+        offset, so it counts as not done and the stage is offered again."""
         if not self._case_dir:
             return False
         try:
             with closing(_open_results_db(self._case_dir)) as db:
                 run = load_last_run(db, self._RUN_TYPE_MEDIA_METADATA)
-            if run is not None:
-                return bool(run['complete'])
-            with closing(_open_cache_db(self._case_dir)) as db:
-                return db.execute('SELECT 1 FROM media_metadata LIMIT 1').fetchone() is not None
+            return (run is not None and bool(run['complete'])
+                    and (run['parser_version'] or 0) >= media_metadata_scan.TAKEN_RULE)
         except Exception:
             return False
 
@@ -10910,7 +10911,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 w, h = fields.get('width'), fields.get('height')
                 orientation = fields.get('orientation')
                 cols.extend([
-                    fields.get('taken', ''),
+                    media_metadata_scan.taken_display(fields),
                     fields.get('camera', ''),
                     fields.get('gps', ''),
                     media_metadata_scan.format_duration(dur) if dur else '',

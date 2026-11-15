@@ -59,3 +59,71 @@ def test_lost_records_are_rebuilt_from_the_stored_files(tmp_path):
     assert ents[0]['mdate'] == '2024-07-01 08:00:00 (local, zone unknown)'
     # nothing left to do the second time
     assert na.recover_missing_records(case, meta, lambda n: 'Other')['recovered'] == 0
+
+
+class _Adapter:
+    """A plain-prefix adapter: ui_path == zip name."""
+    def resolve(self, ui_path):
+        return ui_path
+
+    def ui_path_from_physical(self, physical):
+        return physical.rstrip('/')
+
+
+def test_gzip_time_is_read_from_the_original_archive(tmp_path):
+    import gzip as _gzip
+    import io
+    import os
+    from contextlib import closing
+    import zip_cd_cache
+    from db_utils import _open_cache_db, load_nested_archive_entries
+    case = str(tmp_path / 'case')
+    os.makedirs(os.path.join(case, 'nested_archives'))
+    # an FFS-like archive (stored, never compressed) holding a .gz whose
+    # header says 2024-07-01 12:00:00 UTC
+    buf = io.BytesIO()
+    with _gzip.GzipFile(fileobj=buf, mode='wb', mtime=1719835200) as g:
+        g.write(b'hello log line\n')
+    ffs = str(tmp_path / 'EXTRACTION_FFS.zip')
+    with zipfile.ZipFile(ffs, 'w', compression=zipfile.ZIP_STORED) as z:
+        z.writestr('data/log/app.log.gz', buf.getvalue())
+    zip_cd_cache.save(ffs, case)
+    ui = 'data/log/app.log.gz'
+    with open(os.path.join(case, 'nested_archives', na.stored_name_for(ui)), 'wb') as f:
+        f.write(b'hello log line\n')                       # the decompressed copy
+    meta = {ui: {'size': len(buf.getvalue())}}
+    res = na.recover_missing_records(case, meta, lambda n: 'Other', zip_path=ffs, adapter=_Adapter())
+    assert res['recovered'] == 1
+    with closing(_open_cache_db(case)) as db:
+        ents = load_nested_archive_entries(db, ui)
+    assert ents[0]['entry_path'] == 'app.log' and ents[0]['mdate'] == '2024-07-01 12:00:00 UTC'
+    # without the archive it is still recovered, with no time
+    assert na._gzip_mdate_from_archive(ffs, case, 'data/log/missing.gz') is None
+
+
+def test_a_file_unpacked_under_an_older_path_is_matched(tmp_path, monkeypatch):
+    import os
+    from contextlib import closing
+    import zip_cd_cache
+    from db_utils import _open_cache_db, load_nested_archives
+    case = str(tmp_path)
+    out = os.path.join(case, 'nested_archives')
+    os.makedirs(out)
+    old_ui, new_ui = 'data/media/0/Download/cafÃ©.zip', 'data/media/0/Download/café.zip'
+    with zipfile.ZipFile(os.path.join(out, na.stored_name_for(old_ui)), 'w') as z:
+        z.writestr('a.txt', b'x')
+
+    class _Index:
+        def renames(self):
+            return [(old_ui, new_ui)]
+
+        def close(self):
+            pass
+    monkeypatch.setattr(zip_cd_cache, 'open_index', lambda zp, cd: _Index())
+    meta = {new_ui: {'size': 10}}
+    assert na.recover_missing_records(case, meta, lambda n: 'Other')['recovered'] == 0   # no record of the old name
+    res = na.recover_missing_records(case, meta, lambda n: 'Other', zip_path='x.zip', adapter=_Adapter())
+    assert res['recovered'] == 1 and res['unmatched'] == []
+    with closing(_open_cache_db(case)) as db:
+        rec = load_nested_archives(db)[0]
+    assert rec['ui_path'] == new_ui and rec['stored_filename'] == na.stored_name_for(old_ui)

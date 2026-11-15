@@ -1656,12 +1656,14 @@ def _duplicate_groups_for(duplicate_files: dict) -> dict:
     return {m: sorted(ps) for m, ps in groups.items()}
 
 
-def _recover_nested_records(case_dir: str, ui_metadata: dict) -> None:
+def _recover_nested_records(case_dir: str, ui_metadata: dict,
+                            zip_path: str | None = None, adapter=None) -> None:
     """Re-record unpacked nested archives whose casecache.db rows were lost
     at a cache rebuild (nested_archive.recover_missing_records), and log
     what was done in run_log. Never raises."""
     try:
-        res = nested_archive.recover_missing_records(case_dir, ui_metadata, _get_file_type)
+        res = nested_archive.recover_missing_records(case_dir, ui_metadata, _get_file_type,
+                                                     zip_path=zip_path, adapter=adapter)
     except Exception as exc:
         res = {'recovered': 0, 'unmatched': [], 'error': f"{type(exc).__name__}: {exc}"}
     if not (res.get('recovered') or res.get('error')):
@@ -2276,7 +2278,7 @@ class ZipMetadataWorker(QThread):
             self.status_update.emit(f"Warning: the iOS system check could not run: {exc}")
 
     def _set_ui_extras(self, ui_metadata: dict, folder_map: dict,
-                       folder_counts: dict | None = None) -> None:
+                       folder_counts: dict | None = None, adapter=None) -> None:
         """Work on_metadata_ready needs that is too slow for the GUI thread,
         done here before metadata_ready is emitted (read back there from
         self.worker._ui_extras, the same hand-over as _local_extra_delta).
@@ -2299,7 +2301,7 @@ class ZipMetadataWorker(QThread):
         if self.case_dir:
             # Read here, applied by on_metadata_ready (0.27 + 0.1 s of
             # frozen window on IOS17 when read there).
-            _recover_nested_records(self.case_dir, ui_metadata)
+            _recover_nested_records(self.case_dir, ui_metadata, self.zip_path, adapter)
             self._ui_extras['nested_archives'] = _read_nested_archives(self.case_dir)
             self._ui_extras['embedded_media'] = _read_embedded_media(self.case_dir)
 
@@ -2365,7 +2367,7 @@ class ZipMetadataWorker(QThread):
             self.zip_path, self.case_dir, ffs_adapter, folder_map, zip_names,
             guid_to_bundle, status_cb=self.status_update.emit)
         missing_plist_paths = _find_missing_plists(folder_map, ffs_adapter, guid_to_bundle)
-        self._set_ui_extras(ui_metadata, folder_map, folder_counts)
+        self._set_ui_extras(ui_metadata, folder_map, folder_counts, adapter=ffs_adapter)
         self.metadata_ready.emit(
             ui_metadata, folder_map, guid_to_bundle, zip_names,
             ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
@@ -2478,7 +2480,7 @@ class ZipMetadataWorker(QThread):
         # persist_result still reads guid_to_bundle/folder_sizes after this
         # emit (the snapshot itself is already packed), so the GUI gets its
         # own shallow copies of those two (str/int values only).
-        self._set_ui_extras(ui_metadata, folder_map)
+        self._set_ui_extras(ui_metadata, folder_map, adapter=ffs_adapter)
         self.metadata_ready.emit(
             ui_metadata, folder_map, dict(guid_to_bundle), zip_names,
             ffs_adapter, missing_plist_paths, dict(folder_sizes), zip_ui_paths,
@@ -2703,7 +2705,7 @@ class ZipMetadataWorker(QThread):
             # Emit first — UI tree appears immediately. DB and cache writes follow.
             # guid_to_bundle/folder_sizes are saved below after this emit, so
             # the GUI gets its own shallow copies (see metadata_ready).
-            self._set_ui_extras(ui_metadata, folder_map)
+            self._set_ui_extras(ui_metadata, folder_map, adapter=ffs_adapter)
             self.metadata_ready.emit(
                 ui_metadata, folder_map, dict(guid_to_bundle), zip_names,
                 ffs_adapter, missing_plist_paths, dict(folder_sizes), zip_ui_paths,

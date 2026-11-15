@@ -79,7 +79,8 @@ def parse_mdate(mdate, legacy_is_utc: bool):
 
 from db_utils import (_open_cache_db, load_nested_archives, load_nested_archive_entries, save_nested_archive,
                       save_nested_archive_entries, save_nested_archive_failure)
-from zip_cd_cache import CachedZipView, load as _zcd_load
+from zip_cd_cache import CachedZipView, compute_data_offsets, load as _zcd_load
+from zip_reader import ZipReader
 
 _MEM_LIMIT = 100 * 1024 * 1024   # 100 MB — larger files written to temp first
 
@@ -184,7 +185,54 @@ def stored_name_for(ui_path: str) -> str:
     return f"{key}_{os.path.basename(ui_path) or 'content'}"
 
 
-def recover_missing_records(case_dir: str, ui_metadata: dict, get_file_type) -> dict:
+def _gzip_mdate_from_archive(zip_path: str, case_dir: str, physical: str):
+    """The gzip MTIME of the original .gz entry in the FFS archive, as a
+    stored mdate (UTC), read by offset from the cached index (10 bytes, no
+    decompression); None when it can't be read or is 0."""
+    infos = _zcd_load(zip_path, case_dir)
+    if not infos:
+        return None
+    with CachedZipView(zip_path, infos) as zf:
+        try:
+            info = zf.getinfo(physical)
+        except KeyError:
+            return None
+    off = compute_data_offsets(zip_path, [info]).get(info.filename)
+    if off is None or info.file_size < 10:
+        return None
+    head = ZipReader(zip_path).read_at(off, 10)
+    if head[:2] != b'\x1f\x8b':
+        return None
+    mtime = struct.unpack_from('<I', head, 4)[0]
+    if not mtime:
+        return None
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + MDATE_UTC
+
+
+def _old_ui_paths(zip_path: str, case_dir: str, adapter, ui_metadata: dict) -> dict:
+    """{current ui_path: [its ui_path in older versions of this app]} from
+    the names the A-80 rule changed, as the archive's index records them
+    (ZipIndex.renames()). A stored file was named from the ui_path at the
+    time it was unpacked."""
+    from zip_cd_cache import open_index
+    index = open_index(zip_path, case_dir)
+    if index is None:
+        return {}
+    try:
+        pairs = index.renames()
+    finally:
+        index.close()
+    out: dict = {}
+    for old, new in pairs:
+        now = adapter.ui_path_from_physical(new)
+        was = adapter.ui_path_from_physical(old)
+        if now and was and now != was and now in ui_metadata:
+            out.setdefault(now, []).append(was)
+    return out
+
+
+def recover_missing_records(case_dir: str, ui_metadata: dict, get_file_type,
+                            zip_path: str | None = None, adapter=None) -> dict:
     """Re-record unpacked archives whose casecache.db rows are gone.
 
     The examiner's unpacked archives stay on disk in nested_archives/, but
@@ -193,8 +241,12 @@ def recover_missing_records(case_dir: str, ui_metadata: dict, get_file_type) -> 
     no longer appear (IOS17: 18 unpacked 2026-09-25, rows lost at the
     v19 rebuild 2026-10-21). Each stored name is stored_name_for(ui_path),
     so a file is matched back to its archive by that name and its rows are
-    rebuilt from the file itself (no evidence read). A gzip's header time
-    is not kept in its stored copy, so its child gets no time.
+    rebuilt from the file itself.
+
+    With *zip_path* and *adapter*: a file unpacked under an archive's
+    older ui_path (the A-80 name rule) is matched too, and a gzip's time,
+    not kept in its decompressed copy, is read from the original .gz
+    header in the FFS by offset (10 bytes; the FFS is never written).
 
     Returns {'recovered': n, 'unmatched': [stored names with no archive]}."""
     out = {'recovered': 0, 'unmatched': []}
@@ -211,12 +263,21 @@ def recover_missing_records(case_dir: str, ui_metadata: dict, get_file_type) -> 
         by_base: dict = {}
         for f in missing:
             by_base.setdefault(f.split('_', 1)[1], set()).add(f)
+        olds = (_old_ui_paths(zip_path, case_dir, adapter, ui_metadata)
+                if zip_path and adapter is not None else {})
+
+        def _match(ui_path):
+            for cand in [ui_path] + olds.get(ui_path, []):
+                cands = by_base.get(cand.rsplit('/', 1)[-1])
+                if cands and stored_name_for(cand) in cands:
+                    return stored_name_for(cand), cands
+            return None, None
+
         for ui_path, meta in ui_metadata.items():
-            cands = by_base.get(ui_path.rsplit('/', 1)[-1])
-            if not cands:
+            if ui_path.rsplit('/', 1)[-1] not in by_base and ui_path not in olds:
                 continue
-            name = stored_name_for(ui_path)
-            if name not in cands:
+            name, cands = _match(ui_path)
+            if name is None:
                 continue
             path = os.path.join(out_dir, name)
             with open(path, 'rb') as fh:
@@ -234,7 +295,14 @@ def recover_missing_records(case_dir: str, ui_metadata: dict, get_file_type) -> 
             else:
                 base = os.path.basename(ui_path)
                 child = base[:-3] if base.lower().endswith('.gz') else base
-                rows = [(child, None, os.path.getsize(path),
+                mdate = None
+                if zip_path and adapter is not None:
+                    try:
+                        mdate = _gzip_mdate_from_archive(zip_path, case_dir,
+                                                         adapter.resolve(ui_path))
+                    except Exception:
+                        mdate = None
+                rows = [(child, mdate, os.path.getsize(path),
                          classify_unpacked(child, head, get_file_type))]
             size = (meta or {}).get('size') or 0
             save_nested_archive(db, ui_path, name, size, len(rows))

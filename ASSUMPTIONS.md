@@ -552,7 +552,10 @@ offset and must be confirmed by the examiner. GrayKey provides no offset.
   2026-09-25, records lost 2026-10-21). At case open, an unpacked file
   without a record is matched back to its archive by its stored name and
   re-recorded from the file itself (logged in `run_log`). A recovered
-  gzip has no time: its header is not kept in the stored copy.
+  gzip's time is read from the original `.gz` header in the FFS (by
+  offset, 10 bytes); many tools write 0 there (iOS 17: 143 of 175, Pixel:
+  198 of 200), and those have no time. A file unpacked under an archive's
+  older path (A-80 renames, recorded in the index) is matched too.
 
 **A-24. Header-scan scope comes from one shared ruleset.** *Decision.*
 `config/scan_rules_ios.json` and `scan_rules_android.json` (via

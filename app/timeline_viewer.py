@@ -34,23 +34,26 @@ class TimelineBuildWorker(QThread):
     done = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, case_dir: str, modules: dict, force: bool = False):
+    def __init__(self, case_dir: str, modules: dict, force: bool = False, files=None):
         super().__init__()
         self.case_dir = case_dir
         self._case_dir = case_dir
         self._modules = modules
         self._force = force
+        self._files = files      # timeline.build's *files* (collected on this thread)
 
     def run(self):
         try:
             with closing(_open_results_db(self._case_dir)) as res, \
                     closing(_open_cache_db(self._case_dir)) as cache:
-                fp = timeline.fingerprint(res, self._modules)
+                fp = timeline.fingerprint(res, self._modules,
+                                          self._files['key'] if self._files else None)
                 if not self._force and timeline.stored_fingerprint(cache) == fp:
                     self.done.emit({'rebuilt': False})
                     return
                 out = timeline.build(res, cache, self._modules,
-                                     cancelled=self.isInterruptionRequested)
+                                     cancelled=self.isInterruptionRequested,
+                                     files=self._files)
                 out['rebuilt'] = True
                 self.done.emit(out)
         except Exception as exc:     # shown to the examiner, never swallowed
@@ -182,8 +185,12 @@ class TimelineViewerMixin:
 
         note = QLabel(
             "Times are as each source stored them; nothing is corrected. "
-            "Only reports whose times have a written meaning are listed (see Sources…). "
-            "Caution gives the source's known catch. Double-click a row to open it in its report.")
+            "Only reports whose times have a written meaning are listed (see Sources…), "
+            "plus every User Media file's own times (not Accessed) and its EXIF/video "
+            "taken time when that has a UTC offset, web cache media (the cache record's "
+            "times), and one event per unpacked archive (the files inside arrived with it). "
+            "Caution gives the source's known catch. Double-click a row to open it in its "
+            "report, or a file in the File Browser.")
         note.setWordWrap(True)
         note.setStyleSheet("color: grey;")
         lay.addWidget(note)
@@ -255,9 +262,10 @@ class TimelineViewerMixin:
             return
         if self._tl_worker is not None and self._tl_worker.isRunning():
             return
-        self._tl_status.setText("Building the Timeline from the reports…")
+        self._tl_status.setText("Building the Timeline from the reports and files…")
         self._tl_rebuild_btn.setEnabled(False)
-        worker = TimelineBuildWorker(self._case_dir, self._timeline_modules(), force)
+        worker = TimelineBuildWorker(self._case_dir, self._timeline_modules(), force,
+                                     files=self._timeline_files_spec())
         worker.done.connect(self._timeline_on_built)
         worker.failed.connect(self._timeline_on_failed)
         # Kept referenced until the thread has really finished (Qt aborts
@@ -266,6 +274,40 @@ class TimelineViewerMixin:
                                 if w.isRunning()] + [worker]
         self._tl_worker = worker
         worker.start()
+
+    def _timeline_files_spec(self):
+        """timeline.build's *files*: the User Media files (the Media
+        Browser's own list of locations and media types, minus the ignore
+        list; "seen" files stay in, since seen is not irrelevant), with the
+        File Browser's time columns. The key list is taken here, on the GUI
+        thread; the list itself is built on the worker (lookups only)."""
+        metadata = getattr(self, 'full_metadata', None)
+        if not metadata or not hasattr(self, '_user_media_candidate_paths'):
+            return None
+        import user_media_ignore_list
+        keys = list(metadata)
+        time_cols = list(getattr(self, '_time_cols', ()))
+        entries = user_media_ignore_list.load()
+
+        cache_paths = sorted(getattr(self, '_cache_media_children', ()) or ())
+        archives = {}
+        is_media = getattr(self, '_is_media_file', None)
+        for a in getattr(self, '_nested_archive_map', {}) or {}:
+            inside = self.folder_map.get(a) or []
+            files = [p for p in inside if p not in self.folder_map]
+            archives[a] = (len(files), sum(1 for p in files if is_media and is_media(p)))
+
+        def collect():
+            cands = self._user_media_candidate_paths(keys)
+            paths = [p for p in cands if not user_media_ignore_list.is_ignored(
+                self._canonical_user_media_entry(p), entries)]
+            return {'paths': paths, 'metadata': metadata, 'time_cols': time_cols,
+                    'ignored': len(cands) - len(paths), 'cache_paths': cache_paths,
+                    'archives': archives}
+
+        key = repr((len(keys), time_cols, sorted(map(repr, entries)), len(cache_paths),
+                    sorted(archives.items())))
+        return {'key': key, 'collect': collect}
 
     def _timeline_on_built(self, out: dict) -> None:
         worker, self._tl_worker = self._tl_worker, None
@@ -361,8 +403,8 @@ class TimelineViewerMixin:
                 status = (f"Showing the first {len(rows):,} of {total:,} matching events — "
                           f"narrow the time window or filters to see the rest.")
         elif n_all == 0:
-            status = ("No report in this case has Timeline times yet: see Sources… for "
-                      "which reports have times and why they are not listed")
+            status = ("Nothing in this case has Timeline times yet: see Sources… for "
+                      "which reports and files have times and why they are not listed")
         else:
             status = f"{total:,} events"
             if total != n_all:
@@ -529,6 +571,13 @@ class TimelineViewerMixin:
         if not index.isValid():
             return
         r = self._tl_model.row(index.row())
+        if r[_IDX['script']] == timeline.ARCHIVE_SCRIPT:
+            self.center_tabs.setCurrentIndex(0)
+            self.navigate_tree_to_path(r[_IDX['path']])     # inside the archive
+            return
+        if r[_IDX['script']] in timeline.FILE_SCRIPTS:
+            self._open_parent_folder_from_search(r[_IDX['path']])
+            return
         self._art_jump_to_report_row(r[_IDX['script']], r[_IDX['report_rowid']])
 
     def _timeline_context_menu(self, pos) -> None:
@@ -537,7 +586,8 @@ class TimelineViewerMixin:
             return
         r = self._tl_model.row(index.row())
         menu = QMenu(self._tl_view)
-        menu.addAction("Open in report").triggered.connect(
+        is_file = r[_IDX['script']] in timeline.FILE_SCRIPTS
+        menu.addAction("Show in File Browser" if is_file else "Open in report").triggered.connect(
             lambda _=False, ix=index: self._timeline_open_row(ix))
         what = f"{r[_IDX['source']]}: {r[_IDX['event']] or r[_IDX['meaning']]}"
         menu.addAction("Show activity around this time (±Around)").triggered.connect(

@@ -119,3 +119,17 @@ def test_five_tuple_candidates_still_accepted(monkeypatch):
     monkeypatch.setattr(duplicate_scan, 'ZipEntry', FakeEntry)
     cands = [c[:5] for c in (_cand('a', b'q'), _cand('b', b'q'))]
     assert len(duplicate_scan.find_duplicate_groups('unused.zip', cands)) == 2
+
+
+def test_no_ut_block_gives_no_time_not_dos_as_utc():
+    """A-10: the DOS time is local wall-clock time (Q5), so an entry without
+    a UT block gets no time and is marked, never DOS read as UTC."""
+    info = _info('/data/data/x/f', b'abc', b'')
+    info.date_time = (2024, 7, 1, 12, 0, 0)
+    meta = graykey._parse_entry(info)
+    assert meta['mtime'] == 0 and meta['no_ut'] is True
+    with_ut = graykey._parse_entry(_info('/data/data/x/f', b'abc', _ut()))
+    assert 'no_ut' not in with_ut
+    assert graykey.missing_ut_warning(0) is None
+    w = graykey.missing_ut_warning(3)
+    assert '3 file(s)' in w and 'not used' in w and 'local time' in w

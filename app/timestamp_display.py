@@ -14,6 +14,7 @@ provenance timestamp policy this implements. Tool-provenance formatting
 evidence, so it doesn't belong in this module.
 """
 
+import json
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
+import archive_offset as _archive_offset
 import device_timezone as _device_timezone
 from db_utils import _open_results_db, load_case_setting, save_case_setting
 from dialog_helpers import note_label, WARNING_STYLE
@@ -138,7 +140,17 @@ class TimestampDisplayMixin:
             return _format_ts_named_zone(ts, self._acquisition_zone_name)
         if mode == 'manual' and getattr(self, '_manual_zone_name', ''):
             return _format_ts_named_zone(ts, self._manual_zone_name)
+        if mode == 'archive':
+            choice = getattr(self, '_archive_zone_choice', '')
+            if choice == 'fixed' and self._archive_fixed_offset() is not None:
+                return _archive_offset.format_fixed(ts, self._archive_fixed_offset())
+            if choice and choice != 'fixed':
+                return _format_ts_named_zone(ts, choice)
         return _format_ts_cached(ts)
+
+    def _archive_fixed_offset(self):
+        det = getattr(self, '_archive_offset_detect', None) or {}
+        return det.get('offset_s') if det.get('status') == 'fixed' else None
 
     def _timestamp_mode_text(self) -> str:
         """One-line description of the active timestamp-display mode —
@@ -150,6 +162,13 @@ class TimestampDisplayMixin:
             return f"Acquisition PC local time ({self._acquisition_zone_name})"
         if mode == 'manual' and getattr(self, '_manual_zone_name', ''):
             return f"Manually selected time ({self._manual_zone_name})"
+        if mode == 'archive':
+            choice = getattr(self, '_archive_zone_choice', '')
+            fixed = self._archive_fixed_offset()
+            if choice == 'fixed' and fixed is not None:
+                return f"Local via archive DOS−UT ({_archive_offset.offset_text(fixed)}, fixed)"
+            if choice and choice != 'fixed':
+                return f"Local via archive DOS−UT ({choice}, a zone consistent with the zip)"
         return "UTC"
 
     def _after_timestamp_mode_change(self) -> None:
@@ -239,9 +258,34 @@ class TimestampDisplayMixin:
                 acquisition_zone = load_case_setting(db, 'acquisition_timezone_name', '') or ''
                 manual_zone = load_case_setting(db, 'manual_timezone_name', '') or ''
                 mode = load_case_setting(db, 'timestamp_display_mode', 'utc') or 'utc'
+                archive = self._load_or_detect_archive_offset(db, zip_path, case_dir)
         except Exception:
-            pass
-        return handset_zone, acquisition_zone, manual_zone, mode, is_first_load
+            archive = {'detect': None, 'choice': ''}
+        return handset_zone, acquisition_zone, manual_zone, mode, is_first_load, archive
+
+    @staticmethod
+    def _load_or_detect_archive_offset(db, zip_path: str, case_dir: str) -> dict:
+        """{'detect': archive_offset.detect() result or None, 'choice':
+        'fixed', a zone name, or ''}. Detected once per case from the
+        cached zip index and stored (case_settings 'archive_offset'), so it
+        never changes between sessions; not stored if the index could not
+        be read, so it is tried again next time."""
+        raw = load_case_setting(db, 'archive_offset', None)
+        det = None
+        if raw:
+            try:
+                det = json.loads(raw)
+            except ValueError:
+                det = None
+        if det is None:
+            try:
+                det = _archive_offset.detect_from_archive(zip_path, case_dir)
+                det['rule'] = 1
+                save_case_setting(db, 'archive_offset', json.dumps(det))
+            except Exception:
+                det = None
+        return {'detect': det,
+                'choice': load_case_setting(db, 'archive_zone_choice', '') or ''}
 
     def _timestamp_display_dialog(self, is_first_load: bool = False):
         """Per-case choice of how evidence timestamps are displayed in the
@@ -340,6 +384,47 @@ class TimestampDisplayMixin:
             group.addButton(handset_radio)
             v.addWidget(handset_radio)
 
+        archive_radio = None
+        archive_combo = None
+        det = getattr(self, '_archive_offset_detect', None) or {}
+        if det.get('status') in ('fixed', 'dst'):
+            archive_combo = QComboBox()
+            fixed = self._archive_fixed_offset()
+            if fixed is not None:
+                archive_combo.addItem(
+                    f"Fixed {_archive_offset.offset_text(fixed)} (from the zip)", 'fixed')
+            else:
+                archive_combo.addItem("— pick a zone consistent with the zip —", None)
+            if det.get('zones'):
+                archive_combo.insertSeparator(archive_combo.count())
+                for zone in det['zones']:
+                    archive_combo.addItem(f"{zone} — consistent with the zip", zone)
+            idx = archive_combo.findData(getattr(self, '_archive_zone_choice', '') or None)
+            if idx >= 0:
+                archive_combo.setCurrentIndex(idx)
+            n = det.get('n') or 0
+            seen = ', '.join(f"{c:,} at {_archive_offset.offset_text(o)}"
+                             for o, c in (det.get('bins') or [])[:2]) if n else ''
+            pattern = ("one fixed offset" if fixed is not None else
+                       "two offsets an hour apart (daylight saving), so no single "
+                       "fixed offset fits; pick a zone")
+            row = QHBoxLayout()
+            archive_radio = QRadioButton("Archive offset (DOS vs UT) —")
+            group.addButton(archive_radio)
+            row.addWidget(archive_radio)
+            row.addWidget(archive_combo, 1)
+            v.addLayout(row)
+            v.addWidget(note_label(
+                "(Inferred from how this zip records each file's time twice: DOS, the "
+                "local wall clock, and UT, UTC. It may not match every older event if "
+                "the device timezone changed (travel, DST). Prefer UTC for reporting "
+                f"unless you need local. Sampled {n:,} files: {seen}: {pattern}. "
+                f"{len(det.get('zones') or [])} zones give the same offset as the zip for "
+                f"at least {_archive_offset.ZONE_MATCH:.0%} of the sampled files, each at "
+                "its own date; none is picked for you.)"))
+            archive_combo.setEnabled(current_mode == 'archive')
+            archive_radio.toggled.connect(archive_combo.setEnabled)
+
         def _zone_offset_label(zone_name: str) -> str:
             # All candidates share the same offset at acq_dt by construction
             # (that's the match criterion) — computed per-zone anyway via
@@ -424,9 +509,9 @@ class TimestampDisplayMixin:
             "workstation's.)",
             'manual')
 
-        {'utc': utc_radio, 'handset': handset_radio,
-         'acquisition': acquisition_radio,
-         'manual': manual_radio}.get(current_mode, utc_radio).setChecked(True)
+        ({'utc': utc_radio, 'handset': handset_radio,
+          'acquisition': acquisition_radio, 'archive': archive_radio,
+          'manual': manual_radio}.get(current_mode) or utc_radio).setChecked(True)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -461,6 +546,8 @@ class TimestampDisplayMixin:
             mode = 'handset'
         elif acquisition_radio and acquisition_radio.isChecked():
             mode = 'acquisition'
+        elif archive_radio and archive_radio.isChecked() and archive_combo.currentData():
+            mode = 'archive'
         elif manual_radio.isChecked():
             mode = 'manual'
         else:
@@ -471,12 +558,16 @@ class TimestampDisplayMixin:
         chosen_manual_zone = (manual_combo.currentData() if mode == 'manual' else
                               self._manual_zone_name)
 
+        if mode == 'archive':
+            self._archive_zone_choice = archive_combo.currentData() or ''
         self._timestamp_display_mode = mode
         self._acquisition_zone_name = chosen_acquisition_zone or ''
         self._manual_zone_name = chosen_manual_zone or ''
         try:
             with closing(_open_results_db(case_dir)) as db:
                 save_case_setting(db, 'timestamp_display_mode', mode)
+                save_case_setting(db, 'archive_zone_choice',
+                                  getattr(self, '_archive_zone_choice', '') or '')
                 save_case_setting(db, 'acquisition_timezone_name', self._acquisition_zone_name)
                 save_case_setting(db, 'manual_timezone_name', self._manual_zone_name)
         except Exception:

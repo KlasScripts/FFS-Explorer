@@ -2054,12 +2054,31 @@ class MediaViewerMixin:
         self.status_bar.showMessage("Finding User Media…")
         self._user_media_paths_async(self._show_user_created_media_paths, 'click')
 
-    def _show_user_created_media_paths(self, media_paths: list) -> None:
-        """_show_user_created_media's second half, given the list."""
+    def _web_cache_media_paths(self) -> list[str]:
+        """Media from web cache records (A-75) not yet marked "seen" and not
+        on the User Media ignore list: the "Web Cache Media" review list."""
+        ignore_entries = user_media_ignore_list.load()
+        seen_paths = self._load_seen_media_paths_fresh()
+        return sorted(
+            p for p in getattr(self, '_cache_media_children', ()) or ()
+            if p not in seen_paths and not user_media_ignore_list.is_ignored(
+                self._canonical_user_media_entry(p), ignore_entries))
+
+    def _show_web_cache_media(self) -> None:
+        """The "Web Cache Media" bookmark-panel row: the same grid, ticking
+        and save-your-selection check as User Media, for cache media."""
+        self._show_user_created_media_paths(
+            self._web_cache_media_paths(), list_name="Web Cache Media",
+            sort_desc=" from web cache records")
+
+    def _show_user_created_media_paths(self, media_paths: list, list_name: str = "User Media",
+                                       sort_desc: str = " from known user-created locations") -> None:
+        """_show_user_created_media's second half, given the list (also
+        the "Web Cache Media" row's, with its own name)."""
         self.status_bar.clearMessage()
         if not media_paths:
             self.status_bar.showMessage(
-                "\"User Media\" has no not-yet-viewed files right now.", 4000)
+                f"\"{list_name}\" has no not-yet-viewed files right now.", 4000)
             return
         if self._selection_at_risk():
             choice = self._warn_before_losing_selection()
@@ -2086,7 +2105,6 @@ class MediaViewerMixin:
         self.center_tabs.setCurrentIndex(1)
         self._media_showing_user_only = True
         self._media_context = tuple(media_paths)
-        sort_desc = " from known user-created locations"
         self._media_type_filter = 'all'
         self._media_type_all_btn.setChecked(True)
         self._start_thumbnail_load(media_paths, len(media_paths), sort_desc)

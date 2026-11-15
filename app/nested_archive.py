@@ -34,6 +34,49 @@ from contextlib import closing
 from datetime import datetime, timezone
 
 import header_scan
+# A nested entry's stored mdate says which clock it is (A-10, Q5): the UT
+# extra field and gzip MTIME are UTC; a zip's DOS date_time is the local
+# wall clock of whatever wrote the zip, zone unknown, never read as UTC.
+MDATE_UTC = ' UTC'
+MDATE_LOCAL = ' (local, zone unknown)'
+
+
+def entry_mdate(info):
+    """The stored mdate of a nested zip entry: its UT mtime as UTC when
+    it has one, else its DOS time labelled local, else None."""
+    from archive_offset import ut_mtime
+    ut = ut_mtime(info.extra)
+    if ut:
+        return datetime.fromtimestamp(ut, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + MDATE_UTC
+    dt = info.date_time
+    if not dt or dt[0] <= 1980:
+        return None
+    return (f"{dt[0]:04d}-{dt[1]:02d}-{dt[2]:02d} "
+            f"{dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}" + MDATE_LOCAL)
+
+
+def parse_mdate(mdate, legacy_is_utc: bool):
+    """(utc_seconds or None, local display text or None) for a stored
+    mdate. A value stored before 2026-11-15 has no label: a gzip's was UTC
+    (*legacy_is_utc*), a zip's was its DOS time, local."""
+    if not mdate:
+        return None, None
+    text = mdate
+    if text.endswith(MDATE_UTC):
+        text, is_utc = text[:-len(MDATE_UTC)], True
+    elif text.endswith(MDATE_LOCAL):
+        return None, text
+    else:
+        is_utc = legacy_is_utc
+        if not is_utc:
+            return None, text + MDATE_LOCAL
+    try:
+        dt = datetime.strptime(text, '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return None, None
+    return dt.replace(tzinfo=timezone.utc).timestamp(), None
+
+
 from db_utils import (_open_cache_db, load_nested_archives, load_nested_archive_entries, save_nested_archive,
                       save_nested_archive_entries, save_nested_archive_failure)
 from zip_cd_cache import CachedZipView, load as _zcd_load
@@ -134,6 +177,74 @@ def unpacked_duplicate_candidates(case_dir: str) -> list:
     return out
 
 
+def stored_name_for(ui_path: str) -> str:
+    """The file name an unpacked archive is stored under in
+    case_dir/nested_archives (extract_one)."""
+    key = hashlib.sha1(ui_path.encode()).hexdigest()[:12]
+    return f"{key}_{os.path.basename(ui_path) or 'content'}"
+
+
+def recover_missing_records(case_dir: str, ui_metadata: dict, get_file_type) -> dict:
+    """Re-record unpacked archives whose casecache.db rows are gone.
+
+    The examiner's unpacked archives stay on disk in nested_archives/, but
+    their rows live in casecache.db, which the app deletes and rebuilds
+    when its schema version changes. Without the rows the unpacked files
+    no longer appear (IOS17: 18 unpacked 2026-09-25, rows lost at the
+    v19 rebuild 2026-10-21). Each stored name is stored_name_for(ui_path),
+    so a file is matched back to its archive by that name and its rows are
+    rebuilt from the file itself (no evidence read). A gzip's header time
+    is not kept in its stored copy, so its child gets no time.
+
+    Returns {'recovered': n, 'unmatched': [stored names with no archive]}."""
+    out = {'recovered': 0, 'unmatched': []}
+    out_dir = os.path.join(case_dir, 'nested_archives')
+    if not os.path.isdir(out_dir):
+        return out
+    files = [f for f in os.listdir(out_dir)
+             if '_' in f and not f.endswith('.tmp') and os.path.isfile(os.path.join(out_dir, f))]
+    with closing(_open_cache_db(case_dir)) as db:
+        known = {r['stored_filename'] for r in load_nested_archives(db)}
+        missing = set(files) - known
+        if not missing:
+            return out
+        by_base: dict = {}
+        for f in missing:
+            by_base.setdefault(f.split('_', 1)[1], set()).add(f)
+        for ui_path, meta in ui_metadata.items():
+            cands = by_base.get(ui_path.rsplit('/', 1)[-1])
+            if not cands:
+                continue
+            name = stored_name_for(ui_path)
+            if name not in cands:
+                continue
+            path = os.path.join(out_dir, name)
+            with open(path, 'rb') as fh:
+                head = fh.read(header_scan.TEXT_SIZE_LIMIT)
+            if head[:2] == b'PK':
+                rows = []
+                with zipfile.ZipFile(path) as z:      # the case's own repacked copy
+                    for info in z.infolist():
+                        if info.filename.endswith('/'):
+                            continue
+                        with z.open(info) as fh:
+                            data = fh.read(header_scan.TEXT_SIZE_LIMIT)
+                        ft = classify_unpacked(info.filename.rsplit('/', 1)[-1], data, get_file_type)
+                        rows.append((info.filename, entry_mdate(info), info.file_size, ft))
+            else:
+                base = os.path.basename(ui_path)
+                child = base[:-3] if base.lower().endswith('.gz') else base
+                rows = [(child, None, os.path.getsize(path),
+                         classify_unpacked(child, head, get_file_type))]
+            size = (meta or {}).get('size') or 0
+            save_nested_archive(db, ui_path, name, size, len(rows))
+            save_nested_archive_entries(db, ui_path, rows)
+            cands.discard(name)
+            out['recovered'] += 1
+        out['unmatched'] = sorted(f for c in by_base.values() for f in c)
+    return out
+
+
 def already_extracted(case_dir: str, ui_path: str) -> bool:
     """True if *ui_path* has already been fully extracted (a DB record
     exists, its output file is still on disk, and its recorded entry
@@ -227,9 +338,8 @@ def extract_one(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
         with CachedZipView(zip_path, infos) as zf:
             raw = zf.open(physical_path).read()
 
-        key = hashlib.sha1(ui_path.encode()).hexdigest()[:12]
         basename = os.path.basename(ui_path) or 'content'
-        stored_filename = f"{key}_{basename}"
+        stored_filename = stored_name_for(ui_path)
         out_path = os.path.join(out_dir, stored_filename)
 
         if raw[:2] == b'\x1f\x8b':
@@ -241,8 +351,9 @@ def extract_one(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
                           else basename)
             ft = classify_unpacked(child_name, decompressed, get_file_type)
             gz_mtime = struct.unpack_from('<I', raw, 4)[0] if len(raw) >= 8 else 0
+            # gzip MTIME is Unix seconds (UTC).
             gz_mdate = (datetime.fromtimestamp(gz_mtime, tz=timezone.utc)
-                        .strftime('%Y-%m-%d %H:%M:%S') if gz_mtime else None)
+                        .strftime('%Y-%m-%d %H:%M:%S') + MDATE_UTC if gz_mtime else None)
             content_rows = [(child_name, gz_mdate, len(decompressed), ft)]
             entry_count = 1
             compound_type = f"{ft} — gzip" if ft != 'Other' else None
@@ -273,10 +384,7 @@ def extract_one(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
                         entry_count += 1
                         name = info.filename
                         ft = classify_unpacked(name.rsplit('/', 1)[-1], data, get_file_type)
-                        dt = info.date_time
-                        mdate = (f"{dt[0]:04d}-{dt[1]:02d}-{dt[2]:02d} "
-                                f"{dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}"
-                                if any(dt) else None)
+                        mdate = entry_mdate(info)
                         content_rows.append((info.filename, mdate,
                                              info.file_size, ft))
             finally:

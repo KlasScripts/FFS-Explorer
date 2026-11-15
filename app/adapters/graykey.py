@@ -143,6 +143,7 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
     # only carries flags + mtime (5 bytes); the local-file-header copy carries
     # all timestamps that are flagged.  We parse flag-by-flag so both forms work.
     mtime = atime = ctime = btime = 0
+    no_ut = ut is None
     if ut is not None and len(ut) >= 1:
         flags = ut[0]
         off   = 1
@@ -154,21 +155,11 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
             ctime = struct.unpack_from('<I', ut, off)[0]; off += 4
         if (flags & 8) and off + 4 <= len(ut):   # GrayKey btime extension
             btime = struct.unpack_from('<I', ut, off)[0]
-    else:
-        # No UT block at all — fall back to DOS mod time (always present,
-        # 2-second precision).  Only used when the entry carries no Unix
-        # timestamp whatsoever; a UT block with mtime=0 is honoured as-is
-        # (displayed as "---") rather than being overwritten with the DOS date.
-        # DOS year 1980 is the epoch zero for the format (meaning "not set").
-        import calendar
-        dt = f.date_time   # (year, month, day, hour, min, sec)
-        if dt[0] <= 1980:
-            mtime = 0
-        else:
-            try:
-                mtime = int(calendar.timegm(dt + (0, 0, -1)))
-            except (ValueError, OverflowError):
-                mtime = 0
+    # No UT block: no time (A-10). The zip's DOS time is NOT used: on the
+    # images checked it is the phone's local wall clock, not UTC (Q5), so
+    # it would be shifted by the device's offset. GrayKey writes UT on
+    # every entry, so a missing one means something is wrong with the
+    # archive; the entry is marked (no_ut) and counted in a warning.
 
     # UID/GID from UX block: version(1B) uid_sz(1B) uid(uid_sz B) gid_sz(1B) gid(gid_sz B)
     if ux is not None:
@@ -217,7 +208,20 @@ def _parse_entry(f: zipfile.ZipInfo, extra: bytes | None = None) -> dict:
     }
     if hashes:
         entry.update(hashes)   # 'sha256' / 'sha1' / 'md5', lowercase hex
+    if no_ut:
+        entry['no_ut'] = True
     return entry
+
+
+def missing_ut_warning(n: int):
+    """The banner text when *n* entries have no UT block, or None."""
+    if not n:
+        return None
+    return (f"⚠ {n:,} file(s) in this GrayKey archive have no UT time block, which "
+            f"GrayKey normally writes on every file: their times are shown as ---. "
+            f"The zip's DOS time was not used, because it is the phone's local time, not "
+            f"UTC. Something may be wrong with this extraction: check it against the "
+            f"acquisition tool's own report.")
 
 
 def _has_ut_extras(z: zipfile.ZipFile) -> bool:

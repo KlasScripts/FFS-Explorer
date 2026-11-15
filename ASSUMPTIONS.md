@@ -268,12 +268,17 @@ to entries the zip already has: anything listed in the msgpack but not in the
 zip never appears. In GrayKey and `zip_extras`, the metadata is read from the
 zip entries themselves, so the two can't disagree.
 
-**A-10. A missing UT block in GrayKey falls back to the zip's DOS time,
-treated as UTC.** *Code only.*
-Applies to B and C. The zip's DOS timestamp has no timezone and only 2-second
-precision, so if a tool wrote local time there, those mtimes would be shifted
-by the acquisition machine's offset. A UT block that is present with mtime 0
-is kept as 0 (shown as `---`), not replaced.
+**A-10. A GrayKey entry without a UT block has no time.** *Decision,
+2026-11-15 (replaces "falls back to the zip's DOS time, treated as UTC").*
+- The zip's DOS date_time is the phone's local wall clock with no zone
+  (Q5), so reading it as UTC shifts the time by the device's offset.
+- GrayKey writes a UT block on every entry: none was missing in 171,462
+  files on the Magnet Android 14 image. So a missing UT block means
+  something is wrong with the archive.
+- The entry is shown with no time (`---`), marked `no_ut`, and counted in a
+  warning banner. The DOS time is never used as an evidence time.
+- A UT block present with mtime 0 is also no time.
+- `zip_extras` (Cellebrite Android) already behaved this way.
 
 **A-11. 32-bit UT timestamps.** *Code only.*
 GrayKey and `zip_extras` times are unsigned 32-bit seconds: no sub-second
@@ -487,13 +492,15 @@ reports it as `embedded_archives` so the gap is visible.
 source.*
 - All evidence times are shown as labelled UTC by default; other zones are
   opt-in per case.
-- Each source is assumed to be UTC as stored: msgpack times, UT fields, the
-  DOS fallback (A-10), and app database epochs.
+- Each source is assumed to be UTC as stored: msgpack times, UT fields and
+  app database epochs. The zip's DOS time is local, never an evidence time
+  (A-10, Q5).
 - Parsers store raw values and declare the unit (`timestamp_fields`).
 - The other zones a case can opt into: the **handset's** zone (read from the
   device, iOS only); the **acquisition machine's** zone (guessed from the
-  `.ufd` offset, A-23); or one chosen **manually** (starts blank, never
-  auto-picked).
+  `.ufd` offset, A-23); a zone or fixed offset inferred from the zip's DOS
+  vs UT times (**archive offset**, A-89); or one chosen **manually** (starts
+  blank, never auto-picked).
 - The active mode is shown in exactly one place: a banner above every tab.
   Never repeat it per column.
 - A tool-provenance time ("when did the examiner do X") is different: shown
@@ -508,6 +515,44 @@ automatically.
 (real) on two cases.*
 Only a UTC offset exists, in the `.ufd`, so the zone is guessed from that
 offset and must be confirmed by the examiner. GrayKey provides no offset.
+
+**A-89. The zip's DOS−UT offset is an optional display source only.**
+*Decision, 2026-11-15 (Grok's brief, owner approved).*
+- Detected once per case (`archive_offset.py`) from up to 4,000 files that
+  have both a DOS time (after 1980) and a UT mtime that is not 0. The
+  delta is binned to 15 minutes.
+- Two offsets an hour apart (the smaller with at least 2% of the sample)
+  are daylight saving: no fixed offset is offered. On the Android 15 phone
+  a plain 90% rule would have given "fixed −04:00" and shown 9.6% of the
+  files an hour off.
+- Otherwise at least 90% at one offset is a fixed offset. Anything else,
+  or fewer than 100 files, offers nothing.
+- The IANA zones that give the zip's offset for at least 97% of the sampled
+  files, each at its own date, are listed. None is picked for the examiner.
+- The examiner must opt in; the case never leaves UTC by itself. The banner
+  says "Local via archive DOS−UT", never "Handset".
+- Evidence times and the Timeline stay UT/UTC.
+- Results on the test images (2026-11-15): Magnet fixed −05:00 (3,999 of
+  4,000); Pixel, Android 15 and iOS 17 daylight saving −04:00/−05:00; each
+  listing America/New_York among its zones.
+
+**A-90. Times inside an unpacked archive.** *Decision (owner), 2026-11-15.*
+- A nested zip entry's UT time is UTC. Its DOS time alone is local to
+  whatever made the zip, zone unknown (Q5). It is shown labelled
+  "(local, zone unknown)" and orange, with a tooltip and a note above the
+  File Browser table; it is never converted by the Time setting and never
+  on the Timeline. Those times sort after the UTC ones, in their own
+  written order. A gzip's MTIME is UTC.
+- For the Timeline what counts is when the archive arrived on the phone:
+  one event per unpacked archive, from its own times. The files inside
+  add no file-system-time events; a photo's EXIF taken time still does.
+- Unpacking is the examiner's choice, so a case may have none.
+- Unpacked-archive records live in `casecache.db`, which a cache rebuild
+  deletes while the unpacked files stay on disk (IOS17: 18 unpacked
+  2026-09-25, records lost 2026-10-21). At case open, an unpacked file
+  without a record is matched back to its archive by its stored name and
+  re-recorded from the file itself (logged in `run_log`). A recovered
+  gzip has no time: its header is not kept in the stored copy.
 
 **A-24. Header-scan scope comes from one shared ruleset.** *Decision.*
 `config/scan_rules_ios.json` and `scan_rules_android.json` (via
@@ -989,6 +1034,9 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
   any parse/decompression problem) in the Text tab. The child's Text tab
   says which record it came from and that its times are the record's.
 - Cache media is left out of User Media (not user-created content).
+  It is listed in its own review list ("Web Cache Media", beside User
+  Media) and is on the Timeline as its own source ("Files: web cache
+  media"), with its record's times (owner decision, 2026-11-15).
 - Cache keys of the form `1/0/<url>` (no partition) had the flags prefix
   left in the URL; now stripped when a URL scheme follows. This also fixes
   the Chrome Cache Media/Pages reports' URL column on re-run.
@@ -1386,8 +1434,13 @@ Recorded here; not yet applied.
   that use a GrayKey block version other than 1 (A-3)?
 - **Q4.** Should an unrecognised layout produce a warning, rather than
   silently being treated as Cellebrite with a `filesystem2` default (A-3)?
-- **Q5.** Does any tool write local time (not UTC) into the zip's DOS
-  timestamp (A-10)?
+- ~~**Q5.** Does any tool write local time (not UTC) into the zip's DOS
+  timestamp (A-10)?~~ Answered 2026-11-15: yes. On the Cellebrite Android 14
+  and 15 (`zip_extras`), GrayKey Android 14 and Cellebrite iOS 17 images,
+  DOS minus UT is the device's UTC offset, so DOS is local time: −05:00 on
+  Magnet; −04:00/−05:00 by date on the Pixel, Android 15 and iOS 17 phones.
+  Grok confirmed it against the Pixel's documented local times. A-10 changed
+  accordingly; A-89 uses the offset for display only.
 - **Q6.** Should A-12 and A-14 (no compressed or encrypted entries) be checked
   automatically when a case loads, so a violation is reported rather than
   silently assumed? This is cheap: the sidecar's entry list is already in

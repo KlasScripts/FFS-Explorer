@@ -40,6 +40,7 @@ HARDWARE_MODELS_FILE = os.path.join('config', 'hardware_models.json')           
 sys.path.insert(0, _APP_DIR)
 
 from adapters import FfsAdapter
+from adapters.graykey import missing_ut_warning as _gk_missing_ut_warning
 from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       check_cache_schema, check_results_schema,
                       save_blob, load_blob, open_blob,
@@ -193,6 +194,13 @@ _SELECTED_FILES_SENTINEL = "__selected_files__"
 # "Selected Files" — distinguishes it from a real group's own integer
 # id the same way _SELECTED_FILES_SENTINEL does.
 _USER_MEDIA_SENTINEL = "__user_media__"
+_WEB_CACHE_MEDIA_SENTINEL = "__web_cache_media__"
+_WEB_CACHE_MEDIA_TOOLTIP = (
+    "Pictures/videos a browser or app downloaded to show a page (web cache "
+    "records, A-75): what the user saw or the page loaded, not necessarily "
+    "saved. Kept out of User Media; reviewed here with the same \"Not "
+    "Relevant\" marking and ignore list. Each has its record's times and "
+    "Source URL. Switches to the Media Browser tab.")
 _USER_MEDIA_TOOLTIP = (
     "Show real pictures/videos found in known user-created "
     "locations only (app data, DCIM, Photo Library Data) — "
@@ -1648,6 +1656,29 @@ def _duplicate_groups_for(duplicate_files: dict) -> dict:
     return {m: sorted(ps) for m, ps in groups.items()}
 
 
+def _recover_nested_records(case_dir: str, ui_metadata: dict) -> None:
+    """Re-record unpacked nested archives whose casecache.db rows were lost
+    at a cache rebuild (nested_archive.recover_missing_records), and log
+    what was done in run_log. Never raises."""
+    try:
+        res = nested_archive.recover_missing_records(case_dir, ui_metadata, _get_file_type)
+    except Exception as exc:
+        res = {'recovered': 0, 'unmatched': [], 'error': f"{type(exc).__name__}: {exc}"}
+    if not (res.get('recovered') or res.get('error')):
+        return     # nothing done (an unmatched file alone is not re-logged every open)
+    note = (f"{res['recovered']} unpacked archive(s) re-recorded after a cache rebuild"
+            + (f"; {len(res['unmatched'])} stored file(s) match no archive in this "
+               f"extraction: {', '.join(res['unmatched'][:10])}" if res.get('unmatched') else '')
+            + (f"; error: {res['error']}" if res.get('error') else ''))
+    try:
+        with closing(_open_results_db(case_dir)) as db:
+            run_id = start_run_log(db, 'nested_archive_recovery', notes=note)
+            complete_run_log(db, run_id, processed=res.get('recovered', 0),
+                             output_rows=res.get('recovered', 0), notes=note)
+    except Exception:
+        pass
+
+
 def _read_nested_archives(case_dir: str):
     """The case's unpacked nested archives, read and shaped for
     FastZipBrowser._inject_nested_archives: [(ui_path, stored_path,
@@ -1676,23 +1707,27 @@ def _read_nested_archives(case_dir: str):
             except Exception:
                 entries = []
             rows = []
+            try:
+                with open(stored_path, 'rb') as fh:
+                    legacy_is_utc = fh.read(2) != b'PK'     # a gzip extract
+            except OSError:
+                legacy_is_utc = False
             for e in entries:
                 ep = e['entry_path']
                 if not ep or ep.endswith('/'):
                     continue   # skip directory entries
-                mtime = None
-                if e.get('mdate'):
-                    try:
-                        dt = datetime.strptime(e['mdate'], '%Y-%m-%d %H:%M:%S')
-                        mtime = dt.replace(tzinfo=timezone.utc).timestamp()
-                    except ValueError:
-                        pass
-                rows.append((f"{ui_path}/{ep}", {
+                # A DOS-only time is local, zone unknown: shown as text,
+                # never a UTC mtime (A-10), so never on the Timeline.
+                mtime, mtime_local = nested_archive.parse_mdate(e.get('mdate'), legacy_is_utc)
+                meta = {
                     'size':          e['size'] or 0,
                     '_display_name': ep,
                     '_archive_path': ui_path,
                     'mtime':         mtime,
-                }, e.get('file_type') or 'Other'))
+                }
+                if mtime_local:
+                    meta['mtime_local'] = mtime_local
+                rows.append((f"{ui_path}/{ep}", meta, e.get('file_type') or 'Other'))
             out.append((ui_path, stored_path, entries, rows))
     return out
 
@@ -2264,6 +2299,7 @@ class ZipMetadataWorker(QThread):
         if self.case_dir:
             # Read here, applied by on_metadata_ready (0.27 + 0.1 s of
             # frozen window on IOS17 when read there).
+            _recover_nested_records(self.case_dir, ui_metadata)
             self._ui_extras['nested_archives'] = _read_nested_archives(self.case_dir)
             self._ui_extras['embedded_media'] = _read_embedded_media(self.case_dir)
 
@@ -2768,6 +2804,10 @@ class FileTableModel(QAbstractTableModel):
     # injected by _set_file_model so every model construction site gets them.
     _research_fg  = None
     _research_tip = None
+    # A nested archive's DOS-only time (nested_archive.MDATE_LOCAL): local,
+    # zone unknown. Shown orange with a tooltip, sorted after real times.
+    _local_time_tip = None
+    _LOCAL_TIME_COLOR = QColor('#e07b00')
 
     # {ui_path: ["#rrggbb", ...]} for the Name column's own background
     # tint — every group color a file belongs to, in group-id order
@@ -2903,6 +2943,10 @@ class FileTableModel(QAbstractTableModel):
             cols = row[0]
             return cols[real_col] if real_col < len(cols) else None
         if role == Qt.ItemDataRole.ForegroundRole:
+            cols = row[0]
+            if real_col < len(cols) and isinstance(cols[real_col], str) \
+                    and cols[real_col].endswith(nested_archive.MDATE_LOCAL):
+                return self._LOCAL_TIME_COLOR
             if self._research_fg is not None:
                 c = self._research_fg(row[1])
                 if c is not None:
@@ -2931,6 +2975,11 @@ class FileTableModel(QAbstractTableModel):
                 return c
             return None
         if role == Qt.ItemDataRole.ToolTipRole:
+            cols = row[0]
+            if (self._local_time_tip is not None and real_col < len(cols)
+                    and isinstance(cols[real_col], str)
+                    and cols[real_col].endswith(nested_archive.MDATE_LOCAL)):
+                return self._local_time_tip(row[1])
             return self._research_tip(row[1]) if self._research_tip else None
         if role == Qt.ItemDataRole.FontRole:
             if row[3]:
@@ -3152,7 +3201,14 @@ class FileTableModel(QAbstractTableModel):
             return itemgetter(2)   # C-level accessor — faster than a lambda on large row lists
         if real_column == self._size_col:
             return lambda r: int(r[0][real_column].replace(',', '')) if real_column < len(r[0]) and r[0][real_column] else 0
-        return lambda r: r[0][real_column].lower() if real_column < len(r[0]) and r[0][real_column] else ''
+        local = nested_archive.MDATE_LOCAL.lower()
+
+        def key(r):
+            v = r[0][real_column].lower() if real_column < len(r[0]) and r[0][real_column] else ''
+            # A local, zone-unknown time can't be ordered against UTC times:
+            # its own group, after them, in its own written order.
+            return '\uffff' + v if v.endswith(local) else v
+        return key
 
     def sort_multi(self, levels: list) -> None:
         """Excel-style multi-level sort for the File Browser's preset
@@ -9022,6 +9078,13 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         sel_bar.addWidget(self.columns_btn)
         file_tab_layout.addLayout(sel_bar)
         file_tab_layout.addWidget(self.filter_bar_widget)
+        # Shown when the open folder is inside an unpacked archive whose
+        # files have only the zip's local DOS time (_update_nested_time_note).
+        self._nested_time_note = QLabel()
+        self._nested_time_note.setWordWrap(True)
+        self._nested_time_note.setStyleSheet("color: #e07b00; padding: 2px 4px;")
+        self._nested_time_note.setVisible(False)
+        file_tab_layout.addWidget(self._nested_time_note)
         file_tab_layout.addWidget(self.file_view)
 
         # ── Media Browser tab ───────────────────────────────────────────────
@@ -9132,6 +9195,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.file_model = model
         model._research_fg  = self._research_fg_for_row
         model._research_tip = self._research_tip_for_row
+        model._local_time_tip = self._local_time_tip_for_row
         # Loaded fresh on every model swap (folder navigation, aggregate
         # rebuild, bookmark view) — same "read straight from
         # caseresults.db every time, never cached across folders" cost
@@ -10819,6 +10883,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._maybe_decode_leveldb_on_navigate(folder_path)
 
         self._view_path = folder_path
+        self._update_nested_time_note()
         # Recursive-by-default view for the "Selected Only" tree — added
         # 2026-10-03, direct request. Only applies when *item* actually
         # belongs to that branch (never "/ [Full Filesystem]", regardless
@@ -11013,7 +11078,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                           seg: str | None = None) -> list:
         cols: list = [self._display_name(name)]
         for _, key in self._time_cols:
-            cols.append(self.format_ts(meta.get(key)))
+            if key == 'mtime' and not meta.get('mtime') and meta.get('mtime_local'):
+                cols.append(meta['mtime_local'])     # nested DOS time, local
+            else:
+                cols.append(self.format_ts(meta.get(key)))
         if is_folder and (path in self._nested_archive_map or path in self._leveldb_folder_map
                          or path in self._embedded_media_containers):
             size_val = meta.get('size', 0)   # original archive size, or (LevelDB/embedded
@@ -12849,7 +12917,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             gc.freeze()   # these live all session too — see on_metadata_ready
             (self._handset_zone_name, self._acquisition_zone_name,
              self._manual_zone_name,
-             self._timestamp_display_mode, is_first_load) = tz
+             self._timestamp_display_mode, is_first_load, archive) = tz
+            self._archive_offset_detect = archive.get('detect')
+            self._archive_zone_choice = archive.get('choice') or ''
             self._refresh_timestamp_mode_indicator()
             self._refresh_header_scan_indicator()
             self._refresh_embedded_media_button()
@@ -13346,6 +13416,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return
 
         # Reset all virtual state before rebuilding.
+        self._nested_local_counts = {}
         self._nested_archive_map    = {}
         self._nested_virtual_paths  = frozenset()
         self._nested_virtual_folders = frozenset()
@@ -14881,6 +14952,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._bookmark_list.setItemWidget(um_item, um_row_widget)
         um_item.setSizeHint(um_row_widget.sizeHint())
         self._user_media_paths_async(self._apply_user_media_count, 'panel')
+        # "Web Cache Media" — its own review list next to User Media, only
+        # when the embedded-media sweep has found any (owner decision
+        # 2026-11-15: cache media stays out of User Media, A-75, but must
+        # not be left without a list).
+        n_rows = 2
+        if getattr(self, '_cache_media_children', None):
+            wc_all = list(self._cache_media_children)
+            wc_left = self._web_cache_media_paths()
+            wc_item = QListWidgetItem(
+                f"Web Cache Media  ({len(wc_all):,} · {len(wc_left):,} to review)")
+            wc_item.setData(Qt.ItemDataRole.UserRole, _WEB_CACHE_MEDIA_SENTINEL)
+            wc_item.setToolTip(_WEB_CACHE_MEDIA_TOOLTIP)
+            self._bookmark_list.addItem(wc_item)
+            n_rows = 3
         for g in groups:
             item = QListWidgetItem(f"{g['name']}  ({g['count']:,})")
             item.setData(Qt.ItemDataRole.UserRole, g['id'])
@@ -14903,7 +14988,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         row_h = self._bookmark_list.sizeHintForRow(0)
         if row_h <= 0:
             row_h = 22
-        list_h = row_h * min(len(groups) + 2, MAX_VISIBLE) + 2
+        list_h = row_h * min(len(groups) + n_rows, MAX_VISIBLE) + 2
         self._bookmark_list.setFixedHeight(list_h)
         QTimer.singleShot(0, self._fit_bookmark_panel_size)
         # Keep search scope combo in sync with current bookmark groups.
@@ -14972,6 +15057,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._active_bookmark_group_paths = set()
             self._rebuild_file_view_from_checked()
             return
+        if group_id == _WEB_CACHE_MEDIA_SENTINEL:
+            self._show_web_cache_media()
+            return
         if group_id == _USER_MEDIA_SENTINEL:
             # Both real click paths (this list item, AND the row's own
             # inline "User Media (N)" button — _apply_bookmark_groups'
@@ -14998,7 +15086,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # Neither synthetic row ("Selected Files", "User Media")
             # has a color/deletion concept of its own — only real,
             # saved groups get these.
-            if group_id not in (_SELECTED_FILES_SENTINEL, _USER_MEDIA_SENTINEL):
+            if group_id not in (_SELECTED_FILES_SENTINEL, _USER_MEDIA_SENTINEL,
+                                _WEB_CACHE_MEDIA_SENTINEL):
                 menu.addSeparator()
                 color_act = QAction("Change Color…", self)
                 color_act.triggered.connect(partial(self._change_bookmark_group_color, group_id))
@@ -15819,6 +15908,51 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
     def _research_fg_for_row(self, ui_path):
         return self._research_row_style(ui_path)[0]
+
+    def _nested_archive_times_text(self, archive: str) -> str:
+        """The unpacked archive's own file-system times, as the case's
+        time setting shows them, e.g. "Created 2024-07-02 10:00:00 UTC,
+        Modified ...": when the zip was written on the phone."""
+        meta = self.full_metadata.get(archive) or {}
+        parts = [f"{h} {self.format_ts(meta.get(k))}" for h, k in self._time_cols
+                 if k != 'atime' and meta.get(k)]
+        return ', '.join(parts) or 'no time recorded'
+
+    def _local_time_tip_for_row(self, ui_path):
+        meta = self.full_metadata.get(ui_path) or {}
+        archive = meta.get('_archive_path') or ''
+        return ("This time comes from the zip's DOS field inside an unpacked archive. It is "
+                "the local clock of whatever made that zip, zone unknown: not UTC, not "
+                "converted by the Time setting, and not on the Timeline.\n\n"
+                f"The file arrived on the phone inside {archive.rsplit('/', 1)[-1] or 'the archive'}, "
+                f"written on the phone: {self._nested_archive_times_text(archive)}.")
+
+    def _update_nested_time_note(self) -> None:
+        """The line above the file table when the open folder is inside an
+        unpacked archive whose files have only a local DOS time."""
+        note = getattr(self, '_nested_time_note', None)
+        if note is None:
+            return
+        path = getattr(self, '_view_path', '') or ''
+        archive = next((a for a in getattr(self, '_nested_archive_map', {})
+                        if path == a or path.startswith(a + '/')), None)
+        n = 0
+        if archive:
+            cache = self.__dict__.setdefault('_nested_local_counts', {})
+            if archive not in cache:
+                pre = archive + '/'
+                cache[archive] = sum(1 for p, m in self.full_metadata.items()
+                                     if m and m.get('mtime_local') and p.startswith(pre))
+            n = cache[archive]
+        if not n:
+            note.setVisible(False)
+            return
+        note.setText(
+            f"⚠ {n:,} file(s) in {archive.rsplit('/', 1)[-1]} have only the zip's own time, "
+            f"shown in orange: local to whatever made the zip, zone unknown, not UTC and not "
+            f"on the Timeline. They arrived on the phone with the archive, written: "
+            f"{self._nested_archive_times_text(archive)}.")
+        note.setVisible(True)
 
     def _research_tip_for_row(self, ui_path):
         return self._research_row_style(ui_path)[1]
@@ -17607,6 +17741,20 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if case_dir == self._case_dir:
             self._update_os_coverage_banner(fields if fields else None)
 
+    def _missing_ut_count(self) -> int:
+        """GrayKey entries with no UT block (graykey._parse_entry marks
+        them no_ut), counted once per loaded metadata."""
+        meta = getattr(self, 'full_metadata', None) or {}
+        adapter = getattr(self, '_adapter', None)
+        if not meta or adapter is None or adapter.format != adapter.FORMAT_GRAYKEY:
+            return 0
+        cached = getattr(self, '_missing_ut_cache', None)
+        if cached and cached[0] is meta:
+            return cached[1]
+        n = sum(1 for v in meta.values() if v and v.get('no_ut'))
+        self._missing_ut_cache = (meta, n)
+        return n
+
     def _update_os_coverage_banner(self, fields=None) -> None:
         """Warn when this extraction's OS version is outside the versions
         whose evidence locations were checked (os_coverage.py). *fields*:
@@ -17625,6 +17773,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 fields = []
         platform = 'Android' if self._is_android_archive() else 'iOS'
         text = os_coverage.warning(platform, os_coverage.version_of(fields, platform))
+        missing = _gk_missing_ut_warning(self._missing_ut_count())
+        if missing:
+            text = f"{missing}\n{text}" if text else missing
         self._os_coverage_shown = text
         banner.setText(text or '')
         banner.setToolTip(text or '')

@@ -20,6 +20,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter
 from PySide6.QtWidgets import QAbstractButton, QSizePolicy, QToolButton
 
+from timeline import to_unix_seconds
 from db_utils import _open_results_db, start_run_log, complete_run_log, load_last_run
 from zip_cd_cache import CachedZipView, load as _zcd_load, is_capture_alias, capture_marker
 from highlight_delegate import HighlightDelegate
@@ -955,6 +956,16 @@ class ArtifactRunnerWorker(QThread):
                     self.log.emit(line)
                 if error:
                     self.log.emit(f"  Error: {error}")
+                    # The run stays incomplete; its error is kept so the
+                    # report can say why its rows are from an earlier run
+                    # (see _update_art_version_banner).
+                    if run_id is not None:
+                        try:
+                            case_conn.execute('UPDATE run_log SET notes=? WHERE id=?',
+                                              (str(error)[:2000], run_id))
+                            case_conn.commit()
+                        except Exception:
+                            pass
                 else:
                     count = write_artifact_results(case_conn, script_name, rows)
                     self.log.emit(f"  Done — {count} rows written.")
@@ -2428,6 +2439,9 @@ class ArtifactViewerMixin:
         self._art_active_filter = ''
         self._art_stack.setCurrentIndex(0)
 
+        # Reports may have changed: the Timeline rebuilds when next shown.
+        if hasattr(self, '_refresh_timeline_tab'):
+            self._refresh_timeline_tab()
         if not self._case_dir:
             return
         try:
@@ -3996,12 +4010,37 @@ class ArtifactViewerMixin:
         the existing (older) results — the examiner decides whether/when
         to update via the banner's own button."""
         self._art_version_banner.setVisible(False)
+        self._art_version_update_btn.setText("Update")
         try:
             with closing(_open_results_db(self._case_dir)) as db:
                 last_run = load_last_run(db, f'artifact_{script_name}')
         except Exception:
             return
         if not last_run:
+            return
+
+        # The rows on screen are from an EARLIER run when the last run
+        # ended with an error (it writes nothing), or found no rows before
+        # write_artifact_results removed the table in that case. Said
+        # first and plainly: the examiner must not take them as current.
+        if not last_run.get('complete') or last_run.get('output_rows') == 0:
+            # Tool provenance: local time with its offset (CLAUDE.md).
+            when = last_run.get('completed_at') or last_run.get('run_at') or ''
+            try:
+                from datetime import datetime, timezone
+                when = (datetime.fromisoformat(when).replace(tzinfo=timezone.utc)
+                        .astimezone().isoformat(sep=' ', timespec='seconds'))
+            except ValueError:
+                when = when or 'time not recorded'
+            if not last_run.get('complete'):
+                why = last_run.get('notes') or "no error was recorded (it may have been stopped)"
+                what = f"The last run of this report ({when}) ended with an error: {why}."
+            else:
+                what = f"The last run of this report ({when}) found no rows."
+            self._art_version_banner_label.setText(
+                f"{what} The rows below are from an earlier run, not from the last one.")
+            self._art_version_update_btn.setText("Run again")
+            self._art_version_banner.setVisible(True)
             return
 
         current_version = parser_versions.get_current_version(platform, script_name)
@@ -4221,23 +4260,12 @@ class ArtifactViewerMixin:
         units = getattr(mod, 'timestamp_fields', {}) if mod else {}
         if units:
             def _fmt(raw_value, unit_code):
-                try:
-                    secs = float(raw_value)
-                except (TypeError, ValueError):
+                # One conversion for reports and the Timeline (timeline.py):
+                # s, ms, cocoa_s, cocoa_ns, webkit_us (Chromium: microseconds
+                # since 1601-01-01 UTC).
+                secs = to_unix_seconds(raw_value, unit_code)
+                if secs is None:
                     return str(raw_value)
-                if unit_code == 'ms':
-                    secs /= 1000
-                elif unit_code == 'cocoa_s':
-                    secs += 978307200
-                elif unit_code == 'cocoa_ns':
-                    secs = secs / 1e9 + 978307200
-                elif unit_code == 'webkit_us':
-                    # Chromium/WebKit timestamp: microseconds since
-                    # 1601-01-01 UTC (base::Time's internal representation)
-                    # — used throughout Chrome's own SQLite stores
-                    # (History, Web Data, segmentation_platform's ukm_db,
-                    # ...). Offset is 1601-01-01 -> 1970-01-01 in seconds.
-                    secs = secs / 1e6 - 11644473600
                 return self.format_ts(secs)
             self._art_table_model.set_timestamp_formatting(units, _fmt)
         else:
@@ -4362,16 +4390,41 @@ class ArtifactViewerMixin:
         renderer.start()
 
     def _on_art_report_context_menu(self, pos) -> None:
-        """Right-click on the report table. Only the Chat Groups summary
-        has an action so far: Go to Chat."""
+        """Right-click on the report table: Go to Chat (Chat Groups
+        summary), and Show activity around this time (any row with a
+        time; opens the Timeline)."""
         index = self._art_report_view.indexAt(pos)
-        if getattr(self, '_art_chat_summary', None) is None or not index.isValid():
+        if not index.isValid():
             return
         menu = QMenu(self._art_report_view)
-        go = menu.addAction("Go to Chat")
-        go.setToolTip("Select this chat under Chat Groups and show its messages")
-        go.triggered.connect(lambda _=False, ix=index: self._art_go_to_chat_at(ix))
+        if getattr(self, '_art_chat_summary', None) is not None:
+            go = menu.addAction("Go to Chat")
+            go.setToolTip("Select this chat under Chat Groups and show its messages")
+            go.triggered.connect(lambda _=False, ix=index: self._art_go_to_chat_at(ix))
+        else:
+            self._art_add_timeline_action(menu, index)
+        if menu.isEmpty():
+            return
         menu.exec(self._art_report_view.viewport().mapToGlobal(pos))
+
+    def _art_add_timeline_action(self, menu, index) -> None:
+        """"Show activity around this time" for a report row: the clicked
+        column if it is a time column, else the row's first Timeline (or
+        any) time — see timeline.time_of_row. Names the column it used."""
+        import timeline
+        mod = self._art_current_mod
+        if mod is None or not getattr(mod, 'timestamp_fields', None):
+            return
+        row = self._art_table_model.row_dict(index.row())
+        found = timeline.time_of_row(
+            mod, row, self._art_table_model.column_name(index.column()))
+        if found is None:
+            return
+        utc_ms, field = found
+        label = getattr(mod, 'name', self._art_current_script)
+        act = menu.addAction(f"Show activity around this time ({field}) on the Timeline")
+        act.triggered.connect(lambda _=False: self._timeline_show_around(
+            utc_ms, f"from {label}, {field}"))
 
     def _art_go_to_chat_at(self, index) -> None:
         """Open the chat on *index*'s row of the Chat Groups summary: select

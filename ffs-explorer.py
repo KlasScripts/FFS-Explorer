@@ -81,6 +81,7 @@ from hex_viewer import HexViewerMixin
 from media_viewer import MediaViewerMixin
 from keyword_search import KeywordSearchMixin, format_byte_size
 from artifact_viewer import ArtifactViewerMixin
+from timeline_viewer import TimelineViewerMixin, TIMELINE_TAB_INDEX
 from sqlite_viewer import SqliteViewerMixin, _SQLITE_MAGIC
 from segb_viewer import SegbViewerMixin, is_segb
 from leveldb_viewer import LevelDbViewerMixin, _looks_like_leveldb_dir
@@ -8306,7 +8307,7 @@ def _disambiguated_names(container_hits: list, base_of) -> list[str]:
     return out
 
 
-class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, SqliteViewerMixin, SegbViewerMixin, LevelDbViewerMixin, TimestampDisplayMixin):  # type: ignore[reportIncompatibleMethodOverride]
+class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearchMixin, ArtifactViewerMixin, TimelineViewerMixin, SqliteViewerMixin, SegbViewerMixin, LevelDbViewerMixin, TimestampDisplayMixin):  # type: ignore[reportIncompatibleMethodOverride]
     # _header_tier_counts' result for the open case, once the background
     # count finishes (an open Process Case dialog listens for it).
     header_tier_counts_ready = Signal(object)
@@ -9003,12 +9004,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # ── Artifact Viewer tab ──────────────────────────────────────────────
         artifact_tab = self._setup_artifact_tab()
 
+        # ── Timeline tab ─────────────────────────────────────────────────────
+        timeline_tab = self._setup_timeline_tab()
+
         # ── Tab widget ──────────────────────────────────────────────────────
         self.center_tabs = QTabWidget()
         self.center_tabs.addTab(file_tab,    "File Browser")       # 0
         self.center_tabs.addTab(media_tab,   "Media Browser")      # 1
         self.center_tabs.addTab(search_tab,  "Keyword Search")     # 2
         self.center_tabs.addTab(artifact_tab,"Artifact Viewer")    # 3
+        self.center_tabs.addTab(timeline_tab, "Timeline")          # 4 (TIMELINE_TAB_INDEX)
         self.center_tabs.currentChanged.connect(self._on_center_tab_changed)
 
         # Ctrl+B — bookmark the current selection, in whichever of File
@@ -9795,13 +9800,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._apply_selected_only(False)
         elif index == 1 and self._selected_only_scope:
             self._apply_selected_only(True)
-        if index in (2, 3):
+        if index in (2, 3, TIMELINE_TAB_INDEX):
             # Save current tree width and collapse it for full-width tabs
             sizes = self.splitter.sizes()
             if sizes[0] > 0:
                 self._tree_splitter_sizes = sizes
             self.splitter.setSizes([0, sum(sizes)])
-            if index == 2:
+            if index == TIMELINE_TAB_INDEX:
+                # Built (or found up to date) when first shown for a case.
+                self._timeline_on_shown()
+            elif index == 2:
                 self._update_search_status_bar()
                 # Restore Keyword Search's own last-viewed hit into the
                 # shared bottom panel — same reasoning as the File Browser/
@@ -17672,6 +17680,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _stop(getattr(self, '_thumb_worker', None), method='stop')
         _stop(getattr(self, '_media_page_prefetch_worker', None), method='stop')
         _stop(getattr(self, '_art_media_thumb_worker', None), method='stop')
+        self._timeline_stop_worker()
         _stop(getattr(self, '_search_index_worker', None), method='stop')
         _stop(getattr(self, 'ex_worker', None), method='cancel')
         _stop(getattr(self, '_sql_preview_worker', None), method='requestInterruption')

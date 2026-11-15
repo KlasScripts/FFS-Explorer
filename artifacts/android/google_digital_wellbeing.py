@@ -47,6 +47,15 @@ optional_files = {
     "app_usage_shm": "databases/app_usage-shm",
 }
 timestamp_fields = {"event_time": "ms"}
+timeline_fields = {
+    "event_time": {
+        "meaning": "App event copied from Usage Stats by Digital Wellbeing (Google)",
+        "app": "package", "event": "event_type",
+        "detail": ["task_root_package", "component"],
+        "caution": ("Copied at Digital Wellbeing's syncs: events after the last sync are "
+                    "missing. After a clock change the times move only at the next sync."),
+    },
+}
 core_fields = ["event_time", "package", "event_type", "task_root_package", "component"]
 record_source = {
     "label": "Event",

@@ -51,6 +51,15 @@ description = (
 device_wide = True
 existence_check_paths = ("/events/recent",)
 timestamp_fields = {"posted_time": "ms"}
+timeline_fields = {
+    "posted_time": {
+        "meaning": "Android posted a notification for this conversation",
+        "app": "app", "event_name": "Notification posted",
+        "detail": ["conversation_id"],
+        "caution": ("Experimental, lead only: not evidence that a message arrived. "
+                    "Android keeps these events for about four hours."),
+    },
+}
 core_fields = ["posted_time", "app", "conversation_id",
                "seconds_after_first_unlock", "chats_same_second"]
 record_source = [

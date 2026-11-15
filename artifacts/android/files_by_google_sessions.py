@@ -19,6 +19,20 @@ description = (
 app_path = "data/data/com.google.android.apps.nbu.files"
 files = {"sessions": "files/activityTimeLogStoreName.pb"}
 timestamp_fields = {"start": "ms", "end": "ms"}
+timeline_fields = {
+    "start": {
+        "meaning": "Files by Google screen visit started (app in the foreground)",
+        "app_name": "Files by Google", "event_name": "Session start",
+        "detail": ["duration_s"],
+        "caution": "Does not say which file was shown.",
+    },
+    "end": {
+        "meaning": "Files by Google screen visit ended",
+        "app_name": "Files by Google", "event_name": "Session end",
+        "detail": ["duration_s"],
+        "caution": "Does not say which file was shown.",
+    },
+}
 core_fields = ["start", "end", "duration_s"]
 record_source = [{"label": "Session entry", "ui_path_field": "raw_ui_path"}]
 hidden_fields = ["raw_ui_path", "raw_offset", "raw_length"]

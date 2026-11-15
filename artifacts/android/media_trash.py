@@ -80,6 +80,20 @@ timestamp_fields = {
     "date_added": "s",
     "date_modified": "s",
 }
+timeline_fields = {
+    "trashed_time": {
+        "meaning": "Moved to the trash (worked out from the expiry)",
+        "event_name": "Moved to trash",
+        "detail": ["file_name", "trashed_by", "trashed_time_source"],
+        "caution": ("Experimental. Assumes Android's 30-day trash period; a phone maker "
+                    "can change it. Trashed By is a conclusion: see its reason."),
+    },
+}
+timeline_skip = {
+    "expires": "the date the trash is due to be emptied, not an event",
+    "files_open_from": "a detail column: one end of the Files by Google screen window",
+    "files_open_to": "a detail column: one end of the Files by Google screen window",
+}
 core_fields = [
     "trashed_time", "trashed_time_source", "file_link", "file_name", "trashed_by",
     "trashed_by_reason", "expiry_extended", "extended_source", "status", "original_path",

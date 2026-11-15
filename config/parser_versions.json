@@ -202,10 +202,11 @@
       "changelog": {
         "1": "Adds Files by Google - Opened Files: each open in Files by Google's viewer (file_open_info_table) with its file from the index. Lab: the stored time is 0.4-0.6 s after the viewer screen appears; Safe folder moves delete the open records (ON DELETE CASCADE).",
         "2": "Nests under Google Files parent; short display name Opened Files.",
-        "3": "Warning and notes point to Full-screen Views when Safe folder moves delete open records."
+        "3": "Warning and notes point to Full-screen Views when Safe folder moves delete open records.",
+        "4": "Declares what Opened means for the Timeline. Report output unchanged."
       },
-      "hash": "e957d5d188dc46c8",
-      "version": 3
+      "hash": "e8b1d319f69ffb01",
+      "version": 4
     },
     "android:files_by_google_safe_folder": {
       "changelog": {
@@ -222,10 +223,11 @@
         "1": "Adds Files by Google - App Sessions: start and end of each screen visit from files/activityTimeLogStoreName.pb, each row linked to its bytes. Lab: rows match screen changes in the action log and Usage Stats.",
         "2": "Nests under Google Files parent; short display name App Sessions.",
         "3": "Sort key under Google Files; notes cross-link Opened Files and Full-screen Views.",
-        "4": "Sort key 6 under Google Files."
+        "4": "Sort key 6 under Google Files.",
+        "5": "Declares what Start and End mean for the Timeline. Report output unchanged."
       },
-      "hash": "65fc9c823b9e1ffc",
-      "version": 4
+      "hash": "15570f131263c885",
+      "version": 5
     },
     "android:files_by_google_thumbs": {
       "changelog": {
@@ -257,10 +259,11 @@
     },
     "android:google_digital_wellbeing": {
       "changelog": {
-        "1": "Adds Digital Wellbeing (Google): app usage events Google Digital Wellbeing copied from Usage Stats (app_usage events and component_events), with the UsageEvents name for each code. Codes matched to Usage Stats at the same millisecond on the Poco X7 Pro (4,719 of 4,719) and Pixel 7a, and to live dumpsys usagestats for 47 known app openings in lab run wellbeing-usage-001. The warning says copies are made only at a sync and that the whole history moves after a clock change at the next sync."
+        "1": "Adds Digital Wellbeing (Google): app usage events Google Digital Wellbeing copied from Usage Stats (app_usage events and component_events), with the UsageEvents name for each code. Codes matched to Usage Stats at the same millisecond on the Poco X7 Pro (4,719 of 4,719) and Pixel 7a, and to live dumpsys usagestats for 47 known app openings in lab run wellbeing-usage-001. The warning says copies are made only at a sync and that the whole history moves after a clock change at the next sync.",
+        "2": "Declares what Event Time means for the Timeline, with the sync caution. Report output unchanged."
       },
-      "hash": "8ecfb7a5d546d153",
-      "version": 1
+      "hash": "085aef43e7ff3365",
+      "version": 2
     },
     "android:google_messages": {
       "changelog": {
@@ -304,17 +307,19 @@
     "android:media_trash": {
       "changelog": {
         "1": "Adds Media Trash: every media store file with an expiry date (in the trash or pending), plus trashed files only Google Photos or the media store recovery log still list. Trashed Time is the expiry minus 30 days, or the first expiry of the current trash when the recovery log shows Android extended it. Photos Trash Action, Files Open From/To and App On Screen match Google Photos' queued trash action, a Files by Google session and Usage Stats to the trash time.",
-        "2": "Simpler report: one row per trashed file with Trashed Time, Expiry Extended and Trashed By (Google Photos, Files by Google, another app, or Unknown), each with a column naming the file and field it came from, and a link to the file. Pending files are no longer listed. A Photos trash action now counts only when queued in the trash second or the next (its key is the file's content, so an identical copy trashed at another time no longer matches), time-only matches need a gone file, and every Photos database is read, including signed-in accounts. App On Screen keeps every resumed activity, so it no longer says no app or the wrong app when two overlap. An expiry 7 days after an idle maintenance run in app_logs is marked as probably extended, with no trash time. A row says when Usage Stats disagrees with Photos or Files by Google, as after a clock change."
+        "2": "Simpler report: one row per trashed file with Trashed Time, Expiry Extended and Trashed By (Google Photos, Files by Google, another app, or Unknown), each with a column naming the file and field it came from, and a link to the file. Pending files are no longer listed. A Photos trash action now counts only when queued in the trash second or the next (its key is the file's content, so an identical copy trashed at another time no longer matches), time-only matches need a gone file, and every Photos database is read, including signed-in accounts. App On Screen keeps every resumed activity, so it no longer says no app or the wrong app when two overlap. An expiry 7 days after an idle maintenance run in app_logs is marked as probably extended, with no trash time. A row says when Usage Stats disagrees with Photos or Files by Google, as after a clock change.",
+        "3": "Declares what Trashed Time means for the Timeline; Expires and Files Open From/To are marked as not events. Report output unchanged."
       },
-      "hash": "64cdec943a67af2b",
-      "version": 2
+      "hash": "c11a62bc7b12a2e4",
+      "version": 3
     },
     "android:notification_history": {
       "changelog": {
-        "3": "A history file that cannot be read is now named in the run log instead of being skipped silently. Rows are unchanged."
+        "3": "A history file that cannot be read is now named in the run log instead of being skipped silently. Rows are unchanged.",
+        "4": "Declares what Posted Time means for the Timeline; File Time is marked as not an event. Report output unchanged."
       },
-      "hash": "183e329b6e833fe2",
-      "version": 3
+      "hash": "eeacdd6107155665",
+      "version": 4
     },
     "android:notification_history_setting": {
       "changelog": {
@@ -336,24 +341,28 @@
         "2": "Adds Seconds After Startup (from Usage Stats DEVICE_STARTUP, when a minute or less) and Chats Same Second (different chats of that app posted within a second). They mark a startup sweep and remove nothing.",
         "3": "Seconds After Startup is now Seconds After First Unlock, timed from USER_UNLOCKED. One boot on the Galaxy A53 image has an unlock and no startup row.",
         "4": "Marked experimental and lead only: the name says (Experimental) and the Notes page opens with a red warning. A row is not evidence that a message arrived.",
-        "5": "An event file that cannot be read or decoded, and a Usage Stats read failure, are now named in the run log instead of being skipped silently. Rows are unchanged."
+        "5": "An event file that cannot be read or decoded, and a Usage Stats read failure, are now named in the run log instead of being skipped silently. Rows are unchanged.",
+        "6": "Declares what Posted Time means for the Timeline, with the lead-only caution. Report output unchanged."
       },
-      "hash": "3d39f19a482f4f29",
-      "version": 5
+      "hash": "92549f9e81502461",
+      "version": 6
     },
     "android:samsung_digital_wellbeing": {
       "changelog": {
-        "1": "Adds Digital Wellbeing (Samsung): usage events from Samsung Digital Wellbeing's dwbCommon.db (usageEvents with foundPackages, or pkgName on newer builds), with class name and the UsageEvents name for each code. On the Galaxy A53 image all 251 events in Usage Stats' range match Usage Stats at a fixed 3,275 ms offset."
+        "1": "Adds Digital Wellbeing (Samsung): usage events from Samsung Digital Wellbeing's dwbCommon.db (usageEvents with foundPackages, or pkgName on newer builds), with class name and the UsageEvents name for each code. On the Galaxy A53 image all 251 events in Usage Stats' range match Usage Stats at a fixed 3,275 ms offset.",
+        "2": "Declares what Event Time means for the Timeline, with the 3.275 s caution. Report output unchanged."
       },
-      "hash": "a4f87636eace6752",
-      "version": 1
+      "hash": "222f45cc80006d4c",
+      "version": 2
     },
     "android:samsung_digital_wellbeing_log": {
       "changelog": {
-        "1": "Adds Digital Wellbeing (Samsung) - Log: Samsung Digital Wellbeing's Logging table, with clock set (TIME_SET), boot, boot time and time zone lines marked by kind and the computed boot time read out. Galaxy A53 image: 130 lines, 20 TIME_SET."
+        "1": "Adds Digital Wellbeing (Samsung) - Log: Samsung Digital Wellbeing's Logging table, with clock set (TIME_SET), boot, boot time and time zone lines marked by kind and the computed boot time read out. Galaxy A53 image: 130 lines, 20 TIME_SET.",
+        "2": "Declares what Log Time means for the Timeline; Boot Time is marked as not an event. Report output unchanged.",
+        "3": "Timeline meaning reworded: the time stored with the log line. Report output unchanged."
       },
-      "hash": "21cffecaf64dbfa1",
-      "version": 1
+      "hash": "de575b14340879de",
+      "version": 3
     },
     "android:settings_secure": {
       "changelog": {
@@ -366,10 +375,11 @@
       "changelog": {
         "2": "Adds conversation_id: the shortcut id stored on a shortcut row and the locus id on a locus row. For Google Messages that is conversations._id. Two chats at the same moment are no longer merged into one row. Notification rows have no conversation id.",
         "3": "Description warns that DEVICE_SHUTDOWN is not the moment the phone went off, and that the last minutes before a shutdown or seizure can be missing.",
-        "4": "An event stored with a negative offset (AOSP keeps events up to an hour before the interval start) is now the interval start minus that offset, as Android reads it. It was shown as a 1970 time. A file or mappings list that cannot be read is now named in the run log instead of being skipped silently."
+        "4": "An event stored with a negative offset (AOSP keeps events up to an hour before the interval start) is now the interval start minus that offset, as Android reads it. It was shown as a 1970 time. A file or mappings list that cannot be read is now named in the run log instead of being skipped silently.",
+        "5": "Declares what Event Time means for the Timeline, with the clock-change and shutdown caution. Report output unchanged."
       },
-      "hash": "56bbfe82b96b3034",
-      "version": 4
+      "hash": "f1782771a460df97",
+      "version": 5
     },
     "android:viber": {
       "changelog": {

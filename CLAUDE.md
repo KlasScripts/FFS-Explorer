@@ -45,7 +45,7 @@ section map below instead of reading it whole.
 loading, the file tree/table, filtering, bookmarks, recents, and worker
 lifecycle. Heavy or specialised features live in `app/` as **mixins**
 (`HexViewerMixin`, `MediaViewerMixin`, `KeywordSearchMixin`,
-`ArtifactViewerMixin`, `SqliteViewerMixin`, `SegbViewerMixin`,
+`ArtifactViewerMixin`, `TimelineViewerMixin`, `SqliteViewerMixin`, `SegbViewerMixin`,
 `LevelDbViewerMixin`, `TimestampDisplayMixin`) that `FastZipBrowser` inherits.
 "The hex tab" means the mixin file, not the main file. Format *detection and
 path mapping* (Cellebrite vs GrayKey, iOS vs Android) lives in
@@ -120,6 +120,9 @@ Declarations a parser can set:
   A row with more than one picture opens the full-size viewer in row mode: a bar names each picture, a caption names the one shown, and the chosen column is kept across rows. `media_compare = True`: open side by side (rows that are a picture comparison). Put media columns in `core_fields` if the pictures are the evidence.
 - `timestamp_fields`: `{field: unit}`, unit one of `s`, `ms`, `cocoa_s`,
   `cocoa_ns`, `webkit_us`.
+- `timeline_fields` / `timeline_skip`: what each time means (and the
+  source's caution) for the Timeline tab; a time with neither is listed as
+  "meaning not written yet", never guessed.
 - `record_source` (with `source_match`/`presence_fields`): which raw cell(s)
   a row came from, for Record hex mode.
 - `recoverable_tables`: tables to carve for deleted rows.
@@ -196,6 +199,8 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `ai_summary.py` / `ai_summary_store.py` / `local_llm.py` | Local-LLM report summarization. |
 | `nested_archive.py` | Extracts one embedded archive into `case_dir/nested_archives/` (idempotent). |
 | `sqlite_carve.py` | Deleted-record recovery; `locate_live_row`/`locate_offset`/`identify_structure`/`build_page_map`. |
+| `timeline.py` | Timeline events: the declared time columns of every artifact report (`timeline_fields`), built from `caseresults.db` into `casecache.db` (`timeline_events`, `timeline_sources`, `timeline_meta`; rebuilt when its `fingerprint` changes); `to_unix_seconds` is the one unit conversion, shared with report time columns. Qt-free. Tests: `tests/test_timeline.py`. |
+| `timeline_viewer.py` | `TimelineViewerMixin`: the Timeline centre tab (index 4), its build worker, filters, Sources list, "Show activity around this time" (`_timeline_show_around`, also from the report context menu) and the jump back to the report row. |
 | `artifact_media.py` | `MediaThumbnailDelegate`/`WebpageThumbnailRenderer` for report `media_fields` columns. |
 | `research_store.py` | Global artifact research notes (row colouring). |
 | `parser_versions.py` | Parser version tracking and changelog (update banner). |

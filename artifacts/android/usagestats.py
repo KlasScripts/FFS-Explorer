@@ -46,6 +46,16 @@ description = (
 device_wide = True
 existence_check_paths = ("/usagestats/",)
 timestamp_fields = {"event_time": "ms"}
+timeline_fields = {
+    "event_time": {
+        "meaning": "App or notification event recorded by Android Usage Stats",
+        "app": "package", "event": "event_type",
+        "detail": ["class_name", "notification_channel", "conversation_id"],
+        "caution": ("A clock change of more than 2 s moves every earlier Usage Stats "
+                    "time by the same amount. DEVICE_SHUTDOWN is not the moment the "
+                    "phone went off; the last minutes before a shutdown can be missing."),
+    },
+}
 core_fields = [
     "event_time",
     "package",

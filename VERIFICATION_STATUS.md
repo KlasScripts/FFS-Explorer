@@ -85,6 +85,8 @@ Same grouping as CLAUDE.md's module table.
 | `artifact_runner.py` | 🔴 | | |
 | `artifact_db.py` | 🔴 | | |
 | `artifact_viewer.py` | 🔴 | | |
+| `timeline.py` | 🔴 | | New 2026-11-15. Unit-tested (tests/test_timeline.py) and checked in the app on the Pixel 7a copy (every row of the four reports with rows became one event; a Usage Stats spot check matched to the ms). Meanings written for 9 Android reports from their own notes. NOT yet human-reviewed |
+| `timeline_viewer.py` | 🔴 | | New 2026-11-15. Pivot window, order and jump back to the report row checked by driving the app. NOT yet human-reviewed |
 | `sqlite_carve.py` | 🔴 | | |
 | `artifact_media.py` | 🔴 | | |
 | `research_store.py` | 🔴 | | |

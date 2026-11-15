@@ -27,6 +27,16 @@ optional_files = {
     "dwb_shm": "databases/dwbCommon.db-shm",
 }
 timestamp_fields = {"log_time": "ms", "boot_time": "ms"}
+timeline_fields = {
+    "log_time": {
+        "meaning": "Time stored with a Digital Wellbeing (Samsung) log line",
+        "app_name": "Digital Wellbeing (Samsung)", "event": "kind",
+        "detail": ["value"],
+    },
+}
+timeline_skip = {
+    "boot_time": "the boot time Digital Wellbeing worked out from the clock, not an event",
+}
 core_fields = ["log_time", "kind", "value", "boot_time"]
 record_source = {
     "label": "Log line",

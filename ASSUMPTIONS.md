@@ -1200,6 +1200,11 @@ silently truncating once this was pointed out.
   `header_types`, `guid_bundle`, the nested-archive index,
   `app_intelligence`, `app_registry`, `evidence_page_map`,
   `leveldb_search_index`, `processing_registry` and `media_metadata`.
+- The Timeline tables (`timeline_events`, `timeline_sources`,
+  `timeline_meta`) are in `casecache.db` too: they are rebuilt from the
+  `artifact_<name>` tables in `caseresults.db` (when their fingerprint
+  changes), so they are safe to delete. They are created on first use, not
+  by a cache schema bump, which would delete every case's cache.
 - `caseresults.db`: examiner work and findings, never deleted
   automatically. Holds search results, bookmarks, `device_info`, `run_log`,
   `segb_schemas`, `case_settings`, the `artifact_<name>` tables,

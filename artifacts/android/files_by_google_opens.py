@@ -30,6 +30,14 @@ optional_files = {
     "master_shm": "databases/files_master_database-shm",
 }
 timestamp_fields = {"opened": "ms"}
+timeline_fields = {
+    "opened": {
+        "meaning": "File opened in Files by Google's viewer",
+        "app_name": "Files by Google", "event_name": "Opened in viewer",
+        "detail": ["path", "mime_type"],
+        "caution": "Not how long it was viewed, and not that a video was played.",
+    },
+}
 core_fields = ["opened", "path", "mime_type", "size"]
 media_fields = ["file_link"]
 record_source = {

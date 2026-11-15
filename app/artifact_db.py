@@ -9,7 +9,9 @@ rows can carry different key sets; row[0]-only column selection would
 silently drop whichever keys the other rows have that row[0] doesn't).
 
 All values are stored as TEXT.  The table is always rebuilt from scratch so
-re-running a parser updates the results cleanly.
+re-running a parser updates the results cleanly — including a run that
+finds no rows, which removes the table: rows from an earlier run must never
+be shown as if the latest run had found them.
 """
 
 import sqlite3
@@ -22,13 +24,15 @@ def write_artifact_results(
 ) -> int:
     """Write rows into artifact_<script_name> in the case database.
 
-    Returns the number of rows written.  Does nothing and returns 0 if rows
-    is empty.
+    Returns the number of rows written.  If *rows* is empty, removes any
+    table an earlier run left and returns 0.
     """
+    table = f"artifact_{script_name}"
     if not rows:
+        case_conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        case_conn.commit()
         return 0
 
-    table = f"artifact_{script_name}"
     columns = []
     seen = set()
     for row in rows:

@@ -174,6 +174,30 @@ using the *analysis machine's* timezone, not the evidence's, and can look
 correct by pure coincidence depending on time of year. This has been a
 real, shipped bug more than once in this project.
 
+
+### `timeline_fields` / `timeline_skip` (to put the times on the Timeline tab)
+
+```python
+timeline_fields = {
+    "event_time": {
+        "meaning": "App or notification event recorded by Android Usage Stats",  # required
+        "app": "package",            # column holding the app (or "app_name": fixed text)
+        "event": "event_type",       # column holding the event (or "event_name": fixed text)
+        "detail": ["class_name"],    # columns joined into the one-line Detail
+        "caution": "A clock change of more than 2 s moves every earlier time.",
+    },
+}
+timeline_skip = {"expires": "the date the trash is due to be emptied, not an event"}
+```
+
+A time column is on the Timeline only when its parser says, in plain words,
+what the time means. Write the meaning and the caution from the report's own
+notes or warning, never from the column name. The unit comes from
+`timestamp_fields`. A time column that is not an event (an expiry, a value
+worked out from the clock) goes in `timeline_skip` with the reason. Any time
+column in neither is listed in the Timeline's Sources as "meaning not written
+yet". Code: `app/timeline.py`; test: `tests/test_timeline.py`.
+
 ### `media_fields` (if the app has photos/video/attachments)
 
 ```python

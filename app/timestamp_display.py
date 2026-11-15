@@ -152,6 +152,27 @@ class TimestampDisplayMixin:
             return f"Manually selected time ({self._manual_zone_name})"
         return "UTC"
 
+    def _after_timestamp_mode_change(self) -> None:
+        """Redraw every place that shows evidence times after the setting
+        changed: banner, Database tab, File Browser, the open artifact
+        report and the Timeline. Report and Timeline cells are converted
+        as they are drawn, so without this the cells on screen kept the
+        old zone until something repainted them."""
+        self._refresh_timestamp_mode_indicator()
+        refresh_db_times = getattr(self, '_sql_refresh_times', None)
+        if callable(refresh_db_times):
+            refresh_db_times()
+        art_model = getattr(self, '_art_table_model', None)
+        if art_model is not None:
+            art_model.layoutChanged.emit()
+        refresh_timeline = getattr(self, '_timeline_refresh_times', None)
+        if callable(refresh_timeline):
+            refresh_timeline()
+        if self._view_is_recursive:
+            self._rebuild_file_view_from_checked(preserve_filter=True)
+        else:
+            self._refresh_folder_view(preserve_filter=True)
+
     def _refresh_timestamp_mode_indicator(self):
         """Updates the one shared timestamp-mode banner (above every tab —
         File Browser, Media, Search, Artifacts), so the active
@@ -460,15 +481,7 @@ class TimestampDisplayMixin:
                 save_case_setting(db, 'manual_timezone_name', self._manual_zone_name)
         except Exception:
             pass
-        self._refresh_timestamp_mode_indicator()
-        refresh_db_times = getattr(self, '_sql_refresh_times', None)
-        if callable(refresh_db_times):
-            refresh_db_times()
-
-        if self._view_is_recursive:
-            self._rebuild_file_view_from_checked(preserve_filter=True)
-        else:
-            self._refresh_folder_view(preserve_filter=True)
+        self._after_timestamp_mode_change()
 
         if is_first_load:
             self._open_process_dialog_for_new_case()

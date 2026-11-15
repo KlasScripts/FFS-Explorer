@@ -39,6 +39,15 @@ optional_files = {
     "dwb_shm": "databases/dwbCommon.db-shm",
 }
 timestamp_fields = {"event_time": "ms"}
+timeline_fields = {
+    "event_time": {
+        "meaning": "App event copied from Usage Stats by Digital Wellbeing (Samsung)",
+        "app": "package", "event": "event_type",
+        "detail": ["class_name"],
+        "caution": ("A copy of a Usage Stats event. On the one image tested, every event "
+                    "was 3.275 s later than the same event in Usage Stats."),
+    },
+}
 core_fields = ["event_time", "package", "event_type", "class_name"]
 record_source = {
     "label": "Event",

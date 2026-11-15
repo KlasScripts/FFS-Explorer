@@ -27,6 +27,17 @@ device_wide = True
 # only has something to read when a history protobuf is in the archive.
 existence_check_paths = ("/notification_history/history/",)
 timestamp_fields = {"posted_time": "ms", "file_time": "ms"}
+timeline_fields = {
+    "posted_time": {
+        "meaning": "Notification posted, from Android's notification history",
+        "app": "package", "event_name": "Notification posted",
+        "detail": ["title", "channel_name"],
+        "caution": "Android deletes history older than one day while the feature is on.",
+    },
+}
+timeline_skip = {
+    "file_time": "the history file's name, not an event",
+}
 core_fields = ["posted_time", "package", "title", "text", "channel_name", "conversation_id"]
 record_source = [
     {"label": "Notification history", "ui_path_field": "source_path"},

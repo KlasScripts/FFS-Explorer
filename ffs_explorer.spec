@@ -59,6 +59,8 @@ a = Analysis(
         # since _MEIPASS is only ever set in a real frozen process.
         ('config/scan_rules_ios.json', 'config'),
         ('config/scan_rules_android.json', 'config'),
+        # app/artifact_categories.py reads this via sys._MEIPASS too.
+        ('config/artifact_categories.json', 'config'),
         # The User Media ignore list is examiner-EDITABLE (read and saved
         # next to the exe), so this bundled copy is the curated starting
         # point (the "UI Graphics" wildcard entries), shipped as a seed

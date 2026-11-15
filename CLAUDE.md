@@ -198,6 +198,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `segb_viewer.py` / `segb_schemas.py` | SEGB/Biome tab and built-in stream schemas. |
 | `leveldb_viewer.py` | `LevelDbViewerMixin`: LevelDB/IndexedDB records as virtual files. |
 | `artifact_runner.py` / `artifact_db.py` / `artifact_viewer.py` | Parser plugin system: running, storing, viewing. |
+| `artifact_categories.py` | Category → App → Report arrangement for Run Artifact Parsers and the Artifact Viewer, from `config/artifact_categories.json` (kept out of the parsers so their hash-derived versions don't change); a parser's own `category` / `app_group_label` wins; anything unset is listed under "Other (category not set)", never hidden. Qt-free. Tests: `tests/test_artifact_categories.py` (every shipped parser has a category). |
 | `chrome_cache.py` / `chrome_shared.py` | Chrome HTTP-cache decode and helpers shared by the `chrome_*` parsers. |
 | `ai_summary.py` / `ai_summary_store.py` / `local_llm.py` | Local-LLM report summarization. |
 | `nested_archive.py` | Extracts one embedded archive into `case_dir/nested_archives/` (idempotent). An entry's stored `mdate` says its clock (`entry_mdate`/`parse_mdate`): UT and gzip MTIME are UTC; DOS-only is "(local, zone unknown)", never a UTC mtime, shown orange with a tooltip and a note above the table (`_local_time_tip_for_row`, `_update_nested_time_note`). `recover_missing_records` re-records unpacked files whose `casecache.db` rows were lost at a cache rebuild (matched by `stored_name_for`), run at case open (`_recover_nested_records`, logged in `run_log`). |
@@ -252,7 +253,7 @@ File order, top to bottom:
 - `config/hardware_models.json`, `photo_flags.json`, `research_status.json`,
   `report_columns.json`, `parser_versions.json`, `parser_validation.json`,
   `embedded_media_skip_list_{android,ios}.json`, `user_media_ignore_list.json`,
-  `ai_summary_settings.json`, `scan_rules_{ios,android}.json`,
+  `ai_summary_settings.json`, `scan_rules_{ios,android}.json`, `artifact_categories.json`,
   `epoch_formats.json` (examiner choices in `epoch_formats_user.json`). All follow one
   convention: in `config/` in dev, next to the executable in a frozen build,
   user-editable, cached by mtime+size.

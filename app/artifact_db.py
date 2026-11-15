@@ -87,12 +87,17 @@ def load_artifact_results(
     return columns, rows
 
 
+# caseresults.db tables named artifact_* that are the app's own, not a
+# parser's report (one was listed as a report, "attachment_links").
+_NOT_REPORTS = frozenset({'artifact_attachment_links'})
+
+
 def list_completed_artifacts(case_conn: sqlite3.Connection) -> list[str]:
     """Return script_names for all artifact tables stored in the case database."""
     rows = case_conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'artifact_%'"
     ).fetchall()
-    return [r[0][len('artifact_'):] for r in rows]
+    return [r[0][len('artifact_'):] for r in rows if r[0] not in _NOT_REPORTS]
 
 
 def build_attachment_links(script_name: str, rows: list[dict],

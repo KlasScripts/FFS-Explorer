@@ -15,9 +15,11 @@ from PySide6.QtWidgets import (
     QScrollArea, QCheckBox, QPushButton, QDialog, QMessageBox,
     QProgressDialog, QMenu, QSpinBox, QDoubleSpinBox, QGroupBox,
     QTextBrowser, QListWidget, QListWidgetItem, QAbstractItemView,
+    QTreeWidget, QTreeWidgetItem, QHeaderView,
 )
+import artifact_categories
 from PySide6.QtCore import Qt, QThread, Signal, QAbstractTableModel, QModelIndex, QSettings, QSize
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter, QColor
 from PySide6.QtWidgets import QAbstractButton, QSizePolicy, QToolButton
 
 from timeline import to_unix_seconds
@@ -1078,7 +1080,7 @@ class ArtifactRunnerDialog(QDialog):
                  is_android, parent=None, guid_to_bundle: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Run Artifact Parsers")
-        self.setMinimumSize(480, 540)
+        self.setMinimumSize(620, 640)
         self._worker = None
         self._guid_to_bundle = guid_to_bundle or {}
 
@@ -1186,42 +1188,69 @@ class ArtifactRunnerDialog(QDialog):
             except Exception:
                 pass
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        inner = QWidget()
-        inner_layout = QVBoxLayout(inner)
-        inner_layout.setContentsMargins(6, 6, 6, 6)
-        inner_layout.setSpacing(5)
-        self._checkboxes: list[tuple[QCheckBox, str, object]] = []
-        for script_name, mod in available:
+        # Category → App → Report (artifact_categories.py). Ticking a
+        # category or app ticks everything under it.
+        tree = QTreeWidget()
+        tree.setColumnCount(2)
+        tree.setHeaderLabels(["Report", "Last run"])
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setStretchLastSection(False)
+        show_item_checkboxes(tree)
+        self._tree = tree
+        self._checkboxes: list[tuple[QTreeWidgetItem, str, object]] = []
+        bold = QFont()
+        bold.setBold(True)
+        tristate = (Qt.ItemFlag.ItemIsAutoTristate | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsEnabled)
+
+        def _parent(owner, text, count):
+            it = QTreeWidgetItem(owner, [f"{text}  ({count})"])
+            it.setFlags(tristate)
+            it.setFont(0, bold)
+            it.setCheckState(0, Qt.CheckState.Unchecked)
+            return it
+
+        def _leaf(owner, script_name, mod):
             last = run_history.get(script_name)
-            cb = QCheckBox(getattr(mod, 'name', script_name))
-            # Default to unchecked for parsers already run to completion in this
-            # case — they don't need re-running.  Never-run and incomplete
-            # parsers stay ticked.
-            cb.setChecked(not (last and last['complete']))
-            row = QHBoxLayout()
-            row.setSpacing(10)
-            row.addWidget(cb)
+            it = QTreeWidgetItem(owner, [getattr(mod, 'name', None) or script_name, ""])
+            it.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                        | Qt.ItemFlag.ItemIsSelectable)
+            # Default to unchecked for parsers already run to completion in
+            # this case — they don't need re-running. Never-run and
+            # incomplete parsers stay ticked.
+            it.setCheckState(0, Qt.CheckState.Unchecked if (last and last['complete'])
+                             else Qt.CheckState.Checked)
             if last:
-                rows   = last['output_rows'] or 0
+                rows = last['output_rows'] or 0
                 run_at = _local_date(last['run_at'])
                 if last['complete']:
-                    info_text  = f"last run {run_at} · {rows:,} rows"
-                    info_color = 'grey'
+                    it.setText(1, f"last run {run_at} · {rows:,} rows")
+                    it.setForeground(1, QColor('grey'))
                 else:
-                    info_text  = f"last run {run_at} · incomplete"
-                    info_color = '#b8860b'
-                info_lbl = QLabel(info_text)
-                info_lbl.setStyleSheet(
-                    f"color: {info_color}; font-size: 11px; font-style: italic;")
-                row.addWidget(info_lbl)
-            row.addStretch()
-            inner_layout.addLayout(row)
-            self._checkboxes.append((cb, script_name, mod))
-        inner_layout.addStretch()
-        scroll.setWidget(inner)
-        layout.addWidget(scroll)
+                    it.setText(1, f"last run {run_at} · incomplete")
+                    it.setForeground(1, QColor('#b8860b'))
+            self._checkboxes.append((it, script_name, mod))
+
+        for cat, apps in artifact_categories.arrange(platform, available):
+            n = sum(len(members) for _app, members in apps)
+            cat_item = _parent(tree, cat, n)
+            for app, members in apps:
+                owner = _parent(cat_item, app, len(members)) if app else cat_item
+                for script_name, mod in members:
+                    _leaf(owner, script_name, mod)
+            cat_item.setExpanded(True)
+        layout.addWidget(tree, 1)
+
+        pick = QHBoxLayout()
+        for text, state in (("Tick all", Qt.CheckState.Checked),
+                            ("Untick all", Qt.CheckState.Unchecked)):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _=False, st=state: [
+                it.setCheckState(0, st) for it, _sn, _m in self._checkboxes])
+            pick.addWidget(b)
+        pick.addStretch()
+        layout.addLayout(pick)
 
         layout.addWidget(QLabel("Log:"))
         self._log = QPlainTextEdit()
@@ -1247,8 +1276,8 @@ class ArtifactRunnerDialog(QDialog):
     def _run(self):
         selected = [
             (sn, mod)
-            for cb, sn, mod in self._checkboxes
-            if cb.isChecked()
+            for it, sn, mod in self._checkboxes
+            if it.checkState(0) == Qt.CheckState.Checked
         ]
         if not selected:
             return
@@ -2514,34 +2543,30 @@ class ArtifactViewerMixin:
         # regardless, since it's the one thing worth seeing before anything
         # else in that family. A label with no member run yet never
         # appears — this only groups reports that actually completed.
-        app_groups: dict[str, list[str]] = {}
-        standalone: list[str] = []
-        for script_name in completed:
-            mod = modules.get(script_name)
-            label = getattr(mod, 'app_group_label', None) if mod else None
-            if label:
-                app_groups.setdefault(label, []).append(script_name)
-            else:
-                standalone.append(script_name)
-
-        for script_name in standalone:
-            self._art_tree_model.invisibleRootItem().appendRow(_build_report_item(script_name))
-
-        for app_label in sorted(app_groups):
-            members = app_groups[app_label]
-            overview_script = next(
-                (sn for sn in members if getattr(modules.get(sn), 'is_group_overview', False)),
-                None
-            )
-            members.sort(key=lambda sn: (
-                0 if sn == overview_script else 1,
-                getattr(modules.get(sn), 'group_sort_key', 100),
-            ))
-            app_item = _item(app_label, _ART_APP_GROUP + (overview_script or members[0]))
-            app_item.setFont(QFont("Arial", weight=QFont.Weight.Bold))
-            for script_name in members:
-                app_item.appendRow(_build_report_item(script_name))
-            self._art_tree_model.invisibleRootItem().appendRow(app_item)
+        # Category → App → Report (artifact_categories.py), the same
+        # arrangement as Run Artifact Parsers. An app node only for an app
+        # with more than one report; its overview member (is_group_overview)
+        # is what clicking the app shows. Only reports that completed.
+        root = self._art_tree_model.invisibleRootItem()
+        bold = QFont("Arial", weight=QFont.Weight.Bold)
+        for cat, apps in artifact_categories.arrange(
+                platform, [(sn, modules.get(sn)) for sn in completed]):
+            n = sum(len(members) for _app, members in apps)
+            cat_item = _item(f"{cat}  ({n})")
+            cat_item.setFont(bold)
+            for app, members in apps:
+                if app:
+                    overview = next((sn for sn, m in members
+                                     if getattr(m, 'is_group_overview', False)), members[0][0])
+                    app_item = _item(app, _ART_APP_GROUP + overview)
+                    app_item.setFont(bold)
+                    for script_name, _m in members:
+                        app_item.appendRow(_build_report_item(script_name))
+                    cat_item.appendRow(app_item)
+                else:
+                    cat_item.appendRow(_build_report_item(members[0][0]))
+            root.appendRow(cat_item)
+            self._art_tree_view.setExpanded(self._art_tree_model.indexFromItem(cat_item), True)
 
         # A second, always-present top-level sibling — clicking it opens
         # AISummaryDialog directly (see _on_art_tree_clicked) rather than

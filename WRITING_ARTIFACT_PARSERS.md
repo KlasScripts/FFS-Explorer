@@ -143,6 +143,22 @@ Structure (see `artifacts/ios/whatsapp.notes.md`):
 Images can sit next to the file and be referenced relatively. Editing the
 notes doesn't change the parser's version (only the `.py` is hashed).
 
+### `category` / `app_group_label` (where the report is listed)
+
+Run Artifact Parsers and the Artifact Viewer list reports as Category →
+App → Report. The shipped parsers' places are in
+`config/artifact_categories.json`. A new parser should declare its own:
+
+```python
+category = "Chats & Messaging"   # one of the file's "categories" list
+app_group_label = "WhatsApp"     # only if the app has more than one report
+```
+
+The categories are: Chats & Messaging, Browsers, Usage & Activity,
+Notifications, Media & Files, Device & App Info. An app node is only shown
+when that app has more than one report. A parser with no valid category is
+listed under "Other (category not set)".
+
 ### `timestamp_fields` (recommended if there's a timestamp)
 
 ```python

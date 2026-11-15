@@ -1,0 +1,219 @@
+{
+  "_note": "Which category (and, for an app with several reports, which app) each artifact report is listed under in Run Artifact Parsers and the Artifact Viewer. Kept here, not in the parsers, so a parser's version (a hash of its file) does not change. A parser's own `category` / `app_group_label` declaration wins over this file. Categories must be one of 'categories'.",
+  "categories": [
+    "Chats & Messaging",
+    "Browsers",
+    "Usage & Activity",
+    "Notifications",
+    "Media & Files",
+    "Device & App Info"
+  ],
+  "android": {
+    "app_report": {
+      "category": "Device & App Info"
+    },
+    "burner": {
+      "category": "Chats & Messaging",
+      "app": "Burner"
+    },
+    "burner_messageentity": {
+      "category": "Chats & Messaging",
+      "app": "Burner"
+    },
+    "chrome_app_tabs": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_autofill": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_bookmarks": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_cache_media": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_cache_pages": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_cookies": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_downloads": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_favicons": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_indexeddb_origins": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_local_storage": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_login_data": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_network_action_predictor": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_offline_pages": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_omnibox_shortcuts": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_search": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_sessions": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_site_settings": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_top_sites": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "chrome_web_history": {
+      "category": "Browsers",
+      "app": "Chrome"
+    },
+    "device_info": {
+      "category": "Device & App Info"
+    },
+    "files_by_google_likely_viewer": {
+      "category": "Media & Files",
+      "app": "Google Files"
+    },
+    "files_by_google_opens": {
+      "category": "Media & Files",
+      "app": "Google Files"
+    },
+    "files_by_google_safe_folder": {
+      "category": "Media & Files",
+      "app": "Google Files"
+    },
+    "files_by_google_sessions": {
+      "category": "Media & Files",
+      "app": "Google Files"
+    },
+    "files_by_google_thumbs": {
+      "category": "Media & Files",
+      "app": "Google Files"
+    },
+    "files_by_google_viewer_thumbs": {
+      "category": "Media & Files",
+      "app": "Google Files"
+    },
+    "gboard_clipboard": {
+      "category": "Usage & Activity"
+    },
+    "google_digital_wellbeing": {
+      "category": "Usage & Activity"
+    },
+    "google_messages": {
+      "category": "Chats & Messaging",
+      "app": "Google Messages"
+    },
+    "google_messages_deleted_conversations": {
+      "category": "Chats & Messaging",
+      "app": "Google Messages"
+    },
+    "groupme": {
+      "category": "Chats & Messaging"
+    },
+    "line": {
+      "category": "Chats & Messaging",
+      "app": "LINE"
+    },
+    "line_fts": {
+      "category": "Chats & Messaging",
+      "app": "LINE"
+    },
+    "media_trash": {
+      "category": "Media & Files"
+    },
+    "notification_history": {
+      "category": "Notifications",
+      "app": "Android System"
+    },
+    "notification_history_setting": {
+      "category": "Device & App Info",
+      "app": "Android System"
+    },
+    "notification_snooze": {
+      "category": "Notifications",
+      "app": "Android System"
+    },
+    "people_recent_notifications": {
+      "category": "Notifications"
+    },
+    "samsung_digital_wellbeing": {
+      "category": "Usage & Activity",
+      "app": "Samsung Digital Wellbeing"
+    },
+    "samsung_digital_wellbeing_log": {
+      "category": "Usage & Activity",
+      "app": "Samsung Digital Wellbeing"
+    },
+    "settings_secure": {
+      "category": "Device & App Info",
+      "app": "Android System"
+    },
+    "usagestats": {
+      "category": "Usage & Activity"
+    },
+    "viber": {
+      "category": "Chats & Messaging"
+    },
+    "whatsapp": {
+      "category": "Chats & Messaging",
+      "app": "WhatsApp"
+    },
+    "whatsapp_poll_votes": {
+      "category": "Chats & Messaging",
+      "app": "WhatsApp"
+    }
+  },
+  "ios": {
+    "app_report": {
+      "category": "Device & App Info"
+    },
+    "device_info": {
+      "category": "Device & App Info"
+    },
+    "instagram": {
+      "category": "Chats & Messaging"
+    },
+    "photos_metadata": {
+      "category": "Media & Files"
+    },
+    "sms_messages": {
+      "category": "Chats & Messaging"
+    },
+    "whatsapp": {
+      "category": "Chats & Messaging"
+    },
+    "wifi_known_networks": {
+      "category": "Device & App Info"
+    }
+  }
+}

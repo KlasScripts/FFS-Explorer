@@ -71,59 +71,160 @@ IOS_SHORTCUTS = [
 ]
 
 
-def android_shortcuts(user_data: str = '') -> list:
-    """The Android menu. *user_data* is the detected user-storage folder
-    (the parent of DCIM), default data/media/0."""
-    user_data = user_data or 'data/media/0'
-    return [
-        ("App Data (user 0)", "data/data"),
-        ("User Data",         user_data),
+def android_shortcuts(user_data: str = '', user: int = 0) -> list:
+    """The Android menu for one user. *user* 0 is the owner: the main menu,
+    with the device-wide entries. Any other id gives that user's own
+    entries only (a per-user submenu, see android_users): every path that
+    holds per-user data uses the id, never a hardcoded 0. *user_data* is
+    the detected user-storage folder (the parent of DCIM) for user 0;
+    other users use data/media/<id>."""
+    u = int(user)
+    owner = u == 0
+    # User 0's app data is data/data (the same folder as data/user/0, which
+    # some tools also store as a copy); other users only have data/user/<id>.
+    app = 'data/data' if owner else f'data/user/{u}'
+    media = (user_data or 'data/media/0') if owner else f'data/media/{u}'
+    items = [
+        (f"App Data (user {u})", app),
+        ("User Data",         media),
+    ]
+    if owner:
         # Every user's app data: owner (0), second users, work profile,
-        # Android 15 Private Space each have their own id here.
-        ("All users' app data (work profile, Private Space, other users)", "data/user"),
+        # Private Space, app clones each have their own id here.
+        items.append(("All users' app data (work profile, Private Space, other users)",
+                      "data/user"))
+    items += [
         None,
         ("Media", [
-            ("Photos (DCIM)",    user_data + "/DCIM"),
-            ("Downloads",        user_data + "/Download"),
-            ("Screenshots",      (user_data + "/DCIM/Screenshots",
-                                  user_data + "/Pictures/Screenshots")),
+            ("Photos (DCIM)",    media + "/DCIM"),
+            ("Downloads",        media + "/Download"),
+            ("Screenshots",      (media + "/DCIM/Screenshots",
+                                  media + "/Pictures/Screenshots")),
         ]),
         ("Communications", [
             # Device-encrypted copy first: where mmssms.db normally is on
-            # current Android (EVIDENCE_LOCATIONS.md). The data/data copy
-            # can hold different content, so both are listed.
-            ("SMS / MMS (user_de)", "data/user_de/0/com.android.providers.telephony/databases"),
-            ("SMS / MMS (data/data)", "data/data/com.android.providers.telephony/databases"),
+            # current Android (EVIDENCE_LOCATIONS.md). The credential-
+            # encrypted copy can hold different content, so both are listed.
+            ("SMS / MMS (user_de)", f"data/user_de/{u}/com.android.providers.telephony/databases"),
+            (f"SMS / MMS ({app})", f"{app}/com.android.providers.telephony/databases"),
             # calllog.db was in data/data on all three test phones (Samsung:
             # its own contacts provider), not in user_de as one source says.
-            ("Call History (calllog.db)", ("data/data/com.android.providers.contacts/databases",
-                                           "data/data/com.samsung.android.providers.contacts/databases",
-                                           "data/user_de/0/com.android.providers.contacts/databases")),
-            ("Contacts",         ("data/data/com.android.providers.contacts/databases",
-                                  "data/data/com.samsung.android.providers.contacts/databases")),
+            ("Call History (calllog.db)", (f"{app}/com.android.providers.contacts/databases",
+                                           f"{app}/com.samsung.android.providers.contacts/databases",
+                                           f"data/user_de/{u}/com.android.providers.contacts/databases")),
+            ("Contacts",         (f"{app}/com.android.providers.contacts/databases",
+                                  f"{app}/com.samsung.android.providers.contacts/databases")),
         ]),
         ("Browsing & Web", [
-            ("Chrome",           "data/data/com.android.chrome/app_chrome/Default"),
-            ("Samsung Browser",  ("data/data/com.sec.android.app.sbrowser/app_sbrowser/Default",
-                                  "data/data/com.sec.android.app.sbrowser/databases")),
+            ("Chrome",           f"{app}/com.android.chrome/app_chrome/Default"),
+            ("Samsung Browser",  (f"{app}/com.sec.android.app.sbrowser/app_sbrowser/Default",
+                                  f"{app}/com.sec.android.app.sbrowser/databases")),
         ]),
-        ("System & Device", [
-            ("Accounts",         "data/system_ce/0/accounts_ce.db"),
-            ("Settings (XML)",   ("data/system/users/0",
-                                  "data/data/com.android.providers.settings/databases")),
-            ("Usage Stats",      ("data/system_ce/0/usagestats", "data/system/usagestats/0")),
-            ("Notification History", "data/system_ce/0/notification_history"),
-            ("Recent Tasks / Snapshots", ("data/system_ce/0/recent_tasks",
-                                          "data/system_ce/0/snapshots")),
+    ]
+    system = [
+        ("Accounts",         f"data/system_ce/{u}/accounts_ce.db"),
+        ("Settings (XML)",   (f"data/system/users/{u}",)
+                             + (("data/data/com.android.providers.settings/databases",) if owner else ())),
+        ("Usage Stats",      (f"data/system_ce/{u}/usagestats", f"data/system/usagestats/{u}")),
+        ("Notification History", f"data/system_ce/{u}/notification_history"),
+        ("Recent Tasks / Snapshots", (f"data/system_ce/{u}/recent_tasks",
+                                      f"data/system_ce/{u}/snapshots")),
+    ]
+    if owner:      # device-wide, not per user
+        system += [
             ("Wi-Fi Networks",   ("data/misc/apexdata/com.android.wifi", "data/misc/wifi")),
             ("Bluetooth",        ("data/misc/bluedroid", "data/misc/bluetooth")),
             ("Device Logs",      "data/tombstones"),
-            # On-device Timeline since 2024 lives in the Maps / Play
-            # services app data; the old locationhistory folder is gone.
-            ("Google Maps app data (incl. on-device Timeline)",
-                                 "data/data/com.google.android.apps.maps"),
-        ]),
-    ]
+        ]
+    # On-device Timeline since 2024 lives in the Maps / Play services app
+    # data; the old locationhistory folder is gone.
+    system.append(("Google Maps app data (incl. on-device Timeline)",
+                   f"{app}/com.google.android.apps.maps"))
+    items.append(("System & Device", system))
+    return items
+
+
+# Folders whose next level is the Android user id.
+USER_ROOTS = ('data/user', 'data/user_de', 'data/media', 'data/system_ce',
+              'data/system_de', 'data/misc_ce', 'data/misc_de')
+
+
+def android_users(folders) -> list:
+    """The Android user ids this extraction has a folder for, read from the
+    extraction (the numeric folders under USER_ROOTS), never assumed. 0 is
+    included when data/data exists. Sorted."""
+    ids = set()
+    roots = {r + '/' for r in USER_ROOTS}
+    for path in folders:
+        if path == 'data/data':
+            ids.add(0)
+            continue
+        head, sep, rest = path.rpartition('/')
+        if sep and head + '/' in roots and rest.isdigit():
+            ids.add(int(rest))
+    return sorted(ids)
+
+
+# AOSP UserManager user types (Android 11+ write them as the <user> "type"
+# attribute of data/system/users/<id>.xml).
+_USER_TYPES = {
+    'android.os.usertype.full.SYSTEM': 'owner',
+    'android.os.usertype.system.HEADLESS': 'headless system user',
+    'android.os.usertype.full.SECONDARY': 'secondary user',
+    'android.os.usertype.full.GUEST': 'guest',
+    'android.os.usertype.full.RESTRICTED': 'restricted profile',
+    'android.os.usertype.full.DEMO': 'demo user',
+    'android.os.usertype.profile.MANAGED': 'work profile',
+    'android.os.usertype.profile.PRIVATE': 'Private Space',
+    'android.os.usertype.profile.CLONE': 'app clone',
+    'android.os.usertype.profile.COMMUNAL': 'communal profile',
+}
+_FLAG_MANAGED_PROFILE = 0x20   # older Android, before the type attribute
+_FLAG_GUEST = 0x4
+
+
+def user_type_label(raw: bytes):
+    """The user's type ("work profile", "Private Space", ...) from the
+    bytes of data/system/users/<id>.xml (plain XML or Android binary XML),
+    or None when it can't be read. Never the user's name, which can be a
+    person's name."""
+    if not raw:
+        return None
+    try:
+        import ccl_abx
+        if ccl_abx.is_abx(raw):
+            root = ccl_abx.abx_bytes_to_xml_root(raw)
+        else:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(raw)
+    except Exception:
+        return None
+    user = root if root.tag == 'user' else root.find('.//user')
+    if user is None:
+        return None
+    utype = (user.get('type') or '').strip()
+    if utype:
+        # An unknown type (e.g. a manufacturer's own) is shown as its last
+        # two parts, "profile.XYZ", rather than guessed.
+        return _USER_TYPES.get(utype, '.'.join(utype.split('.')[-2:]))
+    try:
+        flags = int(user.get('flags') or 0)
+    except ValueError:
+        return None
+    if flags & _FLAG_MANAGED_PROFILE:
+        return 'work profile'
+    if flags & _FLAG_GUEST:
+        return 'guest'
+    return None
+
+
+def user_menu_title(u: int, label) -> str:
+    return f"User {u} ({label})" if label else f"User {u}"
+
+
+def users_summary(users, labels) -> str:
+    parts = [f"{u} ({labels[u]})" if labels.get(u) else str(u) for u in users]
+    return f"This extraction has {len(users)} users: " + ", ".join(parts)
 
 
 def candidates_of(entry) -> tuple:

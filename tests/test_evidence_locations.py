@@ -24,7 +24,8 @@ def _in_scope(path, platform):
 
 
 @pytest.mark.parametrize('platform, items', [
-    ('ios', es.IOS_SHORTCUTS), ('android', es.android_shortcuts())])
+    ('ios', es.IOS_SHORTCUTS), ('android', es.android_shortcuts()),
+    ('android', es.android_shortcuts(user=10))])
 def test_every_jump_target_is_an_evidence_folder(platform, items):
     """Header Scan and the other scans cover every place the jump menu
     calls evidence (a pattern is checked by its fixed part)."""
@@ -117,3 +118,80 @@ def test_os_coverage_warning():
     rows = [('Make', 'Google', 'UFD'), ('Android Version', '16', 'build.prop')]
     assert os_coverage.version_of(rows, 'Android') == '16'
     assert os_coverage.version_of(rows, 'iOS') == ''
+
+
+# ── several Android users on one phone ─────────────────────────────────────
+
+def _folders_with_work_profile():
+    """Layout of an Android 16 emulator with a managed work profile (user
+    10), as observed in Grok's lab: separate per-user trees; data/data is
+    user 0 only."""
+    return {'data/data', 'data/data/com.android.chrome', 'data/user', 'data/user/0',
+            'data/user/10', 'data/user/10/com.android.chrome',
+            'data/user/10/com.android.chrome/app_chrome/Default',
+            'data/data/com.android.chrome/app_chrome/Default',
+            'data/user_de', 'data/user_de/0', 'data/user_de/10',
+            'data/media', 'data/media/0', 'data/media/10', 'data/media/10/DCIM',
+            'data/system_ce', 'data/system_ce/0', 'data/system_ce/10',
+            'data/system/users', 'data/system/users/0', 'data/system/users/10',
+            'data/user_de/150'}
+
+
+def test_users_are_read_from_the_extraction():
+    assert es.android_users(_folders_with_work_profile()) == [0, 10, 150]
+    assert es.android_users({'data/data', 'data/user_de/0'}) == [0]
+    # a numeric folder somewhere else is not a user
+    assert es.android_users({'data/data', 'data/app/12', 'data/user/0/x/5'}) == [0]
+
+
+def test_another_users_entries_never_point_at_user_0():
+    for _trail, entry in es.leaves(es.android_shortcuts(user=10)):
+        for cand in es.candidates_of(entry):
+            assert not cand.startswith('data/data'), cand
+            assert '/0/' not in cand and not cand.endswith('/0'), cand
+    labels = [e[0] for _t, e in es.leaves(es.android_shortcuts(user=10))]
+    assert 'Wi-Fi Networks' not in labels        # device-wide: owner's menu only
+    assert "App Data (user 10)" in labels
+
+
+def test_work_profile_chrome_is_its_own_entry():
+    folders = _folders_with_work_profile()
+    def chrome(user):
+        entry = next(e for _t, e in es.leaves(es.android_shortcuts(user=user)) if e[0] == 'Chrome')
+        return es.resolve(es.candidates_of(entry), folders, set())
+    assert chrome(0) == 'data/data/com.android.chrome/app_chrome/Default'
+    assert chrome(10) == 'data/user/10/com.android.chrome/app_chrome/Default'
+    dcim = next(e for _t, e in es.leaves(es.android_shortcuts(user=10)) if e[0] == 'Photos (DCIM)')
+    assert es.resolve(es.candidates_of(dcim), folders, set()) == 'data/media/10/DCIM'
+
+
+def test_user_type_label():
+    work = b'<?xml version="1.0"?><user id="10" type="android.os.usertype.profile.MANAGED" flags="4144" />'
+    assert es.user_type_label(work) == 'work profile'
+    private = b'<user id="11" type="android.os.usertype.profile.PRIVATE" />'
+    assert es.user_type_label(private) == 'Private Space'
+    odd = b'<user id="150" type="com.example.usertype.profile.VAULT" />'
+    assert es.user_type_label(odd) == 'profile.VAULT'             # not guessed
+    old_work = b'<user id="10" flags="48" />'                    # 0x20 managed profile
+    assert es.user_type_label(old_work) == 'work profile'
+    named = b'<user id="12" type="android.os.usertype.full.SECONDARY"><name>Someone</name></user>'
+    assert es.user_type_label(named) == 'secondary user'          # never the name
+    assert es.user_type_label(b'') is None
+    assert es.user_type_label(b'not xml') is None
+    assert es.users_summary([0, 10], {0: 'owner', 10: 'work profile'}) == \
+        'This extraction has 2 users: 0 (owner), 10 (work profile)'
+
+
+_ALICE = os.path.join(ROOT, 'test_data', 'alice_work_profile_user10')
+
+
+@pytest.mark.skipif(not os.path.isdir(_ALICE), reason="Alice lab fixture not on this machine")
+def test_user_type_from_real_android_16_abx():
+    """data/system/users/<id>.xml as Android 16 writes it (ABX), from
+    Grok's lab emulator with a managed work profile (user 10)."""
+    def label(name):
+        with open(os.path.join(_ALICE, name), 'rb') as f:
+            return es.user_type_label(f.read())
+    assert label('10.xml') == 'work profile'
+    assert label('0.xml') == 'owner'
+    assert label('10.decoded.xml') == 'work profile'   # same file as plain XML

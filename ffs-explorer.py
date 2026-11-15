@@ -11844,11 +11844,45 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     def _android_shortcuts(self) -> list:
         return evidence_shortcuts.android_shortcuts(self._android_user_data_path)
 
+    def _android_user_labels(self, users) -> dict:
+        """{user id: type label} from data/system/users/<id>.xml, cached per
+        case; a user whose file can't be read has no label."""
+        cache = getattr(self, '_android_user_label_cache', None)
+        if cache is None or cache[0] != self._case_dir:
+            cache = (self._case_dir, {})
+            self._android_user_label_cache = cache
+        labels = cache[1]
+        for u in users:
+            if u not in labels:
+                raw = self._read_zip_bytes(f"data/system/users/{u}.xml", max_bytes=1 << 20)
+                labels[u] = evidence_shortcuts.user_type_label(raw)
+        return labels
+
     def _show_jump_menu(self):
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
-        shortcuts = self._android_shortcuts() if self._is_android_archive() else FORENSIC_SHORTCUTS
-        self._build_jump_menu(menu, shortcuts)
+        if not self._is_android_archive():
+            self._build_jump_menu(menu, FORENSIC_SHORTCUTS)
+        else:
+            # One phone can hold several Android users (work profile,
+            # Private Space, secondary users, app clones). The main menu is
+            # user 0; every other user found in the extraction gets its own
+            # submenu with the same per-user entries, so nothing of theirs
+            # is hidden behind the owner's.
+            users = evidence_shortcuts.android_users(self.folder_map)
+            others = [u for u in users if u != 0]
+            if others:
+                labels = self._android_user_labels(users)
+                info = QAction(evidence_shortcuts.users_summary(users, labels), self)
+                info.setEnabled(False)
+                menu.addAction(info)
+                menu.addSeparator()
+            self._build_jump_menu(menu, self._android_shortcuts())
+            for u in others:
+                menu.addSeparator()
+                sub = menu.addMenu(evidence_shortcuts.user_menu_title(u, labels.get(u)))
+                sub.setToolTipsVisible(True)
+                self._build_jump_menu(sub, evidence_shortcuts.android_shortcuts(user=u))
         menu.exec(self.jump_btn.mapToGlobal(self.jump_btn.rect().bottomLeft()))
 
     def _adapt_shortcut_path(self, path: str) -> str:

@@ -57,6 +57,34 @@ GrapheneOS forum). `data/data` is only user 0 (it is the same as
 | Samsung extras | `data/log`, `efs/recovery`, `data/system/WifiConfigStore.db`, Secure Folder app data | — | OEM-specific | Tools |
 | Intrusion logging (Android 16, Advanced Protection) | — | encrypted bundles held in the cloud, not a device folder | Android 16 | Source (iVerify) |
 
+**Several users on one phone (Lab: Grok, Android 16 emulator "Alice",
+2026-11-15).** A managed work profile created with
+`pm create-user --profileOf 0 --managed` became user 10:
+
+- `data/data` is the same folder as `data/user/0` (same inode): user 0 only.
+- The work profile has its own trees: `data/user/10`, `data/user_de/10` and
+  `data/media/10`.
+- Per-user emulated storage under `mnt/.../10/...` is a view of that user's
+  media, not a second copy of their app data.
+- An app installed in both profiles has two sandboxes with different
+  inodes: Chrome in `data/data/com.android.chrome` (user 0) and in
+  `data/user/10/com.android.chrome`.
+- An app installed only in the work profile has data only under
+  `data/user/10` (and `data/user_de/10`), never under `data/data`.
+- Other ids (Unverified, not on this lab phone): Samsung Secure Folder is
+  often 150 and Samsung Dual Messenger 95. Private Space, secondary users
+  and app clones each get their own id.
+
+So anything that only opens or scans `data/data` misses every other user.
+The evidence folders already include `data/user`, `data/user_de`,
+`data/media`, `data/system_ce` and the other per-user roots without a
+user id. The jump menu lists each user found in the extraction (see below).
+
+Not checked on a real extraction: none of the four test extractions has a
+second user, and how Cellebrite or GrayKey stores one is not known. The
+Cellebrite test extractions have no `data/user` tree at all, even for
+user 0.
+
 **Copies, not extra evidence (Seen, Android 14 Samsung, Magnet layout):**
 `data/user/0`, `data_mirror/data_ce`, `storage/emulated/0` and `mnt/*/0`
 repeat `data/data` and `data/media/0` path for path (35,267 of 35,267 and
@@ -101,6 +129,40 @@ target silently opened the nearest existing parent folder.
     (XML)" → `data/system/users/0`.
   - "Location History" (the old `locationhistory` folder, gone) is now
     "Google Maps app data (incl. on-device Timeline)".
+  - **Several users.** The menu reads the user ids from the extraction
+    (the numeric folders under `data/user`, `data/user_de`, `data/media`,
+    `data/system_ce`, `data/system_de`, `data/misc_ce` and `data/misc_de`).
+    It never assumes 0 and 10.
+    - When there is more than one, the menu starts with a line naming
+      them, for example "This extraction has 2 users: 0 (owner), 10 (work
+      profile)", and each user other than 0 gets a submenu with the same
+      per-user entries under that id.
+    - The main menu stays user 0, and "App Data (user 0)" opens `data/data`.
+    - The user's type comes from `data/system/users/<id>.xml` (plain or
+      binary XML; never the user's name). When that can't be read, the
+      submenu is just "User <id>".
+    - On the Pixel and Samsung test extractions, `users/0.xml` is binary
+      XML and reads as "owner".
+    - On Alice (Android 16), `users/10.xml` and `users/0.xml` are binary
+      XML and read as "work profile" and "owner" (type attribute, not the
+      name). Test: `test_user_type_from_real_android_16_abx`, skipped when
+      `test_data/alice_work_profile_user10/` is absent.
+    - Alice's user 10 folder listing (package level, plus every folder of
+      `data/media/10` and `data/system/users`) finds users 0 and 10.
+      Resolved against it:
+      - App Data, User Data, DCIM, Downloads, Settings and Google Maps
+        resolve to user 10's own folders.
+      - Screenshots and Samsung Browser are correctly "not in this
+        extraction".
+      - The listing stops at package level. So SMS, call history,
+        contacts and Chrome (`.../databases`, `app_chrome/Default`) and
+        everything under `data/system_ce/10` could not be checked.
+      - User 10's telephony provider folders hold 0 files in both
+        `data/user/10` and `data/user_de/10`. Its contacts provider holds
+        7 and 3, and its Chrome 138.
+    - The submenu was checked in the app with a simulated user 10. Opening
+      a real user 10 folder could not be checked without an extraction
+      that has one.
   - New entries:
     - "All users' app data" (`data/user`, which holds other users, the
       work profile and Private Space);

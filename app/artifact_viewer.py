@@ -381,6 +381,12 @@ class ArtifactTableModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._visible_idx)
 
+    def column_name(self, visible_col: int) -> str | None:
+        """The raw column (field) name at *visible_col* — never the
+        header text, which set_header_labels can change."""
+        real_col = self._real_col(visible_col)
+        return None if real_col is None else self._columns[real_col]
+
     def _real_col(self, visible_col: int) -> int | None:
         """Translate a QTableView column index (visible-space, the only
         space the view/header/sort ever deal in) to its real index into
@@ -2695,29 +2701,59 @@ class ArtifactViewerMixin:
             self._art_load_attachment_hex(row)
         self._art_sync_open_media_dialog(row)
 
-    def _art_resolve_row_attachment(self, row: dict):
-        """(ui_path, data) for *row*'s first non-empty media_fields value,
-        or ('', None) if the row has none / it couldn't be read. Shared by
-        _art_load_attachment_hex (hex-panel Attachment mode) and
-        _art_sync_open_media_dialog (open-viewer-follows-selection) so
-        there's exactly one definition of "this row's own attachment"."""
+    def _art_preferred_media_field(self) -> str | None:
+        """The picture column the examiner chose: the open viewer's chosen
+        single column (wanted_mode, never a fallback it is showing because
+        this row lacks the choice), otherwise the column they last
+        double-clicked or picked in the viewer's bar (kept while the
+        viewer is side by side, so the hex panel never drifts to another
+        of the row's pictures). None = no choice yet."""
         media_fields = getattr(self._art_current_mod, 'media_fields', ()) \
             if self._art_current_mod else ()
-        ui_path = ''
+        dialog = getattr(self, '_art_media_dialog', None)
+        mode = dialog.wanted_mode() if dialog is not None and dialog.isVisible() else None
+        if mode in media_fields:
+            return mode
+        chosen = getattr(self, '_art_hex_media_field', None)
+        return chosen if chosen in media_fields else None
+
+    def _art_resolve_row_attachment(self, row: dict):
+        """(field, ui_path, data, missing) for the picture of *row* the hex
+        panel should show: the examiner's chosen column
+        (_art_preferred_media_field) when this row has it, otherwise the
+        first non-empty media_fields value. *missing* names the chosen
+        column when this row lacks it (so the fallback can be said out
+        loud), else None. ('', '', None, missing) if the row has no
+        attachment. Shared by _art_load_attachment_hex and
+        _art_sync_open_media_dialog so there's exactly one definition of
+        "this row's own attachment"."""
+        media_fields = list(getattr(self._art_current_mod, 'media_fields', ()) \
+            if self._art_current_mod else ())
+        preferred = self._art_preferred_media_field()
+        missing = None
+        if preferred:
+            if row.get(preferred):
+                media_fields.remove(preferred)
+                media_fields.insert(0, preferred)
+            else:
+                missing = preferred
         for field in media_fields:
             val = row.get(field)
             if val:
-                ui_path = val
-                break
-        if not ui_path:
-            return '', None
-        return ui_path, self._read_zip_bytes(ui_path)
+                return field, val, self._read_zip_bytes(val), missing
+        return '', '', None, missing
+
+    def _art_hex_status(self, field: str, ui_path: str, missing=None) -> str:
+        """Status-bar text naming which of the row's pictures the hex
+        panel is on — a row can hold more than one."""
+        note = f"  (no {missing} on this row)" if missing else ""
+        return f"Hex: {field} — {ui_path}{note}" if field else ui_path
 
     def _art_load_attachment_hex(self, row: dict) -> None:
         """Attachment hex mode: the row's first non-empty media_fields
         value, same resolution _on_art_report_double_clicked uses for the
         specific cell clicked."""
-        ui_path, data = self._art_resolve_row_attachment(row)
+        field, ui_path, data, missing = self._art_resolve_row_attachment(row)
         if not ui_path:
             self._show_art_hex_message("No attachment on this row")
             return
@@ -2726,7 +2762,20 @@ class ArtifactViewerMixin:
             return
         self._load_hex_preview_from_bytes(data, ui_path)
         self._art_hex_active = True
-        self.status_bar.showMessage(ui_path)
+        self.status_bar.showMessage(self._art_hex_status(field, ui_path, missing))
+
+    def _on_art_media_mode_chosen(self, mode: str) -> None:
+        """The examiner picked a picture in the open viewer's bar: the hex
+        panel (Attachment mode) moves to that same picture now, not on the
+        next row change. Side by side keeps the hex panel's column."""
+        media_fields = getattr(self._art_current_mod, 'media_fields', ()) \
+            if self._art_current_mod else ()
+        if mode in media_fields:
+            self._art_hex_media_field = mode
+        idx = self._art_report_view.currentIndex()
+        if not idx.isValid() or self._hex_source_is_record():
+            return
+        self._art_load_attachment_hex(self._art_table_model.row_dict(idx.row()))
 
     def _art_sync_open_media_dialog(self, row: dict) -> None:
         """If a MediaFullViewDialog is currently open (non-modal — see
@@ -2740,10 +2789,35 @@ class ArtifactViewerMixin:
         dialog = getattr(self, '_art_media_dialog', None)
         if dialog is None or not dialog.isVisible():
             return
-        ui_path, data = self._art_resolve_row_attachment(row)
+        mode = dialog.wanted_mode()
+        if mode is not None:
+            # Row mode (see _on_art_report_double_clicked): keep the column
+            # the examiner chose, and name it — never silently fall back
+            # to the row's first picture.
+            items = self._art_row_media_items(row)
+            if items:
+                dialog.load_row(items, mode)
+            return
+        _field, ui_path, data, _missing = self._art_resolve_row_attachment(row)
         if not ui_path or data is None:
             return
         dialog.load_content(ui_path, data)
+
+    def _art_row_media_items(self, row: dict) -> list:
+        """[(column name, ui_path, data)] for every non-empty, readable
+        media_fields value of *row*, in declaration order. The label is
+        the column name exactly as the Report table's header shows it."""
+        media_fields = getattr(self._art_current_mod, 'media_fields', ()) \
+            if self._art_current_mod else ()
+        items = []
+        for field in media_fields:
+            val = row.get(field)
+            if not val:
+                continue
+            data = self._read_zip_bytes(val)
+            if data is not None:
+                items.append((field, val, data))
+        return items
 
     def _art_record_sources_for_row(self, row: dict) -> list:
         """Narrow the parser's full record_source declaration down to just
@@ -4187,6 +4261,7 @@ class ArtifactViewerMixin:
         # artifact_media.py and _start_art_media_thumbnails below.
         self._art_media_delegate.show_filename = True
         self._art_table_model.set_media_columns(media_fields)
+        self._art_hex_media_field = None   # see _art_resolve_row_attachment
         media_col_idx = self._art_table_model.media_columns()
         for col in range(self._art_table_model.columnCount()):
             self._art_report_view.setItemDelegateForColumn(
@@ -4353,21 +4428,43 @@ class ArtifactViewerMixin:
             self.status_bar.showMessage(
                 f"Attachment not found in archive: {ui_path}", 5000)
             return
+        # The column's field name, never its header text (which
+        # set_header_labels can change): the viewer's bar and the hex
+        # panel both key on field names.
+        clicked = self._art_table_model.column_name(index.column())
+        self._art_hex_media_field = clicked
         self._hex_source_attach_btn.setChecked(True)
         self._load_hex_preview_from_bytes(data, ui_path)
         self._art_hex_active = True
-        self.status_bar.showMessage(ui_path)
+        self.status_bar.showMessage(self._art_hex_status(clicked, ui_path))
+
+        # A row with more than one picture opens in row mode: a bar names
+        # every picture, the one on screen is captioned, and the choice
+        # is kept as the selection moves (_art_sync_open_media_dialog).
+        # A report whose rows are a comparison (media_compare = True on
+        # the parser, e.g. Likely Full-screen Views) opens side by side.
+        items = self._art_row_media_items(
+            self._art_table_model.row_dict(index.row()))
+        row_mode = len(items) > 1
+        mode = (MediaFullViewDialog.SIDE_BY_SIDE
+                if getattr(self._art_current_mod, 'media_compare', False) else clicked)
 
         dialog = getattr(self, '_art_media_dialog', None)
-        if dialog is not None and dialog.isVisible():
-            dialog.load_content(ui_path, data)
-            dialog.raise_()
-            dialog.activateWindow()
+        if dialog is None or not dialog.isVisible():
+            dialog = MediaFullViewDialog(ui_path, data, parent=self)
+            dialog.finished.connect(self._on_art_media_dialog_closed)
+            dialog.mode_chosen.connect(self._on_art_media_mode_chosen)
+            self._art_media_dialog = dialog
+            if row_mode:
+                dialog.load_row(items, mode)
+            dialog.show()
             return
-        dialog = MediaFullViewDialog(ui_path, data, parent=self)
-        dialog.finished.connect(self._on_art_media_dialog_closed)
-        self._art_media_dialog = dialog
-        dialog.show()
+        if row_mode:
+            dialog.load_row(items, mode)
+        else:
+            dialog.load_content(ui_path, data)
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _on_art_media_dialog_closed(self, _result=None) -> None:
         self._art_media_dialog = None

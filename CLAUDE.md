@@ -117,6 +117,7 @@ Declarations a parser can set:
 - `app_path` / `app_group`: where the app's container is.
 - `files` / `optional_files`: files to extract.
 - `media_fields`: attachment paths (thumbnails, Attachment hex mode).
+  A row with more than one picture opens the full-size viewer in row mode: a bar names each picture, a caption names the one shown, and the chosen column is kept across rows. `media_compare = True`: open side by side (rows that are a picture comparison). Put media columns in `core_fields` if the pictures are the evidence.
 - `timestamp_fields`: `{field: unit}`, unit one of `s`, `ms`, `cocoa_s`,
   `cocoa_ns`, `webkit_us`.
 - `record_source` (with `source_match`/`presence_fields`): which raw cell(s)
@@ -174,6 +175,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `meaning_check.py` | Meaning check (Roblox Sentinel-style, re-implemented): messages vs a harmful example bank and the phone's own messages, via a local embedding model; vectors cached in `casecache.db` `text_embeddings`. Qt-free. |
 | `term_matcher.py` | Tolerant keyword matching (number/symbol swaps, stretched/spaced letters, text-speak, typos with a dictionary guard). Qt-free. |
 | `config_seed.py` | Ships an examiner-editable config list with every install: seed in `_internal/config`, merged once per entry into the file next to the exe. Qt-free. |
+| `files_by_google_glide.py` | Files by Google Glide disk-cache linker: rebuild ResourceCacheKey hashes (scan/Recents/grid/list/viewer), link via index → media store → Safe folder → absent ids → carved external.db size/mtime; temp cleanup. Used by the Google Files thumbnail reports. Qt-free. |
 | `file_browser_presets.py` | Shared filter+sort presets (File Browser dropdown, Media Browser buttons). |
 | `dialog_helpers.py` | Shared Qt dialog-construction helpers; no business logic. |
 | `startup_log.py` | Bounded startup/error log + crash/stall snapshot (`Tools → Open Log Folder`). Qt-free. |

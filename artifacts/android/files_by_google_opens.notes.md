@@ -10,7 +10,7 @@ Path and details come from Files by Google's index row for the file. Nothing is 
 |---|---|---|
 | **An open is not viewing time** | The record is written when the viewer opens. How long the file was on screen is not stored. | [What the time is](#what-the-time-is) |
 | **A video open is not playback** | Opening a video records an open. Nothing records that it played, or how far. | [What the time is](#what-the-time-is) |
-| **Safe folder moves delete open records** | Moving a file to the Safe folder deleted its index row, and the database deletes the file's open records with it. | [Deleted records](#deleted-records) |
+| **Safe folder moves delete open records** | Moving a file to the Safe folder deleted its index row, and the database deletes the file's open records with it. A full-screen viewer thumbnail made earlier can still appear in *Full-screen Views*. | [Deleted records](#deleted-records) |
 
 ---
 
@@ -28,7 +28,7 @@ In the lab the stored time was 0.4–0.6 s after Files by Google's viewer screen
 | `sample-red-200x200.png` | 23:29:18.070 | 23:29:17.573 → 23:29:30.921 |
 | `sample-5s.mp4` | 23:30:12.059 | 23:30:11.651 → 23:30:27.094 |
 
-For how long the viewer stayed open, use *Files by Google – App Sessions* or Usage Stats (`FilePreviewActivity`). Neither names the file.
+For how long the viewer stayed open, use *App Sessions* or Usage Stats (`FilePreviewActivity`). Neither names the file. That a picture was shown full screen at least once (without a time) is *Full-screen Views*.
 
 `file_consumption_data_table` has columns for play state, duration and play position, but it stayed empty after the video was opened in the viewer for about 15 seconds.
 

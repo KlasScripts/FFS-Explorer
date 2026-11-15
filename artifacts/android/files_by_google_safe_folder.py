@@ -7,9 +7,9 @@ time in Unix seconds. In the lab (Files 1.13157, 2026-11-13) the Safe folder
 copies were byte-for-byte identical to the originals: not encrypted.
 """
 
-name = "Files by Google - Safe Folder"
-app_group_label = "Files by Google"
-group_sort_key = 3
+name = "Safe Folder"
+app_group_label = "Google Files"
+group_sort_key = 4
 warning = (
     "Safe folder files are hidden behind a PIN in the app but were not "
     "encrypted in the version tested (1.13157): the copy in Files by Google's "

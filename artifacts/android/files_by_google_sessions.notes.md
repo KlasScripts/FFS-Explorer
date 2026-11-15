@@ -9,7 +9,7 @@ This report lists the **start and end of each screen visit** in Files by Google,
 | ⚠️ Watch out for | What it means for you | Read |
 |---|---|---|
 | **One row is one screen, not one use of the app** | Opening the app, a category and a file gave three rows. | [What a row is](#what-a-row-is) |
-| **No file names** | Line a session up with *Opened Files* to see what was opened in it. | [What a row is](#what-a-row-is) |
+| **No file names** | Line a session up with *Opened Files* (and, without a time, *Full-screen Views*) to see what was opened in it. | [What a row is](#what-a-row-is) |
 | **Old entries may be dropped** | The Poco image held only seven entries, all on one day. | [Validation](#validation) |
 
 ---

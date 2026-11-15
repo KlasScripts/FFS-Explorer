@@ -8,9 +8,9 @@ entry names a file. The Poco X7 Pro image (Files 1.8662) held seven entries,
 all on one day, so older entries may be dropped.
 """
 
-name = "Files by Google - App Sessions"
-app_group_label = "Files by Google"
-group_sort_key = 4
+name = "App Sessions"
+app_group_label = "Google Files"
+group_sort_key = 6
 description = (
     "Start and end of each screen visit in Files by Google, from its session "
     "log. A session shows the app was in the foreground, not which file was "

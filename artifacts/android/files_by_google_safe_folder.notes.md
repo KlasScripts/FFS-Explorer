@@ -10,7 +10,7 @@ This report lists the files in **Files by Google's Safe folder**, its PIN-protec
 |---|---|---|
 | **The copies were not encrypted** | In the version tested (1.13157) the Safe folder copy is the original file, byte for byte, under its original name. | [What a move does](#what-a-move-does) |
 | **File Modified is not the move time** | It is the file's own modified time. The copy's change time (ctime) and the media store log are closer to when it was moved. | [What a move does](#what-a-move-does) |
-| **Files by Google removes its own records of the file** | The file's index row and open records are deleted on the move. Other parts of the phone still show it existed. | [What a move does](#what-a-move-does) |
+| **Files by Google removes its own records of the file** | The file's index row and open records are deleted on the move. Other parts of the phone still show it existed. Glide thumbnails from before the move can remain (*Thumbnail Cache* / *Full-screen Views*). | [What a move does](#what-a-move-does) |
 
 ---
 
@@ -33,7 +33,7 @@ Lab, 2026-11-13: three files moved with file menu → *Move to Safe folder* → 
 | `safe_folder_metadata_table` | One row each: original path, Safe folder path, file's modified time |
 | Files by Google's index and open records | Deleted |
 | Media store `deleted_media`, recovery log, `app_logs` | Still show the files. The log has `Deleted … due to com.google.android.apps.nbu.files` at each move (23:34:10, 23:36:19, 23:37:36) |
-| Thumbnail cache | Thumbnails made before the move stayed |
+| Thumbnail cache | Thumbnails made before the move stayed (*Thumbnail Cache* tiles; *Full-screen Views* for viewer) |
 | Usage Stats | `SafeFolderAuthActivity` and `SafeFolderBrowserActivity` each time the Safe folder was used |
 
 #### ✅ Validation

@@ -732,13 +732,20 @@ class MediaFullViewDialog(QDialog):
         self.load_content(ui_path, data)
         self.resize(760, 680)
 
-    def load_content(self, ui_path: str, data: bytes) -> None:
-        """(Re)build this dialog's content for *ui_path*/*data* — used both
-        by __init__ (first open) and by a caller's own row/thumbnail
-        selection handler to follow selection into an already-open dialog.
-        Tears down whatever the PREVIOUS content needed (a running
-        QMediaPlayer, a temp-file copy) before rebuilding; closeEvent below
-        still handles final cleanup when the dialog itself closes."""
+    SIDE_BY_SIDE = "Side by side"
+    # Emitted with the mode the examiner clicked in the bar (not when a
+    # caller calls load_row), so the owner can keep its hex panel on the
+    # same picture. It is the button's own mode, never a fallback load_row
+    # remapped it to: a fallback is not the examiner's choice.
+    mode_chosen = Signal(str)
+
+    def _choose_mode(self, mode: str) -> None:
+        self.load_row(self._row_items, mode)
+        self.mode_chosen.emit(mode)
+
+    def _teardown_content(self) -> None:
+        """Stop whatever the PREVIOUS content needed (a running
+        QMediaPlayer, a temp-file copy) before rebuilding."""
         if self._scrub_timer is not None:
             self._scrub_timer.stop()
             self._scrub_timer = None
@@ -751,10 +758,115 @@ class MediaFullViewDialog(QDialog):
             self._tmpdir = None
         self._webview = None   # old QWebEngineView (if any) is deleted below
 
+    def load_content(self, ui_path: str, data: bytes) -> None:
+        """(Re)build this dialog's content for *ui_path*/*data* — used both
+        by __init__ (first open) and by a caller's own row/thumbnail
+        selection handler to follow selection into an already-open dialog.
+        A single file with no row context: no picture bar (see load_row
+        for a report row that holds more than one picture)."""
+        self._row_items = []
+        self._row_mode = None
+        self._wanted_mode = None
+        self._teardown_content()
         self.setWindowTitle(ui_path.rsplit('/', 1)[-1] or ui_path)
         layout = self.layout()
         self._clear_layout(layout)
+        self._build_any(layout, ui_path, data)
 
+    def load_row(self, items: list, mode: str | None) -> None:
+        """Show one report row's pictures. *items*: [(column label,
+        ui_path, data)] for every non-empty media column of the row, in
+        column order. *mode*: a column label, or SIDE_BY_SIDE.
+
+        Added 2026-11-15 (examiner request): with more than one picture
+        per row the viewer used to show one of them with nothing saying
+        which, and on a row change always fell back to the first column.
+        Now a bar names every picture in the row, the one on screen is
+        named in a caption and in the window title, and the caller keeps
+        the examiner's chosen column (current_mode) across rows. If the
+        chosen column is empty on this row, the caption says so and the
+        first picture is shown instead."""
+        self._row_items = list(items)
+        # What was asked for, kept apart from what is shown: a row that
+        # lacks the chosen picture shows another one, and the next row
+        # must go back to the examiner's choice, not stay on the fallback.
+        self._wanted_mode = mode
+        labels = [lbl for lbl, _p, _d in items]
+        missing = None
+        if mode == self.SIDE_BY_SIDE and len(items) < 2:
+            missing, mode = mode, (labels[0] if labels else None)
+        elif mode not in labels and mode != self.SIDE_BY_SIDE:
+            if mode:
+                missing = mode
+            mode = labels[0] if labels else None
+        self._row_mode = mode
+        self._teardown_content()
+        layout = self.layout()
+        self._clear_layout(layout)
+        if not items:
+            layout.addWidget(QLabel("This row has no picture."))
+            return
+        if len(items) > 1:
+            bar = QHBoxLayout()
+            bar.addWidget(QLabel(f"This row has {len(items)} pictures:"))
+            for lbl in labels + [self.SIDE_BY_SIDE]:
+                b = QPushButton(lbl)
+                b.setCheckable(True)
+                b.setChecked(lbl == mode)
+                b.clicked.connect(lambda _c=False, m=lbl: self._choose_mode(m))
+                bar.addWidget(b)
+            bar.addStretch()
+            layout.addLayout(bar)
+        note = (f"  (no {missing} on this row)" if missing and missing != self.SIDE_BY_SIDE
+                else ("  (only one picture on this row)" if missing else ""))
+        if mode == self.SIDE_BY_SIDE:
+            self.setWindowTitle(f"Side by side — {', '.join(labels)}")
+            panes = QHBoxLayout()
+            for lbl, ui_path, data in items:
+                pane = QVBoxLayout()
+                cap = QLabel(f"<b>{lbl}</b> — {ui_path.rsplit('/', 1)[-1]}{self._px(data)}")
+                cap.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                pane.addWidget(cap)
+                ext = os.path.splitext(ui_path)[1].lower()
+                if sniff_media_kind(ext, data) == 'image':
+                    self._build_image(pane, data, ext)
+                else:
+                    pane.addWidget(QLabel("Not an image — choose its button above to view it."))
+                panes.addLayout(pane, 1)
+            layout.addLayout(panes, 1)
+            if self.width() < 1200:
+                self.resize(1400, max(self.height(), 700))
+            return
+        lbl, ui_path, data = next(it for it in items if it[0] == mode)
+        name = ui_path.rsplit('/', 1)[-1] or ui_path
+        self.setWindowTitle(f"{lbl} — {name}")
+        cap = QLabel(f"Showing: <b>{lbl}</b> — {name}{self._px(data)}{note}")
+        cap.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(cap)
+        sub = QVBoxLayout()
+        layout.addLayout(sub, 1)
+        self._build_any(sub, ui_path, data)
+
+    @staticmethod
+    def _px(data: bytes) -> str:
+        """' (W×H px)' from the file's own header, or '' if unreadable."""
+        from PySide6.QtCore import QBuffer, QByteArray
+        buf = QBuffer()
+        buf.setData(QByteArray(data))
+        size = QImageReader(buf).size()
+        return f" ({size.width()}\u00d7{size.height()} px)" if size.isValid() else ""
+
+    def current_mode(self) -> str | None:
+        """The column label (or SIDE_BY_SIDE) on screen, None outside row mode."""
+        return getattr(self, '_row_mode', None)
+
+    def wanted_mode(self) -> str | None:
+        """The mode the examiner chose (or the caller asked for), even when
+        this row lacks it and current_mode() is a fallback. None outside
+        row mode."""
+        return getattr(self, '_wanted_mode', None) if self.current_mode() else None
+
+    def _build_any(self, layout, ui_path: str, data: bytes) -> None:
         ext = os.path.splitext(ui_path)[1].lower()
         # Sniff (not just extension) for the same reason ThumbnailWorker
         # does: a generic filename (e.g. Google Messages' MMS cache files,

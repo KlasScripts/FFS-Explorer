@@ -189,40 +189,64 @@
       "hash": "38ddc5bdeef154c4",
       "version": 3
     },
-    "android:files_by_google_index": {
+    "android:files_by_google_likely_viewer": {
       "changelog": {
-        "1": "Adds Files by Google - Indexed Files: files_master_table with full path, media type, and times opened / last opened from file_open_info_table, linked to the file when it is in the extraction. Lab run files-app-usage-001: rows appear within seconds of a download without the app being opened."
+        "1": "Adds Likely Full-screen Views: inferred leftovers via content match to a Glide-proven scan, with case screen-size gate, aspect gate, and ambiguity skip. Not Glide-proven; no open time. Separate from Full-screen Views.",
+        "2": "Review fixes from a blind test on the Pixel and Poco viewer thumbnails, which paired 5 of 15 Poco leftovers to the wrong file. Pairs only to the scan of a file whose id is not in the current media store (a still-present file would normally have a proven viewer key). Screen gate uses the requested viewer box (fill width or height, never larger) instead of output sizes of other pictures. Picture match is the largest difference over a 16x16 grey grid (at most 0.05), with no other file's scan within 0.10; a file's 640 and 256 scans count as one file; flat pictures are not matched. Adds Runner Up Distance and Same File Rows; both leftovers are listed when two match one file. Blind test: Pixel 3/4 and Poco 9/15 correct, 0 wrong; realistic negative 0 false rows; identical copies both gone from the media store remain a stated limit.",
+        "3": "Pictures shown in Core and placed next to the path: Thumbnail and Paired Scan Thumb were hidden in the default Core view. The full-size viewer opens the two side by side (media_compare), with buttons to switch and the picture's name and pixel size in each caption."
       },
-      "hash": "53500b7fbe79447a",
-      "version": 1
+      "hash": "46e1c87849d16a88",
+      "version": 3
     },
     "android:files_by_google_opens": {
       "changelog": {
-        "1": "Adds Files by Google - Opened Files: each open in Files by Google's viewer (file_open_info_table) with its file from the index. Lab: the stored time is 0.4-0.6 s after the viewer screen appears; Safe folder moves delete the open records (ON DELETE CASCADE)."
+        "1": "Adds Files by Google - Opened Files: each open in Files by Google's viewer (file_open_info_table) with its file from the index. Lab: the stored time is 0.4-0.6 s after the viewer screen appears; Safe folder moves delete the open records (ON DELETE CASCADE).",
+        "2": "Nests under Google Files parent; short display name Opened Files.",
+        "3": "Warning and notes point to Full-screen Views when Safe folder moves delete open records."
       },
-      "hash": "cab00751aa915803",
-      "version": 1
+      "hash": "e957d5d188dc46c8",
+      "version": 3
     },
     "android:files_by_google_safe_folder": {
       "changelog": {
-        "1": "Adds Files by Google - Safe Folder: safe_folder_metadata_table with original path, Safe folder path, and whether the copy is in the extraction. Lab: copies are unencrypted originals (Files 1.13157)."
+        "1": "Adds Files by Google - Safe Folder: safe_folder_metadata_table with original path, Safe folder path, and whether the copy is in the extraction. Lab: copies are unencrypted originals (Files 1.13157).",
+        "2": "Nests under Google Files parent; short display name Safe Folder.",
+        "3": "Sort key under Google Files; notes note that Glide thumbnails can remain after a move (Thumbnail Cache / Full-screen Views).",
+        "4": "Sort key 4 under Google Files (after Likely Full-screen Views)."
       },
-      "hash": "e8c08a1b2e779350",
-      "version": 1
-    },
-    "android:files_by_google_scans": {
-      "changelog": {
-        "1": "Adds Files by Google - Background Scans: scan_log_table with start, end, duration, items updated, type and result as stored. Lab: a scan follows each download by 6-14 s with the app never opened."
-      },
-      "hash": "6af34c5648292721",
-      "version": 1
+      "hash": "d275c8d9e5d94dde",
+      "version": 4
     },
     "android:files_by_google_sessions": {
       "changelog": {
-        "1": "Adds Files by Google - App Sessions: start and end of each screen visit from files/activityTimeLogStoreName.pb, each row linked to its bytes. Lab: rows match screen changes in the action log and Usage Stats."
+        "1": "Adds Files by Google - App Sessions: start and end of each screen visit from files/activityTimeLogStoreName.pb, each row linked to its bytes. Lab: rows match screen changes in the action log and Usage Stats.",
+        "2": "Nests under Google Files parent; short display name App Sessions.",
+        "3": "Sort key under Google Files; notes cross-link Opened Files and Full-screen Views.",
+        "4": "Sort key 6 under Google Files."
       },
-      "hash": "c6061405b9f93d0d",
-      "version": 1
+      "hash": "65fc9c823b9e1ffc",
+      "version": 4
+    },
+    "android:files_by_google_thumbs": {
+      "changelog": {
+        "1": "Adds Files by Google - Thumbnail Cache: each Glide disk-cache thumbnail with screen kind (indexing scan, Recents, grid, list, viewer), plain-language behaviour meaning, and a link to the file when the Glide key reverses (index, media store, Safe folder, or removed media store id). Lab files-app-usage-001: 163/163 linked; older Pixel/Poco mostly linked.",
+        "2": "Nests under Google Files parent; short display name Thumbnail Cache.",
+        "3": "Drops the long What It Means column; meaning stays in Report Notes. Adds a short User Looked flag: No for scan/Recents/grid/list, Full screen at least once \u2014 not when for viewer thumbs.",
+        "6": "Tiles only (scan/Recents/grid/list). Unlinked leftovers are Unknown (W\u00d7H); kind is never guessed from pixels. Full-screen viewer thumbs move to Full-screen Views. Link source Id not in the current media store replaces Removed media store id. Temp copies of external.db cleaned after linking.",
+        "7": "Omits cache images claimed by Likely Full-screen Views from Unknown.",
+        "8": "Thumbnail and File Link shown in the default Core view (they were hidden)."
+      },
+      "hash": "ddb770faaf37c3ba",
+      "version": 8
+    },
+    "android:files_by_google_viewer_thumbs": {
+      "changelog": {
+        "1": "Adds Files by Google - Full-screen Views: Glide-proven full-screen viewer thumbnails only (FitCenter recipe). Open times stay in Opened Files; tiles in Thumbnail Cache.",
+        "2": "No size-only guesses. Links via index, media store, Safe folder, or carved size/mtime from external.db WAL/free pages when residue remains. Report notes spell out carve limits.",
+        "3": "Thumbnail and File Link shown in the default Core view (they were hidden)."
+      },
+      "hash": "5d59a55ddba57fec",
+      "version": 3
     },
     "android:gboard_clipboard": {
       "changelog": {

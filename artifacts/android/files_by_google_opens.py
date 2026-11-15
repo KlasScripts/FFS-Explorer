@@ -8,13 +8,14 @@ records too. In the lab (2026-11-13) the stored time was 0.4–0.6 s after the
 viewer screen appeared in Usage Stats.
 """
 
-name = "Files by Google - Opened Files"
-app_group_label = "Files by Google"
-group_sort_key = 2
+name = "Opened Files"
+app_group_label = "Google Files"
+group_sort_key = 1
 warning = (
     "An open record shows the file was opened in Files by Google's viewer at "
     "that time. It does not show how long it was viewed, or that a video was "
-    "played. Moving a file to the Safe folder deletes its open records."
+    "played. Moving a file to the Safe folder deletes its open records; a "
+    "full-screen thumbnail made earlier can still appear in Full-screen Views."
 )
 description = (
     "Each time a file was opened in Files by Google's viewer, with the time "

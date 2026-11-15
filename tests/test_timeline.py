@@ -194,3 +194,26 @@ def test_a_run_with_no_rows_removes_the_earlier_table():
     assert write_artifact_results(res, 'r', []) == 0
     assert not res.execute("SELECT 1 FROM sqlite_master WHERE name='artifact_r'").fetchone()
     assert write_artifact_results(res, 'never', []) == 0      # no table: still fine
+
+
+def test_file_time_rule_matches_the_file_browser_display():
+    """Seconds and nanoseconds (msgpack formats) give the same instant;
+    the File Browser's own display uses the same 1e10 rule."""
+    from timestamp_display import _format_ts_cached
+    secs = 1721258758
+    assert timeline.file_time_ms(secs) == secs * 1000
+    assert timeline.file_time_ms(secs * 1_000_000_000 + 123_000_000) == secs * 1000 + 123
+    assert timeline.file_time_ms(0) is None and timeline.file_time_ms('') is None
+    assert _format_ts_cached(secs) == _format_ts_cached(secs * 1_000_000_000)
+
+
+def test_go_to_centres_a_capped_list(dbs):
+    res, cache = dbs
+    t0 = _utc_ms(2026, 1, 1)
+    write_artifact_results(res, 'r', [{'t': str(t0 + i * 1000)} for i in range(50)])
+    timeline.build(res, cache, {'r': _mod('R', {'t': 'ms'}, {'t': {'meaning': 'm'}})})
+    centre = t0 + 30 * 1000
+    assert timeline.count_before(cache, centre) == 30
+    assert timeline.count_before(cache, centre, descending=True) == 19
+    rows, total = timeline.query(cache, limit=10, offset=25)
+    assert total == 50 and [r[0] for r in rows] == [t0 + i * 1000 for i in range(25, 35)]

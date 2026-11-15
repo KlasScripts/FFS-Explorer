@@ -230,7 +230,7 @@ class TimelineViewerMixin:
         # Never leave another case's (or an older run's) rows on screen: a
         # double-click would open a row number in the wrong report.
         self._tl_model.set_rows([])
-        self._tl_around_at = None
+        self._tl_marker = None
         self._tl_around_label.setVisible(False)
         self._tl_status.setText("The Timeline is rebuilt from the reports when you open this tab.")
         if self.center_tabs.currentIndex() == TIMELINE_TAB_INDEX:
@@ -278,7 +278,7 @@ class TimelineViewerMixin:
             return
         self._tl_built_for = self._case_dir
         self._timeline_fill_combos()
-        self._timeline_apply()
+        self._timeline_load()
         pending, self._tl_after_build = self._tl_after_build, []
         for fn in pending:
             fn()
@@ -321,88 +321,205 @@ class TimelineViewerMixin:
                 self._tl_to.dateTime().toMSecsSinceEpoch())
 
     def _timeline_apply(self, *_a) -> None:
+        """A filter was changed by hand: a "went to" / "around" note no
+        longer describes what is listed, so it is cleared."""
+        self._tl_marker = None
+        self._tl_around_label.setVisible(False)
+        self._timeline_load()
+
+    def _timeline_load(self, center_ms=None) -> None:
+        """Query and show the events the filters select. With *center_ms*
+        and more matches than the cap, the rows shown are centred on that
+        time (and the status says which part of the list it is)."""
         if not getattr(self, '_case_dir', None) or self._tl_built_for != self._case_dir:
             return
         start, end = self._timeline_window_ms()
-        if not self._tl_window_check.isChecked():
-            self._tl_around_label.setVisible(False)
         script = self._tl_source.currentData()
+        scripts = [script] if script else None
+        app = self._tl_app.currentData()
+        text = self._tl_text.text().strip() or None
+        desc = self._tl_desc.isChecked()
         limit = 100_000
+        offset = 0
         with closing(_open_cache_db(self._case_dir)) as cache:
-            rows, total = timeline.query(
-                cache, start, end, [script] if script else None,
-                self._tl_app.currentData(), self._tl_text.text().strip() or None,
-                descending=self._tl_desc.isChecked(), limit=limit)
+            total = timeline.count(cache, start, end, scripts, app, text)
+            if center_ms is not None and total > limit:
+                before = timeline.count_before(cache, center_ms, start, end, scripts,
+                                               app, text, descending=desc)
+                offset = max(0, min(before - limit // 2, total - limit))
+            rows, total = timeline.query(cache, start, end, scripts, app, text,
+                                         descending=desc, limit=limit, offset=offset)
             n_all = cache.execute('SELECT COUNT(*) FROM timeline_events').fetchone()[0]
         self._tl_model.set_rows(rows)
         if total > len(rows):
             # Never silently capped (A-51).
-            text = (f"Showing the first {len(rows):,} of {total:,} matching events — "
-                    f"narrow the time window or filters to see the rest.")
+            if offset:
+                status = (f"Showing events {offset + 1:,}–{offset + len(rows):,} of {total:,} "
+                          f"(the part around the time you went to) — narrow the time "
+                          f"window or filters to see the rest.")
+            else:
+                status = (f"Showing the first {len(rows):,} of {total:,} matching events — "
+                          f"narrow the time window or filters to see the rest.")
         elif n_all == 0:
-            text = ("No report in this case has Timeline times yet: see Sources… for "
-                    "which reports have times and why they are not listed")
+            status = ("No report in this case has Timeline times yet: see Sources… for "
+                      "which reports have times and why they are not listed")
         else:
-            text = f"{total:,} events"
+            status = f"{total:,} events"
             if total != n_all:
-                text += f" (of {n_all:,} on the Timeline)"
-        self._tl_status.setText(text + f" · times shown as {self._timestamp_mode_text()}")
+                status += f" (of {n_all:,} on the Timeline)"
+        self._tl_status.setText(status + f" · times shown as {self._timestamp_mode_text()}")
 
-    # ── pivot ────────────────────────────────────────────────────────────
-    def _timeline_show_around(self, utc_ms: int, what: str = "") -> None:
-        """Switch to the Timeline with a window of ±(Around) minutes on
-        *utc_ms*; *what* says where the time came from."""
-        def _go():
-            half = self._tl_around.value() * 60_000
-            for w, ms in ((self._tl_from, utc_ms - half), (self._tl_to, utc_ms + half)):
-                w.blockSignals(True)
-                w.setDateTime(QDateTime.fromMSecsSinceEpoch(int(ms), QTimeZone.utc()))
-                w.blockSignals(False)
-            self._tl_source.setCurrentIndex(0)
-            self._tl_app.setCurrentIndex(0)
-            self._tl_text.blockSignals(True)
-            self._tl_text.clear()
-            self._tl_text.blockSignals(False)
-            self._tl_window_check.blockSignals(True)
-            self._tl_window_check.setChecked(True)
-            self._tl_window_check.blockSignals(False)
-            self._tl_around_at = (utc_ms, what, self._tl_around.value())
-            self._timeline_set_around_label()
-            self._tl_around_label.setVisible(True)
-            self._timeline_apply()
-            # Select the first event at or after the pivot time.
-            for r in range(self._tl_model.rowCount()):
-                if self._tl_model.row(r)[_IDX['utc_ms']] >= utc_ms:
-                    self._tl_view.selectRow(r)
-                    self._tl_view.scrollTo(self._tl_model.index(r, 0),
-                                           QAbstractItemView.ScrollHint.PositionAtCenter)
-                    break
+    # ── pivot / go to ────────────────────────────────────────────────────
+    def _timeline_add_time_menu(self, menu, times) -> bool:
+        """Add a "🕒 Timeline" submenu to *menu* for a row's times.
+        *times*: [(label, utc_ms, what)] — *label* names the time (a column),
+        *what* says where it came from (shown on the Timeline). Each time
+        gets "Go to … in the Timeline" and "Activity ±1 day around …".
+        Returns False (nothing added) if no time is usable."""
+        times = [(lbl, int(ms), what) for lbl, ms, what in times if ms]
+        if not times:
+            return False
+        sub = menu.addMenu("🕒 Timeline")
+        for lbl, ms, what in times:
+            act = sub.addAction(f"Go to {lbl} ({self._timeline_fmt_ms(ms)}) in the Timeline")
+            act.triggered.connect(lambda _=False, ms=ms, what=what: self._timeline_go_to(ms, what))
+        sub.addSeparator()
+        for lbl, ms, what in times:
+            act = sub.addAction(f"Activity ±1 day around {lbl}")
+            act.triggered.connect(lambda _=False, ms=ms, what=what:
+                                  self._timeline_show_around(ms, what, minutes=24 * 60))
+        return True
+
+    def _timeline_file_times(self, ui_path: str) -> list:
+        """[(label, utc_ms, what)] for a file's own times (the File
+        Browser's time columns: Created/Changed/Modified/Accessed as this
+        archive has them), read from the archive metadata — never from the
+        displayed text, which is in the case's time setting."""
+        meta = (getattr(self, 'full_metadata', None) or {}).get(ui_path) or {}
+        name = ui_path.rsplit('/', 1)[-1] if ui_path else ''
+        out = []
+        for header, key in getattr(self, '_time_cols', ()):
+            ms = timeline.file_time_ms(meta.get(key))
+            if ms:
+                out.append((header, ms, f"{header} of {name} (file system)"))
+        return out
+
+    def _timeline_when_ready(self, fn) -> None:
         self.center_tabs.setCurrentIndex(TIMELINE_TAB_INDEX)
         if self._tl_built_for == self._case_dir and not (
                 self._tl_worker is not None and self._tl_worker.isRunning()):
-            _go()
+            fn()
         else:
-            self._timeline_ensure_built(then=_go)
+            self._timeline_ensure_built(then=fn)
+
+    def _timeline_reset_filters(self, window_ms=None) -> None:
+        """Clear source/app/text; set the UTC window to *window_ms*
+        (start, end), or switch the window off for None. No reload."""
+        for combo in (self._tl_source, self._tl_app):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._tl_text.blockSignals(True)
+        self._tl_text.clear()
+        self._tl_text.blockSignals(False)
+        if window_ms is not None:
+            for w, ms in zip((self._tl_from, self._tl_to), window_ms):
+                w.blockSignals(True)
+                w.setDateTime(QDateTime.fromMSecsSinceEpoch(int(ms), QTimeZone.utc()))
+                w.blockSignals(False)
+        self._tl_window_check.blockSignals(True)
+        self._tl_window_check.setChecked(window_ms is not None)
+        self._tl_window_check.blockSignals(False)
+
+    def _timeline_select_nearest(self, utc_ms: int):
+        """Select and centre the event nearest *utc_ms* (either list
+        order). Returns that event's utc_ms, or None if nothing is listed."""
+        best, best_d = None, None
+        for r in range(self._tl_model.rowCount()):
+            d = abs(self._tl_model.row(r)[_IDX['utc_ms']] - utc_ms)
+            if best_d is None or d < best_d:
+                best, best_d = r, d
+        if best is None:
+            return None
+        self._tl_view.selectRow(best)
+        self._tl_view.scrollTo(self._tl_model.index(best, 0),
+                               QAbstractItemView.ScrollHint.PositionAtCenter)
+        return self._tl_model.row(best)[_IDX['utc_ms']]
+
+    def _timeline_show_around(self, utc_ms: int, what: str = "", minutes=None) -> None:
+        """Switch to the Timeline with a window of ±*minutes* (default: the
+        tab's Around setting) on *utc_ms*; *what* says where the time came
+        from."""
+        def _go():
+            m = int(minutes or self._tl_around.value())
+            self._timeline_reset_filters((utc_ms - m * 60_000, utc_ms + m * 60_000))
+            self._tl_marker = {'kind': 'around', 'ms': utc_ms, 'what': what, 'minutes': m}
+            self._timeline_load(center_ms=utc_ms)
+            self._tl_marker['nearest'] = self._timeline_select_nearest(utc_ms)
+            self._timeline_set_around_label()
+        self._timeline_when_ready(_go)
+
+    def _timeline_go_to(self, utc_ms: int, what: str = "") -> None:
+        """Switch to the Timeline with no filters and select the event
+        nearest *utc_ms*; the note says how far that event is from it."""
+        def _go():
+            self._timeline_reset_filters(None)
+            self._tl_marker = {'kind': 'goto', 'ms': utc_ms, 'what': what}
+            self._timeline_load(center_ms=utc_ms)
+            self._tl_marker['nearest'] = self._timeline_select_nearest(utc_ms)
+            self._timeline_set_around_label()
+        self._timeline_when_ready(_go)
+
+    @staticmethod
+    def _timeline_span_text(ms: int) -> str:
+        ms = abs(int(ms))
+        if ms < 1000:
+            return f"{ms} ms"
+        secs = ms // 1000
+        d, rem = divmod(secs, 86400)
+        h, rem = divmod(rem, 3600)
+        m, s = divmod(rem, 60)
+        parts = [f"{d} d" if d else "", f"{h} h" if h else "", f"{m} min" if m else "",
+                 f"{s} s" if s and not d else ""]
+        return " ".join(p for p in parts if p) or "0 s"
 
     def _timeline_set_around_label(self) -> None:
-        at = getattr(self, '_tl_around_at', None)
-        if not at:
+        mk = getattr(self, '_tl_marker', None)
+        if not mk:
+            self._tl_around_label.setVisible(False)
             return
-        utc_ms, what, minutes = at
-        self._tl_around_label.setText(
-            f"Activity ±{minutes} min around {self._timeline_fmt_ms(utc_ms)}"
-            + (f" — {what}" if what else ""))
+        when = self._timeline_fmt_ms(mk['ms'])
+        src = f" — {mk['what']}" if mk.get('what') else ""
+        if mk['kind'] == 'around':
+            m = mk['minutes']
+            width = (f"{m // 1440} day{'s' if m // 1440 != 1 else ''}" if m % 1440 == 0
+                     else f"{m // 60} h" if m % 60 == 0 else f"{m} min")
+            text = f"Activity ±{width} around {when}{src}"
+        else:
+            text = f"Went to {when}{src}"
+        near = mk.get('nearest')
+        if near is None:
+            text += ". No event is listed."
+        elif near == mk['ms']:
+            text += ". Selected: an event at exactly this time."
+        else:
+            gap = self._timeline_span_text(near - mk['ms'])
+            text += (f". Selected: the nearest event, {gap} "
+                     f"{'after' if near > mk['ms'] else 'before'} this time.")
+        self._tl_around_label.setText(text)
+        self._tl_around_label.setVisible(True)
 
     def _timeline_refresh_times(self) -> None:
         """The time setting changed (TimestampDisplayMixin): redraw the
-        Time column, the pivot label and the status line in the new zone.
-        The window inputs stay in UTC and say so."""
+        Time column, the note and the status line in the new zone. The
+        window inputs stay in UTC and say so."""
         if not hasattr(self, '_tl_model'):
             return
         self._tl_model.layoutChanged.emit()
         self._timeline_set_around_label()
         if getattr(self, '_case_dir', None) and self._tl_built_for == self._case_dir:
-            self._timeline_apply()
+            mk = getattr(self, '_tl_marker', None)
+            self._timeline_load(center_ms=mk['ms'] if mk else None)
 
     def _timeline_open_row(self, index) -> None:
         if not index.isValid():
@@ -418,9 +535,10 @@ class TimelineViewerMixin:
         menu = QMenu(self._tl_view)
         menu.addAction("Open in report").triggered.connect(
             lambda _=False, ix=index: self._timeline_open_row(ix))
-        menu.addAction("Show activity around this time").triggered.connect(
-            lambda _=False: self._timeline_show_around(
-                r[_IDX['utc_ms']], f"{r[_IDX['source']]}: {r[_IDX['event']] or r[_IDX['meaning']]}"))
+        what = f"{r[_IDX['source']]}: {r[_IDX['event']] or r[_IDX['meaning']]}"
+        menu.addAction("Show activity around this time (±Around)").triggered.connect(
+            lambda _=False: self._timeline_show_around(r[_IDX['utc_ms']], what))
+        self._timeline_add_time_menu(menu, [("this event", r[_IDX['utc_ms']], what)])
         menu.exec(self._tl_view.viewport().mapToGlobal(pos))
 
     # ── sources ──────────────────────────────────────────────────────────

@@ -110,7 +110,9 @@ Same grouping as CLAUDE.md's module table.
 | `FastZipBrowser.__init__` + column config | 🔴 | | |
 | `FastZipBrowser` filtering | 🔴 | | |
 | `FastZipBrowser` preview dispatch + tree/table/export | 🔴 | | |
-| `FastZipBrowser` jump menu / Android detection | 🔴 | | |
+| `FastZipBrowser` jump menu / Android detection | 🔴 | | Jump menu rebuilt 2026-11-15 on `evidence_shortcuts.py`: every entry resolved against the file indexes of Android 14 (Samsung/Magnet, Pixel/Cellebrite), Android 15 (Cellebrite) and iOS 17 (Cellebrite), files only; menu, greyed entries and one jump driven in the app on the Pixel copy. Not checked on GrayKey iOS. NOT yet human-reviewed |
+| `evidence_shortcuts.py` | 🔴 | | New 2026-11-15. See the jump-menu row. NOT yet human-reviewed |
+| `os_coverage.py` | 🔴 | | New 2026-11-15. Unit-tested; banner shown and hidden in the app on the Pixel copy. NOT yet human-reviewed |
 | `FastZipBrowser` loading pipeline (`start_loading`→`on_metadata_ready`) + AI-access toggle | 🔴 | | Timezone detection/dialog moved to `timestamp_display.py` (own row above) 2026-08-19 |
 | `FastZipBrowser` folder view refresh / tree population / bookmarks | 🔴 | | |
 | `FastZipBrowser` research-status dialog | 🔴 | | |

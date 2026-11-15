@@ -4413,7 +4413,8 @@ class ArtifactViewerMixin:
         any) time — see timeline.time_of_row. Names the column it used."""
         import timeline
         mod = self._art_current_mod
-        if mod is None or not getattr(mod, 'timestamp_fields', None):
+        units = getattr(mod, 'timestamp_fields', None) if mod is not None else None
+        if not units:
             return
         row = self._art_table_model.row_dict(index.row())
         found = timeline.time_of_row(
@@ -4425,6 +4426,14 @@ class ArtifactViewerMixin:
         act = menu.addAction(f"Show activity around this time ({field}) on the Timeline")
         act.triggered.connect(lambda _=False: self._timeline_show_around(
             utc_ms, f"from {label}, {field}"))
+        # Every time column of the row: go to it, or ±1 day around it.
+        times = []
+        for col, unit in units.items():
+            raw = row.get(col)
+            secs = timeline.to_unix_seconds(raw, unit)
+            if secs is not None and float(raw) != 0:
+                times.append((col, int(round(secs * 1000)), f"from {label}, {col}"))
+        self._timeline_add_time_menu(menu, times)
 
     def _art_go_to_chat_at(self, index) -> None:
         """Open the chat on *index*'s row of the Chat Groups summary: select

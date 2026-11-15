@@ -206,3 +206,42 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
             if progress_cb and (done % 200 == 0 or done == total):
                 progress_cb(done, total)
     return results
+
+
+def proven_copies(members, inode_trusted=False) -> dict:
+    """{copy_ui_path: representative_ui_path} for files PROVEN to be
+    byte-identical to another member without reading any file, so a scan
+    can read one of them and give every copy the same result (Header
+    Scan; ASSUMPTIONS.md entry pending).
+
+    *members*: [(ui_path, size, crc, inode, devid, sha256)], all values
+    already in the zip index (0 / '' when absent). Proof is one of:
+      - the same SHA-256 recorded by the acquisition tool (GrayKey, A-73),
+        with the same size and CRC-32;
+      - the same nonzero (inode, devid) with the same size and CRC-32, only
+        when *inode_trusted* (FfsAdapter.inode_trusted, A-67): the same
+        file on the phone.
+    Anything else, a matching size and CRC-32 included, is not proof and
+    is never mapped: it is scanned on its own. Folders must not be passed.
+
+    The representative is the shortest path (then alphabetical), so the
+    canonical tree is read rather than a mirror of it: data/data/x before
+    data/user/0/x before data_mirror/.../x."""
+    by_key: dict = {}
+    for ui_path, size, crc, inode, devid, sha in members:
+        if sha:
+            proof = ('sha256', sha)
+        elif inode_trusted and inode:
+            proof = ('inode', inode, devid)
+        else:
+            continue
+        by_key.setdefault((size, crc) + proof, []).append(ui_path)
+    out = {}
+    for paths in by_key.values():
+        if len(paths) < 2:
+            continue
+        paths.sort(key=lambda p: (len(p), p))
+        rep = paths[0]
+        for p in paths[1:]:
+            out[p] = rep
+    return out

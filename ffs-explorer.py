@@ -73,6 +73,8 @@ import header_scan
 import nested_archive
 import media_metadata_scan
 import duplicate_scan
+import evidence_shortcuts
+import os_coverage
 import embedded_media_skip_list
 import user_media_ignore_list
 import file_browser_presets
@@ -331,47 +333,9 @@ _TREE_COL_MIN = 1000
 # _SYSTEM_METADATA_NAMES and _UUID_RE now live in ffs_metadata.py (Qt-free,
 # shared with the subprocess parser).  _UUID_RE is imported back above.
 
-FORENSIC_SHORTCUTS = [
-    ("App Data", "mobile/Containers/Data/Application"),
-    ("App Data Plugins", "mobile/Containers/Data/PluginKitPlugin"),
-    ("App Data Shared", "mobile/Containers/Shared/AppGroup"),
-    None,  # separator
-    ("Communications", [
-        ("SMS / iMessage",          "mobile/Library/SMS"),
-        ("Call History",            "wireless/Library/CallHistoryDatabase"),
-        ("Contacts",                "mobile/Library/AddressBook"),
-        ("Mail",                    "mobile/Library/Mail"),
-        ("Voicemail",               "wireless/Library/Voicemail"),
-    ]),
-    ("Media", [
-        ("Photos (DCIM)",           "mobile/Media/DCIM"),
-        ("Photo Library Data",      "mobile/Media/PhotoData"),
-        ("Voice Memos",             "mobile/Media/Recordings"),
-    ]),
-    ("Browsing & Web", [
-        ("Safari",                  "mobile/Library/Safari"),
-        ("Safari Downloads — iOS 13+","mobile/Library/Safari/Downloads"),
-        ("Safari Reading List",     "mobile/Library/Safari/ReadingListArchives"),
-    ]),
-    ("System & Device", [
-        ("Biome — iOS 14+",         "mobile/Library/Biome"),
-        ("KnowledgeC — iOS 9+",     "mobile/Library/CoreDuet/Knowledge"),
-        ("Health",                  "mobile/Library/Health"),
-        ("Calendar",                "mobile/Library/Calendar"),
-        ("Notes",                   "mobile/Library/NoteStore"),
-        ("Reminders",               "mobile/Library/Reminders"),
-        ("Location History",        "mobile/Library/Caches/com.apple.routined"),
-        ("Keychain",                "private/var/Keychains"),
-        ("Wi-Fi Networks",          "wireless/Library/Preferences"),
-        ("Device Logs",             "mobile/Library/Logs"),
-        ("Unified Logs — iOS 10+",          "private/var/db/diagnostics"),
-        ("Unified Logs UUID Text — iOS 10+","private/var/db/uuidtext"),
-    ]),
-    ("Installed Apps", [
-        ("App Executables",             "mobile/Containers/Bundle/Application"),
-        ("Crash Reports",           "mobile/Library/Logs/CrashReporter"),
-    ]),
-]
+# The jump menu's iOS locations now live in evidence_shortcuts.py (each
+# with its per-version candidates; see EVIDENCE_LOCATIONS.md).
+FORENSIC_SHORTCUTS = evidence_shortcuts.IOS_SHORTCUTS
 
 # .png/.gif are deliberately NOT here — see header_scan.GRAPHIC_EXTENSIONS
 # and _EXT_TO_TYPE below for why they're their own 'Graphic' Type instead
@@ -2052,6 +2016,47 @@ def _collect_header_candidates(
     return _resolve_file_candidates(zip_path, targets, ffs_adapter, z=z, delta=delta)
 
 
+def _header_copy_map(candidates, ui_metadata: dict, ffs_adapter, z) -> dict:
+    """{copy: representative} among header-scan *candidates* proven
+    byte-identical without reading them (duplicate_scan.proven_copies:
+    same size and CRC-32, plus the same GrayKey SHA-256 or the same
+    trusted inode). Metadata only (z.getinfo, the .zcd index). {} when *z*
+    is None."""
+    if z is None or not candidates:
+        return {}
+    resolve = ffs_adapter.resolve
+    members = []
+    for ui_path, _off, _size in candidates:
+        try:
+            info = z.getinfo(resolve(ui_path))
+        except KeyError:
+            continue
+        if info.is_dir():
+            continue
+        meta = ui_metadata.get(ui_path) or {}
+        members.append((ui_path, info.file_size, info.CRC,
+                        meta.get('inode') or 0, meta.get('devid') or 0,
+                        meta.get('sha256', '') or ''))
+    return duplicate_scan.proven_copies(members, inode_trusted=ffs_adapter.inode_trusted)
+
+
+def _scan_headers_once_per_copy(zip_path, candidates, copy_of: dict,
+                                progress_cb=None, cancel_check=None) -> dict:
+    """header_scan.scan_entries, reading each set of proven-identical
+    copies once (*copy_of* from _header_copy_map): every copy gets its
+    representative's result under its own path. A copy that is not proven
+    identical is not in *copy_of* and is read itself."""
+    wanted = {c[0] for c in candidates}
+    copy_of = {c: r for c, r in copy_of.items() if c in wanted and r in wanted}
+    reps = [c for c in candidates if c[0] not in copy_of]
+    results = header_scan.scan_entries(zip_path, reps, progress_cb=progress_cb,
+                                       cancel_check=cancel_check)
+    for copy, rep in copy_of.items():
+        if rep in results:
+            results[copy] = results[rep]
+    return results
+
+
 _MEDIA_METADATA_TYPES = ('Picture', 'Graphic', 'Video')
 
 
@@ -2571,6 +2576,7 @@ class ZipMetadataWorker(QThread):
 
                 _need_save_guid_initial = cached_guid_bundle is None and bool(guid_to_bundle)
                 header_candidates: list = []
+                header_copies: dict = {}
                 if self.scan_headers:
                     self.status_update.emit(
                         "Collecting header scan candidates from archive (may be slow on network)…")
@@ -2580,6 +2586,8 @@ class ZipMetadataWorker(QThread):
                         delta=self._local_extra_delta,
                         tier=self.header_scan_tier,
                     )
+                    header_copies = _header_copy_map(
+                        header_candidates, ui_metadata, ffs_adapter, z_ctx)
             finally:
                 if z_ctx is not None:
                     z_ctx.__exit__(None, None, None)
@@ -2687,11 +2695,14 @@ class ZipMetadataWorker(QThread):
                     pass
 
             if header_candidates:
+                n_read = len(header_candidates) - len(header_copies)
+                copies_note = (f" ({len(header_copies):,} proven-identical copies read once)"
+                               if header_copies else "")
                 self.status_update.emit(
-                    f"Scanning headers: {len(header_candidates):,} candidate files...")
-                self.header_scan_progress.emit(len(header_candidates))
-                results = header_scan.scan_entries(
-                    self.zip_path, header_candidates,
+                    f"Scanning headers: {len(header_candidates):,} candidate files{copies_note}...")
+                self.header_scan_progress.emit(n_read)
+                results = _scan_headers_once_per_copy(
+                    self.zip_path, header_candidates, header_copies,
                     progress_cb=self.header_scan_progress.emit,
                 )
                 self.header_scan_done.emit(results)
@@ -4398,9 +4409,13 @@ class HeaderScanWorker(QThread):
             self.done.emit({})
             return
 
-        self.progress.emit(len(candidates))
-        results = header_scan.scan_entries(
-            self._zip_path, candidates,
+        # Files proven identical (same GrayKey SHA-256 or trusted inode,
+        # plus size and CRC-32) are read once; each copy gets the result.
+        copies = _header_copy_map(candidates, self._ui_metadata, self._adapter, z)
+        self.copies_read_once = len(copies)
+        self.progress.emit(len(candidates) - len(copies))
+        results = _scan_headers_once_per_copy(
+            self._zip_path, candidates, copies,
             progress_cb=self.progress.emit,
             cancel_check=self.isInterruptionRequested,
         )
@@ -7251,8 +7266,12 @@ class ProcessDialog(QDialog):
                         save_header_types(cache_db, results)
                 if self._run_id is not None and not cancelled:
                     with closing(_open_results_db(self._case_dir)) as results_db:
-                        complete_run_log(results_db, self._run_id,
-                                         processed=n_total, output_rows=n_found)
+                        copies = getattr(self._scan_worker, 'copies_read_once', 0)
+                        complete_run_log(
+                            results_db, self._run_id, processed=n_total, output_rows=n_found,
+                            notes=(f"{copies:,} files proven identical to another copy "
+                                   f"(same GrayKey SHA-256 or inode, size and CRC-32) were "
+                                   f"read once; each copy has the same result") if copies else None)
                 # Persisted here (not left to the main window) since
                 # ProcessDialog already owns this exact connection/case_dir
                 # at this point — deliberately NOT nested inside the
@@ -8656,6 +8675,15 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         banner_row.addWidget(banner_sep)
         banner_row.addWidget(self._header_scan_banner, 1)
         layout.addLayout(banner_row)
+        # Shown when the extraction's OS version is outside the versions whose
+        # evidence locations were checked on real images (os_coverage.py).
+        self._os_coverage_banner = QLabel()
+        self._os_coverage_banner.setStyleSheet(
+            "color: #e07b00; font-weight: bold; font-size: 12px; padding: 2px 6px;")
+        self._os_coverage_banner.setWordWrap(True)
+        self._os_coverage_banner.setMinimumWidth(1)
+        self._os_coverage_banner.setVisible(False)
+        layout.addWidget(self._os_coverage_banner)
 
         _section_style = (
             "font-weight: bold; padding: 3px 6px;"
@@ -11582,6 +11610,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 act.triggered.connect(
                     partial(self._filter_by_date, header, val, True))
 
+        # Go to this file's times on the Timeline, or ±1 day around them
+        # (raw metadata times, not the displayed text).
+        if ui_path and ui_path not in self.folder_map:
+            self._timeline_add_time_menu(menu, self._timeline_file_times(ui_path))
+
         # Collect file paths from all selected rows for header scan
         _scan_paths = []
         for _idx in self.file_view.selectionModel().selectedRows():
@@ -11809,35 +11842,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         return 'android' if self._is_android_archive() else 'ios'
 
     def _android_shortcuts(self) -> list:
-        user_data = self._android_user_data_path or 'data/media/0'
-        return [
-            ("App Data",        "data/data"),
-            ("User Data",       user_data),
-            None,
-            ("Media", [
-                ("Photos (DCIM)",    user_data + "/DCIM"),
-                ("Downloads",        user_data + "/Download"),
-                ("Screenshots",      user_data + "/DCIM/Screenshots"),
-            ]),
-            ("Communications", [
-                ("SMS / MMS",        "data/data/com.android.providers.telephony/databases"),
-                ("Call History",     "data/data/com.android.providers.contacts/databases"),
-                ("Contacts",         "data/data/com.android.providers.contacts/databases"),
-            ]),
-            ("Browsing & Web", [
-                ("Chrome",           "data/data/com.android.chrome/app_chrome/Default"),
-                ("Samsung Browser",  "data/data/com.sec.android.app.sbrowser/databases"),
-            ]),
-            ("System & Device", [
-                ("Accounts",         "data/system_ce/0/accounts_ce.db"),
-                ("Device Logs",      "data/tombstones"),
-                ("Settings DB",      "data/data/com.android.providers.settings/databases"),
-                ("Location History", "data/data/com.google.android.gms/files/locationhistory"),
-            ]),
-        ]
+        return evidence_shortcuts.android_shortcuts(self._android_user_data_path)
 
     def _show_jump_menu(self):
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         shortcuts = self._android_shortcuts() if self._is_android_archive() else FORENSIC_SHORTCUTS
         self._build_jump_menu(menu, shortcuts)
         menu.exec(self.jump_btn.mapToGlobal(self.jump_btn.rect().bottomLeft()))
@@ -11879,12 +11888,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 menu.addSeparator()
             elif isinstance(item[1], list):
                 submenu = menu.addMenu(item[0])
+                submenu.setToolTipsVisible(True)
                 self._build_jump_menu(submenu, item[1])
             else:
-                name, path = item
-                act = QAction(name, self)
-                act.triggered.connect(
-                    lambda _, p=path: self.navigate_tree_to_path(self._adapt_shortcut_path(p)))
+                # Open the first location this extraction has (locations
+                # move between OS versions, evidence_shortcuts.py). None
+                # found: say so, rather than silently opening the nearest
+                # folder that does exist.
+                name = item[0]
+                cands = evidence_shortcuts.candidates_of(item)
+                target = evidence_shortcuts.resolve(
+                    cands, self.folder_map, getattr(self, 'full_metadata', None) or {},
+                    adapt=self._adapt_shortcut_path)
+                if target is None:
+                    act = QAction(f"{name} — not in this extraction", self)
+                    act.setEnabled(False)
+                    act.setToolTip(
+                        "Looked for: " + ", ".join(self._adapt_shortcut_path(c) for c in cands)
+                        + ". Locations can move between OS versions: an extraction "
+                          "newer than the ones checked may keep this elsewhere.")
+                else:
+                    act = QAction(name, self)
+                    act.setToolTip(target)
+                    act.triggered.connect(
+                        lambda _=False, p=target: self.navigate_tree_to_path(p))
                 menu.addAction(act)
 
     def _on_dropdown_activated(self, index):
@@ -17513,6 +17540,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             except Exception:
                 pass
         if has_label and has_db_info:
+            self._update_os_coverage_banner()
             return
 
         # Reading device info opens the zip — run it off the GUI thread.
@@ -17541,6 +17569,31 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self.update_dropdown_ui()
         # iOS version may only now be known — recheck research staleness colors
         self._refresh_research_styling()
+        if case_dir == self._case_dir:
+            self._update_os_coverage_banner(fields if fields else None)
+
+    def _update_os_coverage_banner(self, fields=None) -> None:
+        """Warn when this extraction's OS version is outside the versions
+        whose evidence locations were checked (os_coverage.py). *fields*:
+        device-info rows; read from the case when not given."""
+        banner = getattr(self, '_os_coverage_banner', None)
+        if banner is None:
+            return
+        if not self._case_dir or not getattr(self, 'folder_map', None):
+            banner.setVisible(False)
+            return
+        if fields is None:
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    fields = load_device_info(db)
+            except Exception:
+                fields = []
+        platform = 'Android' if self._is_android_archive() else 'iOS'
+        text = os_coverage.warning(platform, os_coverage.version_of(fields, platform))
+        self._os_coverage_shown = text
+        banner.setText(text or '')
+        banner.setToolTip(text or '')
+        banner.setVisible(bool(text))
 
     def _entry_display(self, entry: dict, prefs: dict) -> str:
         """Build the display string for one archive entry using slot preferences."""

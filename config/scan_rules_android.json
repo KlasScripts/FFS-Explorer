@@ -3,6 +3,17 @@
   "version": 1,
   "rules": [
     {"path": "data/data/", "include": 1, "user_media": "also_user_media"},
-    {"path": "data/media/", "include": 1, "user_media": "also_user_media"}
+    {"path": "data/media/", "include": 1, "user_media": "also_user_media"},
+    {"path": "data/user/", "include": 1, "user_media": "not_user_media", "_note": "Every user's credential-encrypted app data: owner (0, the same folder as data/data, which some tools store as a second copy), second users, work profile, Android 15 Private Space. Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/user_de/", "include": 1, "user_media": "not_user_media", "_note": "Device-encrypted app data per user; SMS/MMS (mmssms.db) and the call log (calllog.db) normally live here on current Android. Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/system/", "include": 1, "user_media": "not_user_media", "_note": "Packages, app-ops, settings XML (users/<u>), shutdown checkpoints, batterystats, older usagestats and notification_log.db. Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/system_ce/", "include": 1, "user_media": "not_user_media", "_note": "Per-user credential-encrypted system data: accounts_ce.db, usagestats, notification history, recent tasks and snapshots. Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/system_de/", "include": 1, "user_media": "not_user_media", "_note": "Per-user device-encrypted system data: accounts_de.db. Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/misc/", "include": 1, "user_media": "not_user_media", "_note": "Wi-Fi (misc/wifi, misc/apexdata/com.android.wifi), Bluetooth, bootstat, ADB keys. Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/misc_ce/", "include": 1, "user_media": "not_user_media", "_note": "Per-user credential-encrypted misc data, e.g. a per-user Wi-Fi config copy (Android 11+). Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/misc_de/", "include": 1, "user_media": "not_user_media", "_note": "Per-user device-encrypted misc data, e.g. runtime permissions and roles (Android 11+). Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/property/", "include": 1, "user_media": "not_user_media", "_note": "persistent_properties (device and boot properties). Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/tombstones/", "include": 1, "user_media": "not_user_media", "_note": "Native crash records. Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."},
+    {"path": "data/log/", "include": 1, "user_media": "not_user_media", "_note": "Samsung device logs (e.g. power-off reset reason). Added 2026-11-15 (EVIDENCE_LOCATIONS.md)."}
   ]
 }

@@ -33,7 +33,7 @@ import tempfile
 from PySide6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QComboBox, QHBoxLayout, QVBoxLayout,
     QTableView, QPushButton, QFileDialog, QCheckBox, QDialog, QDialogButtonBox,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QMenu,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QBrush
@@ -590,6 +590,9 @@ class SqliteViewerMixin:
         # its stored order (the change view's order is part of the meaning).
         self._sql_table_view.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
         self._sql_table_view.setSortingEnabled(True)
+        # Right-click a row: its time columns on the Timeline.
+        self._sql_table_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._sql_table_view.customContextMenuRequested.connect(self._sql_context_menu)
 
         self._sql_status_label = QLabel("No database selected")
         # Which capture of a database the zip stores more than once — its
@@ -882,6 +885,39 @@ class SqliteViewerMixin:
                 f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL LIMIT {limit}')]
         except Exception:
             return []
+
+    def _sql_context_menu(self, pos) -> None:
+        """Right-click a database row: "🕒 Timeline" for each column the
+        tab shows as a time. The menu names the format and whether it is
+        your choice, built in, or a guess, so a jump made on a guessed
+        format is never taken for a known time."""
+        import epoch_guess
+        index = self._sql_table_view.indexAt(pos)
+        table = self._sql_table_combo.currentData()
+        add = getattr(self, '_timeline_add_time_menu', None)
+        if not index.isValid() or not table or add is None:
+            return
+        model = self._sql_table_view.model()
+        if model is self._sql_diff_model:
+            _status, values, _changed = model._rows[model._view[index.row()]]
+            row = dict(zip(model._columns[1:], values))
+        else:
+            row = self._sql_model.row_dict(index.row())
+        db = (self._sql_ui_path or '').rsplit('/', 1)[-1]
+        times = []
+        for column, (code, source) in self._sql_epoch_choices(table, list(row)).items():
+            raw = row.get(column)
+            if not code or epoch_guess.number(raw) in (None, 0):
+                continue
+            secs = epoch_guess.to_unix(raw, code)
+            if secs is None:
+                continue
+            fmt = f"{epoch_guess.label(code)}, {source}"
+            times.append((f"{column} ({fmt})", int(round(secs * 1000)),
+                          f"{db} {table}.{column} ({fmt})"))
+        menu = QMenu(self._sql_table_view)
+        if add(menu, times):
+            menu.exec(self._sql_table_view.viewport().mapToGlobal(pos))
 
     def _sql_epoch_choices(self, table: str, columns: list) -> dict:
         """{column: (code, source)} for *table*: your saved choice, then a

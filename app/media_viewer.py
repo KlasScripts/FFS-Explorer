@@ -3301,6 +3301,8 @@ class MediaViewerMixin:
                 else [clicked]
             if self._add_report_link_actions(menu, group):
                 menu.addSeparator()
+            if clicked and self._timeline_add_time_menu(menu, self._timeline_file_times(clicked)):
+                menu.addSeparator()
         self._bookmark_submenu(menu, paths)
         menu.exec(self._media_view.viewport().mapToGlobal(pos))
 

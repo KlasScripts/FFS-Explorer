@@ -2117,6 +2117,10 @@ class KeywordSearchMixin:
             leveldb_action = menu.addAction("Show Record in File Browser")
         elif offset is not None:
             sql_action = menu.addAction("Interpret as SQL Record")
+        # The hit's file times on the Timeline (an archive file only; a
+        # nested-archive or LevelDB record has no archive metadata).
+        self._timeline_add_time_menu(
+            menu, self._timeline_file_times(self._search_row_ui_path(item)))
         chosen = menu.exec(self.search_results_view.viewport().mapToGlobal(pos))
         if chosen == action:
             self._open_parent_folder_from_search(self._search_row_ui_path(item), full_path)

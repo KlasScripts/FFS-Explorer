@@ -347,19 +347,50 @@ def _where(start_ms=None, end_ms=None, scripts=None, app=None, text=None):
     return (' WHERE ' + ' AND '.join(clauses)) if clauses else '', args
 
 
+def count(cache_conn, start_ms=None, end_ms=None, scripts=None, app=None, text=None) -> int:
+    where, args = _where(start_ms, end_ms, scripts, app, text)
+    return cache_conn.execute(f'SELECT COUNT(*) FROM timeline_events{where}', args).fetchone()[0]
+
+
+def count_before(cache_conn, center_ms, start_ms=None, end_ms=None, scripts=None,
+                 app=None, text=None, descending=False) -> int:
+    """How many matching events come before *center_ms* in the list order
+    (earlier ones; later ones when *descending*) — the offset that centres
+    a capped list on that time."""
+    where, args = _where(start_ms, end_ms, scripts, app, text)
+    cmp_ = '>' if descending else '<'
+    where = (where + ' AND ' if where else ' WHERE ') + f'utc_ms {cmp_} ?'
+    return cache_conn.execute(f'SELECT COUNT(*) FROM timeline_events{where}',
+                              args + [int(center_ms)]).fetchone()[0]
+
+
 def query(cache_conn, start_ms=None, end_ms=None, scripts=None, app=None,
-          text=None, descending=False, limit=100_000):
+          text=None, descending=False, limit=100_000, offset=0):
     """(rows, total): matching events in time order (ties kept in report
-    order), at most *limit* rows, and how many matched in all — so a capped
-    list can say so (A-51)."""
+    order), at most *limit* rows from *offset*, and how many matched in
+    all — so a capped list can say so (A-51)."""
     where, args = _where(start_ms, end_ms, scripts, app, text)
     total = cache_conn.execute(f'SELECT COUNT(*) FROM timeline_events{where}', args).fetchone()[0]
     order = 'DESC' if descending else 'ASC'
     rows = cache_conn.execute(
         f"SELECT {', '.join(COLUMNS)} FROM timeline_events{where} "
-        f"ORDER BY utc_ms {order}, script, report_rowid, field LIMIT ?",
-        args + [int(limit)]).fetchall()
+        f"ORDER BY utc_ms {order}, script, report_rowid, field LIMIT ? OFFSET ?",
+        args + [int(limit), int(offset)]).fetchall()
     return rows, total
+
+
+def file_time_ms(value):
+    """UTC milliseconds for a file-system time as the archive metadata
+    stores it (whole seconds, or nanoseconds for the msgpack formats —
+    the same rule the File Browser's own display uses: above 1e10 is
+    nanoseconds). None for blank or zero, which mean "no time"."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not v or v != v:
+        return None
+    return int(round(v / 1e6)) if v > 1e10 else int(round(v * 1000))
 
 
 def apps(cache_conn) -> list:

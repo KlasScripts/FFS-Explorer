@@ -956,13 +956,17 @@ def start_run_log(conn: 'sqlite3.Connection', run_type: str,
 
 
 def complete_run_log(conn: 'sqlite3.Connection', run_id: int,
-                     processed: int, output_rows: int) -> None:
-    """Mark a run as complete, recording the finish time and output counts."""
+                     processed: int, output_rows: int, notes: str | None = None) -> None:
+    """Mark a run as complete, recording the finish time and output counts
+    (and *notes*, when given, e.g. how many proven-identical copies a
+    header scan read once)."""
     conn.execute(
         "UPDATE run_log SET completed_at=strftime('%Y-%m-%dT%H:%M:%S','now'), "
         "processed=?, output_rows=?, complete=1 WHERE id=?",
         (processed, output_rows, run_id),
     )
+    if notes is not None:
+        conn.execute("UPDATE run_log SET notes=? WHERE id=?", (notes, run_id))
     conn.commit()
 
 

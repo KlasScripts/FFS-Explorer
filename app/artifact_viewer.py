@@ -1087,7 +1087,8 @@ class ArtifactRunnerDialog(QDialog):
         platform = 'android' if is_android else 'ios'
         self._platform = platform
 
-        from artifact_runner import load_artifacts, _resolve_app_group_base
+        from artifact_runner import (load_artifacts, _resolve_app_group_base,
+                                     _resolve_app_bundle_base, _resolve_glob_subpath)
         all_artifacts, load_errors = load_artifacts(platform)
 
         def _exists(candidates):
@@ -1109,38 +1110,37 @@ class ArtifactRunnerDialog(QDialog):
                     for needle in needles
                     for name in zip_names
                 )
-            if hasattr(mod, 'app_path') and hasattr(mod, 'files'):
-                app_base = mod.app_path.strip('/')
+            # The parser's base folder and files are resolved exactly as
+            # run_artifact resolves them (app_path, app_group or
+            # app_bundle_id; a glob in a file path), so the list and the run
+            # can't disagree. Until 2026-11-17 a glob was checked literally
+            # (never matched) and app_bundle_id had no branch: both kinds of
+            # parser were left out of this list (iOS Instagram, LINE).
+            app_base = None
+            if hasattr(mod, 'files'):
+                if hasattr(mod, 'app_path'):
+                    app_base = mod.app_path.strip('/')
+                elif hasattr(mod, 'app_group'):
+                    app_base = _resolve_app_group_base(mod.app_group, self._guid_to_bundle)
+                    if app_base is None:
+                        return False
+                elif hasattr(mod, 'app_bundle_id'):
+                    app_base = _resolve_app_bundle_base(mod.app_bundle_id, self._guid_to_bundle)
+                    if app_base is None:
+                        return False
+            if app_base is not None:
                 # A parser that enumerates a whole directory itself rather
-                # than declaring fixed files (e.g. chrome_cache.py, via
-                # the _zip_names/_read_zip_bytes reserved paths keys —
-                # see artifact_runner.py) has genuinely no files entries
-                # to check existence against — `any()` over an empty
-                # files.values() is always False, which would silently
-                # hide it from this list regardless of whether its real
-                # target actually exists in the archive. Confirmed a real
-                # gap, not hypothetical: chrome_cache.py was invisible
-                # here on real casework where its own Cache_Data
-                # directory genuinely exists. existence_check_paths is
-                # the same subpath-relative-to-app_base convention as
-                # files.values(), for exactly this case — only consulted
-                # when files itself has nothing to check.
+                # than declaring fixed files (e.g. chrome_cache.py) names
+                # existence_check_paths instead; files itself is empty.
                 check_paths = (list(mod.files.values())
-                              or list(getattr(mod, 'existence_check_paths', ())))
-                if not check_paths:
-                    return False
-                return any(
-                    _exists(adapter.user_candidates(f"{app_base}/{sub.lstrip('/')}"))
-                    for sub in check_paths
-                )
-            if hasattr(mod, 'app_group') and hasattr(mod, 'files'):
-                app_base = _resolve_app_group_base(mod.app_group, self._guid_to_bundle)
-                if app_base is None:
-                    return False
-                return any(
-                    _exists(adapter.user_candidates(f"{app_base}/{sub.lstrip('/')}"))
-                    for sub in mod.files.values()
-                )
+                               or list(getattr(mod, 'existence_check_paths', ())))
+                for sub in check_paths:
+                    resolved = _resolve_glob_subpath(app_base, sub, adapter, zip_names)
+                    if resolved is None:
+                        continue
+                    if _exists(adapter.user_candidates(f"{app_base}/{resolved.lstrip('/')}")):
+                        return True
+                return False
             return any(
                 _exists(adapter.user_candidates(ui_path))
                 for ui_path in getattr(mod, 'target_paths', [])

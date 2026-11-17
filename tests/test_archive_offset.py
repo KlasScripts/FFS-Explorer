@@ -84,10 +84,10 @@ def test_setting_round_trip_and_display(tmp_path):
     o._archive_offset_detect, o._archive_zone_choice = got['detect'], 'fixed'
     o._timestamp_display_mode = 'archive'
     assert o.format_ts(JAN) == '2023-12-31 19:00:00 UTC−05:00'
-    assert o._timestamp_mode_text() == 'Local via archive DOS−UT (UTC−05:00, fixed)'
+    assert o._timestamp_mode_text() == "Archive zip DOS−UT, extraction tool's zone (UTC−05:00, fixed)"
     o._archive_zone_choice = 'America/Bogota'
     assert o.format_ts(JAN) == '2023-12-31 19:00:00 -05'
-    assert 'America/Bogota, a zone consistent with the zip' in o._timestamp_mode_text()
+    assert 'America/Bogota, consistent with the zip' in o._timestamp_mode_text()
     # never "Handset", and nothing chosen falls back to UTC
     o._archive_zone_choice = ''
     assert o._timestamp_mode_text() == 'UTC' and o.format_ts(JAN).endswith(' UTC')

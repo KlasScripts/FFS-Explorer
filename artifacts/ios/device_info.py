@@ -1,5 +1,5 @@
 """Device Info (iOS) — a one-page summary of the DEVICE itself, not app
-content: make/model/OS, FFS acquisition type, timezone, cellular (IMEI/
+content: make/model/OS, FFS acquisition type, phone timezone, cellular (IMEI/
 ICCID/phone/carrier), the Apple ID signed into the device, and any
 Contacts entry that email matches. Renders as a document
 (view_mode="document"), not a table — see CLAUDE.md Conventions' "view_mode
@@ -59,7 +59,8 @@ name = "Device Info"
 description = (
     "A one-page summary of the device that produced this extraction -- "
     "make/model/iOS version, FFS acquisition type (GrayKey/Cellebrite), "
-    "detected timezone, cellular identifiers (IMEI/ICCID/phone number/"
+    "the phone timezone with its source file (the full story is in the "
+    "Timezone & time sources report), cellular identifiers (IMEI/ICCID/phone number/"
     "carrier), the Apple ID signed into the device, and any Contacts "
     "entry that account's own email matches. Every field states its own "
     "real source file inline in the report. IMEI/ICCID/carrier come from "
@@ -144,6 +145,21 @@ def _sqlite_at(paths, ui_path):
     return open_db_readonly(db_path)
 
 
+def timezone_lines(read, adapter) -> list[str]:
+    """Short time zone rows: the phone's setting with its source, read with
+    the same helper as Timestamp Display's "Handset local". No verified iOS
+    source for the automatic time zone switch is read. The Acquisition PC
+    and the zip's DOS-vs-UT offset are in the Timezone & time sources report
+    only."""
+    import device_timezone as dt
+    phone = dt.phone_zone_ios(read, adapter)
+    lines = [f"- **Phone Timezone:** {phone['zone']} — from `{phone['source']}` ({phone['setting']})"
+             if phone else "- **Phone Timezone:** Not found",
+             "- **Automatic Time Zone:** Not determined (no verified iOS source)",
+             f"- *More detail: the **{dt.REPORT_NAME}** report.*"]
+    return lines
+
+
 def run(paths):
     ctx = paths["_case_context"]
     adapter, read = paths["_adapter"], paths["_read_zip_bytes"]
@@ -171,13 +187,8 @@ def run(paths):
     lines.append("- **FFS Type:** "
                  f"{_LAYOUT_LABELS.get(adapter.format, adapter.format)} (iOS)")
 
-    # Detected handset timezone — case_settings, set best-effort at first
-    # case-load (see timestamp_display.py / device_timezone.py Conventions).
-    tz_row = db.execute(
-        "SELECT value FROM case_settings WHERE key='handset_timezone_name'").fetchone()
-    if tz_row and tz_row[0]:
-        lines.append(f"- **Detected Timezone:** {tz_row[0]}")
     db.close()
+    lines.extend(timezone_lines(read, adapter))
     lines.append("")
 
     # wireless/Library/Preferences/com.apple.commcenter.plist

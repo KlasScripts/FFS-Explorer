@@ -186,8 +186,8 @@
         "2": "New parser -- the Android counterpart to ios/device_info.py, same four sections from entirely different sources: system/build.prop (build number, security patch level), telephony.db siminfo (every SIM: phone number, carrier, ICCID, IMSI, MCC/MNC, eSIM-vs-physical), accounts_de.db with accounts_ce.db fallback (the Google account), and contacts2.db (email cross-reference). Verified field-by-field against the Android 14 JoshHickman archive and its documented ground truth, and against a real 3-SIM device (Android 15 CTF25 Cellebrite). Reads siminfo.display_name before carrier_name and mcc_string/mnc_string rather than the legacy integer columns -- on the real Pixel 7a carrier_name is empty and mcc/mnc are both 0. States outright that an Android extraction carries no on-disk IMEI rather than leaving a silently missing field.",
         "3": "Adds a Screen Lock section: whether a PIN, pattern or password file (.pwd in data/system_de/0/spblob) exists, the newest .pwd modified time (and changed time where the extraction keeps it), and when the credential folder was last written. From lab run screenlock-history-001 (Android 16): the .pwd file was written at the second a PIN was set; removing it deleted the .pwd and rewrote the folder. Checked on the lab zips (no PIN, folder written at the removal) and three real images; on the Android 14 JoshHickman Pixel the .pwd time is a minute after the documented Google account add at setup. locksettings.db is left out because it is modified for other reasons."
       },
-      "hash": "38ddc5bdeef154c4",
-      "version": 3
+      "hash": "4a76b7e5949f327b",
+      "version": 4
     },
     "android:files_by_google_likely_viewer": {
       "changelog": {
@@ -369,6 +369,11 @@
         "1": "New parser -- exercises app/ccl_abx.py's ABX decoder (including this session's own two real correctness fixes) against a real shipped parser, the ABX counterpart to ios/wifi_known_networks.py's bplist demonstration. Modeled on ALEAPP's own settingsSecure.py (android_id/bluetooth_name/bluetooth_address/mock_location), reshaped into named columns matching this project's own convention. settings_secure.xml is real ABX on all three of this project's own Android archives, and is one of the exact files that failed outright before this session's own multi-root fix. Verified: real values on all three archives; the decoded Bluetooth MAC on Android 14 JoshHickman matches that archive's own documented ground truth bt_mac exactly."
       },
       "hash": "ae402b221ee5d235",
+      "version": 1
+    },
+    "android:timezone_report": {
+      "changelog": {},
+      "hash": "ddc5b7fd8a6be5c7",
       "version": 1
     },
     "android:usagestats": {

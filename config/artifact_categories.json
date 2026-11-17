@@ -178,6 +178,9 @@
       "category": "Device & App Info",
       "app": "Android System"
     },
+    "timezone_report": {
+      "category": "Device & App Info"
+    },
     "usagestats": {
       "category": "Usage & Activity"
     },
@@ -208,6 +211,9 @@
     },
     "sms_messages": {
       "category": "Chats & Messaging"
+    },
+    "timezone_report": {
+      "category": "Device & App Info"
     },
     "whatsapp": {
       "category": "Chats & Messaging"

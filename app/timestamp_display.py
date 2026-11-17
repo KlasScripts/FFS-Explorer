@@ -104,6 +104,11 @@ def _format_ts_named_zone(ts, zone_name: str) -> str:
         return _format_ts_cached(ts)
 
 
+# Bumped when handset-zone detection learns a new source, so a case saved
+# under the old rule is detected once more ('2': Android persist.sys.timezone).
+HANDSET_ZONE_RULE = '2'
+
+
 class TimestampDisplayMixin:
     """Mixed into FastZipBrowser. Owns: the shared mode banner above every
     tab, the per-case UTC/handset/acquisition/manual mode choice and its
@@ -166,9 +171,9 @@ class TimestampDisplayMixin:
             choice = getattr(self, '_archive_zone_choice', '')
             fixed = self._archive_fixed_offset()
             if choice == 'fixed' and fixed is not None:
-                return f"Local via archive DOS−UT ({_archive_offset.offset_text(fixed)}, fixed)"
+                return f"Archive zip DOS−UT, extraction tool's zone ({_archive_offset.offset_text(fixed)}, fixed)"
             if choice and choice != 'fixed':
-                return f"Local via archive DOS−UT ({choice}, a zone consistent with the zip)"
+                return f"Archive zip DOS−UT, extraction tool's zone ({choice}, consistent with the zip)"
         return "UTC"
 
     def _after_timestamp_mode_change(self) -> None:
@@ -245,14 +250,19 @@ class TimestampDisplayMixin:
                 if zone_setting is None:
                     # Never detected for this case — run the cheap part once now.
                     is_first_load = True
-                    handset_zone = _device_timezone.detect_handset_zone(
-                        zip_path, adapter, case_dir) or ''
+                    handset_zone = self._detect_and_save_handset_zone(db, zip_path, adapter, case_dir)
                     acquisition = _device_timezone.detect_acquisition_offset(zip_path)
-                    save_case_setting(db, 'handset_timezone_name', handset_zone)
                     save_case_setting(db, 'acquisition_offset_hours',
                                       '' if acquisition is None else str(acquisition[0]))
                     save_case_setting(db, 'acquisition_dt',
                                       '' if acquisition is None else acquisition[1].isoformat())
+                elif (load_case_setting(db, 'handset_timezone_rule', '') or '') != HANDSET_ZONE_RULE:
+                    # Detected by an older rule (iOS only until 2026-11-16):
+                    # an Android case saved '' then. Detect once more; a
+                    # zone the examiner may already be displaying in is
+                    # only replaced if the new rule finds one.
+                    handset_zone = (self._detect_and_save_handset_zone(db, zip_path, adapter, case_dir)
+                                    or zone_setting)
                 else:
                     handset_zone = zone_setting
                 acquisition_zone = load_case_setting(db, 'acquisition_timezone_name', '') or ''
@@ -262,6 +272,19 @@ class TimestampDisplayMixin:
         except Exception:
             archive = {'detect': None, 'choice': ''}
         return handset_zone, acquisition_zone, manual_zone, mode, is_first_load, archive
+
+    @staticmethod
+    def _detect_and_save_handset_zone(db, zip_path: str, adapter, case_dir: str) -> str:
+        """The phone's own zone setting (iOS db/timezone/localtime, Android
+        persist.sys.timezone) saved with the file it came from, so the
+        dialog, Device Info and the Timezone report name the same source."""
+        info = _device_timezone.detect_handset_zone_info(zip_path, adapter, case_dir) or {}
+        zone = info.get('zone') or ''
+        source = f"{info['source']} ({info['setting']})" if zone else ''
+        save_case_setting(db, 'handset_timezone_name', zone)
+        save_case_setting(db, 'handset_timezone_source', source)
+        save_case_setting(db, 'handset_timezone_rule', HANDSET_ZONE_RULE)
+        return zone
 
     @staticmethod
     def _load_or_detect_archive_offset(db, zip_path: str, case_dir: str) -> dict:
@@ -322,8 +345,9 @@ class TimestampDisplayMixin:
             with closing(_open_results_db(case_dir)) as db:
                 offset_str = load_case_setting(db, 'acquisition_offset_hours', '') or ''
                 acq_str    = load_case_setting(db, 'acquisition_dt', '') or ''
+                handset_source = load_case_setting(db, 'handset_timezone_source', '') or ''
         except Exception:
-            offset_str, acq_str = '', ''
+            offset_str, acq_str, handset_source = '', '', ''
 
         acquisition_candidates: list[str] = []
         acquisition_guess = None
@@ -380,50 +404,13 @@ class TimestampDisplayMixin:
         handset_radio = None
         if self._handset_zone_name:
             handset_radio = QRadioButton(
-                f"Handset local — {self._handset_zone_name} (detected from device)")
+                f"Handset local — {self._handset_zone_name} (from phone)")
             group.addButton(handset_radio)
             v.addWidget(handset_radio)
-
-        archive_radio = None
-        archive_combo = None
-        det = getattr(self, '_archive_offset_detect', None) or {}
-        if det.get('status') in ('fixed', 'dst'):
-            archive_combo = QComboBox()
-            fixed = self._archive_fixed_offset()
-            if fixed is not None:
-                archive_combo.addItem(
-                    f"Fixed {_archive_offset.offset_text(fixed)} (from the zip)", 'fixed')
-            else:
-                archive_combo.addItem("— pick a zone consistent with the zip —", None)
-            if det.get('zones'):
-                archive_combo.insertSeparator(archive_combo.count())
-                for zone in det['zones']:
-                    archive_combo.addItem(f"{zone} — consistent with the zip", zone)
-            idx = archive_combo.findData(getattr(self, '_archive_zone_choice', '') or None)
-            if idx >= 0:
-                archive_combo.setCurrentIndex(idx)
-            n = det.get('n') or 0
-            seen = ', '.join(f"{c:,} at {_archive_offset.offset_text(o)}"
-                             for o, c in (det.get('bins') or [])[:2]) if n else ''
-            pattern = ("one fixed offset" if fixed is not None else
-                       "two offsets an hour apart (daylight saving), so no single "
-                       "fixed offset fits; pick a zone")
-            row = QHBoxLayout()
-            archive_radio = QRadioButton("Archive offset (DOS vs UT) —")
-            group.addButton(archive_radio)
-            row.addWidget(archive_radio)
-            row.addWidget(archive_combo, 1)
-            v.addLayout(row)
             v.addWidget(note_label(
-                "(Inferred from how this zip records each file's time twice: DOS, the "
-                "local wall clock, and UT, UTC. It may not match every older event if "
-                "the device timezone changed (travel, DST). Prefer UTC for reporting "
-                f"unless you need local. Sampled {n:,} files: {seen}: {pattern}. "
-                f"{len(det.get('zones') or [])} zones give the same offset as the zip for "
-                f"at least {_archive_offset.ZONE_MATCH:.0%} of the sampled files, each at "
-                "its own date; none is picked for you.)"))
-            archive_combo.setEnabled(current_mode == 'archive')
-            archive_radio.toggled.connect(archive_combo.setEnabled)
+                "(The phone's own time zone setting at extraction"
+                + (f", read from {handset_source}" if handset_source else "")
+                + ". It does not say which zone the phone was in on earlier dates.)"))
 
         def _zone_offset_label(zone_name: str) -> str:
             # All candidates share the same offset at acq_dt by construction
@@ -468,7 +455,7 @@ class TimestampDisplayMixin:
             if preselect and preselect in acquisition_candidates:
                 acquisition_combo.setCurrentIndex(acquisition_candidates.index(preselect))
             acquisition_radio = _add_zone_row(
-                "Acquisition computer —", acquisition_combo,
+                "Acquisition PC —", acquisition_combo,
                 f"(the .ufd acquisition report — not this computer, and not "
                 f"necessarily the examiner reviewing this case now — recorded "
                 f"UTC{'+' if offset_hours >= 0 else ''}{offset_hours:g}:00 at "
@@ -476,6 +463,49 @@ class TimestampDisplayMixin:
                 f"that offset — pick the correct one if you know it, otherwise "
                 f"the pre-selected guess is only a starting suggestion)",
                 'acquisition')
+
+        archive_radio = None
+        archive_combo = None
+        det = getattr(self, '_archive_offset_detect', None) or {}
+        if det.get('status') in ('fixed', 'dst'):
+            archive_combo = QComboBox()
+            fixed = self._archive_fixed_offset()
+            if fixed is not None:
+                archive_combo.addItem(
+                    f"Fixed {_archive_offset.offset_text(fixed)} (from the zip)", 'fixed')
+            else:
+                archive_combo.addItem("— pick a zone consistent with the zip —", None)
+            if det.get('zones'):
+                archive_combo.insertSeparator(archive_combo.count())
+                for zone in det['zones']:
+                    archive_combo.addItem(f"{zone} — consistent with the zip", zone)
+            idx = archive_combo.findData(getattr(self, '_archive_zone_choice', '') or None)
+            if idx >= 0:
+                archive_combo.setCurrentIndex(idx)
+            n = det.get('n') or 0
+            seen = ', '.join(f"{c:,} at {_archive_offset.offset_text(o)}"
+                             for o, c in (det.get('bins') or [])[:2]) if n else ''
+            pattern = ("one fixed offset" if fixed is not None else
+                       "two offsets an hour apart (daylight saving), so no single "
+                       "fixed offset fits; pick a zone")
+            row = QHBoxLayout()
+            archive_radio = QRadioButton("Archive (zip DOS vs UT) —")
+            group.addButton(archive_radio)
+            row.addWidget(archive_radio)
+            row.addWidget(archive_combo, 1)
+            v.addLayout(row)
+            v.addWidget(note_label(
+                "(Inferred from how this zip records each file's time twice: UT, UTC, "
+                "and DOS, a local time the extraction software wrote at download in "
+                "the zone it was set to, usually the download computer's. It is not "
+                "the phone's setting and says nothing about where the phone was when "
+                "a file was made. Prefer UTC for reporting unless you need local. "
+                f"Sampled {n:,} files: {seen}: {pattern}. "
+                f"{len(det.get('zones') or [])} zones give the same offset as the zip for "
+                f"at least {_archive_offset.ZONE_MATCH:.0%} of the sampled files, each at "
+                "its own date; none is picked for you.)"))
+            archive_combo.setEnabled(current_mode == 'archive')
+            archive_radio.toggled.connect(archive_combo.setEnabled)
 
         # Manual zone — always offered, unlike the one above (which needs a
         # .ufd to guess from and simply doesn't exist for e.g. a GrayKey
@@ -521,14 +551,16 @@ class TimestampDisplayMixin:
             "⚠ Detected/guessed zones are a snapshot at the moment of "
             "seizure only. If the device changed timezone earlier in its "
             "history (travel, DST, a manual change), older evidence will "
-            "display in the wrong zone under either non-UTC option. The "
-            "\"Acquisition computer\" option is not read from the device at "
-            "all, and is NOT this computer or whoever is reviewing the case "
-            "right now — it's a guess from the workstation that originally "
-            "ran the acquisition, and several real-world zones can share the "
-            "same offset, so confirm or correct it above rather than "
-            "trusting the pre-selected default. Always verify against UTC "
-            "before citing a time in a report.",
+            "display in the wrong zone under any non-UTC option. Only "
+            "\"Handset local\" is read from the phone. \"Acquisition PC\" "
+            "and \"Archive (zip DOS vs UT)\" describe the extraction: the "
+            "workstation that ran the acquisition and the zone the extraction "
+            "software wrote the zip's local times in. Neither is this "
+            "computer or whoever is reviewing the case now, and several "
+            "real-world zones can share one offset, so confirm or correct "
+            "them rather than trusting a pre-selected default. Always verify "
+            "against UTC before citing a time in a report. The Timezone & "
+            "time sources artifact report sets the sources side by side.",
             style=WARNING_STYLE))
 
         # OK only -- no Cancel (see the dlg construction above for why).

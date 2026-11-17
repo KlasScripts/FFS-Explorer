@@ -20,9 +20,14 @@ precision).
   never picked for them: several zones share any offset history.
 - Anything else: no consensus, the option is not offered.
 
-The offset says how the zip's DOS times were written, which is the device's
-clock setting for each file as the extraction tool read it. It may not hold
-for every event if the zone changed (travel, a manual change).
+The offset says how the zip's DOS times were written: by the extraction
+software, at download, in the zone it was set to (usually the download
+computer's, possibly the phone's; which one is untested, as the phone and
+the download PC were both US Eastern on every test image). It is not
+evidence of the phone's zone at any time: a phone seized in Los Angeles and
+downloaded in New York would show New York here. The daylight-saving
+pattern only means the converting clock applied one zone's rules to each
+file's own date.
 """
 import calendar
 import struct

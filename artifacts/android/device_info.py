@@ -93,7 +93,9 @@ name = "Device Info"
 description = (
     "A one-page summary of the device that produced this extraction -- "
     "make/model/Android version, build number and security patch level, "
-    "FFS acquisition type, detected timezone, cellular identifiers per SIM "
+    "FFS acquisition type, the phone timezone and automatic time zone switch "
+    "(each with its source file; the full story is in the Timezone & time "
+    "sources report), cellular identifiers per SIM "
     "(ICCID/phone number/carrier/IMSI/MCC-MNC), the Google account signed "
     "into the device, and any Contacts entry that account's own email "
     "matches. Every field states its own real source file inline in the "
@@ -233,6 +235,29 @@ def screen_lock_lines(ui_metadata: dict) -> list[str]:
     return lines
 
 
+def timezone_lines(read, adapter) -> list[str]:
+    """Short time zone rows: the phone's setting and the automatic time zone
+    switch, each with its source, read with the same helpers as Timestamp
+    Display's "Handset local". The Acquisition PC, the zip's DOS-vs-UT
+    offset and weak hints are in the Timezone & time sources report only."""
+    import device_timezone as dt
+    lines = []
+    phone = dt.phone_zone_android(read, adapter)
+    if phone:
+        lines.append(f"- **Phone Timezone:** {phone['zone']} — from `{phone['source']}` "
+                     f"(`{phone['setting']}`)")
+    else:
+        lines.append("- **Phone Timezone:** Not found")
+    auto = dt.auto_time_zone_android(read, adapter)
+    if auto and auto.get("auto_time_zone") is not None:
+        lines.append(f"- **Automatic Time Zone:** {'On' if auto['auto_time_zone'] else 'Off'} — from "
+                     f"`{auto['source']}` (`auto_time_zone`)")
+    else:
+        lines.append("- **Automatic Time Zone:** Not found")
+    lines.append(f"- *More detail: the **{dt.REPORT_NAME}** report.*")
+    return lines
+
+
 def run(paths):
     import os
     from artifact_runner import open_db_readonly
@@ -272,15 +297,8 @@ def run(paths):
     lines.append("- **FFS Type:** "
                  f"{_LAYOUT_LABELS.get(adapter.format, adapter.format)} (Android)")
 
-    # Detected handset timezone — case_settings, set best-effort at first
-    # case-load (see timestamp_display.py / device_timezone.py
-    # Conventions). Genuinely empty on some real cases, including this
-    # project's own Android 14 JoshHickman one — hence the guard.
-    tz_row = db.execute(
-        "SELECT value FROM case_settings WHERE key='handset_timezone_name'").fetchone()
-    if tz_row and tz_row[0]:
-        lines.append(f"- **Detected Timezone:** {tz_row[0]}")
     db.close()
+    lines.extend(timezone_lines(read, adapter))
     lines.append("")
 
     # telephony.db siminfo — EVERY row, not just the first: a dual-SIM

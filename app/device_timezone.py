@@ -1,5 +1,6 @@
 """device_timezone.py — best-effort detection of the timezone in effect at
-the moment of seizure, for the opt-in "device-local" timestamp display mode.
+the moment of seizure, for the opt-in "device-local" timestamp display mode
+and the Timezone & time sources / Device Info reports.
 
 Qt-free, standalone (opens its own zip), matches the convention of
 artifacts/*.py and mcp_server.py. Both detectors return None on any failure
@@ -176,53 +177,315 @@ _WINDOWS_TO_IANA = {
 }
 
 
-def detect_handset_zone(zip_path: str, adapter, case_dir: str | None = None) -> str | None:
-    """Return the device's own configured IANA timezone name (e.g.
-    'America/New_York'), or None if not found.
+# ── The phone's own time zone settings ──────────────────────────────────
+# Each helper takes read(physical_name) -> bytes | None (raising is fine:
+# it is caught) and the case's adapter, so the Timestamp Display dialog
+# (CachedZipView over the .zcd index) and the device_wide artifact parsers
+# (paths['_read_zip_bytes']) share one implementation. Every result names
+# the exact zip entry it was read from.
 
-    iOS only — verified against a real Cellebrite FFS extraction that
-    `private/var/db/timezone/localtime` is present as a small text file
-    whose content is the resolved zoneinfo path (on a live device this is a
-    symlink; extractions capture it as plain file content instead). No
-    separate Android/iOS check is needed: the file simply won't exist on an
-    Android extraction, so absence is self-describing.
+IOS_LOCALTIME = 'db/timezone/localtime'
+IOS_DATETIME_PLIST = 'db/timed/Library/Preferences/com.apple.preferences.datetime.plist'
+ANDROID_PROPS = 'data/property/persistent_properties'
+ANDROID_OLD_PROP = 'data/property/persist.sys.timezone'      # Android 8 and older: one file per property
+ANDROID_SETTINGS_GLOBAL = 'data/system/users/0/settings_global.xml'
+ANDROID_NETPOLICY = 'data/system/netpolicy.xml'
+_BATTERY_DB_RE = re.compile(r'(^|/)data/user_de/0/com\.android\.settings/databases/battery-usage-db-v\d+$')
+_OLSON_RE = re.compile(rb'\b(?:Africa|America|Antarctica|Arctic|Asia|Atlantic|Australia|Europe|Indian|Pacific)'
+                       rb'/[A-Z][A-Za-z_\-]+(?:/[A-Z][A-Za-z_\-]+)?')
+_ZONED_RE = re.compile(r'\[([A-Za-z_]+/[A-Za-z_/\-+]+)\]')
+MAX_WEAK_HINTS = 3
 
-    Uses adapter.user_candidates() (not system_candidates()) — verified
-    directly against the real archive that `/private/var/db/...` resolves
-    under the same prefix as `/private/var/mobile/...` (the same partition
-    every other artifact parser already reads from), not the OS/system
-    partition.
 
-    Reads via the local .zcd central-directory cache (zip_cd_cache) only —
-    never a raw zipfile.ZipFile on the main archive (this project's own
-    standing Convention has no exception for this case). Never touches the
-    app's shared, non-thread-safe zip handle either way (this runs off the
-    GUI thread). Returns None (no zone detected) rather than falling back
-    to a raw zip open when case_dir is missing or the cache isn't
-    available yet — the one real caller (timestamp_display.py) only ever
-    invokes this from inside an already-open case_dir-keyed DB connection,
-    so case_dir is always truthy in practice; this only matters as an
-    honest default for a hypothetical caller that doesn't.
-    """
-    if not case_dir:
-        return None
+def _candidates(adapter, ui_path: str) -> list[str]:
+    out = []
     try:
-        infos = _zcd_load(zip_path, case_dir)
-        if infos is None:
-            return None
-        with CachedZipView(zip_path, infos) as z:
-            names = frozenset(z.namelist())
-            for candidate in adapter.user_candidates('db/timezone/localtime'):
-                if candidate not in names:
-                    continue
-                content = z.open(candidate).read().decode('utf-8', errors='replace').strip()
-                if 'zoneinfo/' not in content:
-                    continue
-                zone = content.split('zoneinfo/', 1)[1].strip()
-                return zone or None
+        out.append(adapter.resolve(ui_path))
     except Exception:
         pass
+    try:
+        out.extend(adapter.user_candidates(ui_path))
+    except Exception:
+        pass
+    seen, uniq = set(), []
+    for c in out:
+        if c and c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
+def _read_first(read, adapter, ui_path: str):
+    """(physical name, bytes) of the first candidate that reads, or (None, None)."""
+    for name in _candidates(adapter, ui_path):
+        try:
+            data = read(name)
+        except Exception:
+            data = None
+        if data:
+            return name, data
+    return None, None
+
+
+def _varint(buf: bytes, pos: int):
+    shift = result = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return result, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError('varint too long')
+
+
+def parse_persistent_properties(data: bytes) -> dict:
+    """{name: value} from Android's data/property/persistent_properties
+    (Android 9+): a protobuf PersistentProperties message, field 1 repeated
+    PersistentPropertyRecord {1: name, 2: value}. Unknown fields are
+    skipped; a damaged file gives the whole records read before the damage."""
+    out = {}
+    pos, n = 0, len(data or b'')
+    try:
+        while pos < n:
+            key, pos = _varint(data, pos)
+            field, wire = key >> 3, key & 7
+            if wire == 2:
+                length, pos = _varint(data, pos)
+                if pos + length > n:
+                    break                      # cut short: never return a partial record
+                chunk = data[pos:pos + length]
+                pos += length
+                if field != 1:
+                    continue
+                name = value = None
+                p = 0
+                while p < len(chunk):
+                    k, p = _varint(chunk, p)
+                    if k & 7 != 2:
+                        break
+                    ln, p = _varint(chunk, p)
+                    text = chunk[p:p + ln].decode('utf-8', 'replace')
+                    p += ln
+                    if k >> 3 == 1:
+                        name = text
+                    elif k >> 3 == 2:
+                        value = text
+                if name is not None:
+                    out[name] = value if value is not None else ''
+            elif wire == 0:
+                _v, pos = _varint(data, pos)
+            elif wire == 5:
+                pos += 4
+            elif wire == 1:
+                pos += 8
+            else:
+                break
+    except (IndexError, ValueError):
+        pass
+    return out
+
+
+def _known_zone(zone: str) -> bool:
+    try:
+        return zone in available_timezones()
+    except Exception:
+        return False
+
+
+def phone_zone_ios(read, adapter) -> dict | None:
+    """{'zone', 'source', 'setting', 'known'} from db/timezone/localtime.
+    Verified on the iOS 17 Cellebrite image: the extraction keeps the
+    symlink as a small file whose content is the zoneinfo path
+    ('/var/db/timezone/zoneinfo/America/New_York')."""
+    for name in _candidates(adapter, IOS_LOCALTIME):
+        try:
+            data = read(name)
+        except Exception:
+            data = None
+        if not data:
+            continue
+        content = data[:300].decode('utf-8', 'replace').strip()
+        if 'zoneinfo/' not in content:
+            continue
+        zone = content.split('zoneinfo/', 1)[1].strip()
+        if zone:
+            return {'zone': zone, 'source': name,
+                    'setting': 'symlink target', 'known': _known_zone(zone)}
     return None
+
+
+def phone_zone_android(read, adapter) -> dict | None:
+    """{'zone', 'source', 'setting', 'confidence', 'known'} from
+    persist.sys.timezone. Android 9+ keeps it in
+    data/property/persistent_properties (verified on the Pixel 7a, Galaxy
+    A53 and Poco X7 Pro images and the Android 16 lab emulator); older
+    Android keeps one file per property (data/property/persist.sys.timezone,
+    not tested on a real image). vendor.qemu.timezone (emulators only) is
+    never used."""
+    name, data = _read_first(read, adapter, ANDROID_PROPS)
+    if data:
+        props = parse_persistent_properties(data)
+        zone = (props.get('persist.sys.timezone') or '').strip()
+        if zone:
+            return {'zone': zone, 'source': name, 'setting': 'persist.sys.timezone',
+                    'confidence': (props.get('persist.sys.timezone_confidence') or '').strip(),
+                    'known': _known_zone(zone)}
+    name, data = _read_first(read, adapter, ANDROID_OLD_PROP)
+    if data:
+        zone = data[:100].decode('utf-8', 'replace').strip()
+        if zone:
+            return {'zone': zone, 'source': name, 'setting': 'persist.sys.timezone',
+                    'confidence': '', 'known': _known_zone(zone)}
+    return None
+
+
+def phone_zone(read, adapter) -> dict | None:
+    """The phone's own current zone setting, iOS or Android. The two
+    platforms' files never both exist, so no platform check is needed."""
+    return phone_zone_ios(read, adapter) or phone_zone_android(read, adapter)
+
+
+def _xml_root(data: bytes):
+    import ccl_abx
+    if ccl_abx.is_abx(data):
+        return ccl_abx.abx_bytes_to_xml_root(data)
+    import xml.etree.ElementTree as ET
+    return ET.fromstring(data)
+
+
+def auto_time_zone_android(read, adapter) -> dict | None:
+    """{'auto_time_zone': True/False/None, 'auto_time': True/False/None,
+    'source'} from settings_global.xml (ABX on Android 12+). Lab-verified
+    (Android 16 emulator, 2026-11-16): turning "Set time zone
+    automatically" off changed auto_time_zone from 1 to 0."""
+    name, data = _read_first(read, adapter, ANDROID_SETTINGS_GLOBAL)
+    if not data:
+        return None
+    try:
+        root = _xml_root(data)
+    except Exception:
+        return None
+    vals = {}
+    for el in root.iter('setting'):
+        key = el.get('name')
+        if key in ('auto_time_zone', 'auto_time'):
+            vals[key] = el.get('value')
+
+    def _flag(v):
+        return None if v is None else v.strip() == '1'
+    return {'auto_time_zone': _flag(vals.get('auto_time_zone')),
+            'auto_time': _flag(vals.get('auto_time')),
+            'source': name}
+
+
+def ios_datetime_prefs(read, adapter) -> dict | None:
+    """{'values': {key: value}, 'source'} — the plain keys of timed's
+    com.apple.preferences.datetime.plist. Shown raw: on the iOS 17 image it
+    holds only 'timezoneset' = True, whose meaning is not verified, so it is
+    NOT reported as the automatic time zone switch."""
+    name, data = _read_first(read, adapter, IOS_DATETIME_PLIST)
+    if not data:
+        return None
+    import plistlib
+    try:
+        p = plistlib.loads(data)
+    except Exception:
+        return None
+    if not isinstance(p, dict):
+        return None
+    return {'values': {k: v for k, v in p.items() if isinstance(v, (str, bool, int, float))},
+            'source': name}
+
+
+def weak_hints_android(read, adapter, ui_paths=()) -> list[dict]:
+    """Up to MAX_WEAK_HINTS incidental zone ids, each {'source', 'value',
+    'detail'}. Only these allow-listed files are read; app and system
+    tzdata files are never searched (every tzdata copy lists every zone).
+    - netpolicy.xml: a ZonedDateTime such as cycleStart
+      '2023-01-16T00:00-05:00[America/New_York]' (the mobile-data cycle,
+      saved with the zone in effect then; Pixel, Galaxy A53, Poco X7 Pro).
+    - Settings' battery-usage-db-v*: a zone id somewhere in the database
+      (seen on the Android 16 lab emulator; not on the three real phones).
+    *ui_paths*: the case's ui paths, to find which battery-usage-db version
+    the phone has."""
+    hints = []
+    name, data = _read_first(read, adapter, ANDROID_NETPOLICY)
+    if data:
+        try:
+            root = _xml_root(data)
+            seen = set()
+            for el in root.iter():
+                for attr, value in el.attrib.items():
+                    m = _ZONED_RE.search(str(value))
+                    if m and (m.group(1), attr) not in seen:
+                        seen.add((m.group(1), attr))
+                        hints.append({'source': name, 'value': m.group(1),
+                                      'detail': f"{el.tag} {attr}={value}"})
+        except Exception:
+            pass
+    for ui in sorted(p for p in ui_paths if _BATTERY_DB_RE.search(p)):
+        name, data = _read_first(read, adapter, ui)
+        if not data:
+            continue
+        for zone in sorted({m.decode() for m in _OLSON_RE.findall(data)}):
+            hints.append({'source': name, 'value': zone,
+                          'detail': 'zone id found in the database file'})
+    return hints[:MAX_WEAK_HINTS]
+
+
+def compare_with_archive(zone: str, archive_detect: dict | None) -> str | None:
+    """'agree', 'disagree', or None (nothing to compare): whether the phone's
+    zone is one of the zones that fit the zip's DOS−UT stamps. The DOS time
+    is written by the extraction software in ITS zone (usually the download
+    computer's), so 'disagree' most often means the phone was downloaded
+    in another zone, not that the phone's zone changed."""
+    det = archive_detect or {}
+    if not zone or det.get('status') not in ('fixed', 'dst'):
+        return None
+    return 'agree' if zone in (det.get('zones') or []) else 'disagree'
+
+
+def _zip_reader(zip_path: str, case_dir: str | None):
+    """(read, close) over the case's .zcd index, or (None, None)."""
+    if not case_dir:
+        return None, None
+    infos = _zcd_load(zip_path, case_dir)
+    if infos is None:
+        return None, None
+    view = CachedZipView(zip_path, infos)
+    names = frozenset(view.namelist())
+
+    def read(name):
+        if name not in names:
+            return None
+        with view.open(name) as f:
+            return f.read()
+    return read, (lambda: None)
+
+
+def detect_handset_zone_info(zip_path: str, adapter, case_dir: str | None = None) -> dict | None:
+    """phone_zone() over the case's cached zip index (never a raw
+    zipfile.ZipFile on the main archive), or None. Never raises."""
+    try:
+        read, close = _zip_reader(zip_path, case_dir)
+        if read is None:
+            return None
+        try:
+            return phone_zone(read, adapter)
+        finally:
+            close()
+    except Exception:
+        return None
+
+
+def detect_handset_zone(zip_path: str, adapter, case_dir: str | None = None) -> str | None:
+    """The phone's own configured IANA zone name (e.g. 'America/New_York'),
+    or None: iOS db/timezone/localtime, Android persist.sys.timezone. A
+    snapshot at extraction only. See detect_handset_zone_info."""
+    info = detect_handset_zone_info(zip_path, adapter, case_dir)
+    return (info or {}).get('zone') or None
 
 
 _UFD_DATE_RE = re.compile(
@@ -291,8 +554,8 @@ def detect_system_zone() -> str | None:
     Offered purely as a convenience starting point in the manual
     zone-selection list (see the "Timestamp Display" dialog) for cases with
     no .ufd to guess an acquisition offset from (e.g. GrayKey extractions)
-    and no detected handset zone (Android has no equivalent to iOS's
-    localtime file) — never pre-selected, never treated as authoritative
+    and no detected handset zone (neither iOS db/timezone/localtime nor
+    Android persist.sys.timezone found) — never pre-selected, never treated as authoritative
     for either the device or the acquisition.
 
     Works on Windows too (most DF work on this project happens there, so
@@ -362,3 +625,141 @@ def guess_acquisition_zones(offset_hours: float, acquisition_dt: datetime) -> tu
         return None, []
     best = next((z for z in _COMMON_ZONE_PREFERENCE if z in matches), matches[0])
     return best, matches
+
+
+# ── Timezone & time sources report: the sections both platforms share ──
+
+REPORT_NAME = "Timezone & time sources"
+
+REPORT_WARNING = (
+    "> **Timezone at acquisition is a snapshot.** Some apps, EXIF, and older "
+    "file times may reflect travel, DST, or an earlier zone. Prefer **UTC** for "
+    "reporting unless you need local display. Cross-check important times "
+    "against content.")
+
+
+def _offset_text(minutes: int) -> str:
+    sign = '+' if minutes >= 0 else '−'
+    hh, mm = divmod(abs(int(minutes)), 60)
+    return f"UTC{sign}{hh:02d}:{mm:02d}"
+
+
+def _zone_offset_minutes(zone: str, when_utc: datetime):
+    try:
+        return int(when_utc.astimezone(ZoneInfo(zone)).utcoffset().total_seconds() // 60)
+    except Exception:
+        return None
+
+
+def case_archive_detect(settings: dict, zip_path: str, case_dir: str):
+    """The case's stored archive_offset.detect() result, or a fresh one from
+    the cached zip index when the case has none yet (not stored here)."""
+    import json
+    raw = (settings or {}).get('archive_offset')
+    if raw:
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
+    try:
+        import archive_offset
+        return archive_offset.detect_from_archive(zip_path, case_dir)
+    except Exception:
+        return None
+
+
+def acquisition_pc_lines(settings: dict, zip_path: str, phone_zone_name: str = '') -> list[str]:
+    """'## Acquisition PC (not the phone)' from the .ufd's [General] Date."""
+    lines = ["## Acquisition PC (not the phone)"]
+    offset_hours, acq_dt = None, None
+    s = settings or {}
+    if s.get('acquisition_offset_hours') and s.get('acquisition_dt'):
+        try:
+            offset_hours, acq_dt = float(s['acquisition_offset_hours']), datetime.fromisoformat(s['acquisition_dt'])
+        except ValueError:
+            offset_hours = None
+    if offset_hours is None:
+        got = detect_acquisition_offset(zip_path) if zip_path else None
+        if got:
+            offset_hours, acq_dt = got
+    if offset_hours is None:
+        lines.append("- **Acquisition PC offset:** Not found (no `.ufd` acquisition report "
+                     "next to the archive, or no Date field in it).")
+        return lines
+    ufd = os.path.basename(os.path.splitext(zip_path)[0] + '.ufd')
+    lines.append(f"- **Acquisition PC offset:** {_offset_text(round(offset_hours * 60))} at "
+                 f"{acq_dt:%Y-%m-%d %H:%M:%S} PC local time — from `{ufd}` ([General] Date)")
+    guess, zones = guess_acquisition_zones(offset_hours, acq_dt)
+    if zones:
+        lines.append(f"- **Zones with that offset on that date:** {len(zones)}; "
+                     f"suggested starting point {guess} (a guess, not read from anywhere)")
+    if s.get('acquisition_timezone_name'):
+        lines.append(f"- **Zone the examiner confirmed for the Acquisition PC:** {s['acquisition_timezone_name']}")
+    if phone_zone_name and acq_dt is not None:
+        try:
+            phone_min = int(ZoneInfo(phone_zone_name).utcoffset(acq_dt).total_seconds() // 60)
+        except Exception:
+            phone_min = None
+        if phone_min is not None:
+            if phone_min == round(offset_hours * 60):
+                lines.append(f"- The phone's zone ({phone_zone_name}) had the same offset on that date.")
+            else:
+                lines.append(f"- ⚠️ **Different from the phone:** the phone's zone ({phone_zone_name}) was "
+                             f"{_offset_text(phone_min)} on that date. The extraction was run in a "
+                             "different zone from the phone's setting.")
+    lines.append("- *The PC that ran the acquisition and wrote the `.ufd`. Not the phone, and not "
+                 "necessarily the computer reviewing this case.*")
+    return lines
+
+
+def archive_lines(det: dict | None, phone_zone_name: str = '') -> list[str]:
+    """'## Archive (zip DOS vs UT)' from an archive_offset.detect() result."""
+    import archive_offset as ao
+    lines = ["## Archive (zip DOS vs UT)"]
+    det = det or {}
+    n = det.get('n') or 0
+    bins = det.get('bins') or []
+    status = det.get('status')
+    if status not in ('fixed', 'dst'):
+        if n < ao.MIN_SAMPLES:
+            lines.append(f"- **Archive offset:** None (only {n:,} sampled files carry both a DOS time and "
+                         "a UT time, fewer than needed).")
+        else:
+            lines.append(f"- **Archive offset:** None (no consensus among {n:,} sampled files).")
+        return lines
+    if status == 'fixed':
+        top = bins[0]
+        pct = int(top[1] * 1000 // n) / 10        # floored: 3,999 of 4,000 is 99.9%, not 100.0%
+        lines.append(f"- **Archive offset:** {ao.offset_text(top[0])} ({top[1]:,} of {n:,} sampled "
+                     f"files agree, {pct:.1f}%)")
+    else:
+        pair = ', '.join(f"{ao.offset_text(o)} on {c:,}" for o, c in bins[:2])
+        lines.append(f"- **Archive offset:** daylight-saving pattern, {pair} of {n:,} sampled files "
+                     "(no single fixed offset fits)")
+    zones = det.get('zones') or []
+    lines.append(f"- **Zones that fit the stamps:** {len(zones)} give the same offset for at least "
+                 f"{ao.ZONE_MATCH:.0%} of the sampled files, each at its own date")
+    verdict = compare_with_archive(phone_zone_name, det)
+    if verdict == 'agree':
+        lines.append(f"- The phone's zone ({phone_zone_name}) is one of them.")
+    elif verdict == 'disagree':
+        lines.append(f"- ⚠️ **Disagrees with the phone:** the phone's zone ({phone_zone_name}) is not one "
+                     "of them. Most likely the phone was downloaded on a computer set to another zone; "
+                     "it does not show that the phone's zone changed.")
+    lines.append("- *Inferred from the zip, not read from Settings. Each file's time is stored twice: UT "
+                 "(UTC) and DOS (a local time with no zone). The DOS time is written by the extraction "
+                 "software at download, in the zone it was set to, usually the download computer's. It "
+                 "can match the phone, but it is not the phone's setting and says nothing about where "
+                 "the phone was when a file was made.*")
+    return lines
+
+
+def hint_lines(hints: list[dict]) -> list[str]:
+    lines = ["## Other weak hints"]
+    if not hints:
+        lines.append("- None found in the checked files.")
+        return lines
+    for h in hints:
+        lines.append(f"- **{h['value']}** — `{h['source']}` ({h['detail']}). "
+                     "*Weak / incidental — not a change log.*")
+    return lines

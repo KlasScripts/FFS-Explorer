@@ -147,3 +147,27 @@ def test_cache_media_and_archive_sources():
     note = next(s for s in timeline.source_list(cache)
                 if s[0] == timeline.FILES_SCRIPT and s[2] == 'Modified')[9]
     assert '1 files inside unpacked archives' in note
+
+
+def test_detailed_mode_is_its_own_source():
+    import sqlite3
+    res = sqlite3.connect(':memory:')
+    res.execute('CREATE TABLE run_log (id INTEGER PRIMARY KEY, run_type TEXT, complete INTEGER,'
+                ' parser_version INTEGER)')
+    meta = {'data/media/0/DCIM/a.jpg': {'mtime': 1700000000},
+            'data/data/com.x/databases/x.db': {'mtime': 1700000100, 'atime': 1700000200}}
+    def files(detail):
+        return {'key': 'k', 'collect': lambda: {
+            'paths': ['data/media/0/DCIM/a.jpg'], 'metadata': meta,
+            'time_cols': [('Modified', 'mtime'), ('Accessed', 'atime')], 'ignored': 0,
+            **({'detail_paths': ['data/data/com.x/databases/x.db']} if detail else {})}}
+    cache = sqlite3.connect(':memory:')
+    timeline.build(res, cache, {}, files=files(False))
+    assert timeline.count(cache) == 1
+    timeline.build(res, cache, {}, files=files(True))
+    rows, _ = timeline.query(cache, scripts=[timeline.DETAIL_SCRIPT])
+    C = timeline.COLUMNS
+    assert len(rows) == 1 and rows[0][0] == 1700000100000         # no Accessed event
+    assert rows[0][C.index('source')] == timeline.DETAIL_SOURCE
+    assert 'Detailed mode' in rows[0][C.index('caution')]
+    assert timeline.count(cache) == 2

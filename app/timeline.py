@@ -74,7 +74,12 @@ CACHE_SCRIPT = '__files_cache__'  # media from web cache records (A-75)
 CACHE_SOURCE = 'Files: web cache media'
 ARCHIVE_SCRIPT = '__files_archive__'   # unpacked nested archives, one event each
 ARCHIVE_SOURCE = 'Files: archives that arrived on the device'
-FILE_SCRIPTS = (FILES_SCRIPT, CACHE_SCRIPT, ARCHIVE_SCRIPT)
+DETAIL_SCRIPT = '__files_detail__'    # detailed mode: every file in the evidence folders
+DETAIL_SOURCE = 'Files: evidence folders (detailed)'
+FILE_SCRIPTS = (FILES_SCRIPT, CACHE_SCRIPT, ARCHIVE_SCRIPT, DETAIL_SCRIPT)
+_DETAIL_CAUTION = ("Detailed mode: every file in the evidence folders, not only media. "
+                   "Many of these files are written by the system or by apps on their "
+                   "own, without the user doing anything.")
 _CACHE_CAUTION = ("The cache record's own times (A-75): when the browser or app "
                   "downloaded this picture to show a page. The user saw it, or the page "
                   "loaded it; it was not necessarily saved.")
@@ -396,6 +401,13 @@ def build(results_conn, cache_conn, modules: dict, cancelled=lambda: False,
                 extra_caution=_CACHE_CAUTION)
             events += c_events
             sources += c_sources
+        if got.get('detail_paths'):
+            d_events, d_sources = file_events(
+                got['detail_paths'], metadata, time_cols, exif, md5, runs=runs,
+                script=DETAIL_SCRIPT, source=DETAIL_SOURCE, with_taken=False,
+                extra_caution=_DETAIL_CAUTION)
+            events += d_events
+            sources += d_sources
         archives = got.get('archives') or {}
         if archives:
             def _arrived(p):

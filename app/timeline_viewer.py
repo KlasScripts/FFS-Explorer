@@ -130,6 +130,15 @@ class TimelineViewerMixin:
             "not written yet, and how many values were blank or not a time")
         self._tl_sources_btn.clicked.connect(self._timeline_show_sources)
         top.addWidget(self._tl_sources_btn)
+        self._tl_detailed = QCheckBox("Detailed: every file in the evidence folders")
+        self._tl_detailed.setToolTip(
+            "Off: User Media, web cache media, unpacked archives and the reports.\n"
+            "On: also every other file in the evidence folders (the same folders Header "
+            "Scan covers: app data, system and per-user folders, logs...), all types. "
+            "Many more events, many written by the system or apps on their own.\n"
+            "Saved for this case.")
+        self._tl_detailed.toggled.connect(self._timeline_detailed_toggled)
+        top.addWidget(self._tl_detailed)
         self._tl_rebuild_btn = QPushButton("Rebuild")
         self._tl_rebuild_btn.setToolTip("Build the Timeline again from the reports")
         self._tl_rebuild_btn.clicked.connect(lambda: self._timeline_ensure_built(force=True))
@@ -262,7 +271,9 @@ class TimelineViewerMixin:
             return
         if self._tl_worker is not None and self._tl_worker.isRunning():
             return
-        self._tl_status.setText("Building the Timeline from the reports and files…")
+        self._timeline_sync_detailed_box()
+        self._tl_status.setText("Building the Timeline from the reports and files…"
+                                + (" (detailed)" if self._timeline_detailed_on() else ""))
         self._tl_rebuild_btn.setEnabled(False)
         worker = TimelineBuildWorker(self._case_dir, self._timeline_modules(), force,
                                      files=self._timeline_files_spec())
@@ -274,6 +285,51 @@ class TimelineViewerMixin:
                                 if w.isRunning()] + [worker]
         self._tl_worker = worker
         worker.start()
+
+    def _timeline_detailed_on(self) -> bool:
+        if not getattr(self, '_case_dir', None):
+            return False
+        try:
+            from db_utils import load_case_setting
+            with closing(_open_results_db(self._case_dir)) as db:
+                return (load_case_setting(db, 'timeline_detailed', '') or '') == '1'
+        except Exception:
+            return False
+
+    def _timeline_detailed_toggled(self, on: bool) -> None:
+        if not getattr(self, '_case_dir', None):
+            return
+        try:
+            from db_utils import save_case_setting
+            with closing(_open_results_db(self._case_dir)) as db:
+                save_case_setting(db, 'timeline_detailed', '1' if on else '')
+        except Exception:
+            pass
+        self._timeline_ensure_built()
+
+    def _timeline_detail_paths(self, keys, skip) -> list:
+        """Detailed mode's files: every real file under an evidence folder
+        (FfsAdapter.scan_folders minus scan_excludes, the Header Scan
+        scope), except those another source already covers (*skip*) and
+        the app's own synthetic entries (LevelDB records, embedded hits,
+        files inside unpacked archives)."""
+        adapter = getattr(self, '_adapter', None)
+        if adapter is None:
+            return []
+        inc = tuple(p.rstrip('/') + '/' for p in adapter.scan_folders())
+        exc = tuple(p.rstrip('/') + '/' for p in adapter.scan_excludes())
+        meta, folders = self.full_metadata, self.folder_map
+        out = []
+        for p in keys:
+            if not p.startswith(inc) or (exc and p.startswith(exc)):
+                continue
+            if p in folders or p in skip:
+                continue
+            m = meta.get(p)
+            if not m or '_display_name' in m:
+                continue
+            out.append(p)
+        return out
 
     def _timeline_files_spec(self):
         """timeline.build's *files*: the User Media files (the Media
@@ -297,17 +353,32 @@ class TimelineViewerMixin:
             files = [p for p in inside if p not in self.folder_map]
             archives[a] = (len(files), sum(1 for p in files if is_media and is_media(p)))
 
+        detailed = self._timeline_detailed_on()
+
         def collect():
             cands = self._user_media_candidate_paths(keys)
             paths = [p for p in cands if not user_media_ignore_list.is_ignored(
                 self._canonical_user_media_entry(p), entries)]
-            return {'paths': paths, 'metadata': metadata, 'time_cols': time_cols,
-                    'ignored': len(cands) - len(paths), 'cache_paths': cache_paths,
-                    'archives': archives}
+            got = {'paths': paths, 'metadata': metadata, 'time_cols': time_cols,
+                   'ignored': len(cands) - len(paths), 'cache_paths': cache_paths,
+                   'archives': archives}
+            if detailed:
+                # Ignored User Media stays out here too: the examiner chose
+                # to leave it out.
+                got['detail_paths'] = self._timeline_detail_paths(
+                    keys, set(cands) | set(cache_paths) | set(archives))
+            return got
 
         key = repr((len(keys), time_cols, sorted(map(repr, entries)), len(cache_paths),
-                    sorted(archives.items())))
+                    sorted(archives.items()), detailed))
         return {'key': key, 'collect': collect}
+
+    def _timeline_sync_detailed_box(self) -> None:
+        box = getattr(self, '_tl_detailed', None)
+        if box is not None:
+            box.blockSignals(True)
+            box.setChecked(self._timeline_detailed_on())
+            box.blockSignals(False)
 
     def _timeline_on_built(self, out: dict) -> None:
         worker, self._tl_worker = self._tl_worker, None

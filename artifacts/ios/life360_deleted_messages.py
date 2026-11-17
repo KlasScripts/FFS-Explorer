@@ -20,7 +20,9 @@ description = (
 # Hickman iOS 17 image against his documented actions
 # (test_data/josh_hickman_ios17):
 #   - ZCHATMESSAGE holds no live rows; 247 records recovered from WAL frames
-#     are 46 distinct messages (ZMESSAGEID).
+#     are 33 messages under 46 distinct ZMESSAGEID values (13 records of
+#     sent messages hold the client id, ZCLIENTMESSAGEID, before the
+#     server's id replaces it).
 #   - ZDATE is a Core Data time (seconds since 2001): the messages fall on
 #     the documented dates; 30 of 31 documented sent/received messages are
 #     recovered at their documented minute (not: the last one, 09:57).

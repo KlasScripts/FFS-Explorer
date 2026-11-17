@@ -2449,6 +2449,12 @@ class ZipMetadataWorker(QThread):
                     self.status_update.emit(
                         "Parser process failed — retrying in-process.")
                     print(f"[ffs parse subprocess]\n{msg[1]}")
+                    # also in the log file: the console is not there in a
+                    # frozen build, and this was invisible (2026-11-17)
+                    try:
+                        startup_log.message('error', f"first-open parse process failed:\n{msg[1]}")
+                    except Exception:
+                        pass
                     break
         finally:
             recv_conn.close()
@@ -2487,8 +2493,17 @@ class ZipMetadataWorker(QThread):
             set(result['metadata_only']))
         try:
             persist_result(self.case_dir, result)
-        except Exception:
-            pass
+        except Exception as exc:
+            # said, never swallowed: an unsaved snapshot means every later
+            # open of this case parses the archive again
+            import traceback
+            try:
+                startup_log.message('error', "saving the case snapshot failed (the next open "
+                                    f"will parse the archive again):\n{traceback.format_exc()}")
+            except Exception:
+                pass
+            self.status_update.emit(f"Could not save the case snapshot ({type(exc).__name__}: {exc}); "
+                                    "the next open will parse the archive again.")
 
     def run(self):
         try:
@@ -2729,8 +2744,15 @@ class ZipMetadataWorker(QThread):
                         if snapshot_blob is not None:
                             save_blob(_db, _SNAPSHOT_KEY, _SNAPSHOT_VERSION,
                                       snapshot_blob)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    import traceback
+                    try:
+                        startup_log.message('error', "saving the case snapshot failed (the next open "
+                                            f"will parse the archive again):\n{traceback.format_exc()}")
+                    except Exception:
+                        pass
+                    self.status_update.emit(f"Could not save the case snapshot ({type(exc).__name__}: {exc}); "
+                                            "the next open will parse the archive again.")
 
             if header_candidates:
                 n_read = len(header_candidates) - len(header_copies)

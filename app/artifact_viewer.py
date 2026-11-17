@@ -1336,6 +1336,32 @@ class AISummaryWorker(QThread):
         self.done.emit(result)
 
 
+class RedFlagsWorker(QThread):
+    """Red flags of one chat_groups report, scored in chat_flags' worker
+    process (seconds on a big phone; a QThread doing it would starve the GUI
+    of the GIL) and kept in casecache.db."""
+    done = Signal(str, str, str, object)      # case_dir, script, fingerprint, flags or None
+
+    def __init__(self, case_dir, script_name, platform, missing, model, fp, parent=None):
+        super().__init__(parent)
+        self._args = (case_dir, script_name, platform, missing, model, fp)
+
+    def run(self):
+        case_dir, script_name, platform, missing, model, fp = self._args
+        flags = None
+        try:
+            import chat_flags
+            flags = chat_flags.compute_in_process(case_dir, script_name, platform, missing, model)
+            chat_flags.cache_put(case_dir, script_name, fp, flags)
+        except Exception as exc:
+            try:
+                import startup_log
+                startup_log.message('warning', f"red flags for {script_name} failed: {exc}")
+            except Exception:
+                pass
+        self.done.emit(case_dir, script_name, fp, flags)
+
+
 class ChatSummaryWorker(QThread):
     """Runs ai_summary.run_chat_summaries() off the GUI thread: one local-LLM
     summary per chat of a chat_groups report, each saved as it finishes.
@@ -1902,7 +1928,14 @@ class AISummaryDialog(QDialog):
         parent = self.parent()
         which = self._which_combo.currentData()
         if parent is not None and hasattr(parent, '_art_red_flags'):
-            flags, _msgs = parent._art_red_flags(script_name)
+            flags = parent._art_red_flags(script_name)
+            if parent._art_flags_pending(script_name):
+                self._status_label.setText("Red flags for this report are still being worked out "
+                                           "in the background; try again in a moment.")
+                for w in (self._generate_btn, self._save_btn, self._report_combo, self._close_btn):
+                    w.setEnabled(True)
+                self._stop_btn.setVisible(False)
+                return
             ranked = sorted(flags, key=lambda k: -flags[k].get('score', 0))
             focus = {k: f['session'] for k, f in flags.items() if f.get('session')}
             if which == "flagged":
@@ -1959,7 +1992,7 @@ class AISummaryDialog(QDialog):
             f"{result.get('cached', 0):,} already done. Red Flags now include meaning.")
         parent = self.parent()
         if parent is not None and hasattr(parent, '_art_refresh_chat_summary_text'):
-            parent._art_flags_cache = None
+            parent._art_flags_mem = None
             parent._art_refresh_chat_summary_text()
 
     def _on_stop(self) -> None:
@@ -3197,6 +3230,26 @@ class ArtifactViewerMixin:
         self.status_bar.showMessage(f"{ui_path}  —  offset: {loc['abs_offset']:,}{overflow_note}")
 
     def _art_chat_groups(self, script_name: str, decl: dict) -> list:
+        """_art_chat_groups_build, kept in memory until the report's rows or
+        the bookmarks change (5 s for 500,000 messages, measured 2026-11-17:
+        it ran on the tree build and on every Chat Groups visit)."""
+        try:
+            import chat_flags
+            with closing(_open_results_db(self._case_dir)) as conn:
+                marks = conn.execute("SELECT count(*), max(rowid) FROM bookmark_entries").fetchone()
+            stamp = (self._case_dir, script_name, repr(sorted(decl.items(), key=str)),
+                     chat_flags.report_stamp(self._case_dir, script_name), tuple(marks))
+        except Exception:
+            stamp = None
+        memo = getattr(self, '_art_chat_groups_memo', None)
+        if stamp is not None and memo and memo[0] == stamp:
+            return memo[1]
+        out = self._art_chat_groups_build(script_name, decl)
+        if stamp is not None:
+            self._art_chat_groups_memo = (stamp, out)
+        return out
+
+    def _art_chat_groups_build(self, script_name: str, decl: dict) -> list:
         """One dict per conversation of a messaging report, from its
         `chat_groups` declaration (owner request, 2026-10-23/24):
           key            column identifying the conversation (exact match)
@@ -3412,7 +3465,8 @@ class ArtifactViewerMixin:
         chats = self._art_chat_groups(script_name, decl) if decl else []
         fmt = lambda ts: self.format_ts(ts) if ts else ''
         ref, ref_label = self._art_chat_ref(chats)
-        flags, _msgs = self._art_red_flags(script_name)
+        flags = self._art_red_flags(script_name, chats)
+        pending = self._art_flags_pending(script_name)
         import chat_flags
         columns = _chat_summary_columns(decl)
         rows = []
@@ -3429,7 +3483,8 @@ class ArtifactViewerMixin:
                 row.append(c['key'])
             if decl.get('icon'):
                 row.append(c.get('icon') or '')
-            row += [c['name'], chat_flags.flags_label(fl), fl.get('score', 0), kind, c['participants'],
+            row += [c['name'], chat_flags.flags_label(fl) if not pending else "(working out…)",
+                   fl.get('score', 0) if not pending else '', kind, c['participants'],
                    c['messages'], c['incoming'], c['outgoing'], c['media_in'], c['media_out'], c['deleted']]
             if decl.get('call_pattern'):
                 row.append('' if c['calls'] is None else c['calls'])
@@ -3462,7 +3517,9 @@ class ArtifactViewerMixin:
             f"to open it — Participants = everyone in the chat as at extraction"
             + (" — Deletion/disappearing columns: validation status in this report's Notes"
                if decl.get('sort') or decl.get('setting') else "")
-            + (f" — Last 30 Days = {ref_label}" if ref_label else ""))
+            + (f" — Last 30 Days = {ref_label}" if ref_label else "")
+            + (" — Red flags: being worked out in the background; this page updates when done"
+               if pending else ""))
         self._art_stack.setCurrentIndex(1)
         self._art_chat_summary = (script_name, [(c['key'], c['name']) for c in chats])
         if any(f.get('score') for f in flags.values()):
@@ -3520,71 +3577,88 @@ class ArtifactViewerMixin:
             out.update({f"{sn}\x1f{k}": c for k, c in chats.items()})
         return out
 
-    def _art_red_flags(self, script_name: str) -> tuple:
-        """({chat key: chat_flags result}, {chat key: messages}) for a
-        chat_groups report, cached until the report or the keyword lists
-        change. ({}, {}) if it can't be worked out (never breaks the page)."""
-        import os
+    def _art_red_flags(self, script_name: str, chats: list | None = None) -> dict:
+        """{chat key: chat_flags result} for a chat_groups report (each with
+        its chat 'name'), or {} while they are worked out in the background
+        (_art_flags_pending is then True; the page or chat on show is
+        refreshed when they arrive) or can't be (never breaks the page).
+        Kept in memory and in casecache.db under chat_flags.fingerprint (the
+        report's rows, keyword lists, meaning-check vectors), so a page or
+        chat opens at once after the first time. Until 2026-11-17 this
+        re-scored every message on the GUI thread on every click: its key
+        held the case databases' file times, which change all the time.
+        *chats*: the Chat Groups summary when the caller has it."""
         try:
-            import ai_summary
+            import ai_summary_store
             import chat_flags
-            import keyword_lists
-            import term_matcher
             from artifact_runner import list_artifacts
-            stamp = []
-            for path in (os.path.join(self._case_dir, 'caseresults.db'),
-                         os.path.join(self._case_dir, 'casecache.db'), keyword_lists.user_path(),
-                         *[keyword_lists.baseline_path(n) for n in keyword_lists.LISTS]):
-                try:
-                    st = os.stat(path)
-                    stamp.append((st.st_mtime_ns, st.st_size))
-                except OSError:
-                    stamp.append(None)
-            ck = (self._case_dir, script_name, tuple(stamp))
-            cache = getattr(self, '_art_flags_cache', None)
-            if cache and cache[0] == ck:
-                return cache[1], cache[2]
+            model = ai_summary_store.get_embedding_model()
+            fp = chat_flags.fingerprint(self._case_dir, script_name, model)
+            mem = getattr(self, '_art_flags_mem', None)
+            if mem is None:
+                mem = self._art_flags_mem = {}
+            hit = mem.get((self._case_dir, script_name))
+            if hit and hit[0] == fp:
+                return hit[1]
+            got = chat_flags.cache_get(self._case_dir, script_name, fp)
+            if got is not None:
+                mem[(self._case_dir, script_name)] = (fp, got)
+                return got
+            running = getattr(self, '_art_flags_running', None)
+            if running is None:
+                running = self._art_flags_running = {}
+            if running.get((self._case_dir, script_name), (None,))[0] == fp:
+                return {}
             platform = 'android' if self._is_android_archive() else 'ios'
             mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
             decl = getattr(mod, 'chat_groups', None) or {}
             if not decl:
-                return {}, {}
-            units = getattr(mod, 'timestamp_fields', {}) or {}
-            summary_chats = self._art_chat_groups(script_name, decl)
-            ref, _ = self._art_chat_ref(summary_chats)
-            fmt = lambda ts: self.format_ts(ts) if ts else ''
+                return {}
             missing = {}
-            for c in summary_chats:
-                act = _deletion_activity(c, ref, fmt, c['name'])
-                if isinstance(act[10], int) and act[10] > 0:
-                    missing[c['key']] = act[10]
-            msgs = ai_summary.load_chat_messages(self._case_dir, script_name, decl, units)
-            matcher = term_matcher.Matcher(keyword_lists.enabled_terms())
-            meaning = {}
-            try:
-                import ai_summary_store
-                import meaning_check
-                everything = self._art_all_chat_messages()
-                own = {f"{script_name}\x1f{k}": c for k, c in msgs.items()}
-                meaning = meaning_check.chat_meaning(
-                    self._case_dir, own, ai_summary_store.get_embedding_model(), everything)
-                meaning = {(k.split("\x1f", 1)[1] if "\x1f" in k else k): v for k, v in meaning.items()}
-            except Exception:
-                meaning = {}
-            flags = chat_flags.score_chats(msgs, matcher, missing, meaning)
-            for f in flags.values():
-                f['meaning'] = ('complete' if meaning.get('_complete') else
-                                'partial' if meaning else 'not run')
-                f['meaning_pool'] = meaning.get('_harmless', 0)
-            self._art_flags_cache = (ck, flags, msgs)
-            return flags, msgs
+            if decl.get('sort'):           # only then are there gaps to count
+                if chats is None:
+                    chats = self._art_chat_groups(script_name, decl)
+                ref, _ = self._art_chat_ref(chats)
+                fmt = lambda ts: self.format_ts(ts) if ts else ''
+                for c in chats:
+                    act = _deletion_activity(c, ref, fmt, c['name'])
+                    if isinstance(act[10], int) and act[10] > 0:
+                        missing[c['key']] = act[10]
+            worker = RedFlagsWorker(self._case_dir, script_name, platform, missing, model, fp, self)
+            worker.done.connect(self._art_red_flags_done)
+            running[(self._case_dir, script_name)] = (fp, worker)
+            worker.start()
+            return {}
         except Exception as exc:
             try:
                 import startup_log
                 startup_log.message('warning', f"red flags for {script_name} failed: {exc}")
             except Exception:
                 pass
-            return {}, {}
+            return {}
+
+    def _art_flags_pending(self, script_name: str) -> bool:
+        running = getattr(self, '_art_flags_running', None) or {}
+        return (self._case_dir, script_name) in running
+
+    def _art_red_flags_done(self, case_dir: str, script_name: str, fp: str, flags) -> None:
+        running = getattr(self, '_art_flags_running', None) or {}
+        got = running.pop((case_dir, script_name), None)
+        if got is not None:
+            got[1].deleteLater()
+        if case_dir != self._case_dir:
+            return
+        if getattr(self, '_art_flags_mem', None) is None:
+            self._art_flags_mem = {}
+        # a failure is kept as "none" for this fingerprint: not retried on every click
+        self._art_flags_mem[(case_dir, script_name)] = (fp, flags or {})
+        summary = getattr(self, '_art_chat_summary', None)
+        if summary and summary[0] == script_name and self._art_stack.currentIndex() == 1:
+            self._art_show_chat_summary(script_name)
+            return
+        target = getattr(self, '_art_summary_text_target', None)
+        if target and target[0] == script_name:
+            self._art_show_chat_summary_text(*target)
 
     def _art_show_chat_summary_text(self, script_name: str, key: str | None) -> None:
         """Put the saved AI chat summary in the bottom Text tab: one chat's
@@ -3597,16 +3671,40 @@ class ArtifactViewerMixin:
             saved = ai_summary.load_chat_summaries(self._case_dir, script_name)
         except Exception:
             saved = {}
-        flags, msgs = self._art_red_flags(script_name)
+        flags = self._art_red_flags(script_name)
+        pending = self._art_flags_pending(script_name)
         sep = "\n\n" + "═" * 70 + "\n\n"
         how = ("No AI summary yet. To make one: AI Summary (bottom of the Device "
                "Artifacts list) → choose this report → Summarise Chats.")
         if key is not None:
-            chat = msgs.get(key) or {}
+            chat = {}
+            if not pending:
+                try:
+                    from artifact_runner import list_artifacts
+                    platform = 'android' if self._is_android_archive() else 'ios'
+                    mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+                    decl = getattr(mod, 'chat_groups', None) or {}
+                    if decl:
+                        ck = (self._case_dir, script_name, key,
+                              chat_flags.report_stamp(self._case_dir, script_name))
+                        memo = getattr(self, '_art_one_chat_memo', None)
+                        if memo and memo[0] == ck:
+                            chat = memo[1]
+                        else:
+                            chat = ai_summary.load_chat_messages(
+                                self._case_dir, script_name, decl,
+                                getattr(mod, 'timestamp_fields', {}) or {}, only_key=key).get(key) or {}
+                            self._art_one_chat_memo = (ck, chat)
+                except Exception:
+                    chat = {}
             rec = saved.get(key)
-            name = (rec or {}).get("chat_name") or chat.get("name") or "this chat"
+            name = ((rec or {}).get("chat_name") or (flags.get(key) or {}).get("name")
+                    or chat.get("name") or "this chat")
             parts = []
-            if chat:
+            if pending:
+                parts.append("RED FLAGS — being worked out in the background; this text "
+                             "updates when done.")
+            elif chat:
                 parts.append(chat_flags.report_text(name, chat["messages"], flags.get(key)))
             parts.append(rec["report"] if rec else how)
             self._load_text_preview(sep.join(parts), f"Red flags and AI summary — {name}")
@@ -3614,12 +3712,15 @@ class ArtifactViewerMixin:
         ranked = sorted((k for k in flags if flags[k].get("score")),
                         key=lambda k: -flags[k]["score"])
         parts = []
+        if pending:
+            parts.append("WHERE TO LOOK FIRST — red flags are being worked out in the background; "
+                         "this text updates when done.")
         if flags:
             lines = ["WHERE TO LOOK FIRST — chats ranked by red flags (a ranking aid, not a finding)",
                      "Open a chat to see its key messages with context.", ""]
             for i, k in enumerate(ranked[:25], 1):
                 f = flags[k]
-                lines.append(f"{i:2}. {f['level']}  {msgs[k]['name']}  (score {f['score']:g})"
+                lines.append(f"{i:2}. {f['level']}  {f.get('name') or k}  (score {f['score']:g})"
                              + (f"  — {f['window']}" if f['window'] else ""))
                 for r in f["reasons"]:
                     lines.append(f"       • {r}")
@@ -4182,6 +4283,7 @@ class ArtifactViewerMixin:
         e.g. one chat (see _art_show_chat); kept under any typed filter."""
         self._cancel_art_filter_worker()
         self._art_pending_jump = None    # a jump into a previous report is void
+        self._art_pending_sort = None
         self._art_scope = scope
         self._art_chat_summary = None
         table = f'artifact_{script_name}'
@@ -4431,8 +4533,9 @@ class ArtifactViewerMixin:
 
     def _on_art_report_context_menu(self, pos) -> None:
         """Right-click on the report table: Go to Chat (Chat Groups
-        summary), and Show activity around this time (any row with a
-        time; opens the Timeline)."""
+        summary); Show messages around this one (a messaging report's
+        message, in its chat); and Show activity around this time (any row
+        with a time; opens the Timeline)."""
         index = self._art_report_view.indexAt(pos)
         if not index.isValid():
             return
@@ -4442,10 +4545,99 @@ class ArtifactViewerMixin:
             go.setToolTip("Select this chat under Chat Groups and show its messages")
             go.triggered.connect(lambda _=False, ix=index: self._art_go_to_chat_at(ix))
         else:
+            self._art_add_around_action(menu, index)
             self._art_add_timeline_action(menu, index)
         if menu.isEmpty():
             return
         menu.exec(self._art_report_view.viewport().mapToGlobal(pos))
+
+    _AROUND_COUNTS = (1, 5, 20)
+
+    def _art_add_around_action(self, menu, index) -> None:
+        """"Show messages around this one ▸ ±1 / ±5 / ±20 messages" on a row of
+        a messaging report (one with a chat_groups declaration): that
+        message's own chat, limited to the N messages before and after it in
+        time order, with it selected. Owner request 2026-11-17 (search for a
+        message, then see it in context)."""
+        mod = getattr(self, '_art_current_mod', None)
+        decl = getattr(mod, 'chat_groups', None) if mod is not None else None
+        if not decl or not decl.get('key'):
+            return
+        try:
+            rowid = self._art_table_model._rowids[index.row()]
+        except (IndexError, AttributeError):
+            return
+        script = self._art_current_script
+        sub = menu.addMenu("Show messages around this one")
+        for n in self._AROUND_COUNTS:
+            act = sub.addAction(f"±{n} message{'s' if n > 1 else ''}")
+            act.triggered.connect(lambda _=False, n=n: self._art_show_messages_around(script, rowid, n))
+        menu.addSeparator()
+
+    def _art_show_messages_around(self, script_name: str, rowid, n: int) -> None:
+        """The report limited to *rowid*'s chat and the *n* messages either
+        side of it, ordered as the chat is (time, then rowid; rows with no
+        time last, as ai_summary.load_chat_messages orders them), with
+        *rowid* selected. Says so when the row is gone."""
+        from artifact_runner import list_artifacts
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+        decl = getattr(mod, 'chat_groups', None) or {}
+        key_col, time_col = decl.get('key'), decl.get('time')
+        table = f'artifact_{script_name}'
+        try:
+            with closing(_open_results_db(self._case_dir)) as conn:
+                have = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+                if key_col not in have:
+                    return
+                got = conn.execute(f'SELECT "{key_col}" FROM "{table}" WHERE rowid = ?', (rowid,)).fetchone()
+                if got is None:
+                    self.status_bar.showMessage("That message is no longer in the report (re-run since?)")
+                    return
+                key = got[0]
+                if key is None or key == '':
+                    where, args = f'("{key_col}" IS NULL OR "{key_col}" = \'\')', []
+                else:
+                    where, args = f'"{key_col}" = ?', [key]
+                order = (f'"{time_col}" IS NULL, "{time_col}", rowid' if time_col in have else 'rowid')
+                ids = [r[0] for r in conn.execute(
+                    f'SELECT rowid FROM "{table}" WHERE {where} ORDER BY {order}', args)]
+                names = [c for c in ([decl['name']] if isinstance(decl.get('name'), str)
+                                     else list(decl.get('name') or ())) if c in have]
+                label = ''
+                if names:
+                    row = conn.execute(f'SELECT {", ".join(chr(34) + c + chr(34) for c in names)} '
+                                       f'FROM "{table}" WHERE rowid = ?', (rowid,)).fetchone()
+                    label = next((str(v) for v in row if v), '')
+        except Exception as exc:
+            self.status_bar.showMessage(f"Could not show the messages around this one: {exc}")
+            return
+        i = ids.index(rowid)
+        window = ids[max(0, i - n): i + n + 1]
+        before, after = i - max(0, i - n), len(window) - 1 - (i - max(0, i - n))
+        scope_label = (f"Chat{': ' + label if label else ''} — the selected message and {before} "
+                       f"before / {after} after it (±{n}; {len(ids):,} in the chat)")
+        self._art_show_report(script_name, scope=(f'rowid IN ({",".join("?" * len(window))})',
+                                                  list(window), scope_label))
+        # time order (the chat's order), then select: after the view's own
+        # filter pass, which would otherwise put rowid order back
+        self._art_pending_sort = time_col
+        if self._art_filter_worker is not None and self._art_filter_worker.isRunning():
+            self._art_pending_jump = rowid
+        else:
+            self._art_apply_pending_sort()
+            self._art_select_report_rowid(rowid)
+
+    def _art_apply_pending_sort(self) -> None:
+        col = getattr(self, '_art_pending_sort', None)
+        self._art_pending_sort = None
+        if not col:
+            return
+        model = self._art_table_model
+        for vc in range(model.columnCount()):
+            if model.column_name(vc) == col:
+                self._art_report_view.sortByColumn(vc, Qt.SortOrder.AscendingOrder)
+                return
 
     def _art_add_timeline_action(self, menu, index) -> None:
         """"Show activity around this time" for a report row: the clicked
@@ -4806,6 +4998,7 @@ class ArtifactViewerMixin:
         prefix = f"{scope[2]} — " if scope and len(scope) > 2 else ""
         self._art_row_label.setText(f"{prefix}{len(rowids):,} of {total:,} rows")
         self._art_filter_btn.setEnabled(True)
+        self._art_apply_pending_sort()
         pending = getattr(self, '_art_pending_jump', None)
         if pending is not None:          # a jump waiting for this filter
             self._art_pending_jump = None

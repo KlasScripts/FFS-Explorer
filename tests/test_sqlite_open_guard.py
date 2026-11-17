@@ -23,6 +23,7 @@ ALLOWED = {
                                 'copy of a hot journal, the checkpoint view'),
     'app/db_utils.py': (5, 'the case databases caseresults.db / casecache.db'),
     'app/ai_summary.py': (7, 'caseresults.db (report rows and stored summaries)'),
+    'app/chat_flags.py': (4, 'caseresults.db report rows and casecache.db red_flags / text_embeddings (read-only fingerprint and kept red flags)'),
     'app/app_intelligence.py': (1, 'caseresults.db, read-only'),
     'app/artifact_viewer.py': (1, 'caseresults.db report table'),
     'app/case_names.py': (1, 'casecache.db name update'),

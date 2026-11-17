@@ -386,6 +386,20 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
+    # Red flags (chat_flags.score_chats) per chat_groups report, so the
+    # Chat Groups page and each chat open at once instead of re-scoring
+    # every message on every click. fingerprint = the report's own rows,
+    # the keyword lists, the meaning-check vectors and the scorer's version
+    # (chat_flags.fingerprint); any change gives a new one. JSON+zlib.
+    # Additive: no schema version bump needed.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS red_flags (
+            script_name TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            flags       BLOB NOT NULL
+        )
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_CACHE_SCHEMA_VERSION}')
     conn.commit()
     return conn
@@ -1039,23 +1053,87 @@ def clear_run_log(conn: 'sqlite3.Connection', run_type: str) -> None:
 
 # ── Generic blob store ────────────────────────────────────────────────────────
 
+# SQLite refuses one value over 1,000,000,000 bytes ("string or blob too
+# big", SQLITE_LIMIT_LENGTH). The load snapshot of a big phone passes that
+# (~450 bytes per zip entry: 377 MB for an 830k-entry iPhone, so ~2.2M
+# entries reach it), and until 2026-11-17 saving it failed: the first-open
+# parse was retried in-process and the snapshot was never kept, so every
+# open re-parsed. A blob is now stored in parts of BLOB_PART bytes: the
+# first under *key*, the rest under _part_key(key, n).
+BLOB_PART = 256 * 1024 * 1024
+
+
+def _part_key(key: str, n: int) -> str:
+    return f"{key}\x1fpart{n}"
+
+
 def save_blob(conn: 'sqlite3.Connection', key: str, version: str, data: bytes) -> None:
-    """Write a versioned bytes blob under *key*."""
-    conn.execute(
-        'INSERT OR REPLACE INTO blobs (key, version, data) VALUES (?,?,?)',
-        (key, version, data),
-    )
+    """Write a versioned bytes blob under *key* (in parts when large)."""
+    view = memoryview(data)
+    parts = [view[i:i + BLOB_PART] for i in range(0, len(view), BLOB_PART)] or [view]
+    prefix = key + '\x1fpart'
+    conn.execute('DELETE FROM blobs WHERE substr(key, 1, ?) = ?', (len(prefix), prefix))
+    for n, part in enumerate(parts):
+        conn.execute(
+            'INSERT OR REPLACE INTO blobs (key, version, data) VALUES (?,?,?)',
+            (key if n == 0 else _part_key(key, n), version, part),
+        )
     conn.commit()
+
+
+def _blob_rowids(conn: 'sqlite3.Connection', key: str, version: str) -> list | None:
+    """rowids of *key*'s parts in order, or None if absent / another version
+    (or a part is missing: never half a blob)."""
+    row = conn.execute('SELECT rowid, version FROM blobs WHERE key=?', (key,)).fetchone()
+    if row is None or row[1] != version:
+        return None
+    ids = [row[0]]
+    n = 1
+    while True:
+        r = conn.execute('SELECT rowid, version FROM blobs WHERE key=?', (_part_key(key, n),)).fetchone()
+        if r is None:
+            return ids
+        if r[1] != version:
+            return None
+        ids.append(r[0])
+        n += 1
 
 
 def load_blob(conn: 'sqlite3.Connection', key: str, version: str) -> bytes | None:
     """Return the stored bytes for *key* if the version matches, else None."""
-    row = conn.execute(
-        'SELECT version, data FROM blobs WHERE key=?', (key,)
-    ).fetchone()
-    if row is None or row[0] != version:
+    ids = _blob_rowids(conn, key, version)
+    if ids is None:
         return None
-    return row[1]
+    return b''.join(conn.execute('SELECT data FROM blobs WHERE rowid=?', (i,)).fetchone()[0] for i in ids)
+
+
+class _BlobParts(io.RawIOBase):
+    """One read-only stream over several sqlite3 Blob handles, in order."""
+
+    def __init__(self, blobs: list):
+        super().__init__()
+        self._blobs = blobs
+        self._i = 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf) -> int:
+        while self._i < len(self._blobs):
+            got = self._blobs[self._i].read(len(buf))
+            if got:
+                buf[:len(got)] = got
+                return len(got)
+            self._i += 1
+        return 0
+
+    def close(self):
+        for b in self._blobs:
+            try:
+                b.close()
+            except Exception:
+                pass
+        super().close()
 
 
 def open_blob(conn: 'sqlite3.Connection', key: str, version: str):
@@ -1068,14 +1146,13 @@ def open_blob(conn: 'sqlite3.Connection', key: str, version: str):
     the returned object — before closing *conn*.  Falls back to an in-memory
     BytesIO where blobopen is unavailable (Python < 3.11).
     """
-    row = conn.execute(
-        'SELECT rowid, version FROM blobs WHERE key=?', (key,)
-    ).fetchone()
-    if row is None or row[1] != version:
+    ids = _blob_rowids(conn, key, version)
+    if ids is None:
         return None
     if hasattr(conn, 'blobopen'):
         try:
-            return conn.blobopen('blobs', 'data', row[0], readonly=True)
+            handles = [conn.blobopen('blobs', 'data', i, readonly=True) for i in ids]
+            return handles[0] if len(handles) == 1 else io.BufferedReader(_BlobParts(handles), 1 << 20)
         except sqlite3.Error:
             pass
     data = load_blob(conn, key, version)

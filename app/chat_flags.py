@@ -280,3 +280,173 @@ def report_text(name: str, messages: list, r: dict, context: int = 2) -> str:
                 else:
                     out.append(f"        {cat}: »{matched}«" + ("" if how == "exact" else f" ({how})"))
     return "\n".join(out)
+
+
+# ── kept results and background scoring ────────────────────────────────────
+# Scoring every message of a big phone takes seconds (2 s at 50,000
+# messages, measured 2026-11-17), so the result is kept per report in
+# casecache.db (red_flags) under a fingerprint of everything it depends on,
+# and worked out in a worker process (pure-Python CPU work in a QThread
+# starves the GUI of the GIL, as found for the carver, A-81).
+
+FLAGS_VERSION = 1          # bump when scoring changes: kept results are then not reused
+
+
+def report_stamp(case_dir: str, script_name: str) -> str:
+    """The report's rows as stored: table definition, row count, last rowid
+    (a re-run rewrites the table). Cheap."""
+    import hashlib
+    import os
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{os.path.join(case_dir, 'caseresults.db')}?mode=ro", uri=True, timeout=5)
+        try:
+            sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                            (f"artifact_{script_name}",)).fetchone()
+            n, last = c.execute(f'SELECT count(*), max(rowid) FROM "artifact_{script_name}"').fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return 'no-report'
+    return f"{hashlib.sha1((sql[0] if sql else '').encode()).hexdigest()[:12]}|{n}|{last}"
+
+
+def fingerprint(case_dir: str, script_name: str, model: str) -> str:
+    """What the red flags of *script_name* depend on: the report's rows
+    (count, last rowid, table definition), the keyword lists (files' size
+    and time), the meaning-check vectors kept for *model* (count) and
+    FLAGS_VERSION. Cheap: a few queries, no message read."""
+    import os
+    import sqlite3
+    import keyword_lists
+    parts = [str(FLAGS_VERSION), script_name, report_stamp(case_dir, script_name)]
+    for path in (keyword_lists.user_path(), *[keyword_lists.baseline_path(n) for n in keyword_lists.LISTS]):
+        try:
+            st = os.stat(path)
+            parts.append(f"{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append('-')
+    try:
+        c = sqlite3.connect(f"file:{os.path.join(case_dir, 'casecache.db')}?mode=ro", uri=True, timeout=5)
+        try:
+            parts.append(str(c.execute("SELECT count(*) FROM text_embeddings WHERE model=?",
+                                       (model,)).fetchone()[0]))
+        finally:
+            c.close()
+    except sqlite3.Error:
+        parts.append('0')
+    parts.append(model or '')
+    return "|".join(parts)
+
+
+def cache_get(case_dir: str, script_name: str, fp: str) -> dict | None:
+    import json
+    import os
+    import sqlite3
+    import zlib
+    try:
+        c = sqlite3.connect(f"file:{os.path.join(case_dir, 'casecache.db')}?mode=ro", uri=True, timeout=5)
+        try:
+            row = c.execute("SELECT fingerprint, flags FROM red_flags WHERE script_name=?",
+                            (script_name,)).fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+    if not row or row[0] != fp:
+        return None
+    try:
+        # a list of [key, flags] pairs: a JSON object would turn a number key into text
+        return {k: v for k, v in json.loads(zlib.decompress(row[1]).decode('utf-8'))}
+    except (ValueError, TypeError, zlib.error):
+        return None
+
+
+def cache_put(case_dir: str, script_name: str, fp: str, flags: dict) -> None:
+    import json
+    import zlib
+    from db_utils import _open_cache_db
+    try:
+        c = _open_cache_db(case_dir)
+        try:
+            c.execute("INSERT OR REPLACE INTO red_flags (script_name, fingerprint, flags) VALUES (?,?,?)",
+                      (script_name, fp, zlib.compress(json.dumps([[k, v] for k, v in flags.items()],
+                                                      separators=(',', ':')).encode('utf-8'), 6)))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        pass                       # a cache: never break the page
+
+
+def compute_for_report(case_dir: str, script_name: str, platform: str, missing: dict,
+                       model: str) -> dict:
+    """In the worker process: {chat key: flags} for *script_name*, each with
+    the chat's 'name' added (so a page can list it without loading every
+    message) and the meaning-check state. *missing*: {chat key: deleted
+    messages no timer explains} from the Chat Groups summary."""
+    import ai_summary
+    import keyword_lists
+    import term_matcher
+    from artifact_runner import list_artifacts
+    from artifact_db import list_completed_artifacts
+    import sqlite3
+    import os
+    mods = {sn: m for sn, m in list_artifacts(platform)}
+    mod = mods.get(script_name)
+    decl = getattr(mod, 'chat_groups', None) or {}
+    if not decl:
+        return {}
+    msgs = ai_summary.load_chat_messages(case_dir, script_name, decl,
+                                         getattr(mod, 'timestamp_fields', {}) or {})
+    matcher = term_matcher.Matcher(keyword_lists.enabled_terms())
+    meaning = {}
+    try:
+        import meaning_check
+        everything = {}
+        c = sqlite3.connect(f"file:{os.path.join(case_dir, 'caseresults.db')}?mode=ro", uri=True, timeout=5)
+        try:
+            done = list_completed_artifacts(c)
+        finally:
+            c.close()
+        for sn in done:
+            d = getattr(mods.get(sn), 'chat_groups', None) if mods.get(sn) else None
+            if not d:
+                continue
+            got = msgs if sn == script_name else ai_summary.load_chat_messages(
+                case_dir, sn, d, getattr(mods[sn], 'timestamp_fields', {}) or {})
+            everything.update({f"{sn}\x1f{k}": v for k, v in got.items()})
+        own = {f"{script_name}\x1f{k}": v for k, v in msgs.items()}
+        meaning = meaning_check.chat_meaning(case_dir, own, model, everything)
+        meaning = {(k.split("\x1f", 1)[1] if "\x1f" in k else k): v for k, v in meaning.items()}
+    except Exception:
+        meaning = {}
+    flags = score_chats(msgs, matcher, missing or {}, meaning)
+    for k, f in flags.items():
+        f['name'] = msgs.get(k, {}).get('name') or ''
+        f['meaning'] = ('complete' if meaning.get('_complete') else
+                        'partial' if meaning else 'not run')
+        f['meaning_pool'] = meaning.get('_harmless', 0)
+    return flags
+
+
+_POOL = None
+
+
+def _pool():
+    global _POOL
+    if _POOL is None:
+        import atexit
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+        _POOL = ProcessPoolExecutor(1, mp_context=mp.get_context('spawn'))
+        atexit.register(lambda: _POOL.shutdown(wait=False, cancel_futures=True))
+    return _POOL
+
+
+def compute_in_process(case_dir: str, script_name: str, platform: str, missing: dict,
+                       model: str) -> dict:
+    """compute_for_report() in the worker process; blocks the calling
+    (non-GUI) thread without holding the GIL."""
+    return _pool().submit(compute_for_report, case_dir, script_name, platform,
+                          missing, model).result()

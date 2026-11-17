@@ -722,10 +722,12 @@ def _prompt_text(m: dict) -> str:
     return text or "[no text]"
 
 
-def load_chat_messages(case_dir: str, script_name: str, decl: dict, units: dict) -> dict:
+def load_chat_messages(case_dir: str, script_name: str, decl: dict, units: dict,
+                       only_key=None) -> dict:
     """{chat_key: {'name', 'messages': [{'rowid', 'ts', 'time', 'speaker',
     'text', 'media'}]}} from the report table, grouped exactly as the
-    Chat Groups list groups them (decl['key']), oldest message first."""
+    Chat Groups list groups them (decl['key']), oldest message first.
+    *only_key*: just that chat ("" = the rows with no chat key)."""
     import collections
 
     def _cols(v):
@@ -750,8 +752,12 @@ def load_chat_messages(case_dir: str, script_name: str, decl: dict, units: dict)
         have = {r[1] for r in conn.execute(f'PRAGMA table_info("artifact_{script_name}")')}
         want = [c for c in dict.fromkeys([key_col, dir_col, msg_col, time_col, event_col,
                                           *names, *senders, *media_cols]) if c and c in have]
+        where, args = "", ()
+        if only_key is not None and key_col in have:
+            where, args = ((f' WHERE "{key_col}" = ?', (only_key,)) if only_key != ""
+                           else (f' WHERE ("{key_col}" IS NULL OR "{key_col}" = \'\')', ()))
         rows = conn.execute("SELECT rowid, " + ", ".join(f'"{c}"' for c in want)
-                            + f' FROM "artifact_{script_name}"').fetchall()
+                            + f' FROM "artifact_{script_name}"' + where, args).fetchall()
     finally:
         conn.close()
     at = {c: i + 1 for i, c in enumerate(want)}

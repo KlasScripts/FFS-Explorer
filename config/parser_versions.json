@@ -438,6 +438,11 @@
       "hash": "08e736eb88415e67",
       "version": 3
     },
+    "ios:life360_deleted_messages": {
+      "changelog": {},
+      "hash": "503118c172426ee9",
+      "version": 1
+    },
     "ios:line": {
       "changelog": {},
       "hash": "18ce08f82ead5ba0",

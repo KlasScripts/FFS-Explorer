@@ -228,6 +228,9 @@
     "line": {
       "category": "Chats & Messaging",
       "app_group_label": "LINE"
+    },
+    "life360_deleted_messages": {
+      "category": "Chats & Messaging"
     }
   }
 }

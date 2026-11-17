@@ -636,7 +636,11 @@ What each row is, and the rules:
   silently dropped. No `version_fields`: every version is listed.
 - `labels` turn a stored code into a word, shown with the stored value:
   `picture (1)`. `derived` adds a column worked out from one value
-  (direction). **Only declare a label or derived value you checked against
+  (direction): from fixed values (`"values": {None: "Outgoing"}`), or, when
+  the deciding ids differ per phone, from a lookup (`"in": {"table":
+  "ZCHATMEMBER", "column": "Z_PK", "where": "ZISLOGGEDINUSER = 1"}, "then":
+  "Outgoing", "else": "Incoming"`; no field of that table is added). See
+  `artifacts/ios/life360_deleted_messages.py`. **Only declare a label or derived value you checked against
   ground truth, and say in a comment what you checked.**
 - `not_found_in` (optional): list a record only when a column's value is
   not the value of another table's column in any live or recovered row,

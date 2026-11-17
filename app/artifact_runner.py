@@ -1481,6 +1481,11 @@ def _recover_deleted_rows(paths: dict, table: str, field_notes: dict,
 #               a value without a label is shown as stored
 #       "derived": {"direction": {"from": "ZSENDER", "values": {None: "Sent"},
 #                                 "else": "Received"}},           # optional
+#               or, when the deciding ids differ per phone, "in": {"table":
+#               "ZCHATMEMBER", "column": "Z_PK", "where": "ZISLOGGEDINUSER = 1"},
+#               "then": "Outgoing", "else": "Incoming": the value is looked up
+#               in that column of the rows the where-clause selects (which
+#               ids are the local user); no field of that table is added
 #       "not_found_in": {"ZLASTMESSAGE": ["ZMESSAGE", "ZTEXT"]},  # optional:
 #               list a record only when this column's value is not the value
 #               of that other table's column in any live or recovered row
@@ -1532,6 +1537,17 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
                 bucket = seen_values.setdefault((t.name, c), set())
                 bucket.update(v[i] for v in t.live.values())
                 bucket.update(r['values'][i] for r in records if i < len(r['values']))
+            lookups = {}
+            for dname, dspec in (spec.get('derived') or {}).items():
+                if 'in' in dspec:
+                    q = dspec['in']
+                    try:
+                        lookups[dname] = {r[0] for r in conn.execute(
+                            f'SELECT "{q["column"]}" FROM "{q["table"]}" WHERE {q["where"]}')}
+                    except sqlite3.Error as e:
+                        lookups[dname] = None
+                        log_note(f"{spec.get('label', spec['table'])}: {dname} not worked out "
+                                 f"({q['table']}: {e}).")
             not_in = {}
             for col, (otable, ocol) in (spec.get('not_found_in') or {}).items():
                 vals_ = seen_values.get((otable, ocol))
@@ -1599,7 +1615,11 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
             for name, d in (spec.get('derived') or {}).items():
                 if d['from'] in idx and idx[d['from']] < len(vals):
                     v = value(d['from'])
-                    row[name] = d['values'][v] if v in d['values'] else d.get('else', '')
+                    if 'in' in d:
+                        ids = lookups.get(name)
+                        row[name] = '' if ids is None else (d['then'] if v in ids else d.get('else', ''))
+                    else:
+                        row[name] = d['values'][v] if v in d['values'] else d.get('else', '')
             for col, name in fields.items():
                 if col in idx:
                     row[name] = shown(col, value(col))

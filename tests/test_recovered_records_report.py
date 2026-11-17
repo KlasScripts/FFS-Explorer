@@ -84,3 +84,28 @@ def test_declaration_only_parser_gets_a_run(tmp_path):
     m = mods['line_deleted_messages']
     assert callable(m.run)
     assert [e['table'] for e in m.record_source] == ['ZMESSAGE', 'ZCHAT']
+
+
+def test_derived_lookup_of_the_local_users_ids(tmp_path):
+    """derived 'in': Outgoing when the sender is one of the ids a where-clause
+    selects in another table (ids that differ per phone); no field of that
+    table is added to the row."""
+    db = str(tmp_path / 'm.db')
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute('create table member(id integer primary key, me integer, name text)')
+    c.executemany('insert into member values(?,?,?)', [(1, 0, 'a'), (2, 1, 'b'), (3, 0, 'c')])
+    c.execute('create table msg(id integer primary key, sender integer, body text)')
+    for i in range(1, 31):
+        c.execute('insert into msg values(?,?,?)', (5000 + i, 2 if i % 2 else 3, f'message body {i:02d} ' + 'z' * 20))
+    c.execute('delete from msg where id in (5003, 5004)')
+    c.close()
+    module = SimpleNamespace(recovered_records=[{
+        'file_key': 'db', 'table': 'msg', 'label': 'Message',
+        'fields': {'body': 'message', 'sender': 'sender_id'},
+        'derived': {'direction': {'from': 'sender',
+                                  'in': {'table': 'member', 'column': 'id', 'where': 'me = 1'},
+                                  'then': 'Outgoing', 'else': 'Incoming'}}}])
+    rows = ar.recovered_records_report(module, {'db': db})
+    got = {r['message'][:15]: r['direction'] for r in rows}
+    assert got == {'message body 03': 'Outgoing', 'message body 04': 'Incoming'}
+    assert all('name' not in r for r in rows)

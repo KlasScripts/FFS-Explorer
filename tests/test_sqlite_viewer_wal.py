@@ -48,6 +48,7 @@ def _viewer(cls, result):
     v._sql_journal_copy = result["journal_copy"]
     v._sql_dropped = set(result["dropped"])
     v._sql_has_wal = result["has_wal"]
+    v._sql_recovery = result["recovery"]
     v._sql_meta_conn = sqlite3.connect(result["db_path"])
     return v
 
@@ -95,7 +96,10 @@ def test_deleted_row_in_free_space_is_carved(tmp_path):
         shutil.rmtree(result["tmpdir"], ignore_errors=True)
 
 
-def test_rollback_journal_page_is_an_older_version(tmp_path):
+def test_rollback_journal_is_undone_and_the_change_is_shown_as_unfinished(tmp_path):
+    """A journal SQLite would roll back on the next open: the tab shows the
+    committed state (what the app would read, as reports do: decision
+    2026-11-16) and the change the journal undoes as UNFINISHED WRITE."""
     import struct
     db = tmp_path / "j.db"
     con = sqlite3.connect(db)
@@ -120,8 +124,9 @@ def test_rollback_journal_page_is_an_older_version(tmp_path):
         assert result["journal_copy"]
         _cols, rows, n = v._compute_table_diff("note")
         shown = [(s, r[0], r[1]) for s, r, _ in rows]
-        assert ("", 1, "after the change") in shown
-        assert ("JOURNAL", 1, "before the change") in shown and n["journal"] == 1
+        assert ("", 1, "before the change") in shown
+        assert ("UNFINISHED WRITE", 1, "after the change") in shown and n["unfinished"] == 1
+        assert result["rolled_back"] and any('SQLITE_READONLY_ROLLBACK' in x for x in result["notes"])
     finally:
         v._sql_meta_conn.close()
         shutil.rmtree(result["tmpdir"], ignore_errors=True)

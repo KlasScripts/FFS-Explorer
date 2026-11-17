@@ -122,16 +122,10 @@ def _blob_safe(v, _max=64):
 # ── Tier 3: raw SQLite access (opt-in) ──────────────────────────────────────
 
 def _extract_sqlite_ro(ctx: CaseContext, path: str) -> tuple[sqlite3.Connection, str]:
-    """Extract *path* (a ui_path) plus any -wal/-shm sidecars to a locked-down
-    temp copy and open it strictly read-only.
-
-    Sidecars are pulled in unmodified and the copy is chmod'd read-only
-    *before* sqlite3 ever touches it, then opened via a `mode=ro` URI — never
-    a bare connect() — so nothing here can trigger an auto-checkpoint that
-    would alter the extracted WAL (see the project's WAL-handling note: a
-    live connection only ever shows current state, never what checkpointing
-    might discard). Caller must close the connection and rmtree the tmpdir.
-    """
+    """Extract *path* (a ui_path) plus its -wal / -journal to a temp folder
+    and open its committed view read-only through sqlite_reader (the same
+    open reports and the Database tab use). Caller must close the
+    connection and rmtree the tmpdir."""
     path = (path or '').strip('/')
     raw = ctx.read_bytes(path)
     if raw is None:
@@ -139,39 +133,24 @@ def _extract_sqlite_ro(ctx: CaseContext, path: str) -> tuple[sqlite3.Connection,
     if raw[:16] != _SQLITE_MAGIC:
         raise ValueError(f'{path!r} is not a SQLite database (bad header)')
 
+    # The open is sqlite_reader's, shared with reports and the Database tab
+    # (2026-11-17): the -wal applied (never a WAL-less read: that can show
+    # more rows than exist, see below), a hot -journal undone on a
+    # throwaway copy, immutable for a WAL-mode file with no sidecar, and
+    # query_only. The device's -shm is not staged (SQLite rebuilds it).
+    #
+    # Confirmed against real data before this module used the shared
+    # reader: reading a WAL-mode db file WITHOUT its -wal sidecar is not
+    # simply "missing the newest rows": it can show MORE rows than
+    # currently exist (a table showed 8 rows main-file-only vs 1 row with
+    # the WAL applied, matching the sqlite3 CLI + integrity_check).
+    import sqlite_reader
     tmpdir = tempfile.mkdtemp(prefix='ffs_mcp_sqlite_')
-    db_path = os.path.join(tmpdir, os.path.basename(path) or 'db')
     try:
-        with open(db_path, 'wb') as f:
-            f.write(raw)
-        for suffix in ('-wal', '-shm'):
-            sidecar = ctx.read_bytes(path + suffix)
-            if sidecar and sidecar[:16] != _SQLITE_MAGIC:
-                with open(db_path + suffix, 'wb') as f:
-                    f.write(sidecar)
-        for suffix in ('', '-wal'):
-            p = db_path + suffix
-            if os.path.isfile(p):
-                os.chmod(p, 0o444)
-        # -shm deliberately left writable: it is SQLite's shared-memory
-        # WAL-index (pure in-process bookkeeping, never evidence — the WAL
-        # frames themselves live in -wal, which stays read-only above).
-        # SQLite's own docs say a reader needs -shm write access to safely
-        # use the WAL; chmod'ing it 444 here was tested and made no
-        # difference on the one case exercised so far, but the risk of it
-        # mattering on a different SQLite build/version is not worth taking
-        # for a file that is pure bookkeeping, not evidence.
-        #
-        # Separately — and this is the one actually confirmed against real
-        # data — reading a WAL-mode db file WITHOUT its -wal sidecar is not
-        # simply "missing the newest rows": it can show MORE rows than
-        # currently exist. A table here showed 8 rows read main-file-only,
-        # vs. 1 row with the WAL correctly applied (matching the system
-        # sqlite3 CLI + `PRAGMA integrity_check` = ok) — the extra 8 were
-        # stale/superseded page content the WAL had since overwritten, not
-        # real data. Always pull -wal alongside the main file; never treat
-        # a WAL-less read as a safe "no worse than incomplete" fallback.
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5)
+        st = sqlite_reader.stage(os.path.basename(path) or 'db', raw,
+                                 wal=ctx.read_bytes(path + '-wal'),
+                                 journal=ctx.read_bytes(path + '-journal'), parent=tmpdir)
+        conn, _notes = sqlite_reader.connect_committed(st.path)
         return conn, tmpdir
     except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)

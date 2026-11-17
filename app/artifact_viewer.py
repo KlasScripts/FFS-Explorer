@@ -2990,14 +2990,17 @@ class ArtifactViewerMixin:
                 table_matches = [e for e in table_matches
                                  if e.get('file_key') == source_file_key] or table_matches
             rs = table_matches[0] if table_matches else entries[0]
-            is_wal = row.get('raw_file') == 'wal'
-            file_key = f"{rs['file_key']}_wal" if is_wal else rs['file_key']
+            # 'main', 'wal' or 'journal' (sqlite_recovery): a sidecar is the
+            # database's own path + '-wal' / '-journal', as the runner
+            # extracts it (_extract_db_sidecars), declared by the parser or not.
+            raw_file = row.get('raw_file') or 'main'
             ui_path = resolve_module_file_ui_path(
-                mod, file_key, self.guid_to_bundle,
+                mod, rs['file_key'], self.guid_to_bundle,
                 adapter=self._adapter, zip_names=self.zip_names)
+            if ui_path and raw_file in ('wal', 'journal'):
+                ui_path = f"{ui_path}-{raw_file}"
             if not ui_path:
-                where = "WAL sidecar" if is_wal else "source database"
-                self._show_art_hex_message(f"Could not resolve the {where} path for this parser")
+                self._show_art_hex_message("Could not resolve the source database path for this parser")
                 return
             data = self._read_zip_bytes(ui_path)
             if data is None:

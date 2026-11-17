@@ -1207,6 +1207,16 @@ full-size view, `_image_thumbnail` / `_video_thumbnail` for thumbnails.**
 - An `ATTACH`ed second database is **not** read-only just because the main
   one is; it needs its own `mode=ro` URI. *Confirmed (synthetic test).*
 - Carve WAL/SHM sidecars before any connect.
+- *Since 2026-11-16, every evidence open goes through `app/sqlite_reader.py`*
+  (checked by `tests/test_sqlite_open_guard.py`): `mode=ro` when a `-wal`
+  or `-journal` is beside the file; `immutable=1` only when the header says
+  WAL mode (bytes 18/19 = 2) and neither sidecar is beside it. *Confirmed
+  (synthetic test, SQLite 3.50.4):* `mode=ro` there creates an empty `-wal`
+  and `-shm` beside the file, and `immutable=1` with a real `-wal` silently
+  ignores it (8 rows with the WAL, 5 without). When SQLite must write
+  before it can read (a hot journal to roll back, a WAL index to rebuild),
+  the file is opened on a temporary copy, with a note. The device's `-shm`
+  is never needed: SQLite rebuilds the index from the WAL.
 
 **A-47. Carved rows are labelled, never dropped.** *Decision.*
 - A `header_signature` match (the weakest of the four carving methods: no
@@ -1214,6 +1224,14 @@ full-size view, `_image_thumbnail` / `_video_thumbnail` for thumbnails.**
 - Any carved row failing the table's own NOT NULL or timestamp-plausibility
   checks is labelled `(likely false positive — reason)`.
 - Both are still shown.
+- *Amended 2026-11-17.* Three kinds of candidate are left out, each counted
+  in the run's notes: exact copies of live rows (not lost data); candidates
+  holding, in some column, a kind of value (number / text / blob / null)
+  no live row of that column holds; and text that is not valid UTF-8 or a
+  number no app writes (mechanical signs of random bytes). *Confirmed
+  (SQLite Forensic Corpus v2.0):* every false record failed one of these
+  checks and no true record did. A real record partly overwritten since
+  (zero bytes in its text) is kept and labelled so.
 
 **A-48. Report timestamps are stored raw.** *Decision.*
 - Parsers store raw values and declare the unit (`timestamp_fields`); the
@@ -1243,6 +1261,73 @@ silently truncating once this was pointed out.
 - Grounding a fact and characterising what it means are different claims.
   Test both against real data before trusting a prompt change.
 
+**A-94. A database has up to four versions; the committed one is the
+default.** *Decision (owner, 2026-11-16).*
+- Committed: the WAL applied, an unfinished change (hot journal) rolled
+  back, i.e. what the app would read on its next start. What reports and
+  the File Browser's Database tab show.
+- Checkpoint: the main file without its WAL. A whole, consistent database;
+  shown as the Database tab's WAL diff (DELETED / MODIFIED / ADDED).
+- In-flight main: the main file as extracted under a hot journal. Not
+  consistent, so carved only, never queried with SQL. What it holds is
+  labelled UNFINISHED WRITE, and live rows it had already removed
+  UNFINISHED DELETE. Only what the app had written to disk is seen
+  (synthetic test: 27 of 2,000 rows being deleted were flagged; the rest of
+  the change was still in the app's memory).
+- Carved: deleted and older records (A-95).
+
+**A-95. One carver for reports and the Database tab.** *Decision.*
+- `app/sqlite_recovery.py`: per file once (freed pages, WAL frames,
+  journal pages, overflow, free space), per table cheap attribution.
+  Methods: checkpoint (deleted or changed since the last checkpoint: whole
+  rows), WAL frame, journal (table not certain), unfinished write / delete,
+  free space, freed page (table not certain: matched by column count),
+  overflow, pattern (no rowid) and rebuilt header (no rowid; the one lost
+  serial type taken from the table's pattern or tried against its declared
+  column types). Labels follow A-47.
+- A WAL frame of a page that is free now (in no b-tree: it left its table,
+  typically when its rows were deleted) is read like a freed page, table
+  not certain, and only when the record matches the table's own pattern,
+  or, for a table with no live rows, when no other table has as many
+  columns and the types fit the declared column types. Column count alone
+  let every same-width table claim the same records (Pixel: 15,276
+  records; with the rule 897, 2.2%).
+- A column is a rowid alias only when it is the single PRIMARY KEY column
+  declared exactly INTEGER (not INT, BIGINT, …; not WITHOUT ROWID, not
+  INTEGER PRIMARY KEY DESC): SQLite's rule. *Confirmed (synthetic test).*
+- Rows of DROPPED tables are not recovered. *Decision (owner, 2026-11-17):*
+  phone apps delete, update and insert rows; dropping a table is rare (e.g.
+  a schema migration). FQLite 5.21 recovers them (corpus 0A: 99/100).
+
+**A-96. The runner extracts every database's `-wal` and `-journal`.**
+*Decision.* For every SQLite file a parser extracts, from the same archive
+location as the database (never another copy of it, which would mix two
+moments). Before 2026-11-16, 14 parsers extracted a database without its
+`-wal`, several without its `-journal`.
+
+**A-97. Recovery is scored against independent ground truth.** *Decision.*
+- `tests/test_sqlite_corpus.py` scores the carver on the SQLite Forensic
+  Corpus v2.0 (CC0, `test_data/sqlite_forensic_corpus/`). Ground truth is
+  the corpus's own SQL, replayed with triggers that record every deleted,
+  overwritten or dropped row. The test fails on any new wrong record, any
+  fall in recall per category, or any carver error.
+- Same-day comparison (2026-11-17, same ground truth, exact records):
+  deleted records 100/101 (FQLite 5.21: 100, DC3 sqlite_dissect 1.0.0: 68,
+  the previous carver: 24); overwritten records 19/45 (19, 17, 2);
+  pointer-map database 36/1,148 (36, 35, 3). The two known wrong records
+  are real deleted rows whose last bytes were overwritten in the file;
+  sqlite_dissect reports the same wrong values.
+- Josh Hickman's documented deletions (test_data/josh_hickman_*,
+  2026-11-17), every SQLite database of each extraction: Android 44
+  documented, 6 recovered (3 by the previous carver too, 3 only now: MEGA
+  x2, Snapchat), 8 still live rows, 29 not in any database as plain text;
+  iPhone 74 documented, 13 recovered (5 before too, 8 only now: Google
+  Chat x2, Line, Mastodon, MEGA, Snapchat, Viber, Life360), 18 still live,
+  40 not in plain text, 1 in the file but not recovered (Google Voice: an
+  orphaned overflow page). Every one found only now was an older version
+  in the WAL: apps that "delete" by changing the row, whose older versions
+  the previous carver dropped; or a page that later left its table.
+
 ## 13. Case data storage
 
 **A-53. Two case databases, by how replaceable their data is.** *Decision.*
@@ -1251,6 +1336,13 @@ silently truncating once this was pointed out.
   `header_types`, `guid_bundle`, the nested-archive index,
   `app_intelligence`, `app_registry`, `evidence_page_map`,
   `leveldb_search_index`, `processing_registry` and `media_metadata`.
+- `casecache.db` also holds `recovered_records`: the Database tab's
+  carving results per database and table, keyed by path + size + CRC (of
+  it and its sidecars) and `RECOVERY_VERSION`, so a carver change never
+  reuses older results. Stored as JSON (never pickle, so a case folder
+  cannot run code when read). A table name may not start with `sqlite_`
+  (reserved by SQLite: creating one fails, and here it failed the whole
+  cache open). *Confirmed (test).*
 - The Timeline tables (`timeline_events`, `timeline_sources`,
   `timeline_meta`) are in `casecache.db` too: they are rebuilt from the
   `artifact_<name>` tables in `caseresults.db` (when their fingerprint
@@ -1402,6 +1494,13 @@ Tools menu when AI access was off once hid every other Tools action too.
   stage starts or ends (finding candidates, saving results) belongs on the
   worker, and a result the worker already holds is passed to the window,
   not re-read from the case database.
+- **The Database tab carves in a worker process** (`sqlite_recovery.
+  records_in_process`, one spawned worker keeping each file's decoding).
+  On a QThread it froze the window for 2.8-4.6 s on the Pixel's 95 MB
+  Snapchat database, although "in the background": pure-Python decoding
+  holds the GIL and the GUI thread waits for it each time it runs Python.
+  In a process: longest freeze 0.15 s. *Confirmed (real window,
+  2026-11-17).*
 - **Not yet confirmed in a frozen build:** the pool starts its workers the
   same way (`spawn`, `freeze_support`) as the first-open parse, which
   works in the exe.

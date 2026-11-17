@@ -493,16 +493,12 @@ def _live_leaf_pages(raw: bytes, page_size: int) -> set[int]:
     leaves: set[int] = set()
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        conn = sqlite3.connect(f'file:{tmp_path}?mode=ro', uri=True)
-        try:
+        # The main file as stored (its own page topology), read in memory by
+        # the carver's read-only connection: no temp file.
+        with sc._readonly_connection(raw) as conn:
             roots = [r[0] for r in conn.execute(
                 "SELECT rootpage FROM sqlite_master WHERE type='table' "
                 "AND rootpage > 0")]
-        finally:
-            conn.close()
         for root in roots:
             try:
                 leaves.update(sc.walk_table_leaf_pages(raw, page_size, root))
@@ -934,31 +930,29 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
     # kind == 'sqlite'
     seen_blobs: list[bytes] = []          # live media, to skip recovered copies of it
     tmp_dir = tempfile.mkdtemp(prefix='ffs_em_')
-    tmp_path = os.path.join(tmp_dir, 'db.sqlite')
     try:
-        with open(tmp_path, 'wb') as f:
-            f.write(raw)
-        # Live = what SQLite itself shows, which includes rows committed in
-        # the -wal but not yet copied into the main file (2026-10-23: the
-        # -wal used to be left out, so such media was missed). If the db
-        # can't be opened with its -wal, scan it without, as before.
-        live: list[dict] = []
-        if wal_bytes:
-            with open(tmp_path + '-wal', 'wb') as f:
-                f.write(wal_bytes)
-            try:
-                live = list(scan_sqlite_live(tmp_path))
-            except Exception:
-                live = []
-                for sfx in ('-wal', '-shm'):
-                    try:
-                        os.unlink(tmp_path + sfx)
-                    except OSError:
-                        pass
-        if not live:
-            live = list(scan_sqlite_live(tmp_path))
+        # Live = the committed view (sqlite_reader: the -wal applied, as the
+        # app reads it). If the WAL cannot be applied, the main file alone is
+        # read as what it is, the checkpoint view, and each hit's location
+        # says so: its media are real bytes in the file but may since have
+        # been changed or deleted by the WAL (2026-11-17; before, the main
+        # file alone was scanned silently as if current).
+        import sqlite_reader
+        st = sqlite_reader.stage('db.sqlite', raw, wal=wal_bytes, parent=tmp_dir)
+        suffix = ''
+        try:
+            live = list(scan_sqlite_live(st.path))
+        except Exception:
+            live = []
+            if st.has_wal:
+                os.unlink(st.path + '-wal')
+                for extra in ('-shm',):
+                    if os.path.exists(st.path + extra):
+                        os.unlink(st.path + extra)
+                live = list(scan_sqlite_live(st.path))
+                suffix = ' [main file without its WAL: the WAL could not be applied]'
         for hit in live:
-            location = f"{hit['table']}.{hit['column']} (rowid={hit['rowid']})"
+            location = f"{hit['table']}.{hit['column']} (rowid={hit['rowid']}){suffix}"
             rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
             seen_blobs.append(hit['blob'])
     except Exception:

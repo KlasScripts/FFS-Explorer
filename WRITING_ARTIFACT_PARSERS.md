@@ -90,9 +90,15 @@ doesn't.
 
 `files` are required — if one is missing from the archive, the parser
 doesn't run and FFS Explorer says why. `optional_files` are extracted when
-present but never block the run — always list a database's `-wal`/`-shm`
-sidecars here, since a database in WAL mode can have its newest rows only
-in the `-wal` file (never in the main file).
+present but never block the run.
+
+You don't need to list a database's `-wal` or `-journal`: since
+2026-11-16 the runner extracts both beside every SQLite file it extracts
+(`_extract_db_sidecars`), from the same place in the archive as the
+database, so a WAL's newest rows and an unfinished change are never missed
+because a parser forgot them. Declaring them anyway is harmless. The `-shm`
+is not needed (SQLite rebuilds it from the WAL); list it only if your parser
+reads it as evidence.
 
 ### `run(paths)`
 
@@ -542,10 +548,19 @@ picker the same way a missed SQL JOIN is.
 recoverable_tables = ["messages"]
 ```
 
-Declares a table to also carve for deleted rows (freeblocks, freed pages,
-WAL history). No recovery code belongs in the parser — this declaration is
-the entire contribution; the shared carving pipeline does the work and
-appends whatever it finds to your `run()` output. Only add this once
+Declares a table to also carve for deleted and older rows. No recovery
+code belongs in the parser — this declaration is the entire contribution;
+the shared carver (`app/sqlite_recovery.py`, the same one the File
+Browser's Database tab uses) does the work and appends whatever it finds to
+your `run()` output: rows deleted or changed since the last checkpoint,
+older versions in WAL frames and rollback-journal pages, the unfinished
+write under a hot journal, and deleted records in free space, on freed
+pages, on overflow pages and found by the table's record pattern
+(including records whose header the delete overwrote). Each recovered row
+carries `recovery_method`, `recovery_note` (plain words: how it was found
+and how sure that is), `table_certain`, `recovery_version`, and its exact
+`raw_file` (`main`/`wal`/`journal`) and `raw_offset`. Rows of dropped
+tables are not recovered. Only add this once
 you've actually checked (a real negative — "no WAL, checked, found
 nothing" — is still worth declaring, so a future re-check on different
 data finds it automatically instead of needing another one-off

@@ -368,6 +368,24 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
         )
     ''')
 
+    # Deleted/older SQLite records found by sqlite_recovery.py, per database
+    # (path + size + CRC of it and its sidecars) and table, so the Database
+    # tab carves a database once, not on every session. recovery_version is
+    # part of the key: a carver change never reuses older results. Rebuilt
+    # like everything here (the archive is the source).
+    # Additive (CREATE TABLE IF NOT EXISTS): no schema version bump needed.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS recovered_records (
+            db_key           TEXT NOT NULL,
+            table_name       TEXT NOT NULL,
+            recovery_version INTEGER NOT NULL,
+            ncols            INTEGER NOT NULL,
+            records          BLOB NOT NULL,
+            notes            TEXT NOT NULL,
+            PRIMARY KEY (db_key, table_name, recovery_version)
+        )
+    ''')
+
     conn.execute(f'PRAGMA user_version = {_CACHE_SCHEMA_VERSION}')
     conn.commit()
     return conn

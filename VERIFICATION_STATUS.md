@@ -88,6 +88,8 @@ Same grouping as CLAUDE.md's module table.
 | `timeline.py` | 🔴 | | New 2026-11-15. Unit-tested (tests/test_timeline.py) and checked in the app on the Pixel 7a copy (every row of the four reports with rows became one event; a Usage Stats spot check matched to the ms). Meanings written for 9 Android reports from their own notes. NOT yet human-reviewed |
 | `timeline_viewer.py` | 🔴 | | New 2026-11-15. Pivot window, order and jump back to the report row checked by driving the app. File events (User Media times, EXIF taken) built and double-click to the File Browser checked by driving the app on iOS 17 and Pixel copies. NOT yet human-reviewed |
 | `sqlite_carve.py` | 🔴 | | |
+| `sqlite_reader.py` | 🔴 | | New 2026-11-16. The one evidence SQLite open (committed / checkpoint views). Unit-tested on synthetic WAL, hot-journal and WAL-mode-without-WAL databases (tests/test_sqlite_reader.py). NOT yet human-reviewed |
+| `sqlite_recovery.py` | 🔴 | | New 2026-11-16. The one carver for reports and the Database tab. Unit-tested against written ground truth (tests/test_sqlite_recovery.py) and scored on the SQLite Forensic Corpus (tests/test_sqlite_corpus.py; same-day comparison with FQLite 5.21 and DC3 sqlite_dissect in A-97); compared with the previous carver on six case copies. NOT yet human-reviewed |
 | `artifact_media.py` | 🔴 | | |
 | `research_store.py` | 🔴 | | |
 | `validation_store.py` / `parser_validation.py` | 🔴 | | |

@@ -1575,17 +1575,33 @@ def record_column_names(conn, table: str) -> list[str]:
 
 
 def rowid_alias_column(conn, table: str) -> str | None:
-    """The column name that a bare cell rowid transparently stands in
-    for (single-column INTEGER PRIMARY KEY), or None if this table has
-    no such column. Used to backfill that field with the real rowid on a
-    carved row that has one — its record-body value is otherwise always
-    a placeholder NULL, never the actual id."""
+    """The column a cell's rowid stands in for, or None.
+
+    SQLite's rule (https://sqlite.org/lang_createtable.html#rowid): a
+    column is an alias for the rowid only when it is the table's single
+    PRIMARY KEY column and its declared type is exactly "INTEGER" (any
+    case). "INT PRIMARY KEY", "BIGINT PRIMARY KEY", "INT UNSIGNED PRIMARY
+    KEY" are ordinary columns whose value is stored in the record. Not an
+    alias either: a WITHOUT ROWID table, and the documented quirk
+    "INTEGER PRIMARY KEY DESC" in the column definition.
+
+    Until 2026-11-17 any type containing "int" was taken as an alias, and
+    a carved row's real stored value in such a column was replaced by the
+    cell's rowid (SQLite Forensic Corpus 17-01: mid INT PRIMARY KEY)."""
+    import re
     info = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
-    pk_cols = [row[1] for row in info if row[5]]
-    if len(pk_cols) == 1 and any(row[1] == pk_cols[0] and 'int' in (row[2] or '').lower()
-                                 for row in info):
-        return pk_cols[0]
-    return None
+    pk_cols = [row for row in info if row[5]]
+    if len(pk_cols) != 1 or (pk_cols[0][2] or '').strip().upper() != 'INTEGER':
+        return None
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                       (table,)).fetchone()
+    sql = (row[0] or '') if row else ''
+    if re.search(r'\)\s*WITHOUT\s+ROWID\s*;?\s*$', sql, re.I):
+        return None
+    col = re.escape(pk_cols[0][1])
+    if re.search(rf'["`\[]?{col}["`\]]?\s+INTEGER\s+PRIMARY\s+KEY\s+DESC\b', sql, re.I):
+        return None
+    return pk_cols[0][1]
 
 
 def notnull_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -1753,14 +1769,21 @@ def _find_table_file(extracted_paths: dict, table: str) -> str | None:
     return whichever one's sqlite_master actually defines *table* — a
     parser script declaring `recoverable_tables` names only the table, not
     which of its (possibly several) database files holds it."""
-    for path in extracted_paths.values():
-        if not os.path.isfile(path):
+    # Only the parser's own extracted files: reserved keys ('_adapter',
+    # '_ui_path_for', '_read_zip_bytes', ...) hold objects and functions.
+    # Until 2026-11-16 a function here raised TypeError on the isfile
+    # check, recover_deleted_rows' catch-all turned that into [], and every
+    # bare-name recoverable_tables entry recovered nothing (from
+    # 2026-10-22, when '_ui_path_for' was added to paths).
+    for key, path in extracted_paths.items():
+        if key.startswith('_') or not isinstance(path, str) or not os.path.isfile(path):
             continue
         try:
             with open(path, 'rb') as f:
                 if f.read(16) != b'SQLite format 3\x00':
                     continue
-            conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5)
+            import sqlite_reader
+            conn, _notes = sqlite_reader.connect_committed(path)
             try:
                 hit = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -1849,6 +1872,8 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None,
     gets surfaced instead)."""
     field_notes = field_notes or {}
     try:
+        import sqlite_recovery
+        import sqlite_reader
         if file_key is not None:
             db_path = paths.get(file_key)
             if db_path is None or not os.path.isfile(db_path):
@@ -1857,221 +1882,71 @@ def recover_deleted_rows(paths: dict, table: str, field_notes: dict = None,
             db_path = _find_table_file(paths, table)
             if db_path is None:
                 return []
-        with open(db_path, 'rb') as f:
-            raw = f.read()
-        header = parse_db_header(raw)
 
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5)
+        def _read(p):
+            try:
+                with open(p, 'rb') as f:
+                    return f.read()
+            except OSError:
+                return None
+        raw = _read(db_path)
+        wal = _read(db_path + '-wal')
+        journal = _read(db_path + '-journal')
+        parse_db_header(raw)              # raises if it is not a database
+
+        conn, _notes = sqlite_reader.connect_committed(db_path)
+        checkpoint = sqlite_reader.connect_checkpoint(db_path)
         try:
-            root_row = conn.execute(
-                "SELECT rootpage FROM sqlite_master WHERE type='table' AND name=?",
-                (table,)).fetchone()
-            if root_row is None:
+            t = sqlite_recovery.table_info(conn, table, checkpoint)
+            if t is None:
                 return []
-            live_rowids = {r[0] for r in conn.execute(f'SELECT rowid FROM "{table}"')}
-            cols = record_column_names(conn, table)
-            id_col = rowid_alias_column(conn, table)
-            # id_col excluded: a header_signature row structurally can
-            # never carry it (the rowid-alias column's record-body value is
-            # always a placeholder NULL — see record_column_names — and
-            # only the rowid-based paths below ever backfill it from the
-            # cell's own rowid, which a header_signature match doesn't
-            # have). Checking it here would flag every genuine header_
-            # signature carve of this table as a violation, not just a real
-            # false positive.
-            notnull_cols = notnull_columns(conn, table) - ({id_col} if id_col else set())
-
-            leaves = walk_table_leaf_pages(raw, header['page_size'], root_row[0])
-
-            # Candidates WITH a rowid — require an exact column-count match,
-            # since these also required an intact (payload_length, rowid)
-            # pair to decode at all; a count mismatch here means it isn't
-            # really a row of this table, not a truncated one.
-            rowid_candidates = carve_unallocated_region(raw, header['page_size'], leaves)
-            rowid_candidates += carve_freed_pages(raw, header['page_size'], header)
-
-            wal_path = db_path + '-wal'
-            if os.path.isfile(wal_path):
-                with open(wal_path, 'rb') as f:
-                    wal = f.read()
-                # `leaves` alone (from the main file) misses a table whose
-                # root/interior pages were never checkpointed at all — see
-                # walk_table_leaf_pages' own docstring for the real case
-                # this was found against. Re-walking with a WAL-image
-                # fallback recovers the correct leaf set for exactly that
-                # case, and is a no-op for a table that WAS already
-                # checkpointed (the fallback only ever fires for a page
-                # missing from the main file).
-                wal_images = _wal_latest_page_images(wal, header['page_size'])
-                wal_leaves = walk_table_leaf_pages(raw, header['page_size'], root_row[0], wal_images)
-                rowid_candidates += carve_wal_history_for_table(
-                    wal, header['page_size'], set(leaves) | set(wal_leaves), live_rowids)
-
-            out, seen, content_seen = [], set(), set()
-            for c in rowid_candidates:
-                if c['rowid'] in live_rowids or len(cols) != len(c['values']):
-                    continue  # still live elsewhere, or not a real row of this table
-                key = (c['rowid'], c['page'], c['offset'])
-                if key in seen:
-                    continue
-                seen.add(key)
-                fields = {name: blob_safe(v) for name, v in zip(cols, c['values'])}
-                if id_col:
-                    # The record body's own value for the rowid-alias
-                    # column is a placeholder NULL (see record_column_names)
-                    # — the real value only exists as the cell's rowid,
-                    # which this candidate has. Backfill it.
-                    fields[id_col] = c['rowid']
-                fields.update(flatten_json_fields(fields))
-                # Exact-duplicate content (e.g. the same logical row
-                # captured unchanged across several WAL frames) is pure
-                # noise -- collapse it. A row whose fields genuinely
-                # evolved between frames (e.g. a "read" flag flipping) is
-                # NOT a duplicate by this check and is kept: that's real
-                # timeline signal, not noise, and collapsing it would lose
-                # information rather than just tidying the output.
-                content_key = tuple(sorted(fields.items()))
-                if content_key in content_seen:
-                    continue
-                content_seen.add(content_key)
-                is_wal = c['source'] == 'wal_frame'
-                # Same confidence gate header_signature candidates get
-                # below -- see _confidence_gate's own docstring for why
-                # this now runs for every carving path, not just that one.
-                # These candidates already passed a stronger structural
-                # check (exact column-count match against the live schema,
-                # plus a real rowid+payload-length decode) than
-                # header_signature ever can, so this rarely fires here --
-                # but "rarely" isn't "never", and the row is never
-                # withheld either way, only labeled, same as always.
-                notnull_violations, timestamp_issues = _confidence_gate(
-                    fields, notnull_cols, timestamp_fields)
-                row = {
-                    'recovered': True,
-                    'recovery_method': c['source'],
-                    'source_table': table,
-                    # Which of a parser's own files this table was actually
-                    # carved from — None for the common case (bare-string
-                    # recoverable_tables entry, table name unique across
-                    # every file this parser reads) but a real value (e.g.
-                    # "ukm_db") for the pinned tuple form, which only
-                    # exists because two of a parser's files can define a
-                    # same-named table (see this function's own docstring).
-                    # A record_source lookup needs this same disambiguator
-                    # when it declares two entries sharing that table name
-                    # too — matching by table name alone would be exactly
-                    # the collision this field exists to resolve.
-                    'source_file_key': file_key,
-                    'raw_page': c['page'],
-                    'raw_rowid': c['rowid'],
-                    # Exact on-disk location of THIS candidate's own bytes,
-                    # for the Artifact Viewer's Hex-panel Record mode to
-                    # jump straight to — no live-b-tree search needed (that
-                    # would never find a carved row anyway); the carving
-                    # pass already knows precisely where it found this one.
-                    # 'main' = the primary db file record_source's file_key
-                    # already resolves; 'wal' = that same key's "_wal"
-                    # sidecar (see resolve_module_file_ui_path's caller).
-                    # c['offset'] (main-file case) is PAGE-relative (0..
-                    # page_size-1, same as every other page-scoped offset
-                    # this module works with internally) — converted to a
-                    # true file-absolute offset here, the one place a
-                    # consumer (the Hex panel) actually needs one, the same
-                    # way locate_live_row already does for a live row's own
-                    # abs_offset. c['wal_offset'] needs no such conversion —
-                    # it's already file-absolute (built from the WAL frame's
-                    # own absolute header offset, not a page number).
-                    'raw_file':   'wal' if is_wal else 'main',
-                    'raw_offset': (c['wal_offset'] if is_wal
-                                   else (c['page'] - 1) * header['page_size'] + c['offset']),
-                    'raw_length': c.get('length') or c.get('cell_len'),
-                    'notnull_violations': notnull_violations,
-                    'timestamp_issues': timestamp_issues,
-                }
-                row.update(fields)
-                row.update(_try_link_foreign_keys(conn, table, fields))
-                row.update({f'{col}_caveat': note for col, note in field_notes.items()
-                           if col in fields})
-                out.append(row)
-
-            # Header-signature candidates — no rowid to compare against
-            # live_rowids at all (see the section docstring above
-            # carve_by_header_signature for why), so every match here is,
-            # by construction, not one of the rows the live query already
-            # returned. A short match (fewer values than `cols`) is a
-            # genuine truncation, not a mismatch — keep it, missing fields
-            # simply absent from the row rather than padded with a guess.
-            signature = sample_header_signature(raw, header['page_size'], leaves)
-            for c in carve_by_header_signature(raw, header['page_size'], leaves, signature):
-                key = ('header_signature', c['page'], c['header_offset'])
-                if key in seen:
-                    continue
-                seen.add(key)
-                fields = {name: blob_safe(v) for name, v in zip(cols, c['values'])}
+            fr = sqlite_recovery.for_connection(raw, wal, journal, conn)
+            records, _rnotes = fr.records(t)
+            cols, id_col = t.columns, t.id_col
+            out, content_seen = [], set()
+            for r in records:
+                values = list(r['values'])
+                fields = {name: blob_safe(v) for name, v in zip(cols, values)}
                 fields.update(flatten_json_fields(fields))
                 content_key = tuple(sorted(fields.items()))
                 if content_key in content_seen:
                     continue
                 content_seen.add(content_key)
-                # Same shared confidence gate the rowid-based loop above now
-                # also runs (see _confidence_gate's own docstring) — a NOT
-                # NULL column decoding as blank, or a declared timestamp
-                # column decoding outside a sane range, is a structural
-                # sign this candidate isn't really a row of *table* at all
-                # — never used to drop the row (this project's standing
-                # rule is escalate, don't silently discard), only to label
-                # it more specifically than the bare "(unverified match)"
-                # every header_signature row already gets.
                 notnull_violations, timestamp_issues = _confidence_gate(
-                    fields, notnull_cols, timestamp_fields)
-                # Outright rejection, not a label — see _text_plausible's
-                # own docstring for why NUL-dominated "text" is a
-                # mechanical fact about the bytes, not a content-meaning
-                # guess (the kind of judgment call this project otherwise
-                # avoids making on a candidate's behalf). This is the one
-                # place in this whole function that actually drops a
-                # candidate rather than surfacing it with an escalating
-                # caution label — logged, not silent, so a real anomaly
-                # here still leaves SOME trace even though the Report
-                # table itself intentionally never sees it.
-                implausible_text_fields = sorted(
-                    name for name, value in fields.items()
-                    if isinstance(value, str) and not _text_plausible(value))
-                if implausible_text_fields:
-                    print(f"[sqlite_carve] rejected header_signature candidate in "
-                         f"'{table}' (page {c['page']}, offset {c['header_offset']}): "
-                         f"implausible text in {', '.join(implausible_text_fields)}")
-                    continue
+                    fields, t.notnull, timestamp_fields)
                 row = {
                     'recovered': True,
-                    'recovery_method': c['source'],
+                    'recovery_method': r['method'],
+                    'recovery_note': sqlite_recovery.describe(r),
+                    'recovery_version': sqlite_recovery.RECOVERY_VERSION,
+                    'table_certain': r['table_certain'],
                     'source_table': table,
+                    # Which of a parser's own files this table was carved
+                    # from (the pinned tuple form of recoverable_tables).
                     'source_file_key': file_key,
-                    'raw_page': c['page'],
-                    'raw_rowid': None,
-                    # header-signature matches only ever come from the main
-                    # db file's free space (see carve_by_header_signature —
-                    # it's never run against WAL frames), so this is always
-                    # 'main'. c['header_offset'] is PAGE-relative (same
-                    # convention as c['offset'] in the rowid-based loop
-                    # above) — converted to file-absolute here, same reason
-                    # and same formula as that loop's own comment.
-                    'raw_file':   'main',
-                    'raw_offset': (c['page'] - 1) * header['page_size'] + c['header_offset'],
-                    'raw_length': c.get('length'),
-                    'truncated': c['truncated'],
+                    'raw_page': r['page'],
+                    'raw_rowid': r['rowid'],
+                    # Exact location of the record's bytes, for the Hex
+                    # panel's Record mode: 'main', 'wal' or 'journal' (the
+                    # database's sidecar), offset absolute in that file.
+                    'raw_file': r['file'],
+                    'raw_offset': r['offset'],
+                    'raw_length': r['length'],
                     'notnull_violations': notnull_violations,
                     'timestamp_issues': timestamp_issues,
                 }
+                if r['truncated']:
+                    row['truncated'] = True
                 row.update(fields)
                 row.update(_try_link_foreign_keys(conn, table, fields))
                 row.update({f'{col}_caveat': note for col, note in field_notes.items()
                            if col in fields})
                 out.append(row)
-
             return out
         finally:
             conn.close()
+            if checkpoint is not None:
+                checkpoint.close()
     except Exception:
         return []
 

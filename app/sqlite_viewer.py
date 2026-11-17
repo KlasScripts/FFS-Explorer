@@ -63,10 +63,15 @@ _DIFF_BG = {
     'MODIFIED': QColor(255, 193, 7, 45),     # amber
     'WAL HISTORY': QColor(66, 133, 244, 55),          # blue
     'WAL HISTORY (older WAL)': QColor(66, 133, 244, 30),
+    'WAL HISTORY (page now free)': QColor(66, 133, 244, 30),
     'JOURNAL':  QColor(0, 150, 136, 50),     # teal
     'CARVED':   QColor(156, 39, 176, 45),    # purple
     'CARVED (freed page)': QColor(156, 39, 176, 25),
     'CARVED (pattern)':    QColor(156, 39, 176, 25),
+    'CARVED (rebuilt)':    QColor(156, 39, 176, 25),
+    'CARVED (overflow)':   QColor(156, 39, 176, 35),
+    'UNFINISHED WRITE':    QColor(255, 112, 67, 55),   # orange
+    'UNFINISHED DELETE':   QColor(255, 112, 67, 35),
 }
 _DIFF_CELL_CHANGED = QColor(255, 193, 7, 130)   # stronger amber for changed cells
 
@@ -77,10 +82,15 @@ _DIFF_TIP = {
     'MODIFIED': "Changed by the WAL. Cells show old → new.",
     'WAL HISTORY': "Older version in a WAL frame of this table's page.",
     'WAL HISTORY (older WAL)': "Earlier WAL round. Page may have held another table.",
+    'WAL HISTORY (page now free)': "WAL copy of a now-free page. Table not certain.",
     'JOURNAL':  "Older page from rollback journal. May be another table's.",
     'CARVED':   "Deleted record from free space on this table's pages.",
     'CARVED (freed page)': "Freed page. Table not certain: matched by column count.",
     'CARVED (pattern)': "Found by record pattern, no rowid. [cut off] = missing.",
+    'CARVED (rebuilt)': "Header overwritten; rebuilt from this table's pattern.",
+    'CARVED (overflow)': "Deleted record continued on overflow pages.",
+    'UNFINISHED WRITE': "App was writing this; never committed.",
+    'UNFINISHED DELETE': "Live row the unfinished write was removing or moving.",
 }
 
 _JOURNAL_MAGIC = b'\xd9\xd5\x05\xf9\x20\xa1\x63\xd7'
@@ -269,11 +279,13 @@ class SqliteDiffModel(QAbstractTableModel):
 
 
 class SqlitePreviewWorker(QThread):
-    """Extracts a SQLite db (+ WAL/SHM sidecars) to a temp copy and counts
-    every table's rows — off the GUI thread.  Both the extraction write and
-    the per-table SELECT COUNT(*) loop can take seconds on a large database
-    (e.g. a case on a network share), and this previously ran synchronously
-    in _load_sqlite_preview on every file click."""
+    """Prepares a database for the Database tab, off the GUI thread: the
+    committed view (what the app would read: WAL applied, an unfinished
+    change undone; sqlite_reader.py) written as a plain file every query
+    here runs on, the checkpoint view (main file alone) when there is a
+    WAL, and the files the carver reads (sqlite_recovery.py), then counts
+    every table's rows. The device's -shm is not used: SQLite rebuilds its
+    index from the WAL."""
     done = Signal(dict)
 
     def __init__(self, raw: bytes, name: str, wal: bytes | None, shm: bytes | None,
@@ -282,125 +294,232 @@ class SqlitePreviewWorker(QThread):
         self._raw  = raw
         self._name = name
         self._wal  = wal
-        self._shm  = shm
+        self._shm  = shm            # kept for the call signature; never staged
         self._journal = journal
 
     def run(self):
-        tmpdir = tempfile.mkdtemp(prefix="ffs_sqlite_")
-        db_path = os.path.join(tmpdir, self._name)
+        self.done.emit(prepare_database(self._raw, self._name, self._wal, self._journal,
+                                        self.isInterruptionRequested))
+
+
+def prepare_database(raw: bytes, name: str, wal: bytes | None = None,
+                     journal: bytes | None = None, stop=lambda: False) -> dict:
+    """Everything the Database tab shows for one database, as a dict (see
+    SqlitePreviewWorker). Qt-free so tests and the worker share it."""
+    import sqlite_reader
+    import sqlite_recovery
+    tmpdir = sqlite_reader.new_temp_dir('ffs_sqlite_')     # removed at exit at the latest
+    try:
+        st = sqlite_reader.stage(name, raw, wal=wal, journal=journal, parent=tmpdir)
+    except Exception as exc:
+        return {'error': f"Could not extract {name}: {exc}", 'tmpdir': tmpdir}
+    if stop():
+        return {'cancelled': True, 'tmpdir': tmpdir}
+    try:
+        conn, notes = sqlite_reader.connect_committed(st.path)
         try:
-            with open(db_path, 'wb') as f:
-                f.write(self._raw)
-        except Exception as exc:
-            self.done.emit({'error': f"Could not extract {self._name}: {exc}", 'tmpdir': tmpdir})
-            return
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+            image = sqlite_reader.committed_image(conn)
+        finally:
+            conn.close()     # never hand a cross-thread sqlite3 connection to the GUI thread
+    except Exception:
+        return {'error': f"{name} is not a valid SQLite database.", 'tmpdir': tmpdir}
+    notes = list(st.notes) + notes
 
-        # Pull WAL/SHM sidecars alongside so the latest committed pages show.
-        # A real -wal/-shm never starts with the SQLite main-db magic; guards
-        # against readers that fall back to the whole db blob when the
-        # sidecar entry doesn't exist (e.g. gzip-sourced nested archives).
-        wrote_wal = False
-        for suffix, sidecar in (('-wal', self._wal), ('-shm', self._shm)):
-            if sidecar is None or sidecar[:16] == _SQLITE_MAGIC:
-                continue
+    def write(sub, data):
+        d = os.path.join(tmpdir, sub)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name)
+        with open(path, 'wb') as f:
+            f.write(data)
+        return path
+
+    # Every query in the tab runs on this plain copy of the committed view.
+    db_path = write('committed', sqlite_reader.readable_image(image))
+    counts = {}
+    c = sqlite3.connect(f'file:{db_path}?immutable=1', uri=True)
+    try:
+        for t in tables:
+            if stop():
+                return {'cancelled': True, 'tmpdir': tmpdir}
             try:
-                with open(db_path + suffix, 'wb') as f:
-                    f.write(sidecar)
-                if suffix == '-wal':
-                    wrote_wal = True
+                counts[t] = c.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
             except Exception:
-                pass
+                counts[t] = 0
+    finally:
+        c.close()
 
-        # When a WAL is present, keep a pristine copy of the main file alone
-        # so the GUI thread can compute the pre-WAL (last-checkpointed) state,
-        # and the WAL bytes themselves: closing a connection on db_path
-        # checkpoints the WAL into that copy and deletes its -wal.
-        has_wal = wrote_wal
-        before_path = None
-        wal_copy = None
-        if wrote_wal:
-            before_dir = os.path.join(tmpdir, 'before')
-            os.makedirs(before_dir, exist_ok=True)
-            before_path = os.path.join(before_dir, self._name)
-            wal_copy = os.path.join(tmpdir, 'wal-frames')
-            try:
-                with open(before_path, 'wb') as f:
-                    f.write(self._raw)
-                with open(wal_copy, 'wb') as f:
-                    f.write(self._wal)
-            except Exception:
-                has_wal = False
-                before_path = None
-                wal_copy = None
-
-        # The main file as it came out of the archive, for carving, and the
-        # rollback journal. The journal is never put beside db_path: SQLite
-        # would roll it back into the copy on open.
-        main_copy = os.path.join(tmpdir, 'main-file')
-        journal_copy = None
+    # The checkpoint view (main file alone), only when a WAL was applied;
+    # a table the WAL dropped exists only there.
+    has_wal = st.has_wal
+    before_path = wal_copy = None
+    dropped = []
+    if has_wal:
+        before_path = write('before', raw)
+        wal_copy = os.path.join(tmpdir, 'wal-frames')
+        with open(wal_copy, 'wb') as f:
+            f.write(wal)
         try:
-            with open(main_copy, 'wb') as f:
-                f.write(self._raw)
-        except Exception:
-            main_copy = None
-        if self._journal and self._journal[:8] == _JOURNAL_MAGIC:
-            journal_copy = os.path.join(tmpdir, 'journal-pages')
+            before = sqlite3.connect(f'file:{before_path}?immutable=1', uri=True)
             try:
-                with open(journal_copy, 'wb') as f:
-                    f.write(self._journal)
-            except Exception:
-                journal_copy = None
-
-        if self.isInterruptionRequested():
-            self.done.emit({'cancelled': True, 'tmpdir': tmpdir})
-            return
-
-        try:
-            conn = sqlite3.connect(db_path)
-            try:
-                tables = [r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-                counts = {}
-                for t in tables:
-                    if self.isInterruptionRequested():
-                        self.done.emit({'cancelled': True, 'tmpdir': tmpdir})
-                        return
-                    try:
-                        counts[t] = conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
-                    except Exception:
+                for (t,) in before.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%' ORDER BY name"):
+                    if t not in counts:
+                        dropped.append(t)
                         counts[t] = 0
             finally:
-                conn.close()   # never hand a cross-thread sqlite3 connection to the GUI thread
+                before.close()
         except Exception:
-            self.done.emit({'error': f"{self._name} is not a valid SQLite database.",
-                             'tmpdir': tmpdir})
-            return
+            dropped = []
 
-        # A table the WAL dropped exists only in the pre-WAL copy.
-        dropped = []
-        if before_path:
-            try:
-                before = sqlite3.connect(f'file:{before_path}?immutable=1', uri=True)
-                try:
-                    for (t,) in before.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table' "
-                            "AND name NOT LIKE 'sqlite_%' ORDER BY name"):
-                        if t not in counts:
-                            dropped.append(t)
-                            counts[t] = 0
-                finally:
-                    before.close()
-            except Exception:
-                dropped = []
-        tables = tables + dropped
+    # The main file as extracted (the in-flight main under a hot journal)
+    # and the rollback journal, for the carver.
+    main_copy = os.path.join(tmpdir, 'main-file')
+    with open(main_copy, 'wb') as f:
+        f.write(raw)
+    journal_copy = None
+    if st.has_journal and journal[:8] == sqlite_reader.JOURNAL_MAGIC:
+        journal_copy = os.path.join(tmpdir, 'journal-pages')
+        with open(journal_copy, 'wb') as f:
+            f.write(journal)
+    committed_copy = None
+    if image != raw:
+        committed_copy = os.path.join(tmpdir, 'committed-image')
+        with open(committed_copy, 'wb') as f:
+            f.write(image)
+    rolled_back = any('SQLITE_READONLY_ROLLBACK' in n for n in notes)
+    recovery = sqlite_recovery.FileRecovery(
+        raw, wal if has_wal else None, journal if journal_copy else None,
+        image if image != raw else None)
+    return {
+        'tmpdir': tmpdir, 'db_path': db_path, 'before_path': before_path,
+        'wal_copy': wal_copy, 'dropped': dropped,
+        'main_copy': main_copy, 'journal_copy': journal_copy,
+        'has_wal': has_wal, 'name': name, 'tables': tables + dropped, 'counts': counts,
+        'notes': notes, 'rolled_back': rolled_back, 'recovery': recovery,
+        # the same files, for carving in the worker process
+        'recovery_files': {'key': tmpdir, 'main': main_copy,
+                           'wal': wal_copy if has_wal else None,
+                           'journal': journal_copy, 'committed': committed_copy,
+                           'db': db_path, 'before': before_path},
+    }
 
-        self.done.emit({
-            'tmpdir': tmpdir, 'db_path': db_path, 'before_path': before_path,
-            'wal_copy': wal_copy, 'dropped': dropped,
-            'main_copy': main_copy, 'journal_copy': journal_copy,
-            'has_wal': has_wal, 'name': self._name, 'tables': tables, 'counts': counts,
-        })
+
+# Databases already prepared this session, so returning to one (switching
+# back to the File Browser tab, or clicking it again) shows it at once with
+# the deleted records already found. Keyed by the path and the bytes' size
+# and CRC, so a different copy is never confused with this one.
+_PREPARED: 'OrderedDict[tuple, dict]' = None
+_PREPARED_MAX = 3
+
+
+def _prepared_cache():
+    global _PREPARED
+    if _PREPARED is None:
+        from collections import OrderedDict
+        _PREPARED = OrderedDict()
+    return _PREPARED
+
+
+def _prepared_key(ui_path, raw, wal, journal) -> tuple:
+    import zlib
+    return (ui_path, len(raw), zlib.crc32(raw),
+            len(wal or b''), zlib.crc32(wal or b''), len(journal or b''), zlib.crc32(journal or b''))
+
+
+def _is_prepared_dir(tmpdir) -> bool:
+    return any(e.get('tmpdir') == tmpdir for e in _prepared_cache().values())
+
+
+def _status_for(r: dict) -> str:
+    """The Database tab's Change label for one sqlite_recovery record."""
+    m = r['method']
+    if m == 'unfinished_delete':
+        return 'UNFINISHED DELETE'
+    if m == 'unfinished_write' or r.get('in_unfinished_write'):
+        return 'UNFINISHED WRITE'
+    if m == 'wal_frame':
+        if r.get('page_now_free'):
+            return 'WAL HISTORY (page now free)'
+        return 'WAL HISTORY (older WAL)' if r.get('older_wal') else 'WAL HISTORY'
+    return {'journal': 'JOURNAL', 'freeblock': 'CARVED', 'page_gap': 'CARVED',
+            'freed_page': 'CARVED (freed page)', 'overflow': 'CARVED (overflow)',
+            'header_signature': 'CARVED (pattern)',
+            'header_rebuilt': 'CARVED (rebuilt)'}.get(m, 'CARVED')
+
+
+def recovered_rows_for(recovery, db_path: str, before_path: str | None, table: str,
+                       files: dict | None = None):
+    """([(status, values, changed_cells)], notes) for *table*. Opens its own
+    connections. With *files* (prepare_database's 'recovery_files') the
+    carving runs in the worker process (sqlite_recovery.records_in_process),
+    so the window never waits for the GIL; without, in this process."""
+    import sqlite_recovery
+    if files is not None:
+        recs, notes, ncols = sqlite_recovery.records_in_process(files, table)
+        return _rows_from_records(recs, ncols), notes
+    if recovery is None or not db_path:
+        return [], []
+    conn = sqlite3.connect(f'file:{db_path}?immutable=1', uri=True)
+    ck = sqlite3.connect(f'file:{before_path}?immutable=1', uri=True) if before_path else None
+    try:
+        t = sqlite_recovery.table_info(conn, table, ck)
+        if t is None:
+            return [], []
+        recs, notes = recovery.records(t)
+    finally:
+        conn.close()
+        if ck is not None:
+            ck.close()
+    return _rows_from_records(recs, t.ncols), notes
+
+
+def _rows_from_records(recs, ncols):
+    out = []
+    for r in recs:
+        if r['method'] in ('checkpoint_deleted', 'checkpoint_older'):
+            continue                          # the WAL diff shows these
+        values = list(r['values'])[:ncols]
+        if len(values) < ncols:
+            values += [_CUT_OFF] * (ncols - len(values))
+        out.append((_status_for(r), values, set()))
+    return out
+
+
+class SqliteRecoveryWorker(QThread):
+    """recovered_rows_for() for one table, off the GUI thread."""
+    done = Signal(str, list, list)
+
+    def __init__(self, recovery, db_path, before_path, table, files=None,
+                 case_dir=None, db_key=None):
+        super().__init__()
+        self.recovery, self.db_path, self.before_path, self.table = (
+            recovery, db_path, before_path, table)
+        self.files, self.case_dir, self.db_key = files, case_dir, db_key
+
+    def run(self):
+        try:
+            if self.files is not None and self.case_dir and self.db_key:
+                # kept from an earlier session (casecache.db), else carve in
+                # the worker process and keep the result
+                import sqlite_recovery
+                hit = sqlite_recovery.cache_get(self.case_dir, self.db_key, self.table)
+                if hit is None:
+                    recs, notes, ncols = sqlite_recovery.records_in_process(self.files, self.table)
+                    sqlite_recovery.cache_put(self.case_dir, self.db_key, self.table,
+                                              recs, notes, ncols)
+                else:
+                    recs, notes, ncols = hit
+                rows = _rows_from_records(recs, ncols)
+            else:
+                rows, notes = recovered_rows_for(self.recovery, self.db_path,
+                                                 self.before_path, self.table, self.files)
+        except Exception as exc:
+            rows, notes = [], [f"Looking for deleted records failed: {exc}"]
+        self.done.emit(self.table, rows, notes)
 
 
 class EpochFormatsDialog(QDialog):
@@ -538,6 +657,11 @@ class SqliteViewerMixin:
         self._sql_ui_path       = ''             # archive path of the open database
         self._sql_epoch         = {}             # {table: {column: (code, source)}}
         self._sql_epoch_upper   = None           # latest plausible time (s)
+        self._sql_recovery      = None           # sqlite_recovery.FileRecovery of the open db
+        self._sql_recovered_cache = {}           # {table: (rows, notes)}
+        self._sql_recovery_worker = None
+        self._sql_recovery_pending = None        # table being carved in the background
+        self._sql_async         = True           # carve in the background (tests: inline)
         self._sql_model         = ArtifactTableModel()
         self._sql_diff_model    = SqliteDiffModel()
 
@@ -667,6 +791,19 @@ class SqliteViewerMixin:
         note = self._capture_note(ui_path, wal)
         self._sql_capture_label.setText(note)
         self._sql_capture_label.setVisible(bool(note))
+        key = _prepared_key(ui_path, raw, wal if wal and wal[:16] != _SQLITE_MAGIC else None,
+                            journal if journal and journal[:16] != _SQLITE_MAGIC else None)
+        self._sql_prepared_key = key
+        cache = _prepared_cache()
+        entry = cache.get(key)
+        if entry is not None and os.path.isdir(entry.get('tmpdir') or ''):
+            cache.move_to_end(key)
+            last = entry.get('_last_table')        # read first: showing the file selects table 0
+            self._on_sqlite_preview_ready(entry)
+            idx = self._sql_table_combo.findData(last) if last else -1
+            if idx > 0:
+                self._sql_table_combo.setCurrentIndex(idx)
+            return
         self._set_sql_controls_enabled(False)
         self._sql_status_label.setText(f"Loading {name}…")
         self._stop_sqlite_preview_worker()
@@ -689,6 +826,16 @@ class SqliteViewerMixin:
 
     def _on_sqlite_preview_ready(self, result: dict) -> None:
         self._sql_preview_worker = None
+        if not (result.get('cancelled') or result.get('error')):
+            key = getattr(self, '_sql_prepared_key', None)
+            cache = _prepared_cache()
+            if key is not None and cache.get(key) is not result:
+                cache[key] = result
+                while len(cache) > _PREPARED_MAX:
+                    _old_key, old = cache.popitem(last=False)
+                    if old.get('tmpdir') and old.get('tmpdir') != result.get('tmpdir'):
+                        shutil.rmtree(old['tmpdir'], ignore_errors=True)
+            self._sql_prepared = result
 
         if result.get('cancelled') or result.get('error'):
             tmpdir = result.get('tmpdir')
@@ -706,6 +853,12 @@ class SqliteViewerMixin:
         self._sql_journal_copy = result.get('journal_copy')
         self._sql_dropped     = set(result.get('dropped') or ())
         self._sql_has_wal     = result['has_wal']
+        self._sql_recovery    = result.get('recovery')
+        self._sql_recovered_cache = result.setdefault('_recovered_cache', {})
+        self._sql_epoch       = result.setdefault('_epoch_cache', {})
+        notes = [n for n in (self._sql_capture_label.text(),) if n] + list(result.get('notes') or ())
+        self._sql_capture_label.setText("  ".join(notes))
+        self._sql_capture_label.setVisible(bool(notes))
         name   = result['name']
         tables = result['tables']
         counts = result['counts']
@@ -788,6 +941,9 @@ class SqliteViewerMixin:
         table = self._sql_table_combo.itemData(idx)
         if not table:
             return
+        prepared = getattr(self, '_sql_prepared', None)
+        if prepared is not None:
+            prepared['_last_table'] = table
 
         self._cancel_sql_filter_worker()
         self._sql_filter_input.blockSignals(True)
@@ -800,6 +956,9 @@ class SqliteViewerMixin:
             self._show_table_diff(table)
         elif not self._show_table_diff(table, only_if_recovered=True):
             self._load_table_normal(table)
+            if self._sql_recovery_pending == table:
+                self._sql_status_label.setText(
+                    self._sql_status_label.text() + "  ·  looking for deleted records…")
 
     def _load_table_normal(self, table: str) -> None:
         """Browse all rows of *table* (paged for rowid tables)."""
@@ -879,10 +1038,39 @@ class SqliteViewerMixin:
             self._sql_epoch_upper = upper or epoch_guess.default_upper()
         return self._sql_epoch_upper
 
+    def _sql_column_samples(self, table: str, columns: list, limit: int = 500,
+                            rows: int = 5000) -> dict:
+        """{column: up to *limit* non-NULL, non-BLOB values} from ONE pass
+        over the first *rows* rows. One query per column walked the whole
+        table once per column: on a table whose rows run onto overflow pages
+        that froze the window for seconds (Pixel Snapchat
+        simple_db_helper.db, 2026-11-17). BLOBs are not loaded (typeof() is
+        answered from the record header) and epoch_guess ignores them."""
+        out = {c: [] for c in columns}
+        if not columns:
+            return out
+        picks = ', '.join(
+            f'CASE WHEN typeof("{c}") IN (\'integer\', \'real\', \'text\') THEN "{c}" END'
+            for c in columns)
+        try:
+            for row in self._sql_meta_conn.execute(f'SELECT {picks} FROM "{table}" LIMIT {rows}'):
+                for c, v in zip(columns, row):
+                    if v is not None and len(out[c]) < limit:
+                        out[c].append(v)
+        except Exception:
+            pass
+        return out
+
     def _sql_column_sample(self, table: str, column: str, limit: int = 500) -> list:
+        # BLOBs are left out in SQL: epoch_guess ignores them anyway, and
+        # fetching them (often megabytes, on overflow pages) froze the
+        # window for seconds on a table with media columns (Pixel Snapchat
+        # simple_db_helper.db, 2026-11-17). typeof() is answered from the
+        # record header without reading the value.
         try:
             return [r[0] for r in self._sql_meta_conn.execute(
-                f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL LIMIT {limit}')]
+                f'SELECT "{column}" FROM "{table}" '
+                f'WHERE typeof("{column}") IN (\'integer\', \'real\', \'text\') LIMIT {limit}')]
         except Exception:
             return []
 
@@ -930,10 +1118,13 @@ class SqliteViewerMixin:
         path = self._sql_store_path()
         upper = self._sql_upper_time()
         found = {}
+        samples = None
         for column in columns:
             code, source = epoch_store.lookup(path, table, column)
             if code is None:
-                code = epoch_guess.guess(self._sql_column_sample(table, column), upper)
+                if samples is None:
+                    samples = self._sql_column_samples(table, columns)
+                code = epoch_guess.guess(samples.get(column, []), upper)
                 source = 'guessed' if code else None
             if code is not None or source:
                 found[column] = (code or '', source)
@@ -1053,168 +1244,62 @@ class SqliteViewerMixin:
 
     def _recovered_rows(self, table: str, columns: list,
                         before_map: dict, after_map: dict) -> list:
-        """Row versions that are not in the live table, from three places.
-
-        WAL HISTORY: an older version in a WAL frame for one of this table's
-        pages. "(older WAL)" when the frame's salt is from an earlier WAL
-        generation. JOURNAL: an older version in a rollback-journal page,
-        which holds the page as it was before a change. CARVED: a deleted
-        record still in the main file, in free space on this table's pages
-        or on a freed page (sqlite_carve, the same carving the reports use).
-        A freed page can come from another table, so a carved row must have
-        this table's column count and a rowid no live row uses, the same
-        rule the reports apply. An ordinary single-row delete overwrites the
-        cell's length and rowid, so free space is also searched by the
-        table's record-header signature (learned from live rows, needs five
-        or more). Those rows have no rowid: the id is left blank, and a row
-        cut off by the end of the free range keeps only the columns read.
-
-        A version equal to the pre-WAL or final row is not repeated. Cells
-        that overflow onto another page are skipped by the decoder, so a
-        cut-off row never shows as an edit. Rowid tables only.
-        """
-        import struct
-        from sqlite_carve import (
-            iter_wal_frames, decode_leaf_page_cells, walk_table_leaf_pages,
-            _wal_latest_page_images, rowid_alias_column, parse_db_header,
-            carve_unallocated_region, carve_freed_pages,
-            sample_header_signature, carve_by_header_signature, _text_plausible)
-        if any(k[0] != 'rid' for k in list(before_map) + list(after_map)):
+        """Row versions that are not in the live table, from the shared
+        carver (sqlite_recovery.py, the same one reports use): WAL history,
+        rollback-journal pages, the unfinished write under a hot journal,
+        and deleted records in free space, on freed pages, on overflow
+        pages, and found by this table's record pattern. Rows the WAL
+        deleted or changed are already in the diff (DELETED / MODIFIED), so
+        the carver's checkpoint records are not repeated. Worked out once
+        per table and kept; in the window it is done in the background
+        (_start_sql_recovery) and the table is shown again when ready."""
+        cache = self.__dict__.setdefault('_sql_recovered_cache', {})
+        if table in cache:
+            return cache[table][0]
+        if getattr(self, '_sql_async', False) and getattr(self, '_sql_recovery', None) is not None:
+            self._start_sql_recovery(table)
             return []
-        main = self._sql_file_bytes(self._sql_main_copy)
-        wal = self._sql_file_bytes(self._sql_wal_copy)
-        journal = self._sql_file_bytes(self._sql_journal_copy)
-        try:
-            header = parse_db_header(main)
-            page_size = header['page_size']
-        except ValueError:
-            header = None
-            page_size = struct.unpack('>I', wal[8:12])[0] if len(wal) >= 32 else 0
-        if not page_size:
-            return []
-        wal_images = _wal_latest_page_images(wal, page_size) if wal else {}
+        rows, notes = recovered_rows_for(getattr(self, '_sql_recovery', None),
+                                         self._sql_db_path, self._sql_before_path, table)
+        cache[table] = (rows, notes)
+        return rows
 
-        # Leaves of this table before and after the WAL; the after copy is
-        # db_path, which closing the counting connection checkpointed.
-        leaves, id_col, raws = set(), None, []
-        sources = ((self._sql_main_copy, None), (self._sql_db_path, self._sql_meta_conn))
-        for path, conn in sources:
-            raw = self._sql_file_bytes(path)
-            if not raw:
-                continue
-            own = conn is None
-            if own:
-                conn = sqlite3.connect(f'file:{path}?immutable=1', uri=True)
+    def _start_sql_recovery(self, table: str) -> None:
+        worker = getattr(self, '_sql_recovery_worker', None)
+        if worker is not None and worker.isRunning():
+            if worker.table == table:
+                return
+            worker.done.disconnect()
+            worker.wait()
+        prepared = getattr(self, '_sql_prepared', None) or {}
+        key = getattr(self, '_sql_prepared_key', None)
+        import hashlib
+        db_key = hashlib.sha1(repr(key).encode()).hexdigest() if key else None
+        w = SqliteRecoveryWorker(self._sql_recovery, self._sql_db_path,
+                                 self._sql_before_path, table, prepared.get('recovery_files'),
+                                 getattr(self, '_case_dir', None), db_key)
+        w.done.connect(self._on_sql_recovery_done)
+        self._sql_recovery_worker = w
+        self._sql_recovery_pending = table
+        w.start()
+
+    def _on_sql_recovery_done(self, table: str, rows: list, notes: list) -> None:
+        self._sql_recovery_worker = None
+        self._sql_recovery_pending = None
+        self.__dict__.setdefault('_sql_recovered_cache', {})[table] = (rows, notes)
+        if self._sql_table_combo.currentData() == table:
+            self._on_sql_table_changed(self._sql_table_combo.currentIndex())
+
+    def _stop_sql_recovery_worker(self) -> None:
+        worker = getattr(self, '_sql_recovery_worker', None)
+        if worker is not None:
             try:
-                row = conn.execute(
-                    "SELECT rootpage FROM sqlite_master WHERE type='table' AND name=?",
-                    (table,)).fetchone()
-                if row and row[0]:
-                    own_leaves = walk_table_leaf_pages(raw, page_size, row[0], wal_images)
-                    leaves |= set(own_leaves)
-                    raws.append((raw, own_leaves))
-                    id_col = id_col or rowid_alias_column(conn, table)
-            except Exception:
+                worker.done.disconnect()
+            except (RuntimeError, TypeError):
                 pass
-            finally:
-                if own:
-                    conn.close()
-        ncols = len(columns)
-        id_idx = columns.index(id_col) if id_col in columns else None
-        live = {k[1] for k in after_map}
-        seen, out = set(), []
-
-        def empty(vals):
-            return all(v in (None, '', b'') for i, v in enumerate(vals) if i != id_idx)
-
-        def keep(status, cell, carved=False):
-            values = list(cell['values'])
-            if len(values) != ncols:
-                return
-            if carved and (cell['rowid'] in live or empty(values)):
-                return
-            if id_idx is not None:
-                values[id_idx] = cell['rowid']
-            version = tuple(values)
-            key = ('rid', cell['rowid'])
-            if before_map.get(key) == version or after_map.get(key) == version:
-                return
-            if (cell['rowid'], version) in seen:
-                return
-            seen.add((cell['rowid'], version))
-            out.append((status, values, set()))
-
-        def page_cells(image, page_no):
-            try:
-                return decode_leaf_page_cells(image, page_no, 100 if page_no == 1 else 0)
-            except (ValueError, IndexError):
-                return []
-
-        if wal and leaves:
-            salt = wal[16:24]
-            for frame in iter_wal_frames(wal, page_size):
-                if frame['page'] not in leaves:
-                    continue
-                off = frame['frame_offset']
-                status = ('WAL HISTORY' if wal[off + 8:off + 16] == salt
-                          else 'WAL HISTORY (older WAL)')
-                for cell in page_cells(frame['image'], frame['page']):
-                    keep(status, cell)
-
-        if journal and leaves:
-            for page_no, image in _journal_pages(journal):
-                if page_no in leaves:
-                    for cell in page_cells(image, page_no):
-                        keep('JOURNAL', cell)
-
-        for raw, own_leaves in raws:
-            try:
-                cells = carve_unallocated_region(raw, page_size, own_leaves)
-                own_header = parse_db_header(raw)
-                # A freed page is no longer any table's: its rows are
-                # placed here only because the column count matches.
-                cells += [dict(c, _status='CARVED (freed page)')
-                          for c in carve_freed_pages(raw, page_size, own_header)]
-            except Exception:
-                continue
-            for cell in cells:
-                keep(cell.get('_status', 'CARVED'), cell, carved=True)
-
-        # No rowid survives these, so compare everything except the id.
-        def without_id(vals):
-            return tuple(v for i, v in enumerate(vals) if i != id_idx)
-        live_rows = list(before_map.values()) + list(after_map.values())
-        prefixes: dict = {}
-
-        def known_prefix(n):
-            if n not in prefixes:
-                prefixes[n] = {without_id(list(v)[:n]) for v in live_rows}
-            return prefixes[n]
-        for raw, own_leaves in raws:
-            try:
-                signature = sample_header_signature(raw, page_size, own_leaves)
-                cells = carve_by_header_signature(raw, page_size, own_leaves, signature)
-            except Exception:
-                continue
-            for cell in cells:
-                values = list(cell['values'])[:ncols]
-                read = len(values)
-                values += [None] * (ncols - read)
-                if empty(values) or any(isinstance(v, str) and not _text_plausible(v) for v in values):
-                    continue
-                if id_idx is not None:
-                    values[id_idx] = None
-                # A cut-off record matches a live row when the columns it
-                # has agree; the missing ones are not compared.
-                version = without_id(values[:read])
-                if version in known_prefix(read) or ('sig', read, version) in seen:
-                    continue
-                seen.add(('sig', read, version))
-                values[read:] = [_CUT_OFF] * (ncols - read)
-                if id_idx is not None and id_idx >= read:
-                    values[id_idx] = None
-                out.append(('CARVED (pattern)', values, set()))
-        return out
+            worker.wait()
+        self._sql_recovery_worker = None
+        self._sql_recovery_pending = None
 
     def _compute_table_diff(self, table: str):
         """Return (columns, rows, counts) for the change view of *table*.
@@ -1227,7 +1312,7 @@ class SqliteViewerMixin:
         JOURNAL, CARVED). With no WAL, before and after are the same file."""
         after_cols, after_map = self._read_keyed(self._sql_meta_conn, table)
         if self._sql_before_path:
-            before_conn = sqlite3.connect(self._sql_before_path)
+            before_conn = sqlite3.connect(f'file:{self._sql_before_path}?immutable=1', uri=True)
             try:
                 before_cols, before_map = self._read_keyed(before_conn, table)
             finally:
@@ -1284,6 +1369,8 @@ class SqliteViewerMixin:
             'before': len(before_map), 'deleted': deleted, 'modified': modified,
             'added': added, 'history': count('WAL HISTORY'),
             'journal': count('JOURNAL'), 'carved': count('CARVED'),
+            'unfinished': count('UNFINISHED WRITE'),
+            'unfinished_delete': count('UNFINISHED DELETE'),
         }
 
     def _show_table_diff(self, table: str, only_if_recovered: bool = False) -> bool:
@@ -1306,7 +1393,8 @@ class SqliteViewerMixin:
             self._sql_status_label.setText(f"Could not diff {table}: {exc}")
             self._load_table_normal(table)
             return True
-        changed = sum(n[k] for k in ('deleted', 'modified', 'added', 'history', 'journal', 'carved'))
+        changed = sum(n[k] for k in ('deleted', 'modified', 'added', 'history', 'journal',
+                                     'carved', 'unfinished', 'unfinished_delete'))
         if only_if_recovered and not changed and not self._sql_affected_only:
             return False
 
@@ -1328,7 +1416,13 @@ class SqliteViewerMixin:
                       f"{n['added']:,} added", f"{n['history']:,} WAL history"]
         if self._sql_journal_copy:
             parts.append(f"{n['journal']:,} journal")
+        if n.get('unfinished'):
+            parts.append(f"{n['unfinished']:,} unfinished write")
+        if n.get('unfinished_delete'):
+            parts.append(f"{n['unfinished_delete']:,} unfinished delete")
         parts.append(f"{n['carved']:,} carved")
+        if getattr(self, '_sql_recovery_pending', None) == table:
+            parts.append("looking for deleted records…")
         changes = ' · '.join(parts) + dropped + self._sql_epoch_note(units)
         if self._sql_affected_only:
             self._sql_status_label.setText(f'{table} — {changed:,} changes · {changes}')
@@ -1356,6 +1450,8 @@ class SqliteViewerMixin:
         """Diff every table once to learn how many rows each had affected by the
         WAL, so the table dropdown can show which tables changed.  Cached."""
         counts = {}
+        self._stop_sql_recovery_worker()
+        was_async, self._sql_async = self._sql_async, False   # every table, here and now
         for i in range(self._sql_table_combo.count()):
             t = self._sql_table_combo.itemData(i)
             if not t:
@@ -1366,9 +1462,11 @@ class SqliteViewerMixin:
             try:
                 _cols, _rows, n = self._compute_table_diff(t)
                 counts[t] = sum(n[k] for k in (
-                    'deleted', 'modified', 'added', 'history', 'journal', 'carved'))
+                    'deleted', 'modified', 'added', 'history', 'journal', 'carved', 'unfinished',
+                    'unfinished_delete'))
             except Exception:
                 counts[t] = None
+        self._sql_async = was_async
         self._sql_affected_counts = counts
 
     def _rebuild_table_combo(self) -> None:
@@ -1408,7 +1506,12 @@ class SqliteViewerMixin:
             w = fm.horizontalAdvance(str(header)) + 24
             for row in range(n_rows):
                 text = model.data(model.index(row, col)) or ''
-                w = max(w, fm.horizontalAdvance(text) + 12)
+                # Columns are capped at max_width (~50 characters), so only
+                # the start of a long cell matters; measuring all of a
+                # 100 kB text froze the window for a second (2026-11-17).
+                w = max(w, fm.horizontalAdvance(str(text)[:80]) + 12)
+                if w >= max_width:
+                    break
             self._sql_table_view.setColumnWidth(col, min(w, max_width))
 
     # ── Filtering ──────────────────────────────────────────────────────────────
@@ -1526,6 +1629,7 @@ class SqliteViewerMixin:
 
     def _clear_sqlite_preview(self) -> None:
         self._stop_sqlite_preview_worker()
+        self._stop_sql_recovery_worker()
         self._cancel_sql_filter_worker()
         for model in (getattr(self, '_sql_model', None),
                       getattr(self, '_sql_diff_model', None)):
@@ -1557,7 +1661,8 @@ class SqliteViewerMixin:
         self._sql_affected_counts = None
         self._sql_tables = []
         self._set_sql_controls_enabled(False)
-        if self._sql_tmpdir and os.path.isdir(self._sql_tmpdir):
+        if (self._sql_tmpdir and os.path.isdir(self._sql_tmpdir)
+                and not _is_prepared_dir(self._sql_tmpdir)):
             shutil.rmtree(self._sql_tmpdir, ignore_errors=True)
         self._sql_tmpdir      = None
         self._sql_db_path     = None
@@ -1565,6 +1670,8 @@ class SqliteViewerMixin:
         self._sql_wal_copy    = None
         self._sql_main_copy   = None
         self._sql_journal_copy = None
+        self._sql_recovery    = None
+        self._sql_recovered_cache = {}
         self._sql_dropped     = set()
         self._sql_epoch       = {}
         self._sql_epoch_upper = None

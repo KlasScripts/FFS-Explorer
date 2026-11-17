@@ -127,7 +127,8 @@ def snapshot_structure(folder_map: dict, container_base: str) -> list[dict]:
 # ── Schema snapshot ───────────────────────────────────────────────────────────
 
 def _dump_schema(sqlite_path: str) -> dict:
-    conn = sqlite3.connect(f'file:{sqlite_path}?mode=ro', uri=True, timeout=5)
+    import sqlite_reader                      # the shared evidence open (committed view)
+    conn, _notes = sqlite_reader.connect_committed(sqlite_path)
     try:
         tables = [r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "

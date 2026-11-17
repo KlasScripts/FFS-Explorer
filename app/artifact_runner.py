@@ -632,17 +632,16 @@ def open_db_readonly(db_path: str) -> sqlite3.Connection:
     connect/row_factory ceremony, and this is the ONE place every
     SQL-based parser's live-query connect should go through, Chrome or
     not — see chrome_shared.py's own module docstring."""
+    # The open itself (read-only URI, immutable for a WAL-mode file with no
+    # sidecar beside it, a temporary finished copy when SQLite must write
+    # first) is sqlite_reader's, shared with every other evidence reader.
+    import sqlite_reader
     label = _db_label(db_path)
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
-                           factory=_NamedConnection)
-    conn._db_label = label
-    try:
-        conn.execute("PRAGMA schema_version").fetchone()   # opens the file now
-    except sqlite3.OperationalError as e:
-        if getattr(e, 'sqlite_errorname', '') not in _NEEDS_WRITE_TO_OPEN:
-            raise
-        conn.close()
-        conn = _open_recovered_copy(db_path, label, e.sqlite_errorname)
+    # Errors raised while opening must name the file too, so the label is
+    # on the class the connection is made from, not set afterwards.
+    factory = type('_LabelledConnection', (_NamedConnection,), {'_db_label': label})
+    conn, notes = sqlite_reader.connect_committed(db_path, factory=factory, label=label)
+    _open_notes.extend(f"  Note: {n}" for n in notes)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -659,10 +658,7 @@ def open_db_readonly(db_path: str) -> sqlite3.Connection:
 # on its next start; the extracted copy (which carving reads) is never
 # touched. Each case is reported via take_open_notes() in the parser log.
 
-_NEEDS_WRITE_TO_OPEN = {'SQLITE_READONLY_ROLLBACK', 'SQLITE_READONLY_RECOVERY',
-                        'SQLITE_READONLY_CANTINIT', 'SQLITE_READONLY_CANTLOCK'}
 _open_notes: list[str] = []
-_temp_dirs: list[str] = []
 
 
 def embedded_media_path(paths: dict, file_key: str, table: str, column: str,
@@ -782,41 +778,6 @@ def take_open_notes() -> list[str]:
     notes = list(_open_notes)
     _open_notes.clear()
     return notes
-
-
-def _cleanup_temp_dirs() -> None:
-    import shutil
-    for d in _temp_dirs:
-        shutil.rmtree(d, ignore_errors=True)
-    _temp_dirs.clear()
-
-
-def _open_recovered_copy(db_path: str, label: str, reason: str) -> sqlite3.Connection:
-    import atexit
-    import shutil
-    import tempfile
-    if not _temp_dirs:
-        atexit.register(_cleanup_temp_dirs)
-    tmp = tempfile.mkdtemp(prefix='ffs_db_')
-    _temp_dirs.append(tmp)
-    name = os.path.basename(db_path)
-    copy = os.path.join(tmp, name)
-    for suffix in ('', '-journal', '-wal', '-shm'):
-        if os.path.exists(db_path + suffix):
-            shutil.copyfile(db_path + suffix, copy + suffix)
-    conn = sqlite3.connect(copy, factory=_NamedConnection)
-    conn._db_label = label
-    conn.execute("PRAGMA schema_version").fetchone()   # SQLite finishes here
-    conn.execute("PRAGMA query_only = 1")
-    what = ("an unfinished change in its -journal (the app was writing when "
-            "the device was acquired)" if reason == 'SQLITE_READONLY_ROLLBACK'
-            else "a -wal whose index had to be rebuilt")
-    _open_notes.append(
-        f"  Note: {label} had {what}. SQLite won't read it without first "
-        f"undoing/finishing that, so it was read from a temporary copy "
-        f"where SQLite did so, as the app itself would on its next start. "
-        f"The extracted copy is unchanged. ({reason})")
-    return conn
 
 
 # ── Database errors name their file ──────────────────────────────────────────
@@ -1418,6 +1379,49 @@ def _extract_candidate(
     return False
 
 
+def _extract_db_sidecars(dest_path: str, candidates: list[str], zip_path: str,
+                         zip_obj, zip_name_set: set) -> list[str]:
+    """For an extracted SQLite database, also extract its -wal and -journal
+    from the SAME archive location the database came from (never another
+    copy of it elsewhere, which would mix two moments), beside the copy.
+    Every parser gets them, declared or not: without the -wal a report reads
+    stale rows and loses the WAL's history; without the -journal an
+    unfinished change is not undone. A sidecar already there with the
+    archive's size is kept; any other (e.g. an empty -wal SQLite made beside
+    an earlier copy) is replaced, and a -shm the archive does not hold is
+    removed with it (SQLite's own index, rebuilt from the WAL). Returns the
+    sidecars written."""
+    written: list[str] = []
+    if zip_obj is None:
+        return written
+    try:
+        with open(dest_path, 'rb') as f:
+            if f.read(16) != b'SQLite format 3\x00':
+                return written
+    except OSError:
+        return written
+    src = next((c for c in candidates if c in zip_name_set), None)
+    if src is None:
+        return written
+    for suffix in ('-wal', '-journal'):
+        name = src + suffix
+        if name not in zip_name_set:
+            continue
+        info = zip_obj.getinfo(name)
+        dest = dest_path + suffix
+        if os.path.exists(dest) and os.path.getsize(dest) == info.file_size:
+            continue
+        data = ZipEntry(zip_path, name, info).read()
+        with open(dest, 'wb') as f:
+            f.write(data)
+        written.append(os.path.basename(dest))
+        if suffix == '-wal' and os.path.exists(dest_path + '-shm'):
+            shm = src + '-shm'
+            if shm not in zip_name_set or os.path.getsize(dest_path + '-shm') != zip_obj.getinfo(shm).file_size:
+                os.remove(dest_path + '-shm')
+    return written
+
+
 def _recover_deleted_rows(paths: dict, table: str, field_notes: dict,
                           file_key: str = None, timestamp_fields: dict = None) -> list[dict]:
     """One entry of a parser's `recoverable_tables` -> extra rows from
@@ -1758,6 +1762,7 @@ def run_artifact(
             dest_path  = os.path.join(dest_dir, os.path.basename(resolved))
             if not _extract_candidate(candidates, zip_path, dest_path, zip_obj):
                 return [], f"{script_name}: file not found: {ui_path}"
+            _extract_db_sidecars(dest_path, candidates, zip_path, zip_obj, _name_set)
             paths[key] = dest_path
             paths.setdefault('_ui_paths', {})[key] = _ui_path_for(ui_path)
         for key, subpath in getattr(module, 'optional_files', {}).items():
@@ -1768,6 +1773,7 @@ def run_artifact(
             candidates = adapter.user_candidates(ui_path)
             dest_path  = os.path.join(dest_dir, os.path.basename(resolved))
             if _extract_candidate(candidates, zip_path, dest_path, zip_obj):
+                _extract_db_sidecars(dest_path, candidates, zip_path, zip_obj, _name_set)
                 paths[key] = dest_path
                 paths.setdefault('_ui_paths', {})[key] = _ui_path_for(ui_path)
         try:
@@ -1827,14 +1833,13 @@ def run_artifact(
                     # misrepresent real user behavior. Never withheld,
                     # only labeled, same as always.
                     confidence = f' (likely false positive — {"; ".join(reasons)})'
-                elif r.get('recovery_method') == 'header_signature':
-                    # Clean confidence gate, but still the one carving path
-                    # with no rowid to cross-check at all — see
-                    # carve_by_header_signature's own docstring for why
-                    # that structurally makes it the weakest of the four.
-                    confidence = ' (unverified match)'
                 else:
-                    confidence = ''
+                    # How it was found and how sure that is, in plain words
+                    # (sqlite_recovery.describe): '' for an ordinary deleted
+                    # cell found intact in free space; "unverified match"
+                    # for the pattern searches, which have no rowid.
+                    note = r.get('recovery_note') or ''
+                    confidence = f' ({note})' if note else ''
                 r.setdefault('source', f"Carved — {label}{confidence}")
             rows = rows + recovered
         return rows, ''

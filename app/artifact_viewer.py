@@ -3167,11 +3167,23 @@ class ArtifactViewerMixin:
             self._show_art_hex_message(f"Source database not found in archive: {ui_path}")
             return
         import sqlite_carve
-        loc = sqlite_carve.locate_live_row(data, str(table), rowid_int)
+        # With a -wal, the row is looked up where the committed view has it:
+        # the latest committed WAL frame of its page, else the main file
+        # (sqlite_recovery.locate_committed_row). Until 2026-11-17 only the
+        # main file was searched: a row only in the WAL was "not found", and
+        # a row the WAL changed was shown at its stale bytes.
+        wal = self._read_zip_bytes(ui_path + '-wal')
+        if wal:
+            import sqlite_recovery
+            loc = sqlite_recovery.locate_committed_row(data, wal, str(table), rowid_int)
+            if loc is not None and loc['file'] == 'wal':
+                data, ui_path = wal, ui_path + '-wal'
+        else:
+            loc = sqlite_carve.locate_live_row(data, str(table), rowid_int)
         if loc is None:
             self._show_art_hex_message(
-                f"Record not found at its expected location in "
-                f"{os.path.basename(ui_path)} (may be WAL-only, or deleted)")
+                f"Record not found in {os.path.basename(ui_path)}"
+                f"{' or its -wal' if wal else ''} (it may have been deleted)")
             return
         self._load_hex_preview_from_bytes_at(data, ui_path, loc['abs_offset'], loc['length'])
         self._art_hex_active = True

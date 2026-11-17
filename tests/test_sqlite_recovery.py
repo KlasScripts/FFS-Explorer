@@ -166,3 +166,19 @@ def test_kept_results_round_trip_exactly(tmp_path):
         assert rv.cache_get(str(case), 'k1', 'chat') is None
     finally:
         rv.RECOVERY_VERSION = real
+
+
+def test_live_row_is_located_where_the_committed_view_has_it(tmp_path):
+    """Record mode: a row only in the WAL is found there, and a row the WAL
+    changed is never cited at its stale bytes in the main file."""
+    path, truth = wal_db(str(tmp_path))
+    main, wal = open(path, 'rb').read(), open(path + '-wal', 'rb').read()
+    for rid, text in truth['committed'].items():
+        loc = rv.locate_committed_row(main, wal, 'messages', rid)
+        data = wal if loc['file'] == 'wal' else main
+        cell = data[loc['abs_offset']:loc['abs_offset'] + loc['length']]
+        plen, c1 = sc.read_varint(cell, 0)
+        got, c2 = sc.read_varint(cell, c1)
+        assert got == rid and sc.decode_record(cell[c1 + c2:c1 + c2 + plen])[1] == text
+    assert rv.locate_committed_row(main, wal, 'messages', 5) is None       # deleted in the WAL
+    assert rv.locate_committed_row(main, None, 'messages', 5)['file'] == 'main'

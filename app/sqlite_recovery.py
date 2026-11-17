@@ -1288,3 +1288,97 @@ def cache_put(case_dir: str, db_key: str, table: str, records: list, notes: list
         return True
     except Exception:
         return False
+
+
+# ── where a LIVE row's bytes are (Record mode) ─────────────────────────────
+
+def committed_wal_images(main: bytes, wal: bytes) -> dict:
+    """{page: (image, file offset of the image)} for the WAL frames SQLite
+    would apply: the current salt, up to the last commit frame. A later
+    frame of a page replaces an earlier one."""
+    out: dict = {}
+    if not wal or not sqlite_reader.is_wal(wal):
+        return out
+    try:
+        page_size = struct.unpack('>I', wal[8:12])[0]
+    except struct.error:
+        return out
+    salt = wal[16:24]
+    pending: dict = {}
+    for f in sc.iter_wal_frames(wal, page_size):
+        off = f['frame_offset']
+        if wal[off + 8:off + 16] != salt:
+            continue                                  # an earlier WAL generation
+        pending[f['page']] = (f['image'], off + 24)
+        if f['is_commit']:
+            out.update(pending)
+            pending = {}
+    return out                                        # frames after the last commit: not applied
+
+
+def locate_committed_row(main: bytes, wal: bytes | None, table: str, rowid: int) -> dict | None:
+    """Where the committed version of *table*'s row *rowid* is: {'file':
+    'main' | 'wal', 'abs_offset', 'length', 'overflows'}, or None. A page
+    the WAL replaced is read from the WAL (its latest committed frame), so a
+    row only in the WAL is found and a row the WAL changed is never cited
+    at its stale bytes in the main file."""
+    try:
+        header = sc.parse_db_header(main)
+    except ValueError:
+        return None
+    page_size = header['page_size']
+    usable = page_size - (header.get('reserved_bytes', 0) or 0)
+    images = committed_wal_images(main, wal) if wal else {}
+    st = sqlite_reader.stage('db', main, wal=wal)
+    try:
+        conn, _ = sqlite_reader.connect_committed(st.path)
+        try:
+            row = conn.execute("SELECT rootpage FROM sqlite_master WHERE type='table' AND name=?",
+                               (table,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+
+    def page(pno):
+        if pno in images:
+            return images[pno][0], 'wal', images[pno][1]
+        return sc._page_bytes(main, page_size, pno), 'main', (pno - 1) * page_size
+
+    stack, seen = [row[0]], set()
+    while stack:
+        pno = stack.pop()
+        if pno in seen or pno < 1:
+            continue
+        seen.add(pno)
+        img, file, base = page(pno)
+        ho = 100 if pno == 1 else 0
+        if len(img) < ho + 8:
+            continue
+        kind = img[ho]
+        n = struct.unpack('>H', img[ho + 3:ho + 5])[0]
+        if kind == sc._INTERIOR_TABLE_PAGE:
+            stack.append(struct.unpack('>I', img[ho + 8:ho + 12])[0])
+            for i in range(n):
+                p = ho + 12 + 2 * i
+                cell = struct.unpack('>H', img[p:p + 2])[0]
+                if cell:
+                    stack.append(struct.unpack('>I', img[cell:cell + 4])[0])
+        elif kind == sc._LEAF_TABLE_PAGE:
+            for i in range(n):
+                p = ho + 8 + 2 * i
+                try:
+                    cell = struct.unpack('>H', img[p:p + 2])[0]
+                    plen, c1 = sc.read_varint(img, cell)
+                    rid, c2 = sc.read_varint(img, cell + c1)
+                except (ValueError, struct.error, IndexError):
+                    continue
+                if sc._to_signed_rowid(rid) != rowid:
+                    continue
+                local, overflows = sc._cell_local_payload_size(plen, usable)
+                return {'file': file, 'abs_offset': base + cell,
+                        'length': c1 + c2 + local + (4 if overflows else 0),
+                        'overflows': overflows}
+    return None

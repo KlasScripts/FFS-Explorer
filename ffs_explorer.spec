@@ -8,6 +8,14 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
+# Every app/ module and everything the dynamically loaded artifacts/ scripts
+# import (scripts/frozen_imports.py): a module only a report imports is
+# invisible to PyInstaller's analysis and was left out of the build
+# ("No module named 'files_by_google_glide'", 2026-11-17).
+sys.path.insert(0, os.path.join(os.path.abspath(SPECPATH), 'scripts'))
+from frozen_imports import hidden_imports as _hidden_imports
+_AUTO_HIDDEN = _hidden_imports(os.path.abspath(SPECPATH))
+
 # Release version, e.g. 'v0.50.21': CI passes the tag it builds as FFS_VERSION
 # (build-windows-exe.yml, which also puts it in the zip's name); a local build
 # asks git. Shipped as _internal/version.txt, which app/version.py reads for
@@ -218,7 +226,8 @@ a = Analysis(
       # which we don't install; collecting it crashes the PyInstaller build.
       + collect_submodules('mcp', filter=lambda name: not name.startswith('mcp.cli'))
       + collect_submodules('uvicorn')
-      + ['google.protobuf', 'six'],
+      + ['google.protobuf', 'six']
+      + _AUTO_HIDDEN,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

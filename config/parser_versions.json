@@ -184,7 +184,8 @@
     "android:device_info": {
       "changelog": {
         "2": "New parser -- the Android counterpart to ios/device_info.py, same four sections from entirely different sources: system/build.prop (build number, security patch level), telephony.db siminfo (every SIM: phone number, carrier, ICCID, IMSI, MCC/MNC, eSIM-vs-physical), accounts_de.db with accounts_ce.db fallback (the Google account), and contacts2.db (email cross-reference). Verified field-by-field against the Android 14 JoshHickman archive and its documented ground truth, and against a real 3-SIM device (Android 15 CTF25 Cellebrite). Reads siminfo.display_name before carrier_name and mcc_string/mnc_string rather than the legacy integer columns -- on the real Pixel 7a carrier_name is empty and mcc/mnc are both 0. States outright that an Android extraction carries no on-disk IMEI rather than leaving a silently missing field.",
-        "3": "Adds a Screen Lock section: whether a PIN, pattern or password file (.pwd in data/system_de/0/spblob) exists, the newest .pwd modified time (and changed time where the extraction keeps it), and when the credential folder was last written. From lab run screenlock-history-001 (Android 16): the .pwd file was written at the second a PIN was set; removing it deleted the .pwd and rewrote the folder. Checked on the lab zips (no PIN, folder written at the removal) and three real images; on the Android 14 JoshHickman Pixel the .pwd time is a minute after the documented Google account add at setup. locksettings.db is left out because it is modified for other reasons."
+        "3": "Adds a Screen Lock section: whether a PIN, pattern or password file (.pwd in data/system_de/0/spblob) exists, the newest .pwd modified time (and changed time where the extraction keeps it), and when the credential folder was last written. From lab run screenlock-history-001 (Android 16): the .pwd file was written at the second a PIN was set; removing it deleted the .pwd and rewrote the folder. Checked on the lab zips (no PIN, folder written at the removal) and three real images; on the Android 14 JoshHickman Pixel the .pwd time is a minute after the documented Google account add at setup. locksettings.db is left out because it is modified for other reasons.",
+        "4": "Timezone lines: Phone Timezone (persist.sys.timezone in data/property/persistent_properties, with its confidence) and Automatic Time Zone (auto_time_zone in settings_global.xml), each with its source. Replaces the single Detected Timezone line; the full detail is the Timezone & time sources report."
       },
       "hash": "4a76b7e5949f327b",
       "version": 4
@@ -424,10 +425,11 @@
     },
     "ios:device_info": {
       "changelog": {
-        "3": "Evidence databases (Accounts3.sqlite, AddressBook.sqlitedb) are now materialized WITH their -wal/-shm sidecars and opened via open_db_readonly, so the report reads each database's real current state rather than its last-checkpointed one -- measured on the IOS17 JoshHickman archive, replaying AddressBook's 1.2 MB WAL surfaces 7 ABMultiValue email rows where the main database alone shows 6. The Apple ID and linked-contact results are unchanged on that archive, but a device whose owner-contact row lived only in the WAL would previously have reported no linked contact. Sources are now written to artifact_parser_files/ for inspection instead of a leaked tempfile. 'FFS Type' now names the detected archive LAYOUT ('Cellebrite-style archive layout') instead of printing the format constant as if it identified the acquisition tool -- a claim this project cannot stand behind (see the FORMAT_GRAYKEY/FORMAT_CELLEBRITE ambiguity Convention)."
+        "3": "Evidence databases (Accounts3.sqlite, AddressBook.sqlitedb) are now materialized WITH their -wal/-shm sidecars and opened via open_db_readonly, so the report reads each database's real current state rather than its last-checkpointed one -- measured on the IOS17 JoshHickman archive, replaying AddressBook's 1.2 MB WAL surfaces 7 ABMultiValue email rows where the main database alone shows 6. The Apple ID and linked-contact results are unchanged on that archive, but a device whose owner-contact row lived only in the WAL would previously have reported no linked contact. Sources are now written to artifact_parser_files/ for inspection instead of a leaked tempfile. 'FFS Type' now names the detected archive LAYOUT ('Cellebrite-style archive layout') instead of printing the format constant as if it identified the acquisition tool -- a claim this project cannot stand behind (see the FORMAT_GRAYKEY/FORMAT_CELLEBRITE ambiguity Convention).",
+        "4": "Timezone lines: Phone Timezone from db/timezone/localtime with its source; Automatic Time Zone shown as not determined (no verified iOS source; timezoneset in com.apple.preferences.datetime.plist is shown raw in the Timezone & time sources report). Replaces the single Detected Timezone line."
       },
-      "hash": "74e0547a0e99e193",
-      "version": 3
+      "hash": "53bf1345c61d587c",
+      "version": 4
     },
     "ios:instagram": {
       "changelog": {
@@ -435,6 +437,16 @@
       },
       "hash": "08e736eb88415e67",
       "version": 3
+    },
+    "ios:line": {
+      "changelog": {},
+      "hash": "18ce08f82ead5ba0",
+      "version": 1
+    },
+    "ios:line_deleted_messages": {
+      "changelog": {},
+      "hash": "868b2e682508434e",
+      "version": 1
     },
     "ios:photos_metadata": {
       "changelog": {},
@@ -447,6 +459,11 @@
       },
       "hash": "43fabe7554b92a27",
       "version": 9
+    },
+    "ios:timezone_report": {
+      "changelog": {},
+      "hash": "4e375465396fc7a4",
+      "version": 1
     },
     "ios:whatsapp": {
       "changelog": {

@@ -130,6 +130,11 @@ Declarations a parser can set:
 - `device_wide = True`: scans the whole archive (given a `CaseContext`).
 - `requires_nested_extraction`: embedded zips to extract before `run()`.
 - `view_mode = "document"`: render as a markdown page.
+- `report_type = "recovered_records"` with `recovered_records = [...]`: a
+  deleted / changed records report with no `run()` (the loader attaches
+  `artifact_runner.recovered_records_report`): per table the columns that
+  matter, `version_fields`, optional `labels` / `derived` / `not_found_in`;
+  never joined. Example: `artifacts/ios/line_deleted_messages.py`.
 
 Shared helpers in `app/artifact_runner.py` (import directly):
 `open_db_readonly` (the only way to open an evidence SQLite file),

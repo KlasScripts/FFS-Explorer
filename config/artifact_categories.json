@@ -220,6 +220,14 @@
     },
     "wifi_known_networks": {
       "category": "Device & App Info"
+    },
+    "line_deleted_messages": {
+      "category": "Chats & Messaging",
+      "app_group_label": "LINE"
+    },
+    "line": {
+      "category": "Chats & Messaging",
+      "app_group_label": "LINE"
     }
   }
 }

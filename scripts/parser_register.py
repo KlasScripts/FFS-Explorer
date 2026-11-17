@@ -21,7 +21,7 @@ OUT = os.path.join(ROOT, "PARSER_REGISTER.md")
 
 # (label, regex over the parser's source). Order is the column order.
 FORMATS = [
-    ("SQLite", r"open_db_readonly\(|sqlite3\."),
+    ("SQLite", r"open_db_readonly\(|sqlite3\.|^report_type\s*=\s*.recovered_records"),
     ("SQLite carving", r"^recoverable_tables\s*="),
     ("plist", r"plistlib\.|biplist|decode_plist_blob"),
     ("NSKeyedArchiver", r"deserialize_nska|NSKeyedArchiver|decode_plist_blob"),

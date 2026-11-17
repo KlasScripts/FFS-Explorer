@@ -1223,6 +1223,11 @@ def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[
             spec = importlib.util.spec_from_file_location(script_name, path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
+            if getattr(mod, 'report_type', None) == 'recovered_records' and not hasattr(mod, 'run'):
+                # a declaration-only parser: the shared code makes its rows
+                mod.run = lambda paths, _m=mod: recovered_records_report(_m, paths)
+                if not hasattr(mod, 'record_source'):
+                    mod.record_source = _recovered_records_record_source(mod)
             modules.append((script_name, mod))
             import parser_versions
             parser_versions.check_version(platform, script_name, path)
@@ -1447,6 +1452,199 @@ def _recover_deleted_rows(paths: dict, table: str, field_notes: dict,
         return []
     return sqlite_carve.recover_deleted_rows(
         paths, table, field_notes, file_key=file_key, timestamp_fields=timestamp_fields)
+
+
+# ── Report type: recovered records ───────────────────────────────────────────
+# A parser that declares report_type = "recovered_records" has no run() of
+# its own: it declares the database file(s) and, per table, the columns that
+# matter, and this shared code makes the report (owner design, 2026-11-17).
+# Each row is one recovered record as found (the table's own values, never
+# joined to other tables), with how it was found, how sure that is, and
+# where its bytes are:
+#   - Deleted: a row no longer in the table (deleted since the checkpoint,
+#     in a WAL frame, free space, a freed page, overflow, by pattern), and
+#     Unfinished write / Unfinished delete under a hot journal;
+#   - Changed: an earlier version of a row that is still live, listed only
+#     when one of the table's version_fields differs from the live row
+#     (the live value beside it as "<field> (now)"). Versions that differ
+#     only in other columns are counted in the run log, never silently
+#     dropped. No version_fields: every version is listed.
+# Declaration, one entry per table:
+#   recovered_records = [{
+#       "file_key": "line",            # a files/optional_files key
+#       "table": "ZMESSAGE",
+#       "label": "Message",            # shown in the Record column
+#       "fields": {"ZTEXT": "message_text", ...},   # column -> report name
+#       "version_fields": ["ZTEXT", ...],           # what makes a version matter
+#       "labels": {"ZCONTENTTYPE": {0: "text", 1: "picture"}},  # optional:
+#               shown as "picture (1)": the word, then the stored value kept;
+#               a value without a label is shown as stored
+#       "derived": {"direction": {"from": "ZSENDER", "values": {None: "Sent"},
+#                                 "else": "Received"}},           # optional
+#       "not_found_in": {"ZLASTMESSAGE": ["ZMESSAGE", "ZTEXT"]},  # optional:
+#               list a record only when this column's value is not the value
+#               of that other table's column in any live or recovered row
+#               (e.g. a chat's last-message preview: only the ones that are
+#               the sole trace of a message). A comparison of values, not a
+#               join; the ones left out are counted in the run log.
+#   }]
+# Only declare a label or derived value that was checked against ground
+# truth, and say where in the parser.
+# timestamp_fields uses the report names, as for any parser.
+
+RECOVERED_STATUS = {
+    'checkpoint_deleted': 'Deleted', 'wal_frame': 'Deleted', 'journal': 'Deleted',
+    'freeblock': 'Deleted', 'page_gap': 'Deleted', 'freed_page': 'Deleted',
+    'overflow': 'Deleted', 'header_signature': 'Deleted', 'header_rebuilt': 'Deleted',
+    'header_schema': 'Deleted', 'unfinished_write': 'Unfinished write',
+    'unfinished_delete': 'Unfinished delete', 'checkpoint_older': 'Changed',
+}
+
+
+def recovered_records_report(module, paths: dict) -> list[dict]:
+    """The rows of a report_type = "recovered_records" parser (see above)."""
+    import sqlite_reader
+    import sqlite_recovery
+    from sqlite_carve import blob_safe
+    rows: list[dict] = []
+    seen_values: dict = {}       # (table, column) -> values in live and recovered rows
+    for spec in getattr(module, 'recovered_records', ()):
+        db_path = paths.get(spec['file_key'])
+        if not db_path or not os.path.isfile(db_path):
+            log_note(f"{spec.get('label', spec['table'])}: {spec['file_key']} not in this extraction.")
+            continue
+
+        def rd(p):
+            return open(p, 'rb').read() if os.path.isfile(p) else None
+        conn, notes = sqlite_reader.connect_committed(db_path)
+        checkpoint = sqlite_reader.connect_checkpoint(db_path)
+        try:
+            t = sqlite_recovery.table_info(conn, spec['table'], checkpoint)
+            if t is None:
+                log_note(f"{spec['table']} is not a table with rowids in "
+                         f"{os.path.basename(db_path)}: nothing recovered from it.")
+                continue
+            fr = sqlite_recovery.for_connection(rd(db_path), rd(db_path + '-wal'),
+                                                rd(db_path + '-journal'), conn)
+            records, rnotes = fr.records(t)
+            idx0 = {c: i for i, c in enumerate(t.columns)}
+            for c, i in idx0.items():
+                bucket = seen_values.setdefault((t.name, c), set())
+                bucket.update(v[i] for v in t.live.values())
+                bucket.update(r['values'][i] for r in records if i < len(r['values']))
+            not_in = {}
+            for col, (otable, ocol) in (spec.get('not_found_in') or {}).items():
+                vals_ = seen_values.get((otable, ocol))
+                if vals_ is None:
+                    try:
+                        vals_ = {r[0] for r in conn.execute(f'SELECT "{ocol}" FROM "{otable}"')}
+                    except sqlite3.Error:
+                        vals_ = set()
+                not_in[col] = (vals_, otable, ocol)
+        finally:
+            conn.close()
+            if checkpoint is not None:
+                checkpoint.close()
+        for n in notes + rnotes:
+            log_note(f"{spec.get('label', spec['table'])}: {n}")
+        fields = spec.get('fields') or {c: c for c in t.columns}
+        missing = [c for c in fields if c not in t.columns]
+        if missing:
+            log_note(f"{spec['table']} has no column(s) {', '.join(missing)} in this version of the app.")
+        vf = [c for c in (spec.get('version_fields') or []) if c in t.columns]
+        idx = {c: t.columns.index(c) for c in t.columns}
+        label = spec.get('label', spec['table'])
+        seen: set = set()
+        hidden: dict = {}
+        known = 0
+        for r in records:
+            status = RECOVERED_STATUS.get(r['method'], 'Deleted')
+            vals = list(r['values'])
+            rowid = r['rowid']
+            live = t.live.get(rowid) if rowid is not None else None
+            if r['method'] == 'unfinished_delete':
+                status = 'Unfinished delete'
+            elif r.get('in_unfinished_write'):
+                status = 'Unfinished write'
+            elif live is not None:
+                status = 'Changed'
+            changed = []
+            if status == 'Changed':
+                changed = [c for c in (vf or t.columns)
+                           if idx[c] < len(vals) and vals[idx[c]] != live[idx[c]]]
+                if not changed:
+                    hidden[rowid] = hidden.get(rowid, 0) + 1
+                    continue
+            if any(idx[c] < len(vals) and vals[idx[c]] in pool
+                   for c, (pool, _ot, _oc) in not_in.items() if c in idx):
+                known += 1
+                continue
+            key_cols = vf or t.columns
+            key = (status, rowid, tuple(repr(vals[idx[c]]) if idx[c] < len(vals) else None
+                                        for c in key_cols))
+            if key in seen:
+                continue
+            seen.add(key)
+            labels = spec.get('labels') or {}
+
+            def shown(col, v):
+                table_ = labels.get(col)
+                if table_ and v in table_:
+                    return f"{table_[v]} ({v})" if v is not None else table_[v]
+                return blob_safe(v)
+
+            def value(col):
+                return vals[idx[col]] if col in idx and idx[col] < len(vals) else None
+            row = {'record': label, 'status': status, 'row_id': rowid}
+            for name, d in (spec.get('derived') or {}).items():
+                if d['from'] in idx and idx[d['from']] < len(vals):
+                    v = value(d['from'])
+                    row[name] = d['values'][v] if v in d['values'] else d.get('else', '')
+            for col, name in fields.items():
+                if col in idx:
+                    row[name] = shown(col, value(col))
+            for c in changed:
+                if c in fields:
+                    now = live[idx[c]]
+                    # an empty current value says so, rather than a blank
+                    # cell that reads as missing data
+                    row[f"{fields[c]} (now)"] = '(empty)' if now in (None, '') else shown(c, now)
+            note = sqlite_recovery.describe(r)
+            row.update({
+                'changed_fields': ', '.join(fields.get(c, c) for c in changed),
+                'how_found': note,
+                'table_certain': r['table_certain'],
+                'source': f"Carved — {label}" + (f" ({note})" if note else ''),
+                'recovered': True,
+                'recovery_method': r['method'],
+                'recovery_version': sqlite_recovery.RECOVERY_VERSION,
+                'source_table': t.name,
+                'source_file_key': spec['file_key'],
+                'raw_rowid': rowid,
+                'raw_page': r['page'],
+                'raw_file': r['file'],
+                'raw_offset': r['offset'],
+                'raw_length': r['length'],
+            })
+            if r.get('truncated'):
+                row['truncated'] = True
+            rows.append(row)
+        if known:
+            where = '; '.join(f"{fields.get(c, c)} = a {ot}.{oc} value" for c, (_p, ot, oc) in not_in.items())
+            log_note(f"{label}: {known} record(s) whose {where} already in the report or the "
+                     "live table: not listed.")
+        if hidden:
+            names = ', '.join(fields.get(c, c) for c in vf)
+            log_note(f"{label}: {sum(hidden.values())} earlier version(s) of {len(hidden)} live "
+                     f"row(s) differ only in columns other than {names}: not listed.")
+    return rows
+
+
+def _recovered_records_record_source(module) -> list[dict]:
+    """record_source for the Hex panel's Record mode (raw offset jump)."""
+    return [{'label': s.get('label', s['table']), 'file_key': s['file_key'],
+             'table': s['table'], 'rowid_fields': ['row_id']}
+            for s in getattr(module, 'recovered_records', ())]
 
 
 # ── Running ───────────────────────────────────────────────────────────────────

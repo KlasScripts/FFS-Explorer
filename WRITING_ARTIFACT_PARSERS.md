@@ -152,8 +152,9 @@ notes doesn't change the parser's version (only the `.py` is hashed).
 ### `category` / `app_group_label` (where the report is listed)
 
 Run Artifact Parsers and the Artifact Viewer list reports as Category →
-App → Report. The shipped parsers' places are in
-`config/artifact_categories.json`. A new parser should declare its own:
+App → Report. Every shipped parser has its place in
+`config/artifact_categories.json` (`tests/test_artifact_categories.py`
+checks it). A parser may also declare its own, which wins:
 
 ```python
 category = "Chats & Messaging"   # one of the file's "categories" list
@@ -589,6 +590,63 @@ See `artifacts/android/chrome_web_history.py` for a two-source example, and
 CLAUDE.md's Conventions for the confidence-tiering reasoning (why only
 `header_signature` gets the caution suffix, not the other three carving
 paths).
+
+### `report_type = "recovered_records"`: a deleted / changed records report with no `run()`
+
+For "what was deleted or changed in this app's messages", don't write a
+`run()` at all. Declare the database and, per table, the columns that
+matter; the shared code (`artifact_runner.recovered_records_report`, using
+the same carver as `recoverable_tables`) makes the report. Example:
+`artifacts/ios/line_deleted_messages.py`.
+
+```python
+name = "LINE — Deleted & Changed Messages (iOS)"
+description = "..."
+category = "Chats & Messaging"
+app_group = "group.com.linecorp.line"
+files = {"line": "Library/Application Support/PrivateStore/P_*/Messages/Line.sqlite"}
+
+report_type = "recovered_records"
+recovered_records = [{
+    "file_key": "line", "table": "ZMESSAGE", "label": "Message",
+    "fields": {"ZTIMESTAMP": "timestamp", "ZTEXT": "message", "ZSENDER": "sender_id"},
+    "version_fields": ["ZTEXT", "ZSENDER"],            # what makes a version matter
+    "labels": {"ZCONTENTTYPE": {0: "text", 1: "picture"}},          # optional
+    "derived": {"direction": {"from": "ZSENDER", "values": {None: "Outgoing"},
+                              "else": "Incoming"}},                  # optional
+}]
+timestamp_fields = {"timestamp": "ms"}
+```
+
+What each row is, and the rules:
+
+- One recovered record exactly as found in one table. **Never joined** to
+  other tables: ids stay ids (owner decision 2026-11-17: the recovered
+  record is the evidence; looking up names is a separate, later step).
+- `status`: **Deleted** (no longer in the table), **Changed** (an earlier
+  version of a row that is still there), **Unfinished write / delete**
+  (hot journal). `how_found` and `table_certain` say how and how sure.
+- **Changed** rows are listed only when a `version_fields` column differs
+  from the live row, with the live value beside it as `<name> (now)` and
+  `changed_fields` naming what changed. Choose the columns that carry
+  meaning: the text, the sender, the chat, the kind, and the app's own
+  deleted / edited / type field (WhatsApp marks "This message was deleted"
+  by its type, not its text). Leave out delivery and sync columns. Versions
+  that differ only in other columns are counted in the run log, never
+  silently dropped. No `version_fields`: every version is listed.
+- `labels` turn a stored code into a word, shown with the stored value:
+  `picture (1)`. `derived` adds a column worked out from one value
+  (direction). **Only declare a label or derived value you checked against
+  ground truth, and say in a comment what you checked.**
+- `not_found_in` (optional): list a record only when a column's value is
+  not the value of another table's column in any live or recovered row,
+  e.g. a chat's last-message preview whose text is in no message. A
+  comparison of values, not a join.
+- Use the same field names as the app's other reports (`timestamp`,
+  `message`, `direction`) so they line up.
+- The `-wal` / `-journal` need not be declared (the runner extracts them).
+  `record_source` is made for you (the Hex panel jumps to the record's
+  exact bytes).
 
 ### Reusable helpers
 

@@ -1295,6 +1295,17 @@ default.** *Decision (owner, 2026-11-16).*
 - A column is a rowid alias only when it is the single PRIMARY KEY column
   declared exactly INTEGER (not INT, BIGINT, …; not WITHOUT ROWID, not
   INTEGER PRIMARY KEY DESC): SQLite's rule. *Confirmed (synthetic test).*
+- A deleted / changed records report is its own report type
+  (`report_type = "recovered_records"`, declarations only, no `run()`).
+  *Decision (owner, 2026-11-17):* each row is the recovered record as found
+  in one table, **never joined** to other tables (the record is the
+  evidence; a join would mix it with today's data). An earlier version of a
+  live row is listed only when a declared `version_fields` column differs
+  from the live row, the live value beside it; versions differing only in
+  other columns are counted in the run log, never silently dropped. Codes
+  turned into words (`labels`, `derived`) only where checked against ground
+  truth. First: `artifacts/ios/line_deleted_messages.py` (both documented
+  deletions on the Josh Hickman iOS 17 image recovered).
 - Rows of DROPPED tables are not recovered. *Decision (owner, 2026-11-17):*
   phone apps delete, update and insert rows; dropping a table is rare (e.g.
   a schema migration). FQLite 5.21 recovers them (corpus 0A: 99/100).

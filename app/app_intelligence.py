@@ -1201,8 +1201,9 @@ def scan_apps(ctx) -> list:
             return None
         return mt
 
+    from file_table import fields_of
     archive_max_mtime = max(
-        (v for v in (_real_mtime(m) for m in ui_metadata.values()) if v),
+        (v for v in (_real_mtime({'mtime': mt}) for _p, (mt,) in fields_of(ui_metadata, ('mtime',))) if v),
         default=None)
 
     packages_root = _load_packages_xml(ctx) if (

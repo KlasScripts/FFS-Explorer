@@ -273,7 +273,7 @@ def recover_missing_records(case_dir: str, ui_metadata: dict, get_file_type,
                     return stored_name_for(cand), cands
             return None, None
 
-        for ui_path, meta in ui_metadata.items():
+        for ui_path in ui_metadata:       # paths first: the entry only for a match
             if ui_path.rsplit('/', 1)[-1] not in by_base and ui_path not in olds:
                 continue
             name, cands = _match(ui_path)
@@ -304,7 +304,7 @@ def recover_missing_records(case_dir: str, ui_metadata: dict, get_file_type,
                         mdate = None
                 rows = [(child, mdate, os.path.getsize(path),
                          classify_unpacked(child, head, get_file_type))]
-            size = (meta or {}).get('size') or 0
+            size = (ui_metadata.get(ui_path) or {}).get('size') or 0
             save_nested_archive(db, ui_path, name, size, len(rows))
             save_nested_archive_entries(db, ui_path, rows)
             cands.discard(name)

@@ -16,6 +16,7 @@ unchanged.  This module intentionally imports nothing from the Qt GUI module
 so a spawned child never has to drag Qt parsing logic along the critical path.
 """
 
+import os
 import re
 import time
 import zipfile
@@ -38,10 +39,12 @@ from zip_cd_cache import (CachedZipView, load as _cd_cache_load,
 # chunks so the GUI can deserialize them incrementally and yield the GIL between
 # chunks (a single 500 MB+ unpackb held the GIL ~1-2 s and froze the UI).
 SNAPSHOT_KEY     = 'load_snapshot'
-SNAPSHOT_VERSION = '5'   # 3: earlier captures of repeated paths get their own entry (A-72)
+SNAPSHOT_VERSION = '6'   # 3: earlier captures of repeated paths get their own entry (A-72)
                          # 4: the iOS system partition is not listed (A-82)
                          # 5: a GrayKey entry without a UT block gets no time, never
                          #    its DOS time read as UTC (A-10)
+                         # 6: ui_metadata and folder_map are in a file table beside
+                         #    casecache.db (app/file_table.py), not in the blob
 
 # Items per snapshot chunk — small enough that one chunk's unpack is well under a
 # frame, so yielding the GIL between chunks keeps the UI animating.
@@ -65,16 +68,54 @@ def _chunked(d: dict, n: int):
         yield block
 
 
+def _empty_folder_entries(adapter_args, zip_names, ui_metadata, folder_map) -> list:
+    """The paths the archive stores as a bare folder entry (name ending in
+    "/") that have nothing under them: what FastZipBrowser's empty-folder
+    scan used to work out at every open (Cellebrite gives such a folder its
+    directory size, so its size cannot tell it from a file). Fixed by the
+    extraction, so worked out once here and kept in the snapshot."""
+    resolve = FfsAdapter(adapter_args[0], adapter_args[1], adapter_args[2],
+                         bool(adapter_args[3])).resolve
+    names = zip_names if isinstance(zip_names, (set, frozenset)) else set(zip_names)
+    folders = set(folder_map)
+    out = []
+    for n, p in enumerate(ui_metadata):
+        if n % _YIELD_EVERY == 0:
+            time.sleep(0)
+        if p not in folders and (resolve(p) + '/') in names:
+            out.append(p)
+    return out
+
+
 def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
-                  ui_metadata, folder_map, metadata_only) -> bytes:
+                  ui_metadata, folder_map, metadata_only, file_table_dir=None) -> bytes:
     """Pack a load snapshot as a header object followed by chunked ui_metadata
     and folder_map objects (see SNAPSHOT_VERSION).  Concatenated msgpack
-    objects, read back by unpack_snapshot."""
-    ui_parts = [msgpack.packb(c, use_bin_type=True)
-                for c in _chunked(ui_metadata, _SNAP_CHUNK)]
-    fm_parts = [msgpack.packb(c, use_bin_type=True)
-                for c in _chunked(folder_map, _SNAP_CHUNK)]
+    objects, read back by unpack_snapshot.
+
+    With *file_table_dir* (the case folder) ui_metadata and folder_map are
+    written to a file table there instead (app/file_table.py) and the header
+    names it; if they would not read back exactly from one (file_table.write
+    refuses), they go in the blob as before."""
+    table_name = None
+    if file_table_dir:
+        import file_table
+        path = file_table.new_path(file_table_dir)
+        try:
+            file_table.write(ui_metadata, folder_map, path)
+            table_name = os.path.basename(path)
+            file_table.remove_others(file_table_dir, keep=path)
+        except ValueError:
+            table_name = None
+    if table_name is None:
+        ui_parts = [msgpack.packb(c, use_bin_type=True)
+                    for c in _chunked(ui_metadata, _SNAP_CHUNK)]
+        fm_parts = [msgpack.packb(c, use_bin_type=True)
+                    for c in _chunked(folder_map, _SNAP_CHUNK)]
+    else:
+        ui_parts, fm_parts = [], []
     header = msgpack.packb({
+        'empty_folders': _empty_folder_entries(adapter_args, zip_names, ui_metadata, folder_map),
         'adapter':       adapter_args,
         'delta':         delta,
         'zip_names':     list(zip_names),
@@ -82,6 +123,9 @@ def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
         'metadata_only': list(metadata_only),
         'n_ui':          len(ui_parts),
         'n_fm':          len(fm_parts),
+        'file_table':    table_name,
+        'n_files':       len(ui_metadata),
+        'n_folders':     len(folder_map),
     }, use_bin_type=True)
     return b''.join([header] + ui_parts + fm_parts)
 
@@ -129,7 +173,7 @@ def _stream_map(unp, yield_cb):
     return out
 
 
-def unpack_snapshot(raw, yield_cb=None) -> dict:
+def unpack_snapshot(raw, yield_cb=None, case_dir=None) -> dict:
     """Inverse of pack_snapshot.  Calls yield_cb() (if given) after each chunk
     so a caller on a worker thread can release the GIL and keep the GUI alive.
 
@@ -143,6 +187,27 @@ def unpack_snapshot(raw, yield_cb=None) -> dict:
         unp = msgpack.Unpacker(raw, raw=False, strict_map_key=False,
                                max_buffer_size=0)
     header = _stream_map(unp, yield_cb)
+    if header.get('file_table'):
+        # ui_metadata / folder_map are in the case's file table: mapped, not
+        # unpacked. Missing, unreadable or not the one this snapshot wrote
+        # (other counts) -> an exception, and the caller parses again.
+        import file_table
+        if not case_dir:
+            raise ValueError('snapshot names a file table but no case folder was given')
+        name = os.path.basename(header['file_table'])
+        ui_metadata, folder_map = file_table.open_maps(os.path.join(case_dir, name))
+        if len(ui_metadata) != header['n_files'] or len(folder_map) != header['n_folders']:
+            raise ValueError('the file table does not match the snapshot')
+        return {
+            'empty_folders': header.get('empty_folders'),
+            'adapter':       header['adapter'],
+            'delta':         header['delta'],
+            'zip_names':     header['zip_names'],
+            'zip_ui_paths':  header['zip_ui_paths'],
+            'metadata_only': header['metadata_only'],
+            'ui_metadata':   ui_metadata,
+            'folder_map':    folder_map,
+        }
     ui_metadata: dict = {}
     for _ in range(header['n_ui']):
         ui_metadata.update(next(unp))
@@ -154,6 +219,7 @@ def unpack_snapshot(raw, yield_cb=None) -> dict:
         if yield_cb:
             yield_cb()
     return {
+        'empty_folders': header.get('empty_folders'),
         'adapter':       header['adapter'],
         'delta':         header['delta'],
         'zip_names':     header['zip_names'],
@@ -186,7 +252,7 @@ def load_snapshot_from_case(case_dir: str) -> dict | None:
             if blob is None:
                 return None
             with closing(blob):
-                return unpack_snapshot(blob)
+                return unpack_snapshot(blob, case_dir=case_dir)
     except Exception:
         return None
 
@@ -569,7 +635,7 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
                     ffs_adapter.sys_prefix, ffs_adapter.old_layout]
     snapshot_blob = pack_snapshot(
         adapter_args, delta, zip_names, zip_ui_paths,
-        ui_metadata, folder_map, metadata_only)
+        ui_metadata, folder_map, metadata_only, file_table_dir=case_dir or None)
 
     return {
         'adapter_args':   [ffs_adapter.format, ffs_adapter.user_prefix,

@@ -130,6 +130,7 @@ from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, 
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
                              qInstallMessageHandler, QtMsgType)
 from PySide6.QtCore import QSettings as _QSettings
+from file_table import fields_of as _ft_fields_of, any_set as _ft_any_set
 startup_log.step('Qt and app modules loaded')
 
 FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface responsive at 60 fps while the tree builds
@@ -1290,6 +1291,8 @@ def _count_header_candidates(ui_metadata: dict, ffs_adapter, tier: int = 1) -> i
 def _copy_metadata(ui_metadata: dict) -> dict:
     """A copy of ui_metadata made off the GUI thread, which may add
     unpacked files to it meanwhile: retried if it changed mid-copy."""
+    if hasattr(ui_metadata, 'table'):    # a file_table.FileList: shares the mapped file
+        return ui_metadata.copy()
     for _ in range(5):
         try:
             return dict(ui_metadata)
@@ -1642,8 +1645,7 @@ def _meta_col_keys_for(data: dict) -> tuple:
     """Which _META_COL_HEADERS keys *data* carries. A full scan of every
     entry (~0.4 s on an 830k-entry archive), so ZipMetadataWorker runs it
     before metadata_ready instead of the GUI thread (see _ui_extras)."""
-    return tuple(k for k in _META_COL_HEADERS
-                 if any(v.get(k) for v in data.values() if v))
+    return tuple(k for k in _META_COL_HEADERS if _ft_any_set(data, k))
 
 
 def _duplicate_groups_for(duplicate_files: dict) -> dict:
@@ -1949,7 +1951,7 @@ def _discover_all_archives(
     scan_roots = None if unscoped else tuple(ffs_adapter.archive_discovery_folders())
     excludes = () if unscoped else tuple(ffs_adapter.scan_excludes())
     results = []
-    for ui_path, meta in ui_metadata.items():
+    for ui_path in ui_metadata:          # paths first: the entry only for a match
         if scan_roots is not None and not ui_path.startswith(scan_roots):
             continue
         if excludes and ui_path.startswith(excludes):
@@ -1961,6 +1963,7 @@ def _discover_all_archives(
         if not _is_extractable(name, ft):
             continue
         category = _classify_archive(ui_path, ffs_adapter)
+        meta = ui_metadata.get(ui_path)
         mtime = meta.get('mtime', 0) if isinstance(meta, dict) else 0
         results.append({'ui_path': ui_path, 'category': category,
                         'file_type': ft, 'mtime': mtime})
@@ -2166,7 +2169,8 @@ def _collect_duplicate_candidates(ffs_adapter, ui_metadata: dict, z) -> list[tup
     processing."""
     resolve = ffs_adapter.resolve
     out = []
-    for ui_path, meta in ui_metadata.items():
+    # three fields of every file, read from the file table's columns
+    for ui_path, (inode, devid, sha256) in _ft_fields_of(ui_metadata, ('inode', 'devid', 'sha256')):
         try:
             info = z.getinfo(resolve(ui_path))
         except KeyError:
@@ -2177,8 +2181,8 @@ def _collect_duplicate_candidates(ffs_adapter, ui_metadata: dict, z) -> list[tup
             # the MD5 path on — the size-0 group of empty files.
             continue
         out.append((ui_path, info.filename, info,
-                   meta.get('inode') or 0, meta.get('devid') or 0,
-                   meta.get('sha256', '')))
+                   inode or 0, devid or 0,
+                   '' if sha256 is None else sha256))
     return out
 
 
@@ -2349,7 +2353,8 @@ class ZipMetadataWorker(QThread):
                     # unpacker directly (no second in-memory copy of a
                     # hundreds-of-MB snapshot), and the GIL is yielded
                     # between chunks so the GUI keeps animating.
-                    snap = unpack_snapshot(blob, yield_cb=lambda: time.sleep(0))
+                    snap = unpack_snapshot(blob, yield_cb=lambda: time.sleep(0),
+                                           case_dir=self.case_dir)
             fmt, user_pfx, sys_pfx, old_layout = snap['adapter']
             ffs_adapter = FfsAdapter(fmt, user_pfx, sys_pfx, bool(old_layout))
             self._local_extra_delta = snap['delta']
@@ -2368,6 +2373,8 @@ class ZipMetadataWorker(QThread):
             guid_to_bundle, status_cb=self.status_update.emit)
         missing_plist_paths = _find_missing_plists(folder_map, ffs_adapter, guid_to_bundle)
         self._set_ui_extras(ui_metadata, folder_map, folder_counts, adapter=ffs_adapter)
+        # worked out when the snapshot was packed (None in an older snapshot)
+        self._ui_extras['empty_folders'] = snap.get('empty_folders')
         self.metadata_ready.emit(
             ui_metadata, folder_map, guid_to_bundle, zip_names,
             ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
@@ -2713,7 +2720,8 @@ class ZipMetadataWorker(QThread):
                         [ffs_adapter.format, ffs_adapter.user_prefix,
                          ffs_adapter.sys_prefix, ffs_adapter.old_layout],
                         self._local_extra_delta, zip_names, zip_ui_paths,
-                        ui_metadata, folder_map, metadata_only_folders)
+                        ui_metadata, folder_map, metadata_only_folders,
+                        file_table_dir=self.case_dir)
                 except Exception:
                     snapshot_blob = None
 
@@ -9844,16 +9852,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._empty_folder_entries = None
         self._empty_folder_seq = getattr(self, '_empty_folder_seq', 0) + 1
         my_seq = self._empty_folder_seq
-        adapter, names, folder_map = self._adapter, self.zip_names, self.folder_map
-        keys = list(self.full_metadata)       # one C-level copy, before the GUI changes it
+        known = (getattr(getattr(self, 'worker', None), '_ui_extras', None) or {}).get('empty_folders')
+        if known is not None:
+            # from the load snapshot (ffs_metadata._empty_folder_entries): no scan
+            self._empty_folder_entries = frozenset(known)
+            return
+        adapter, names = self._adapter, self.zip_names
+        # Copies taken here, before the GUI changes them; cheap for the file
+        # table (it shares the mapped file), read in full on the worker only.
+        keys = _copy_metadata(self.full_metadata)
+        folder_map = self.folder_map.copy()
 
         def _scan():
             resolve = adapter.resolve
+            folders = set(folder_map)         # one set: a C lookup per path below
             out = []
             for n, p in enumerate(keys):
                 if n % 5000 == 0:
                     time.sleep(0)             # let the GUI thread have the GIL
-                if p not in folder_map and (resolve(p) + '/') in names:
+                if p not in folders and (resolve(p) + '/') in names:
                     out.append(p)
             return frozenset(out)
         fut = _CASE_OPEN_POOL.submit(_scan)
@@ -12812,7 +12829,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     except Exception:
                         pass
             # Copied here, not on the GUI thread (see _copy_metadata).
-            items = list(_copy_metadata(ui_metadata).items())
+            # paths only: _header_tier_counts never reads the entries
+            items = [(p, None) for p in _copy_metadata(ui_metadata)]
             infos = _cd_cache_load(zip_path, case_dir) if case_dir else None
             z = CachedZipView(zip_path, infos) if infos is not None else None
             return _header_tier_counts(items, adapter, z, with_tier3=tier3)
@@ -15965,8 +15983,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             cache = self.__dict__.setdefault('_nested_local_counts', {})
             if archive not in cache:
                 pre = archive + '/'
-                cache[archive] = sum(1 for p, m in self.full_metadata.items()
-                                     if m and m.get('mtime_local') and p.startswith(pre))
+                fm_ = self.full_metadata
+                cache[archive] = sum(1 for p in fm_ if p.startswith(pre)
+                                     and (m := fm_.get(p)) and m.get('mtime_local'))
             n = cache[archive]
         if not n:
             note.setVisible(False)

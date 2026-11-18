@@ -386,93 +386,119 @@ def extract_one(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
     already_extracted() themselves first (this function doesn't, since
     ffs-explorer.py's own batch worker has its own progress-reporting
     reasons to check that at a different layer)."""
-    out_dir = os.path.join(case_dir, 'nested_archives')
-    os.makedirs(out_dir, exist_ok=True)
     try:
-        # Read via the local .zcd central-directory cache only — never a
-        # raw zipfile.ZipFile on the main archive (this project's own
-        # standing Convention has no exception for this case). The main
-        # FFS archive itself is never compressed, so this is a direct
-        # offset seek rather than a second full central-directory read
-        # over what can be a large network-hosted zip. case_dir is
-        # already a required parameter here (out_dir is built from it
-        # unconditionally above), so .zcd is already guaranteed present
-        # by the time this ever runs — raises honestly if it somehow
-        # isn't, caught by this function's own surrounding try/except
-        # (returns a real error_message rather than crashing silently).
-        infos = _zcd_load(zip_path, case_dir)
-        if infos is None:
-            raise RuntimeError("Local .zcd cache not available")
-        with CachedZipView(zip_path, infos) as zf:
-            raw = zf.open(physical_path).read()
-
-        basename = os.path.basename(ui_path) or 'content'
-        stored_filename = stored_name_for(ui_path)
-        out_path = os.path.join(out_dir, stored_filename)
-
-        if raw[:2] == b'\x1f\x8b':
-            # ── Gzip: decompress and store the raw decompressed file ──
-            decompressed = gzip.decompress(raw)
-            with open(out_path, 'wb') as f:
-                f.write(decompressed)
-            child_name = (basename[:-3] if basename.lower().endswith('.gz')
-                          else basename)
-            ft = classify_unpacked(child_name, decompressed, get_file_type)
-            gz_mtime = struct.unpack_from('<I', raw, 4)[0] if len(raw) >= 8 else 0
-            # gzip MTIME is Unix seconds (UTC).
-            gz_mdate = (datetime.fromtimestamp(gz_mtime, tz=timezone.utc)
-                        .strftime('%Y-%m-%d %H:%M:%S') + MDATE_UTC if gz_mtime else None)
-            content_rows = [(child_name, gz_mdate, len(decompressed), ft)]
-            entry_count = 1
-            compound_type = f"{ft} — gzip" if ft != 'Other' else None
-
-        else:
-            # ── ZIP: repack as ZIP_STORED ───────────────────────────────
-            tmp_path = out_path + '.tmp'
-            if file_size > _MEM_LIMIT:
-                with open(tmp_path, 'wb') as f:
-                    f.write(raw)
-                src_arg = tmp_path
-            else:
-                src_arg = None
-
-            entry_count = 0
-            content_rows = []
-            compound_type = None
-            src_handle = open(src_arg, 'rb') if src_arg else io.BytesIO(raw)
-            try:
-                with zipfile.ZipFile(src_handle, 'r') as src_zip, \
-                     zipfile.ZipFile(out_path, 'w',
-                                     compression=zipfile.ZIP_STORED) as dst_zip:
-                    for info in src_zip.infolist():
-                        if info.filename.endswith('/'):
-                            continue   # skip directory entries
-                        data = src_zip.read(info.filename)
-                        dst_zip.writestr(info, data, compress_type=zipfile.ZIP_STORED)
-                        entry_count += 1
-                        name = info.filename
-                        ft = classify_unpacked(name.rsplit('/', 1)[-1], data, get_file_type)
-                        mdate = entry_mdate(info)
-                        content_rows.append((info.filename, mdate,
-                                             info.file_size, ft))
-            finally:
-                if src_arg:
-                    src_handle.close()
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-
+        res = unpack_to_disk(zip_path, case_dir, ui_path, physical_path, file_size, get_file_type)
         with closing(_open_cache_db(case_dir)) as db:
-            save_nested_archive(db, ui_path, stored_filename, file_size, entry_count)
-            save_nested_archive_entries(db, ui_path, content_rows)
-        return True, compound_type, None
+            record_extraction(db, ui_path, file_size, res)
+        return True, res['compound_type'], None
 
     except Exception as exc:
         msg = str(exc)
         try:
             with closing(_open_cache_db(case_dir)) as db:
-                save_nested_archive_failure(db, ui_path, msg)
+                record_failure(db, ui_path, msg)
         except Exception:
             pass
         return False, None, msg
+
+
+def unpack_to_disk(zip_path: str, case_dir: str, ui_path: str, physical_path: str,
+                   file_size: int, get_file_type) -> dict:
+    """The unpacking half of extract_one: read the entry, write the
+    unpacked (gzip) or repacked ZIP_STORED (zip) file to
+    case_dir/nested_archives, and return what record_extraction stores:
+    {'stored_filename', 'entry_count', 'content_rows', 'compound_type'}.
+    Raises on any failure. Writes nothing to the case databases, so several
+    can run at once (each archive has its own stored name), with the
+    recording done over one connection (NestedArchiveWorker, 2026-11-18:
+    an open and close of casecache.db per archive was ~1 s of a 1,458-
+    archive IOS17 extraction)."""
+    out_dir = os.path.join(case_dir, 'nested_archives')
+    os.makedirs(out_dir, exist_ok=True)
+    # Read via the local .zcd central-directory cache only — never a
+    # raw zipfile.ZipFile on the main archive (this project's own
+    # standing Convention has no exception for this case). The main
+    # FFS archive itself is never compressed, so this is a direct
+    # offset seek rather than a second full central-directory read
+    # over what can be a large network-hosted zip. case_dir is
+    # already a required parameter here (out_dir is built from it
+    # unconditionally above), so .zcd is already guaranteed present
+    # by the time this ever runs — raises honestly if it somehow
+    # isn't, caught by this function's own surrounding try/except
+    # (returns a real error_message rather than crashing silently).
+    infos = _zcd_load(zip_path, case_dir)
+    if infos is None:
+        raise RuntimeError("Local .zcd cache not available")
+    with CachedZipView(zip_path, infos) as zf:
+        raw = zf.open(physical_path).read()
+
+    basename = os.path.basename(ui_path) or 'content'
+    stored_filename = stored_name_for(ui_path)
+    out_path = os.path.join(out_dir, stored_filename)
+
+    if raw[:2] == b'\x1f\x8b':
+        # ── Gzip: decompress and store the raw decompressed file ──
+        decompressed = gzip.decompress(raw)
+        with open(out_path, 'wb') as f:
+            f.write(decompressed)
+        child_name = (basename[:-3] if basename.lower().endswith('.gz')
+                      else basename)
+        ft = classify_unpacked(child_name, decompressed, get_file_type)
+        gz_mtime = struct.unpack_from('<I', raw, 4)[0] if len(raw) >= 8 else 0
+        # gzip MTIME is Unix seconds (UTC).
+        gz_mdate = (datetime.fromtimestamp(gz_mtime, tz=timezone.utc)
+                    .strftime('%Y-%m-%d %H:%M:%S') + MDATE_UTC if gz_mtime else None)
+        content_rows = [(child_name, gz_mdate, len(decompressed), ft)]
+        entry_count = 1
+        compound_type = f"{ft} — gzip" if ft != 'Other' else None
+
+    else:
+        # ── ZIP: repack as ZIP_STORED ───────────────────────────────
+        tmp_path = out_path + '.tmp'
+        if file_size > _MEM_LIMIT:
+            with open(tmp_path, 'wb') as f:
+                f.write(raw)
+            src_arg = tmp_path
+        else:
+            src_arg = None
+
+        entry_count = 0
+        content_rows = []
+        compound_type = None
+        src_handle = open(src_arg, 'rb') if src_arg else io.BytesIO(raw)
+        try:
+            with zipfile.ZipFile(src_handle, 'r') as src_zip, \
+                 zipfile.ZipFile(out_path, 'w',
+                                 compression=zipfile.ZIP_STORED) as dst_zip:
+                for info in src_zip.infolist():
+                    if info.filename.endswith('/'):
+                        continue   # skip directory entries
+                    data = src_zip.read(info.filename)
+                    dst_zip.writestr(info, data, compress_type=zipfile.ZIP_STORED)
+                    entry_count += 1
+                    name = info.filename
+                    ft = classify_unpacked(name.rsplit('/', 1)[-1], data, get_file_type)
+                    mdate = entry_mdate(info)
+                    content_rows.append((info.filename, mdate,
+                                         info.file_size, ft))
+        finally:
+            if src_arg:
+                src_handle.close()
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    return {'stored_filename': stored_filename, 'entry_count': entry_count,
+            'content_rows': content_rows, 'compound_type': compound_type}
+
+
+def record_extraction(db, ui_path: str, file_size: int, res: dict) -> None:
+    """Record an unpack_to_disk result in casecache.db (what extract_one
+    always did after unpacking)."""
+    save_nested_archive(db, ui_path, res['stored_filename'], file_size, res['entry_count'])
+    save_nested_archive_entries(db, ui_path, res['content_rows'])
+
+
+def record_failure(db, ui_path: str, msg: str) -> None:
+    save_nested_archive_failure(db, ui_path, msg)

@@ -134,6 +134,23 @@ def _names_from_index(info: dict, case_dir: str, yield_cb=None) -> list:
         idx.close()
 
 
+def _leveldb_dirs(folder_map) -> list:
+    """The parsed folders that look like LevelDB/IndexedDB folders
+    (leveldb_viewer._looks_like_leveldb_dir), in folder_map order: fixed
+    by the extraction, so worked out once here. The GUI checks only the
+    folders added or replaced since (FastZipBrowser._leveldb_dirs_now); a
+    pass over every folder's children on the GUI thread froze the window
+    0.8 s at Process Case on IOS17 (2026-11-18)."""
+    from leveldb_viewer import _looks_like_leveldb_dir
+    out = []
+    for n, p in enumerate(folder_map):
+        if n % _YIELD_EVERY == 0:
+            time.sleep(0)
+        if _looks_like_leveldb_dir(folder_map, p):
+            out.append(p)
+    return out
+
+
 def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
                   ui_metadata, folder_map, metadata_only, file_table_dir=None,
                   zip_path=None) -> bytes:
@@ -172,6 +189,7 @@ def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
         ui_parts, fm_parts = [], []
     header = msgpack.packb({
         'empty_folders': _empty_folder_entries(adapter_args, zip_names, ui_metadata, folder_map),
+        'leveldb_dirs':  _leveldb_dirs(folder_map),
         'adapter':       adapter_args,
         'delta':         delta,
         'zip_names':     None if names_index else list(zip_names),
@@ -266,6 +284,7 @@ def unpack_snapshot(raw, yield_cb=None, case_dir=None) -> dict:
             zip_ui_paths = file_table.ZipPaths(ui_metadata.table)
         return {
             'empty_folders': header.get('empty_folders'),
+            'leveldb_dirs':  header.get('leveldb_dirs'),
             'adapter':       header['adapter'],
             'delta':         header['delta'],
             'zip_names':     zip_names,

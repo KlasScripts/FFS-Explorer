@@ -45,6 +45,42 @@ from zip_reader import THREAD_WORKERS
 _CHUNK = 4 * 1024 * 1024
 
 
+_PROCESS_BATCH = 2000        # files per task sent to a worker process
+_MIN_FOR_PROCESSES = 50_000  # fewer files than this: threads (starting the pool
+                             # costs more: Android 14's 29k files, 2.2 s on
+                             # threads, 3.0 s with 9 processes, 2026-11-18)
+_proc_handles: dict = {}     # a worker process's open handle per zip
+
+
+def md5_ranges(zip_path: str, items: list) -> list:
+    """Worker-process task: [(key, md5 hex or None)] for [(key, data_offset,
+    size)] of stored entries of *zip_path*, read in 4 MB chunks with one
+    handle per process. None when the archive ends early or cannot be read
+    (never reported as a duplicate), as _md5_hex. Module-level so 'spawn'
+    can pickle it."""
+    fh = _proc_handles.get(zip_path)
+    if fh is None or fh.closed:
+        fh = _proc_handles[zip_path] = open(zip_path, 'rb')
+    out = []
+    for key, off, size in items:
+        try:
+            h = hashlib.md5()
+            pos = 0
+            ok = True
+            while pos < size:
+                fh.seek(off + pos)
+                chunk = fh.read(min(_CHUNK, size - pos))
+                if not chunk:
+                    ok = False
+                    break
+                h.update(chunk)
+                pos += len(chunk)
+            out.append((key, h.hexdigest() if ok else None))
+        except OSError:
+            out.append((key, None))
+    return out
+
+
 def _md5_hex(zip_path, phys, zinfo, reader) -> str | None:
     """MD5 of one file, or None if it can't be read in full (then it is
     never reported as a duplicate). *reader* is set for a file unpacked
@@ -67,7 +103,7 @@ def _md5_hex(zip_path, phys, zinfo, reader) -> str | None:
 
 
 def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
-                          progress_cb=None, cancel_check=None):
+                          progress_cb=None, cancel_check=None, processes: int = 0):
     """*candidates* — [(ui_path, physical_path, zinfo, inode, devid)] for
     every real file to consider, where *zinfo* is the entry's
     zipfile.ZipInfo (already parsed from the central directory — no new
@@ -97,7 +133,14 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
 
     cancel_check() — checked before every hash; returns whatever has been
     confirmed so far if it becomes true (a partial, still-correct result,
-    never a half-hashed group)."""
+    never a half-hashed group).
+
+    *processes* > 1: stored entries of the main zip are hashed in that many
+    worker processes (md5_ranges, data offsets from
+    zip_cd_cache.compute_data_offsets), the rest on threads as before. On
+    IOS17 (169k files, 4 GB, warm cache) 3.6 s on 8 threads, 1.2 s on 9
+    processes, the same digests (2026-11-18); and the hashing no longer
+    holds the app's Python lock beside the window."""
     by_size_crc: dict[tuple[int, int], list] = {}
     # Optional 6th field: the SHA-256 the acquisition tool recorded ('' if
     # none). Optional 7th: a zero-arg callable returning the file's bytes,
@@ -190,22 +233,86 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
             return g, u, None     # unreadable, as above
 
     done = 0
+
+    def _record(g, u, digest):
+        nonlocal done
+        digests[g][u] = digest
+        remaining[g] -= 1
+        if remaining[g] == 0:
+            _finish_group(g)
+        done += 1
+        if progress_cb and (done % 200 == 0 or done == total):
+            progress_cb(done, total)
+
+    units_left = [(g, u) for g, units in enumerate(grouped_units) for u in range(len(units))]
+    if processes > 1 and total >= _MIN_FOR_PROCESSES:
+        units_left = _hash_in_processes(zip_path, grouped_units, units_left, processes,
+                                        _record, cancel_check)
+        if units_left is None:          # cancelled
+            return results
+
     with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as pool:
-        futures = [pool.submit(_hash, g, u)
-                   for g, units in enumerate(grouped_units) for u in range(len(units))]
+        futures = [pool.submit(_hash, g, u) for g, u in units_left]
         for fut in as_completed(futures):
             if cancel_check and cancel_check():
                 pool.shutdown(wait=False, cancel_futures=True)
                 return results
-            g, u, digest = fut.result()
-            digests[g][u] = digest
-            remaining[g] -= 1
-            if remaining[g] == 0:
-                _finish_group(g)
-            done += 1
-            if progress_cb and (done % 200 == 0 or done == total):
-                progress_cb(done, total)
+            _record(*fut.result())
     return results
+
+
+def _hash_in_processes(zip_path, grouped_units, units, processes, record, cancel_check):
+    """Hash the stored main-zip entries among *units* [(g, u)] in worker
+    processes, calling record(g, u, digest) for each. Returns the units
+    left for the threads (unpacked files, compressed entries, entries whose
+    data offset is not known; all of them if no pool can be started), or
+    None if cancelled."""
+    from zip_cd_cache import compute_data_offsets
+    mine, rest = [], []
+    for g, u in units:
+        (_ui, _phys, zinfo, _i, _d, _sha, reader), _members = grouped_units[g][u]
+        if reader is None and getattr(zinfo, 'compress_type', 0) == 0:
+            mine.append((g, u, zinfo))
+        else:
+            rest.append((g, u))
+    if not mine:
+        return rest
+    try:
+        offsets = compute_data_offsets(zip_path, [z for _g, _u, z in mine])
+    except Exception:
+        return units
+    items = []
+    for g, u, zinfo in mine:
+        off = offsets.get(zinfo.filename)
+        if off is None:
+            rest.append((g, u))
+        else:
+            items.append(((g, u), off, zinfo.file_size))
+    items.sort(key=lambda x: x[1])              # archive order
+    batches = [items[k:k + _PROCESS_BATCH] for k in range(0, len(items), _PROCESS_BATCH)]
+    try:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+        pool = ProcessPoolExecutor(processes, mp_context=mp.get_context('spawn'))
+    except Exception:
+        return units
+    recorded = set()
+    try:
+        futures = [pool.submit(md5_ranges, zip_path, b) for b in batches]
+        for fut in as_completed(futures):
+            if cancel_check and cancel_check():
+                pool.shutdown(wait=False, cancel_futures=True)
+                return None
+            for (g, u), digest in fut.result():
+                record(g, u, digest)
+                recorded.add((g, u))
+    except Exception:
+        # a broken pool (e.g. a worker that could not start): whatever was
+        # not recorded is hashed on the threads instead
+        pool.shutdown(wait=False, cancel_futures=True)
+        return rest + [k for k, _o, _s in items if k not in recorded]
+    pool.shutdown(wait=True)
+    return rest
 
 
 def proven_copies(members, inode_trusted=False) -> dict:

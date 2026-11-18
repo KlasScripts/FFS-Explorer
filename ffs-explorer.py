@@ -2495,6 +2495,13 @@ class ZipMetadataWorker(QThread):
         self._set_ui_extras(ui_metadata, folder_map, folder_counts, adapter=ffs_adapter)
         # worked out when the snapshot was packed (None in an older snapshot)
         self._ui_extras['empty_folders'] = snap.get('empty_folders')
+        ldb = snap.get('leveldb_dirs')
+        if ldb is None:
+            # a snapshot from before they were kept (v0.50.47): worked out
+            # here on the worker, not by the GUI thread at Process Case
+            from ffs_metadata import _leveldb_dirs
+            ldb = _leveldb_dirs(folder_map)
+        self._ui_extras['leveldb_dirs'] = ldb
         self.metadata_ready.emit(
             ui_metadata, folder_map, guid_to_bundle, zip_names,
             ffs_adapter, missing_plist_paths, folder_sizes, zip_ui_paths,
@@ -4734,27 +4741,84 @@ class NestedArchiveWorker(QThread):
         ok = err = skipped = 0
         total       = len(self._candidates)
         gzip_types: dict[str, str] = {}
-        for i, ui_path in enumerate(self._candidates):
-            if self.isInterruptionRequested():
-                break
-            self.progress.emit(i, total, ui_path)
+        todo = []
+        for ui_path in self._candidates:
             if ui_path in completed:
                 skipped += 1
                 ok += 1
                 self.item_done.emit(ui_path, True)
-                continue
-            success, gzip_type = self._process_one(ui_path, out_dir)
-            if success:
-                ok += 1
-                if gzip_type:
-                    gzip_types[ui_path] = gzip_type
             else:
-                err += 1
-            self.item_done.emit(ui_path, success)
+                todo.append(ui_path)
+        # Unpacked on threads, recorded over one connection here
+        # (2026-11-18): one archive at a time with a casecache.db open and
+        # close each, IOS17's 1,458 archives took 4.7 s on one core.
+        # A cancel stops the archives not started; those already unpacked
+        # are still recorded.
+        done = skipped
+        from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
+        with closing(_open_cache_db(self._case_dir)) as db, \
+                ThreadPoolExecutor(max_workers=self._THREADS, thread_name_prefix='ffs-unpack') as pool:
+            futures = {pool.submit(self._unpack, p): p for p in todo}
+            cancelled = False
+            for fut in as_completed(futures):
+                if not cancelled and self.isInterruptionRequested():
+                    cancelled = True
+                    for f in futures:
+                        f.cancel()
+                ui_path = futures[fut]
+                try:
+                    res, file_size = fut.result()
+                except CancelledError:
+                    continue
+                except Exception as exc:
+                    res, file_size, msg = None, 0, str(exc)
+                if res is not None:
+                    try:
+                        nested_archive.record_extraction(db, ui_path, file_size, res)
+                    except Exception as exc:
+                        res, msg = None, str(exc)
+                done += 1
+                self.progress.emit(done, total, ui_path)
+                if res is not None:
+                    ok += 1
+                    if res['compound_type']:
+                        gzip_types[ui_path] = res['compound_type']
+                    self.item_done.emit(ui_path, True)
+                else:
+                    err += 1
+                    try:
+                        nested_archive.record_failure(db, ui_path, msg)
+                    except Exception:
+                        pass
+                    self._report_error(ui_path, msg)
+                    self.item_done.emit(ui_path, False)
         self.progress.emit(total, total, '')
         if gzip_types:
             self.types_updated.emit(gzip_types)
         self.finished.emit(ok, err, ok - skipped)
+
+    _THREADS = 4
+
+    def _unpack(self, ui_path: str):
+        """(nested_archive.unpack_to_disk result, file size) for one
+        candidate; raises on failure. Runs on the unpack threads."""
+        meta = self._ui_metadata.get(ui_path, {}) or {}
+        file_size = meta.get('size', 0)
+        return nested_archive.unpack_to_disk(
+            self._zip_path, self._case_dir, ui_path, self._adapter.resolve(ui_path),
+            file_size, _get_file_type), file_size
+
+    def _report_error(self, ui_path: str, err: str) -> None:
+        """item_error and the examiner-facing nested_archive_errors.log line,
+        as _process_one does."""
+        self.item_error.emit(ui_path, err or 'unknown error')
+        try:
+            log_path = os.path.join(self._case_dir, 'nested_archive_errors.log')
+            ts = datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            with open(log_path, 'a', encoding='utf-8') as lf:
+                lf.write(f"[{ts}] FAILED: {ui_path}\n  {err}\n")
+        except OSError:
+            pass
 
     def _process_one(self, ui_path: str, out_dir: str) -> tuple[bool, str | None]:
         """Process one candidate.  Returns (success, compound_type_or_None).
@@ -5369,7 +5433,8 @@ class DuplicateDetectionWorker(QThread):
         results = duplicate_scan.find_duplicate_groups(
             self._zip_path, candidates, inode_trusted=self._adapter.inode_trusted,
             progress_cb=lambda done, total: self.progress.emit(done, total),
-            cancel_check=self.isInterruptionRequested)
+            cancel_check=self.isInterruptionRequested,
+            processes=_EMBEDDED_MEDIA_PROCESSES)
         complete = not self.isInterruptionRequested()
         n_groups = len({v['md5'] for v in results.values()})
         try:
@@ -6611,9 +6676,17 @@ class ProcessDialog(QDialog):
         # per-file progress line (file name + running picture/video
         # tally) routinely runs longer than a single line comfortably
         # fits, and this label previously had no wrap at all.
+        # The integrity check runs beside the other stages
+        # (_start_integrity_check), so it has its own line.
+        self._integrity_label = QLabel()
+        self._integrity_label.setWordWrap(True)
+        self._integrity_label.setVisible(False)
+        layout.addWidget(self._integrity_label)
         self._status_label = QLabel()
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
+        self._finish_after_integrity = False
+        self._integrity_pending = False    # started, its done() not handled yet
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -7216,6 +7289,7 @@ class ProcessDialog(QDialog):
         self._post_integrity_scan = run_scan
         self._pending_upgrade_tier = upgrade_tier if run_scan else 0
         self._run_integrity = run_integrity
+        self._finish_after_integrity = False
         self._wait_for_case_open()
 
     def _wait_for_case_open(self):
@@ -7371,25 +7445,33 @@ class ProcessDialog(QDialog):
                 "The data integrity check was skipped.")
             self._continue_after_integrity()
             return
-        self._status_label.setText("Hashing archive (SHA256)…")
+        # Beside the other stages, not before them (2026-11-18): it reads the
+        # whole zip once and nothing else needs its result, but it was a
+        # third of an IOS17 run (15.7 of 43.5 s on one core) with every
+        # other stage waiting. hashlib and file reads release the GIL.
+        self._integrity_label.setText("Hashing archive (SHA256)…")
+        self._integrity_label.setVisible(True)
         self._integrity_worker = IntegrityCheckWorker(self._zip_path)
         self._integrity_worker.progress.connect(self._on_integrity_progress)
         self._integrity_worker.done.connect(self._on_integrity_done)
+        self._integrity_pending = True
         self._integrity_worker.start()
+        self._continue_after_integrity()
 
     def _on_integrity_progress(self, done_bytes: int, total: int):
         gb = 1024 ** 3
         pct = (done_bytes / total * 100) if total else 0
-        self._status_label.setText(
+        self._integrity_label.setText(
             f"Hashing archive (SHA256): {done_bytes / gb:.1f} / "
             f"{total / gb:.1f} GB ({pct:.0f}%)")
 
     def _on_integrity_done(self, digest: str):
+        self._integrity_pending = False
         if not digest:
-            self._status_label.setText(
+            self._integrity_label.setText(
                 "Integrity check cancelled." if self._scan_cancelled
                 else "Integrity check failed — could not read the archive.")
-            self._finish_operations()
+            self._finish_waiting_for_integrity()
             return
         matched = digest in self._expected_hashes
         if self._case_dir:
@@ -7404,7 +7486,7 @@ class ProcessDialog(QDialog):
             except Exception:
                 pass
         if matched:
-            self._status_label.setText(
+            self._integrity_label.setText(
                 "Integrity check passed — SHA256 matches the capture record.")
         else:
             QMessageBox.warning(
@@ -7414,12 +7496,18 @@ class ProcessDialog(QDialog):
                 f"Computed: {digest}\n\n"
                 "The data has changed since it was captured and may be "
                 "compromised.")
-            self._status_label.setText(
+            self._integrity_label.setText(
                 "⚠ Integrity check FAILED — archive hash does not match the "
                 "capture record.")
         self._chk_integrity.setChecked(False)
         self._refresh_stats()
-        self._continue_after_integrity()
+        self._finish_waiting_for_integrity()
+
+    def _finish_waiting_for_integrity(self):
+        """The other stages ended before the hash: finish now."""
+        if self._finish_after_integrity:
+            self._finish_after_integrity = False
+            self._finish_operations()
 
     def _start_header_scan(self):
         self._run_id: int | None = None
@@ -7593,8 +7681,32 @@ class ProcessDialog(QDialog):
                 "still running in the background — this list is limited to "
                 "app/user-accessible areas until it completes.")
 
-        archives = _discover_all_archives(self._ui_metadata, self._adapter,
-                                          overrides, unscoped=unscoped)
+        # The search reads every path: on the background pool, not the GUI
+        # thread (0.75 s of frozen window on IOS17, 2026-11-18). This method
+        # runs again with the result; the part above is cheap and the same.
+        found = getattr(self, '_archives_found', None)
+        if found is None:
+            meta, adapter = _copy_metadata(self._ui_metadata), self._adapter
+            fut = _BG_POOL.submit(_discover_all_archives, meta, adapter,
+                                  overrides, unscoped=unscoped)
+            self._status_label.setText(
+                (self._status_label.text() + "\n" if self._status_label.text() else "")
+                + "Looking for archives…")
+
+            def _poll():
+                if not fut.done():
+                    QTimer.singleShot(50, _poll)
+                    return
+                try:
+                    self._archives_found = fut.result()
+                except Exception:
+                    self._archives_found = _discover_all_archives(
+                        self._ui_metadata, self._adapter, overrides, unscoped=unscoped)
+                self._show_archive_selection()
+            QTimer.singleShot(50, _poll)
+            return
+        self._archives_found = None
+        archives = found
 
         # Build lookup: ui_path -> DB record (includes error_msg)
         db_records: dict[str, dict] = {}
@@ -8017,6 +8129,12 @@ class ProcessDialog(QDialog):
         self._finish_operations()
 
     def _finish_operations(self):
+        if self._integrity_pending:
+            # the last stage ended before the hash: finish when it does
+            # (_finish_waiting_for_integrity). A flag, not isRunning(): the
+            # thread can still be ending after its done() was handled.
+            self._finish_after_integrity = True
+            return
         if getattr(self, '_leveldb_index_failed', None):
             # Later stages replace the status line; keep this one visible.
             self._status_label.setText(
@@ -12258,6 +12376,27 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         extracted = {p for p, r in records.items() if not r.get('error_msg')}
         return sum(1 for a in archives if a['ui_path'] not in extracted)
 
+    def _leveldb_dirs_now(self) -> list:
+        """[p for p in self.folder_map if _looks_like_leveldb_dir(...)], in
+        that order, without reading every folder's children: the parsed
+        folders come from the snapshot (ffs_metadata._leveldb_dirs) and
+        only the folders added or replaced since are checked."""
+        import file_table
+        fm = self.folder_map
+        stored = getattr(self, '_stored_leveldb_dirs', None)
+        if stored is None or not isinstance(fm, file_table.FolderMap):
+            return [p for p in fm if _looks_like_leveldb_dir(fm, p)]
+        top, gone = fm.top, fm.gone
+        cands = [p for p in stored if p not in gone
+                 and (p not in top or _looks_like_leveldb_dir(fm, p))]
+        known = set(stored)
+        cands += [p for p in list(top) if p not in known and _looks_like_leveldb_dir(fm, p)]
+
+        def place(p):       # folder_map order: stored folders in place, then added ones
+            j = fm._locate(p)
+            return (0, j) if j >= 0 else (1, 0)
+        return sorted(cands, key=place)
+
     def _leveldb_search_coverage(self) -> tuple[list, list]:
         """(all_leveldb_paths, unindexed_paths) — one shared predicate so
         the coverage count (below) and the actual indexing action can
@@ -12292,7 +12431,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         a real LevelDB/IndexedDB folder is a real LevelDB/IndexedDB
         folder either way."""
         all_paths = list(dict.fromkeys(
-            [p for p in self.folder_map if _looks_like_leveldb_dir(self.folder_map, p)]
+            self._leveldb_dirs_now()
             + list(self._leveldb_folder_map.keys())
         ))
         if not all_paths or not self._case_dir:
@@ -12751,6 +12890,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._prefetched_embedded_media = extras.get('embedded_media')
         self.full_metadata = data
         self.folder_map = folder_map
+        # parsed LevelDB folders from the snapshot (None: work them out)
+        self._stored_leveldb_dirs = extras.get('leveldb_dirs')
         # New case: research colors depend on this device's iOS version
         self._research_row_cache = {}
         self._research_ios_cache = None

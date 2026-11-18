@@ -49,19 +49,20 @@ import struct
 import uuid
 import zlib
 from array import array
-from collections.abc import MutableMapping
+from collections.abc import MutableMapping, Set
 
 import msgpack
 
 from zip_index import _hash_table
 
-MAGIC = b'FFSFILE\x02'   # 2: a NUL after each name
+MAGIC = b'FFSFILE\x03'   # 2: a NUL after each name; 3: in_zip bits
 FIELDS = ('atime', 'btime', 'ctime', 'gid', 'inode', 'links', 'mode', 'mtime',
           'prot', 'size', 'uid')
 _FIELD_SET = frozenset(FIELDS) | {'xattr'}
 _I64_MIN, _I64_MAX = -(1 << 63), (1 << 63) - 1
 _U64_MAX = (1 << 64) - 1
 WHOLE = 1 << 15                # flags bit: the entry is stored whole (msgpack)
+IN_ZIP = 1 << 14               # flags bit: the path has its own entry in the zip (zip_ui_paths)
 _HEADER = struct.Struct('<8sQ')
 _SECTION = struct.Struct('<16sQQ')
 SUFFIX = '.ffsfiles'
@@ -98,9 +99,12 @@ def new_path(case_dir: str) -> str:
     return os.path.join(case_dir, f'files-{uuid.uuid4().hex}{SUFFIX}')
 
 
-def write(ui_metadata: dict, folder_map: dict, path: str) -> None:
+def write(ui_metadata: dict, folder_map: dict, path: str, in_zip=None) -> None:
     """Write the file list and folder contents to *path* (through a temporary
-    file). ValueError if anything would not read back exactly."""
+    file). ValueError if anything would not read back exactly. *in_zip*:
+    the file-list paths that have their own zip entry (zip_ui_paths), kept
+    as a bit per file (ZipPaths reads it); ValueError if one is not in the
+    file list."""
     names: list[str] = list(ui_metadata)
     row: dict[str, int] = {n: i for i, n in enumerate(names)}
     n_files = len(names)
@@ -154,6 +158,15 @@ def write(ui_metadata: dict, folder_map: dict, path: str) -> None:
             p_start[i], p_len[i] = len(pool), len(blob)
             pool += blob
             flags[i] = WHOLE
+    n_in_zip = 0
+    if in_zip is not None:
+        for p in in_zip:
+            i = row.get(p, -1)
+            if not 0 <= i < n_files:
+                raise ValueError('a zip_ui_paths path is not in the file list')
+            if not flags[i] & IN_ZIP:
+                flags[i] |= IN_ZIP
+                n_in_zip += 1
 
     enc = [n.encode('utf-8', 'surrogatepass') for n in names]
     if any(b'\x00' in b for b in enc):
@@ -165,6 +178,7 @@ def write(ui_metadata: dict, folder_map: dict, path: str) -> None:
         name_len.append(len(b))
         off += len(b) + 1          # each name is followed by a NUL (names_run)
     sections = [('counts', struct.pack('<QQ', n_files, len(names))),
+                ('in_zip', struct.pack('<qQ', 1 if in_zip is not None else 0, n_in_zip)),
                 ('order', ','.join(order).encode('ascii')),
                 ('names', b'\x00'.join(enc) + b'\x00'), ('name_start', name_start.tobytes()),
                 ('name_len', name_len.tobytes()), ('table', _hash_table(row).tobytes()),
@@ -228,6 +242,7 @@ class FileTable:
                 raise ValueError('file table is cut short')
             s[name.rstrip(b'\x00').decode('ascii')] = mv[off:off + ln]
         self.n_files, self.n_rows = struct.unpack('<QQ', s['counts'])
+        self.has_in_zip, self.n_in_zip = struct.unpack('<qQ', s['in_zip']) if 'in_zip' in s else (0, 0)
         self.order = tuple(bytes(s['order']).decode('ascii').split(','))
         self._names = s['names']
         self.name_start, self.name_len = s['name_start'].cast('Q'), s['name_len'].cast('I')
@@ -530,6 +545,33 @@ class _Values:
         return len(self._m)
 
 
+class ZipPaths(Set):
+    """zip_ui_paths (the file-list paths with their own zip entry) from the
+    file table's IN_ZIP bits: `p in it` without a set of 2M strings (0.41 GB
+    on the synthetic iPhone). Files added while the case is open are never
+    in it, as they were never in the set."""
+
+    def __init__(self, table: 'FileTable'):
+        self.table = table
+
+    def __contains__(self, p) -> bool:
+        i = self.table.find(p)
+        return 0 <= i < self.table.n_files and bool(self.table.flags[i] & IN_ZIP)
+
+    def __iter__(self):
+        t, flags = self.table, self.table.flags
+        for a in range(0, t.n_files, _RUN):
+            for k, nm in enumerate(t.names_run(a, min(a + _RUN, t.n_files))):
+                if flags[a + k] & IN_ZIP:
+                    yield nm
+
+    def __len__(self) -> int:
+        return self.table.n_in_zip
+
+    def __reduce__(self):
+        return (_reopen_zip_paths, (self.table.path,))
+
+
 # ── Fast reads for loops over every file (work on a plain dict too) ─────────
 
 def fields_of(ui_metadata, fields: tuple):
@@ -599,6 +641,10 @@ def open_table(path: str) -> FileTable:
     if t is None:
         t = _OPEN[path] = FileTable(path)
     return t
+
+
+def _reopen_zip_paths(path):
+    return ZipPaths(open_table(path))
 
 
 def _reopen(kind, path, top, gone):

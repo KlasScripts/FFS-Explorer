@@ -87,8 +87,56 @@ def _empty_folder_entries(adapter_args, zip_names, ui_metadata, folder_map) -> l
     return out
 
 
+def _zip_names_index(zip_names, zip_path, case_dir):
+    """{'file', 'cd_sha256', 'n'} naming the case's zip index (.ffsidx) when
+    its set of names is exactly *zip_names*, so the snapshot need not hold
+    the names (0.54 GB as a set, most of the blob, synthetic iPhone); else
+    None and they are stored as before."""
+    if not (zip_path and case_dir):
+        return None
+    try:
+        import zip_index
+        path = zip_index.index_path(zip_path, case_dir)
+        idx = zip_index.ZipIndex(path)
+        try:
+            names = {idx.name(i) for i in range(len(idx))}
+            want = zip_names if isinstance(zip_names, (set, frozenset)) else set(zip_names)
+            if names != want:
+                return None
+            return {'file': os.path.basename(path), 'cd_sha256': idx.cd_sha256, 'n': len(names)}
+        finally:
+            idx.close()
+    except Exception:
+        return None
+
+
+def _names_from_index(info: dict, case_dir: str, yield_cb=None) -> list:
+    """The zip names the snapshot left to the index (_zip_names_index):
+    each distinct name once. ValueError if the index is not the one the
+    snapshot named."""
+    import zip_index
+    idx = zip_index.ZipIndex(os.path.join(case_dir, os.path.basename(info['file'])))
+    try:
+        if idx.cd_sha256 != info['cd_sha256']:
+            raise ValueError('the zip index is not the one this snapshot was made with')
+        seen, out = set(), []
+        for i in range(len(idx)):
+            n = idx.name(i)
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+            if yield_cb and i % _STREAM_YIELD == _STREAM_YIELD - 1:
+                yield_cb()
+        if len(out) != info['n']:
+            raise ValueError('the zip index does not match the snapshot')
+        return out
+    finally:
+        idx.close()
+
+
 def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
-                  ui_metadata, folder_map, metadata_only, file_table_dir=None) -> bytes:
+                  ui_metadata, folder_map, metadata_only, file_table_dir=None,
+                  zip_path=None) -> bytes:
     """Pack a load snapshot as a header object followed by chunked ui_metadata
     and folder_map objects (see SNAPSHOT_VERSION).  Concatenated msgpack
     objects, read back by unpack_snapshot.
@@ -98,15 +146,23 @@ def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
     names it; if they would not read back exactly from one (file_table.write
     refuses), they go in the blob as before."""
     table_name = None
+    ui_in_table = False
     if file_table_dir:
         import file_table
         path = file_table.new_path(file_table_dir)
         try:
-            file_table.write(ui_metadata, folder_map, path)
+            try:
+                # zip_ui_paths as a bit per file (file_table.ZipPaths)
+                file_table.write(ui_metadata, folder_map, path, in_zip=zip_ui_paths)
+                ui_in_table = zip_ui_paths is not None
+            except ValueError:
+                file_table.write(ui_metadata, folder_map, path)
             table_name = os.path.basename(path)
             file_table.remove_others(file_table_dir, keep=path)
         except ValueError:
             table_name = None
+            ui_in_table = False
+    names_index = _zip_names_index(zip_names, zip_path, file_table_dir) if table_name else None
     if table_name is None:
         ui_parts = [msgpack.packb(c, use_bin_type=True)
                     for c in _chunked(ui_metadata, _SNAP_CHUNK)]
@@ -118,8 +174,10 @@ def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
         'empty_folders': _empty_folder_entries(adapter_args, zip_names, ui_metadata, folder_map),
         'adapter':       adapter_args,
         'delta':         delta,
-        'zip_names':     list(zip_names),
-        'zip_ui_paths':  (list(zip_ui_paths) if zip_ui_paths is not None else None),
+        'zip_names':     None if names_index else list(zip_names),
+        'zip_names_index': names_index,
+        'zip_ui_paths':  (list(zip_ui_paths) if zip_ui_paths is not None and not ui_in_table else None),
+        'zip_ui_in_table': ui_in_table,
         'metadata_only': list(metadata_only),
         'n_ui':          len(ui_parts),
         'n_fm':          len(fm_parts),
@@ -198,12 +256,20 @@ def unpack_snapshot(raw, yield_cb=None, case_dir=None) -> dict:
         ui_metadata, folder_map = file_table.open_maps(os.path.join(case_dir, name))
         if len(ui_metadata) != header['n_files'] or len(folder_map) != header['n_folders']:
             raise ValueError('the file table does not match the snapshot')
+        zip_names = header['zip_names']
+        if zip_names is None and header.get('zip_names_index'):
+            zip_names = _names_from_index(header['zip_names_index'], case_dir, yield_cb)
+        zip_ui_paths = header['zip_ui_paths']
+        if header.get('zip_ui_in_table'):
+            if not ui_metadata.table.has_in_zip:
+                raise ValueError('the file table has no in-zip bits')
+            zip_ui_paths = file_table.ZipPaths(ui_metadata.table)
         return {
             'empty_folders': header.get('empty_folders'),
             'adapter':       header['adapter'],
             'delta':         header['delta'],
-            'zip_names':     header['zip_names'],
-            'zip_ui_paths':  header['zip_ui_paths'],
+            'zip_names':     zip_names,
+            'zip_ui_paths':  zip_ui_paths,
             'metadata_only': header['metadata_only'],
             'ui_metadata':   ui_metadata,
             'folder_map':    folder_map,
@@ -635,7 +701,8 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
                     ffs_adapter.sys_prefix, ffs_adapter.old_layout]
     snapshot_blob = pack_snapshot(
         adapter_args, delta, zip_names, zip_ui_paths,
-        ui_metadata, folder_map, metadata_only, file_table_dir=case_dir or None)
+        ui_metadata, folder_map, metadata_only, file_table_dir=case_dir or None,
+        zip_path=zip_path)
 
     return {
         'adapter_args':   [ffs_adapter.format, ffs_adapter.user_prefix,

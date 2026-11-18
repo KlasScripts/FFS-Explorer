@@ -19,6 +19,7 @@ import gzip
 import zlib
 import json
 import hashlib
+import threading
 import struct
 import plistlib
 import xml.dom.minidom
@@ -130,7 +131,7 @@ from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, 
                              QModelIndex, QPersistentModelIndex, QAbstractTableModel,
                              qInstallMessageHandler, QtMsgType)
 from PySide6.QtCore import QSettings as _QSettings
-from file_table import fields_of as _ft_fields_of, any_set as _ft_any_set
+from file_table import fields_of as _ft_fields_of, any_set as _ft_any_set, ZipPaths as _ft_ZipPaths
 startup_log.step('Qt and app modules loaded')
 
 FRAME_BUDGET_SECS = 0.016   # max seconds per UI batch — keeps the interface responsive at 60 fps while the tree builds
@@ -1359,6 +1360,66 @@ def _header_tier_counts(items, ffs_adapter, z, with_tier3: bool = False) -> dict
     return {'files': files, 'legacy': legacy}
 
 
+_TIER_COUNTS_KEY = 'header_tier_counts'
+_TIER_COUNTS_VERSION = '1'   # bump when _header_tier_counts or _header_candidate_matches change
+
+
+def _add_tier_counts(a: dict, b: dict) -> dict:
+    """Two _header_tier_counts results for disjoint sets of paths, added:
+    every figure in them is a per-path count (legacy[3] is len(items))."""
+    return {part: {t: a[part][t] + b[part].get(t, 0) for t in a[part]} for part in ('files', 'legacy')}
+
+
+def _header_tier_counts_cached(ui_metadata, ffs_adapter, z, with_tier3: bool,
+                               case_dir: str | None) -> dict | None:
+    """_header_tier_counts for the whole file list, with the part that comes
+    from the extraction's own files (the file table, which never changes for
+    a case) saved in casecache.db and reused at every later open: 3-9 s of
+    the synthetic iPhone's open, every time (2026-11-18). Files added while
+    the case is open (unpacked from nested archives) are counted fresh and
+    added. Same result as counting everything (checked on IOS17, Magnet and
+    the synthetic iPhone). A plain dict file list (no file table) is counted
+    as before."""
+    import file_table as _ft
+    if z is None:
+        return None
+    if not isinstance(ui_metadata, _ft.FileList) or ui_metadata.gone or not case_dir:
+        return _header_tier_counts([(p, None) for p in ui_metadata], ffs_adapter, z,
+                                   with_tier3=with_tier3)
+    table = ui_metadata.table
+    index = getattr(getattr(z, '_by_name', None), '_index', None)
+    ident = hashlib.sha1(repr((
+        os.path.basename(table.path), table.n_files, getattr(index, 'cd_sha256', None),
+        list(ffs_adapter.scan_folders()), list(ffs_adapter.scan_excludes()),
+        ffs_adapter.format, ffs_adapter.user_prefix, ffs_adapter.sys_prefix,
+        ffs_adapter.old_layout, bool(with_tier3))).encode()).hexdigest()
+    version = f'{_TIER_COUNTS_VERSION}|{ident}'
+    stored = None
+    try:
+        with closing(_open_cache_db(case_dir)) as db:
+            raw = load_blob(db, _TIER_COUNTS_KEY + ('3' if with_tier3 else ''), version)
+        if raw is not None:
+            d = json.loads(raw)
+            stored = {part: {int(t): n for t, n in d[part].items()} for part in ('files', 'legacy')}
+    except Exception:
+        stored = None
+    if stored is None:
+        stored = _header_tier_counts([(p, None) for p, _i in ui_metadata._live()],
+                                     ffs_adapter, z, with_tier3=with_tier3)
+        if stored is None:
+            return None
+        try:
+            with closing(_open_cache_db(case_dir)) as db:
+                save_blob(db, _TIER_COUNTS_KEY + ('3' if with_tier3 else ''), version,
+                          json.dumps(stored).encode())
+        except Exception:
+            pass
+    added = [(p, None) for p in list(ui_metadata.top) if p in ui_metadata._added]
+    if not added:
+        return stored
+    return _add_tier_counts(stored, _header_tier_counts(added, ffs_adapter, z, with_tier3=with_tier3))
+
+
 def _save_header_scan_count(db, tier: int, tier_counts: dict | None,
                             ui_metadata: dict, ffs_adapter) -> None:
     """Store how many files *tier* covered, at the moment its scan finished
@@ -1651,6 +1712,34 @@ def _meta_col_keys_for(data: dict) -> tuple:
     entry (~0.4 s on an 830k-entry archive), so ZipMetadataWorker runs it
     before metadata_ready instead of the GUI thread (see _ui_extras)."""
     return tuple(k for k in _META_COL_HEADERS if _ft_any_set(data, k))
+
+
+def _folder_file_counts(folder_map, counts: dict) -> dict:
+    """Fill *counts* with every folder's file count, as
+    FastZipBrowser._count_files_recursive gives it (files under the folder,
+    recursively, each folder once), deepest folders first. Qt-free, for the
+    load worker: on the GUI thread the sort of every folder alone froze the
+    window 0.8 s on a 475k-folder case (2026-11-18)."""
+    folders = list(folder_map)
+    is_folder = set(folders).__contains__      # a C lookup, not the file table's
+    children = folder_map.get
+
+    def count(folder, visited):
+        if folder in counts:
+            return counts[folder]
+        if folder in visited:
+            return 0
+        visited.add(folder)
+        n = 0
+        for child in children(folder, []):
+            n += count(child, visited) if is_folder(child) else 1
+        counts[folder] = n
+        return n
+    for i, f in enumerate(sorted(folders, key=lambda p: p.count('/'), reverse=True)):
+        if i % 5000 == 0:
+            time.sleep(0)
+        count(f, set())
+    return counts
 
 
 def _duplicate_groups_for(duplicate_files: dict) -> dict:
@@ -2219,6 +2308,7 @@ class ZipMetadataWorker(QThread):
     # (result dict | None, is_new): ios_system_check's result for this case
     # (None = not iOS / not checkable); is_new when it was made this open.
     system_check_ready   = Signal(object, bool)
+    system_check_finished = Signal()    # the check thread ended (with or without a result)
 
     def __init__(self, zip_path: str, header_scan_tier: int = 0, case_dir: str | None = None):
         super().__init__()
@@ -2252,6 +2342,22 @@ class ZipMetadataWorker(QThread):
             self.status_update.emit(
                 f"Updated {len(summary['names']):,} file names from an older version "
                 f"({n:,} stored paths; see the run log). Rebuilding the folder tree…")
+
+    def _start_system_check(self) -> None:
+        """_run_system_check on its own thread, beside the parse instead of
+        before it: on a first open the parse waited ~4 s for it (synthetic
+        iPhone, 2026-11-18), and its result is not used by the parse. Says
+        system_check_finished when it ends; Process Case on a new case waits
+        for that, so the notice still comes first."""
+        def _run():
+            try:
+                self._run_system_check()
+            finally:
+                try:
+                    self.system_check_finished.emit()
+                except RuntimeError:
+                    pass          # this load's worker is gone (a newer load)
+        threading.Thread(target=_run, name='ffs-systemcheck', daemon=True).start()
 
     def _run_system_check(self) -> None:
         """Signs of jailbreaking or sideloading, and how much of the iOS
@@ -2302,8 +2408,14 @@ class ZipMetadataWorker(QThread):
                         folder_counts, _ = load_folder_data(db)
                 except Exception:
                     folder_counts = {}
+        fresh_counts = False
+        if len(folder_counts) < len(folder_map):
+            # first open (or a re-parse): counted here, not on the GUI thread
+            folder_counts = _folder_file_counts(folder_map, dict(folder_counts))
+            fresh_counts = True
         self._ui_extras = {
             'file_counts':       folder_counts,
+            'file_counts_fresh': fresh_counts,
             'meta_col_keys':     _meta_col_keys_for(ui_metadata),
             'android_user_data': _android_user_data_for(folder_map),
         }
@@ -2366,7 +2478,10 @@ class ZipMetadataWorker(QThread):
             step = lambda: time.sleep(0)
             zip_names = frozenset_in_steps(snap['zip_names'], step)
             zui = snap['zip_ui_paths']
-            zip_ui_paths = frozenset_in_steps(zui, step) if zui is not None else None
+            if zui is None or isinstance(zui, (set, frozenset, _ft_ZipPaths)):
+                zip_ui_paths = zui      # the file table's in-zip bits: no set made
+            else:
+                zip_ui_paths = frozenset_in_steps(zui, step)
             ui_metadata = snap['ui_metadata']
             folder_map  = snap['folder_map']
             metadata_only_folders = set(snap['metadata_only'])
@@ -2540,7 +2655,7 @@ class ZipMetadataWorker(QThread):
 
             if self.case_dir and _cd_cache_valid(self.zip_path, self.case_dir):
                 self._update_case_names()
-                self._run_system_check()
+                self._start_system_check()
 
             # Fast path: a previous load of this archive left a snapshot in the
             # cache DB — re-emit it and skip all archive I/O and derivations.
@@ -2568,7 +2683,7 @@ class ZipMetadataWorker(QThread):
                     self.status_update.emit(
                         f"Central directory copied to case folder in {_elapsed:.1f}s.")
                     self._update_case_names()
-                    self._run_system_check()
+                    self._start_system_check()
 
                 # Fast path: offload the heavy parse to a child process.  It
                 # runs on its own interpreter/GIL so the CPU-bound work doesn't
@@ -2726,7 +2841,7 @@ class ZipMetadataWorker(QThread):
                          ffs_adapter.sys_prefix, ffs_adapter.old_layout],
                         self._local_extra_delta, zip_names, zip_ui_paths,
                         ui_metadata, folder_map, metadata_only_folders,
-                        file_table_dir=self.case_dir)
+                        file_table_dir=self.case_dir, zip_path=self.zip_path)
                 except Exception:
                     snapshot_blob = None
 
@@ -12582,6 +12697,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         _seq = self._system_check_seq
         self.worker.system_check_ready.connect(
             lambda result, is_new, seq=_seq: self._on_system_check_ready(result, is_new, seq))
+        self._system_check_arrived = False
+        self.worker.system_check_finished.connect(
+            lambda seq=_seq: setattr(self, '_system_check_arrived', True)
+            if seq == getattr(self, '_system_check_seq', 0) else None)
         self.worker.start()
 
     def _open_process_dialog_for_new_case(self) -> None:
@@ -12609,6 +12728,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         a case is created."""
         if not self.zip_path:
             return
+        # The system check runs beside the parse (_start_system_check): its
+        # notice comes first, so wait for it to end (at most a minute).
+        waited = getattr(self, '_process_dialog_waits', 0)
+        if not getattr(self, '_system_check_arrived', True) and waited < 300:
+            self._process_dialog_waits = waited + 1
+            QTimer.singleShot(200, self._open_process_dialog_for_new_case)
+            return
+        self._process_dialog_waits = 0
         if getattr(self, '_system_notice_pending', False):
             self._show_system_check_dialog()   # what the case leaves out, first
         self._open_process_dialog(preselect_nested=True, preselect_tier1=True,
@@ -12758,7 +12885,30 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         gc.freeze()
         gc.enable()   # paused while the snapshot loaded (_try_load_from_snapshot)
         # Start background precomputation of folder counts if not already cached.
-        if len(self._file_count_cache) < len(self.folder_map):
+        if extras.get('file_counts_fresh'):
+            # Counted on the worker from the folders as parsed; the archives
+            # and media containers added since are folders now, so they and
+            # every folder above them are counted again here (the rest is
+            # cached, so a few lookups), as a count made after they were
+            # added would have them. Then saved, as the precompute did.
+            for c in list(getattr(self, '_nested_archive_map', {}) or {}) + \
+                    list(getattr(self, '_embedded_media_containers', ()) or ()):
+                p = c
+                while True:
+                    self._file_count_cache.pop(p, None)
+                    if not p:
+                        break
+                    p = p.rsplit('/', 1)[0] if '/' in p else ''
+            for c in list(getattr(self, '_nested_archive_map', {}) or {}) + \
+                    list(getattr(self, '_embedded_media_containers', ()) or ()):
+                p = c
+                while True:
+                    self._count_files_recursive(p)
+                    if not p:
+                        break
+                    p = p.rsplit('/', 1)[0] if '/' in p else ''
+            self._save_folder_counts_to_db()
+        elif len(self._file_count_cache) < len(self.folder_map):
             QTimer.singleShot(300, self._start_precompute_folder_counts)
         # LevelDB/IndexedDB indexing for Keyword Search — moved
         # 2026-10-12 from an automatic QTimer.singleShot fired right
@@ -12834,11 +12984,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     except Exception:
                         pass
             # Copied here, not on the GUI thread (see _copy_metadata).
-            # paths only: _header_tier_counts never reads the entries
-            items = [(p, None) for p in _copy_metadata(ui_metadata)]
+            meta = _copy_metadata(ui_metadata)
             infos = _cd_cache_load(zip_path, case_dir) if case_dir else None
             z = CachedZipView(zip_path, infos) if infos is not None else None
-            return _header_tier_counts(items, adapter, z, with_tier3=tier3)
+            return _header_tier_counts_cached(meta, adapter, z, tier3, case_dir)
 
         fut = _CASE_OPEN_POOL.submit(_count)
         self._track_load_job('header-scan counts', fut)
@@ -18020,18 +18169,20 @@ if __name__ == "__main__":
     # the worker target instead of opening another GUI window).
     import multiprocessing
     multiprocessing.freeze_support()
-    if sys.platform == "win32":
-        # GIL hand-over: every SQLite call, file read or frozen-build import
-        # on the GUI thread releases the GIL, and while a background thread
-        # runs Python (case open: the zip index build, snapshot unpack,
-        # search index) the GUI thread waits a whole switch interval to get
-        # it back. On Windows CPython waits in whole milliseconds and the
-        # timer rounds the default 5 ms up to ~15 ms; below 1 ms it asks at
-        # once. Measured: 10 case-DB opens on the GUI thread beside one busy
-        # thread took 4.2 s at 5 ms (and at 1 ms), 0.03 s at 0.5 ms; in the
-        # v0.50.15 exe this was a 3.3 s freeze in on_metadata_ready. Cost:
-        # two CPU-bound Python threads together ran ~15% slower.
-        sys.setswitchinterval(0.0005)
+    # GIL hand-over: every SQLite call, file read or frozen-build import
+    # on the GUI thread releases the GIL, and while a background thread
+    # runs Python (case open: the zip index build, snapshot unpack,
+    # search index) the GUI thread waits a whole switch interval to get
+    # it back. On Windows CPython waits in whole milliseconds and the
+    # timer rounds the default 5 ms up to ~15 ms; below 1 ms it asks at
+    # once. Measured: 10 case-DB opens on the GUI thread beside one busy
+    # thread took 4.2 s at 5 ms (and at 1 ms), 0.03 s at 0.5 ms; in the
+    # v0.50.15 exe this was a 3.3 s freeze in on_metadata_ready. Cost:
+    # two CPU-bound Python threads together ran ~15% slower.
+    # On every platform since 2026-11-18: with the default 5 ms the Mac
+    # showed 1-2.3 s window freezes at a 2.5M-entry reopen, at 0.5 ms
+    # none over 0.3 s (6 reopens, IOS17 and the synthetic iPhone).
+    sys.setswitchinterval(0.0005)
     if sys.platform == "darwin":
         # Dev runs from the bare interpreter inherit Python.app's bundle, so the
         # Dock and menu bar say "Python". Patch the in-memory bundle info before

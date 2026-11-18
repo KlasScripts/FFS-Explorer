@@ -199,3 +199,60 @@ def test_field_helpers_match_the_dict_way(table):
     for f in ('size', 'xattr', 'capture', 'devid', 'nope', 'btime', 'links'):
         assert ft.any_set(FL, f) == any(v.get(f) for v in ref.values() if v), f
         assert ft.any_set(ref, f) == ft.any_set(FL, f)
+
+
+def test_in_zip_bits_answer_like_the_set(tmp_path):
+    ui, fm = _sample(400)
+    in_zip = frozenset(list(ui)[::3])
+    p = str(tmp_path / 'z.ffsfiles')
+    ft.write(ui, fm, p, in_zip=in_zip)
+    zp = ft.ZipPaths(ft.FileTable(p))
+    assert len(zp) == len(in_zip) and set(zp) == in_zip
+    assert all((k in zp) == (k in in_zip) for k in list(ui) + ['nope', 'private/var/mobile/F1'])
+    with pytest.raises(ValueError):                      # a path that is not in the file list
+        ft.write(ui, fm, str(tmp_path / 'y.ffsfiles'), in_zip={'not/a/file'})
+
+
+def _small_zip_case(tmp_path):
+    import zipfile, zip_cd_cache
+    zpath = tmp_path / 'EXTRACTION_FFS.zip'
+    with zipfile.ZipFile(zpath, 'w') as zf:
+        for n in ('d/', 'd/a.db', 'd/b.txt', 'e/c.plist'):
+            zf.writestr(n, b'' if n.endswith('/') else b'x')
+    case = tmp_path / 'case'
+    case.mkdir()
+    assert zip_cd_cache.save(str(zpath), str(case))
+    assert zip_cd_cache.open_index(str(zpath), str(case)) is not None
+    return str(zpath), str(case)
+
+
+def test_snapshot_names_the_zip_index_and_keeps_in_zip_bits(tmp_path):
+    zpath, case = _small_zip_case(tmp_path)
+    names = ['d/', 'd/a.db', 'd/b.txt', 'e/c.plist']
+    ui = {'d/a.db': {'size': 1}, 'd/b.txt': {'size': 1}, 'e/c.plist': {'size': 1}, 'meta/only': {'size': 0}}
+    fm = {'': ['d', 'e', 'meta'], 'd': ['d/a.db', 'd/b.txt'], 'e': ['e/c.plist'], 'meta': ['meta/only']}
+    zui = frozenset(['d/a.db', 'd/b.txt', 'e/c.plist'])
+    blob = ffs_metadata.pack_snapshot(['cellebrite', '', '', 1], None, names, zui, ui, fm, set(),
+                                      file_table_dir=case, zip_path=zpath)
+    head = msgpack.Unpacker(raw=False, strict_map_key=False)
+    head.feed(blob)
+    h = next(head)
+    assert h['zip_names'] is None and h['zip_names_index']['n'] == 4 and h['zip_ui_in_table']
+    snap = ffs_metadata.unpack_snapshot(blob, case_dir=case)
+    assert set(snap['zip_names']) == set(names) and len(snap['zip_names']) == 4
+    assert isinstance(snap['zip_ui_paths'], ft.ZipPaths) and set(snap['zip_ui_paths']) == zui
+    assert 'meta/only' not in snap['zip_ui_paths']
+    # names that are not exactly the index's: stored in the snapshot as before
+    ft._OPEN.clear()
+    blob2 = ffs_metadata.pack_snapshot(['cellebrite', '', '', 1], None, names[:3], zui, ui, fm, set(),
+                                       file_table_dir=case, zip_path=zpath)
+    h2 = next(iter(msgpack.Unpacker(__import__('io').BytesIO(blob2), raw=False, strict_map_key=False)))
+    assert h2['zip_names'] == names[:3] and h2['zip_names_index'] is None
+    # an index that is not the one the snapshot named: refused (the case is parsed again)
+    ft._OPEN.clear()
+    blob3 = ffs_metadata.pack_snapshot(['cellebrite', '', '', 1], None, names, zui, ui, fm, set(),
+                                       file_table_dir=case, zip_path=zpath)
+    h3 = next(iter(msgpack.Unpacker(__import__('io').BytesIO(blob3), raw=False, strict_map_key=False)))
+    h3['zip_names_index']['cd_sha256'] = '0' * 64
+    with pytest.raises(ValueError):
+        ffs_metadata._names_from_index(h3['zip_names_index'], case)

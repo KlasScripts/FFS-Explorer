@@ -18066,9 +18066,16 @@ if __name__ == "__main__":
     startup_log.step('building main window')
     window = FastZipBrowser()
     startup_log.step('main window built')
+    app.aboutToQuit.connect(startup_log.quitting)
     app.aboutToQuit.connect(window._stop_all_workers)
     atexit.register(window._stop_all_workers)  # runs before Qt's atexit on exception exit
     window.show()
     startup_log.step(f"main window show() called, geometry {window.geometry().getRect()}")
     QTimer.singleShot(0, startup_log.window_shown)
+    # Freeze logger heartbeat (app/freeze_log.py): a freeze is the GUI thread
+    # missing these beats. Parented to the app so it lives all session.
+    import freeze_log
+    _freeze_beat = QTimer(app)
+    _freeze_beat.timeout.connect(freeze_log.beat)
+    _freeze_beat.start(int(freeze_log.BEAT_S * 1000))
     sys.exit(app.exec())

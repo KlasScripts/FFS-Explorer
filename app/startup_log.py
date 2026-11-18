@@ -43,6 +43,7 @@ CRASH_NAME = 'crash.log'
 MAX_BYTES = 1_000_000
 BACKUPS = 3
 WATCHDOG_SECONDS = 60
+QUIT_DUMP_SECONDS = 60   # stacks to crash.log if stopping the workers takes longer
 _REPEAT_LIMIT = 5
 
 _logger = logging.getLogger('ffs_explorer.startup')
@@ -149,6 +150,25 @@ def window_shown() -> None:
     except Exception:
         pass
     step('main window shown, event loop running')
+    try:
+        import freeze_log
+        freeze_log.start(_crash_file)
+    except Exception:
+        pass
+
+
+def quitting() -> None:
+    """The event loop is ending (QApplication.aboutToQuit): stop logging
+    freezes, since the window no longer beats while workers are stopped, and
+    keep a stack dump armed in case stopping them hangs."""
+    try:
+        import freeze_log
+        freeze_log.stop()
+        if _crash_file is not None:
+            faulthandler.dump_traceback_later(QUIT_DUMP_SECONDS, repeat=False, file=_crash_file)
+    except Exception:
+        pass
+    step('quitting: stopping background work')
 
 
 def message(level: str, text: str) -> None:
@@ -352,7 +372,16 @@ def _at_exit() -> None:
         repeated = {t: n - _REPEAT_LIMIT for t, n in _seen.items() if n > _REPEAT_LIMIT}
         for text, extra in sorted(repeated.items(), key=lambda kv: -kv[1])[:20]:
             _logger.info('repeated %s more times: %s', f'{extra:,}', text[:200])
+        try:
+            import freeze_log
+            line = freeze_log.summary()
+            if line:
+                _logger.info('%s', line)
+        except Exception:
+            pass
         step('exiting')
         faulthandler.cancel_dump_traceback_later()
+        import freeze_log
+        freeze_log.arm_exit_watchdog(_crash_file)
     except Exception:
         pass

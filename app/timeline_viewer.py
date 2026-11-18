@@ -341,7 +341,9 @@ class TimelineViewerMixin:
         if not metadata or not hasattr(self, '_user_media_candidate_paths'):
             return None
         import user_media_ignore_list
-        keys = list(metadata)
+        # a list of a dict's keys (C-level), or the file table's cheap copy,
+        # whose paths are read only by the worker (collect, below)
+        keys = metadata.copy() if hasattr(metadata, 'table') else list(metadata)
         time_cols = list(getattr(self, '_time_cols', ()))
         entries = user_media_ignore_list.load()
 

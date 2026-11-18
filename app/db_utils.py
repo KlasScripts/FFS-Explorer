@@ -407,6 +407,17 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
 
 # ── Results DB ────────────────────────────────────────────────────────────────
 
+_RESULTS_SCHEMA_READY: set = set()   # (dev, inode) of results DBs set up by this process
+
+
+def _file_identity(path: str):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 def _open_results_db(cache_dir: str) -> sqlite3.Connection:
     """Open (or create) caseresults.db inside *cache_dir*.
 
@@ -438,6 +449,17 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
             f"version of the app (expected {_RESULTS_SCHEMA_VERSION}). "
             "Search results and artifact data are preserved in the existing file."
         )
+
+    # The tables, indexes and column migrations below only ever add what is
+    # missing, so once this process has run them for this file they are not
+    # run again: each run took the write lock ~20 times and wrote
+    # user_version, and a second thread opening the file at the same moment
+    # waited for it (2.5 s of frozen window at case open, synthetic iPhone,
+    # 2026-11-18). Keyed by the file's identity; a new or recreated file has
+    # user_version 0, so it is always set up whatever its inode number.
+    ident = _file_identity(db_path)
+    if ver == _RESULTS_SCHEMA_VERSION and ident is not None and ident in _RESULTS_SCHEMA_READY:
+        return conn
 
     conn.execute('''
         CREATE TABLE IF NOT EXISTS search_index (
@@ -689,6 +711,9 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
 
     conn.execute(f'PRAGMA user_version = {_RESULTS_SCHEMA_VERSION}')
     conn.commit()
+    ident = _file_identity(db_path)
+    if ident is not None:
+        _RESULTS_SCHEMA_READY.add(ident)
     return conn
 
 

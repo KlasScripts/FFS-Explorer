@@ -24,7 +24,7 @@ import re
 import struct
 import zipfile
 from array import array
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from bisect import bisect_right
 
 _MAGIC = b'ZCD\x02'   # v1 (msgpack) silently invalidated by magic mismatch
@@ -253,8 +253,7 @@ def load(zip_path: str, case_dir: str) -> list | None:
     index = _open_index(zip_path, case_dir, path)
     if index is None:
         return None
-    from zip_index import IndexEntry
-    infos = [IndexEntry(index, i) for i in range(len(index))]
+    infos = _Entries(index)
     by_name = _NameIndex(index, infos)
     _parsed_cache[path] = (st.st_mtime, st.st_size, infos, by_name)
     _register_layout(zip_path, infos)
@@ -290,6 +289,37 @@ def _open_index(zip_path: str, case_dir: str, zcd_path: str):
         return None
 
 
+class _Entries(Sequence):
+    """The archive's entries as a list made on demand from the mapped index:
+    entries[i] is zip_index.IndexEntry(index, i), built when asked for and not
+    kept. A list of 2.54M IndexEntry objects held ~1.1 GB for the whole
+    session (synthetic iPhone, 2026-11-18); an entry is ~2 us to make. Same
+    order and the same fields as the list it replaces (an entry is a new
+    object each time: compare entries by their fields, not with `is`)."""
+
+    def __init__(self, index):
+        self._index = index
+        self._n = len(index)
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, i):
+        from zip_index import IndexEntry
+        if isinstance(i, slice):
+            return [IndexEntry(self._index, k) for k in range(*i.indices(self._n))]
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError('entry index out of range')
+        return IndexEntry(self._index, i)
+
+    def __iter__(self):
+        from zip_index import IndexEntry
+        index = self._index
+        return (IndexEntry(index, i) for i in range(self._n))
+
+
 class _NameIndex(Mapping):
     """{name: entry} over the index's own name table: what zipfile's
     NameToInfo was, with the capture names (A-72), in the same order."""
@@ -308,8 +338,8 @@ class _NameIndex(Mapping):
         return isinstance(name, str) and self._index.find(name) >= 0
 
     def __iter__(self):
-        infos = self._infos
-        return (infos[i].filename for i in self._index.order)
+        name = self._index.name           # an entry's filename is its index name
+        return (name(i) for i in self._index.order)
 
     def __len__(self):
         return len(self._index.order)
@@ -431,6 +461,12 @@ class CachedZipView:
     def getinfo(self, name: str) -> zipfile.ZipInfo:
         return self._by_name[name]
 
+    def has_file(self, name: str) -> bool:
+        """getinfo(name) exists and is not a folder entry, without making
+        the entry: a found entry's filename is *name* itself, and is_dir()
+        is a trailing "/"."""
+        return name in self._by_name and not name.endswith('/')
+
     # ── Data reads ────────────────────────────────────────────────────────────
 
     def open(self, name_or_info) -> io.IOBase:
@@ -525,7 +561,11 @@ def _layout_key(zip_path: str) -> str:
 def _register_layout(zip_path: str, infos: list[zipfile.ZipInfo]) -> None:
     """Record the header-offset layout of a FULL infolist (load() only —
     a subset would make neighbouring entries look adjacent)."""
-    offs = array('Q', (i.header_offset for i in infos))
+    if isinstance(infos, _Entries):
+        offs = array('Q')
+        offs.frombytes(infos._index.header_offset.tobytes())   # the index's own column
+    else:
+        offs = array('Q', (i.header_offset for i in infos))
     # A central directory lists entries in offset order, so the offsets are
     # normally already sorted and distinct: checked in a plain loop, which
     # lets other threads run. One sorted() of IOS17's 830k offsets held the
@@ -572,32 +612,76 @@ def _header_offset_read(fh, info: zipfile.ZipInfo) -> int:
     return info.header_offset + 30 + fname_len + extra_len
 
 
-def _learn_layout(fh, layout: _Layout) -> bool:
-    """Read real local headers for a deterministic sample and record, per
-    group, the one delta / trailer length they show (see the section
-    comment). Returns False when nothing usable was learned."""
-    order = sorted(layout.infos, key=lambda i: i.header_offset)
-    nxt = {a.header_offset: b.header_offset for a, b in zip(order, order[1:])}
-    picks: dict[int, zipfile.ZipInfo] = {}
+def _learn_sample(infos) -> tuple[list, dict]:
+    """The entries _learn_layout reads, and {header_offset: the next
+    entry's header_offset} for them. Works on index rows when *infos* is
+    the mapped index (_Entries), so only the sampled entries are made; the
+    same picks, in the same way, as the list version below."""
+    if not isinstance(infos, _Entries):
+        order = sorted(infos, key=lambda i: i.header_offset)
+        nxt = {a.header_offset: b.header_offset for a, b in zip(order, order[1:])}
+        picks: dict[int, zipfile.ZipInfo] = {}
+
+        def spread(seq, k):
+            n = len(seq)
+            for s in range(min(k, n)):
+                info = seq[(s * (n - 1)) // max(k - 1, 1)]
+                picks[info.header_offset] = info
+
+        spread(order, _SAMPLE_SPREAD)
+        groups: dict[tuple, list] = {}
+        for info in order:
+            groups.setdefault((_zip64_len(info.extra), bool(info.flag_bits & 0x08)), []).append(info)
+        for group in groups.values():
+            picks[group[0].header_offset] = group[0]
+            picks[group[-1].header_offset] = group[-1]
+            spread(group, _SAMPLE_PER_GROUP)
+        return list(picks.values()), {o: nxt[o] for o in picks if o in nxt}
+
+    from zip_index import IndexEntry
+    index = infos._index
+    hdr, flags = index.header_offset, index.flag_bits
+    order = sorted(range(len(index)), key=hdr.__getitem__)     # stable: ties keep index order
+    offs = array('Q', (hdr[r] for r in order))
+    rows: dict[int, int] = {}                                   # header_offset -> row, last write wins
 
     def spread(seq, k):
         n = len(seq)
         for s in range(min(k, n)):
-            info = seq[(s * (n - 1)) // max(k - 1, 1)]
-            picks[info.header_offset] = info
+            r = seq[(s * (n - 1)) // max(k - 1, 1)]
+            rows[hdr[r]] = r
 
     spread(order, _SAMPLE_SPREAD)
     groups: dict[tuple, list] = {}
-    for info in order:
-        groups.setdefault((_zip64_len(info.extra), bool(info.flag_bits & 0x08)), []).append(info)
+    for r in order:
+        ex = index.extra(r)
+        groups.setdefault((_zip64_len(ex), bool(flags[r] & 0x08)), []).append(r)
     for group in groups.values():
-        picks[group[0].header_offset] = group[0]
-        picks[group[-1].header_offset] = group[-1]
+        rows[hdr[group[0]]] = group[0]
+        rows[hdr[group[-1]]] = group[-1]
         spread(group, _SAMPLE_PER_GROUP)
+    # what {a.off: b.off for a, b in zip(order, order[1:])} gives for an
+    # offset: the entry after the LAST position holding it that has a next
+    n = len(offs)
+    nxt = {}
+    for o in rows:
+        j = bisect_right(offs, o) - 1
+        if j == n - 1:
+            j -= 1
+        if j >= 0 and offs[j] == o:
+            nxt[o] = offs[j + 1]
+    return [IndexEntry(index, r) for r in rows.values()], nxt
+
+
+def _learn_layout(fh, layout: _Layout) -> bool:
+    """Read real local headers for a deterministic sample and record, per
+    group, the one delta / trailer length they show (see the section
+    comment). Returns False when nothing usable was learned."""
+    picked, nxt = _learn_sample(layout.infos)
 
     deltas: dict[int, set] = {}
     trailers: dict[bool, set] = {}
-    for info in picks.values():
+    for info in picked:
         z64 = _zip64_len(info.extra)
         name_len = _name_len(info)
         if z64 < 0 or name_len < 0:

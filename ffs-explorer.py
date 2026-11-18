@@ -1330,6 +1330,7 @@ def _header_tier_counts(items, ffs_adapter, z, with_tier3: bool = False) -> dict
     scan_folders = tuple(ffs_adapter.scan_folders())
     excludes = tuple(ffs_adapter.scan_excludes())
     resolve, getinfo = ffs_adapter.resolve, z.getinfo
+    has_file = getattr(z, 'has_file', None)   # CachedZipView: no entry made per path
     files = {1: 0, 2: 0, 3: 0} if with_tier3 else {1: 0, 2: 0}
     legacy = {1: 0, 2: 0, 3: len(items)}
     for n, (ui_path, _meta) in enumerate(items):
@@ -1341,12 +1342,16 @@ def _header_tier_counts(items, ffs_adapter, z, with_tier3: bool = False) -> dict
         unknown = in_scope and _header_candidate_matches(ui_path, scan_folders, 1, excludes)
         legacy[2] += in_scope
         legacy[1] += unknown
-        try:
-            info = getinfo(resolve(ui_path))
-        except KeyError:
-            continue
-        if info.is_dir():
-            continue
+        if has_file is not None:
+            if not has_file(resolve(ui_path)):
+                continue
+        else:
+            try:
+                info = getinfo(resolve(ui_path))
+            except KeyError:
+                continue
+            if info.is_dir():
+                continue
         if with_tier3:
             files[3] += 1
         files[2] += in_scope

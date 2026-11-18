@@ -188,5 +188,5 @@ def test_load_serves_index_entries_and_builds_the_index_once(tmp_path):
     assert [i.filename for i in infos] == ["Dump/x.db", "Dump/y.db"]
     assert os.path.exists(zi.index_path(str(zpath), str(case)))
     view = zc.CachedZipView(str(zpath), infos)
-    assert view.getinfo("Dump/y.db") is infos[1] and view.namelist() == ["Dump/x.db", "Dump/y.db"]
+    assert (view.getinfo("Dump/y.db").filename, view.getinfo("Dump/y.db").header_offset) == (infos[1].filename, infos[1].header_offset) and view.namelist() == ["Dump/x.db", "Dump/y.db"]
     assert view.open("Dump/x.db").read() == b"1"

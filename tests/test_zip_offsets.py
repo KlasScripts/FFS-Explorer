@@ -157,7 +157,7 @@ def test_cached_views_share_load_index(tmp_path):
     a = zc.CachedZipView(zip_path, infos)
     b = zc.CachedZipView(zip_path, infos)
     assert a._by_name is b._by_name
-    assert a.getinfo(infos[4].filename) is infos[4]
+    assert (a.getinfo(infos[4].filename).filename, a.getinfo(infos[4].filename).header_offset) == (infos[4].filename, infos[4].header_offset)  # entries are made on demand: equal, not the same object
     assert a.namelist() == [i.filename for i in infos]
 
 

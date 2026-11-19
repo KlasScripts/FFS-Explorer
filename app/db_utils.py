@@ -1683,6 +1683,21 @@ def load_embedded_media_hits(conn: 'sqlite3.Connection') -> list:
     return [dict(zip(cols, r)) for r in rows]
 
 
+def replace_embedded_media_hits(conn: 'sqlite3.Connection', containers, hits: list) -> None:
+    """Save *hits* as the hits of *containers* (the files just scanned):
+    their earlier rows are deleted first, in the same transaction, so a
+    rescan by newer scan logic replaces what an older one found instead of
+    adding to it (2026-11-19, beta: owner decision). Bookmarks and seen marks
+    on a replaced hit's name may no longer match it."""
+    containers = list(dict.fromkeys(containers))
+    with conn:
+        for i in range(0, len(containers), 500):
+            part = containers[i:i + 500]
+            conn.execute('DELETE FROM embedded_media_hits WHERE source_ui_path IN (%s)'
+                         % ','.join('?' * len(part)), part)
+    save_embedded_media_hits(conn, hits)
+
+
 def clear_embedded_media_hits(conn: 'sqlite3.Connection') -> None:
     """Delete every recorded embedded-media hit — used only when the
     examiner explicitly asks to redo the scan from scratch, never

@@ -411,10 +411,11 @@ def compute_display_name(ui_path: str, source_kind: str, location: str,
         name = f"{segment}{ext}"
     else:
         dbname = ui_path.rsplit('/', 1)[-1] or 'database'
+        base = f"{dbname}-{hit['table']}" if hit.get('recovered') and hit.get('table') else dbname
         if hit.get('partial'):
-            name = f"{dbname}-carved-partial{ext}"
+            name = f"{base}-carved-partial{ext}"
         elif hit.get('recovered'):
-            name = f"{dbname}-carved{ext}"
+            name = f"{base}-carved{ext}"
         else:
             # <db>-<table>-<column>-<rowid>: the table is part of the name
             # (owner request, 2026-10-23) because a rowid only means
@@ -867,6 +868,101 @@ def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES, label: str = '
         }
 
 
+# Strongest first: which of several records holding the same image is listed.
+_METHOD_RANK = {m: i for i, m in enumerate((
+    'checkpoint_deleted', 'checkpoint_older', 'wal_frame', 'unfinished_write',
+    'unfinished_delete', 'freeblock', 'page_gap', 'overflow', 'journal', 'freed_page',
+    'header_rebuilt', 'header_signature', 'header_schema'))}
+
+
+def scan_sqlite_recovered(raw: bytes, wal_bytes: bytes | None = None,
+                          journal_bytes: bytes | None = None, known: list | None = None,
+                          min_size: int = MIN_MEDIA_BYTES):
+    """Deleted and older media of a database through sqlite_recovery, the
+    way reports call it (committed view, checkpoint view, -wal, -journal),
+    every table: a list of hit dicts, or None when SQLite cannot open the
+    database (the caller then carves its bytes directly).
+
+    One hit per image: an image held by several records (the same row in
+    several WAL frames, or a freed page matched to every table of its
+    width) is listed once, at its strongest record (table certain first,
+    then whole before cut off, then method), its location naming that
+    record and its notes saying how sure that is and how many other
+    records hold it. Media equal to live media (*known*) is left out, as is
+    a cut-off image that is the start of one found whole."""
+    import sqlite_reader
+    import sqlite_recovery as rv
+    try:
+        sc.parse_db_header(raw)
+    except ValueError:
+        return None                    # not a database SQLite can open
+    known = list(known or [])
+    tmp = tempfile.mkdtemp(prefix='ffs_emr_')
+    try:
+        st = sqlite_reader.stage('db.sqlite', raw, wal=wal_bytes, journal=journal_bytes, parent=tmp)
+        try:
+            conn, _notes = sqlite_reader.connect_committed(st.path)
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        except sqlite3.DatabaseError:
+            return None
+        ck = sqlite_reader.connect_checkpoint(st.path)
+        try:
+            fr = rv.for_connection(raw, wal_bytes, journal_bytes, conn)
+            found: dict = {}            # sha256 -> [(rank, table, column, record, blob)]
+            for table in tables:
+                t = rv.table_info(conn, table, ck)
+                if t is None:
+                    continue
+                recs, _ = fr.records(t)
+                for r in recs:
+                    for i, v in enumerate(r['values']):
+                        if not isinstance(v, (bytes, bytearray)) or len(v) < min_size:
+                            continue
+                        got = classify_media_blob(bytes(v))
+                        if got is None:
+                            continue
+                        blob = bytes(v)
+                        cut = bool(r.get('truncated')) or (r.get('overflow_status') not in (None, 'complete'))
+                        rank = (0 if r.get('table_certain') else 1, 1 if cut else 0,
+                                _METHOD_RANK.get(r['method'], 99))
+                        col = t.columns[i] if i < len(t.columns) else f'column{i + 1}'
+                        found.setdefault(hashlib.sha256(blob).digest(), []).append(
+                            (rank, table, col, r, blob, got, cut))
+        finally:
+            conn.close()
+            if ck is not None:
+                ck.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    known_sha = {hashlib.sha256(b).digest() for b in known}
+    whole = known + [c[0][4] for c in found.values() if not min(c, key=lambda x: x[0])[6]]
+    out = []
+    for sha, cands in found.items():
+        if sha in known_sha:
+            continue
+        rank, table, col, r, blob, (kind, ext, http_headers), cut = min(cands, key=lambda x: x[0])
+        if cut and any(len(w) > len(blob) and w.startswith(blob) for w in whole):
+            continue
+        rid = r.get('rowid')
+        where = f"{r.get('file') or 'main'} offset {r['offset']}" if r.get('offset') is not None else (r.get('file') or 'main')
+        frame = f", WAL frame {r['frame_index']}" if r.get('frame_index') is not None else ''
+        location = (f"{table}.{col} (rowid={rid if rid is not None else '?'}; {r['method']}; "
+                    f"{where}; page {r.get('page')}{frame})")
+        notes = [n for n in [rv.describe(r)] if n]
+        if cut:
+            notes.append(f"cut off: {len(blob):,} bytes of the image survive"
+                         + (f" ({r['overflow_status']})" if r.get('overflow_status') not in (None, 'complete') else ''))
+        if len(cands) > 1:
+            n_other = len(cands) - 1
+            notes.append(f"also in {n_other} other record{'s' if n_other > 1 else ''} of this database")
+        out.append({'rowid': rid, 'blob': blob, 'kind': kind, 'ext': ext, 'http_headers': http_headers,
+                    'recovered': True, 'partial': cut, 'table': table, 'column': col,
+                    'recovery_source': r['method'], 'page': r.get('page'),
+                    'location': location, 'notes': '; '.join(notes)})
+    return out
+
+
 # ── manual, single-file entry point ("Search for Embedded Media" ──────
 #    context-menu action) plus the shared per-container orchestration
 #    both that and the bulk EmbeddedMediaScanWorker use ──────────────
@@ -976,18 +1072,21 @@ def scan_job(job: tuple) -> tuple[str, list | None]:
     of the last three a read_source() source or None. Returns (ui_path,
     rows); rows is None when the file itself couldn't be read, so the
     caller doesn't record it as done and the next run retries it."""
-    kind, ui_path, scan_dir, scan_scope, main, wal, partner = job
+    kind, ui_path, scan_dir, scan_scope, main, wal, partner = job[:7]
+    journal = job[7] if len(job) > 7 else None
     raw = read_source(main)
     if raw is None:
         return ui_path, None
     return ui_path, scan_container(kind, ui_path, raw, scan_dir, scan_scope,
                                    wal_bytes=read_source(wal),
-                                   partner_bytes=read_source(partner))
+                                   partner_bytes=read_source(partner),
+                                   journal_bytes=read_source(journal))
 
 
 def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
                    scan_scope: str, wal_bytes: bytes | None = None,
-                   partner_bytes: bytes | None = None) -> list[dict]:
+                   partner_bytes: bytes | None = None,
+                   journal_bytes: bytes | None = None) -> list[dict]:
     """Scan one already-classified container's raw bytes for embedded
     media and return ready-to-save embedded_media_hits row dicts. Moved
     here 2026-09-23 out of EmbeddedMediaScanWorker's own per-candidate
@@ -1086,6 +1185,16 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    # Deleted and older media: the carver reports and the Database tab use
+    # (sqlite_recovery, every table), so a carved image has the same table,
+    # method and file offset everywhere (2026-11-19; before, the sweep had
+    # its own carving and said only 'rowid=N (page N, method)'). Only for a
+    # database SQLite cannot open does the byte-level carving below run.
+    carved = scan_sqlite_recovered(raw, wal_bytes, journal_bytes, seen_blobs)
+    if carved is not None:
+        for hit in carved:
+            rows.append(_build_hit_row(ui_path, 'sqlite', hit['location'], scan_dir, hit, scan_scope))
+        return _unique_rows(rows)
     try:
         for hit in scan_sqlite_deleted(raw, wal_bytes=wal_bytes):
             location = (f"rowid={hit.get('rowid')} (page {hit.get('page')}, "

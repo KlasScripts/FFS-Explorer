@@ -103,12 +103,16 @@ def test_sweep_names_and_wal_aware_live_scan(tmp_path):
     live = [r for r in rows if not r['recovered']]
     assert len(live) == len(imgs) - len(DELETE)        # rows only in the -wal count as live
     deleted = {hashlib.sha256(imgs[r - 1]).hexdigest() for r in DELETE}
-    carved = {r['sha256'] for r in rows if 'overflow chain' in (r['recovery_source'] or '')
-              and 'PARTIAL' not in r['recovery_source']}
+    # carved by sqlite_recovery (2026-11-19): whole images, one row each,
+    # named with their table; cut-off ones say so in name and notes
+    whole = [r for r in rows if r['recovered'] and '-carved-partial' not in r['display_name']]
+    carved = {r['sha256'] for r in whole}
     assert carved == deleted                           # no duplicates of live media
-    names = {r['display_name'] for r in rows if r['recovered']}
-    assert any(n.startswith('w.db-carved') for n in names)
-    assert all('-carved-partial' in r['display_name'] for r in rows if 'PARTIAL' in (r['recovery_source'] or ''))
+    assert len(whole) == len(carved)                   # one row per image
+    assert all(r['display_name'].startswith('w.db-media-carved') for r in whole)
+    assert all(r['location'].startswith('media.data (rowid=') for r in whole)
+    assert all('cut off' in (r['notes'] or '') for r in rows
+               if r['recovered'] and '-carved-partial' in r['display_name'])
 
 
 def test_live_names_include_the_table():

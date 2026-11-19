@@ -67,6 +67,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       mark_media_seen, unmark_media_seen, load_seen_media_paths,
                       indexed_leveldb_folders,
                       save_embedded_media_hits, load_embedded_media_hits,
+                      replace_embedded_media_hits,
                       save_cache_record_sources, load_cache_record_sources,
                       clear_embedded_media_hits,
                       save_processing_registry_entries, processed_ui_paths,
@@ -5091,6 +5092,7 @@ class EmbeddedMediaScanWorker(QThread):
             needed.append(ui_path)
             if kind == 'sqlite':
                 needed.append(ui_path + '-wal')
+                needed.append(ui_path + '-journal')
             elif kind == 'cache' and ui_path.endswith('_s'):
                 needed.append(ui_path[:-2] + '_0')   # its Content-Type is there
         in_zip = {p: (off, size) for p, off, size in _resolve_file_candidates(
@@ -5110,9 +5112,10 @@ class EmbeddedMediaScanWorker(QThread):
         jobs = []
         for kind, ui_path in candidates:
             wal = source(ui_path + '-wal') if kind == 'sqlite' else None
+            journal = source(ui_path + '-journal') if kind == 'sqlite' else None
             partner = (source(ui_path[:-2] + '_0')
                        if kind == 'cache' and ui_path.endswith('_s') else None)
-            jobs.append((kind, ui_path, scan_dir, scan_scope, source(ui_path), wal, partner))
+            jobs.append((kind, ui_path, scan_dir, scan_scope, source(ui_path), wal, partner, journal))
         jobs.sort(key=lambda j: -(self._ui_metadata.get(j[1], {}).get('size') or 0))
         return jobs
 
@@ -5244,10 +5247,12 @@ class EmbeddedMediaScanWorker(QThread):
             # file is just scanned again (hits are INSERT OR IGNORE).
             if not self._case_dir:
                 return
-            if pending_rows:
+            if pending_rows or pending_registry:
                 try:
                     with closing(_open_results_db(self._case_dir)) as db:
-                        save_embedded_media_hits(db, pending_rows)
+                        # every file scanned now: its old hits are replaced
+                        replace_embedded_media_hits(
+                            db, [p for p, _v, _n in pending_registry], pending_rows)
                         sources = [(r['source_ui_path'], r.get('source_url'),
                                     r.get('content_type_hint'))
                                    for r in pending_rows if r.get('source_kind') == 'cache']
@@ -5613,12 +5618,16 @@ class SingleFileEmbeddedMediaWorker(QThread):
 
         self.started_scan.emit(len(raw))
 
-        wal_bytes = None
+        wal_bytes = journal_bytes = None
         if kind == 'sqlite':
             try:
                 wal_bytes = z.open(self._adapter.resolve(self._ui_path + '-wal')).read()
             except Exception:
                 wal_bytes = None
+            try:
+                journal_bytes = z.open(self._adapter.resolve(self._ui_path + '-journal')).read()
+            except Exception:
+                journal_bytes = None
 
         partner = None
         if kind == 'cache' and self._ui_path.endswith('_s'):
@@ -5632,7 +5641,7 @@ class SingleFileEmbeddedMediaWorker(QThread):
         os.makedirs(scan_dir, exist_ok=True)
         rows = ems.scan_container(kind, self._ui_path, raw, scan_dir,
                                   'manual_single_file', wal_bytes=wal_bytes,
-                                  partner_bytes=partner)
+                                  partner_bytes=partner, journal_bytes=journal_bytes)
 
         counts = {'live_pictures': 0, 'live_videos': 0,
                  'recovered_pictures': 0, 'recovered_videos': 0}
@@ -5641,10 +5650,10 @@ class SingleFileEmbeddedMediaWorker(QThread):
                     ('pictures' if r['media_kind'] == 'image' else 'videos')
             counts[bucket] += 1
 
-        if rows and self._case_dir:
+        if self._case_dir:
             try:
                 with closing(_open_results_db(self._case_dir)) as db:
-                    save_embedded_media_hits(db, rows)
+                    replace_embedded_media_hits(db, [self._ui_path], rows)
                     sources = [(r['source_ui_path'], r.get('source_url'), r.get('content_type_hint'))
                                for r in rows if r.get('source_kind') == 'cache']
                     if sources:
@@ -10808,11 +10817,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     lines += ["", "PARTIAL: only the start of the original survives. "
                               "The rest was overwritten by SQLite or reused for other "
                               "data, so the file is cut off where it stops."]
-                elif 'overflow chain' in loc and 'wal_frame' in loc:
+                # older sweep locations say 'overflow chain' / 'wal_frame';
+                # sqlite_recovery's (2026-11-19) '; overflow;' / '; wal offset'
+                elif (('overflow chain' in loc or '; overflow;' in loc)
+                      and ('wal_frame' in loc or '; wal offset' in loc)):
                     lines += ["", "Recovered whole from the database's -wal history: "
                               "the page versions saved there for that transaction give "
                               "exactly the length its record declares, ending correctly."]
-                elif 'overflow chain' in loc:
+                elif 'overflow chain' in loc or '; overflow;' in loc:
                     lines += ["", "Recovered whole: its overflow pages were all still "
                               "free and gave exactly the length its record declares, "
                               "ending correctly."]
@@ -13870,7 +13882,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     '_em_kind':                h['source_kind'],
                     '_em_location':            h.get('location') or '',
                     '_em_recovered':           bool(h.get('recovered')),
-                    '_em_partial':             ', PARTIAL ' in (h.get('recovery_source') or ''),
+                    '_em_partial':             (', PARTIAL ' in (h.get('recovery_source') or '')
+                                                or '-carved-partial' in (h.get('display_name') or '')),
                 }
                 if h.get('notes'):
                     child['notes'] = h['notes']

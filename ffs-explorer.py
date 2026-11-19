@@ -10804,7 +10804,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 lines.append(f"Live database value: {loc}")
             else:
                 lines.append(f"Recovered from deleted data: {loc}")
-                if 'PARTIAL' in loc:
+                if meta.get('_em_partial') or 'PARTIAL' in loc:
                     lines += ["", "PARTIAL: only the start of the original survives. "
                               "The rest was overwritten by SQLite or reused for other "
                               "data, so the file is cut off where it stops."]
@@ -10816,6 +10816,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     lines += ["", "Recovered whole: its overflow pages were all still "
                               "free and gave exactly the length its record declares, "
                               "ending correctly."]
+            if meta.get('notes'):
+                lines += ["", f"Notes: {meta['notes']}"]
             self._load_text_preview("\n".join(lines), ui_path)
 
     def _load_nested_entry_preview(self, ui_path: str) -> None:
@@ -13868,6 +13870,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     '_em_kind':                h['source_kind'],
                     '_em_location':            h.get('location') or '',
                     '_em_recovered':           bool(h.get('recovered')),
+                    '_em_partial':             ', PARTIAL ' in (h.get('recovery_source') or ''),
                 }
                 if h.get('notes'):
                     child['notes'] = h['notes']

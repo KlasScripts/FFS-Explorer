@@ -84,6 +84,16 @@ _SQLITE_MAIN_EXTENSIONS = frozenset({'.db', '.sqlite', '.sqlite3', '.db3'})
 _SQLITE_SIDECAR_SUFFIXES = ('-wal', '-shm', '-journal')
 _PLIST_EXTENSION = '.plist'
 
+# The note on a live database hit read from the main file alone because its
+# -wal could not be applied (embedded_media_hits.notes). From 2026-11-17 to
+# 2026-11-19 it was the end of the hit's location instead, in brackets;
+# db_utils moves it to notes when a case is opened.
+WAL_NOT_APPLIED_NOTE = 'main file without its WAL: the WAL could not be applied'
+
+# The note on a PARTIAL carve (scan_sqlite_overflow); db_utils builds the
+# same note from an older row's location.
+from db_utils import embedded_media_partial_note as partial_note   # noqa: E402
+
 _MEDIA_MAGIC_KIND = {'Picture': 'image', 'Graphic': 'image', 'Video': 'video'}
 
 _HTTP_STATUS_RE = re.compile(rb'^HTTP/\d\.\d \d{3}')
@@ -645,6 +655,12 @@ def scan_sqlite_overflow(raw: bytes, wal_bytes: bytes | None = None,
                'http_headers': http_headers, 'recovered': True, 'partial': True,
                'recovery_source': (f"{rec['source']}, overflow chain, PARTIAL "
                                    f"{len(blob):,} of {size:,} bytes: {rec['status']}"),
+               # the location names where it was found, like a complete
+               # carve's; how much survives is its note (2026-11-19; before,
+               # the location ended in the PARTIAL text, as recovery_source
+               # still does)
+               'location_source': f"{rec['source']}, overflow chain",
+               'notes': partial_note(f"{len(blob):,}", f"{size:,}", rec['status']),
                'page': rec['page']}
 
 
@@ -1047,7 +1063,7 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
         # file alone was scanned silently as if current).
         import sqlite_reader
         st = sqlite_reader.stage('db.sqlite', raw, wal=wal_bytes, parent=tmp_dir)
-        suffix = ''
+        note = None
         try:
             live = list(scan_sqlite_live(st.path))
         except Exception:
@@ -1058,9 +1074,11 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
                     if os.path.exists(st.path + extra):
                         os.unlink(st.path + extra)
                 live = list(scan_sqlite_live(st.path))
-                suffix = ' [main file without its WAL: the WAL could not be applied]'
+                note = WAL_NOT_APPLIED_NOTE
         for hit in live:
-            location = f"{hit['table']}.{hit['column']} (rowid={hit['rowid']}){suffix}"
+            location = f"{hit['table']}.{hit['column']} (rowid={hit['rowid']})"
+            if note:
+                hit['notes'] = note
             rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
             seen_blobs.append(hit['blob'])
     except Exception:
@@ -1078,7 +1096,7 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
     try:
         for hit in scan_sqlite_overflow(raw, wal_bytes=wal_bytes, known=seen_blobs):
             location = (f"rowid={hit.get('rowid')} (page {hit.get('page')}, "
-                        f"{hit.get('recovery_source')})")
+                        f"{hit.get('location_source') or hit.get('recovery_source')})")
             rows.append(_build_hit_row(ui_path, 'sqlite', location, scan_dir, hit, scan_scope))
     except Exception:
         pass

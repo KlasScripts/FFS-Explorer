@@ -658,6 +658,36 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE embedded_media_hits ADD COLUMN notes TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # From 2026-11-17 to 2026-11-19 a live hit read without its -wal said so
+    # at the end of its location; it is a note now. Moved in place, so a
+    # rescan finds the row (location is part of the UNIQUE key) instead of
+    # adding a second one. A row whose plain form already exists is left
+    # as it is: nothing is deleted.
+    _wal_suffix = ' [main file without its WAL: the WAL could not be applied]'
+    conn.execute(
+        "UPDATE OR IGNORE embedded_media_hits "
+        "SET location = substr(location, 1, length(location) - length(?1)), "
+        "    notes = CASE WHEN notes IS NULL OR notes = '' THEN ?2 ELSE notes || '; ' || ?2 END "
+        "WHERE source_kind = 'sqlite' AND length(location) > length(?1) "
+        "  AND substr(location, length(location) - length(?1) + 1) = ?1",
+        (_wal_suffix, _wal_suffix.strip(' []')))
+    # Likewise a PARTIAL carve's 'rowid=N (page N, <source>, overflow chain,
+    # PARTIAL a of b bytes: <why>)' (until 2026-11-19): the location keeps
+    # where it was found, the rest is its note (embedded_media_scan.
+    # partial_note). recovery_source still holds the whole text.
+    import re
+    partial_note = embedded_media_partial_note
+    _partial = re.compile(r'^(.*, overflow chain), PARTIAL ([\d,]+) of ([\d,]+) bytes: ([^)]*)\)$')
+    for rid, loc, notes in conn.execute(
+            "SELECT id, location, notes FROM embedded_media_hits "
+            "WHERE source_kind = 'sqlite' AND location LIKE '%, overflow chain, PARTIAL %'").fetchall():
+        m = _partial.match(loc)
+        if not m:
+            continue
+        note = partial_note(m.group(2), m.group(3), m.group(4))
+        conn.execute("UPDATE OR IGNORE embedded_media_hits SET location = ?, notes = ? WHERE id = ?",
+                     (m.group(1) + ')', f'{notes}; {note}' if notes else note, rid))
+    conn.commit()
 
     # Media Browser "seen" tracking (added 2026-09-24, direct request: a
     # "Not Interested" button marking a whole page of media as reviewed,
@@ -1584,6 +1614,12 @@ def load_evidence_page_map(conn: 'sqlite3.Connection', ui_path: str) -> dict | N
     return {r[0]: {'kind': r[1], 'name': r[2], 'table': r[3],
                    'is_leaf': None if r[4] is None else bool(r[4])}
             for r in rows}
+
+
+def embedded_media_partial_note(got: str, size: str, status: str) -> str:
+    """The note on a PARTIAL carve (embedded_media_scan.scan_sqlite_overflow):
+    how much of the record's declared length survives and why it stops."""
+    return f"PARTIAL: {got} of {size} bytes recovered ({status})"
 
 
 def save_embedded_media_hits(conn: 'sqlite3.Connection', hits: list) -> None:

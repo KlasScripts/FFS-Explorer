@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _CHILD = r'''
@@ -54,6 +56,9 @@ def test_release_keeps_the_thread_until_it_ends():
     assert p.returncode == 0 and 'reaped' in p.stdout, p.stderr[-500:]
 
 
+@pytest.mark.skipif(not os.environ.get('FFS_RUN_ABORT_TESTS'),
+                    reason='deliberately aborts a child Python (a macOS crash report each run); '
+                           'set FFS_RUN_ABORT_TESTS=1 to run it')
 def test_dropping_it_the_old_way_aborts():
     p = _run(False)
     assert p.returncode != 0 or 'Destroyed while thread' in p.stderr

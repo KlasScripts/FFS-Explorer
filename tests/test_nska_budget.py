@@ -38,7 +38,9 @@ def test_cross_linked_archive_stops_and_sweep_still_finds_blob():
     assert decode_plist_blob(raw) is None
     hits = list(scan_plist_bytes(raw, label='test.mom'))
     assert time.time() - t < 30
-    assert [h['plist_path'] for h in hits] == [f'$objects[{61}]']
+    # read from the object table, each object once (no expansion): the PNG
+    # at the path the expanded tree would give it, down the [0] chain
+    assert [h['plist_path'] for h in hits] == ['.'.join(['[0]'] * 60)]
     assert hits[0]['blob'] == PNG
     assert nska_deserialize.rec_uids == []          # library state reset
 

@@ -71,8 +71,7 @@ import sqlite3
 import tempfile
 
 import sqlite_carve as sc
-from artifact_runner import (NskaTooComplex, decode_plist_blob, decompress_http_body,
-                             deserialize_nska_budgeted, open_db_readonly)
+from artifact_runner import decompress_http_body, open_db_readonly
 import header_scan
 
 # Below this, a blob is essentially never a real photo/video — cuts out
@@ -395,7 +394,9 @@ def compute_display_name(ui_path: str, source_kind: str, location: str,
         return seg.replace('/', '∕')
     if source_kind == 'plist':
         segment = (location.rsplit('.', 1)[-1] if location else '').strip('<>[]')
-        if not segment or segment.startswith('nested-bplist'):
+        if segment.startswith('unreferenced $objects'):
+            segment = 'unreferenced'      # a left-over keyed-archive object (_nska_values)
+        elif not segment or segment.startswith('nested-bplist'):
             segment = 'embedded'
         name = f"{segment}{ext}"
     else:
@@ -651,85 +652,168 @@ def scan_sqlite_overflow(raw: bytes, wal_bytes: bytes | None = None,
 #    (a real case — see leveldb_viewer.py's own confirmed example of an
 #    NSData field that is itself a second, embedded bplist) ────────────
 
-def _walk_plist_values(obj, path: tuple = (), _depth: int = 0):
-    """Recursively yield (dotted_path_tuple, bytes_value) for every real
-    NSData-shaped leaf in a decoded plist structure. Handles plain
-    dict/list, and — since decode_plist_blob's own NSKeyedArchiver path
-    (nska_deserialize) can return custom dataclass-like objects for a
-    nested archived object — anything with its own __dict__ too, the
-    same shape leveldb_viewer._jsonify already has to handle for the
-    equivalent IndexedDB/CryptoKey case."""
-    if _depth > 8:
-        return
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            yield from _walk_plist_values(v, path + (str(k),), _depth + 1)
-    elif isinstance(obj, (list, tuple)):
-        for i, v in enumerate(obj):
-            yield from _walk_plist_values(v, path + (f'[{i}]',), _depth + 1)
-    elif isinstance(obj, (bytes, bytearray)):
-        b = bytes(obj)
-        if b.startswith(b'bplist00'):
-            nested = decode_plist_blob(b)
-            if nested is not None:
-                yield from _walk_plist_values(
-                    nested, path + ('<nested-bplist>',), _depth + 1)
-                return
-        yield path, b
-    elif hasattr(obj, '__dict__') and not isinstance(
-            obj, (str, int, float, bool, type(None))):
-        for k, v in vars(obj).items():
-            yield from _walk_plist_values(v, path + (str(k),), _depth + 1)
+# How many plists inside plists (a bplist stored as data in another) are
+# followed; past that the inner bytes are classified as they are.
+_MAX_NESTED_PLISTS = 8
 
 
-_log = logging.getLogger('ffs_explorer.startup.embedded_media')
-
-
-def _nska_object_table_values(raw: bytes):
-    """(path, bytes) for every binary value in an NSKeyedArchiver plist's
-    flat $objects table, without expanding the object graph. Used when
-    the archive is too cross-linked to expand (NskaTooComplex): each blob
-    is found exactly once, labelled $objects[N]."""
+def _parse_plist(raw: bytes):
+    """The plist's top object, or None: plistlib, then the tolerant reader
+    for a binary plist one bad CFDate makes plistlib reject (A-42), the
+    same two steps as artifact_runner.decode_plist_blob."""
     import plistlib
     try:
-        objects = plistlib.loads(raw).get('$objects') or []
+        return plistlib.loads(raw)
     except Exception:
+        from artifact_runner import _read_binary_plist_tolerantly
+        return _read_binary_plist_tolerantly(raw)
+
+
+def _plist_values(raw: bytes, prefix: tuple = (), _nest: int = 0):
+    """(path, bytes) for every data value in a plist file or blob, or None
+    if *raw* is not a plist. A keyed archive is walked over its object
+    table (_nska_values), a plain plist as the tree it is (_tree_values)."""
+    top = _parse_plist(raw)
+    if top is None:
+        return None
+    if isinstance(top, dict) and top.get('$archiver') == 'NSKeyedArchiver':
+        return _nska_values(top, prefix, _nest)
+    return _tree_values(top, prefix, _nest)
+
+
+def _leaf_values(b: bytes, path: tuple, nest: int):
+    """A data value: the values inside it when it is itself a binary plist
+    (labelled '<nested-bplist>'), else the bytes themselves."""
+    if b.startswith(b'bplist00') and nest < _MAX_NESTED_PLISTS:
+        inner = _plist_values(b, path + ('<nested-bplist>',), nest + 1)
+        if inner is not None:
+            yield from inner
+            return
+    yield path, b
+
+
+def _tree_values(obj, prefix: tuple, nest: int):
+    """(path, bytes) for every data value in a decoded plain plist, keys
+    and [i] indexes as the path. The whole tree, however deep (until
+    2026-11-19 the walk stopped 8 levels down)."""
+    stack = [(obj, prefix)]
+    while stack:
+        o, path = stack.pop()
+        if isinstance(o, (bytes, bytearray)):
+            yield from _leaf_values(bytes(o), path, nest)
+        elif isinstance(o, dict):
+            stack.extend(reversed([(v, path + (str(k),)) for k, v in o.items()]))
+        elif isinstance(o, (list, tuple)):
+            stack.extend(reversed([(v, path + (f'[{i}]',)) for i, v in enumerate(o)]))
+
+
+def _nska_values(top: dict, prefix: tuple, nest: int):
+    """(path, bytes) for every data value in a keyed archive
+    (NSKeyedArchiver), each object visited once, without expanding the
+    object graph.
+
+    Expanding it (nska_deserialize, as reports do) copies a shared object
+    into every place that references it, so the work can grow without
+    bound: IOS17 2026-11-19, a 110 KB archive took 5.7 s (9.6 million
+    library calls), and 46 plists took 30 s of the sweep's 34 s on plists.
+    Media needs only the bytes, and each sits once in $objects.
+
+    Labels are the path the expanded tree gives the object's first
+    appearance, by nska_deserialize's own rules: a depth-first walk in key
+    order, NSDictionary by its keys, NSArray/NSSet as [i], any other object
+    by its fields except $class (so NSMutableData ends in .NS.data), and
+    the $top names as nska_deserialize sets them out. An object held in
+    several places is one hit, at its first place (the expanded tree gave
+    one per place). Objects nothing in $top reaches (left over in the
+    table) are walked after, labelled '<unreferenced $objects[N]>';
+    expanding never showed them, so their media was not found before
+    2026-11-19."""
+    from plistlib import UID
+    objects = top.get('$objects')
+    if not isinstance(objects, list):
         return
-    for i, obj in enumerate(objects):
-        if isinstance(obj, dict) and isinstance(obj.get('NS.data'), (bytes, bytearray)):
-            obj = obj['NS.data']          # NSMutableData is archived as a dict
-        if isinstance(obj, (bytes, bytearray)):
-            yield from _walk_plist_values(bytes(obj), (f'$objects[{i}]',))
+    n = len(objects)
+    visited = set()
+
+    def classname(o):
+        c = o.get('$class')
+        if isinstance(c, UID) and 0 <= c.data < n and isinstance(objects[c.data], dict):
+            return objects[c.data].get('$classname')
+        return None
+
+    def resolved(v):
+        """A UID's target, as nska_deserialize turns it into a key."""
+        while isinstance(v, UID):
+            if not 0 <= v.data < n:
+                return None
+            v = objects[v.data]
+        if isinstance(v, dict) and classname(v) in ('NSString', 'NSMutableString') and 'NS.string' in v:
+            return v['NS.string']
+        return None if v == '$null' else v
+
+    def children(o, path):
+        """(value, path) pairs of one object or inline value, in order."""
+        if isinstance(o, dict):
+            cn = classname(o)
+            keys, vals = o.get('NS.keys'), o.get('NS.objects')
+            if (cn in ('NSDictionary', 'NSMutableDictionary') and isinstance(keys, list)
+                    and isinstance(vals, list) and len(keys) == len(vals)):
+                out, seen = [], set()
+                for k, v in zip(keys, vals):
+                    k = resolved(k)
+                    try:
+                        if k in seen:      # nska_deserialize keeps the first
+                            continue
+                        seen.add(k)
+                    except TypeError:      # an unhashable key: nska_deserialize drops it
+                        continue
+                    out.append((v, path + (str(k),)))
+                return out
+            if cn in ('NSArray', 'NSMutableArray', 'NSSet', 'NSMutableSet') and isinstance(vals, list):
+                return [(v, path + (f'[{i}]',)) for i, v in enumerate(vals)]
+            if cn in ('NSString', 'NSMutableString', 'NSDate', 'NSUUID'):
+                return []
+            return [(v, path + (str(k),)) for k, v in o.items() if k != '$class']
+        if isinstance(o, list):
+            return [(v, path + (f'[{i}]',)) for i, v in enumerate(o)]
+        return []
+
+    def walk(start, path):
+        stack = [(start, path)]
+        while stack:
+            o, p = stack.pop()
+            if isinstance(o, UID):
+                if not 0 <= o.data < n or o.data in visited:
+                    continue
+                visited.add(o.data)
+                o = objects[o.data]
+            if isinstance(o, (bytes, bytearray)):
+                yield from _leaf_values(bytes(o), p, nest)
+            else:
+                stack.extend(reversed(children(o, p)))
+
+    roots = top.get('$top')
+    names = list(roots) if isinstance(roots, dict) else []
+    for i, name in enumerate(names):
+        root = roots[name]
+        target = resolved(root) if isinstance(root, UID) else root
+        p = prefix + ((f'[{i}]',) if len(names) > 1 else ())
+        # nska_deserialize names a dict or list root only when it isn't 'root'
+        # (and always names any other value)
+        if not (isinstance(target, (dict, list)) and str(name).lower() == 'root'):
+            p += (str(name),)
+        yield from walk(root, p)
+    for i in range(1, n):          # $objects[0] is '$null'
+        if i not in visited:
+            yield from walk(UID(i), prefix + (f'<unreferenced $objects[{i}]>',))
 
 
 def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES, label: str = ''):
     """Yields dicts for every NSData-shaped value in *raw* (a whole
     plist FILE's bytes, binary or XML) that classifies as genuine media."""
-    values = None
-    import plistlib
-    try:
-        top = plistlib.loads(raw)
-    except Exception:
-        top = None
-    if isinstance(top, dict) and top.get('$archiver') == 'NSKeyedArchiver':
-        try:
-            content = deserialize_nska_budgeted(raw, len(top.get('$objects') or ()))
-        except NskaTooComplex as exc:
-            # e.g. a Core Data .mom: expanding it never finishes (see
-            # artifact_runner._NSKA_STEPS_PER_OBJECT), but its blobs can
-            # still be read straight from the object table.
-            _log.info('embedded media: %s: NSKeyedArchiver plist too cross-linked to unpack '
-                      '(%s, %d objects); scanned its object table directly instead',
-                      label or 'plist', exc, len(top.get('$objects') or ()))
-            values = _nska_object_table_values(raw)
-        except Exception:
-            return
-    else:
-        content = decode_plist_blob(raw)
+    values = _plist_values(raw)
     if values is None:
-        if content is None:
-            return
-        values = _walk_plist_values(content)
+        return
     for path, value in values:
         if len(value) < min_size:
             continue

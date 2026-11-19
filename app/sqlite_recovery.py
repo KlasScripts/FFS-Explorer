@@ -81,7 +81,7 @@ from dataclasses import dataclass, field
 import sqlite_carve as sc
 import sqlite_reader
 
-RECOVERY_VERSION = 12
+RECOVERY_VERSION = 13
 
 CERTAIN_METHODS = {'checkpoint_deleted', 'checkpoint_older', 'wal_frame', 'freeblock',
                    'page_gap', 'unfinished_write'}
@@ -276,6 +276,117 @@ class FileRecovery:
             self._memo['wal_images'] = ({f['page']: f['image'] for f in self._wal_frames()}
                                         if self.wal else {})
         return self._memo['wal_images']
+
+    # ── which table a page belonged to when a WAL transaction committed ──
+    def _commit_of(self, frame_index: int) -> int | None:
+        """Index of the commit frame that ends *frame_index*'s transaction,
+        in the current WAL generation; None for a frame of an earlier
+        generation (its base, the main file before a later checkpoint, is
+        gone) or one whose transaction never committed."""
+        if 'commit_of' not in self._memo:
+            frames = self._wal_frames()
+            commit_of, nxt = {}, None
+            for f in reversed(frames):
+                if f['older_wal']:
+                    continue
+                if f['is_commit']:
+                    nxt = f['frame_index']
+                commit_of[f['frame_index']] = nxt
+            self._memo['commit_of'] = commit_of
+        return self._memo['commit_of'].get(frame_index)
+
+    def _page_at(self, upto: int):
+        """page_no -> that page as of the commit frame *upto*: its latest
+        current-generation frame up to there, else the main file (the
+        database at the last checkpoint). How SQLite itself reads it."""
+        key = ('by_page',)
+        if key not in self._memo:
+            by_page: dict = {}
+            for f in self._wal_frames():
+                if not f['older_wal']:
+                    by_page.setdefault(f['page'], []).append((f['frame_index'], f['image']))
+            self._memo[key] = by_page
+        by_page = self._memo[key]
+
+        def page(pn):
+            for k, image in reversed(by_page.get(pn, ())):
+                if k <= upto:
+                    return image
+            return self._page(self.main, pn)
+        return page
+
+    def _owners_at(self, upto: int) -> dict:
+        """{leaf page: table name} in the database as of commit frame *upto*:
+        each table's root read from sqlite_master as it was then (name,
+        rootpage; the CREATE text is not needed, so a long one that spills
+        onto overflow pages does not hide the table), each b-tree walked
+        through that commit's pages. Memoised per commit."""
+        key = ('owners', upto)
+        if key in self._memo:
+            return self._memo[key]
+        page = self._page_at(upto)
+        owners: dict = {}
+
+        def leaves_of(root):
+            out, stack, seen = [], [root], set()
+            while stack:
+                pn = stack.pop()
+                if pn in seen or pn < 1:
+                    continue
+                seen.add(pn)
+                img = page(pn)
+                ho = 100 if pn == 1 else 0
+                if len(img) < ho + 12:
+                    continue
+                kind = img[ho]
+                if kind == sc._LEAF_TABLE_PAGE:
+                    out.append(pn)
+                elif kind == sc._INTERIOR_TABLE_PAGE:
+                    n = struct.unpack('>H', img[ho + 3:ho + 5])[0]
+                    stack.append(struct.unpack('>I', img[ho + 8:ho + 12])[0])
+                    for i in range(n):
+                        co = struct.unpack('>H', img[ho + 12 + 2 * i:ho + 14 + 2 * i])[0]
+                        if co and co + 4 <= len(img):
+                            stack.append(struct.unpack('>I', img[co:co + 4])[0])
+            return out
+        try:
+            roots = {}
+            for pn in leaves_of(1):                 # sqlite_master
+                img = page(pn)
+                ho = 100 if pn == 1 else 0
+                n = struct.unpack('>H', img[ho + 3:ho + 5])[0]
+                for i in range(n):
+                    co = struct.unpack('>H', img[ho + 8 + 2 * i:ho + 10 + 2 * i])[0]
+                    if not co or co >= len(img):
+                        continue
+                    plen, a = sc.read_varint(img, co)
+                    _rid, b = sc.read_varint(img, co + a)
+                    start = co + a + b
+                    payload = img[start:start + plen]
+                    try:
+                        types, hlen = sc.parse_record_header(payload, 0)
+                        values, _cut = sc.decode_body(payload, types[:4], hlen)
+                    except ValueError:
+                        continue
+                    if (len(values) >= 4 and values[0] == 'table' and isinstance(values[1], str)
+                            and isinstance(values[3], int) and values[3] > 0):
+                        roots[values[1]] = values[3]
+            for name, root in roots.items():
+                for pn in leaves_of(root):
+                    owners.setdefault(pn, name)
+        except (ValueError, IndexError, struct.error):
+            owners = {}
+        self._memo[key] = owners
+        return owners
+
+    def _owner_when_written(self, frame_index: int, page_no: int) -> tuple[str | None, int | None]:
+        """(table name, commit frame index): the table whose leaf *page_no*
+        was when the transaction holding *frame_index* committed; (None,
+        None) when that cannot be shown."""
+        upto = self._commit_of(frame_index)
+        if upto is None:
+            return None, None
+        return self._owners_at(upto).get(page_no), upto
 
     def _journal_records(self) -> list[tuple[int, bytes, int]]:
         if 'journal' not in self._memo:
@@ -572,6 +683,26 @@ class FileRecovery:
                 keep('wal_frame', c, 'wal', f['frame_offset'] + 24,
                      older_wal=f['older_wal'], frame_index=f['frame_index'])
 
+        # WAL frames of a page that is free now but was one of this table's
+        # leaves when the frame's transaction committed: the database as of
+        # that commit (main file + the WAL frames up to it, as SQLite reads
+        # it) shows the page in this table's b-tree, so its records are this
+        # table's, older versions of live rows included: table certain.
+        # A page in use by any table now is not read this way (the rule
+        # below); nor a frame of an earlier WAL round or an uncommitted one.
+        # Before 2026-11-19 these were missed: IOS17 AddressBookImages, three
+        # earlier contact photos of live rows, found whole in the WAL.
+        in_use_now = self._pages_in_use()
+        for f in self._wal_frames():
+            if f['page'] in leaves or f['page'] in in_use_now or f['older_wal']:
+                continue
+            owner, upto = self._owner_when_written(f['frame_index'], f['page'])
+            if owner != t.name:
+                continue
+            for c in guarded(self._cells, f['page'], f['image']):
+                keep('wal_frame', c, 'wal', f['frame_offset'] + 24,
+                     frame_index=f['frame_index'], leaf_at_commit=upto)
+
         # WAL frames of a page that is free now (in no table's b-tree): it
         # left its table, typically when its rows were deleted, so like a
         # freed page its records are matched by column count, an unused
@@ -616,6 +747,12 @@ class FileRecovery:
         if has_sig or free_tpl:
             for f in self._wal_frames():
                 if f['page'] in leaves or f['page'] in in_use:
+                    continue
+                if not f['older_wal'] and self._owner_when_written(f['frame_index'], f['page'])[0]:
+                    # whose leaf it was at its commit is known: this table's
+                    # records are taken above, another table's are not this
+                    # table's (two tables of one shape each took the other's
+                    # rows here before 2026-11-19: ground-truth test)
                     continue
                 for c in guarded(self._cells, f['page'], f['image']):
                     if not free_ok(c.get('types') or []):
@@ -679,6 +816,15 @@ class FileRecovery:
         # freed pages: no table's any more, matched by column count only
         for source, c in self._freed_cells():
             file, base = self._origin(source, c['page'], c['_image'])
+            if file == 'wal' and self.page_size:
+                # its image is a WAL frame: whose leaf the page was at that
+                # frame's commit, when known, settles it (the WAL frames
+                # above took this table's; another table's are not this one's)
+                # (nothing is known for an earlier WAL round's or an
+                # uncommitted frame: _owner_when_written gives None)
+                fi = (base - 24 - 32) // (24 + self.page_size)
+                if self._owner_when_written(fi, c['page'])[0]:
+                    continue
             keep('freed_page', c, file, base, carved=True, table_certain=False)
 
         # overflowing deleted records
@@ -689,6 +835,15 @@ class FileRecovery:
                 continue
             src = o.get('source', '')
             on_table = o['page'] in leaves
+            leaf_at_commit = None
+            if not on_table and o.get('wal_frame_offset') is not None and self.page_size:
+                # a WAL page free now that was this table's leaf when its
+                # transaction committed (see the WAL frames above)
+                fi = (o['wal_frame_offset'] - 32) // (24 + self.page_size)
+                if o['page'] not in self._pages_in_use():
+                    owner, upto = self._owner_when_written(fi, o['page'])
+                    if owner == t.name:
+                        on_table, leaf_at_commit = True, upto
             if not (on_table or src.startswith('freed_page')):
                 continue
             values = list(o['values'])[:ncols]
@@ -719,7 +874,8 @@ class FileRecovery:
             local, _ovf = sc._cell_local_payload_size(o.get('payload_len') or 0, usable)
             rec('overflow', rowid, values, file, offset, local + 4, o['page'],
                 truncated=not full, overflow_status=o.get('status'),
-                table_certain=on_table and not src.startswith('freed_page'))
+                table_certain=on_table and not src.startswith('freed_page'),
+                leaf_at_commit=leaf_at_commit)
 
         # record-pattern searches (no rowid): copies of live rows are dropped
         def without_id(vals):
@@ -1123,6 +1279,9 @@ def describe(r: dict) -> str:
                 "matched by column count")
     elif r['method'] == 'wal_frame' and r.get('older_wal'):
         text = "older version in an earlier WAL round; table not certain"
+    if r.get('leaf_at_commit') is not None:
+        text = (text + "; " if text else "") + (
+            f"page free now, this table's when WAL frame {r['leaf_at_commit']} committed")
     if r['method'] == 'overflow':
         status = r.get('overflow_status') or ''
         text += '' if status == 'complete' else f" (partial: {status})"

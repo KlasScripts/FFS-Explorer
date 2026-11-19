@@ -53,8 +53,9 @@ def _run_as_gui(m, body):
 def test_freeze_logged_with_stack(fl, caplog):
     caplog.set_level(logging.INFO, logger='ffs_explorer.startup')
     _run_as_gui(fl, lambda: (_beat_for(fl, 0.4), _busy_gui_work(0.9), _beat_for(fl, 0.4)))
-    assert len(fl.recent) == 1
-    rec = fl.recent[0]
+    # the longest freeze: on a busy machine a short extra one can also be
+    # logged, from this thread itself being scheduled late
+    rec = max(fl.recent, key=lambda r: r['seconds'])
     assert 0.6 < rec['seconds'] < 1.5
     assert rec['samples'] >= 3
     assert rec['stack'][0][2] == '_busy_gui_work'
@@ -62,7 +63,10 @@ def test_freeze_logged_with_stack(fl, caplog):
     assert 'freezes over' in fl.summary()
 
 
-def test_regular_beats_log_nothing(fl):
+def test_regular_beats_log_nothing(fl, monkeypatch):
+    # 1 s, not 0.3 s: under CPU load the beating thread itself can be
+    # scheduled a few hundred ms late (seen once in 12 loaded runs)
+    monkeypatch.setattr(fl, 'THRESHOLD_S', 1.0)
     _run_as_gui(fl, lambda: _beat_for(fl, 1.0))
     assert fl.recent == [] and fl.summary() is None
 
@@ -79,7 +83,7 @@ def test_other_busy_thread_reported(fl):
         _run_as_gui(fl, lambda: (_beat_for(fl, 0.2), _busy_gui_work(0.8), _beat_for(fl, 0.3)))
     finally:
         stop.set(); w.join()
-    others = fl.recent[0]['others']
+    others = max(fl.recent, key=lambda r: r['seconds'])['others']
     assert any(name == 'ffs-caseopen_0' and any(fn == '_competing_worker' for _f, _n, fn in st)
                for name, st, _k in others)
 

@@ -81,7 +81,7 @@ from dataclasses import dataclass, field
 import sqlite_carve as sc
 import sqlite_reader
 
-RECOVERY_VERSION = 13
+RECOVERY_VERSION = 14
 
 CERTAIN_METHODS = {'checkpoint_deleted', 'checkpoint_older', 'wal_frame', 'freeblock',
                    'page_gap', 'unfinished_write'}
@@ -107,11 +107,28 @@ class TableInfo:
 
 
 def _rows_by_rowid(conn: sqlite3.Connection, table: str) -> dict | None:
+    """{rowid: values} of the table's live rows, or None if it cannot be
+    read. TEXT that is not valid UTF-8 (WebKit IndexedDB's Records.key
+    holds binary keys) is read as the carver decodes carved text
+    (sqlite_carve.decode_value: UTF-8 with U+FFFD for bad bytes), so live
+    and carved versions compare equal; before 2026-11-19 one such value
+    made the whole table uncarved (IOS17: every WebKit IndexedDB Records
+    table)."""
     try:
-        cur = conn.execute(f'SELECT rowid, * FROM "{table}"')
+        return {r[0]: tuple(r[1:]) for r in conn.execute(f'SELECT rowid, * FROM "{table}"')}
+    except sqlite3.OperationalError as exc:
+        if 'decode' not in str(exc).lower():
+            return None
     except sqlite3.Error:
         return None
-    return {r[0]: tuple(r[1:]) for r in cur}
+    old = conn.text_factory
+    conn.text_factory = lambda b: b.decode('utf-8', errors='replace')
+    try:
+        return {r[0]: tuple(r[1:]) for r in conn.execute(f'SELECT rowid, * FROM "{table}"')}
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.text_factory = old
 
 
 def _root(conn, table):

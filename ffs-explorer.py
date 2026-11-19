@@ -1703,8 +1703,14 @@ _ACQ_HASH_HEADERS = {'sha256': 'SHA-256 (GrayKey)', 'sha1': 'SHA-1 (GrayKey)',
 # (added 2026-10-20, ASSUMPTIONS.md A-72): "1 of 2" / "2 of 2" on every copy
 # of a path GrayKey wrote more than once; the earlier copies also carry
 # "[capture k of n]" in their name (zip_cd_cache.capture_alias).
+# "Notes" (2026-11-19): short facts about how the tool found or read a file,
+# one column for all of them instead of a column per fact; each source sets
+# 'notes' on its own entries ('; ' between notes). So far: embedded-media
+# hits (embedded_media_hits.notes, e.g. a plist image referenced in several
+# places). Tool-written and rebuilt with the case, never the examiner's own.
 _META_COL_HEADERS = {'capture': 'Capture', **_ACQ_HASH_HEADERS,
-                     'source_url': 'Source URL'}   # media extracted from a web cache record
+                     'source_url': 'Source URL',   # media extracted from a web cache record
+                     'notes': 'Notes'}
 
 
 def _meta_col_keys_for(data: dict) -> tuple:
@@ -13863,6 +13869,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     '_em_location':            h.get('location') or '',
                     '_em_recovered':           bool(h.get('recovered')),
                 }
+                if h.get('notes'):
+                    child['notes'] = h['notes']
                 if h['source_kind'] == 'cache':
                     # A Simple Cache record holds exactly one cached response,
                     # so the record file's own times ARE this media's times

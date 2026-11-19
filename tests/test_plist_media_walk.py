@@ -121,3 +121,48 @@ def test_not_a_plist_and_plain_plist():
     assert list(ems.scan_plist_bytes(b'not a plist')) == []
     raw = plistlib.dumps({'a': [1, {'b': PNG}], 'c': JPG})
     assert _scanned(raw) == {('a.[1].b', PNG), ('c', JPG)}
+
+
+def _notes(raw):
+    return {h['plist_path']: h['notes'] for h in ems.scan_plist_bytes(raw)}
+
+
+def test_shared_image_noted_once():
+    notes = _notes(_rich())
+    # PNG2: items[0] and meta.icon point to the same object
+    assert notes['items.[0]'] == 'also referenced in 1 other place in this plist'
+    assert notes['photo'] == '' and notes['data.NS.data'] == ''
+    # three references: two other places
+    objs = ['$null', {'$class': UID(2), 'a': UID(3), 'b': UID(3), 'c': UID(3)}, CUSTOM, PNG]
+    assert _notes(_archive(objs)) == {'a': 'also referenced in 2 other places in this plist'}
+    # NSMutableData shared: counted on the object holding the bytes
+    objs = ['$null', {'$class': UID(2), 'a': UID(3), 'b': UID(3)}, CUSTOM,
+            {'$class': UID(4), 'NS.data': JPG}, MDATA]
+    assert _notes(_archive(objs)) == {'a.NS.data': 'also referenced in 1 other place in this plist'}
+
+
+def test_unreferenced_and_nested_notes():
+    # an unreferenced object: its own start is not a reference
+    objs = ['$null', {'$class': UID(2), 'photo': UID(3)}, CUSTOM, PNG, JPG]
+    assert _notes(_archive(objs)) == {'photo': '', '<unreferenced $objects[4]>': ''}
+    # a nested plist referenced twice, holding a shared image
+    inner = _archive(['$null', {'$class': UID(2), 'x': UID(3), 'y': UID(3)}, CUSTOM, PNG])
+    outer = _archive(['$null', {'$class': UID(2), 'p': UID(3), 'q': UID(3)}, CUSTOM, inner])
+    assert _notes(outer) == {'p.<nested-bplist>.x':
+                             'the plist holding it is also referenced in 1 other place in this plist; '
+                             'also referenced in 1 other place in this plist'}
+
+
+def test_notes_saved_and_updated_on_a_rerun(tmp_path):
+    import db_utils
+    row = {'source_ui_path': 'a.plist', 'source_kind': 'plist', 'location': 'photo',
+           'display_name': 'photo.png', 'media_kind': 'image', 'extracted_path': 'x',
+           'sha256': 'aa', 'byte_length': 5, 'recovered': 0, 'recovery_source': 'plist',
+           'http_wrapped': 0, 'content_type_hint': None, 'scan_scope': 'everywhere'}
+    db = db_utils._open_results_db(str(tmp_path))
+    db_utils.save_embedded_media_hits(db, [row])                    # an older scan: no notes
+    assert db_utils.load_embedded_media_hits(db)[0]['notes'] is None
+    db_utils.save_embedded_media_hits(db, [{**row, 'notes': 'also referenced in 1 other place in this plist'}])
+    hits = db_utils.load_embedded_media_hits(db)
+    assert len(hits) == 1 and hits[0]['notes'] == 'also referenced in 1 other place in this plist'
+    db.close()

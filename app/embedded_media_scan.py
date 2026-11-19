@@ -670,8 +670,9 @@ def _parse_plist(raw: bytes):
 
 
 def _plist_values(raw: bytes, prefix: tuple = (), _nest: int = 0):
-    """(path, bytes) for every data value in a plist file or blob, or None
-    if *raw* is not a plist. A keyed archive is walked over its object
+    """(path, bytes, notes) for every data value in a plist file or blob,
+    or None if *raw* is not a plist; *notes* is a list of short facts for
+    the hit's Notes (embedded_media_hits.notes). A keyed archive is walked over its object
     table (_nska_values), a plain plist as the tree it is (_tree_values)."""
     top = _parse_plist(raw)
     if top is None:
@@ -681,21 +682,25 @@ def _plist_values(raw: bytes, prefix: tuple = (), _nest: int = 0):
     return _tree_values(top, prefix, _nest)
 
 
-def _leaf_values(b: bytes, path: tuple, nest: int):
+def _leaf_values(b: bytes, path: tuple, nest: int, notes: list = ()):
     """A data value: the values inside it when it is itself a binary plist
-    (labelled '<nested-bplist>'), else the bytes themselves."""
+    (labelled '<nested-bplist>'; the outer value's notes go first, said of
+    the plist holding it), else the bytes themselves."""
     if b.startswith(b'bplist00') and nest < _MAX_NESTED_PLISTS:
         inner = _plist_values(b, path + ('<nested-bplist>',), nest + 1)
         if inner is not None:
-            yield from inner
+            outer = [f'the plist holding it is {n}' for n in notes]
+            for ipath, value, inotes in inner:
+                yield ipath, value, outer + inotes
             return
-    yield path, b
+    yield path, b, list(notes)
 
 
 def _tree_values(obj, prefix: tuple, nest: int):
     """(path, bytes) for every data value in a decoded plain plist, keys
     and [i] indexes as the path. The whole tree, however deep (until
-    2026-11-19 the walk stopped 8 levels down)."""
+    2026-11-19 the walk stopped 8 levels down). A plain plist holds no
+    shared values, so no notes."""
     stack = [(obj, prefix)]
     while stack:
         o, path = stack.pop()
@@ -724,7 +729,10 @@ def _nska_values(top: dict, prefix: tuple, nest: int):
     by its fields except $class (so NSMutableData ends in .NS.data), and
     the $top names as nska_deserialize sets them out. An object held in
     several places is one hit, at its first place (the expanded tree gave
-    one per place). Objects nothing in $top reaches (left over in the
+    one per place), with a note of how many other references point to it:
+    object fields or array slots, each counted once (where the objects
+    above it are shared too, the expanded tree shows it in more places
+    than that). Objects nothing in $top reaches (left over in the
     table) are walked after, labelled '<unreferenced $objects[N]>';
     expanding never showed them, so their media was not found before
     2026-11-19."""
@@ -734,6 +742,8 @@ def _nska_values(top: dict, prefix: tuple, nest: int):
         return
     n = len(objects)
     visited = set()
+    refs: dict = {}        # object index -> references to it seen
+    found = []             # (owner object index or None, path, bytes)
 
     def classname(o):
         c = o.get('$class')
@@ -779,18 +789,22 @@ def _nska_values(top: dict, prefix: tuple, nest: int):
         return []
 
     def walk(start, path):
-        stack = [(start, path)]
+        stack = [(start, path, None)]
         while stack:
-            o, p = stack.pop()
+            o, p, owner = stack.pop()
             if isinstance(o, UID):
-                if not 0 <= o.data < n or o.data in visited:
+                if not 0 <= o.data < n:
+                    continue
+                refs[o.data] = refs.get(o.data, 0) + 1
+                if o.data in visited:
                     continue
                 visited.add(o.data)
+                owner = o.data
                 o = objects[o.data]
             if isinstance(o, (bytes, bytearray)):
-                yield from _leaf_values(bytes(o), p, nest)
+                found.append((owner, p, bytes(o)))
             else:
-                stack.extend(reversed(children(o, p)))
+                stack.extend(reversed([(v, cp, owner) for v, cp in children(o, p)]))
 
     roots = top.get('$top')
     names = list(roots) if isinstance(roots, dict) else []
@@ -802,10 +816,18 @@ def _nska_values(top: dict, prefix: tuple, nest: int):
         # (and always names any other value)
         if not (isinstance(target, (dict, list)) and str(name).lower() == 'root'):
             p += (str(name),)
-        yield from walk(root, p)
+        walk(root, p)
     for i in range(1, n):          # $objects[0] is '$null'
         if i not in visited:
-            yield from walk(UID(i), prefix + (f'<unreferenced $objects[{i}]>',))
+            walk(UID(i), prefix + (f'<unreferenced $objects[{i}]>',))
+            refs[i] -= 1           # the walk's own start is not a reference
+    for owner, p, value in found:
+        # the value's own object, or the object holding it inline (NSData's
+        # NS.data): shared when more than one reference points to it
+        others = refs.get(owner, 0) - 1 if owner is not None else 0
+        notes = ([f'also referenced in {others} other place{"s" if others > 1 else ""} '
+                  'in this plist'] if others > 0 else [])
+        yield from _leaf_values(value, p, nest, notes)
 
 
 def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES, label: str = ''):
@@ -814,7 +836,7 @@ def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES, label: str = '
     values = _plist_values(raw)
     if values is None:
         return
-    for path, value in values:
+    for path, value, notes in values:
         if len(value) < min_size:
             continue
         result = classify_media_blob(value)
@@ -825,6 +847,7 @@ def scan_plist_bytes(raw: bytes, min_size: int = MIN_MEDIA_BYTES, label: str = '
             'plist_path': '.'.join(path), 'blob': value,
             'kind': kind, 'ext': ext, 'http_headers': http_headers,
             'recovered': False, 'recovery_source': 'plist',
+            'notes': '; '.join(notes),
         }
 
 
@@ -889,6 +912,7 @@ def _build_hit_row(ui_path: str, source_kind: str, location: str,
         'http_wrapped': int(bool(hit.get('http_headers'))),
         'content_type_hint': headers.get('content-type'),
         'scan_scope': scan_scope,
+        'notes': hit.get('notes') or None,
     }
 
 

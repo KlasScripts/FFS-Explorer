@@ -651,6 +651,13 @@ def _open_results_db(cache_dir: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE embedded_media_hits ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # notes (2026-11-19): short facts about how the hit was found, shown in
+    # the File Browser's Notes column (e.g. a plist image referenced in
+    # several places). NULL = none.
+    try:
+        conn.execute("ALTER TABLE embedded_media_hits ADD COLUMN notes TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     # Media Browser "seen" tracking (added 2026-09-24, direct request: a
     # "Not Interested" button marking a whole page of media as reviewed,
@@ -1593,18 +1600,20 @@ def save_embedded_media_hits(conn: 'sqlite3.Connection', hits: list) -> None:
     name — stored rather than re-derived later from `location`, since
     `location`'s own free-text shape (built for human reading, not
     parsing) isn't a reliable source to parse a name back out of.
-    INSERT OR IGNORE — the table's own UNIQUE(source_ui_path, location,
-    sha256) means a re-run over the same file just silently skips a hit
-    it already recorded, rather than erroring or duplicating it."""
+    A hit already recorded (the table's UNIQUE(source_ui_path, location,
+    sha256)) is kept as it is, except its notes, which a re-run sets to
+    what this scan found (a note added by a newer scan reaches an older
+    case's rows; 'notes' may be absent or None)."""
     conn.executemany(
-        'INSERT OR IGNORE INTO embedded_media_hits '
+        'INSERT INTO embedded_media_hits '
         '(source_ui_path, source_kind, location, display_name, media_kind, '
         'extracted_path, sha256, byte_length, recovered, recovery_source, '
-        'http_wrapped, content_type_hint, scan_scope) '
+        'http_wrapped, content_type_hint, scan_scope, notes) '
         'VALUES (:source_ui_path, :source_kind, :location, :display_name, '
         ':media_kind, :extracted_path, :sha256, :byte_length, :recovered, '
-        ':recovery_source, :http_wrapped, :content_type_hint, :scan_scope)',
-        hits,
+        ':recovery_source, :http_wrapped, :content_type_hint, :scan_scope, :notes) '
+        'ON CONFLICT(source_ui_path, location, sha256) DO UPDATE SET notes = excluded.notes',
+        [{**h, 'notes': h.get('notes') or None} for h in hits],
     )
     conn.commit()
 
@@ -1628,13 +1637,13 @@ def load_embedded_media_hits(conn: 'sqlite3.Connection') -> list:
     rows = conn.execute(
         'SELECT id, source_ui_path, source_kind, location, display_name, '
         'media_kind, extracted_path, sha256, byte_length, recovered, '
-        'recovery_source, http_wrapped, content_type_hint, scan_scope, found_at '
+        'recovery_source, http_wrapped, content_type_hint, scan_scope, found_at, notes '
         'FROM embedded_media_hits ORDER BY id DESC'
     ).fetchall()
     cols = ('id', 'source_ui_path', 'source_kind', 'location', 'display_name',
            'media_kind', 'extracted_path', 'sha256', 'byte_length', 'recovered',
            'recovery_source', 'http_wrapped', 'content_type_hint',
-           'scan_scope', 'found_at')
+           'scan_scope', 'found_at', 'notes')
     return [dict(zip(cols, r)) for r in rows]
 
 

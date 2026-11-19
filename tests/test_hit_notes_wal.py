@@ -115,3 +115,19 @@ def test_old_partial_rows_moved_to_notes(tmp_path):
                          'wal_frame, overflow chain, PARTIAL 7,000 of 20,000 bytes: bad pointer')
     assert got['qq'] == ('rowid=6 (page 9, wal_frame, overflow chain)', None, None)   # complete: untouched
     db.close()
+
+
+def test_live_image_also_in_older_record_noted(tmp_path):
+    p = str(tmp_path / 'c.db')
+    c = sqlite3.connect(p, isolation_level=None)
+    c.execute('PRAGMA journal_mode=WAL')
+    c.execute('PRAGMA wal_autocheckpoint=0')
+    c.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, img BLOB)')
+    c.execute("INSERT INTO t VALUES (1, 'old name', ?)", (PNG,))
+    c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    c.execute("UPDATE t SET name = 'new name' WHERE id = 1")   # same image, earlier version in the main file
+    raw, wal = open(p, 'rb').read(), open(p + '-wal', 'rb').read()
+    c.close()
+    rows = ems.scan_container('sqlite', 'c.db', raw, str(tmp_path / 'o'), 'everywhere', wal_bytes=wal)
+    assert [(r['recovered'], r['notes']) for r in rows] == [
+        (0, 'also in 1 deleted or older record of this database')]

@@ -31,8 +31,9 @@ ALLOWED = {
                              '_extract_sqlite_ro -> sqlite_reader)'),
     'app/sqlite_carve.py': (2, '_readonly_connection: an in-memory (or temp) read-only copy of '
                                'the main file as stored, for its own page topology'),
-    'app/sqlite_recovery.py': (2, 'worker process: immutable opens of the Database tab\'s own '
-                                  'prepared copies'),
+    'app/sqlite_recovery.py': (3, 'worker process: immutable opens of the Database tab\'s own '
+                                  'prepared copies, and recovery_files\' own checkpoint-view '
+                                  'copy (as prepare_database makes it)'),
     'app/sqlite_viewer.py': (7, 'the Database tab\'s own prepared copies (committed and '
                                 'checkpoint), made by sqlite_reader'),
 }

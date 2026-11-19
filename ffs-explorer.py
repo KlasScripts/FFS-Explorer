@@ -5157,7 +5157,7 @@ class EmbeddedMediaScanWorker(QThread):
                     # e.g. a worker process died: not recorded, retried next run
                     startup_log.message('WARNING', f'embedded media: {futures[fut][1]} '
                                         f'not scanned ({exc})')
-                    yield futures[fut][1], None
+                    yield futures[fut][1], None, None
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
             if cancelled:
@@ -5239,6 +5239,9 @@ class EmbeddedMediaScanWorker(QThread):
 
         n_hits = 0
         pending_rows: list[dict] = []
+        # each database's carved tables, kept for the Database tab (and
+        # anything else asking sqlite_recovery for them): carved once here
+        pending_carved: list = []
         pending_registry: list[tuple[str, str, int]] = []
         last_save = time.monotonic()
 
@@ -5260,6 +5263,12 @@ class EmbeddedMediaScanWorker(QThread):
                             save_cache_record_sources(db, sources)
                 except Exception:
                     pass
+            if pending_carved:
+                try:
+                    import sqlite_recovery
+                    sqlite_recovery.cache_put_many(self._case_dir, pending_carved)
+                except Exception as exc:
+                    startup_log.message('WARNING', f'embedded media: carved records not kept ({exc})')
             if pending_registry:
                 try:
                     with closing(_open_cache_db(self._case_dir)) as db:
@@ -5269,10 +5278,13 @@ class EmbeddedMediaScanWorker(QThread):
                     pass
             pending_rows.clear()
             pending_registry.clear()
+            pending_carved.clear()
 
         done = 0
-        for ui_path, new_rows in self._run_jobs(jobs):
+        for ui_path, new_rows, kept in self._run_jobs(jobs):
             done += 1
+            if kept:
+                pending_carved.extend(kept)
             if new_rows is not None:
                 # None = the file couldn't be read: not recorded, so the
                 # next run retries it rather than skipping it for good.

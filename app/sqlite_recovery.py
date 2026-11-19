@@ -1339,6 +1339,113 @@ def _pool():
     return _POOL
 
 
+_SQLITE_MAGIC = b'SQLite format 3\x00'
+
+
+def db_cache_key(ui_path: str, raw: bytes, wal: bytes | None, journal: bytes | None) -> str:
+    """The key casecache.db's recovered_records keeps one database's results
+    under: its path and the size and CRC of it and of its -wal and -journal
+    (a sidecar that is really a database itself counts as absent), the same
+    for the Database tab and the embedded-media sweep, so either reuses
+    what the other carved."""
+    import zlib
+    wal = wal if wal and wal[:16] != _SQLITE_MAGIC else None
+    journal = journal if journal and journal[:16] != _SQLITE_MAGIC else None
+    key = (ui_path, len(raw), zlib.crc32(raw),
+           len(wal or b''), zlib.crc32(wal or b''), len(journal or b''), zlib.crc32(journal or b''))
+    return hashlib.sha1(repr(key).encode()).hexdigest()
+
+
+def recovery_files(raw: bytes, wal: bytes | None, journal: bytes | None, tmpdir: str,
+                   name: str = 'db.sqlite') -> tuple[dict, list] | None:
+    """(files, tables) for records_for_files, laid out as the Database tab
+    lays them out (sqlite_viewer.prepare_database's 'recovery_files': the
+    main file, the -wal and -journal when real, the committed image when it
+    differs, the committed view's readable copy, the checkpoint view), so the
+    records carved from them are the tab's; *tables* includes those only the
+    checkpoint view has (the WAL dropped them). None when SQLite cannot
+    open it. Files are written under *tmpdir*, which the caller removes."""
+    import os
+    st = sqlite_reader.stage(name, raw, wal=wal, journal=journal, parent=tmpdir)
+    try:
+        conn, _notes = sqlite_reader.connect_committed(st.path)
+        try:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+            image = sqlite_reader.committed_image(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+    def write(sub, data):
+        d = os.path.join(tmpdir, sub)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name)
+        with open(path, 'wb') as f:
+            f.write(data)
+        return path
+    db_path = write('committed', sqlite_reader.readable_image(image))
+    before_path = wal_copy = None
+    if st.has_wal:
+        before_path = write('before', raw)
+        wal_copy = os.path.join(tmpdir, 'wal-frames')
+        with open(wal_copy, 'wb') as f:
+            f.write(wal)
+        try:
+            before = sqlite3.connect(f'file:{before_path}?immutable=1', uri=True)
+            try:
+                for (t,) in before.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%' ORDER BY name"):
+                    if t not in tables:
+                        tables.append(t)
+            finally:
+                before.close()
+        except sqlite3.Error:
+            pass
+    main_copy = os.path.join(tmpdir, 'main-file')
+    with open(main_copy, 'wb') as f:
+        f.write(raw)
+    journal_copy = None
+    if st.has_journal and journal[:8] == sqlite_reader.JOURNAL_MAGIC:
+        journal_copy = os.path.join(tmpdir, 'journal-pages')
+        with open(journal_copy, 'wb') as f:
+            f.write(journal)
+    committed_copy = None
+    if image != raw:
+        committed_copy = os.path.join(tmpdir, 'committed-image')
+        with open(committed_copy, 'wb') as f:
+            f.write(image)
+    return ({'key': tmpdir, 'main': main_copy, 'wal': wal_copy, 'journal': journal_copy,
+             'committed': committed_copy, 'db': db_path, 'before': before_path}, tables)
+
+
+def cache_put_many(case_dir: str, items: list) -> int:
+    """Keep many tables' results in one transaction: *items* is
+    [(db_key, table, records, notes, ncols)]; a table over CACHE_MAX_BYTES
+    is not kept. Returns how many were kept."""
+    if not case_dir or not items:
+        return 0
+    import json
+    from db_utils import _open_cache_db
+    conn = _open_cache_db(case_dir)
+    kept = 0
+    try:
+        with conn:
+            for db_key, table, records, notes, ncols in items:
+                blob = encode_records(records)
+                if len(blob) > CACHE_MAX_BYTES:
+                    continue
+                conn.execute('INSERT OR REPLACE INTO recovered_records VALUES (?,?,?,?,?,?)',
+                             (db_key, table, RECOVERY_VERSION, ncols, blob, json.dumps(notes)))
+                kept += 1
+    finally:
+        conn.close()
+    return kept
+
+
 def records_for_files(files: dict, table: str) -> tuple[list, list, int]:
     """In the worker process: (records, notes, ncols) for *table* of the
     prepared database described by *files* ({'key', 'main', 'wal',

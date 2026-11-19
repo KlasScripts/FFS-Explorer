@@ -877,7 +877,8 @@ _METHOD_RANK = {m: i for i, m in enumerate((
 
 def scan_sqlite_recovered(raw: bytes, wal_bytes: bytes | None = None,
                           journal_bytes: bytes | None = None, known: list | None = None,
-                          min_size: int = MIN_MEDIA_BYTES):
+                          min_size: int = MIN_MEDIA_BYTES, copies_of_known: dict | None = None,
+                          keep_tables: list | None = None):
     """Deleted and older media of a database through sqlite_recovery, the
     way reports call it (committed view, checkpoint view, -wal, -journal),
     every table: a list of hit dicts, or None when SQLite cannot open the
@@ -889,7 +890,13 @@ def scan_sqlite_recovered(raw: bytes, wal_bytes: bytes | None = None,
     then whole before cut off, then method), its location naming that
     record and its notes saying how sure that is and how many other
     records hold it. Media equal to live media (*known*) is left out, as is
-    a cut-off image that is the start of one found whole."""
+    a cut-off image that is the start of one found whole; *copies_of_known*,
+    if given, is filled with {sha256 hex: records holding it} for those, so
+    the live hit can say so. Every table's records are carved exactly as
+    the Database tab carves them (sqlite_recovery.recovery_files +
+    records_for_files) and, if *keep_tables* is a list, appended to it as
+    (table, records, notes, ncols) for casecache.db, so the tab shows them
+    without carving again."""
     import sqlite_reader
     import sqlite_recovery as rv
     try:
@@ -899,22 +906,24 @@ def scan_sqlite_recovered(raw: bytes, wal_bytes: bytes | None = None,
     known = list(known or [])
     tmp = tempfile.mkdtemp(prefix='ffs_emr_')
     try:
-        st = sqlite_reader.stage('db.sqlite', raw, wal=wal_bytes, journal=journal_bytes, parent=tmp)
         try:
-            conn, _notes = sqlite_reader.connect_committed(st.path)
-            tables = [r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
-        except sqlite3.DatabaseError:
+            prepared = rv.recovery_files(raw, wal_bytes, journal_bytes, tmp)
+        except (sqlite3.Error, OSError, ValueError):
+            prepared = None
+        if prepared is None:
             return None
-        ck = sqlite_reader.connect_checkpoint(st.path)
+        files, tables = prepared
+        conn = open_db_readonly(files['db'])        # the committed view's copy, for column names
         try:
-            fr = rv.for_connection(raw, wal_bytes, journal_bytes, conn)
             found: dict = {}            # sha256 -> [(rank, table, column, record, blob)]
             for table in tables:
-                t = rv.table_info(conn, table, ck)
-                if t is None:
+                try:
+                    recs, rnotes, ncols = rv.records_for_files(files, table)
+                except Exception:
                     continue
-                recs, _ = fr.records(t)
+                if keep_tables is not None:
+                    keep_tables.append((table, recs, rnotes, ncols))
+                cols = sc.record_column_names(conn, table) if recs else []
                 for r in recs:
                     for i, v in enumerate(r['values']):
                         if not isinstance(v, (bytes, bytearray)) or len(v) < min_size:
@@ -926,13 +935,12 @@ def scan_sqlite_recovered(raw: bytes, wal_bytes: bytes | None = None,
                         cut = bool(r.get('truncated')) or (r.get('overflow_status') not in (None, 'complete'))
                         rank = (0 if r.get('table_certain') else 1, 1 if cut else 0,
                                 _METHOD_RANK.get(r['method'], 99))
-                        col = t.columns[i] if i < len(t.columns) else f'column{i + 1}'
+                        col = cols[i] if i < len(cols) else f'column{i + 1}'
                         found.setdefault(hashlib.sha256(blob).digest(), []).append(
                             (rank, table, col, r, blob, got, cut))
         finally:
             conn.close()
-            if ck is not None:
-                ck.close()
+            rv._CHILD_FILES.pop(files['key'], None)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     known_sha = {hashlib.sha256(b).digest() for b in known}
@@ -940,6 +948,8 @@ def scan_sqlite_recovered(raw: bytes, wal_bytes: bytes | None = None,
     out = []
     for sha, cands in found.items():
         if sha in known_sha:
+            if copies_of_known is not None:
+                copies_of_known[sha.hex()] = len(cands)
             continue
         rank, table, col, r, blob, (kind, ext, http_headers), cut = min(cands, key=lambda x: x[0])
         if cut and any(len(w) > len(blob) and w.startswith(blob) for w in whole):
@@ -1068,25 +1078,35 @@ def read_source(source) -> bytes | None:
 def scan_job(job: tuple) -> tuple[str, list | None]:
     """Scan one candidate; the entry point for a worker process.
 
-    *job*: (kind, ui_path, scan_dir, scan_scope, main, wal, partner), each
-    of the last three a read_source() source or None. Returns (ui_path,
-    rows); rows is None when the file itself couldn't be read, so the
-    caller doesn't record it as done and the next run retries it."""
+    *job*: (kind, ui_path, scan_dir, scan_scope, main, wal, partner[,
+    journal]), each source a read_source() source or None. Returns (ui_path,
+    rows, kept); rows is None when the file itself couldn't be read, so the
+    caller doesn't record it as done and the next run retries it; kept is a
+    database's carved tables for casecache.db (sqlite_recovery.
+    cache_put_many items) or None."""
     kind, ui_path, scan_dir, scan_scope, main, wal, partner = job[:7]
     journal = job[7] if len(job) > 7 else None
     raw = read_source(main)
     if raw is None:
-        return ui_path, None
-    return ui_path, scan_container(kind, ui_path, raw, scan_dir, scan_scope,
-                                   wal_bytes=read_source(wal),
-                                   partner_bytes=read_source(partner),
-                                   journal_bytes=read_source(journal))
+        return ui_path, None, None
+    wal_b, journal_b = read_source(wal), read_source(journal)
+    keep: list = []
+    rows = scan_container(kind, ui_path, raw, scan_dir, scan_scope, wal_bytes=wal_b,
+                          partner_bytes=read_source(partner), journal_bytes=journal_b,
+                          keep_tables=keep if kind == 'sqlite' else None)
+    kept = None
+    if keep:
+        import sqlite_recovery
+        db_key = sqlite_recovery.db_cache_key(ui_path, raw, wal_b, journal_b)
+        kept = [(db_key, t, recs, notes, ncols) for t, recs, notes, ncols in keep]
+    return ui_path, rows, kept
 
 
 def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
                    scan_scope: str, wal_bytes: bytes | None = None,
                    partner_bytes: bytes | None = None,
-                   journal_bytes: bytes | None = None) -> list[dict]:
+                   journal_bytes: bytes | None = None,
+                   keep_tables: list | None = None) -> list[dict]:
     """Scan one already-classified container's raw bytes for embedded
     media and return ready-to-save embedded_media_hits row dicts. Moved
     here 2026-09-23 out of EmbeddedMediaScanWorker's own per-candidate
@@ -1190,7 +1210,16 @@ def scan_container(kind: str, ui_path: str, raw: bytes, scan_dir: str,
     # method and file offset everywhere (2026-11-19; before, the sweep had
     # its own carving and said only 'rowid=N (page N, method)'). Only for a
     # database SQLite cannot open does the byte-level carving below run.
-    carved = scan_sqlite_recovered(raw, wal_bytes, journal_bytes, seen_blobs)
+    copies: dict = {}
+    carved = scan_sqlite_recovered(raw, wal_bytes, journal_bytes, seen_blobs,
+                                   copies_of_known=copies, keep_tables=keep_tables)
+    for row in rows:
+        # a live image also in deleted or older records: one hit, noted
+        n = copies.get(row['sha256']) if not row['recovered'] else None
+        if n:
+            note = (f"also in {n} deleted or older record{'s' if n > 1 else ''} "
+                    "of this database")
+            row['notes'] = f"{row['notes']}; {note}" if row.get('notes') else note
     if carved is not None:
         for hit in carved:
             rows.append(_build_hit_row(ui_path, 'sqlite', hit['location'], scan_dir, hit, scan_scope))

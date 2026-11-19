@@ -1274,6 +1274,8 @@ class SqliteViewerMixin:
         prepared = getattr(self, '_sql_prepared', None) or {}
         key = getattr(self, '_sql_prepared_key', None)
         import hashlib
+        # == sqlite_recovery.db_cache_key(ui_path, raw, wal, journal): the
+        # sweep keeps its results under the same key (tests check they agree)
         db_key = hashlib.sha1(repr(key).encode()).hexdigest() if key else None
         w = SqliteRecoveryWorker(self._sql_recovery, self._sql_db_path,
                                  self._sql_before_path, table, prepared.get('recovery_files'),

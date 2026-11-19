@@ -1284,6 +1284,9 @@ class SqliteViewerMixin:
         w.start()
 
     def _on_sql_recovery_done(self, table: str, rows: list, notes: list) -> None:
+        release = getattr(self, '_release_worker', None)   # sent from inside run()
+        if release is not None:
+            release(self._sql_recovery_worker)
         self._sql_recovery_worker = None
         self._sql_recovery_pending = None
         self.__dict__.setdefault('_sql_recovered_cache', {})[table] = (rows, notes)

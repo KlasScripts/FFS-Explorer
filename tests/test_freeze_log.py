@@ -122,3 +122,30 @@ def test_exit_watchdog(tmp_path, hang):
         assert 'Timeout' in text and '<module>' in text
     else:
         assert p.returncode == 0 and text == ''
+
+
+def test_beat_arms_nothing(fl, monkeypatch):
+    """beat() only records the time: until 2026-11-19 it re-armed
+    faulthandler.dump_traceback_later every second on the GUI thread
+    (Windows crashes in beat() after long freezes)."""
+    import faulthandler
+    calls = []
+    monkeypatch.setattr(faulthandler, 'dump_traceback_later', lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(faulthandler, 'dump_traceback', lambda *a, **k: calls.append(a))
+    _run_as_gui(fl, lambda: _beat_for(fl, 1.5))
+    assert calls == []
+
+
+def test_long_freeze_dumps_every_thread_once(fl, monkeypatch, tmp_path):
+    monkeypatch.setattr(fl, 'HARD_S', 0.8)
+    crash = open(tmp_path / 'crash.log', 'w+')
+    t = threading.Thread(target=lambda: (fl.start(crash), _beat_for(fl, 0.3),
+                                         _busy_gui_work(1.6), _beat_for(fl, 0.4)))
+    t.start()
+    t.join(30)
+    crash.flush()
+    text = open(tmp_path / 'crash.log').read()
+    assert text.count('GUI not responding for') == 1
+    assert '_busy_gui_work' in text and 'Thread 0x' in text
+    rec = max(fl.recent, key=lambda r: r['seconds'])
+    assert rec['seconds'] > 1.2

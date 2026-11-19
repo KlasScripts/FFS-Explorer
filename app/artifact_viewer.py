@@ -5010,6 +5010,9 @@ class ArtifactViewerMixin:
                 self._art_filter_worker.done.disconnect()
             except Exception:
                 pass
+            release = getattr(self, '_release_worker', None)   # still running: keep it alive
+            if release is not None:
+                release(self._art_filter_worker)
         self._art_filter_worker = None
 
     # ── Script / source / files views ─────────────────────────────────────────

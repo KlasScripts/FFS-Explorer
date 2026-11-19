@@ -6312,6 +6312,32 @@ class FilterSortPresetDialog(QDialog):
         }
 
 
+def _gzip_archive_types(case_dir: str) -> dict[str, str]:
+    """{archive ui_path: '<type> — gzip'} for every single-entry archive
+    unpacked from gzip (not a stored ZIP), from casecache.db and the
+    unpacked files' first bytes. Qt-free, for the background pool."""
+    out_dir = os.path.join(case_dir, 'nested_archives')
+    gzip_types: dict[str, str] = {}
+    with closing(_open_cache_db(case_dir)) as db:
+        for rec in load_nested_archives(db):
+            if rec['entry_count'] != 1:
+                continue
+            stored_path = os.path.join(out_dir, rec['stored_filename'])
+            try:
+                with open(stored_path, 'rb') as f:
+                    magic = f.read(2)
+            except OSError:
+                continue
+            if magic == b'PK':
+                continue  # stored ZIP, not a gzip extract
+            entries = load_nested_archive_entries(db, rec['ui_path'])
+            if entries:
+                ft = entries[0].get('file_type') or 'Other'
+                if ft != 'Other':
+                    gzip_types[rec['ui_path']] = f"{ft} — gzip"
+    return gzip_types
+
+
 class ProcessDialog(QDialog):
     """Lets the user view header-scan history and re-run the file header scan."""
     header_scan_done       = Signal(dict)
@@ -7873,34 +7899,27 @@ class ProcessDialog(QDialog):
                 f"extension, {by_content:,} from their content, {unknown:,} unknown.")
 
     def _apply_gzip_type_overrides(self):
-        """Read all single-entry gzip-extracted archives from the DB and emit
-        their detected content type (e.g. 'JSON — gzip') as header_scan_done
-        so the file browser Type column updates immediately."""
+        """Emit every single-entry gzip-extracted archive's detected content
+        type (e.g. 'JSON — gzip') as header_scan_done, so the file browser
+        Type column updates. The reading (a file open and a query per
+        archive) is on the background pool: on the GUI thread it froze the
+        window 21-29 s after extraction on Windows (1,333 archives on
+        IOS17; 0.2 s on the Mac), 2026-11-19."""
         if not self._case_dir:
             return
-        try:
-            out_dir = os.path.join(self._case_dir, 'nested_archives')
-            gzip_types: dict[str, str] = {}
-            with closing(_open_cache_db(self._case_dir)) as db:
-                for rec in load_nested_archives(db):
-                    if rec['entry_count'] != 1:
-                        continue
-                    stored_path = os.path.join(out_dir, rec['stored_filename'])
-                    if not os.path.isfile(stored_path):
-                        continue
-                    with open(stored_path, 'rb') as f:
-                        magic = f.read(2)
-                    if magic == b'PK':
-                        continue  # stored ZIP, not a gzip extract
-                    entries = load_nested_archive_entries(db, rec['ui_path'])
-                    if entries:
-                        ft = entries[0].get('file_type') or 'Other'
-                        if ft != 'Other':
-                            gzip_types[rec['ui_path']] = f"{ft} — gzip"
-            if gzip_types:
-                self.header_scan_done.emit(gzip_types)
-        except Exception:
-            pass
+        fut = _BG_POOL.submit(_gzip_archive_types, self._case_dir)
+
+        def _poll():
+            if not fut.done():
+                QTimer.singleShot(50, _poll)
+                return
+            try:
+                types = fut.result()
+                if types:
+                    self.header_scan_done.emit(types)
+            except Exception:          # includes the dialog having closed meanwhile
+                pass
+        QTimer.singleShot(50, _poll)
 
     def _on_cancel(self):
         self._scan_cancelled = True
@@ -12533,6 +12552,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             return True
 
         def _finished(failed_all, cancelled):
+            self._release_worker(self._leveldb_index_worker)
             self._leveldb_index_worker = None
             if (self._case_dir and not cancelled and not failed_all
                     and state['idx'] == total):
@@ -18236,6 +18256,24 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             worker.requestInterruption()
         self._retired_workers.append(worker)
         worker.finished.connect(partial(self._reap_retired_worker, worker))
+
+    def _release_worker(self, worker):
+        """Let go of a QThread whose results are in (or no longer wanted)
+        without Python freeing it before its thread has ended: its result
+        signal is sent from inside run(), so the thread is often still
+        running when the handler drops the last reference, and Qt aborts
+        ("QThread: Destroyed while thread '' is still running": Windows,
+        LevelDB indexing, 2026-11-19). Kept in _retired_workers until
+        finished, like _retire_worker, but not asked to stop."""
+        if worker is None:
+            return
+        try:
+            running = worker.isRunning()
+        except RuntimeError:            # already deleted on the C++ side
+            return
+        if running:
+            self._retired_workers.append(worker)
+            worker.finished.connect(partial(self._reap_retired_worker, worker))
 
     def _reap_retired_worker(self, worker):
         try:

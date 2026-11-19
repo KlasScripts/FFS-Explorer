@@ -310,6 +310,8 @@ def _install_abort_dump(dump_path: str) -> None:
                                     wintypes.HANDLE)
         k32.GetCurrentProcess.restype = wintypes.HANDLE
         k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k32.TerminateProcess.restype = wintypes.BOOL
         dbghelp.MiniDumpWriteDump.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.HANDLE,
                                               ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
                                               ctypes.c_void_p)
@@ -330,6 +332,15 @@ def _install_abort_dump(dump_path: str) -> None:
                         _crash_file.write(f"\nNative stack dump {'written to' if ok else 'FAILED:'} "
                                           f"{dump_path}\n")
                         _crash_file.flush()
+            except Exception:
+                pass
+            # End at once. ucrt._exit still runs C-runtime and DLL shutdown,
+            # which can wait forever for a lock the crashed thread holds:
+            # Windows (x64 emulated, 2026-11-19), a process stuck in
+            # _exit(3) that taskkill /F could not end. TerminateProcess
+            # runs no shutdown code.
+            try:
+                k32.TerminateProcess(k32.GetCurrentProcess(), 3)
             except Exception:
                 pass
             ucrt._exit(3)

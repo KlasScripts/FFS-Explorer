@@ -13,9 +13,18 @@ How it works: the GUI thread calls beat() from a QTimer every BEAT_S. A
 daemon thread notices when the beats stop and samples the GUI thread's stack
 (sys._current_frames). It needs the interpreter lock to do that, so a freeze
 spent inside one long C call that holds the lock gets no sample; the log then
-says so. For freezes of HARD_S or more (and a total hang) faulthandler, which
-runs without the lock, writes every thread's stack to crash.log: beat()
-re-arms it about once a second.
+says so. A freeze of HARD_S or more also has every thread's stack written to
+crash.log, by the watcher thread itself while it holds the lock
+(faulthandler.dump_traceback), so the other threads are stopped while their
+frames are read.
+
+beat() only records the time. Until 2026-11-19 it re-armed
+faulthandler.dump_traceback_later every second: each call joins the previous
+watchdog OS thread and starts a new one on the GUI thread, and when it fired
+it read every thread's frames WITHOUT the lock while worker threads ran.
+Windows (x64 emulated, v0.50.48): 4 of 5 crashes during Process Case and
+first open had the GUI thread in beat() right after a long freeze, and the
+freeze log showed it stuck 1-4 s on the re-arm lines.
 
 Also: arm_exit_watchdog() for the exit, so a process that logged "exiting"
 but never ended writes its stacks to crash.log and is ended (a work-PC
@@ -56,7 +65,7 @@ _state = {
     'others': Counter(),  # other busy threads' stacks during it
     'in_freeze': False,
     'freeze_start': 0.0,
-    'armed_at': 0.0,      # when faulthandler was last re-armed
+    'dumped': False,      # this freeze's stacks are in crash.log
     'count': 0, 'total': 0.0, 'longest': 0.0, 'logged': 0,
     'started': False, 'stopped': False,
 }
@@ -85,7 +94,7 @@ def start(crash_file=None) -> None:
 
 def stop() -> None:
     """The app is quitting: beats stop for good; nothing more is logged
-    as a freeze and beat() no longer re-arms the faulthandler dump."""
+    as a freeze or dumped."""
     global _crash_file
     with _lock:
         _state['stopped'] = True
@@ -94,17 +103,9 @@ def stop() -> None:
 
 
 def beat() -> None:
-    """The GUI thread is alive (called from a QTimer)."""
-    try:
-        if _state['stopped']:
-            return
-        now = time.monotonic()
-        _state['last'] = now
-        if _crash_file is not None and now - _state['armed_at'] >= 1.0:
-            _state['armed_at'] = now
-            faulthandler.dump_traceback_later(HARD_S, repeat=False, file=_crash_file)
-    except Exception:
-        pass
+    """The GUI thread is alive (called from a QTimer). Only records the
+    time: nothing is armed and no thread is started here."""
+    _state['last'] = time.monotonic()
 
 
 def _frames(frame, depth: int) -> tuple:
@@ -146,14 +147,34 @@ def _watch() -> None:
                 if gap >= THRESHOLD_S:
                     if not _state['in_freeze']:
                         _state['in_freeze'] = True
+                        _state['dumped'] = False
                         _state['freeze_start'] = _state['last']
                         _state['samples'] = []
                         _state['others'] = Counter()
                     _sample()
+                    if gap >= HARD_S and not _state['dumped']:
+                        _state['dumped'] = True
+                        _dump_all(gap)
                 elif _state['in_freeze']:
                     _end_freeze(_state['last'] - _state['freeze_start'])
         except Exception:
             pass
+
+
+def _dump_all(gap: float) -> None:
+    """Every thread's stack to crash.log, from the watcher thread while it
+    holds the interpreter lock (the other threads are stopped meanwhile)."""
+    f = _crash_file
+    if f is None:
+        return
+    try:
+        f.write(f"\nGUI not responding for {gap:.0f} s ({time.strftime('%Y-%m-%d %H:%M:%S')}); "
+                "every thread's stack:\n")
+        f.flush()
+        faulthandler.dump_traceback(file=f, all_threads=True)
+        f.flush()
+    except Exception:
+        pass
 
 
 def _fmt(stack: tuple) -> str:
@@ -197,7 +218,7 @@ def _end_freeze(seconds: float) -> None:
                      'lock inside one C call (Qt, SQLite, msgpack …) the whole time')
         lines = [f'GUI froze {seconds:.2f} s; {where}']
         if seconds >= HARD_S and _crash_file is not None:
-            lines.append('    every thread\'s stack at %.0f s is in crash.log ("Timeout")' % HARD_S)
+            lines.append('    every thread\'s stack at %.0f s is in crash.log' % HARD_S)
         for name, st, k in rec['others']:
             lines.append(f'    busy meanwhile: {name} ({k} samples): {_fmt(st)}')
         _logger.warning('%s', '\n'.join(lines))
@@ -219,7 +240,7 @@ def arm_exit_watchdog(crash_file, seconds: float = EXIT_S) -> None:
     writes every thread's stack to *crash_file* and ends the process. Runs
     in faulthandler's own C thread, so it works while Python is finalising."""
     try:
-        stop()                         # beat() must no longer re-arm the dump
+        stop()
         if crash_file is None:
             return
         # No header written now: a normal exit must leave crash.log empty.

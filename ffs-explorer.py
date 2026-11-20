@@ -5454,18 +5454,24 @@ class DuplicateDetectionWorker(QThread):
         # Files unpacked from nested archives join the same grouping (A-74).
         candidates += nested_archive.unpacked_duplicate_candidates(self._case_dir)
         self.collected.emit(len(candidates))
-        results = duplicate_scan.find_duplicate_groups(
-            self._zip_path, candidates, inode_trusted=self._adapter.inode_trusted,
-            progress_cb=lambda done, total: self.progress.emit(done, total),
-            cancel_check=self.isInterruptionRequested,
-            processes=_EMBEDDED_MEDIA_PROCESSES)
+        results = {}
+        if not self.isInterruptionRequested():      # not cancelled while listing
+            results = duplicate_scan.find_duplicate_groups(
+                self._zip_path, candidates, inode_trusted=self._adapter.inode_trusted,
+                progress_cb=lambda done, total: self.progress.emit(done, total),
+                cancel_check=self.isInterruptionRequested,
+                processes=_EMBEDDED_MEDIA_PROCESSES)
         complete = not self.isInterruptionRequested()
         n_groups = len({v['md5'] for v in results.values()})
-        try:
-            with closing(_open_cache_db(self._case_dir)) as cache_db:
-                save_duplicate_files(cache_db, results)
-        except Exception:
-            pass
+        # A cancelled run keeps the earlier results: save_duplicate_files
+        # replaces the whole table, and before 2026-11-20 a cancel replaced
+        # a full earlier run with the few groups confirmed so far.
+        if complete:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as cache_db:
+                    save_duplicate_files(cache_db, results)
+            except Exception:
+                pass
         try:
             with closing(_open_results_db(self._case_dir)) as results_db:
                 if run_id is None:
@@ -7338,7 +7344,10 @@ class ProcessDialog(QDialog):
         self._run_btn.setEnabled(False)
         self._close_btn.setEnabled(False)
         self._cancel_btn.setVisible(True)
+        self._cancel_btn.setEnabled(True)
         self._scan_cancelled = False
+        self._cancel_all = False
+        self._integrity_cancelled = False
         self._status_label.setText("")
         self._post_integrity_scan = run_scan
         self._pending_upgrade_tier = upgrade_tier if run_scan else 0
@@ -7353,7 +7362,7 @@ class ProcessDialog(QDialog):
         background threads), so both shared one Python lock and the window
         stalled for up to 1.3 s at a time (measured 2026-11-03)."""
         self._waiting_for_case_open = False
-        if self._scan_cancelled:
+        if self._scan_cancelled or getattr(self, '_cancel_all', False):
             self._status_label.setText("Cancelled before any stage started.")
             self._finish_operations()
             return
@@ -7377,6 +7386,8 @@ class ProcessDialog(QDialog):
     # LevelDB used to run before the header scan.
 
     def _continue_after_integrity(self):
+        if self._stop_all_requested():
+            return
         if self._post_integrity_scan:
             self._start_header_scan()
         elif self._chk_nested.isChecked():
@@ -7436,6 +7447,8 @@ class ProcessDialog(QDialog):
                 f"Keyword Search ({names}{more}; reasons in Tools ▸ Open Log Folder).")
 
     def _continue_after_leveldb_indexing(self):
+        if self._stop_all_requested():
+            return
         if self._chk_embedded_media.isChecked():
             self._start_embedded_media_scan()
         else:
@@ -7523,7 +7536,7 @@ class ProcessDialog(QDialog):
         self._integrity_pending = False
         if not digest:
             self._integrity_label.setText(
-                "Integrity check cancelled." if self._scan_cancelled
+                "Integrity check cancelled." if getattr(self, '_integrity_cancelled', False)
                 else "Integrity check failed — could not read the archive.")
             self._finish_waiting_for_integrity()
             return
@@ -7666,7 +7679,9 @@ class ProcessDialog(QDialog):
             if self._embedded_media_on_record():
                 self._chk_embedded_media.setChecked(True)
 
-        if self._chk_nested.isChecked() and not cancelled:
+        # A skipped header scan still goes on to extraction; only "Stop all
+        # stages" ends the run (via _continue_after_nested's check below).
+        if self._chk_nested.isChecked() and not getattr(self, '_cancel_all', False):
             self._show_archive_selection()
         else:
             # Tier 2/3 re-check every file, not just unknown-extension
@@ -7934,18 +7949,102 @@ class ProcessDialog(QDialog):
                 pass
         QTimer.singleShot(50, _poll)
 
-    def _on_cancel(self):
-        self._scan_cancelled = True
-        if self._scan_worker and self._scan_worker.isRunning():
-            self._scan_worker.requestInterruption()
-        if self._nested_worker and self._nested_worker.isRunning():
-            self._nested_worker.requestInterruption()
+    def _running_stage(self):
+        """(name, worker) of the stage running now, worker 'leveldb' for
+        the LevelDB indexing (no QThread of its own here), or None. The
+        integrity hash runs beside the other stages, so it counts only
+        when nothing else is running."""
+        for w, name in ((self._scan_worker, 'header scan'),
+                        (self._nested_worker, 'archive extraction'),
+                        (self._embedded_media_worker, 'embedded-media sweep'),
+                        (self._media_metadata_worker, 'EXIF/video metadata'),
+                        (self._dedup_worker, 'duplicate detection')):
+            if w and w.isRunning():
+                return name, w
+        if getattr(self, '_leveldb_indexing_active', False):
+            return 'LevelDB/IndexedDB indexing', 'leveldb'
         if self._integrity_worker and self._integrity_worker.isRunning():
-            self._integrity_worker.requestInterruption()
-        if self._embedded_media_worker and self._embedded_media_worker.isRunning():
-            self._embedded_media_worker.requestInterruption()
-        if self._media_metadata_worker and self._media_metadata_worker.isRunning():
-            self._media_metadata_worker.requestInterruption()
+            return 'data integrity hash', self._integrity_worker
+        return None
+
+    def _ask_cancel_choice(self, stage_name: str) -> str | None:
+        """'all', 'stage', or None (keep running). Before 2026-11-20 Cancel
+        silently stopped the running stage and the integrity hash, and the
+        later stages then started anyway (a header-scan cancel also skipped
+        archive extraction), so one press never meant "stop"."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Cancel Process Case")
+        box.setText(f"Stop every stage, or skip only the one running now ({stage_name})?")
+        box.setInformativeText(
+            "Skip this stage: the stages after it still run, and the data "
+            "integrity hash keeps running.\n"
+            "Stop all stages: nothing more starts and the hash stops too.\n"
+            "What is already saved is kept either way.")
+        all_btn = box.addButton("Stop all stages", QMessageBox.ButtonRole.DestructiveRole)
+        skip_btn = box.addButton("Skip this stage", QMessageBox.ButtonRole.AcceptRole)
+        keep_btn = box.addButton("Keep running", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep_btn)
+        box.setEscapeButton(keep_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is all_btn:
+            return 'all'
+        if clicked is skip_btn:
+            return 'stage'
+        return None
+
+    def _on_cancel(self):
+        if getattr(self, '_waiting_for_case_open', False):
+            # no stage has started yet: nothing to choose between
+            self._cancel_all = True
+            self._scan_cancelled = True
+            return
+        stage = self._running_stage()
+        if stage is None:
+            return                       # between stages: nothing running to cancel
+        choice = self._ask_cancel_choice(stage[0])
+        if choice is None:
+            return
+        if choice == 'all':
+            self._cancel_all = True
+            self._scan_cancelled = True
+            self._cancel_btn.setEnabled(False)
+            self._status_label.setText("Stopping — no further stage will start…")
+            for w in (self._scan_worker, self._nested_worker, self._embedded_media_worker,
+                      self._media_metadata_worker, self._dedup_worker):
+                if w and w.isRunning():
+                    w.requestInterruption()
+            if self._integrity_worker and self._integrity_worker.isRunning():
+                self._integrity_cancelled = True
+                self._integrity_worker.requestInterruption()
+            return
+        # Only the stage that was running when Cancel was pressed: if it
+        # ended while the question was open, nothing is cancelled.
+        _name, w = stage
+        if w == 'leveldb':
+            if getattr(self, '_leveldb_indexing_active', False):
+                self._scan_cancelled = True          # its cancel_check reads this
+        elif w.isRunning():
+            if w is self._integrity_worker:
+                self._integrity_cancelled = True
+            else:
+                self._scan_cancelled = True
+            w.requestInterruption()
+
+    def _stop_all_requested(self) -> bool:
+        """Called where the next stage would start: True (and the run is
+        finished) after "Stop all stages"; otherwise the next stage starts
+        uncancelled, whatever happened to the one before."""
+        if not getattr(self, '_cancel_all', False):
+            self._scan_cancelled = False
+            return False
+        text = self._status_label.text()
+        self._status_label.setText(
+            (text + "\n" if text and not text.startswith("Stopping") else "")
+            + "Stopped — the remaining stages were not run.")
+        self._finish_operations()
+        return True
 
     # ── Embedded-media sweep ────────────────────────────────────────────────
 
@@ -7958,6 +8057,8 @@ class ProcessDialog(QDialog):
         them from the unpacked archive (nested_archive.unpacked_file_index).
         Before 2026-10-22 this comment claimed so, but neither was true:
         they were typed by name only and every read silently failed."""
+        if self._stop_all_requested():
+            return
         self._start_leveldb_stage()
 
     def _continue_after_embedded_media(self):
@@ -7968,6 +8069,8 @@ class ProcessDialog(QDialog):
         the time this runs. No longer the real last stage — duplicate
         detection (_continue_after_media_metadata) was appended after it,
         2026-10-16."""
+        if self._stop_all_requested():
+            return
         if self._chk_media_metadata.isChecked():
             self._start_media_metadata_scan()
         else:
@@ -8124,6 +8227,8 @@ class ProcessDialog(QDialog):
         detection (app/duplicate_scan.py), added 2026-10-16. Has no
         dependency on any other stage's own output, so appending it here
         was simplest rather than interleaving it earlier."""
+        if self._stop_all_requested():
+            return
         if self._chk_dedup.isChecked():
             self._start_dedup_scan()
         else:
@@ -8165,14 +8270,15 @@ class ProcessDialog(QDialog):
         # Saved and logged by the worker.
         n_groups = len({v['md5'] for v in results.values()})
         if not complete:
+            # not saved (DuplicateDetectionWorker.run): earlier results stay
             self._status_label.setText(
-                f"Duplicate detection cancelled — {len(results):,} file(s) "
-                f"in {n_groups:,} group(s) confirmed so far.")
+                "Duplicate detection cancelled — nothing saved; the previous "
+                "results, if any, are kept.")
         else:
             self._status_label.setText(
                 f"Duplicate detection done — {len(results):,} file(s) in "
                 f"{n_groups:,} group(s) confirmed byte-identical.")
-        self.duplicate_detection_done.emit(results)
+            self.duplicate_detection_done.emit(results)
         self._finish_operations()
 
     def _finish_operations(self):

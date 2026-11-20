@@ -268,6 +268,8 @@ def _hash_in_processes(zip_path, grouped_units, units, processes, record, cancel
     data offset is not known; all of them if no pool can be started), or
     None if cancelled."""
     from zip_cd_cache import compute_data_offsets
+    if cancel_check and cancel_check():
+        return None
     mine, rest = [], []
     for g, u in units:
         (_ui, _phys, zinfo, _i, _d, _sha, reader), _members = grouped_units[g][u]

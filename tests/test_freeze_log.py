@@ -125,6 +125,25 @@ def test_callee_read_from_bytecode():
     assert 'freeze_log._line_calls' in (freeze_log._line_calls(f) or '')
 
 
+def test_every_missed_freeze_counted(fl):
+    """While the watcher is shut out the GUI thread can freeze several
+    times: beat() notes each one and all are logged (only the last was,
+    first version 2026-11-20), the longest with what the watcher saw."""
+    fl._state['last'] = time.monotonic() - 0.7
+    fl.beat()
+    fl._state['last'] = time.monotonic() - 1.2
+    fl.beat()
+    fl._state['last'] = time.monotonic() - 0.6
+    fl.beat()
+    assert len(fl._state['missed']) == 3
+    fl._log_missed(None, None, None, 0.0)
+    assert fl._state['count'] == 3 and fl._state['missed'] == []
+    recs = fl.recent[-3:]
+    assert [round(r['seconds'], 1) for r in recs] == [0.7, 1.2, 0.6]
+    assert recs[1]['same_stretch'] is None
+    assert recs[0]['same_stretch'] == recs[2]['same_stretch'] == pytest.approx(recs[1]['seconds'])
+
+
 def test_lock_holder_named(fl):
     """One thread holding Python's lock in a long C call (json.dumps): the
     GUI thread can get the lock back first, so beat() notes the gap; the

@@ -92,7 +92,7 @@ _state = {
     'held': Counter(),    # (thread, stack, line's calls) -> CPU s used while shut out
     'idle_cpu': 0.0,      # of 'starved', the part no thread here used the CPU
     'cpu': {},            # every thread's CPU seconds at the last wake
-    'missed': None,       # a freeze beat() saw that the watcher did not (s)
+    'missed': [],         # freezes beat() saw that the watcher did not (s each)
     'count': 0, 'total': 0.0, 'longest': 0.0, 'logged': 0,
     'started': False, 'stopped': False,
 }
@@ -132,13 +132,16 @@ def stop() -> None:
 def beat() -> None:
     """The GUI thread is alive (called from a QTimer). Only records the
     time: nothing is armed and no thread is started here. A gap since the
-    last beat that the watcher is not already timing is noted as a float
-    for it to log: when one thread holds Python's lock, the GUI thread can
-    get the lock back before the watcher does, and that freeze would
-    otherwise never be seen (found 2026-11-20)."""
+    last beat that the watcher is not already timing is appended (a float)
+    for it to log: when other threads hold Python's lock, the GUI thread can
+    get the lock now and then while the watcher gets none for many seconds
+    (19.5 s during Windows extraction, 2026-11-20), so several freezes can
+    pass that it never sees running."""
     now = time.monotonic()
     if now - _state['last'] >= THRESHOLD_S and not _state['in_freeze']:
-        _state['missed'] = now - _state['last']
+        missed = _state['missed']
+        if len(missed) < 200:
+            missed.append(now - _state['last'])
     _state['last'] = now
 
 
@@ -331,6 +334,7 @@ def _begin_freeze() -> None:
     _state['max_gap'] = 0.0
     _state['held'] = Counter()
     _state['idle_cpu'] = 0.0
+    _state['same_stretch'] = None
 
 
 def _note_late(frames: dict, names: dict, cpu: dict, late: float) -> None:
@@ -339,8 +343,28 @@ def _note_late(frames: dict, names: dict, cpu: dict, late: float) -> None:
     _note_held(frames, names, cpu, late)
 
 
+def _log_missed(frames, names, cpu, late: float) -> None:
+    """Log the freezes beat() saw that the watcher never caught running
+    (the GUI thread got the lock back first), oldest first. What the
+    watcher saw on this late wake goes with the longest of them; the
+    others say they were in the same stretch. Only between freezes (or
+    right before one starts): it uses the per-freeze state."""
+    gaps = list(_state['missed'])
+    _state['missed'].clear()
+    if not gaps:
+        return
+    longest = max(range(len(gaps)), key=gaps.__getitem__)
+    for i, seconds in enumerate(gaps):
+        _begin_freeze()
+        if i != longest and len(gaps) > 1:
+            _state['same_stretch'] = gaps[longest]
+        elif frames is not None and late >= _LATE_S:
+            _note_late(frames, names, cpu, late)
+        _end_freeze(seconds)
+
+
 def _watch() -> None:
-    mine = _state        # a module reload (tests) replaces it: this watcher then ends
+    mine = _state       # a module reload (tests) replaces it: this watcher then ends
     t_prev = time.monotonic()
     while True:
         time.sleep(SAMPLE_S)
@@ -358,9 +382,9 @@ def _watch() -> None:
                 gap = now - _state['last']
                 if gap >= THRESHOLD_S:
                     if not _state['in_freeze']:
+                        _log_missed(None, None, None, 0.0)   # earlier ones first
                         _begin_freeze()
                         _state['in_freeze'] = True
-                        _state['missed'] = None
                     if late >= _LATE_S:
                         _note_late(frames, names, cpu, late)
                     _sample(frames, names)
@@ -369,15 +393,8 @@ def _watch() -> None:
                         _dump_all(gap)
                 elif _state['in_freeze']:
                     _end_freeze(_state['last'] - _state['freeze_start'])
-                elif _state.get('missed'):
-                    # beat() saw a freeze the watcher never caught running
-                    # (the GUI thread got the lock back first): logged now,
-                    # with what the watcher saw on this late wake
-                    seconds, _state['missed'] = _state['missed'], None
-                    _begin_freeze()
-                    if late >= _LATE_S:
-                        _note_late(frames, names, cpu, late)
-                    _end_freeze(seconds)
+                elif _state['missed']:
+                    _log_missed(frames, names, cpu, late)
                 _state['cpu'] = cpu
                 del frames
         except Exception:
@@ -428,7 +445,8 @@ def _end_freeze(seconds: float) -> None:
     rec['starved'] = min(_state['starved'], seconds)
     rec['max_gap'] = _state['max_gap']
     rec['held'] = [(name, st, call, s) for (name, st, call), s in _state['held'].most_common(3)]
-    rec['idle_cpu'] = min(_state['idle_cpu'], rec['starved'])
+    rec['idle_cpu'] = min(_state['idle_cpu'], _state['starved'])
+    rec['same_stretch'] = _state.get('same_stretch')
     del recent[:-19]
     recent.append(rec)
     if _state['logged'] >= MAX_LOGGED:
@@ -451,6 +469,9 @@ def _end_freeze(seconds: float) -> None:
         elif starved:
             where = ('no GUI stack sampled: the watcher could not run until the freeze '
                      'was over (see below)')
+        elif rec['same_stretch']:
+            where = ('no GUI stack sampled: one of several freezes while the watcher could '
+                     f'not run (see the {rec["same_stretch"]:.2f} s one for what ran)')
         else:
             where = ('no Python stack sampled: the GUI thread held the interpreter '
                      'lock inside one C call (Qt, SQLite, msgpack …) the whole time')
@@ -460,14 +481,25 @@ def _end_freeze(seconds: float) -> None:
                    if not rec['held'] and not rec['idle_cpu'] else
                    "a thread held Python's lock (named below)" if rec['held'] else
                    'no thread of this process ran: no CPU was free for it')
-            lines.append(f'    the watcher thread could not run for {rec["starved"]:.1f} s of it '
-                         f'(longest {rec["max_gap"]:.1f} s): {why}')
+            shut = _state['starved']
+            if rec['max_gap'] > seconds + 0.2:
+                # the watcher was shut out longer than this freeze lasted:
+                # the GUI thread got the lock now and then, the watcher not
+                lines.append(f'    the watcher thread could not run for {rec["max_gap"]:.1f} s '
+                             f'up to the end of it (longer than the freeze; any other freezes '
+                             f'in that time are logged as well): {why}')
+            else:
+                lines.append(f'    the watcher thread could not run for {rec["starved"]:.1f} s '
+                             f'of it: {why}')
             if rec['held'] and rec['idle_cpu'] >= 0.5:
                 lines.append(f'    for {rec["idle_cpu"]:.1f} s of that no thread here ran: '
                              'no CPU was free')
+        else:
+            shut = _state['starved']
         for name, st, call, s in rec['held']:
             on_line = f'; calls on that line: {call}' if call else ''
-            lines.append(f'    ran {s:.1f} s of CPU meanwhile: {name}, now at {_fmt(st)}{on_line}')
+            lines.append(f'    ran {s:.1f} s of CPU in the {shut:.1f} s the watcher could not '
+                         f'run: {name}, now at {_fmt(st)}{on_line}')
         if seconds >= HARD_S and _crash_file is not None:
             lines.append('    every thread\'s stack at %.0f s is in crash.log' % HARD_S)
         for name, st, k in rec['others']:

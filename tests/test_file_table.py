@@ -5,6 +5,7 @@ independent; pickling maps the same file; anything that would not read
 back exactly is refused; a snapshot that names a file table reads it back,
 and one whose file table is missing or another one fails (so the case is
 parsed again) rather than giving a wrong file list."""
+import gc
 import os
 import pickle
 import random
@@ -163,8 +164,12 @@ def test_snapshot_round_trip_and_stale_table(tmp_path):
     assert isinstance(snap['ui_metadata'], ft.FileList)
     assert dict(snap['ui_metadata'].items()) == ui and dict(snap['folder_map'].items()) == fm
     assert snap['metadata_only'] == ['m'] and snap['zip_names'] == ['z']
-    # a second write replaces the first table; the first snapshot is then refused
+    # a second write replaces the first table; the first snapshot is then refused.
+    # Let go of the first mapping first: Windows can't delete a mapped file
+    # (remove_others leaves it for a later write).
+    del snap
     ft._OPEN.clear()
+    gc.collect()
     ui2 = dict(list(ui.items())[:-1])
     blob2 = _snapshot(case, ui2, fm)
     assert len([n for n in os.listdir(case) if n.endswith(ft.SUFFIX)]) == 1

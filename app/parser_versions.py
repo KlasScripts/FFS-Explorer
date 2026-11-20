@@ -95,6 +95,10 @@ def _hash_source(path: str) -> str | None:
             data = f.read()
     except OSError:
         return None
+    # Line endings don't count: a Windows checkout (git autocrlf) has the
+    # same source with CRLF, and must not bump every parser's version.
+    # An LF file hashes exactly as before.
+    data = data.replace(b"\r\n", b"\n")
     return hashlib.blake2b(data, digest_size=8).hexdigest()
 
 

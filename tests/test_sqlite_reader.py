@@ -116,7 +116,8 @@ def test_committed_image_of_a_hot_journal_is_rolled_back(tmp_path):
 
 
 def test_a_folder_name_with_hash_and_question_mark(tmp_path):
-    odd = tmp_path / 'Case #12 ?draft'
+    # Windows forbids '?' in a folder name, so there only '#' is tested
+    odd = tmp_path / ('Case #12 draft' if os.name == 'nt' else 'Case #12 ?draft')
     odd.mkdir()
     path, truth = wal_db(str(odd))
     conn, _ = sr.connect_committed(path)

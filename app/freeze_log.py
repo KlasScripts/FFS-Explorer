@@ -18,6 +18,23 @@ crash.log, by the watcher thread itself while it holds the lock
 (faulthandler.dump_traceback), so the other threads are stopped while their
 frames are read.
 
+Two more facts make a freeze line say WHY (added 2026-11-20, after the
+v0.50.50 Windows test, where most lines named the Process Case dialog's
+exec() line as if it were the cause):
+- Which call the GUI thread is in (_callee: read from the bytecode, so it
+  works in the frozen build, which has no source). A GUI thread inside
+  app.exec() or a dialog's exec() is running no Python: Qt is busy, or it
+  is waiting for Python's lock to call the beat.
+- How long the watcher thread itself could not run. It sleeps SAMPLE_S
+  and needs Python's lock to wake; waking far later means another thread
+  held the lock, or no CPU was free. Which: each thread's own CPU time
+  (Windows GetThreadTimes, pthread CPU clocks elsewhere; not on macOS) is
+  read at every wake, so the thread that used the CPU while the watcher
+  was shut out is named with where it is now and the calls on that source
+  line (e.g. "_enc, json.dumps, encode, zlib.compress"); if no thread here
+  used it, the machine had no CPU free. A holder can't be sampled during
+  the hold itself: by the time the watcher runs, the call has ended.
+
 beat() only records the time. Until 2026-11-19 it re-armed
 faulthandler.dump_traceback_later every second: each call joins the previous
 watchdog OS thread and starts a new one on the GUI thread, and when it fired
@@ -51,6 +68,9 @@ EXIT_S = 20.0          # exit watchdog: end the process this long after "exiting
 MAX_LOGGED = 200       # freezes written to the log per session (all are counted)
 _STACK_DEPTH = 14      # innermost frames shown for the GUI thread
 _OTHER_DEPTH = 3       # innermost frames shown for each other busy thread
+_HELD_DEPTH = 6        # innermost frames shown for a thread that held the lock
+_LATE_S = 0.25         # the watcher waking this much late counts as "could not run"
+_QT_WAITS = ('exec', 'exec_')   # calls that run Qt's event loop
 
 _logger = logging.getLogger('ffs_explorer.startup')
 
@@ -66,6 +86,13 @@ _state = {
     'in_freeze': False,
     'freeze_start': 0.0,
     'dumped': False,      # this freeze's stacks are in crash.log
+    'callees': {},        # GUI stack -> the call its innermost frame is in
+    'starved': 0.0,       # seconds of this freeze the watcher could not run
+    'max_gap': 0.0,       # the longest of those stretches
+    'held': Counter(),    # (thread, stack, line's calls) -> CPU s used while shut out
+    'idle_cpu': 0.0,      # of 'starved', the part no thread here used the CPU
+    'cpu': {},            # every thread's CPU seconds at the last wake
+    'missed': None,       # a freeze beat() saw that the watcher did not (s)
     'count': 0, 'total': 0.0, 'longest': 0.0, 'logged': 0,
     'started': False, 'stopped': False,
 }
@@ -104,8 +131,15 @@ def stop() -> None:
 
 def beat() -> None:
     """The GUI thread is alive (called from a QTimer). Only records the
-    time: nothing is armed and no thread is started here."""
-    _state['last'] = time.monotonic()
+    time: nothing is armed and no thread is started here. A gap since the
+    last beat that the watcher is not already timing is noted as a float
+    for it to log: when one thread holds Python's lock, the GUI thread can
+    get the lock back before the watcher does, and that freeze would
+    otherwise never be seen (found 2026-11-20)."""
+    now = time.monotonic()
+    if now - _state['last'] >= THRESHOLD_S and not _state['in_freeze']:
+        _state['missed'] = now - _state['last']
+    _state['last'] = now
 
 
 def _frames(frame, depth: int) -> tuple:
@@ -121,13 +155,73 @@ def _busy(stack: tuple) -> bool:
     return bool(stack) and stack[0][0] not in _IDLE_FILES
 
 
-def _sample() -> None:
-    frames = sys._current_frames()
-    names = {t.ident: t.name for t in threading.enumerate()}
+_callee_cache: dict = {}
+
+
+def _callee(frame) -> str | None:
+    """The call *frame* is in right now, as written ('json.dumps',
+    'dlg.exec'), or None if it isn't in a call or that can't be told.
+
+    Read from the bytecode, not the source (a frozen build has none): the
+    instruction at f_lasti is the CALL, and the loads that name the called
+    thing start where the CALL's own source span starts (Python 3.11+
+    instruction positions)."""
+    try:
+        return _callee_at(frame.f_code, frame.f_lasti)
+    except Exception:
+        return None
+
+
+def _callee_at(code, lasti: int) -> str | None:
+    """_callee for the instruction at offset *lasti* of *code*."""
+    try:
+        key = (code, lasti)
+        if key in _callee_cache:
+            return _callee_cache[key]
+        import dis
+        ins = list(dis.get_instructions(code))
+        name = None
+        call = next((i for i in ins if i.offset == lasti), None)
+        if (call is not None and call.opname.startswith('CALL')
+                and not call.opname.startswith('CALL_INTRINSIC') and call.positions):
+            start = (call.positions.lineno, call.positions.col_offset)
+            parts = []
+            for i in ins:
+                if i.offset >= lasti:
+                    break
+                if not i.positions or (i.positions.lineno, i.positions.col_offset) != start:
+                    continue
+                if i.opname in ('LOAD_GLOBAL', 'LOAD_NAME', 'LOAD_FAST', 'LOAD_DEREF',
+                                'LOAD_FAST_CHECK', 'LOAD_FAST_BORROW'):
+                    parts = [str(i.argval)]            # a new chain starts here
+                elif i.opname in ('LOAD_ATTR', 'LOAD_METHOD') and parts:
+                    parts.append(str(i.argval))
+            if parts:
+                name = '.'.join(parts[-3:])
+        if len(_callee_cache) > 512:
+            _callee_cache.clear()
+        _callee_cache[key] = name
+        return name
+    except Exception:
+        return None
+
+
+def _qt_wait(stack: tuple, callee: str | None) -> bool:
+    """The GUI thread is inside Qt's event loop (app.exec() or a dialog's
+    exec()) with no Python of its own running."""
+    if callee and callee.rsplit('.', 1)[-1] in _QT_WAITS:
+        return True
+    return _in_event_loop(stack) or (bool(stack) and all(fn == '<module>' for _f, _n, fn in stack))
+
+
+def _sample(frames: dict, names: dict) -> None:
     me = threading.get_ident()
     main = frames.get(_state['main'])
     if main is not None:
-        _state['samples'].append(_frames(main, _STACK_DEPTH))
+        st = _frames(main, _STACK_DEPTH)
+        _state['samples'].append(st)
+        if st not in _state['callees']:
+            _state['callees'][st] = _callee(main)
     for ident, fr in frames.items():
         if ident in (me, _state['main']):
             continue
@@ -136,27 +230,156 @@ def _sample() -> None:
             _state['others'][(names.get(ident, '?'), st)] += 1
 
 
+def _line_calls(frame) -> str | None:
+    """The calls on *frame*'s current source line, in order ('_enc,
+    json.dumps, encode, zlib.compress'), from the bytecode."""
+    try:
+        import dis
+        line = frame.f_lineno
+        names = []
+        for i in dis.get_instructions(frame.f_code):
+            if (i.opname.startswith('CALL') and not i.opname.startswith('CALL_INTRINSIC')
+                    and i.positions and i.positions.lineno == line):
+                n = _callee_at(frame.f_code, i.offset)
+                if n and n not in names:
+                    names.append(n)
+        return ', '.join(names[:6]) or None
+    except Exception:
+        return None
+
+
+_kernel32 = None
+_thread_handles: dict = {}
+
+
+def _thread_cpu(threads) -> dict:
+    """{ident: CPU seconds the thread has used}, for *threads*
+    (threading.enumerate()); {} where the platform can't tell."""
+    global _kernel32
+    out = {}
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            from ctypes import wintypes
+            if _kernel32 is None:
+                k = ctypes.WinDLL('kernel32', use_last_error=True)
+                k.OpenThread.restype = wintypes.HANDLE
+                k.OpenThread.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+                k.GetThreadTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+                k.CloseHandle.argtypes = (wintypes.HANDLE,)
+                _kernel32 = k
+            k = _kernel32
+            alive = set()
+            for t in threads:
+                tid = t.native_id
+                if not tid:
+                    continue
+                alive.add(tid)
+                h = _thread_handles.get(tid)
+                if h is None:
+                    h = k.OpenThread(0x0800, False, tid)   # THREAD_QUERY_LIMITED_INFORMATION
+                    if not h:
+                        continue
+                    _thread_handles[tid] = h
+                ft = [wintypes.FILETIME() for _ in range(4)]
+                if k.GetThreadTimes(h, *[ctypes.byref(f) for f in ft]):
+                    kern = (ft[2].dwHighDateTime << 32) | ft[2].dwLowDateTime
+                    user = (ft[3].dwHighDateTime << 32) | ft[3].dwLowDateTime
+                    out[t.ident] = (kern + user) / 1e7
+            for tid in [d for d in _thread_handles if d not in alive]:
+                k.CloseHandle(_thread_handles.pop(tid))
+        elif hasattr(time, 'pthread_getcpuclockid'):
+            for t in threads:
+                try:
+                    out[t.ident] = time.clock_gettime(time.pthread_getcpuclockid(t.ident))
+                except (OSError, OverflowError, TypeError):
+                    pass
+    except Exception:
+        return {}
+    return out
+
+
+def _note_held(frames: dict, names: dict, cpu: dict, late: float) -> None:
+    """The watcher just woke *late* s late: the threads whose CPU time grew
+    meanwhile are the ones that ran (held Python's lock); none means no CPU
+    was free for this process."""
+    me = threading.get_ident()
+    prev = _state['cpu']
+    used = 0.0
+    for ident, now in cpu.items():
+        if ident == me or ident not in prev:
+            continue
+        d = now - prev[ident]
+        if d < 0.1 or d < 0.2 * late:
+            continue
+        used += d
+        fr = frames.get(ident)
+        st = _frames(fr, _HELD_DEPTH) if fr is not None else ()
+        name = 'GUI thread' if ident == _state['main'] else names.get(ident, '?')
+        _state['held'][(name, st, _line_calls(fr) if fr is not None else None)] += d
+    if cpu and prev and used < 0.3 * late:
+        _state['idle_cpu'] += late
+
+
+def _begin_freeze() -> None:
+    _state['dumped'] = False
+    _state['freeze_start'] = _state['last']
+    _state['samples'] = []
+    _state['others'] = Counter()
+    _state['callees'] = {}
+    _state['starved'] = 0.0
+    _state['max_gap'] = 0.0
+    _state['held'] = Counter()
+    _state['idle_cpu'] = 0.0
+
+
+def _note_late(frames: dict, names: dict, cpu: dict, late: float) -> None:
+    _state['starved'] += late
+    _state['max_gap'] = max(_state['max_gap'], late)
+    _note_held(frames, names, cpu, late)
+
+
 def _watch() -> None:
+    mine = _state        # a module reload (tests) replaces it: this watcher then ends
+    t_prev = time.monotonic()
     while True:
         time.sleep(SAMPLE_S)
         try:
             with _lock:
-                if _state['stopped']:
+                now = time.monotonic()
+                late = now - t_prev - SAMPLE_S
+                t_prev = now
+                if _state is not mine or _state['stopped']:
                     return
-                gap = time.monotonic() - _state['last']
+                frames = sys._current_frames()
+                threads = threading.enumerate()
+                names = {t.ident: t.name for t in threads}
+                cpu = _thread_cpu(threads)
+                gap = now - _state['last']
                 if gap >= THRESHOLD_S:
                     if not _state['in_freeze']:
+                        _begin_freeze()
                         _state['in_freeze'] = True
-                        _state['dumped'] = False
-                        _state['freeze_start'] = _state['last']
-                        _state['samples'] = []
-                        _state['others'] = Counter()
-                    _sample()
+                        _state['missed'] = None
+                    if late >= _LATE_S:
+                        _note_late(frames, names, cpu, late)
+                    _sample(frames, names)
                     if gap >= HARD_S and not _state['dumped']:
                         _state['dumped'] = True
                         _dump_all(gap)
                 elif _state['in_freeze']:
                     _end_freeze(_state['last'] - _state['freeze_start'])
+                elif _state.get('missed'):
+                    # beat() saw a freeze the watcher never caught running
+                    # (the GUI thread got the lock back first): logged now,
+                    # with what the watcher saw on this late wake
+                    seconds, _state['missed'] = _state['missed'], None
+                    _begin_freeze()
+                    if late >= _LATE_S:
+                        _note_late(frames, names, cpu, late)
+                    _end_freeze(seconds)
+                _state['cpu'] = cpu
+                del frames
         except Exception:
             pass
 
@@ -199,24 +422,52 @@ def _end_freeze(seconds: float) -> None:
         stack, n = Counter(samples).most_common(1)[0]
         rec['stack'] = stack
         rec['share'] = n / len(samples)
+        rec['callee'] = _state['callees'].get(stack)
+        rec['qt_wait'] = _qt_wait(stack, rec['callee'])
     rec['others'] = [(name, st, n) for (name, st), n in _state['others'].most_common(4)]
+    rec['starved'] = min(_state['starved'], seconds)
+    rec['max_gap'] = _state['max_gap']
+    rec['held'] = [(name, st, call, s) for (name, st, call), s in _state['held'].most_common(3)]
+    rec['idle_cpu'] = min(_state['idle_cpu'], rec['starved'])
     del recent[:-19]
     recent.append(rec)
     if _state['logged'] >= MAX_LOGGED:
         return
     _state['logged'] += 1
     try:
-        if samples and _in_event_loop(rec['stack']):
-            where = (f'GUI thread in Qt\'s event loop, no Python running ({n} of {len(samples)} '
-                     'samples): Qt itself was busy (drawing, layout, a large model reset) '
-                     'or the system delayed the timer (e.g. macOS App Nap on a hidden window)')
+        # Lock starvation: the watcher itself could not run for most of it.
+        starved = rec['starved'] >= 0.5 * seconds
+        if samples and rec['qt_wait']:
+            where = (f'GUI thread in Qt, no Python running ({n} of {len(samples)} samples, '
+                     f'waiting in {rec["callee"] or "exec"} at {_fmt(rec["stack"][:2])})')
+            cause = (': waiting for Python\'s lock (see below)' if starved else
+                     ': Qt itself was busy (drawing, layout, a large model reset) or the '
+                     'system delayed the timer (e.g. macOS App Nap on a hidden window)')
+            where += cause
         elif samples:
-            where = (f'GUI thread at ({n} of {len(samples)} samples): '
+            call = f' in {rec["callee"]}' if rec['callee'] else ''
+            where = (f'GUI thread{call} at ({n} of {len(samples)} samples): '
                      f'{_fmt(rec["stack"])}')
+        elif starved:
+            where = ('no GUI stack sampled: the watcher could not run until the freeze '
+                     'was over (see below)')
         else:
             where = ('no Python stack sampled: the GUI thread held the interpreter '
                      'lock inside one C call (Qt, SQLite, msgpack …) the whole time')
         lines = [f'GUI froze {seconds:.2f} s; {where}']
+        if starved:
+            why = ("another thread held Python's lock, or no CPU was free"
+                   if not rec['held'] and not rec['idle_cpu'] else
+                   "a thread held Python's lock (named below)" if rec['held'] else
+                   'no thread of this process ran: no CPU was free for it')
+            lines.append(f'    the watcher thread could not run for {rec["starved"]:.1f} s of it '
+                         f'(longest {rec["max_gap"]:.1f} s): {why}')
+            if rec['held'] and rec['idle_cpu'] >= 0.5:
+                lines.append(f'    for {rec["idle_cpu"]:.1f} s of that no thread here ran: '
+                             'no CPU was free')
+        for name, st, call, s in rec['held']:
+            on_line = f'; calls on that line: {call}' if call else ''
+            lines.append(f'    ran {s:.1f} s of CPU meanwhile: {name}, now at {_fmt(st)}{on_line}')
         if seconds >= HARD_S and _crash_file is not None:
             lines.append('    every thread\'s stack at %.0f s is in crash.log' % HARD_S)
         for name, st, k in rec['others']:

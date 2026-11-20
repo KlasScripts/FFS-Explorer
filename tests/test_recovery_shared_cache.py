@@ -56,3 +56,29 @@ def test_kept_records_read_back(tmp_path):
     for _k, t, recs, notes, ncols in items:
         got = rv.cache_get(case, 'k', t)
         assert got is not None and rv.encode_records(got[0]) == rv.encode_records(recs) and got[2] == ncols
+
+
+def test_encoded_in_worker_read_back(tmp_path):
+    """The sweep encodes in its worker process (encode_many) and the
+    window's process only writes the blobs (cache_put_encoded): what reads
+    back is the same as cache_put_many's, and a too-large table is left out
+    before anything is sent back."""
+    db, _ = fx.deleted_rows_db(str(tmp_path / 'f'))
+    raw = _read(db)
+    os.makedirs(tmp_path / 'x')
+    files, tables = rv.recovery_files(raw, None, None, str(tmp_path / 'x'))
+    items = [('k', t, *rv.records_for_files(files, t)) for t in tables]
+    enc = rv.encode_many(items)
+    assert all(isinstance(blob, bytes) for _k, _t, blob, _n, _c in enc)
+    case = str(tmp_path / 'case')
+    os.makedirs(case)
+    assert rv.cache_put_encoded(case, enc) == len(items)
+    for _k, t, recs, notes, ncols in items:
+        got = rv.cache_get(case, 'k', t)
+        assert got is not None and rv.encode_records(got[0]) == rv.encode_records(recs)
+        assert got[1] == notes and got[2] == ncols
+
+
+def test_encode_many_leaves_out_too_large(monkeypatch):
+    monkeypatch.setattr(rv, 'CACHE_MAX_BYTES', 10)
+    assert rv.encode_many([('k', 't', [[b'x' * 1000, 'y' * 1000]], [], 2)]) == []

@@ -1082,8 +1082,10 @@ def scan_job(job: tuple) -> tuple[str, list | None]:
     journal]), each source a read_source() source or None. Returns (ui_path,
     rows, kept); rows is None when the file itself couldn't be read, so the
     caller doesn't record it as done and the next run retries it; kept is a
-    database's carved tables for casecache.db (sqlite_recovery.
-    cache_put_many items) or None."""
+    database's carved tables for casecache.db, already encoded here
+    (sqlite_recovery.encode_many: cache_put_encoded items), or None.
+    Encoded in the worker so the window's process never runs the JSON
+    encoding (one long C call holding Python's lock)."""
     kind, ui_path, scan_dir, scan_scope, main, wal, partner = job[:7]
     journal = job[7] if len(job) > 7 else None
     raw = read_source(main)
@@ -1098,7 +1100,8 @@ def scan_job(job: tuple) -> tuple[str, list | None]:
     if keep:
         import sqlite_recovery
         db_key = sqlite_recovery.db_cache_key(ui_path, raw, wal_b, journal_b)
-        kept = [(db_key, t, recs, notes, ncols) for t, recs, notes, ncols in keep]
+        kept = sqlite_recovery.encode_many(
+            [(db_key, t, recs, notes, ncols) for t, recs, notes, ncols in keep]) or None
     return ui_path, rows, kept
 
 

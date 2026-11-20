@@ -98,6 +98,60 @@ def test_event_loop_stack_recognised():
     assert not freeze_log._in_event_loop((('x.py', 1, 'reload_tree'), ('ffs-explorer.py', 1, 'main')))
 
 
+def test_qt_wait_recognised():
+    """app.exec() at module level and a dialog's exec() are Qt's event
+    loop, not Python work (v0.50.50 logs named those lines as causes)."""
+    mod = (('ffs-explorer.py', 18471, '<module>'),)
+    assert freeze_log._qt_wait(mod, None)
+    dlg = (('ffs-explorer.py', 12649, '_open_process_dialog'), ('ffs-explorer.py', 18471, '<module>'))
+    assert freeze_log._qt_wait(dlg, 'dlg.exec')
+    assert not freeze_log._qt_wait(dlg, 'self._refresh_stats')
+    assert not freeze_log._qt_wait(dlg, None)
+
+
+def test_callee_read_from_bytecode():
+    import json
+    seen = []
+
+    def grab(x):
+        seen.append(freeze_log._callee(sys._getframe(1)))
+        return x
+    sorted([2, 1], key=grab)                      # this frame is in the call to sorted
+    assert seen[0] == 'sorted'
+    seen.clear()
+    json.dumps([1], default=None, sort_keys=bool(grab(1)))
+    assert seen[0] == 'grab'                      # the call running when grab looked
+    f = sys._getframe()
+    assert 'freeze_log._line_calls' in (freeze_log._line_calls(f) or '')
+
+
+def test_lock_holder_named(fl):
+    """One thread holding Python's lock in a long C call (json.dumps): the
+    GUI thread can get the lock back first, so beat() notes the gap; the
+    freeze is logged with the thread that used the CPU meanwhile."""
+    import json
+    if not freeze_log._thread_cpu(threading.enumerate()):
+        pytest.skip('no per-thread CPU time on this platform')
+    big = [{'a': [i, str(i), [i] * 5]} for i in range(200_000)]
+    t = time.perf_counter()
+    json.dumps(big)
+    reps = max(1, int(1.0 / max(time.perf_counter() - t, 0.01)))
+    big = big * reps                              # one dumps of about 1 s
+
+    def lock_holder():
+        time.sleep(0.4)
+        json.dumps(big)
+    h = threading.Thread(target=lock_holder, name='lock-holder')
+    h.start()
+    try:
+        _run_as_gui(fl, lambda: _beat_for(fl, 2.5))
+    finally:
+        h.join()
+    rec = max(fl.recent, key=lambda r: r['seconds'])
+    assert rec['seconds'] > 0.6 and rec['starved'] > 0.5 * rec['seconds']
+    assert any(name == 'lock-holder' and s > 0.5 for name, _st, _c, s in rec['held'])
+
+
 _CHILD = r"""
 import sys, time
 sys.path.insert(0, {app!r})

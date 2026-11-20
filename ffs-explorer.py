@@ -5266,7 +5266,8 @@ class EmbeddedMediaScanWorker(QThread):
             if pending_carved:
                 try:
                     import sqlite_recovery
-                    sqlite_recovery.cache_put_many(self._case_dir, pending_carved)
+                    # already encoded in the worker process (scan_job)
+                    sqlite_recovery.cache_put_encoded(self._case_dir, pending_carved)
                 except Exception as exc:
                     startup_log.message('WARNING', f'embedded media: carved records not kept ({exc})')
             if pending_registry:

@@ -1422,28 +1422,53 @@ def recovery_files(raw: bytes, wal: bytes | None, journal: bytes | None, tmpdir:
              'committed': committed_copy, 'db': db_path, 'before': before_path}, tables)
 
 
+def encode_many(items: list) -> list:
+    """[(db_key, table, records, notes, ncols)] -> the same tables encoded,
+    [(db_key, table, blob, notes_json, ncols)], for cache_put_encoded; a
+    table whose blob is over CACHE_MAX_BYTES is left out.
+
+    Call it where the records were made (the sweep's worker process,
+    embedded_media_scan.scan_job), not in the window's process: json.dumps
+    of a large table is one C call that holds Python's lock the whole time,
+    so the window can't run. On Windows (v0.50.50 exe, IOS17) the sweep's
+    save in the window's process froze it for up to 7 s and made the sweep
+    475 s instead of 75 s (2026-11-20). A blob is also far smaller to send
+    back than the records themselves."""
+    import json
+    out = []
+    for db_key, table, records, notes, ncols in items:
+        blob = encode_records(records)
+        if len(blob) <= CACHE_MAX_BYTES:
+            out.append((db_key, table, blob, json.dumps(notes), ncols))
+    return out
+
+
+def cache_put_encoded(case_dir: str, items: list) -> int:
+    """Keep encode_many() output in one transaction. Returns how many were
+    kept. Nothing here encodes, so it is cheap on any thread."""
+    if not case_dir or not items:
+        return 0
+    from db_utils import _open_cache_db
+    conn = _open_cache_db(case_dir)
+    try:
+        with conn:
+            conn.executemany('INSERT OR REPLACE INTO recovered_records VALUES (?,?,?,?,?,?)',
+                             [(db_key, table, RECOVERY_VERSION, ncols, blob, notes_json)
+                              for db_key, table, blob, notes_json, ncols in items])
+    finally:
+        conn.close()
+    return len(items)
+
+
 def cache_put_many(case_dir: str, items: list) -> int:
     """Keep many tables' results in one transaction: *items* is
     [(db_key, table, records, notes, ncols)]; a table over CACHE_MAX_BYTES
-    is not kept. Returns how many were kept."""
+    is not kept. Returns how many were kept. Encodes on the calling thread:
+    from the window's process, prefer encode_many in a worker process and
+    cache_put_encoded here."""
     if not case_dir or not items:
         return 0
-    import json
-    from db_utils import _open_cache_db
-    conn = _open_cache_db(case_dir)
-    kept = 0
-    try:
-        with conn:
-            for db_key, table, records, notes, ncols in items:
-                blob = encode_records(records)
-                if len(blob) > CACHE_MAX_BYTES:
-                    continue
-                conn.execute('INSERT OR REPLACE INTO recovered_records VALUES (?,?,?,?,?,?)',
-                             (db_key, table, RECOVERY_VERSION, ncols, blob, json.dumps(notes)))
-                kept += 1
-    finally:
-        conn.close()
-    return kept
+    return cache_put_encoded(case_dir, encode_many(items))
 
 
 def records_for_files(files: dict, table: str) -> tuple[list, list, int]:

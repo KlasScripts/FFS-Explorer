@@ -201,8 +201,10 @@ jailbroken test phone.*
   database, TrollStore), and reads `/etc/hosts` for lines a stock phone
   does not have.
 - A path found is reported as a **sign, not proof**, with its zip entry.
-  The result is stored in `run_log` (`ios_system_check`) and shown once per
-  case, and on demand from Tools.
+  The result is stored in `run_log` (`ios_system_check`). It is shown at
+  case open only when a sign is found (once per case; owner decision
+  2026-11-21), leading with the signs and then that the app covers the user
+  partition only; otherwise only on demand from Tools.
 - How much of the system partition the extraction holds is reported with
   the result, so "nothing found" in a partial extraction (GrayKey: IOS18
   CTF25 has 271 system entries, no `/usr` or `/etc`) is not read as "not
@@ -244,6 +246,10 @@ jailbroken test phone.*
     and fail silently, which looks the same as a missing plist; see A-76.
   - A GUID is specific to one installation. Anything stored across cases must
     use the bundle id: `FfsAdapter.canonical_app_path()`.
+  - The first-open bundle-id read takes only `<Containers>/Data/Application`,
+    `Data/PluginKitPlugin` and `Shared/AppGroup` `/<GUID>/` metadata plists.
+    On IOS17, iOS 16.5 and IOS18 the only other ones under Containers were
+    5-12 in `Data/InternalDaemon` (2026-11-21).
 - Android (C, D1, D2) uses `data/data/<package>` directly, with no mapping.
 
 ## 4. What each layout provides
@@ -1082,6 +1088,9 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
   offsets deliberately 12 bytes wrong, all 1,181 / 1,221 containers are
   still named; a cached map missing 131 / 171 folders (every App Group
   plus 30 apps) is fully repaired on open, 0 wrong names.
+- A container folder still unnamed after this is shown by its GUID; since
+  2026-11-21 (owner) that is said on the Loaded status message and listed
+  in the startup log, not in a warning dialog.
 
 **A-77. Deleted SQLite media larger than one page is recovered by
 following its overflow chain.** *Decision (owner) + Confirmed (real),

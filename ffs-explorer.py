@@ -2999,6 +2999,25 @@ class FileTableModel(QAbstractTableModel):
         self._headers  = list(headers)
         self._all_rows = []   # all rows, never modified by filtering
         self._rows     = []   # currently visible (filtered) rows
+        # Bumped whenever _rows changes (rows added, filtered, sorted), so a
+        # list worked out from the visible rows (cached()) is reused until
+        # then: on 2.19 million rows the Media Browser's tab-switch check
+        # took 10 s every switch (2026-11-21).
+        self._rows_version = 0
+        self._derived: dict = {}
+        # A per-row flag (the Media Browser's "is this media"), worked out as
+        # rows are added, so a tab switch only reads it (set_row_flagger).
+        self._row_flagger = None
+        self._row_flags_key = None
+        self._row_flags: dict = {}
+        # The visible flagged paths and file count, kept as rows are added or
+        # filtered in (_note_visible_added); None after a sort or a new flag
+        # key, worked out again on the next read (flagged_rows).
+        self._flag_state = None
+        # The visible rows' paths in order, kept the same way, for
+        # row_of_path: building it on the first lookup took 2 s on 1.56
+        # million rows (2026-11-21). None after a sort.
+        self._path_list = []
         # Columns (index into _headers, 'Name' never) with no real value in
         # any row added so far — kept up to date per batch in
         # append_rows_batch, the only way rows enter _all_rows, so
@@ -3202,13 +3221,76 @@ class FileTableModel(QAbstractTableModel):
                 if not _NO_DATA_VALUES.issuperset(map(str, map(itemgetter(i), cells))):
                     self._no_data_cols.discard(i)
         self._all_rows.extend(rows)
+        if self._row_flagger is not None:
+            flag, flags = self._row_flagger, self._row_flags
+            for r in rows:
+                flags[r[1]] = flag(r)
         visible = [r for r in rows if (self._show_folders if r[2] >= 0 else self._show_files)]
         if visible:
             first = len(self._rows)
             last  = first + len(visible) - 1
             self.beginInsertRows(QModelIndex(), first, last)
             self._rows.extend(visible)
+            self._rows_version += 1
+            self._note_visible_added(visible)
             self.endInsertRows()
+
+    def _note_visible_added(self, rows) -> None:
+        if self._path_list is not None:
+            self._path_list.extend(r[1] for r in rows)
+        st = self._flag_state
+        if st is not None:
+            flags = self._row_flags
+            files = [r for r in rows if r[2] < 0]
+            st[0].extend(r[1] for r in files if flags.get(r[1]))
+            st[1] += len(files)
+
+    def cached(self, name: str, key, compute):
+        """compute() over the visible rows, reused while they and *key*
+        are unchanged (see _rows_version)."""
+        hit = self._derived.get(name)
+        if hit is not None and hit[0] == (self._rows_version, key):
+            return hit[1]
+        value = compute()
+        self._derived[name] = ((self._rows_version, key), value)
+        return value
+
+    def set_row_flagger(self, flag, key) -> None:
+        """flag(row) -> bool for every row, worked out as rows are added
+        (append_rows_batch) and here for rows already in; a new *key* (what
+        the flag depends on changed) works them all out again."""
+        if key != self._row_flags_key or self._row_flagger is None:
+            self._row_flags = {r[1]: flag(r) for r in self._all_rows}
+            self._row_flags_key = key
+            # from the rows already visible (none, or one folder's, when a
+            # model is installed); kept up to date as rows come in after
+            flags = self._row_flags
+            files = [r for r in self._rows if r[2] < 0]
+            self._flag_state = [[r[1] for r in files if flags.get(r[1])], len(files)]
+        self._row_flagger = flag
+
+    def flagged_rows(self) -> tuple[tuple, int]:
+        """(paths of the visible flagged rows in order, number of visible
+        files): only reads the flags, so a sort or filter costs one pass of
+        lookups, not a check of every file."""
+        flags = self._row_flags
+        if self._flag_state is None:
+            files = [r for r in self._rows if r[2] < 0]
+            self._flag_state = [[r[1] for r in files if flags.get(r[1])], len(files)]
+        st = self._flag_state
+        return self.cached('flagged', self._row_flags_key, lambda: (tuple(st[0]), st[1]))
+
+    def row_of_path(self, ui_path: str) -> int:
+        """The visible row of *ui_path*, or -1: one C-level search of the
+        visible paths (kept per version), not a Python loop through the
+        model's data() calls row by row."""
+        if self._path_list is None:
+            self._path_list = [r[1] for r in self._rows]
+        paths = self._path_list
+        try:
+            return paths.index(ui_path)
+        except ValueError:
+            return -1
 
     # ── filtering ────────────────────────────────────────────────────────────
 
@@ -3253,6 +3335,10 @@ class FileTableModel(QAbstractTableModel):
         # Clear visible rows immediately
         self.beginResetModel()
         self._rows = []
+        self._rows_version += 1
+        self._path_list = []
+        if self._flag_state is not None:
+            self._flag_state = [[], 0]
         self.endResetModel()
 
         show_files   = self._show_files
@@ -3297,9 +3383,12 @@ class FileTableModel(QAbstractTableModel):
                 # only call it when there's at least one row to insert.
                 self.beginInsertRows(QModelIndex(), 0, len(visible) - 1)
                 self._rows = visible
+                self._rows_version += 1
+                self._note_visible_added(visible)
                 self.endInsertRows()
             else:
                 self._rows = visible
+                self._rows_version += 1
             self.filter_done.emit(len(visible), total)
             return
 
@@ -3316,6 +3405,8 @@ class FileTableModel(QAbstractTableModel):
                 last  = first + len(matched) - 1
                 self.beginInsertRows(QModelIndex(), first, last)
                 self._rows.extend(matched)
+                self._rows_version += 1
+                self._note_visible_added(matched)
                 self.endInsertRows()
             idx[0] = end
             self.filter_progress.emit(len(self._rows), total)
@@ -3357,6 +3448,9 @@ class FileTableModel(QAbstractTableModel):
         key = self._sort_key_for_column(real_column)
         self._all_rows.sort(key=key, reverse=reverse)
         self._rows.sort(key=key, reverse=reverse)
+        self._rows_version += 1
+        self._flag_state = None
+        self._path_list = None
         self.layoutChanged.emit()
 
     def _sort_key_for_column(self, real_column):
@@ -3400,6 +3494,9 @@ class FileTableModel(QAbstractTableModel):
             key = self._sort_key_for_column(real_column)
             self._all_rows.sort(key=key, reverse=descending)
             self._rows.sort(key=key, reverse=descending)
+        self._rows_version += 1
+        self._flag_state = None
+        self._path_list = None
         self.layoutChanged.emit()
 
 
@@ -9637,6 +9734,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # detach, calling headerData on a freed Python wrapper → SIGSEGV.
         self.proxy_model.setSourceModel(model)
         self.file_model = model
+        # Media flag per row as rows are added, so switching to the Media
+        # Browser only reads it (MediaViewerMixin._install_media_flagger).
+        self._install_media_flagger(model)
         model._research_fg  = self._research_fg_for_row
         model._research_tip = self._research_tip_for_row
         model._local_time_tip = self._local_time_tip_for_row
@@ -10404,11 +10504,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # _is_media_file (not a bare MEDIA_EXTENSIONS check) so this stays
             # consistent with _load_media_from_file_model's own definition of
             # "media" — see that shared method's own docstring.
-            new_context = tuple(
-                r[1] for r in self.file_model._rows
-                if r[1] not in self.folder_map
-                and self._is_media_file(r[1])
-            )
+            # Kept by the model until its rows change: a pass over every row
+            # here took 10 s per switch on 2.19 million rows (2026-11-21).
+            new_context = self._file_model_media()[0]
 
             if new_context == self._media_context:
                 # Nothing changed — grid model already loaded, just re-apply selection.
@@ -11285,14 +11383,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._log(f"{'Folder' if is_folder else 'File'} selected: {ui_path}")
 
     def _select_file_in_table(self, ui_path):
-        """Find ui_path in the current file model and select that row."""
-        for row in range(self.file_model.rowCount()):
-            if self.file_model.index(row, 0).data(Qt.ItemDataRole.UserRole) == ui_path:
-                proxy_idx = self.proxy_model.mapFromSource(self.file_model.index(row, 0))
-                if proxy_idx.isValid():
-                    self.file_view.setCurrentIndex(proxy_idx)
-                    self.file_view.scrollTo(proxy_idx)
-                break
+        """Find ui_path in the current file model and select that row.
+        One search of the visible paths (FileTableModel.row_of_path): a
+        Python loop through data() for every row paused the switch back
+        from the Media Browser on a large view."""
+        row = self.file_model.row_of_path(ui_path)
+        if row >= 0:
+            proxy_idx = self.proxy_model.mapFromSource(self.file_model.index(row, 0))
+            if proxy_idx.isValid():
+                self.file_view.setCurrentIndex(proxy_idx)
+                self.file_view.scrollTo(proxy_idx)
             
     def eventFilter(self, obj, event):
         if obj is self.tree_view and event.type() == event.Type.Resize:

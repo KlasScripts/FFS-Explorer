@@ -2211,13 +2211,16 @@ class MediaViewerMixin:
         check added in only one of the two places would silently
         reintroduce exactly the kind of drift this predicate exists to
         prevent."""
-        if os.path.splitext(ui_path)[1].lower() in MEDIA_EXTENSIONS:
-            is_media = True
-        else:
-            is_media = self._header_type_overrides.get(ui_path) in ('Picture', 'Graphic', 'Video')
-        if not is_media:
+        if not self._is_media_type(ui_path):
             return False
         return self.full_metadata.get(ui_path, {}).get('size', 0) > 0
+
+    def _is_media_type(self, ui_path: str) -> bool:
+        """The type half of _is_media_file (extension, or header-scan type);
+        the other half is a size above 0."""
+        if os.path.splitext(ui_path)[1].lower() in MEDIA_EXTENSIONS:
+            return True
+        return self._header_type_overrides.get(ui_path) in ('Picture', 'Graphic', 'Video')
 
     # Extensions that carry the "first frame may not show everything"
     # risk the grid badge (set_video_paths) warns about — real video
@@ -2362,6 +2365,39 @@ class MediaViewerMixin:
             return False
         return self._header_type_overrides.get(ui_path) == 'Video'
 
+    def _file_model_media(self) -> tuple[tuple, int]:
+        """(media paths, file count) of the File Browser's visible rows, in
+        their order: one pass, kept by the model until its rows change
+        (FileTableModel.cached) or the folders or header-scan types do.
+        Shared by the tab-switch check (_on_center_tab_changed) and
+        _load_media_from_file_model, which each made their own pass over
+        every row before: 10 s per switch on 2.19 million rows."""
+        model = self.file_model
+        self._install_media_flagger(model)
+        return model.flagged_rows()
+
+    def _install_media_flagger(self, model) -> None:
+        """Give a File Browser model the per-row "is media" flag, worked out
+        as its rows are added (FileTableModel.set_row_flagger), so a tab
+        switch only reads it. Called when a model is installed and before
+        reading; worked out again when the header-scan types change.
+
+        The flag is _is_media_file for a file row, with the size taken from
+        the row's own Size cell (written from the same size field) rather
+        than the file table: per row, the file-table reads made the first
+        switch take 36 s on 1.56 million rows (2026-11-21)."""
+        over = self._header_type_overrides
+        sc = model._size_col
+
+        def flag(r):
+            if r[2] >= 0:                      # a folder (its file count)
+                return False
+            if sc < 0 or sc >= len(r[0]):
+                return self._is_media_file(r[1])
+            return (self._is_media_type(r[1])
+                    and r[0][sc].replace(',', '').strip('0 ') != '')
+        model.set_row_flagger(flag, (id(over), len(over)))
+
     def _load_media_from_file_model(self):
         """Load the media tab using exactly the current visible file model
         rows. Also exits the Embedded Media/User Media alternate views —
@@ -2389,14 +2425,10 @@ class MediaViewerMixin:
         self._media_type_all_btn.setChecked(True)
         model = self.file_model
 
-        total_files = sum(1 for r in model._rows if r[1] not in self.folder_map)
-        media_paths = [
-            r[1] for r in model._rows
-            if r[1] not in self.folder_map
-            and self._is_media_file(r[1])
-        ]
+        media_context, total_files = self._file_model_media()
+        media_paths = list(media_context)
 
-        self._media_context = tuple(media_paths)
+        self._media_context = media_context
 
         if 0 <= model._sort_col < len(model._headers):
             arrow = "↑" if model._sort_order == Qt.SortOrder.AscendingOrder else "↓"
@@ -2498,10 +2530,25 @@ class MediaViewerMixin:
         # button, which already passes real absolute paths and needs no
         # override) — see ThumbnailWorker's own local_path_overrides
         # docstring.
-        self._media_local_overrides = {
-            p: src for p in media_paths
-            if (src := self.full_metadata.get(p, {}).get('_embedded_media_source'))
-        }
+        # An embedded-media file is added while the app runs
+        # (_inject_embedded_media), after the case's file table was written
+        # (ZipMetadataWorker packs it before anything is injected), so with
+        # file_table.FileList it is always in the in-memory layer (`top`).
+        # Only that layer is searched: reading every media file's record
+        # took 6.8 s for 316,716 media files (2026-11-21).
+        meta = self.full_metadata
+        layer = getattr(meta, 'top', None)
+        if layer is not None:
+            wanted = set(media_paths) if layer else ()
+            self._media_local_overrides = {
+                p: src for p, m in layer.items()
+                if p in wanted and (src := (m or {}).get('_embedded_media_source'))
+            }
+        else:
+            self._media_local_overrides = {
+                p: src for p in media_paths
+                if (src := meta.get(p, {}).get('_embedded_media_source'))
+            }
 
         target_page = 0
         pending = self._pending_media_selection

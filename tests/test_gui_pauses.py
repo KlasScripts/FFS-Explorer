@@ -170,3 +170,64 @@ def test_a_filter_during_a_sort_wins(tmp_path):
     _wait(app, lambda: not m._sort_workers)
     app.processEvents()
     assert m._rowids == [5, 3, 1]
+
+
+def test_file_browser_lists_are_kept_until_its_rows_change():
+    """Switching to the Media Browser checked every File Browser row each
+    time: 10 s on 2.19 million rows (2026-11-21). The list is now kept by
+    the model until its rows change (added, filtered, sorted)."""
+    import importlib.util
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location('ffs_main_pauses', os.path.join(root, 'ffs-explorer.py'))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    model = m.FileTableModel(['Name', 'Size (Bytes)'])
+    model.append_rows_batch([([f'f{i:06d}.jpg', str(i)], f'd/f{i:06d}.jpg', -1) for i in range(50_000)])
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return tuple(r[1] for r in model._rows)
+    first = model.cached('media', 'k', compute)
+    again = model.cached('media', 'k', compute)
+    assert again is first and len(calls) == 1                 # reused while unchanged
+    assert model.row_of_path('d/f049999.jpg') == 49_999
+    model.sort(1, Qt.SortOrder.DescendingOrder)                # rows reordered
+    assert model.cached('media', 'k', compute)[0] == 'd/f049999.jpg' and len(calls) == 2
+    assert model.row_of_path('d/f049999.jpg') == 0
+    assert model.cached('media', 'other key', compute) and len(calls) == 3
+    model.set_filter('')                                       # rows replaced
+    assert model.cached('media', 'other key', compute) and len(calls) == 4
+
+
+def test_media_flags_and_path_list_kept_as_rows_arrive():
+    """The media list and the path list are kept as rows come in, so a
+    tab switch or a selection only reads them; a sort rebuilds them once;
+    nothing is counted twice."""
+    import importlib.util
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location('ffs_main_flags', os.path.join(root, 'ffs-explorer.py'))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    model = m.FileTableModel(['Name', 'Size (Bytes)'])
+    model.append_rows_batch([(['dir', '0'], 'd', 3)])                      # a folder, before the flagger
+    model.set_row_flagger(lambda r: r[2] < 0 and r[1].endswith('.jpg'), 'k')
+    for start in range(0, 3000, 500):
+        model.append_rows_batch([([f'f{i}', '1'], f'd/f{i:04d}.{"jpg" if i % 3 == 0 else "txt"}', -1)
+                                 for i in range(start, start + 500)])
+    media, files = model.flagged_rows()
+    assert files == 3000 and len(media) == 1000 and media[0] == 'd/f0000.jpg'
+    assert model.row_of_path('d/f2999.txt') == 3000 and len(model._path_list) == 3001
+    model.sort(1, Qt.SortOrder.DescendingOrder)
+    media2, files2 = model.flagged_rows()
+    assert files2 == 3000 and sorted(media2) == sorted(media)
+    assert list(media2) == [r[1] for r in model._rows if r[1].endswith('.jpg')]   # in the new order
+    assert model.row_of_path('d/f2997.jpg') == [r[1] for r in model._rows].index('d/f2997.jpg')
+    model.set_filter('')                                                   # rows put back
+    assert model.flagged_rows()[1] == 3000 and len(model._path_list) == 3001

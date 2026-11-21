@@ -332,7 +332,10 @@ are then turned into GitHub issues and deleted from the inbox. Use `gh`.
 - **Start of a session on FFS-Explorer:** check the `ISSUES.md` inbox, for
   example with `gh api repos/KlasScripts/ffs-notes/contents/ISSUES.md --jq
   .content | base64 -d`. If entries are waiting under `## New`, tell Klas and
-  offer to move them to GitHub issues.
+  offer to move them to GitHub issues. Read GitHub, not a local clone: Klas
+  may add entries from Cursor on the phone, which pushes straight to GitHub,
+  sometimes on its own branch or as a pull request
+  (`gh pr list -R KlasScripts/ffs-notes`).
 - **Before starting a task:** look for an open issue that covers it
   (`gh issue list -R KlasScripts/ffs-notes --search "<words>"`) and name it.
 - **When the session fixes an issue:** say "We fixed B-xx (#N). Should I

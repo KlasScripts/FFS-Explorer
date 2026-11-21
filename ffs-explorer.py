@@ -1861,6 +1861,40 @@ def _read_embedded_media(case_dir: str):
 _NO_DATA_VALUES = frozenset(('', '---'))
 
 
+def _top_scope_paths(scope) -> list:
+    """The paths of *scope* with no other scope path above them. The
+    "Selected Only" tree rebuild (_rebuild_selected_only_children) skips
+    every path under one it has already expanded, so these give the same
+    tree; ticking a folder puts every folder under it in the scope too,
+    and sorting and splitting all 475,533 of them for the root took
+    1.5-1.9 s of frozen window (2026-11-21). Each folder above a path is
+    looked at once (memo)."""
+    if '' in scope:
+        return ['']
+    covered: dict = {}
+
+    def is_covered(p):
+        stack = []
+        while True:
+            parent = p.rsplit('/', 1)[0] if '/' in p else ''
+            if parent in covered:
+                ans = covered[parent] or parent in scope
+                break
+            if parent in scope:
+                ans = True
+                break
+            if parent == '':
+                ans = False
+                break
+            stack.append(parent)
+            p = parent
+        # every folder walked through has the same answer for what is under it
+        for q in stack:
+            covered[q] = ans
+        return ans
+    return [p for p in scope if not is_covered(p)]
+
+
 def _count_selected_files(checked_folders, checked_files, folder_map: dict,
                           is_folder) -> int:
     """How many distinct real files a tick selection resolves to: every
@@ -11806,6 +11840,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         fm = self.folder_map
         if root not in fm:
             return []
+        # A small branch is walked. A big one is a pass over the folder
+        # names instead (_all_folder_names, kept per case): walking reads
+        # every folder's whole child list, files included, which for the
+        # root of a 2.19-million-entry case took 22.7 s of frozen window
+        # when it was ticked (2026-11-21). Same folders either way.
         seen = {root}
         out = [root]
         stack = [root]
@@ -11815,7 +11854,28 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     seen.add(child)
                     out.append(child)
                     stack.append(child)
-        return out
+            if len(out) > 5000:
+                break
+        else:
+            return out
+        names = self._all_folder_names()
+        if root == '':
+            return list(names)
+        pre = root + '/'
+        return [root] + [k for k in names if k.startswith(pre)]
+
+    def _all_folder_names(self) -> list:
+        """Every folder path of the case, kept until folders are added
+        (nested archives, embedded media). Built in the background when
+        the case opens (_start_case_meta_load), so the first big tick only
+        reads it; 1.6 s to build for 475,233 folders."""
+        fm = self.folder_map
+        got = getattr(self, '_folder_names_cache', None)
+        if got is not None and got[0] is fm and got[1] == len(fm):
+            return got[2]
+        names = list(fm)
+        self._folder_names_cache = (fm, len(fm), names)
+        return names
 
     def _set_branch_checked(self, index, checked: bool):
         """Tick/untick a folder and all its descendants.
@@ -11859,11 +11919,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # (untick) the branch's own new _checked_folders membership.
         # Skipped when no file is ticked on its own (nothing to discard):
         # for the root this loop visited all 830k IOS17 entries, ~0.25 s.
-        if self._checked_files:
-            for d in descendants:
-                for child in self.folder_map.get(d, []):
-                    if child not in self.folder_map:
-                        self._checked_files.discard(child)
+        self._drop_ticked_files_under(path)
         if not checked:
             # Demote a still-fully-checked ANCESTOR of path too, if any
             # — added 2026-10-02, same reasoning as
@@ -12076,7 +12132,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         folders = sorted(checked)
         total_folders = len(folders)
         total_extra = len(extra_files)
-        state = {'idx': 0, 'extra_idx': 0, 'count': 0}
+        state = {'idx': 0, 'extra_idx': 0, 'count': 0, 'children': None, 'child_idx': 0}
         self.table_status_label.setText("0 items  (loading…)")
         self.status_bar.showMessage(f"Loading…  0 files  (0 of {total_folders} folders)")
 
@@ -12090,17 +12146,33 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
             while state['idx'] < total_folders:
                 folder = folders[state['idx']]
-                state['idx'] += 1
+                # The deadline is checked per file, and a big folder carries
+                # on in the next batch: checked per folder, one folder with
+                # tens of thousands of files froze the window 1.6 s
+                # (2026-11-21).
+                if state['children'] is None:
+                    state['children'] = self.folder_map.get(folder, [])
+                    state['child_idx'] = 0
+                children = state['children']
                 disp_parent = self._display_path(folder)
-                for child in self.folder_map.get(folder, []):
+                cut = False
+                while state['child_idx'] < len(children):
+                    child = children[state['child_idx']]
+                    state['child_idx'] += 1
                     row = self._build_entry_row(child, display_parent=disp_parent,
                                                 photo_cols=has_photos, exif_cols=has_exif, link_cols=has_links,
                                                 inode_cols=has_inode, link_count_cols=has_link_count,
                                                 dup_cols=has_dup, hash_keys=self._meta_col_keys)
-                    if row is None:
-                        continue
-                    batch_rows.append(row)
-                    state['count'] += 1
+                    if row is not None:
+                        batch_rows.append(row)
+                        state['count'] += 1
+                    if (state['child_idx'] & 63) == 0 and time.monotonic() >= deadline:
+                        cut = True
+                        break
+                if cut and state['child_idx'] < len(children):
+                    break  # yield back; this folder carries on next batch
+                state['idx'] += 1
+                state['children'] = None
                 if time.monotonic() >= deadline:
                     break  # yield back to the event loop
             else:
@@ -13496,6 +13568,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         fut = _CASE_OPEN_POOL.submit(_load)
         self._track_load_job('file types and case results', fut)
+        # The folder list a big tick reads (_all_folder_names), built now so
+        # ticking a large branch never has to.
+        _BG_POOL.submit(self._all_folder_names)
 
         def _poll():
             if my_seq != self._case_meta_seq:
@@ -16983,12 +17058,23 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._checked_folders.update(descendants)
         # Skipped when no file is ticked on its own (nothing to discard):
         # for the root this loop visited all 830k IOS17 entries, ~0.25 s.
-        if self._checked_files:
-            for d in descendants:
-                for child in self.folder_map.get(d, []):
-                    if child not in self.folder_map:
-                        self._checked_files.discard(child)
+        self._drop_ticked_files_under(path)
         self._try_collapse_full_ancestors(path)
+
+    def _drop_ticked_files_under(self, path: str) -> None:
+        """Remove every individually ticked file under *path* from
+        _checked_files (a full tick or untick of *path* covers them). Goes
+        through the ticked files, never the folders' child lists: those
+        loops looked at every file under the root, 8.2 s of frozen window
+        on 2.19 million entries (2026-11-21)."""
+        files = self._checked_files
+        if not files:
+            return
+        if path == '':
+            files.clear()
+            return
+        pre = path + '/'
+        files.difference_update([f for f in files if f.startswith(pre)])
 
     def _try_collapse_full_ancestors(self, path: str) -> None:
         """The reverse of _exclude_from_full_ancestor's own 'explode':
@@ -17054,11 +17140,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._checked_folders.difference_update(descendants)
         # Skipped when no file is ticked on its own (nothing to discard):
         # for the root this loop visited all 830k IOS17 entries, ~0.25 s.
-        if self._checked_files:
-            for d in descendants:
-                for child in self.folder_map.get(d, []):
-                    if child not in self.folder_map:
-                        self._checked_files.discard(child)
+        self._drop_ticked_files_under(path)
         self._exclude_from_full_ancestor(path)
 
     def _exclude_from_full_ancestor(self, target_path: str) -> None:
@@ -17498,7 +17580,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         for the "User Media" filter's own real 10,000+-file scale."""
         partial: set = set()
         checked = self._checked_folders
-        for p in chain(checked, self._checked_files):
+        # Only the top ticked folders: every ticked folder under one of them
+        # has the same folders above it, already checked or walked. Walking
+        # up from all 475,533 ticked folders under the root took 1 s
+        # (2026-11-21).
+        for p in chain(_top_scope_paths(checked), self._checked_files):
             cur = p
             while True:
                 cur = cur.rsplit('/', 1)[0] if '/' in cur else ''
@@ -17913,7 +17999,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             created: dict[str, QStandardItem] = {'': root}
             full_expand: set[str] = set()
             past_landmark: set[str] = set()
-            for scope_path in sorted(self._selected_only_scope,
+            for scope_path in sorted(_top_scope_paths(self._selected_only_scope),
                                      key=lambda p: p.count('/')):
                 parts = [p for p in scope_path.split('/') if p]
                 cur_path = ''

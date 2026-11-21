@@ -231,3 +231,78 @@ def test_media_flags_and_path_list_kept_as_rows_arrive():
     assert model.row_of_path('d/f2997.jpg') == [r[1] for r in model._rows].index('d/f2997.jpg')
     model.set_filter('')                                                   # rows put back
     assert model.flagged_rows()[1] == 3000 and len(model._path_list) == 3001
+
+
+def _main_module():
+    import importlib.util
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location('ffs_main_ticks', os.path.join(root, 'ffs-explorer.py'))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_ticks_same_result_without_walking_every_file():
+    """Ticking a big folder walked every folder's whole child list (22.7 s
+    for the root of 2.19 million entries, 2026-11-21). The descendant
+    folders, the dropped single-file ticks and the half-ticked folders
+    are the same as the old walk gives."""
+    import random
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    m = _main_module()
+    rnd = random.Random(7)
+    fm = {'': []}
+
+    def add(parent, depth):
+        for i in range(rnd.randint(1, 4)):
+            name = f'{parent}/d{i}' if parent else f'd{i}'
+            if depth < 6 and rnd.random() < 0.6:
+                fm[parent].append(name)
+                fm[name] = []
+                add(name, depth + 1)
+            else:
+                fm[parent].append(name + '.txt')
+    add('', 0)
+    win = m.FastZipBrowser.__new__(m.FastZipBrowser)
+    win.folder_map = fm
+    folders = list(fm)
+
+    def old_descendants(root):
+        seen, out, stack = {root}, [root], [root]
+        while stack:
+            for c in fm.get(stack.pop(), ()):
+                if c in fm and c not in seen:
+                    seen.add(c); out.append(c); stack.append(c)
+        return out
+    for root in folders:
+        assert set(m.FastZipBrowser._descendant_folders(win, root)) == set(old_descendants(root))
+    files = [c for k in fm for c in fm[k] if c not in fm]
+    for _ in range(200):
+        path = rnd.choice(folders)
+        win._checked_files = set(rnd.sample(files, min(len(files), 8)))
+        expect = set(win._checked_files)
+        for d in old_descendants(path):
+            for c in fm.get(d, []):
+                if c not in fm:
+                    expect.discard(c)
+        m.FastZipBrowser._drop_ticked_files_under(win, path)
+        assert win._checked_files == expect
+        # half ticks: the same as the old walk over every ticked folder
+        checked = set()
+        for top in rnd.sample(folders, 3):
+            checked.update(old_descendants(top))      # a full tick, as the app keeps it
+        win._checked_folders = checked
+        m.FastZipBrowser._recompute_partial_folders(win)
+        got = win._partial_folders
+        want = set()
+        for p in list(checked) + list(win._checked_files):
+            cur = p
+            while True:
+                cur = cur.rsplit('/', 1)[0] if '/' in cur else ''
+                if cur in checked:
+                    break
+                want.add(cur)
+                if cur == '':
+                    break
+        assert got == want

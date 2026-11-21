@@ -28,10 +28,16 @@ section map below instead of reading it whole.
 | `CLAUDE.md` (this file) | Code map and coding rules only. No facts or decision history. |
 | `WRITING_ARTIFACT_PARSERS.md` | How to write a parser, with examples. |
 | `VERIFICATION_STATUS.md` | Which parts a human has reviewed. |
-| `IDEAS.md` | Ideas not yet scheduled, with evidence and sketches. Not decisions. |
+| [ISSUES.md](https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md) | The only backlog. Lives in the ffs-notes repo, not here. |
 | `FFS_processing.md` | Older processing walkthrough; `ASSUMPTIONS.md` §17 lists its known errors. |
 
-**`ASSUMPTIONS.md` is read-only.**
+**The only backlog** is
+https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md.
+When something ships, is rejected, or is newly found, update that file:
+status `done` or `wont-do` plus one line why, or a new short entry. Do not
+revive the deleted notes as a second list in this repo.
+
+**`ASSUMPTIONS.md` is read-only.** It stays the design-facts file.
 - Read the relevant entries before changing code they name.
 - Never edit it without first agreeing the change with the user: propose
   what to add or correct, and the evidence, in conversation.
@@ -172,8 +178,8 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `ios_system_check.py` | Once per iOS case: signs of jailbreaking or sideloading (a fixed path list: OWASP MASTG, rootless jailbreak folders, package managers, TrollStore; plus `/etc/hosts` lines a stock phone lacks) and how much of the system partition the extraction holds (A-82, A-83). Run by `ZipMetadataWorker._run_system_check`, stored as a `run_log` row (`ios_system_check`); `FastZipBrowser._show_system_check_dialog` shows the result once per case (before Process Case on a new case) and from Tools ▸ iOS System Check. Qt-free. Tests: `tests/test_ios_system_check.py`. |
 | `header_scan.py` | Magic-byte/text file-type detection (`classify_magic`). |
 | `scan_rules.py` | Shared folder-prefix ruleset behind `FfsAdapter.scan_folders()` and friends. |
-| `evidence_shortcuts.py` | The "Jump to ▾" menu's locations, each with its per-OS-version candidates (newest first; a `*` pattern opens the folder of its first match, e.g. Notes' `NoteStore.sqlite`); `resolve()` picks the first one the extraction has, and the menu greys out an entry with none. Android users are read from the extraction (`android_users`: numeric folders under `data/user`, `data/user_de`, `data/media`, `data/system_ce`, ...); `android_shortcuts(user=u)` gives that user's entries (never a hardcoded 0), shown as a submenu per user other than 0, typed from `data/system/users/<u>.xml` (`user_type_label`, never the name). Paths are Cellebrite-form (no `private/var/`; `prefix_shortcut` adds it on GrayKey). Sources and version notes: `EVIDENCE_LOCATIONS.md`. Qt-free. Tests: `tests/test_evidence_locations.py` (every jump target must be inside a `scan_rules` include). |
-| `os_coverage.py` | The OS versions whose evidence locations were checked on real images (`CHECKED`) and documented by sources (`DOCUMENTED`); `warning()` gives the banner text shown under the time banner when an extraction is newer, older or of unreadable version. Update `CHECKED` only after checking a real extraction against `EVIDENCE_LOCATIONS.md`. Qt-free. |
+| `evidence_shortcuts.py` | The "Jump to ▾" menu's locations, each with its per-OS-version candidates (newest first; a `*` pattern opens the folder of its first match, e.g. Notes' `NoteStore.sqlite`); `resolve()` picks the first one the extraction has, and the menu greys out an entry with none. Android users are read from the extraction (`android_users`: numeric folders under `data/user`, `data/user_de`, `data/media`, `data/system_ce`, ...); `android_shortcuts(user=u)` gives that user's entries (never a hardcoded 0), shown as a submenu per user other than 0, typed from `data/system/users/<u>.xml` (`user_type_label`, never the name). Paths are Cellebrite-form (no `private/var/`; `prefix_shortcut` adds it on GrayKey). Sources and version notes: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md. Qt-free. Tests: `tests/test_evidence_locations.py` (every jump target must be inside a `scan_rules` include). |
+| `os_coverage.py` | The OS versions whose evidence locations were checked on real images (`CHECKED`) and documented by sources (`DOCUMENTED`); `warning()` gives the banner text shown under the time banner when an extraction is newer, older or of unreadable version. Update `CHECKED` only after checking a real extraction against https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md. Qt-free. |
 | `embedded_media_scan.py` | The embedded-media sweep. |
 | `duplicate_scan.py` | Process Case duplicate detection: size+CRC grouping, MD5 to confirm (inode shortcut where trusted). Also `proven_copies()`: files proven identical with no read (same size+CRC plus the same GrayKey SHA-256 or trusted inode), used by Header Scan (`_header_copy_map` / `_scan_headers_once_per_copy` in `ffs-explorer.py`) to read each set once and give every copy the result; size+CRC alone is never proof. Qt-free. Tests: `tests/test_header_scan_copies.py`. |
 | `embedded_media_skip_list.py` | Known-noise database skip list for the sweep. |

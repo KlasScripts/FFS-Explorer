@@ -6,9 +6,9 @@ forensics tools reviewed for practices worth considering, plus one internal
 review of ios-ffs-browser's own GUI workflows. Nothing in this list has been
 implemented yet — this is a planning document, not a change log.
 
-Detailed reasoning for each finding lives in the two existing review docs at
-the project root — `CRUSH_REVIEW.md` and `GUI_WORKFLOW_REVIEW.md` — this file
-is the reprioritized action list drawn from those, plus three further reviews
+Detailed reasoning for each finding lives in
+https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md. This file
+is the reprioritized action list drawn from those reviews, plus three further reviews
 (mf-scan, ALEAPP, FQLite) that were discussed in chat rather than written to
 their own files, at the user's own request ("talk first"). Every item below
 names which review it came from.
@@ -660,7 +660,7 @@ headers — even though nothing here is a vendored copy the way those files are.
    convention in the whole `artifacts/` tree, and it's scoped to one app
    family rather than being universal.*
 
-4. **[GUI_WORKFLOW_REVIEW.md, now further validated by ALEAPP] Add
+4. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md, now further validated by ALEAPP] Add
    CSV/TSV export for Artifact Report tables.** The single largest gap found
    in the internal workflow review — no way to get a parsed report's own
    rows out of the tool at all today, not even a context menu. ALEAPP's own
@@ -672,7 +672,7 @@ headers — even though nothing here is a vendored copy the way those files are.
    commas in decoded message text. `ArtifactTableModel` already has uniform
    row access for both DB-mode and list-mode reports — this is close to a
    plain iteration + a writer, no new data layer needed.
-   *Source: GUI_WORKFLOW_REVIEW.md (Reporting workflow); TSV-over-CSV
+   *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md (Reporting workflow); TSV-over-CSV
    detail from ALEAPP.*
 
 5. **[DONE 2026-09-12 — see CLAUDE.md's `sqlite_carve.locate_offset`
@@ -746,25 +746,25 @@ headers — even though nothing here is a vendored copy the way those files are.
    EXIF-orientation bug and its fix were found via this session's own
    direct investigation, not from Crush or any other sibling tool.*
 
-7. **[GUI_WORKFLOW_REVIEW.md] Surface WHY an app scored high, inline, in
+7. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md] Surface WHY an app scored high, inline, in
    the Apps table** (`_populate_apps_table`/`_APPS_COLUMNS`) — the
    evidence-database/webview-storage detail is already computed by
    `app_intelligence.scan_apps()`, just not shown outside the AI-only MCP
    path today. Cheap, display-only.
-   *Source: GUI_WORKFLOW_REVIEW.md (Triage workflow).*
+   *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md (Triage workflow).*
 
-8. **[GUI_WORKFLOW_REVIEW.md] Double-click an Apps-table row jumps the File
+8. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md] Double-click an Apps-table row jumps the File
    Browser to that app's Data Folder** — closes the "found it, now what"
    gap Triage currently has (confirmed: clicking an Apps-table row does
    nothing today, `_art_current_mod` is explicitly `None` for it).
-   *Source: GUI_WORKFLOW_REVIEW.md (Triage workflow).*
+   *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md (Triage workflow).*
 
-9. **[GUI_WORKFLOW_REVIEW.md] Add a "Validated" indicator column to the
+9. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md] Add a "Validated" indicator column to the
    Apps table**, sourced from `validation_store.get()` per row — the
    lookup already exists, just not run table-wide.
-   *Source: GUI_WORKFLOW_REVIEW.md (Validation workflow).*
+   *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md (Validation workflow).*
 
-10. **[GUI_WORKFLOW_REVIEW.md + mf-scan] Extend the search backend to also
+10. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md + mf-scan] Extend the search backend to also
     query already-populated `artifact_<name>` tables**, not just raw files
     — closes the "two separate search tools" gap (raw Keyword Search vs.
     each report's own separate, single-report-only filter box). While
@@ -775,29 +775,29 @@ headers — even though nothing here is a vendored copy the way those files are.
     concretely portable enhancement to the same search backend, for hits
     currently invisible because they're base64-encoded inside a plist/JSON
     value.
-    *Source: GUI_WORKFLOW_REVIEW.md (Searching workflow) for the base
+    *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md (Searching workflow) for the base
     gap; mf-scan (`src/ops/search/base64.rs`) for the base64-phase technique.*
 
-11. **[GUI_WORKFLOW_REVIEW.md] Let a bookmark entry optionally carry a
+11. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md] Let a bookmark entry optionally carry a
     report row's own citation** (record_source key), not just a file path
     — the most granular, most forensically specific thing this tool
     produces currently has no bookmark of its own.
-    *Source: GUI_WORKFLOW_REVIEW.md (Bookmarking workflow).*
+    *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md (Bookmarking workflow).*
 
-12. **[GUI_WORKFLOW_REVIEW.md] Decide, deliberately, how (or whether) to
+12. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md] Decide, deliberately, how (or whether) to
     help a "new app, no parser" examiner without AI access** — partially
     answered by item 1 above (a generic live/deleted row viewer for an
     unsupported app's own table), but the broader question (should
     `list_apps`/`build_artifact_parser`-style guidance exist outside the
     MCP/AI path at all) is still a real, open design decision, not a quick
     fix.
-    *Source: GUI_WORKFLOW_REVIEW.md ("New app not supported" workflow).*
+    *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md ("New app not supported" workflow).*
 
-13. **[CRUSH_REVIEW.md] A right-click "Search for this value" on any Report
+13. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md] A right-click "Search for this value" on any Report
     table cell**, pre-filling Keyword Search — closes most of the practical
     cross-report navigation gap cheaply, without attempting general
     cross-app identity resolution.
-    *Source: CRUSH_REVIEW.md / GUI_WORKFLOW_REVIEW.md (Reviewing artifacts
+    *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md (Reviewing artifacts
     workflow).*
 
 14. **[Four independent sibling tools now agree — Crush, mf-scan, ALEAPP,
@@ -812,13 +812,13 @@ headers — even though nothing here is a vendored copy the way those files are.
     *Source: Crush (`sqlcipher3`), mf-scan (`src/decrypt/`), ALEAPP
     (`sqlcipher_decrypt.py`), FQLite (`SQLCipherForensicDecryptor.java`).*
 
-15. **[GUI_WORKFLOW_REVIEW.md, depends on item 4] A hash manifest on
+15. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md, depends on item 4] A hash manifest on
     report export** — trivial once CSV/TSV export exists, not worth
     building standalone first.
-    *Source: GUI_WORKFLOW_REVIEW.md / CRUSH_REVIEW.md (Reporting; Crush's
+    *Source: https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md (Reporting; Crush's
     own integrity-mode hash manifest).*
 
-16. **[GUI_WORKFLOW_REVIEW.md, per direct design discussion] Let the four
+16. **[https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md, per direct design discussion] Let the four
     center tabs detach into their own windows** (Qt dock widgets) for real
     multi-monitor support. Doesn't touch any tab's own content or existing
     per-tab state-preservation work, only the container.
@@ -2059,8 +2059,9 @@ headers — even though nothing here is a vendored copy the way those files are.
   center tabs.** Rejected in direct discussion — this project's own
   per-app-specific column richness is exactly what a generic unified
   table would cost, and none of the real navigation gaps found are
-  actually caused by tabs being tabs. See GUI_WORKFLOW_REVIEW.md's own
-  "Window layout" section for the full reasoning.
+  actually caused by tabs being tabs. See
+  https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md
+  ("Window layout") for the full reasoning.
 - **General whole-file "scrap scanning" for unattributed deleted records**
   (FQLite's own core methodology, bottom-up rather than table-first).
   Rejected as a standing feature — no schema to check plausibility

@@ -715,7 +715,10 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
     else:
         metadata_only = set()
 
-    status("Packing snapshot…")
+    # About 75 s for 2.19 million entries (2026-11-21), with no figure to
+    # show: say what it is for, so a long wait is not read as a hang.
+    status(f"Saving the list of {len(ui_metadata):,} files to the case folder, so the next "
+           "open takes seconds (on a big extraction this takes a few minutes)…")
     adapter_args = [ffs_adapter.format, ffs_adapter.user_prefix,
                     ffs_adapter.sys_prefix, ffs_adapter.old_layout]
     snapshot_blob = pack_snapshot(

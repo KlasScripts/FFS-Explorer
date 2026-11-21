@@ -124,3 +124,16 @@ def test_saved_once_and_read_back(tmp_path):
     assert isc.load(db) == r
     (run_type, out), = db.execute("SELECT run_type, output_rows FROM run_log").fetchall()
     assert run_type == isc.RUN_TYPE and out == 1
+
+
+def test_notice_with_signs_leads_with_them_then_the_scope():
+    """Shown at case open only when signs are found (owner, 2026-11-21):
+    the signs come first, then that the app is limited to the user's file
+    locations and the system partition is not in scope."""
+    changed = STOCK_HOSTS + b"0.0.0.0 ocsp.apple.com\n"
+    html = isc.notice_html(_run(OLD, _stock(OLD), hosts=changed))
+    assert html.index("Signs of jailbreaking or sideloading found") < html.index("ocsp.apple.com")
+    assert html.index("ocsp.apple.com") < html.index("Not every file in this extraction is in scope")
+    assert "limited to the user's file locations" in html
+    plain = isc.notice_html(_run(OLD, _stock(OLD)))
+    assert "None found" in plain and "Not every file" not in plain

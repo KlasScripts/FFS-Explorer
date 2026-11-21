@@ -138,6 +138,32 @@ def _mcm_identifier_at(rf, data_offset: int, file_size: int,
         return None, reason + f'; header retry failed ({type(e).__name__})'
 
 
+_APP_CONTAINER_KINDS = frozenset({('Data', 'Application'), ('Data', 'PluginKitPlugin'),
+                                  ('Shared', 'AppGroup')})
+_GUID_NAME_RE = re.compile(
+    r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')
+
+
+def _app_container_plists(zip_names, container_prefix: str) -> list:
+    """The metadata plists of app containers only: <container_prefix>
+    Data/Application, Data/PluginKitPlugin or Shared/AppGroup, then the
+    GUID folder, then the plist directly in it (the folders
+    container_parents() names). On IOS17, iOS 16.5 and IOS18 the only other
+    plists under Containers/ were 5-12 in Data/InternalDaemon (system
+    daemons, never named in the tree), none deeper (2026-11-21)."""
+    meta_name = ".com.apple.mobile_container_manager.metadata.plist"
+    out = []
+    for f in zip_names:
+        if not (f.startswith(container_prefix) and f.endswith(meta_name)):
+            continue
+        parts = f[len(container_prefix):].split('/')
+        if (len(parts) == 4 and parts[3] == meta_name
+                and (parts[0], parts[1]) in _APP_CONTAINER_KINDS
+                and _GUID_NAME_RE.match(parts[2])):
+            out.append(f)
+    return out
+
+
 def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
                            z: zipfile.ZipFile | None = None,
                            container_prefix: str = "",
@@ -161,8 +187,7 @@ def _build_guid_bundle_map(zip_path: str, zip_names: frozenset,
     (zip_name, reason)."""
     meta_name = ".com.apple.mobile_container_manager.metadata.plist"
     if container_prefix:
-        meta_files = [f for f in zip_names
-                      if f.startswith(container_prefix) and f.endswith(meta_name)]
+        meta_files = _app_container_plists(zip_names, container_prefix)
     else:
         meta_files = [f for f in zip_names if f.endswith(meta_name)]
     if not meta_files:

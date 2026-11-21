@@ -324,10 +324,10 @@ class TimestampDisplayMixin:
         neither, so manual selection can be the only non-UTC option at
         all). Reachable from the Tools menu at any time (is_first_load
         stays False there — see the explicit lambda at that connection
-        site, which avoids Qt's own triggered(bool) signal ambiguity);
-        also shown proactively the first time a case is opened (see
-        _start_case_meta_load / _show_timestamp_dialog_when_ready, which
-        passes is_first_load=True).
+        site, which avoids Qt's own triggered(bool) signal ambiguity).
+        Until 2026-11-21 it was also shown the first time a case was
+        opened (is_first_load=True); now a new case shows in UTC and
+        Process Case opens without it (FastZipBrowser._after_case_ready).
 
         is_first_load=True additionally hands off to Process Case once
         this dialog is accepted — added 2026-09-26, direct request

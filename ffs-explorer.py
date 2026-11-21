@@ -29,7 +29,7 @@ import subprocess
 import configparser
 import shutil
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from functools import partial
 from itertools import chain, islice
@@ -1337,8 +1337,8 @@ def _header_tier_counts(items, ffs_adapter, z, with_tier3: bool = False) -> dict
     files = {1: 0, 2: 0, 3: 0} if with_tier3 else {1: 0, 2: 0}
     legacy = {1: 0, 2: 0, 3: len(items)}
     for n, (ui_path, _meta) in enumerate(items):
-        if n % 2000 == 0:
-            time.sleep(0)
+        if n % 2000 == 1999:
+            time.sleep(0.001)   # a real pause: sleep(0) left the GUI waiting
         in_scope = _header_candidate_matches(ui_path, scan_folders, 2, excludes)
         if not in_scope and not with_tier3:
             continue
@@ -9055,6 +9055,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
     # _header_tier_counts' result for the open case, once the background
     # count finishes (an open Process Case dialog listens for it).
     header_tier_counts_ready = Signal(object)
+    # The case-open lane, also used by the media viewer's User Media list:
+    # one busy background thread at a time (_build_tree_when_case_ready).
+    _case_open_pool = _CASE_OPEN_POOL
 
     def __init__(self):
         super().__init__()
@@ -11843,13 +11846,35 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # cached, so each call only touches immediate children.  In arbitrary
         # order the first near-root folder would walk the entire archive in
         # one uninterruptible slot (hundreds of ms for 300k+ entries).
-        self._precompute_folders = sorted(
-            self.folder_map.keys(), key=lambda p: p.count('/'), reverse=True)
+        # The order is worked out in the background (a sort of every folder
+        # path on the window thread), and the tree waits for the counts
+        # (a case-open job, _build_tree_when_case_ready).
+        self._precompute_folders = []
         self._precompute_batch_index = 0
-        self._precompute_counts_batch()
+        self._precompute_done = done = Future()
+        self._track_load_job('folder file counts', done)
+        order = _BG_POOL.submit(lambda fm=self.folder_map: sorted(
+            fm.keys(), key=lambda p: p.count('/'), reverse=True))
+        zip_path = self.zip_path
+
+        def _wait():
+            if self.zip_path != zip_path:
+                done.set_result(None)
+                return
+            if not order.done():
+                QTimer.singleShot(30, _wait)
+                return
+            try:
+                self._precompute_folders = order.result()
+            except Exception:
+                done.set_result(None)
+                return
+            self._precompute_counts_batch()
+        QTimer.singleShot(30, _wait)
 
     def _precompute_counts_batch(self):
         if self.zip_path != self._precompute_zip_path:
+            self._precompute_done.set_result(None)
             return  # archive changed; abort stale callbacks
         folders = self._precompute_folders
         i = self._precompute_batch_index
@@ -11864,6 +11889,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             QTimer.singleShot(0, self._precompute_counts_batch)
         else:
             self._save_folder_counts_to_db()
+            self._precompute_done.set_result(None)
 
     def _save_folder_counts_to_db(self):
         if not self._case_dir:
@@ -11876,7 +11902,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     save_folder_counts(db, counts)
             except Exception:
                 pass
-        _BG_POOL.submit(_save)
+        self._track_load_job('saving folder counts', _CASE_OPEN_POOL.submit(_save))
 
 
     def ensure_and_open_export_dir(self):
@@ -11985,7 +12011,16 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         got = getattr(self, '_folder_names_cache', None)
         if got is not None and got[0] is fm and got[1] == len(fm):
             return got[2]
-        names = list(fm)
+        if threading.current_thread() is threading.main_thread():
+            names = list(fm)
+        else:
+            # a background build pauses every 5,000 folders so the window
+            # gets Python's lock (reading the file table is Python code)
+            names = []
+            for i, k in enumerate(fm):
+                names.append(k)
+                if i % 5000 == 4999:
+                    time.sleep(0.001)
         self._folder_names_cache = (fm, len(fm), names)
         return names
 
@@ -13554,7 +13589,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     p = p.rsplit('/', 1)[0] if '/' in p else ''
             self._save_folder_counts_to_db()
         elif len(self._file_count_cache) < len(self.folder_map):
-            QTimer.singleShot(300, self._start_precompute_folder_counts)
+            self._start_precompute_folder_counts()
         # LevelDB/IndexedDB indexing for Keyword Search — moved
         # 2026-10-12 from an automatic QTimer.singleShot fired right
         # here into an explicit Process Case stage (see ProcessDialog's
@@ -13571,35 +13606,75 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         Before 2026-11-03 the tree came first and those jobs ran beside it
         and beside whatever the examiner started next (Process Case), all
         contending for one Python lock. Dropped if another case is opened
-        meanwhile."""
+        meanwhile.
+
+        Every job is waited for (2026-11-21, the examiner's choice: all
+        background work done before the tree): also the User Media list,
+        the folder list, the folder file counts and their save, and the
+        archive checks worker (the iOS system check), whose work beside the
+        new case's dialogs stuttered the window up to 1.9 s on 2.19
+        million entries. Then _after_case_ready shows what comes next."""
         metadata = self.full_metadata
-        jobs = getattr(self, '_load_jobs', {})
-        # The User Media list belongs to the bookmark panel, not the tree.
-        waiting_for = {n: f for n, f in jobs.items() if n != 'User Media list'}
 
         def _poll():
             if self.full_metadata is not metadata:
                 return
-            busy = [n for n, f in waiting_for.items() if not f.done()]
+            # read on every poll: applying the case results
+            # (_start_case_meta_load) starts the User Media list
+            busy = self._load_jobs_running()
+            if getattr(self, '_case_meta_applied', None) is not metadata and self._case_dir:
+                busy.append('case results')
+            if not getattr(self, '_worker_done', True):
+                busy.append('archive checks')
             if busy:
                 self.status_bar.showMessage(
-                    "Preparing case: " + ", ".join(busy) + "…")
+                    "Preparing case: " + ", ".join(dict.fromkeys(busy)) + "…")
                 QTimer.singleShot(50, _poll)
                 return
+            self._warn_missing_plists(missing_plist_paths)
             self.reload_tree_entirely()
             self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
-            self._warn_missing_plists(missing_plist_paths)
+            self._after_case_ready(metadata)
         _poll()
 
+    def _after_case_ready(self, metadata) -> None:
+        """Once the tree is in (and no other dialog is open): on a new case
+        Process Case opens (_open_process_dialog_for_new_case), with the
+        iOS System Check first if it found signs of jailbreaking; on an
+        older case the System Check shows only if it found signs and has
+        not been shown. Times show in UTC; Tools ▸ Timestamp Display
+        changes that (no first-load prompt since 2026-11-21)."""
+        if self.full_metadata is not metadata:
+            return
+        if not getattr(self, '_tree_done', True) or QApplication.activeModalWidget() is not None:
+            QTimer.singleShot(100, lambda: self._after_case_ready(metadata))
+            return
+        if getattr(self, '_new_case_first_load', False):
+            self._new_case_first_load = False
+            self._open_process_dialog_for_new_case()
+        elif getattr(self, '_system_notice_pending', False):
+            self._show_system_check_dialog()
+
     def _warn_missing_plists(self, missing_plist_paths):
-        if missing_plist_paths:
-            # Only warn about UUID folders that actually have content in the zip.
-            # Metadata-only or empty folders have no extractable files so the
-            # missing plist does not affect the user.
-            actionable = [p for p in missing_plist_paths
-                          if self._folder_total_size(p) > 0]
-            if actionable:
-                self._warn_and_select_missing(actionable)
+        """Note app container folders still without a bundle id, with
+        content, on the "Loaded" message (_on_tree_loaded): they are shown
+        by their GUID, and listed in the startup log. Until 2026-11-21 a
+        warning dialog said so and ticked them; dropped (owner): the
+        LaunchServices and App Group sources name nearly every one
+        (A-76), so the dialog was almost always about nothing useful."""
+        actionable = [p for p in (missing_plist_paths or ())
+                      if self._folder_total_size(p) > 0]
+        self._unnamed_containers_note = (
+            f"  ·  {len(actionable):,} app folder{'s' if len(actionable) != 1 else ''} "
+            "could not be named, shown by GUID (see the log)" if actionable else '')
+        if actionable:
+            import startup_log
+            startup_log.message('warning', f"{len(actionable):,} app container folder(s) "
+                                "with content have no bundle id; shown by GUID:\n  "
+                                + "\n  ".join(sorted(actionable)[:200])
+                                + (f"\n  …and {len(actionable) - 200:,} more"
+                                   if len(actionable) > 200 else ''))
+
 
     def _start_header_tier_count(self, with_tier3: bool | None = None):
         """Count each header-scan tier's files once per case, on the
@@ -13722,7 +13797,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._track_load_job('file types and case results', fut)
         # The folder list a big tick reads (_all_folder_names), built now so
         # ticking a large branch never has to.
-        _BG_POOL.submit(self._all_folder_names)
+        # on the case-open lane, one job at a time: several busy Python
+        # threads at once starved the window of Python's lock for up to
+        # 8.7 s on a first open of 2.19 million entries (2026-11-21)
+        self._track_load_job('folder list', _CASE_OPEN_POOL.submit(self._all_folder_names))
 
         def _poll():
             if my_seq != self._case_meta_seq:
@@ -13775,21 +13853,22 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             # 2026-10-17: CTF26 showed "User Media (1,294)" but clicking
             # it selected 3,913 files; reproduced exactly (0 overrides →
             # 1,294; 5,049 overrides loaded → 3,913). Recount now.
-            self._refresh_bookmark_panel()
-            if is_first_load:
-                # Surface the choice proactively on a brand-new case rather
-                # than leaving it undiscovered behind the Tools menu — the
-                # menu item (_timestamp_display_dialog) stays available to
-                # revisit this at any later time too.
-                self._show_timestamp_dialog_when_ready(my_seq)
+            self._refresh_bookmark_panel()     # starts the User Media list
+            # A new case: Process Case opens once the tree is in
+            # (_after_case_ready). Times show in UTC; the Timestamp Display
+            # dialog is no longer shown first (owner, 2026-11-21), it stays
+            # in the Tools menu.
+            self._new_case_first_load = is_first_load
+            self._case_meta_applied = self.full_metadata
 
         QTimer.singleShot(10, _poll)
 
     def _on_system_check_ready(self, result, is_new: bool, seq: int) -> None:
-        """ios_system_check's result arrived (ZipMetadataWorker). Shown once
-        per case (case_settings NOTICE_SETTING), waiting for any other modal
-        dialog to close; on a new case _open_process_dialog_for_new_case
-        shows it before Process Case."""
+        """ios_system_check's result arrived (ZipMetadataWorker). Shown at
+        case open only when it found signs of jailbreaking or sideloading
+        (owner, 2026-11-21), once per case (case_settings NOTICE_SETTING),
+        after the tree is in (_after_case_ready; before Process Case on a
+        new case). Otherwise only from Tools ▸ iOS System Check."""
         import ios_system_check
         if seq != getattr(self, '_system_check_seq', 0):
             return   # a newer archive load superseded this one
@@ -13804,18 +13883,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             shown = ''
         if shown == ios_system_check.LOGIC_VERSION:
             return
-        self._system_notice_pending = True
-        QTimer.singleShot(0, lambda: self._show_system_check_when_ready(seq))
-
-    def _show_system_check_when_ready(self, seq: int) -> None:
-        """Same waiting rule as _show_timestamp_dialog_when_ready: never on
-        top of another modal dialog."""
-        if seq != getattr(self, '_system_check_seq', 0) or not self._system_notice_pending:
-            return
-        if QApplication.activeModalWidget() is not None or not self._metadata_ready_fired:
-            QTimer.singleShot(200, lambda: self._show_system_check_when_ready(seq))
-            return
-        self._show_system_check_dialog()
+        self._system_notice_pending = ios_system_check.has_findings(result)
 
     def _show_system_check_dialog(self) -> None:
         """What this case does not show, and the jailbreak/sideloading check
@@ -13851,46 +13919,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         lay.addLayout(row)
         dlg.resize(640, 520 if ios_system_check.has_findings(result) else 440)
         dlg.exec()
-
-    def _show_timestamp_dialog_when_ready(self, seq: int):
-        """Show the proactive first-load Timestamp Display dialog now that
-        background detection has actually finished, deferring only if
-        another modal is currently blocking (e.g. the missing-plist
-        integrity warning, _warn_and_select_missing) so the two can never
-        stack unexpectedly on top of each other. *seq* is the
-        _case_meta_seq snapshot from the load that triggered this — same
-        staleness guard _poll() itself uses, checked again on every deferred
-        retry (not just the initial call) since a retry can span an
-        arbitrarily long wait for another modal to clear, during which a
-        DIFFERENT case could in principle have been opened; bails quietly
-        rather than showing a case-A-triggered dialog against whatever
-        case is current by the time a modal finally clears.
-
-        Previously fired after an unconditional QTimer.singleShot(200, ...)
-        — a guess that OTHER unrelated pre-render (tree population via
-        _populate_tree_children_batched, _refresh_artifact_tab, the
-        device-label fetch, folder-count precompute) would have settled by
-        then. None of those have any actual bearing on this dialog — it
-        never reads tree/artifact state — so the 200ms was never a real
-        dependency, only a coincidence that happened to hold on a fast dev
-        machine. On a slower cold start (a frozen Windows build especially
-        — exe unpacking, antivirus scanning, slower disk I/O for the
-        tree's zip reads) those unrelated stages routinely took far longer
-        than 200ms, so the dialog would pop up modally while they were
-        still visibly running underneath it (a nested Qt event loop from
-        .exec() still processes their queued QTimer callbacks) — looking
-        like the app had hung right as everything else appeared to
-        finish. See the "Proactive first-load trigger race" note under
-        Timestamp Display in CLAUDE.md's Conventions section for the full
-        incident writeup."""
-        if seq != self._case_meta_seq:
-            return  # a newer archive load superseded the one that queued this
-        if QApplication.activeModalWidget() is not None:
-            QTimer.singleShot(50, lambda: self._show_timestamp_dialog_when_ready(seq))
-            return
-        self._timestamp_display_dialog(is_first_load=True)
-
-    # ── AI access (embedded MCP server) ───────────────────────────────────────
 
     def _recompute_meta_col_keys(self, data: dict | None = None) -> None:
         """Which _META_COL_HEADERS keys this archive's metadata carries —
@@ -15213,47 +15241,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._refresh_folder_view(
                 preserve_filter=preserve_filter, select_path=select_path)
 
-    def _warn_and_select_missing(self, paths):
-        from PySide6.QtWidgets import QMessageBox
-        count = len(paths)
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Archive Integrity Warning")
-        msg.setIcon(QMessageBox.Icon.Warning)
-        msg.setText(
-            f"{count} UUID folder{'s' if count != 1 else ''} "
-            f"{'are' if count != 1 else 'is'} missing the expected\n"
-            f".com.apple.mobile_container_manager.metadata.plist file.\n\n"
-            f"This may indicate a corrupt or incomplete download. The bundle ID\n"
-            f"cannot be resolved for these folders — they are displayed using\n"
-            f"their raw UUID. The affected folders have been selected so you\n"
-            f"can press \"Show Selected Items\" to review them."
-        )
-        msg.setDetailedText("\n".join(sorted(paths)))
-        msg.exec()
-        self._tick_items_by_path(set(paths))
-
-    def _tick_items_by_path(self, path_set):
-        """Check the tree item for every path in path_set.
-        Descends only the branches needed, loading lazily as it goes."""
-        # Record in the checked set first — the tree walk below only updates
-        # the visual state of items it can reach.
-        self._checked_folders.update(p for p in path_set if p in self.folder_map)
-        for path in path_set:
-            self._tick_single_path(path)
-        self.tree_view.viewport().update()
-        self._rebuild_file_view_from_checked()
-        # Keep "Selected only" in sync — added 2026-09-26 alongside what
-        # used to be _select_bookmark_group_files (folded into
-        # _replace_selection_from_bookmark_entries 2026-10-01), but
-        # applies to every caller (including the pre-existing missing-
-        # bundle-ID warning flow):
-        # any direct _checked_folders mutation should update the
-        # "Selected Only" tree branch the same way an ordinary checkbox
-        # click already does via _deferred_rebuild.
-        self._selected_only_scope = self._compute_selected_only_scope()
-        self._sync_selected_only_after_scope_change()
-        self._refresh_file_checked_paths()
-
     def _tick_single_path(self, target_path):
         """Navigate to target_path in the tree, loading lazily, and
         visually sync its checkbox to its CURRENT authoritative state
@@ -15447,7 +15434,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._maybe_hide_load_progress()
         elapsed = time.monotonic() - getattr(self, '_load_start', time.monotonic())
         self.status_bar.showMessage(
-            f"Loaded: {os.path.basename(self.zip_path)}  —  {elapsed:.1f}s")
+            f"Loaded: {os.path.basename(self.zip_path)}  —  {elapsed:.1f}s"
+            + getattr(self, '_unnamed_containers_note', ''))
         if hasattr(self, '_adapter') and self._adapter.format == FfsAdapter.FORMAT_GRAYKEY:
             QTimer.singleShot(0, self._expand_to_private_var)
         QTimer.singleShot(0, self._fit_splitter_to_tree)

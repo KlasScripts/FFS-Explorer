@@ -1903,7 +1903,11 @@ class MediaViewerMixin:
         # for 830k entries), or the file table's cheap copy (file_table.py),
         # whose paths are read in full only by the worker
         keys = metadata.copy() if hasattr(metadata, 'table') else list(metadata)
-        fut = _USER_MEDIA_POOL.submit(self._user_media_paths, keys)
+        # the panel's list is built on the case-open lane when the window
+        # has one, after the other case-open jobs, not beside them
+        pool = (getattr(self, '_case_open_pool', None) or _USER_MEDIA_POOL
+                if purpose == 'panel' else _USER_MEDIA_POOL)
+        fut = pool.submit(self._user_media_paths, keys)
         if purpose == 'panel' and hasattr(self, '_track_load_job'):
             self._track_load_job('User Media list', fut)
 

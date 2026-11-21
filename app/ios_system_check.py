@@ -271,12 +271,59 @@ def load(results_db) -> dict | None:
 NOTICE_SETTING = "ios_system_notice_shown"   # case_settings: LOGIC_VERSION once shown
 
 
+def _signs_list_html(result: dict, escape) -> list:
+    parts = ["<ul>"]
+    for h in result["signs"]:
+        more = f" ({h['entries']:,} entries)" if h["entries"] > 1 else ""
+        parts.append(f"<li><code>{escape(h['path'])}</code>: {escape(h['what'])}{more}<br>"
+                     f"<small>in the archive as <code>{escape(h['example'])}</code></small></li>")
+    extra_hosts = (result.get("hosts") or {}).get("extra_lines") or []
+    if extra_hosts:
+        lines = "<br>".join(f"<code>{escape(l)}</code>" for l in extra_hosts[:20])
+        more = f"<br>…and {len(extra_hosts) - 20} more" if len(extra_hosts) > 20 else ""
+        parts.append(f"<li><code>/etc/hosts</code> has lines a stock iPhone does not have "
+                     f"(they redirect or block web addresses):<br>{lines}{more}</li>")
+    parts.append("</ul>")
+    return parts
+
+
+def _findings_html(result: dict, escape) -> str:
+    """The dialog when signs were found: the only time it is shown at case
+    open (owner, 2026-11-21). The signs first, then what the case leaves
+    out."""
+    n_sys = result["system_entries"]
+    parts = ["<h3 style='color:#b00020'>Signs of jailbreaking or sideloading found</h3>",
+             f"<p>{result['checked'] - 1} known locations were checked in both partitions, and "
+             "<code>/etc/hosts</code> was read. These are signs, not proof: a file can be left "
+             "from an earlier jailbreak, a security tool or the extraction itself. Examine them "
+             "with another tool and record what you find.</p>"]
+    parts += _signs_list_html(result, escape)
+    parts.append("<p><b>Not every file in this extraction is in scope.</b> FFS Explorer is "
+                 "limited to the user's file locations (the user partition). ")
+    if n_sys:
+        parts.append(f"The {n_sys:,} entries of the iOS system partition (<code>/System</code>, "
+                     "<code>/Applications</code>, <code>/usr</code>, <code>/etc</code>…) are not "
+                     "listed in the File Browser, not processed and not found by Keyword Search. "
+                     "On a jailbroken phone that partition can hold changes and tools that matter: "
+                     "they are still in the archive, so examine it with another tool.</p>")
+    else:
+        parts.append("This extraction holds no files from the iOS system partition, where a "
+                     "jailbreak's changes and tools are usually kept.</p>")
+    parts.append("<p><small>The result is saved in the case's run log "
+                 "(<code>ios_system_check</code>). Tools ▸ iOS System Check shows this again. "
+                 "Locations checked: OWASP MASTG jailbreak-detection paths, rootless "
+                 "jailbreak folders, package managers and TrollStore (ASSUMPTIONS.md A-83).</small></p>")
+    return "".join(parts)
+
+
 def notice_html(result: dict) -> str:
     """The dialog text: what this case does not show, and what the check
     found. Plain language for the examiner; every number is from *result*."""
     from html import escape
     cov = coverage_label(result)
     n_sys = result["system_entries"]
+    if has_findings(result):
+        return _findings_html(result, escape)
     parts = ["<h3>What FFS Explorer does not show in this case</h3>"]
 
     parts.append("<p><b>1. The iOS system partition is left out.</b><br>")
@@ -290,40 +337,23 @@ def notice_html(result: dict) -> str:
         parts.append("This extraction holds no files from it, so nothing is left out here; "
                      "but nothing from it could be checked either.</p>")
 
-    signs = result["signs"]
-    extra_hosts = (result.get("hosts") or {}).get("extra_lines") or []
     parts.append("<p><b>2. Signs of jailbreaking or sideloading</b> are the main reason to look "
                  f"there, so {result['checked'] - 1} known locations were checked in both "
                  "partitions, and <code>/etc/hosts</code> was read.</p>")
-    if signs or extra_hosts:
-        parts.append("<p style='color:#b00020'><b>Signs found.</b> These are signs, not proof: a file "
-                     "can be left from an earlier jailbreak, a security tool or the extraction "
-                     "itself. Examine them with another tool and record what you find.</p><ul>")
-        for h in signs:
-            more = f" ({h['entries']:,} entries)" if h["entries"] > 1 else ""
-            parts.append(f"<li><code>{escape(h['path'])}</code>: {escape(h['what'])}{more}<br>"
-                         f"<small>in the archive as <code>{escape(h['example'])}</code></small></li>")
-        if extra_hosts:
-            lines = "<br>".join(f"<code>{escape(l)}</code>" for l in extra_hosts[:20])
-            more = f"<br>…and {len(extra_hosts) - 20} more" if len(extra_hosts) > 20 else ""
-            parts.append(f"<li><code>/etc/hosts</code> has lines a stock iPhone does not have "
-                         f"(they redirect or block web addresses):<br>{lines}{more}</li>")
-        parts.append("</ul>")
+    parts.append("<p><b>None found.</b> ")
+    if cov == "full":
+        parts.append("This extraction holds the system partition, so all the locations "
+                     "could be checked")
+        parts.append(", and <code>/etc/hosts</code> is the stock file." if result.get("hosts")
+                     else ", but <code>/etc/hosts</code> is not in it.")
     else:
-        parts.append("<p><b>None found.</b> ")
-        if cov == "full":
-            parts.append("This extraction holds the system partition, so all the locations "
-                         "could be checked")
-            parts.append(", and <code>/etc/hosts</code> is the stock file." if result.get("hosts")
-                         else ", but <code>/etc/hosts</code> is not in it.")
-        else:
-            missing = [f"<code>/{f}</code>" for f, n in result["coverage"].items() if not n]
-            parts.append(f"But this extraction holds {'only part' if cov == 'partial' else 'none'} "
-                         f"of the system partition (no {', '.join(missing)}), so most of the "
-                         "locations could not be checked")
-            parts.append("." if result.get("hosts") else ", and <code>/etc/hosts</code> is not in it.")
-        parts.append(" Finding nothing does not prove the phone was never jailbroken: "
-                     "a jailbreak can be removed.</p>")
+        missing = [f"<code>/{f}</code>" for f, n in result["coverage"].items() if not n]
+        parts.append(f"But this extraction holds {'only part' if cov == 'partial' else 'none'} "
+                     f"of the system partition (no {', '.join(missing)}), so most of the "
+                     "locations could not be checked")
+        parts.append("." if result.get("hosts") else ", and <code>/etc/hosts</code> is not in it.")
+    parts.append(" Finding nothing does not prove the phone was never jailbroken: "
+                 "a jailbreak can be removed.</p>")
 
     parts.append("<p><small>The result is saved in the case's run log "
                  "(<code>ios_system_check</code>). Tools ▸ iOS System Check shows this again. "

@@ -888,7 +888,7 @@ order.** *Decision, 2026-10-12; the numbering is Code only.*
     chrome_cache_media, chrome_favicons, chrome_offline_pages); only iOS SMS
     has been checked on real data;
   - the other 30 parsers declare none; any that reference files need it.
-  Tracked in IDEAS.md idea 4; the rule for new parsers is in
+  Tracked in https://github.com/KlasScripts/ffs-notes/blob/main/ISSUES.md; the rule for new parsers is in
   WRITING_ARTIFACT_PARSERS.md (`media_fields`).
 - *Fixed 2026-10-22, verified on all six test archives:*
   - GrayKey iOS: paths built from `mobile/...` (SMS attachments, Photos)

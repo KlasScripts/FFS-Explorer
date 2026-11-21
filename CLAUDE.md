@@ -28,7 +28,8 @@ section map below instead of reading it whole.
 | `CLAUDE.md` (this file) | Code map and coding rules only. No facts or decision history. |
 | `WRITING_ARTIFACT_PARSERS.md` | How to write a parser, with examples. |
 | `VERIFICATION_STATUS.md` | Which parts a human has reviewed. |
-| `IDEAS.md` | Ideas not yet scheduled, with evidence and sketches. Not decisions. |
+| **Issue log** (ffs-notes repo) | **Open bugs, features, and ideas.** GitHub issues on `KlasScripts/ffs-notes`, plus the `ISSUES.md` inbox there. See "Issue log" below. |
+| `IDEAS.md` | Older ideas with evidence and sketches. Read for evidence; open work is tracked in the issue log. |
 | `FFS_processing.md` | Older processing walkthrough; `ASSUMPTIONS.md` §17 lists its known errors. |
 
 **`ASSUMPTIONS.md` is read-only.**
@@ -319,6 +320,30 @@ human has walked through and confirmed (🔴 not reviewed / 🟡 changed since /
 - **Before editing a file or `ffs-explorer.py` section listed as 🟢**, name
   the row and its date first, so the user can decide whether to re-review.
 - A real functional change to a 🟢 row should drop it to 🟡.
+
+## Issue log (instruction to Claude, on the Mac and the PC)
+
+Open work is tracked as GitHub issues on `KlasScripts/ffs-notes`. Each title
+starts with its id, for example "B-01 Opening a case hangs the window".
+`ISSUES.md` in that repo is an inbox: Cursor adds new entries there, and they
+are then turned into GitHub issues and deleted from the inbox. Use `gh`.
+`ffs-notes/CLAUDE.md` has the conversion steps.
+
+- **Start of a session on FFS-Explorer:** check the `ISSUES.md` inbox, for
+  example with `gh api repos/KlasScripts/ffs-notes/contents/ISSUES.md --jq
+  .content | base64 -d`. If entries are waiting under `## New`, tell Klas and
+  offer to move them to GitHub issues.
+- **Before starting a task:** look for an open issue that covers it
+  (`gh issue list -R KlasScripts/ffs-notes --search "<words>"`) and name it.
+- **When the session fixes an issue:** say "We fixed B-xx (#N). Should I
+  close it?" Close it only on a yes, with one line on what shipped and the
+  commit or version.
+- **When something comes up that will not be done now:** say "Shall I add
+  this as an issue?" On a yes, create it with the next free id and raise the
+  "Next free ids" line in `ISSUES.md`.
+- **When an idea is rejected:** ask before closing its issue as not planned,
+  with one line on why.
+- Do not keep a second list of open work in this repo.
 
 ## Conventions (coding rules)
 

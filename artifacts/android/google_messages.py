@@ -1,21 +1,11 @@
 name = "Google Messages (SMS/MMS/RCS)"
 description = ("Messages from Google Messages' local database (bugle_db, "
-              "tables parts/messages), live rows plus anything freeblocks/"
-              "freed pages/WAL history/header-signature scanning recovers "
-              "from those same tables — merged into this report, since "
-              "it's all one source. Checked, not skipped: on the "
-              "extraction this was built against, bugle_db has "
-              "PRAGMA secure_delete = FAST set, which actively zeroes "
-              "freed page bytes at delete time rather than leaving them as "
-              "recoverable garbage — confirmed by inspecting the freed "
-              "page ranges directly (all zero bytes) on a database known "
-              "to have a deleted conversation. A genuine negative for this "
-              "carving technique specifically, not evidence nothing was "
-              "ever deleted: see the \"Google Messages — Recovered "
-              "(deleted conversations)\" report, which recovers "
-              "conversation-level metadata (who, when) for a fully "
-              "deleted conversation through a different mechanism — "
-              "surviving audit-log tables, not byte carving."
+              "tables parts/messages), live rows only: deleted and changed "
+              "records are in \"Google Messages — Deleted & Changed Records\" "
+              "(2026-11-21), and conversation-level metadata (who, when) for "
+              "a fully deleted conversation, from surviving audit-log "
+              "tables, in \"Google Messages — Recovered (deleted "
+              "conversations)\"."
               " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from conversation_participants; the owner's own number per message from messages.self_id. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.google.android.apps.messaging"
 files = {
@@ -29,9 +19,6 @@ optional_files = {
     "bugle_db_shm": "databases/bugle_db-shm",
 }
 
-# Declarative only — no recovery code belongs here; see description above
-# for what was actually found.
-recoverable_tables = ["messages", "parts"]
 
 # Raw values (never a formatted string) so the Report table can display
 # them per the case's timestamp-display setting. "date" is this module's

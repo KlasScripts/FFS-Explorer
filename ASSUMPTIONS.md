@@ -725,8 +725,8 @@ type and length, so no knowledge of the app or table is needed.
   - Known limit: a deleted photo big enough to have needed overflow pages
     is not recovered.
   - Known limit: a single-row `DELETE` on a page that's still in use is not
-    recovered without the table's schema; per-app `recoverable_tables`
-    parsers cover that.
+    recovered without the table's schema; the per-app deleted-records
+    reports (`report_type = "recovered_records"`) cover that.
 - **plist:** NSData values are checked, including a bplist nested inside an
   NSData (real in iOS `_atsContext`-style fields).
 - **HTTP-wrapped blobs:** a stored HTTP response is unwrapped (headers
@@ -1306,6 +1306,12 @@ default.** *Decision (owner, 2026-11-16).*
   turned into words (`labels`, `derived`) only where checked against ground
   truth. First: `artifacts/ios/line_deleted_messages.py` (both documented
   deletions on the Josh Hickman iOS 17 image recovered).
+- *Decision (owner, 2026-11-21):* a main report holds live rows only.
+  Deleted and older records are in a separate `recovered_records` report
+  per app, covering its message table and its media/attachment tables,
+  which can't be reliably linked to each other. `recoverable_tables` is
+  retired: it carved on every run (23.9 s of 74 s for 500,000 WhatsApp
+  messages).
 - Rows of DROPPED tables are not recovered. *Decision (owner, 2026-11-17):*
   phone apps delete, update and insert rows; dropping a table is rare (e.g.
   a schema migration). FQLite 5.21 recovers them (corpus 0A: 99/100).

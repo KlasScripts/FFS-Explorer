@@ -138,7 +138,8 @@
       "app": "Google Messages"
     },
     "groupme": {
-      "category": "Chats & Messaging"
+      "category": "Chats & Messaging",
+      "app": "GroupMe"
     },
     "line": {
       "category": "Chats & Messaging",
@@ -185,7 +186,8 @@
       "category": "Usage & Activity"
     },
     "viber": {
-      "category": "Chats & Messaging"
+      "category": "Chats & Messaging",
+      "app": "Viber"
     },
     "whatsapp": {
       "category": "Chats & Messaging",
@@ -194,6 +196,30 @@
     "whatsapp_poll_votes": {
       "category": "Chats & Messaging",
       "app": "WhatsApp"
+    },
+    "whatsapp_deleted": {
+      "category": "Chats & Messaging",
+      "app": "WhatsApp"
+    },
+    "google_messages_deleted": {
+      "category": "Chats & Messaging",
+      "app": "Google Messages"
+    },
+    "line_deleted": {
+      "category": "Chats & Messaging",
+      "app": "LINE"
+    },
+    "viber_deleted": {
+      "category": "Chats & Messaging",
+      "app": "Viber"
+    },
+    "groupme_deleted": {
+      "category": "Chats & Messaging",
+      "app": "GroupMe"
+    },
+    "chrome_deleted_history": {
+      "category": "Browsers",
+      "app": "Chrome"
     }
   },
   "ios": {
@@ -210,13 +236,15 @@
       "category": "Media & Files"
     },
     "sms_messages": {
-      "category": "Chats & Messaging"
+      "category": "Chats & Messaging",
+      "app": "Messages"
     },
     "timezone_report": {
       "category": "Device & App Info"
     },
     "whatsapp": {
-      "category": "Chats & Messaging"
+      "category": "Chats & Messaging",
+      "app": "WhatsApp"
     },
     "wifi_known_networks": {
       "category": "Device & App Info"
@@ -231,6 +259,14 @@
     },
     "life360_deleted_messages": {
       "category": "Chats & Messaging"
+    },
+    "whatsapp_deleted": {
+      "category": "Chats & Messaging",
+      "app": "WhatsApp"
+    },
+    "sms_deleted": {
+      "category": "Chats & Messaging",
+      "app": "Messages"
     }
   }
 }

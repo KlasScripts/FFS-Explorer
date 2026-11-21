@@ -1,20 +1,12 @@
 name = "Burner"
 description = ("Messages from Burner's primary local message store "
               "(com.adhoclabs.burner.messages.db, table DbMessage), live rows "
-              "plus anything DbMessage's own freeblocks/freed pages/WAL "
-              "history/header-signature scan recovers — merged into this same "
-              "report, not a separate one, since it's the same source. Checked, "
-              "not skipped: on the extraction this was built against, DbMessage "
-              "has no WAL at all and carving its live pages found nothing "
-              "recoverable — a real negative, not an unexamined gap. Field-by-"
-              "field validated against documented ground truth; no known "
-              "reliability issues. A SEPARATE database (burnerDatabase.db) "
-              "keeps its own redundant copy of some of this same content under "
-              "a different table (MessageEntity) and, on that same extraction, "
-              "retained one message via WAL history that this database had "
-              "already lost entirely — reported separately, not here, because "
-              "it's a genuinely different source with a different confidence "
-              "level: see the \"Burner — Recovered (MessageEntity)\" report."
+              "only: deleted and changed records of this table and of "
+              "burnerDatabase.db's MessageEntity (a separate store that, on "
+              "the extraction this was built against, kept one message this "
+              "database had lost) are in \"Burner — Deleted & Changed "
+              "Records\" (2026-11-21). Field-by-field validated against "
+              "documented ground truth; no known reliability issues."
               " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from always 1:1: the contact, or the burner number the message arrived on. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.adhoclabs.burner"
 files = {
@@ -31,13 +23,6 @@ optional_files = {
     "messages_shm": "databases/com.adhoclabs.burner.messages.db-shm",
 }
 
-# Declarative only — no recovery code belongs here. DbMessage genuinely has
-# nothing recoverable on this extraction (no WAL, and carving its live
-# pages found nothing — see description above), but the declaration stays:
-# on a different extraction, where this same table might actually have
-# recoverable content, this is what makes it surface automatically instead
-# of requiring another one-off investigation.
-recoverable_tables = ["DbMessage"]
 
 # Lets the Artifact Viewer's Hex-panel "Record" mode jump straight to this
 # row's own on-disk cell in com.adhoclabs.burner.messages.db (see

@@ -4,17 +4,9 @@ description = ("Messages from iOS's SMS/iMessage database (sms.db, table "
               "with attributedBody (typedstream) decoded as a fallback for "
               "rows whose plain-text `text` column is empty — edited "
               "messages and several share-link message types store their "
-              "content only there. Live rows plus anything freeblocks/freed "
-              "pages/WAL history/header-signature scanning recovers from "
-              "the same table, merged into this same report. Checked, not "
-              "skipped: on the extraction this was built against, sms.db "
-              "has PRAGMA secure_delete = FAST set, which actively zeroes "
-              "freed page bytes at delete time — confirmed by inspecting "
-              "the freed ranges directly (all zero) on a database with two "
-              "confirmed-deleted messages old enough to have fully expired "
-              "past Apple's own recovery mechanism (below). A real negative "
-              "for carving specifically, not evidence nothing was deleted. "
-              "Separately, and NOT byte carving: iOS 16+ keeps a message "
+              "content only there. Live rows only: deleted and changed "
+              "records are in \"SMS & iMessage — Deleted & Changed Records\" "
+              "(2026-11-21). iOS 16+ keeps a message "
               "deleted from a conversation (but not yet past its ~30-40 day "
               "retention window) fully intact in this same `message` table "
               "— it's simply no longer linked via chat_message_join, "
@@ -27,10 +19,8 @@ description = ("Messages from iOS's SMS/iMessage database (sms.db, table "
               "against, one message deleted ~6 hours before the extraction "
               "was still present this way; two older ones (deleted ~6+ "
               "months prior) were fully expired from both this table and "
-              "Apple's own recoverable-message tables, and only checkable "
-              "via carving (see above — genuinely gone). Two further "
-              "confirmed limitations, checked directly on this extraction, "
-              "not carving-related and not covered by recoverable_tables: "
+              "Apple's own recoverable-message tables. Two further "
+              "confirmed limitations, checked directly on this extraction: "
               "(1) editing a message overwrites `text`/`attributedBody` in "
               "place — `edited_at` on a row means the CURRENT text is "
               "shown, the pre-edit version is gone from this table with no "
@@ -55,11 +45,6 @@ optional_files = {
     "sms_shm": "sms.db-shm",
 }
 
-# Declarative only — no recovery code belongs here; see description above
-# for what was actually found (a real negative for carving specifically —
-# the SQL-level recently-deleted-window recovery above is handled in run()
-# directly, since it's a live join, not carved content).
-recoverable_tables = ["message"]
 
 # Raw values (never a formatted string) so the Report table can display
 # them per the case's timestamp-display setting. The first six are this

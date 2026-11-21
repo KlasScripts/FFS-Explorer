@@ -1,13 +1,12 @@
 name = "Viber"
 description = ("Messages from Viber's local database (viber_messages, table "
-              "messages), live rows plus anything freeblocks/freed pages/WAL "
-              "history/header-signature scanning recovers — merged into this "
-              "same report, since it's all one source. On the extraction this "
-              "was built against a known 'sent, then deleted' test message is "
-              "genuinely absent — not present as bytes anywhere in the main "
-              "db, WAL, or SHM files, checked rather than assumed. Field-by-"
-              "field validated against documented ground truth; no known "
-              "reliability issues."
+              "messages), live rows only: deleted and changed records are in "
+              "\"Viber — Deleted & Changed Messages\" (2026-11-21). On the "
+              "extraction this was built against a known 'sent, then deleted' "
+              "test message is genuinely absent — not present as bytes anywhere "
+              "in the main db, WAL, or SHM files, checked rather than assumed. "
+              "Field-by-field validated against documented ground truth; no "
+              "known reliability issues."
               " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from participants (participant_type 0 is the device owner). This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.viber.voip"
 files = {
@@ -22,11 +21,6 @@ optional_files = {
     "viber_messages_shm": "databases/viber_messages-shm",
 }
 
-# Declarative only — no recovery code belongs here; see description above
-# for what was actually found. artifact_runner.py reads this after run()
-# returns and, on its own, looks for deleted rows of this table (see
-# app/sqlite_carve.py), appending anything found as extra rows.
-recoverable_tables = ["messages"]
 
 # Raw values (never a formatted string) so the Report table can display
 # them per the case's timestamp-display setting (UTC/handset/acquisition —

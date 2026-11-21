@@ -1,21 +1,11 @@
 name = "Line"
 description = ("Messages from LINE's local database (naver_line, table "
-              "chat_history), live rows plus anything freeblocks/freed pages/"
-              "WAL history/header-signature scanning recovers from that same "
-              "table — merged into this report, since it's all one source. "
-              "Checked, not skipped: on the extraction this was built "
-              "against naver_line has no WAL at all and carving its live "
-              "pages found nothing recoverable, a real negative. A "
-              "SEPARATE database (unencrypted_test_full_text_search_message."
-              "db) keeps a full-text-search index of message bodies and, on "
-              "that same extraction, retained one deleted message's text via "
-              "WAL history that this database had already lost entirely — "
-              "reported separately, not here, because that index carries no "
-              "timestamp or direction for a row, only text and which "
-              "conversation it belongs to: see the \"LINE — Recovered "
-              "(full-text search index)\" report. Field-by-field validated "
-              "against documented ground truth; no known reliability "
-              "issues on the fields this report does carry."
+              "chat_history), live rows only: deleted and changed records are "
+              "in \"LINE — Deleted & Changed Messages\" (2026-11-21), and "
+              "messages kept only in LINE's separate full-text-search index "
+              "in \"LINE — Recovered (full-text search index)\". Field-by-"
+              "field validated against documented ground truth; no known "
+              "reliability issues on the fields this report does carry."
               " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from chat_member for groups; a 1:1 chat's id is the peer; the owner has no id in this database, so \"Me\". This is membership as at extraction, not at the time of any message, so no message row claims who received it."
               " A row with no content and no attachment (type 33, e.g. friend added) is Direction System: its from_mid is blank like a sent row, but nobody sent it. from_mid is shown as stored. Message is chat_history.content exactly as stored; calls, locations and images are named in Event.")
 app_path = "data/data/jp.naver.line.android"
@@ -30,9 +20,6 @@ optional_files = {
     "naver_line_shm": "databases/naver_line-shm",
 }
 
-# Declarative only — no recovery code belongs here; see description above
-# for what was actually found.
-recoverable_tables = ["chat_history"]
 
 # Raw values (never a formatted string) so the Report table can display
 # them per the case's timestamp-display setting. "timestamp" is this

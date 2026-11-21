@@ -38,25 +38,9 @@ description = (
     "re-visit was 814ms. History wins the suppressed pair since it's the "
     "richer, primary source (has transition/qualifiers/from_url; UKM never "
     "does), so the surviving row is never the one with less information. "
-    "Deleted-row recovery is declared for both underlying tables (Chrome "
-    "History's own visits, and Segmentation Platform's urls) and pinned "
-    "to the correct file for each via file_key -- the two databases have "
-    "a literal table-name collision (both define a table called `urls`), "
-    "confirmed to silently pick only one of them without pinning; the "
-    "file_key parameter (sqlite_carve.recover_deleted_rows) exists "
-    "specifically because of this real case. History's own visits/urls "
-    "recovery is a confirmed, tested negative on real data (a single "
-    "deleted entry and a full history clear both left nothing "
-    "recoverable -- Chrome appears to rebuild/vacuum the file on both). "
-    "Segmentation Platform's urls recovery is a confirmed POSITIVE on "
-    "real data: 6 rows recovered via WAL history from the same GTLAB "
-    "clear-history run, including a Google anti-bot \"sorry\" redirect "
-    "and the actual visited result page -- none of it visible anywhere "
-    "else once the clear finished. Recovered rows carry the raw column "
-    "name of whichever table they came from (visits' own `visit_time`, "
-    "or urls' own `url_id`/`last_timestamp`) rather than this report's "
-    "own live-row field names -- expected raggedness for a recovered row "
-    "only, not a bug. "
+    "Live rows only: deleted and changed records of both sources are "
+    "in \"Chrome — Deleted History Records\" (2026-11-21), including "
+    "the Segmentation Platform rows recovered after a history clear. "
     "Field-by-field validated against Joshua Hickman's documented "
     "Android 14 test image: all 6 documented non-Incognito Chrome "
     "actions on 2024-07-13 matched exactly by url/title/transition; the "
@@ -112,38 +96,7 @@ record_source = [
      "rowid_fields": ["raw_url_id", "url_id"], "source_match": ["Segmentation Platform (UKM)"]},
 ]
 
-# "visits" is a bare string -- only History.db has a table by that name, so
-# no collision. ("ukm_db", "urls") is pinned -- see description above for
-# the real table-name collision this avoids.
-recoverable_tables = ["visits", ("ukm_db", "urls")]
 
-# A carved row never runs through run() below, so it can't set "source"
-# itself -- the runner (artifact_runner.py) fills it in from this table
-# using these labels, e.g. "Carved -- Chrome History (visits table)", with
-# " (unverified match)" appended automatically for a header_signature carve
-# (no rowid at all -- the weakest of the four carving paths, and the only
-# one that can be a truncated/false-positive match rather than a
-# structurally-confirmed row). See recovery_source_labels in
-# artifact_runner.py's docstring.
-#
-# What to expect from a GENUINE carved row of each table, so a blank field
-# alone is never mistaken for a false-positive signal: `visits` has no
-# `title` column at all (real schema: id/url/visit_time/from_visit/
-# transition/segment_id/visit_duration/... -- title only ever lives in the
-# separate `urls` table, joined for live rows only) -- a carved visits row
-# with no title is expected, not suspicious. ukm_db's `urls` DOES have a
-# `title` column (real schema: url_id/url/last_timestamp/counter/title/
-# profile_id) but it's nullable there too -- a real anti-bot/redirect page
-# genuinely has none (see the description above's own recovered example).
-# The one field a genuine carved `visits` row should NOT be missing is
-# `transition` itself (NOT NULL in the real schema, always some integer) --
-# an absent or zero-length `transition` on a row whose `source` says
-# "(unverified match)" is the actual sign worth treating with suspicion,
-# not a missing title.
-recovery_source_labels = {
-    "visits": "Chrome History (visits table)",
-    "urls": "Segmentation Platform (UKM, urls table)",
-}
 
 _CORE_TRANSITIONS = {
     0: "LINK", 1: "TYPED", 2: "AUTO_BOOKMARK", 3: "AUTO_SUBFRAME",

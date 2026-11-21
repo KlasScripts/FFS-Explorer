@@ -1,12 +1,9 @@
 name = "GroupMe"
 description = ("Messages from GroupMe's local database (groupme.db, table "
-              "messages), live rows plus anything freeblocks/freed pages/WAL "
-              "history/header-signature scanning recovers — merged into this "
-              "same report, since it's all one source. On the extraction this "
-              "was built against there's no WAL for this database and carving "
-              "its live pages found nothing recoverable; a real negative, not "
-              "an unexamined gap. Field-by-field validated against documented "
-              "ground truth; no known reliability issues."
+              "messages), live rows only: deleted and changed records are in "
+              "\"GroupMe — Deleted & Changed Messages\" (2026-11-21). "
+              "Field-by-field validated against documented ground truth; no "
+              "known reliability issues."
               " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from members (groups) and chats (DMs); the owner is the sender id seen in DMs. This is membership as at extraction, not at the time of any message, so no message row claims who received it.")
 app_path = "data/data/com.groupme.android"
 files = {
@@ -18,13 +15,6 @@ optional_files = {
     "groupme_shm": "databases/groupme.db-shm",
 }
 
-# Declarative only — no recovery code belongs here. Nothing recoverable was
-# found on the extraction this was built against (see description above),
-# but the declaration stays so a different extraction — where this table
-# might actually have deleted content sitting in freeblocks/WAL history —
-# surfaces it automatically instead of requiring another one-off
-# investigation.
-recoverable_tables = ["messages"]
 
 # Raw values (never a formatted string) so the Report table can display
 # them per the case's timestamp-display setting. "timestamp" is this

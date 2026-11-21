@@ -1492,6 +1492,13 @@ def _recover_deleted_rows(paths: dict, table: str, field_notes: dict,
 #               (e.g. a chat's last-message preview: only the ones that are
 #               the sole trace of a message). A comparison of values, not a
 #               join; the ones left out are counted in the run log.
+#       "json_fields": ["value"],     # optional: a column holding the whole
+#               record as a JSON object (Room's TypeConverter pattern, e.g.
+#               Burner's MessageEntity): its keys are added as
+#               "<field>.<key>" (sqlite_carve.flatten_json_fields); the
+#               column itself is kept
+#       "field_notes": {"value": "..."},   # optional: a caveat checked against
+#               ground truth, shown on every row as "<field>_caveat"
 #   }]
 # Only declare a label or derived value that was checked against ground
 # truth, and say where in the parser.
@@ -1623,6 +1630,14 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
             for col, name in fields.items():
                 if col in idx:
                     row[name] = shown(col, value(col))
+            for col in spec.get('json_fields') or ():
+                if col in idx:
+                    from sqlite_carve import flatten_json_fields
+                    for k, v in flatten_json_fields({fields.get(col, col): value(col)}).items():
+                        row.setdefault(k, blob_safe(v))
+            for col, note_text in (spec.get('field_notes') or {}).items():
+                if col in idx:
+                    row[f"{fields.get(col, col)}_caveat"] = note_text
             for c in changed:
                 if c in fields:
                     now = live[idx[c]]

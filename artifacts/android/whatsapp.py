@@ -1,25 +1,12 @@
 name     = "WhatsApp Messages"
 description = ("Messages from WhatsApp's local database (msgstore.db, "
-              "table message), live rows plus anything freeblocks/freed "
-              "pages/WAL history/header-signature scanning recovers from "
-              "the same table, merged into this same report. Checked, not "
-              "skipped: on the extraction this was built against, "
-              "msgstore.db has PRAGMA secure_delete = FAST set, which "
-              "actively zeroes freed page bytes at delete time — confirmed "
-              "by inspecting the freed ranges directly (all zero, aside "
-              "from a single leftover 2-byte freeblock-link fragment "
-              "followed by zeros, not record content) on a database with "
-              "one confirmed-deleted message (a message._id gap). Checked "
-              "the same way against message_ftsv2_content (WhatsApp's own "
-              "full-text-search shadow table, the same kind of table that "
-              "recovered a deleted message on LINE via WAL history) and "
-              "against the live WAL for both tables — no stale/uncommitted "
-              "copy of the deleted row's page was present either. A real "
-              "negative for carving specifically, not evidence nothing was "
-              "deleted. message_revoked (WhatsApp's own \"delete for "
-              "everyone\" tombstone table) was empty on this extraction — "
-              "the one documented deletion here was a local-only delete, "
-              "which WhatsApp does not appear to route through that table."
+              "table message), live rows only: deleted and changed records "
+              "are in \"WhatsApp — Deleted & Changed Records\" (2026-11-21). "
+              "message_revoked (WhatsApp's own \"delete for everyone\" "
+              "tombstone table) was empty on the extraction this was built "
+              "against — the one documented deletion there was a local-only "
+              "delete, which WhatsApp does not appear to route through that "
+              "table."
               " Chat members (Chat Groups summary only, hidden in this report; 2026-10-24): everyone in each conversation, from group members from group_participant_user; the owner's number from shared_prefs/com.whatsapp_preferences_light.xml (registration_jid). Where a group's member list is empty it says so. This is membership as at extraction, not at the time of any message, so no message row claims who received it."
               " Reactions (2026-10-29): message_add_on type 56 with its emoji in message_add_on_reaction, shown on the message that was reacted to as \"emoji person time\", comma separated; that time is written in UTC. Last Reaction Time is the newest one."
               " Text and Event (2026-10-29): Text is exactly what the database stores. This report's own labels (calls, system lines, Photo/GIF/Sticker, location kind, Poll, unknown types) are in Event, never in Text. Group lines name the person message_system_chat_participant stores, not \"you\". Direction of a system row (type 7) is System, not Sent: the database stores from_me 1 on every system row, including groups dated years before the phone's first message (Pixel 7a image), so it does not show who acted. from_me is a column as stored.")
@@ -182,9 +169,6 @@ hidden_fields = ["chat_members",
     "thumbnail_link", "group_icon",
 ]
 
-# Declarative only — no recovery code belongs here; see description above
-# for what was actually found.
-recoverable_tables = ["message"]
 
 # Raw values (never a formatted string) so the Report table can display
 # them per the case's timestamp-display setting. "sent_time" is this

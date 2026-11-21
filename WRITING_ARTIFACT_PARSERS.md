@@ -181,8 +181,8 @@ SQLite stores: History, Web Data, segmentation_platform's `ukm_db`, ...).
 **Always pass the raw stored value through unconverted and let the unit
 code do the conversion** — do not hand-convert to a different epoch in
 `run()` before returning it (e.g. converting webkit-microseconds to
-Unix-ms yourself and then declaring `"ms"`). A `recoverable_tables`-carved
-row carries the *raw* column value straight from the table, in its
+Unix-ms yourself and then declaring `"ms"`). A carved row (a `recovered_records`
+report) carries the *raw* column value straight from the table, in its
 original epoch, under the same field name a hand-converted live row would
 use — if `run()` converts but the carved path can't, the same field name
 ends up holding two different units depending on whether the row is live
@@ -487,9 +487,8 @@ unchanged from before this existed. Real, worked example:
 Two entries sharing a bare table name across different files (real case
 above: Chrome History's own `urls` vs. `ukm_db`'s `urls`) is fine for a
 LIVE row (`source_match` already disambiguates it) but needs one more
-thing for a CARVED row of that table: declare the SAME `file_key`-pinned
-tuple in `recoverable_tables` you'd need anyway for the collision (see
-below) — the carving pass already tags a recovered row with which file it
+thing for a CARVED row of that table: in a `recovered_records` report, pin
+each table to its file with `file_key` (see below) — the carving pass already tags a recovered row with which file it
 came from, which the Hex panel uses to pick the right entry even though
 `source_match` itself never runs for a carved row (it already knows its
 real source table directly).
@@ -505,7 +504,7 @@ the feature at all. If you can't confirm a table's rowid is real, leave
 that entry out; the report still works, that row's Record mode just says
 "not available."
 
-A row your `recoverable_tables` recovery pass carved (below) still has a
+A row a `recovered_records` report carved (below) still has a
 real, exact citation too — the carving pass already knows precisely which
 bytes it found, in either the main db file or a `-wal` sidecar — so
 `record_source` covers both live and recovered rows for free once
@@ -543,60 +542,27 @@ SQL-backed entries above; `presence_fields` falls back to
 nothing at that field (nothing decoded for it) is dropped from the
 picker the same way a missed SQL JOIN is.
 
-### `recoverable_tables` (if you've checked for deleted content)
+### Deleted and changed records: their own report, never mixed in
 
-```python
-recoverable_tables = ["messages"]
-```
-
-Declares a table to also carve for deleted and older rows. No recovery
-code belongs in the parser — this declaration is the entire contribution;
-the shared carver (`app/sqlite_recovery.py`, the same one the File
-Browser's Database tab uses) does the work and appends whatever it finds to
-your `run()` output: rows deleted or changed since the last checkpoint,
-older versions in WAL frames and rollback-journal pages, the unfinished
-write under a hot journal, and deleted records in free space, on freed
-pages, on overflow pages and found by the table's record pattern
-(including records whose header the delete overwrote). Each recovered row
-carries `recovery_method`, `recovery_note` (plain words: how it was found
-and how sure that is), `table_certain`, `recovery_version`, and its exact
-`raw_file` (`main`/`wal`/`journal`) and `raw_offset`. Rows of dropped
-tables are not recovered. Only add this once
-you've actually checked (a real negative — "no WAL, checked, found
-nothing" — is still worth declaring, so a future re-check on different
-data finds it automatically instead of needing another one-off
-investigation).
-
-Every recovered row automatically gets a `source` field — `"Carved —
-{table}"`, or `"Carved — {table} (unverified match)"` for a header_signature
-match (no rowid, the weakest of the four carving paths) — so a report whose
-`core_fields` includes `"source"` never shows a carved row's most important
-column blank. A `header_signature` match is additionally cross-checked
-against the live schema and, if you declare `timestamp_fields` (using the
-RAW source-table column name, not just your own output field name — see
-above), against a plausible timestamp range; a real hit upgrades the suffix
-to `"Carved — {table} (likely false positive — implausible timestamp:
-last_timestamp)"` naming the exact reason, never silently dropping the row
-— see `sqlite_carve.notnull_columns`/`_timestamp_plausible`. Nothing to
-declare for this beyond `timestamp_fields` you'd want anyway. If your
-`recoverable_tables` spans more than one underlying table/database, give
-each one a real name instead of a bare SQL table name:
-
-```python
-recovery_source_labels = {"visits": "Chrome History (visits table)"}
-```
-
-See `artifacts/android/chrome_web_history.py` for a two-source example, and
-CLAUDE.md's Conventions for the confidence-tiering reasoning (why only
-`header_signature` gets the caution suffix, not the other three carving
-paths).
+A main report holds live rows only (ASSUMPTIONS.md A-95, 2026-11-21).
+`recoverable_tables` (carving a table on every run and appending what it
+found to the live rows) is retired: it took 23.9 s of a 74 s run for
+500,000 WhatsApp messages, usually to find nothing. Deleted and older
+records go in a separate `report_type = "recovered_records"` report per
+app, covering its message table and its media/attachment tables (below);
+`tests/test_recovered_reports.py` stops a shipped parser declaring
+`recoverable_tables` again.
 
 ### `report_type = "recovered_records"`: a deleted / changed records report with no `run()`
 
 For "what was deleted or changed in this app's messages", don't write a
 `run()` at all. Declare the database and, per table, the columns that
 matter; the shared code (`artifact_runner.recovered_records_report`, using
-the same carver as `recoverable_tables`) makes the report. Example:
+the one carver, `app/sqlite_recovery.py`, the Database tab uses too) makes
+the report. Examples: `artifacts/android/whatsapp_deleted.py` (a message
+table and a media table), `artifacts/android/burner_messageentity.py` (a
+JSON-blob column split with `json_fields`, a checked caveat with
+`field_notes`),
 `artifacts/ios/line_deleted_messages.py`.
 
 ```python
@@ -675,8 +641,8 @@ re-writing it inline — that's what it's there for.
 a bare `sqlite3.connect()`** — see the example at the top of this
 document. A bare connect, even for a read-only `SELECT`, can trigger
 SQLite's own checkpoint-on-close behavior and silently delete the file's
-own `-wal`/`-shm` sidecars before anything else (a `recoverable_tables`
-carving pass, or just a re-opened case) gets a chance to read them —
+own `-wal`/`-shm` sidecars before anything else (a deleted-records
+report's carving, or just a re-opened case) gets a chance to read them —
 destroying deleted-row history that was recoverable a moment earlier.
 
 ```python

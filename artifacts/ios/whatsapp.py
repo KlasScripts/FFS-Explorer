@@ -3,26 +3,15 @@ description = ("Messages from WhatsApp's local iOS store (ChatStorage.sqlite, "
               "a Core Data database — a different schema from the Android "
               "parser's msgstore.db, same app), table ZWAMESSAGE joined to "
               "ZWACHATSESSION for the conversation and ZWAGROUPMEMBER for "
-              "the specific sender within a group chat. Live rows plus "
-              "anything freeblocks/freed pages/WAL history/header-signature "
-              "scanning recovers from the same table, merged into this same "
-              "report. Checked, not skipped: on the extraction this was "
-              "built against, ChatStorage.sqlite has PRAGMA secure_delete "
-              "= FAST set (matches every other messaging app checked in "
-              "this project), and the `recoverable_tables` carving pass "
-              "below — run against real ground-truth-documented deleted "
-              "content — came back with zero recovered rows, consistent "
-              "with a raw byte-level search of the file for that same "
-              "deleted message's exact text also finding no trace. A real "
-              "negative for carving specifically, not evidence nothing was "
-              "deleted (see next). Separately, and NOT carving: the "
-              "deletion itself is real and independently confirmed, not "
-              "just claimed by ground truth — ZWAMESSAGE's Z_PK primary-key "
-              "sequence has a gap of exactly one row (174, between a live "
-              "row at 173 and one at 175) whose timing matches the "
-              "documented receive-then-delete window precisely, the same "
-              "signature this project used to confirm a genuine deletion "
-              "on Burner (Android). Message text for a handful of early "
+              "the specific sender within a group chat. Live rows only: "
+              "deleted and changed records are in \"WhatsApp — Deleted & "
+              "Changed Records (iOS)\" (2026-11-21). A deletion is visible "
+              "here without recovery, though: on the extraction this was "
+              "built against, ZWAMESSAGE's Z_PK sequence has a gap of exactly "
+              "one row (174, between live rows 173 and 175) whose timing "
+              "matches the documented receive-then-delete window, the same "
+              "signature used to confirm a deletion on Burner (Android). "
+              "Message text for a handful of early "
               "rows (message types 5/6/10, all from the app's install/"
               "setup period with no ZTEXT at all) could not be identified "
               "against any documented WhatsApp Core Data enum and are "
@@ -104,9 +93,6 @@ hidden_fields = ["chat_members", "raw_chat_id", "raw_group_member_id", "raw_medi
 # exist in the archive, 2026-10-23).
 link_fields = ["attachment_path", "thumbnail_link"]
 
-# Declarative only — no recovery code belongs here; see description above
-# for what was actually found.
-recoverable_tables = ["ZWAMESSAGE"]
 
 # Raw values (never a formatted string) so the Report table can display
 # them per the case's timestamp-display setting. "timestamp" is this

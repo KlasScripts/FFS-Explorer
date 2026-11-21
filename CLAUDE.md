@@ -125,7 +125,8 @@ Declarations a parser can set:
   "meaning not written yet", never guessed.
 - `record_source` (with `source_match`/`presence_fields`): which raw cell(s)
   a row came from, for Record hex mode.
-- `recoverable_tables`: tables to carve for deleted rows.
+- `recoverable_tables`: retired (A-95, 2026-11-21): a main report holds live
+  rows only; deleted records go in a `recovered_records` report (below).
 - `hidden_fields`, `core_fields`: column visibility.
 - `device_wide = True`: scans the whole archive (given a `CaseContext`).
 - `requires_nested_extraction`: embedded zips to extract before `run()`.
@@ -134,7 +135,10 @@ Declarations a parser can set:
   deleted / changed records report with no `run()` (the loader attaches
   `artifact_runner.recovered_records_report`): per table the columns that
   matter, `version_fields`, optional `labels` / `derived` / `not_found_in`;
-  never joined. Example: `artifacts/ios/line_deleted_messages.py`.
+  never joined. Optional `json_fields` (a JSON-object column split into
+  `<field>.<key>`) and `field_notes` (a checked caveat per row). One per
+  messaging app (message + media tables): `*_deleted*.py`, `line_fts.py`,
+  `burner_messageentity.py`. Example: `artifacts/ios/line_deleted_messages.py`.
 
 Shared helpers in `app/artifact_runner.py` (import directly):
 `open_db_readonly` (the only way to open an evidence SQLite file),

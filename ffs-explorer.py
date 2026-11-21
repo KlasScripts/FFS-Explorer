@@ -12,6 +12,7 @@ if __name__ == '__main__' and '--multiprocessing-fork' not in sys.argv:
 import re
 import io
 import gc
+import heapq
 import time
 import atexit
 import zipfile
@@ -2981,6 +2982,51 @@ _HEADER_TOOLTIPS: dict[str, str] = {
 }
 
 
+def _sorted_chunked(items: list) -> list:
+    """sorted(items), for a background thread: sorted in chunks of 50,000
+    merged by heapq.merge, so Python's lock is never held for long (one
+    sort of 475,000 paths holds it, freezing the window)."""
+    chunks = [sorted(items[lo:lo + 50000]) for lo in range(0, len(items), 50000)]
+    if len(chunks) <= 1:
+        return chunks[0] if chunks else []
+    return list(heapq.merge(*chunks))
+
+
+def _sorted_rows_and_lists(all_rows: list, rows: list, steps, flags: dict):
+    """_sorted_rows, plus FileTableModel's flagged-rows state
+    ([flagged file paths, file count] of the visible rows) and visible
+    path list in the new order, all on the background thread."""
+    new_all, new_rows = _sorted_rows(all_rows, rows, steps)
+    files = [r for r in new_rows if r[2] < 0]
+    flag_state = [[r[1] for r in files if flags.get(r[1])], len(files)]
+    return new_all, new_rows, flag_state, [r[1] for r in new_rows]
+
+
+def _sorted_rows(all_rows: list, rows: list, steps) -> tuple[list, list]:
+    """(all_rows, rows) sorted by *steps* [(key, descending)], least
+    significant first, each stable: the same order list.sort gives. Run on
+    a background thread (FileTableModel._start_sort): the keys are made in
+    Python, and the sort is done in chunks of 50,000 merged by
+    heapq.merge, so Python's lock is never held for long (one list.sort of
+    1.56 million rows holds it the whole time). *rows* (the visible ones,
+    a subsequence of *all_rows* in the same order) come out in the new
+    order of all_rows."""
+    order = list(range(len(all_rows)))
+    for key, rev in steps:
+        keys = [key(all_rows[i]) for i in order]
+        n = len(keys)
+        chunks = [sorted(range(lo, min(lo + 50000, n)), key=keys.__getitem__, reverse=rev)
+                  for lo in range(0, n, 50000)]
+        merged = (list(heapq.merge(*chunks, key=keys.__getitem__, reverse=rev))
+                  if len(chunks) > 1 else (chunks[0] if chunks else []))
+        order = [order[j] for j in merged]
+    new_all = [all_rows[i] for i in order]
+    if len(rows) == len(all_rows):
+        return new_all, list(new_all)
+    visible = {id(r) for r in rows}
+    return new_all, [r for r in new_all if id(r) in visible]
+
+
 class FileTableModel(QAbstractTableModel):
     """Lightweight table model backed by a plain Python list.
     Dramatically faster than QStandardItemModel for large row counts:
@@ -2995,6 +3041,7 @@ class FileTableModel(QAbstractTableModel):
     # docstring below); FastZipBrowser._on_file_row_check_toggled is the
     # one connected slot, in _set_file_model.
     check_toggled   = Signal(str, bool, bool)
+    sort_busy       = Signal(bool)       # a background sort started / ended
 
     _GREY_COLOR        = QColor(Qt.GlobalColor.darkGray)
     _BOLD_FONT         = QFont("Arial", weight=QFont.Weight.ExtraBold)
@@ -3039,6 +3086,7 @@ class FileTableModel(QAbstractTableModel):
         # took 10 s every switch (2026-11-21).
         self._rows_version = 0
         self._derived: dict = {}
+        self._sort_gen = 0           # the newest sort (_start_sort)
         # A per-row flag (the Media Browser's "is this media"), worked out as
         # rows are added, so a tab switch only reads it (set_row_flagger).
         self._row_flagger = None
@@ -3475,17 +3523,10 @@ class FileTableModel(QAbstractTableModel):
         if column == 0:
             return  # the tickbox column isn't sortable
         real_column = column - 1
-        self.layoutAboutToBeChanged.emit()
         self._sort_col = column
         self._sort_order = order
         reverse = (order == Qt.SortOrder.DescendingOrder)
-        key = self._sort_key_for_column(real_column)
-        self._all_rows.sort(key=key, reverse=reverse)
-        self._rows.sort(key=key, reverse=reverse)
-        self._rows_version += 1
-        self._flag_state = None
-        self._path_list = None
-        self.layoutChanged.emit()
+        self._start_sort([(self._sort_key_for_column(real_column), reverse)])
 
     def _sort_key_for_column(self, real_column):
         """A sort key callable for one real _headers-space column index
@@ -3522,12 +3563,64 @@ class FileTableModel(QAbstractTableModel):
         and others string-ascending)."""
         if not levels:
             return
-        self.layoutAboutToBeChanged.emit()
         self._sort_col = -1   # no single header arrow applies to a multi-sort
-        for real_column, descending in reversed(levels):
-            key = self._sort_key_for_column(real_column)
-            self._all_rows.sort(key=key, reverse=descending)
-            self._rows.sort(key=key, reverse=descending)
+        self._start_sort([(self._sort_key_for_column(real_column), descending)
+                          for real_column, descending in reversed(levels)])
+
+    # Below this many rows a sort is done at once, as it always was.
+    _BACKGROUND_SORT_MIN = 20000
+
+    def _start_sort(self, steps) -> None:
+        """Sort _all_rows and _rows by *steps* [(key, descending)], least
+        significant first, each a stable sort (the same order as
+        list.sort). A big table is sorted on a background thread
+        (_sorted_rows) and the order swapped in when it is ready, the old
+        order staying on show meanwhile: on the window thread, sorting
+        1.56 million rows held it for seconds (2026-11-21). If the rows
+        change meanwhile (rows added, filtered), it sorts again."""
+        self._sort_gen += 1
+        gen = self._sort_gen
+        if len(self._all_rows) < self._BACKGROUND_SORT_MIN:
+            self.layoutAboutToBeChanged.emit()
+            for key, rev in steps:
+                self._all_rows.sort(key=key, reverse=rev)
+                self._rows.sort(key=key, reverse=rev)
+            self._sorted_applied()
+            return
+        version = self._rows_version
+        flags = self._row_flags
+        fut = _BG_POOL.submit(_sorted_rows_and_lists, list(self._all_rows), list(self._rows),
+                              steps, flags)
+        self.sort_busy.emit(True)
+
+        def poll():
+            if gen != self._sort_gen:
+                return                      # a newer sort superseded this one
+            if not fut.done():
+                QTimer.singleShot(30, poll)
+                return
+            if self._rows_version != version:
+                self._start_sort(steps)     # rows changed while it sorted
+                return
+            try:
+                new_all, new_rows, flag_state, path_list = fut.result()
+            except Exception:
+                self.sort_busy.emit(False)
+                return
+            self.layoutAboutToBeChanged.emit()
+            self._all_rows, self._rows = new_all, new_rows
+            self._sorted_applied()
+            # the media flags and the path list in the new order, made with
+            # the sort: worked out again on the window thread, the first
+            # Media Browser switch after sorting 1.56 million rows held it
+            # 2.18 s (2026-11-21). Kept only if the flags are unchanged.
+            if self._row_flags is flags:
+                self._flag_state = flag_state
+            self._path_list = path_list
+            self.sort_busy.emit(False)
+        QTimer.singleShot(30, poll)
+
+    def _sorted_applied(self) -> None:
         self._rows_version += 1
         self._flag_state = None
         self._path_list = None
@@ -9729,6 +9822,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.status_bar.addPermanentWidget(self.progress_bar)
         self.status_bar.showMessage("Ready")
 
+    def _on_file_sort_busy(self, busy: bool) -> None:
+        if busy:
+            self.status_bar.showMessage("Sorting…")
+        elif self.status_bar.currentMessage() == "Sorting…":
+            self.status_bar.clearMessage()
+
     def _set_file_model(self, model):
         """Set the file model, connect its filter signals, and update the proxy.
 
@@ -9768,6 +9867,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # detach, calling headerData on a freed Python wrapper → SIGSEGV.
         self.proxy_model.setSourceModel(model)
         self.file_model = model
+        # A big sort runs in the background (FileTableModel._start_sort):
+        # say so while it does.
+        model.sort_busy.connect(self._on_file_sort_busy)
         # A fill of the previous model may have paused redrawing
         # (_rebuild_file_view_from_checked): a new model always draws.
         # (The first model is set in __init__, before the view exists.)
@@ -11850,6 +11952,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # every folder's whole child list, files included, which for the
         # root of a 2.19-million-entry case took 22.7 s of frozen window
         # when it was ticked (2026-11-21). Same folders either way.
+        if root == '' and len(fm) > 5000:
+            # every folder hangs under the root (_build_folder_tree links
+            # each up to it), as the walk below would find, after
+            # 0.13-0.35 s of reading child lists
+            return list(self._all_folder_names())
         seen = {root}
         out = [root]
         stack = [root]
@@ -12069,9 +12176,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # since the loop below only ever walked _checked_folders.
         # Excluding a file already covered by its OWN checked folder
         # avoids a duplicate row once that folder gets fully ticked too.
-        extra_files = sorted(
+        extra_files = [   # sorted with the folders, below (_sort_lists_then)
             f for f in self._checked_files
-            if (f.rsplit('/', 1)[0] if '/' in f else '') not in checked)
+            if (f.rsplit('/', 1)[0] if '/' in f else '') not in checked]
         self._view_path = ""
         self._view_is_recursive = bool(checked or extra_files)
         self._view_folder_recursive = False
@@ -12134,7 +12241,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 self.status_bar.showMessage("No folders selected")
             return
 
-        folders = sorted(checked)
+        folders = list(checked)      # sorted before the first batch
         total_folders = len(folders)
         total_extra = len(extra_files)
         state = {'idx': 0, 'extra_idx': 0, 'count': 0, 'children': None, 'child_idx': 0,
@@ -12266,7 +12373,34 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                         and not (self._media_showing_embedded or self._media_showing_user_only)):
                     self._load_media_from_file_model()
 
-        QTimer.singleShot(0, _process_batch)
+        self._sort_lists_then((folders, extra_files), my_gen, _process_batch)
+
+    # Below this many paths the tick lists are sorted at once.
+    _BACKGROUND_PATH_SORT_MIN = 20000
+
+    def _sort_lists_then(self, lists, gen: int, then) -> None:
+        """Sort each list in *lists* in place, then call *then* (unless a
+        newer view replaced this one, _load_gen != *gen*). Many paths are
+        sorted on a background thread (_sorted_chunked): sorting the
+        475,533 folders of a ticked root held the window 0.4-1.2 s
+        (2026-11-21). The order is the same as list.sort."""
+        if sum(len(l) for l in lists) < self._BACKGROUND_PATH_SORT_MIN:
+            for l in lists:
+                l.sort()
+            QTimer.singleShot(0, then)
+            return
+        fut = _BG_POOL.submit(lambda: [_sorted_chunked(l) for l in lists])
+
+        def poll():
+            if gen != self._load_gen:
+                return
+            if not fut.done():
+                QTimer.singleShot(30, poll)
+                return
+            for l, done in zip(lists, fut.result()):
+                l[:] = done
+            then()
+        QTimer.singleShot(30, poll)
 
     def show_table_context_menu(self, point):
         index = self.file_view.indexAt(point)

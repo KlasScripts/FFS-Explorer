@@ -173,7 +173,8 @@ def test_a_filter_during_a_sort_wins(tmp_path):
 
 
 def test_file_browser_lists_are_kept_until_its_rows_change():
-    """Switching to the Media Browser checked every File Browser row each
+    """(15,000 rows: below FileTableModel._BACKGROUND_SORT_MIN, so the sort
+    here is done at once.) Switching to the Media Browser checked every File Browser row each
     time: 10 s on 2.19 million rows (2026-11-21). The list is now kept by
     the model until its rows change (added, filtered, sorted)."""
     import importlib.util
@@ -185,7 +186,7 @@ def test_file_browser_lists_are_kept_until_its_rows_change():
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     model = m.FileTableModel(['Name', 'Size (Bytes)'])
-    model.append_rows_batch([([f'f{i:06d}.jpg', str(i)], f'd/f{i:06d}.jpg', -1) for i in range(50_000)])
+    model.append_rows_batch([([f'f{i:06d}.jpg', str(i)], f'd/f{i:06d}.jpg', -1) for i in range(15_000)])
     calls = []
 
     def compute():
@@ -194,10 +195,10 @@ def test_file_browser_lists_are_kept_until_its_rows_change():
     first = model.cached('media', 'k', compute)
     again = model.cached('media', 'k', compute)
     assert again is first and len(calls) == 1                 # reused while unchanged
-    assert model.row_of_path('d/f049999.jpg') == 49_999
+    assert model.row_of_path('d/f014999.jpg') == 14_999
     model.sort(1, Qt.SortOrder.DescendingOrder)                # rows reordered
-    assert model.cached('media', 'k', compute)[0] == 'd/f049999.jpg' and len(calls) == 2
-    assert model.row_of_path('d/f049999.jpg') == 0
+    assert model.cached('media', 'k', compute)[0] == 'd/f014999.jpg' and len(calls) == 2
+    assert model.row_of_path('d/f014999.jpg') == 0
     assert model.cached('media', 'other key', compute) and len(calls) == 3
     model.set_filter('')                                       # rows replaced
     assert model.cached('media', 'other key', compute) and len(calls) == 4
@@ -321,3 +322,125 @@ def test_main_window_builds():
     finally:
         w.close()
         w.deleteLater()
+
+
+def test_background_file_sort_gives_the_same_order():
+    """A big File Browser sort runs in the background (chunks merged),
+    with exactly the order list.sort gives, ties kept in place; the visible
+    rows follow; a sort superseded, or rows changed meanwhile, never lands
+    stale (2026-11-21: 1.56 million rows held the window for seconds)."""
+    import random
+    import time as _t
+    from operator import itemgetter
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    m = _main_module()
+    rnd = random.Random(5)
+    rows = [([f'n{rnd.randrange(500):03d}', str(rnd.randrange(50))], f'p{i}', -1) for i in range(120_000)]
+    # the chunked sorter, both directions and two levels, against list.sort
+    for steps in ([(lambda r: r[0][0], False)], [(lambda r: r[0][0], True)],
+                  [(lambda r: int(r[0][1]), True), (lambda r: r[0][0], False)]):
+        want = list(rows)
+        for key, rev in steps:
+            want.sort(key=key, reverse=rev)
+        vis = rows[::3]
+        got_all, got_vis = m._sorted_rows(list(rows), vis, steps)
+        assert got_all == want
+        keep = {id(r) for r in vis}
+        assert got_vis == [r for r in want if id(r) in keep]
+
+    model = m.FileTableModel(['Name', 'Size (Bytes)'])
+    model.append_rows_batch(rows)
+    model.set_row_flagger(lambda r: r[0][1].endswith('7'), 'k')
+    busy = []
+    model.sort_busy.connect(busy.append)
+    t = _t.perf_counter()
+    model.sort(1, Qt.SortOrder.DescendingOrder)
+    assert _t.perf_counter() - t < 0.2                       # the window is not held
+    deadline = _t.monotonic() + 60
+    while busy != [True, False] and _t.monotonic() < deadline:
+        app.processEvents()
+        _t.sleep(0.01)
+    want = sorted(rows, key=lambda r: r[0][0].lower(), reverse=True)
+    assert model._all_rows == want and model._rows == want
+    # the media flags and path list came with the sort, in the new order
+    assert model._flag_state is not None and model._path_list is not None
+    assert model.flagged_rows() == (tuple(r[1] for r in want if r[0][1].endswith('7')), len(want))
+    assert model._path_list == [r[1] for r in want]
+    # a newer sort wins over one still running
+    model.sort(1, Qt.SortOrder.AscendingOrder)
+    model.sort(2, Qt.SortOrder.AscendingOrder)
+    busy.clear()
+    deadline = _t.monotonic() + 60
+    while len(busy) < 2 and _t.monotonic() < deadline:
+        app.processEvents()
+        _t.sleep(0.01)
+    for _ in range(50):
+        app.processEvents()
+        _t.sleep(0.01)
+    key = model._sort_key_for_column(1)
+    assert model._all_rows == sorted(want, key=key)
+
+
+def test_ticked_folders_sorted_in_the_background_same_order():
+    """Ticking the root sorted its 475,533 folders on the window thread
+    (0.4-1.2 s, 2026-11-21). They are sorted in the background now, in
+    exactly sorted()'s order, and a view replaced meanwhile never fills."""
+    import random
+    import time as _t
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    m = _main_module()
+    rnd = random.Random(11)
+    parts = ['a', 'a-b', 'a b', 'A', 'é', 'z', '_x', 'a.b', '0']
+    paths = list({'/'.join(rnd.choice(parts) + str(rnd.randrange(30))
+                           for _ in range(rnd.randint(1, 5))) for _ in range(130_000)})
+    assert m._sorted_chunked(list(paths)) == sorted(paths)
+    assert m._sorted_chunked([]) == []
+
+    win = m.FastZipBrowser.__new__(m.FastZipBrowser)
+    for gen_after, should_run in ((1, True), (2, False)):
+        win._load_gen = 1
+        folders, extra = list(paths), list(paths[:500])
+        ran = []
+        t = _t.perf_counter()
+        m.FastZipBrowser._sort_lists_then(win, (folders, extra), 1, lambda: ran.append(1))
+        assert _t.perf_counter() - t < 0.2              # the window is not held
+        win._load_gen = gen_after                       # 2: a newer view replaced it
+        deadline = _t.monotonic() + 30
+        while _t.monotonic() < deadline and not ran:
+            QCoreApplication.processEvents()
+            _t.sleep(0.01)
+            if not should_run and _t.monotonic() > deadline - 25:
+                break
+        assert bool(ran) == should_run
+        if should_run:
+            assert folders == sorted(paths) and extra == sorted(paths[:500])
+
+
+def test_root_descendants_of_a_big_case_are_every_folder():
+    """Ticking the root of a case with over 5000 folders takes every folder
+    name with no walk (0.13-0.35 s of child-list reads on 475,233
+    folders, 2026-11-21): the same folders the walk finds, since the
+    folder tree links every folder up to the root."""
+    import sys
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    m = _main_module()
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'app'))
+    from ffs_metadata import _build_folder_tree
+    meta = {f'a{i % 7}/b{i % 300}/c{i}/f.txt': {} for i in range(9000)}
+    fm = _build_folder_tree(meta)
+    assert len(fm) > 5000
+    win = m.FastZipBrowser.__new__(m.FastZipBrowser)
+    win.folder_map = fm
+    seen, stack = {''}, ['']
+    while stack:
+        for c in fm.get(stack.pop(), ()):
+            if c in fm and c not in seen:
+                seen.add(c)
+                stack.append(c)
+    got = m.FastZipBrowser._descendant_folders(win, '')
+    assert set(got) == seen and len(got) == len(seen)

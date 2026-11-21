@@ -9768,6 +9768,11 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # detach, calling headerData on a freed Python wrapper → SIGSEGV.
         self.proxy_model.setSourceModel(model)
         self.file_model = model
+        # A fill of the previous model may have paused redrawing
+        # (_rebuild_file_view_from_checked): a new model always draws.
+        # (The first model is set in __init__, before the view exists.)
+        if hasattr(self, 'file_view'):
+            self.file_view.setUpdatesEnabled(True)
         # Media flag per row as rows are added, so switching to the Media
         # Browser only reads it (MediaViewerMixin._install_media_flagger).
         self._install_media_flagger(model)
@@ -12132,12 +12137,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         folders = sorted(checked)
         total_folders = len(folders)
         total_extra = len(extra_files)
-        state = {'idx': 0, 'extra_idx': 0, 'count': 0, 'children': None, 'child_idx': 0}
+        state = {'idx': 0, 'extra_idx': 0, 'count': 0, 'children': None, 'child_idx': 0,
+                 'shown_at': 0.0}
         self.table_status_label.setText("0 items  (loading…)")
         self.status_bar.showMessage(f"Loading…  0 files  (0 of {total_folders} folders)")
 
         def _process_batch():
             if my_gen != self._load_gen:
+                self.file_view.setUpdatesEnabled(True)
                 return  # superseded by a newer rebuild — stop silently
 
             # Process as many folders as fit within ~16 ms (one frame budget)
@@ -12198,18 +12205,29 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     if time.monotonic() >= deadline:
                         break
 
+            # The table is redrawn at most twice a second while it fills:
+            # redrawing it, its scrollbar and the status texts after every
+            # 16 ms batch made filling 1.56 million rows take minutes in the
+            # app against under a minute without (2026-11-21). The window
+            # still handles input between batches.
+            more = state['idx'] < total_folders or state['extra_idx'] < total_extra
+            now = time.monotonic()
+            show = not more or now - state['shown_at'] >= 0.5
+            self.file_view.setUpdatesEnabled(show)
             self.file_model.append_rows_batch(batch_rows)
             # Keep the rows built so far out of later garbage-collection
             # passes: each full pass rescanned every row, growing with the
             # table (root tick on IOS17: 140-414 ms passes, each a frozen
             # window). gc.freeze() is O(1); start_loading unfreezes.
             gc.freeze()
-            self.status_bar.showMessage(
-                f"Loading…  {state['count']:,} files  "
-                f"({state['idx']} of {total_folders} folders)")
-            self.table_status_label.setText(f"{state['count']:,} items  (loading…)")
+            if show:
+                state['shown_at'] = now
+                self.status_bar.showMessage(
+                    f"Loading…  {state['count']:,} files  "
+                    f"({state['idx']} of {total_folders} folders)")
+                self.table_status_label.setText(f"{state['count']:,} items  (loading…)")
 
-            if state['idx'] < total_folders or state['extra_idx'] < total_extra:
+            if more:
                 QTimer.singleShot(0, _process_batch)
             else:
                 self.file_view.resizeColumnsToContents()
@@ -14968,6 +14986,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         def _process_batch():
             if my_gen != self._load_gen:
+                self.file_view.setUpdatesEnabled(True)
                 return  # superseded by a newer rebuild — stop silently
             deadline = time.monotonic() + FRAME_BUDGET_SECS
             batch_rows = []

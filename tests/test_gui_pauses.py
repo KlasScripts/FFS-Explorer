@@ -306,3 +306,18 @@ def test_ticks_same_result_without_walking_every_file():
                 if cur == '':
                     break
         assert got == want
+
+
+def test_main_window_builds():
+    """The main window is built once with no case (the File Browser's first
+    model is set before its view exists): a start-up crash there on
+    2026-11-21 was caught by hand, not by a test."""
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    m = _main_module()
+    w = m.FastZipBrowser()
+    try:
+        assert w.file_view.updatesEnabled() and w.file_model.rowCount() == 0
+    finally:
+        w.close()
+        w.deleteLater()

@@ -1060,6 +1060,17 @@ class LevelDbIndexError(Exception):
     rather than looking indexed with no records."""
 
 
+def _has_searchable_text(text: str) -> bool:
+    """False for a record whose decoded text is empty or only blanks and
+    control characters: there is nothing in it for Keyword Search to find.
+    Android 14 (JoshHickman, 2026-11-21): Google Play services' SafetyNet
+    Safe Browsing lists (com.google.android.gms/snet/leveldb/snet_sb_list_*)
+    gave 173,376 of the case's 179,340 index rows, every one with empty
+    text. A folder left with no rows still gets save_leveldb_search_records'
+    sentinel, so it is not offered again as unindexed."""
+    return any(not ch.isspace() and ch.isprintable() for ch in text)
+
+
 def run_leveldb_search_index(job: dict) -> list[tuple[int, str, str, str]]:
     """The second half of LevelDbViewerMixin.index_leveldb_folder_for_search:
     extracts *job*'s files (from plan_leveldb_search_index) and decodes
@@ -1087,6 +1098,8 @@ def run_leveldb_search_index(job: dict) -> list[tuple[int, str, str, str]]:
                 try:
                     text = preview_bytes.decode('utf-8')
                 except UnicodeDecodeError:
+                    continue
+                if not _has_searchable_text(text):
                     continue
                 rows.append((idx, display_name, text, content_type))
             return rows
@@ -1136,6 +1149,8 @@ def run_leveldb_search_index(job: dict) -> list[tuple[int, str, str, str]]:
                 continue
         else:
             continue   # 'bin'/'empty'/'protobuf' — nothing new to index
+        if not _has_searchable_text(text):
+            continue
         _, display_name = _sanitize_record_name(
             rec.user_key, idx, session_storage_names=session_storage_names)
         rows.append((idx, display_name, text, content_type))

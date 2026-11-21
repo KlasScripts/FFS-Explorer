@@ -129,3 +129,45 @@ def test_cancel_while_waiting_for_case_open_needs_no_question(PD):
     d._waiting_for_case_open = True
     d._on_cancel()
     assert d.asked == [] and d._cancel_all
+
+
+def test_stop_all_after_the_run_ended_keeps_its_message(PD):
+    scan = Worker()
+    d = _dialog(PD, 'all', _scan_worker=scan)
+    d._status_label.setText('Header scan done.')
+
+    def ask(stage_name):
+        scan.running = False                         # the run ended meanwhile
+        return 'all'
+    d._ask_cancel_choice = ask
+    d._on_cancel()
+    assert d._status_label.text() == 'Header scan done.'
+
+
+@pytest.fixture(scope='module')
+def main_globals(PD):
+    return PD._load_last_dedup_run.__globals__
+
+
+@pytest.mark.parametrize('history, expect', [
+    ([], None),
+    ([{'complete': False, 'output_rows': 0}], 'cancelled'),
+    ([{'complete': True, 'output_rows': 9}], 9),
+    ([{'complete': False, 'output_rows': 0}, {'complete': True, 'output_rows': 9}], 'later'),
+])
+def test_dedup_results_on_record_are_the_last_complete_run(PD, main_globals, monkeypatch, tmp_path, history, expect):
+    """A cancelled duplicate run saves nothing, so the dialog shows the
+    last complete run's numbers (noting a later cancelled one)."""
+    monkeypatch.setitem(main_globals, 'load_run_history', lambda db, rt: history)
+    monkeypatch.setitem(main_globals, '_open_results_db', lambda case: __import__('sqlite3').connect(':memory:'))
+    d = type('D', (), {'_case_dir': str(tmp_path), '_RUN_TYPE_DEDUP': 'duplicate_detection',
+                       '_load_last_dedup_run': PD._load_last_dedup_run})()
+    got = d._load_last_dedup_run()
+    if expect is None:
+        assert got is None
+    elif expect == 'cancelled':
+        assert got['complete'] is False
+    elif expect == 'later':
+        assert got['output_rows'] == 9 and got.get('later_cancelled')
+    else:
+        assert got['output_rows'] == 9 and not got.get('later_cancelled')

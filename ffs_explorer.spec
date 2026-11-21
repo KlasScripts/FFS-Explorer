@@ -87,6 +87,7 @@ a = Analysis(
         # The embedded-media skip list: same seed arrangement as
         # user_media_ignore_list.json above (config_seed.py).
         ('config/embedded_media_skip_list_ios.json', 'config'),
+        ('config/embedded_media_skip_list_android.json', 'config'),
         # Keyword lists (keyword_lists.py): the baseline is read in place from
         # here (_internal/config); the examiner's own terms and on/off choices
         # live in keyword_lists_user.json next to the exe. The dictionary

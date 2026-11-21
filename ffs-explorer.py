@@ -5476,10 +5476,13 @@ class DuplicateDetectionWorker(QThread):
             with closing(_open_results_db(self._case_dir)) as results_db:
                 if run_id is None:
                     run_id = start_run_log(results_db, self._run_type)
+                if complete:
+                    notes, saved = f"{n_groups} group(s)", len(results)
+                else:
+                    notes, saved = "cancelled before finishing; nothing saved", 0
                 results_db.execute('UPDATE run_log SET total=?, notes=? WHERE id=?',
-                                   (len(results), f"{n_groups} group(s)", run_id))
-                complete_run_log(results_db, run_id,
-                                 processed=len(results), output_rows=len(results))
+                                   (saved, notes, run_id))
+                complete_run_log(results_db, run_id, processed=saved, output_rows=saved)
                 if not complete:
                     results_db.execute(
                         'UPDATE run_log SET complete=0 WHERE id=?', (run_id,))
@@ -6947,6 +6950,11 @@ class ProcessDialog(QDialog):
                     "finishing. Re-running will clear previous results and "
                     "start fresh.</i>"
                 )
+            elif dedup_last.get('later_cancelled'):
+                lines.append(
+                    "<i>A later run was cancelled and saved nothing; these are "
+                    "the results of the last complete run.</i>"
+                )
 
         self._stats_label.setText("<br>".join(lines))
 
@@ -7015,9 +7023,19 @@ class ProcessDialog(QDialog):
             return None
         try:
             with closing(_open_results_db(self._case_dir)) as db:
-                return load_last_run(db, self._RUN_TYPE_DEDUP)
+                history = load_run_history(db, self._RUN_TYPE_DEDUP)
         except Exception:
             return None
+        if not history:
+            return None
+        # A cancelled run saves nothing (DuplicateDetectionWorker.run), so
+        # the results on record are the last complete run's.
+        done = next((h for h in history if h['complete']), None)
+        if done is None:
+            return history[0]                    # only cancelled runs
+        if not history[0]['complete']:
+            done = dict(done, later_cancelled=True)
+        return done
 
     # ── Case folder browse ────────────────────────────────────────────────────
 
@@ -8010,7 +8028,10 @@ class ProcessDialog(QDialog):
             self._cancel_all = True
             self._scan_cancelled = True
             self._cancel_btn.setEnabled(False)
-            self._status_label.setText("Stopping — no further stage will start…")
+            if self._running_stage() is not None:
+                # not if the run ended while the question was open: its own
+                # end message is already showing
+                self._status_label.setText("Stopping — no further stage will start…")
             for w in (self._scan_worker, self._nested_worker, self._embedded_media_worker,
                       self._media_metadata_worker, self._dedup_worker):
                 if w and w.isRunning():

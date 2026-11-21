@@ -91,3 +91,27 @@ def test_extract_dir_name_long_paths_capped_and_distinct():
     assert a != b
     assert a.startswith('mobile_Containers_Data_Applica') and a.endswith('_primary.ldb')
     assert a == extract_dir_name(base + 'primary.ldb')       # stable across runs
+
+
+def test_records_with_no_text_get_no_index_row(tmp_path, monkeypatch):
+    """Android 14 (2026-11-21): the SafetyNet Safe Browsing lists gave
+    173,376 index rows with empty text, 97% of the case's LevelDB index."""
+    import types
+    import ccl_leveldb
+
+    recs = [types.SimpleNamespace(user_key=k, value=v, key=k, seq=i, state=None)
+            for i, (k, v) in enumerate([(b'blank', b'\x00'), (b'spaces', b' \r\n\t'),
+                                        (b'word', b'hello'), (b'json', b'{"a": 1}')])]
+
+    class FakeDb:
+        def __init__(self, path):
+            pass
+
+        def iterate_records_raw(self):
+            return iter(recs)
+
+        def close(self):
+            pass
+    monkeypatch.setattr(ccl_leveldb, 'RawLevelDb', FakeDb)
+    rows = run_leveldb_search_index(_job(tmp_path))
+    assert [r[0] for r in rows] == [2, 3]

@@ -1312,6 +1312,22 @@ default.** *Decision (owner, 2026-11-16).*
   which can't be reliably linked to each other. `recoverable_tables` is
   retired: it carved on every run (23.9 s of 74 s for 500,000 WhatsApp
   messages).
+- *Decision (owner, 2026-11-21):* identical copies of a recovered record
+  (same shown values, any row ID) are one row, with the number of copies;
+  their locations are kept. An app that rewrites a row by delete + insert
+  (Burner's MessageEntity) leaves one copy per rewrite under a new row ID:
+  99 rows for 17 messages, 18 once collapsed (the 18th a real change, the
+  read flag).
+- *Decision (owner, 2026-11-21):* a deleted-records report names its main
+  report (`deleted_of`) and takes its app location and database files from
+  it, so they are declared once; it stays a separate report (its own run,
+  version and table), never a section of the main one.
+- *Decision (owner, 2026-11-21):* a deleted-records report also lists its
+  media/attachment tables' LIVE rows whose message is gone (status
+  Orphaned, `orphan_of`): not deleted, so never recovered, and missing from
+  the main report, which lists a row only with its message. Compared by id,
+  never joined. *Confirmed (Josh Hickman iOS 17):* 1 of 28 SMS attachments
+  (an outgoing JPEG with no message_attachment_join row).
 - Rows of DROPPED tables are not recovered. *Decision (owner, 2026-11-17):*
   phone apps delete, update and insert rows; dropping a table is rare (e.g.
   a schema migration). FQLite 5.21 recovers them (corpus 0A: 99/100).

@@ -35,12 +35,8 @@ description = (
 # Column names checked against both tables on the Josh Hickman Android 14 image
 # (2026-11-21): DbMessage id, burnerId, contactId, dateCreated, direction, type,
 # state, isRead, mediaUrl, text; MessageEntity value, burnerId, contactId, id.
-app_path = "data/data/com.adhoclabs.burner"
-files = {
-    "messages": "databases/com.adhoclabs.burner.messages.db",
-    "main": "databases/burnerDatabase.db",
-}
-# The -wal and -journal are extracted beside each file by the runner (A-96).
+
+deleted_of = "burner"   # its main report: the app location and database files come from there (A-95)
 
 report_type = "recovered_records"
 recovered_records = [
@@ -73,7 +69,7 @@ recovered_records = [
 timestamp_fields = {"dateCreated": "ms", "value.dateCreated": "ms"}
 
 core_fields = ["status", "record", "dateCreated", "value.dateCreated", "message", "value.text",
-               "direction", "value.direction", "value_caveat", "changed_fields", "how_found"]
+               "direction", "value.direction", "value_caveat", "changed_fields", "how_found", "copies"]
 hidden_fields = ["recovered", "recovery_method", "recovery_version", "source_table",
                  "source_file_key", "raw_rowid", "raw_page", "raw_file", "raw_offset",
-                 "raw_length", "source", "table_certain"]
+                 "raw_length", "source", "table_certain", "copy_locations"]

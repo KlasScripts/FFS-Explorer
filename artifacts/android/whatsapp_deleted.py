@@ -22,6 +22,9 @@ description = (
     'database with one confirmed-deleted message (a message._id gap); the same for '
     'message_ftsv2_content and the live WAL. A real negative for recovery there, not '
     'evidence nothing was deleted.'
+    '\n\nAlso listed: live message_media rows whose message is gone (status Orphaned): '
+    'not deleted, so not recovered, and not in the main report, which lists a row only '
+    'with its message. None on the test image checked (2026-11-21).'
 )
 
 # Declaration-only report (report_type "recovered_records", ASSUMPTIONS.md
@@ -31,9 +34,8 @@ description = (
 # Column names checked against the tables on the test images named in
 # the description (2026-11-21); a column a version of the app lacks is
 # left out and noted in the run log.
-app_path = 'data/data/com.whatsapp'
-files = {'msgstore': 'databases/msgstore.db'}
-# The -wal and -journal are extracted beside each file by the runner (A-96).
+
+deleted_of = "whatsapp"   # its main report: the app location and database files come from there (A-95)
 
 report_type = "recovered_records"
 recovered_records = [{'file_key': 'msgstore',
@@ -65,6 +67,7 @@ recovered_records = [{'file_key': 'msgstore',
              'media_duration': 'media_duration',
              'width': 'width',
              'height': 'height'},
+  'orphan_of': {'column': 'message_row_id', 'in': ['message', '_id']},
   'version_fields': ['file_path', 'media_caption', 'mime_type', 'file_hash']}]
 
 timestamp_fields = {'timestamp': 'ms', 'received_timestamp': 'ms'}
@@ -76,7 +79,7 @@ core_fields = ['status',
  'media_path',
  'changed_fields',
  'message (now)',
- 'how_found']
+ 'how_found', "copies"]
 hidden_fields = ['recovered',
  'recovery_method',
  'recovery_version',
@@ -88,4 +91,4 @@ hidden_fields = ['recovered',
  'raw_offset',
  'raw_length',
  'source',
- 'table_certain']
+ 'table_certain', "copy_locations"]

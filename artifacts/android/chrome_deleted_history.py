@@ -33,10 +33,8 @@ description = (
 # Column names checked against the tables on the test images named in
 # the description (2026-11-21); a column a version of the app lacks is
 # left out and noted in the run log.
-app_path = 'data/data/com.android.chrome'
-files = {'history': 'app_chrome/Default/History'}
-optional_files = {'ukm_db': 'app_chrome/segmentation_platform/ukm_db'}
-# The -wal and -journal are extracted beside each file by the runner (A-96).
+
+deleted_of = "chrome_web_history"   # its main report: the app location and database files come from there (A-95)
 
 report_type = "recovered_records"
 recovered_records = [{'file_key': 'history',
@@ -83,7 +81,7 @@ core_fields = ['status',
  'url',
  'title',
  'changed_fields',
- 'how_found']
+ 'how_found', "copies"]
 hidden_fields = ['recovered',
  'recovery_method',
  'recovery_version',
@@ -95,4 +93,4 @@ hidden_fields = ['recovered',
  'raw_offset',
  'raw_length',
  'source',
- 'table_certain']
+ 'table_certain', "copy_locations"]

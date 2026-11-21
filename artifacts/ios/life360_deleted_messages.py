@@ -76,7 +76,7 @@ recovered_records = [
 timestamp_fields = {"timestamp": "cocoa_s"}
 
 core_fields = ["status", "timestamp", "direction", "message", "deleted_in_app",
-               "changed_fields", "how_found"]
+               "changed_fields", "how_found", "copies"]
 hidden_fields = ["recovered", "recovery_method", "recovery_version", "source_table",
                  "source_file_key", "raw_rowid", "raw_page", "raw_file", "raw_offset",
-                 "raw_length", "source"]
+                 "raw_length", "source", "copy_locations"]

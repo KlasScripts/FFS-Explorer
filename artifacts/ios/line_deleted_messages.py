@@ -39,11 +39,8 @@ description = (
 # Names follow the Android LINE report (artifacts/android/line.py):
 # timestamp, message, direction Outgoing / Incoming.
 category = "Chats & Messaging"
-app_group = "group.com.linecorp.line"
-files = {
-    "line": "Library/Application Support/PrivateStore/P_*/Messages/Line.sqlite",
-}
-# The -wal and -journal are extracted beside it by the runner (A-96).
+
+deleted_of = "line"   # its main report: the app location and database files come from there (A-95)
 
 report_type = "recovered_records"
 recovered_records = [
@@ -86,7 +83,7 @@ recovered_records = [
 timestamp_fields = {"timestamp": "ms"}
 
 core_fields = ["status", "timestamp", "direction", "message", "changed_fields", "message (now)",
-               "content_type", "record", "how_found"]
+               "content_type", "record", "how_found", "copies"]
 hidden_fields = ["recovered", "recovery_method", "recovery_version", "source_table",
                  "source_file_key", "raw_rowid", "raw_page", "raw_file", "raw_offset",
-                 "raw_length", "source"]
+                 "raw_length", "source", "copy_locations"]

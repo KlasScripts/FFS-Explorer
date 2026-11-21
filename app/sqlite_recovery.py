@@ -1,8 +1,8 @@
 """sqlite_recovery.py — deleted and older records of a SQLite database, one
 way for every caller. Qt-free.
 
-Reports (`recoverable_tables`, via sqlite_carve.recover_deleted_rows) and
-the File Browser's Database tab both ask this module, so they find the
+Deleted-records reports (`report_type = "recovered_records"`) and the
+File Browser's Database tab both ask this module, so they find the
 same records with the same labels. The byte-level decoders stay in
 sqlite_carve.py; this module decides which candidates belong to which
 table and how sure that is.

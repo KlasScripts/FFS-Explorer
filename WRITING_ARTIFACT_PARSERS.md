@@ -553,6 +553,29 @@ app, covering its message table and its media/attachment tables (below);
 `tests/test_recovered_reports.py` stops a shipped parser declaring
 `recoverable_tables` again.
 
+A deleted-records report names its main report with `deleted_of =
+"<main script name>"`: the loader gives it the main report's app location
+(`app_path` / `app_group`) and every database file its tables name
+(`file_key`, from the main report's `files` or `optional_files`), so they
+are declared once; anything it declares itself wins (LINE's full-text
+index reads a database the main report doesn't). The main report then
+shows a line linking to it. Use the main report's `file_key` names.
+
+Identical copies of a record (the same shown values under any row id, as
+an app that rewrites a row by delete + insert leaves) are one row: its
+`copies` column counts them and the hidden `copy_locations` keeps where
+each was found (A-95). Put `copies` in `core_fields` and
+`copy_locations` in `hidden_fields`, as the shipped reports do.
+
+For a media or attachment table, declare `orphan_of` to also list its
+LIVE rows whose message is gone (status Orphaned): not deleted, so never
+recovered, and missing from the main report, which lists a row only with
+its message. `{"column": "message_row_id", "in": ["message", "_id"]}`, or
+with `"via": [join table, its column for this row, its column for the
+message]` when a join table links them (iOS SMS attachments). Compared by
+id, never joined. On the Josh Hickman iOS 17 image this found 1 of 28 SMS
+attachments.
+
 ### `report_type = "recovered_records"`: a deleted / changed records report with no `run()`
 
 For "what was deleted or changed in this app's messages", don't write a

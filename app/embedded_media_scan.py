@@ -18,8 +18,8 @@ thread, and from the MCP server, with no Qt dependency).
 ── Why this is schema-agnostic, not per-table like sqlite_carve's own
 `recoverable_tables` convention ────────────────────────────────────────
 
-Every OTHER carving/recovery feature in this project (recoverable_tables,
-record_source) is built around a PARSER that already knows which table
+Every OTHER carving/recovery feature in this project (the per-app
+deleted-records reports, record_source) is built around a PARSER that already knows which table
 and columns matter for one specific app. This feature's whole point is
 the opposite: find media in databases and plists this project has NO
 parser for at all. SQLite's own on-disk record format is genuinely

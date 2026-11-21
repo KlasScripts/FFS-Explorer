@@ -105,63 +105,14 @@ HOW) and has real code elsewhere doing the actual work:
                        — the Report table formats it per the case's
                        UTC/handset/acquisition setting at display time (see
                        CLAUDE.md's timestamp conventions).
-    recoverable_tables list[str] — declarative only, names SQL table(s)
-                       this script's own query reads from that its
-                       recovery pass (sqlite_carve) can also carve deleted
-                       rows from; no recovery code belongs on the module
-                       itself — see recovery_field_notes below for the one
-                       companion attribute.
-    recovery_field_notes dict[str, dict[str, str]] — {table_name:
-                       {column: caveat}}, matched against recoverable_tables
-                       entries; a caveat string attached to a specific
-                       recovered column this script's own cross-checking
-                       found unreliable (e.g. a flag that turned out
-                       constant regardless of truth) — the raw recovered
-                       value is never altered, just labeled.
-    recovery_source_labels dict[str, str] — {table_name: friendly_label},
-                       matched against recoverable_tables entries. Optional
-                       — every recovered row gets a `source` field either
-                       way (see below), this only controls how readable it
-                       is. Needed because a carved row never runs through
-                       this script's own run(), so it can't set `source`
-                       itself the way a live row does; if this script's
-                       `core_fields` includes "source", a carved row would
-                       otherwise show blank there instead of merely
-                       ragged. The runner fills `source` on every recovered
-                       row automatically: `f"Carved — {label or table}"`,
-                       upgraded to `" (likely false positive — ...)"`
-                       naming the exact reason whenever sqlite_carve's own
-                       confidence gate finds one — a NOT NULL live-schema
-                       column decoded blank, or a timestamp_fields-declared
-                       column decoding outside a plausible range (before
-                       1970-01-01 UTC, or noticeably in the future). This
-                       gate runs for EVERY carving path (generalized
-                       2026-09-05 from an original header_signature-only
-                       check, per direct instruction: an implausible
-                       decoded timestamp means the record itself is likely
-                       spurious, not a cosmetic nuance specific to one
-                       carving method), so any of the four can carry this
-                       label, not just header_signature. Absent a
-                       violation, header_signature candidates STILL get a
-                       plain `" (unverified match)"` suffix — that path has
-                       no rowid at all to cross-check against, the
-                       weakest of the four carving paths structurally (see
-                       sqlite_carve.py's own carve_by_header_signature
-                       docstring) — while a clean freeblock/freed-page/
-                       WAL-frame row gets no suffix at all, since those
-                       already passed a stronger structural check (exact
-                       column-count match + a real rowid decode) that
-                       header_signature can't offer. See
-                       recover_deleted_rows' `notnull_violations`/
-                       `timestamp_issues` and sqlite_carve._confidence_gate/
-                       notnull_columns/_timestamp_plausible. The row is
-                       never withheld either way, only the label — this
-                       project's standing escalate-don't-silently-discard
-                       rule. Declare this whenever a
-                       parser's recoverable_tables spans more than one
-                       underlying table/database an examiner would
-                       otherwise have to infer from a bare SQL table name —
-                       see artifacts/android/chrome_web_history.py.
+    recoverable_tables, recovery_field_notes, recovery_source_labels —
+                       retired 2026-11-21 (ASSUMPTIONS.md A-95): a main
+                       report holds live rows only; deleted and changed
+                       records are a report_type = "recovered_records"
+                       report of their own (deleted_of names the main
+                       report; field_notes is the caveat). The runner no
+                       longer reads them; tests/test_recovered_reports.py
+                       stops a shipped parser declaring them.
     media_fields list[str] — output field names holding an archive ui_path
                        (never a filesystem path, never bytes the parser
                        copied itself) to an attachment/media file; rendered
@@ -195,8 +146,8 @@ HOW) and has real code elsewhere doing the actual work:
                        never varies), "rowid_fields": list[str] (output
                        fields to try in order for the row's rowid in that
                        table — list more than one when a live row and a
-                       recoverable_tables-carved row use different field
-                       names for the same concept), "source_match":
+                       carved row use different field names for the same
+                       concept), "source_match":
                        list[str] (optional — only needed when this
                        script's run() merges more than one live query
                        into one report, e.g. chrome_web_history.py's
@@ -232,10 +183,10 @@ HOW) and has real code elsewhere doing the actual work:
                        recovered from via source_table) — matched by
                        table name instead, narrowed further by file_key
                        only if more than one entry shares that bare table
-                       name (the identical collision recoverable_tables'
-                       own file_key pinning already exists to resolve at
-                       carve time — a recovered row carries
-                       source_file_key for exactly this). See
+                       name (the same collision a recovered_records
+                       report's file_key pinning resolves at carve time —
+                       a recovered row carries source_file_key for exactly
+                       this). See
                        artifacts/ios/whatsapp.py for a worked 4-entry
                        single-query example,
                        artifacts/android/whatsapp.py for a worked
@@ -316,7 +267,7 @@ load):
                               — the parser's own run() is never even called
                               in that case, matching every other early-
                               return failure shape in this function.
-    recoverable_tables/media_fields/timestamp_fields/record_source all
+    media_fields/timestamp_fields/record_source all
     still work identically for a device_wide parser's own output rows —
     nothing about this API changes how the OUTPUT is declared, only how
     run() gets its INPUT.
@@ -608,14 +559,12 @@ def decode_plist_blob(data: bytes):
 def open_db_readonly(db_path: str) -> sqlite3.Connection:
     """Open a sqlite file for a plain live query, READ-ONLY — every
     parser's own run() should call this instead of a bare
-    sqlite3.connect(), whether or not the parser declares
-    recoverable_tables. A bare connect (even for a pure SELECT, no
+    sqlite3.connect(). A bare connect (even for a pure SELECT, no
     explicit write) can trigger SQLite's own checkpoint-on-close
     behavior, silently DELETING the file's own -wal/-shm sidecars before
     anything else gets a chance to read them — destroying exactly the
-    historical/superseded WAL frame content sqlite_carve.py's own
-    recoverable_tables carving pass needs afterward for deleted-row
-    recovery (see CLAUDE.md's own WAL-checkpoint Conventions entry).
+    historical/superseded WAL frame content a deleted-records report's
+    carving needs afterward (see CLAUDE.md's own WAL-checkpoint Conventions entry).
 
     Added 2026-09-12, confirmed by direct testing that a read-only URI
     connect (`file:{path}?mode=ro`) returns byte-for-byte identical
@@ -1234,7 +1183,48 @@ def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[
         except Exception as exc:
             errors.append((fname, f"{type(exc).__name__}: {exc}"))
             print(f"[artifact_runner] Could not load {fname}: {exc}")
+    by_name = dict(modules)
+    for script_name, mod in list(modules):
+        if getattr(mod, 'deleted_of', None):
+            problem = _take_from_main_report(mod, by_name.get(mod.deleted_of))
+            if problem:
+                modules.remove((script_name, mod))
+                errors.append((f"{script_name}.py", problem))
     return modules, errors
+
+
+def _take_from_main_report(mod, main) -> str | None:
+    """A deleted-records report names its main report (`deleted_of`,
+    ASSUMPTIONS.md A-95) and takes from it the app location (app_path /
+    app_group) and every database file its tables name (file_key), from the
+    main report's files or optional_files, so they are declared once. What
+    the report declares itself wins (e.g. LINE's full-text index, a database
+    the main report doesn't read). Marks the main report with
+    `deleted_report` (this report's module) for the viewer's pointer.
+    Returns what is wrong, or None."""
+    if main is None:
+        return f"deleted_of names '{mod.deleted_of}', which is not a report on this platform"
+    if not hasattr(mod, 'app_path') and not hasattr(mod, 'app_group'):
+        for attr in ('app_path', 'app_group'):
+            if hasattr(main, attr):
+                setattr(mod, attr, getattr(main, attr))
+    files = dict(getattr(mod, 'files', None) or {})
+    optional = dict(getattr(mod, 'optional_files', None) or {})
+    main_files = getattr(main, 'files', None) or {}
+    main_optional = getattr(main, 'optional_files', None) or {}
+    for spec in getattr(mod, 'recovered_records', ()):
+        key = spec['file_key']
+        if key in files or key in optional:
+            continue
+        if key in main_files:
+            files[key] = main_files[key]
+        elif key in main_optional:
+            optional[key] = main_optional[key]
+        else:
+            return f"file_key '{key}' is not a file of {mod.deleted_of} or of this report"
+    mod.files, mod.optional_files = files, optional
+    main.deleted_report = mod
+    return None
 
 
 def list_artifacts(platform: str) -> list[tuple[str, object]]:
@@ -1427,33 +1417,6 @@ def _extract_db_sidecars(dest_path: str, candidates: list[str], zip_path: str,
     return written
 
 
-def _recover_deleted_rows(paths: dict, table: str, field_notes: dict,
-                          file_key: str = None, timestamp_fields: dict = None) -> list[dict]:
-    """One entry of a parser's `recoverable_tables` -> extra rows from
-    app/sqlite_carve.py's freeblock/freed-page/WAL-history scan, or [] if
-    nothing survived, the module can't be imported, or anything about the
-    attempt failed. A parser declares only the table name (see viber.py /
-    burner.py for the one-line convention) — no recovery code belongs in
-    an artifact script; this is the only call site. *field_notes* is the
-    matching entry (if any) of a parser's optional `recovery_field_notes`
-    — also declarative, a caveat string per column the parser's own
-    cross-checking found unreliable, attached to the recovered row rather
-    than silently dropped or (worse) "corrected" to a guess. *file_key*
-    is passed straight through to sqlite_carve.recover_deleted_rows — see
-    its own docstring for when a parser needs it (two of its own database
-    files defining a same-named table). *timestamp_fields* is the parser's
-    own module-level declaration, passed through so a header_signature
-    candidate's declared timestamp column can be checked for plausibility
-    — see recovery_source_labels below and sqlite_carve.recover_deleted_
-    rows' own docstring."""
-    try:
-        import sqlite_carve
-    except ImportError:
-        return []
-    return sqlite_carve.recover_deleted_rows(
-        paths, table, field_notes, file_key=file_key, timestamp_fields=timestamp_fields)
-
-
 # ── Report type: recovered records ───────────────────────────────────────────
 # A parser that declares report_type = "recovered_records" has no run() of
 # its own: it declares the database file(s) and, per table, the columns that
@@ -1499,6 +1462,13 @@ def _recover_deleted_rows(paths: dict, table: str, field_notes: dict,
 #               column itself is kept
 #       "field_notes": {"value": "..."},   # optional: a caveat checked against
 #               ground truth, shown on every row as "<field>_caveat"
+#       "orphan_of": {"column": "message_row_id", "in": ["message", "_id"]},
+#               optional, for a media/attachment table: also list its LIVE
+#               rows whose message is gone (status Orphaned): not deleted, so
+#               never recovered, and missing from the main report. "via":
+#               [join table, its column for this row, its column for the
+#               message] when a join table links them (iOS SMS). Compared by
+#               id, never joined (A-95)
 #   }]
 # Only declare a label or derived value that was checked against ground
 # truth, and say where in the parser.
@@ -1564,6 +1534,24 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
                     except sqlite3.Error:
                         vals_ = set()
                 not_in[col] = (vals_, otable, ocol)
+            # Live rows whose message is gone (orphan_of): not deleted, so
+            # never recovered, and missing from the main report, whose query
+            # starts from the message. Compared by id, never joined (A-95).
+            orphans = []
+            ospec = spec.get('orphan_of')
+            if ospec:
+                ocol, (ttab, tkey) = ospec['column'], ospec['in']
+                target = f'SELECT "{tkey}" FROM "{ttab}" WHERE "{tkey}" IS NOT NULL'
+                if ospec.get('via'):
+                    jt, jleft, jright = ospec['via']
+                    target = (f'SELECT "{jleft}" FROM "{jt}" WHERE "{jleft}" IS NOT NULL '
+                              f'AND "{jright}" IN ({target})')
+                try:
+                    orphans = [r[0] for r in conn.execute(
+                        f'SELECT rowid FROM "{t.name}" WHERE "{ocol}" IS NOT NULL '
+                        f'AND "{ocol}" NOT IN ({target})')]
+                except sqlite3.Error as e:
+                    log_note(f"{spec.get('label', spec['table'])}: orphaned rows not checked ({e}).")
         finally:
             conn.close()
             if checkpoint is not None:
@@ -1577,7 +1565,7 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
         vf = [c for c in (spec.get('version_fields') or []) if c in t.columns]
         idx = {c: t.columns.index(c) for c in t.columns}
         label = spec.get('label', spec['table'])
-        seen: set = set()
+        seen: dict = {}          # copy key -> the row listed for it
         hidden: dict = {}
         known = 0
         for r in records:
@@ -1602,12 +1590,25 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
                    for c, (pool, _ot, _oc) in not_in.items() if c in idx):
                 known += 1
                 continue
+            # One row per record: a copy (the same row id and version
+            # values, or the same shown values under any row id, as an app
+            # that rewrites by delete + insert leaves; A-95) is counted on
+            # the row already listed, with its location, never dropped.
             key_cols = vf or t.columns
             key = (status, rowid, tuple(repr(vals[idx[c]]) if idx[c] < len(vals) else None
                                         for c in key_cols))
-            if key in seen:
+            shown_key = (status,
+                         tuple(repr(vals[idx[c]]) if c in idx and idx[c] < len(vals) else None
+                               for c in fields),
+                         tuple(repr(live[idx[c]]) for c in changed))
+            first = seen.get(key) or seen.get(shown_key)
+            if first is not None:
+                first['copies'] += 1
+                first['copy_locations'] += (f"; {r['file']} offset {r['offset']}"
+                                            + (f" rowid {rowid}" if rowid is not None else ''))
+                seen.setdefault(key, first)
+                seen.setdefault(shown_key, first)
                 continue
-            seen.add(key)
             labels = spec.get('labels') or {}
 
             def shown(col, v):
@@ -1663,7 +1664,60 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
             })
             if r.get('truncated'):
                 row['truncated'] = True
+            row['copies'] = 1
+            row['copy_locations'] = (f"{r['file']} offset {r['offset']}"
+                                     + (f" rowid {rowid}" if rowid is not None else ''))
+            seen[key] = row
+            seen[shown_key] = row
             rows.append(row)
+        if orphans:
+            labels_ = spec.get('labels') or {}
+            what = (f"{ospec['in'][0]} (through {ospec['via'][0]})" if ospec.get('via')
+                    else f"{ospec['in'][0]} row")
+            for rowid in orphans:
+                vals = t.live.get(rowid)
+                if vals is None:
+                    continue
+                row = {'record': label, 'status': 'Orphaned', 'row_id': rowid}
+                for col, name in fields.items():
+                    if col in idx and idx[col] < len(vals):
+                        v = vals[idx[col]]
+                        tab = labels_.get(col)
+                        row[name] = (f"{tab[v]} ({v})" if tab and v in tab and v is not None
+                                     else blob_safe(v))
+                for col in spec.get('json_fields') or ():
+                    if col in idx:
+                        from sqlite_carve import flatten_json_fields
+                        for k, v in flatten_json_fields({fields.get(col, col): vals[idx[col]]}).items():
+                            row.setdefault(k, blob_safe(v))
+                for col, note_text in (spec.get('field_notes') or {}).items():
+                    if col in idx:
+                        row[f"{fields.get(col, col)}_caveat"] = note_text
+                key_v = vals[idx[ospec['column']]] if ospec['column'] in idx else rowid
+                row.update({
+                    'changed_fields': '',
+                    'how_found': (f"live row; no {what} row has its "
+                                  f"{fields.get(ospec['column'], ospec['column'])} ({key_v})"),
+                    'table_certain': True,
+                    'source': f"Live — {label} (orphaned)",
+                    'recovered': False,
+                    'recovery_method': 'orphaned_live_row',
+                    'recovery_version': sqlite_recovery.RECOVERY_VERSION,
+                    'source_table': t.name,
+                    'source_file_key': spec['file_key'],
+                    'raw_rowid': rowid, 'raw_page': None, 'raw_file': 'main',
+                    'raw_offset': None, 'raw_length': None,
+                    'copies': 1, 'copy_locations': '',
+                })
+                rows.append(row)
+            log_note(f"{label}: {len(orphans)} live row(s) whose {what} is gone: "
+                     "listed as Orphaned.")
+        collapsed = sum(x['copies'] - 1 for x in rows if x.get('source_table') == t.name
+                        and x.get('source_file_key') == spec['file_key'] and x['record'] == label)
+        if collapsed:
+            log_note(f"{label}: {collapsed} identical {'copy' if collapsed == 1 else 'copies'} "
+                     "of records already listed: counted in copies, their locations in "
+                     "copy_locations.")
         if known:
             where = '; '.join(f"{fields.get(c, c)} = a {ot}.{oc} value" for c, (_p, ot, oc) in not_in.items())
             log_note(f"{label}: {known} record(s) whose {where} already in the report or the "
@@ -1815,13 +1869,8 @@ def run_artifact(
     kept for direct inspection.  Extraction is skipped if the file exists.
 
     Returns (rows, error). On success rows is a list[dict] — the parser's
-    own query result plus whatever its `recoverable_tables` declaration
-    turned up, appended after. A script wanting recovered/carved content
-    kept as its own separate, independently-trusted report (rather than
-    blended into a normal query's output) should be its own separate
-    script whose `run()` returns [] and whose entire contribution is its
-    `recoverable_tables` declaration — see e.g.
-    artifacts/android/burner_messageentity.py. On failure rows is [] and
+    own query result (live rows only; deleted records are a
+    recovered_records report of their own, A-95). On failure rows is [] and
     error describes what went wrong.
     """
     parser_name = getattr(module, 'name', script_name)
@@ -2013,68 +2062,6 @@ def run_artifact(
             rows = module.run(paths) or []
         except Exception as exc:
             return [], f"{script_name}: {exc}"
-        all_notes = getattr(module, 'recovery_field_notes', {})
-        all_labels = getattr(module, 'recovery_source_labels', {})
-        all_timestamp_fields = getattr(module, 'timestamp_fields', {})
-        for entry in getattr(module, 'recoverable_tables', ()):
-            # A bare string is the common case (search every extracted
-            # file for this table name). A (file_key, table) tuple pins
-            # the search to one specific file — needed when two of a
-            # parser's own database files define a same-named table; see
-            # sqlite_carve.recover_deleted_rows' docstring.
-            if isinstance(entry, tuple):
-                file_key, table = entry
-            else:
-                file_key, table = None, entry
-            recovered = _recover_deleted_rows(paths, table, all_notes.get(table, {}),
-                                              file_key=file_key, timestamp_fields=all_timestamp_fields)
-            # A carved row never runs through this module's own run(), so
-            # it can't set `source` the way a live row does — without this,
-            # a report whose core_fields includes "source" shows a blank
-            # cell for exactly the rows where provenance matters most. See
-            # recovery_source_labels above. header_signature carves have no
-            # rowid at all (the other three paths are pre-filtered to an
-            # exact column-count match against the live schema before ever
-            # reaching here) — flagged as the weaker match it structurally
-            # is, not asserted as equally confirmed. sqlite_carve already
-            # cross-checked each header_signature row's NOT NULL columns and
-            # any declared timestamp field for plausibility (see
-            # notnull_violations/timestamp_issues on the row) — a genuine
-            # hit there escalates the label past the generic "(unverified
-            # match)" rather than silently dropping the row; the row itself
-            # is never withheld either way, per this project's standing
-            # escalate-don't-discard rule.
-            label = all_labels.get(table, table)
-            for r in recovered:
-                reasons = []
-                if r.get('notnull_violations'):
-                    reasons.append('NOT NULL columns blank: ' + ', '.join(r['notnull_violations']))
-                if r.get('timestamp_issues'):
-                    reasons.append('implausible timestamp: ' + ', '.join(r['timestamp_issues']))
-                if reasons:
-                    # The confidence GATE now runs for every carving path
-                    # (see sqlite_carve._confidence_gate), not just
-                    # header_signature — a freeblock/freed-page/WAL-frame
-                    # candidate can trip it too, even though those paths
-                    # already passed a stronger structural check (exact
-                    # column-count match + a real rowid decode) than
-                    # header_signature ever can. Either way, an implausible
-                    # decoded timestamp is treated as a strong sign the
-                    # RECORD ITSELF is spurious, not cosmetic — most
-                    # load-bearing for a report like Chrome web history,
-                    # where a plausible-looking but fabricated row would
-                    # misrepresent real user behavior. Never withheld,
-                    # only labeled, same as always.
-                    confidence = f' (likely false positive — {"; ".join(reasons)})'
-                else:
-                    # How it was found and how sure that is, in plain words
-                    # (sqlite_recovery.describe): '' for an ordinary deleted
-                    # cell found intact in free space; "unverified match"
-                    # for the pattern searches, which have no rowid.
-                    note = r.get('recovery_note') or ''
-                    confidence = f' ({note})' if note else ''
-                r.setdefault('source', f"Carved — {label}{confidence}")
-            rows = rows + recovered
         return rows, ''
 
     # ── Single-file API (legacy) ──────────────────────────────────────────────

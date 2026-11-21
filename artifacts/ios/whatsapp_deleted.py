@@ -21,6 +21,9 @@ description = (
     'secure_delete = FAST; carving found nothing for a documented deleted message, and a '
     'byte search of the file for its text found no trace. The deletion itself shows as a '
     'one-row gap in ZWAMESSAGE.Z_PK (see that report).'
+    '\n\nAlso listed: live ZWAMEDIAITEM rows whose message is gone (status Orphaned): '
+    'not deleted, so not recovered, and not in the main report, which lists a row only '
+    'with its message. None on the test image checked (2026-11-21).'
 )
 
 # Declaration-only report (report_type "recovered_records", ASSUMPTIONS.md
@@ -30,9 +33,8 @@ description = (
 # Column names checked against the tables on the test images named in
 # the description (2026-11-21); a column a version of the app lacks is
 # left out and noted in the run log.
-app_group = 'group.net.whatsapp.WhatsApp.shared'
-files = {'chatstorage': 'ChatStorage.sqlite'}
-# The -wal and -journal are extracted beside each file by the runner (A-96).
+
+deleted_of = "whatsapp"   # its main report: the app location and database files come from there (A-95)
 
 report_type = "recovered_records"
 recovered_records = [{'file_key': 'chatstorage',
@@ -76,6 +78,7 @@ recovered_records = [{'file_key': 'chatstorage',
              'ZAUTHORNAME': 'author_name',
              'ZVCARDNAME': 'vcard_name',
              'ZMEDIAURLDATE': 'media_url_date'},
+  'orphan_of': {'column': 'ZMESSAGE', 'in': ['ZWAMESSAGE', 'Z_PK']},
   'version_fields': ['ZMEDIALOCALPATH', 'ZTITLE', 'ZMEDIAURL', 'ZLATITUDE', 'ZLONGITUDE']}]
 
 timestamp_fields = {'message_date': 'cocoa_s', 'sent_date': 'cocoa_s', 'media_url_date': 'cocoa_s'}
@@ -87,7 +90,7 @@ core_fields = ['status',
  'media_path',
  'changed_fields',
  'message (now)',
- 'how_found']
+ 'how_found', "copies"]
 hidden_fields = ['recovered',
  'recovery_method',
  'recovery_version',
@@ -99,4 +102,4 @@ hidden_fields = ['recovered',
  'raw_offset',
  'raw_length',
  'source',
- 'table_certain']
+ 'table_certain', "copy_locations"]

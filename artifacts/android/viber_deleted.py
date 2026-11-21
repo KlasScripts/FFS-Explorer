@@ -28,12 +28,11 @@ description = (
 # Column names checked against the tables on the test images named in
 # the description (2026-11-21); a column a version of the app lacks is
 # left out and noted in the run log.
-app_path = 'data/data/com.viber.voip'
-files = {'viber': 'databases/viber_messages'}
-# The -wal and -journal are extracted beside each file by the runner (A-96).
+
+deleted_of = "viber"   # its main report: the app location and database files come from there (A-95)
 
 report_type = "recovered_records"
-recovered_records = [{'file_key': 'viber',
+recovered_records = [{'file_key': 'viber_messages',
   'table': 'messages',
   'label': 'Message',
   'fields': {'_id': 'message_id',
@@ -59,7 +58,7 @@ recovered_records = [{'file_key': 'viber',
 
 timestamp_fields = {'msg_date': 'ms'}
 
-core_fields = ['status', 'msg_date', 'message', 'extra_mime', 'changed_fields', 'message (now)', 'how_found']
+core_fields = ['status', 'msg_date', 'message', 'extra_mime', 'changed_fields', 'message (now)', 'how_found', "copies"]
 hidden_fields = ['recovered',
  'recovery_method',
  'recovery_version',
@@ -71,4 +70,4 @@ hidden_fields = ['recovered',
  'raw_offset',
  'raw_length',
  'source',
- 'table_certain']
+ 'table_certain', "copy_locations"]

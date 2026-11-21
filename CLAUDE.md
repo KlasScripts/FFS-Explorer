@@ -135,7 +135,10 @@ Declarations a parser can set:
   deleted / changed records report with no `run()` (the loader attaches
   `artifact_runner.recovered_records_report`): per table the columns that
   matter, `version_fields`, optional `labels` / `derived` / `not_found_in`;
-  never joined. Optional `json_fields` (a JSON-object column split into
+  never joined; `deleted_of` names the main report, whose app location and
+  files it takes (`artifact_runner._take_from_main_report`); identical
+  copies are one row with `copies`; `orphan_of` also lists a media table's live
+  rows whose message is gone (status Orphaned). Optional `json_fields` (a JSON-object column split into
   `<field>.<key>`) and `field_notes` (a checked caveat per row). One per
   messaging app (message + media tables): `*_deleted*.py`, `line_fts.py`,
   `burner_messageentity.py`. Example: `artifacts/ios/line_deleted_messages.py`.

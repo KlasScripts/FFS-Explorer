@@ -20,6 +20,9 @@ description = (
     '(carried over from the Google Messages report): bugle_db has PRAGMA secure_delete = '
     'FAST; the freed page ranges were all zero on a database known to have a deleted '
     'conversation. A real negative for recovery, not evidence nothing was deleted.'
+    '\n\nAlso listed: live parts rows whose message is gone (status Orphaned): '
+    'not deleted, so not recovered, and not in the main report, which lists a row only '
+    'with its message. None on the test image checked (2026-11-21).'
 )
 
 # Declaration-only report (report_type "recovered_records", ASSUMPTIONS.md
@@ -29,12 +32,11 @@ description = (
 # Column names checked against the tables on the test images named in
 # the description (2026-11-21); a column a version of the app lacks is
 # left out and noted in the run log.
-app_path = 'data/data/com.google.android.apps.messaging'
-files = {'bugle': 'databases/bugle_db'}
-# The -wal and -journal are extracted beside each file by the runner (A-96).
+
+deleted_of = "google_messages"   # its main report: the app location and database files come from there (A-95)
 
 report_type = "recovered_records"
-recovered_records = [{'file_key': 'bugle',
+recovered_records = [{'file_key': 'bugle_db',
   'table': 'messages',
   'label': 'Message',
   'fields': {'_id': 'message_id',
@@ -48,7 +50,7 @@ recovered_records = [{'file_key': 'bugle',
              'sms_message_uri': 'sms_message_uri',
              'rcs_message_id': 'rcs_message_id'},
   'version_fields': ['conversation_id', 'sender_id', 'message_protocol', 'mms_subject']},
- {'file_key': 'bugle',
+ {'file_key': 'bugle_db',
   'table': 'parts',
   'label': 'Part (text or attachment)',
   'fields': {'_id': 'part_id',
@@ -63,6 +65,7 @@ recovered_records = [{'file_key': 'bugle',
              'latitude': 'latitude',
              'longitude': 'longitude',
              'local_cache_path': 'local_cache_path'},
+  'orphan_of': {'column': 'message_id', 'in': ['messages', '_id']},
   'version_fields': ['text', 'content_type', 'uri', 'file_name']}]
 
 timestamp_fields = {'sent_timestamp': 'ms', 'received_timestamp': 'ms', 'timestamp': 'ms'}
@@ -75,7 +78,7 @@ core_fields = ['status',
  'content_type',
  'changed_fields',
  'message (now)',
- 'how_found']
+ 'how_found', "copies"]
 hidden_fields = ['recovered',
  'recovery_method',
  'recovery_version',
@@ -87,4 +90,4 @@ hidden_fields = ['recovered',
  'raw_offset',
  'raw_length',
  'source',
- 'table_certain']
+ 'table_certain', "copy_locations"]

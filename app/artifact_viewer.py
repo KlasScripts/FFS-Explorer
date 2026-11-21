@@ -2390,6 +2390,14 @@ class ArtifactViewerMixin:
         self._art_version_banner.setVisible(False)
         report_layout.addWidget(self._art_version_banner)
 
+        # A main report holds live rows only; this names its deleted-records
+        # report (deleted_of, ASSUMPTIONS.md A-95) and opens it.
+        self._art_deleted_link = QLabel()
+        self._art_deleted_link.setTextFormat(Qt.TextFormat.RichText)
+        self._art_deleted_link.linkActivated.connect(self._art_open_deleted_report)
+        self._art_deleted_link.setVisible(False)
+        report_layout.addWidget(self._art_deleted_link)
+
         report_layout.addWidget(self._art_report_view)
 
         # Script page — read-only monospace text editor
@@ -4182,6 +4190,46 @@ class ArtifactViewerMixin:
                 w = max(w, fm.horizontalAdvance(text) + 12)
             self._art_report_view.setColumnWidth(col, min(w, max_width))
 
+    def _update_art_deleted_link(self, mod) -> None:
+        """Under a main report: the line naming its deleted-records report
+        (set by artifact_runner._take_from_main_report), a link when that
+        report has been run, else how to run it."""
+        deleted = getattr(mod, 'deleted_report', None) if mod is not None else None
+        if deleted is None:
+            self._art_deleted_link.setVisible(False)
+            return
+        name = html.escape(getattr(deleted, 'name', deleted.__name__))
+        if self._art_find_tree_item_by_role(_ART_GROUP + deleted.__name__) is not None:
+            self._art_deleted_link.setText(
+                f'Live rows only. Deleted and changed records: '
+                f'<a href="{html.escape(deleted.__name__)}">{name}</a>')
+        else:
+            # Not in the tree: never run, or run and found nothing (a report
+            # with no rows has no table). The run log says which.
+            try:
+                with closing(_open_results_db(self._case_dir)) as db:
+                    last = load_last_run(db, f'artifact_{deleted.__name__}')
+            except Exception:
+                last = None
+            if last and last['complete']:
+                when = html.escape(_local_date(last.get('completed_at') or last.get('run_at') or ''))
+                state = f'ran {when}: no deleted or changed records found'
+            elif last:
+                state = 'its last run did not finish (Tools ▸ Run Artifact Parsers)'
+            else:
+                state = 'not run yet (Tools ▸ Run Artifact Parsers)'
+            self._art_deleted_link.setText(
+                f'Live rows only. Deleted and changed records are in "{name}": {state}.')
+        self._art_deleted_link.setVisible(True)
+
+    def _art_open_deleted_report(self, script_name: str) -> None:
+        item = self._art_find_tree_item_by_role(_ART_GROUP + script_name)
+        if item is None:
+            return
+        index = item.index()
+        self._art_tree_view.setCurrentIndex(index)
+        self._on_art_tree_clicked(index)
+
     def _update_art_version_banner(self, script_name: str, platform: str) -> None:
         """Show/hide the non-blocking version banner above the report
         table: visible either when the parser version that produced THIS
@@ -4367,6 +4415,7 @@ class ArtifactViewerMixin:
         # already current — just compare it against whatever version
         # produced THIS report (recorded in run_log at run time).
         self._update_art_version_banner(script_name, platform)
+        self._update_art_deleted_link(mod)
 
         # view_mode = "document" (see artifacts/ios|android/device_info.py):
         # a report whose run() returns ONE row with a single
@@ -4500,7 +4549,10 @@ class ArtifactViewerMixin:
         self._art_start_thumbnails(script_name, saved_media or {})
 
         core_fields = getattr(mod, 'core_fields', None) if mod else None
-        has_recoverable = bool(getattr(mod, 'recoverable_tables', None)) if mod else False
+        # The "Hide likely false positives" box: for a table holding carved
+        # rows, a deleted-records report or a report made before main
+        # reports went live-only (A-95, 2026-11-21) and not re-run since.
+        has_recoverable = 'source' in cols and 'recovered' in cols
         self._setup_report_filter_ui(cols, hidden_fields, script_name, core_fields, has_recoverable)
         self._art_resize_columns()
         self._art_row_label.setText(f"{len(ids):,} rows")

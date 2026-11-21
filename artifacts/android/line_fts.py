@@ -28,11 +28,11 @@ description = (
 # Columns checked on the Josh Hickman Android 14 image (2026-11-21):
 # fts_message_content docid, c0formatted_message; message_chat_relation
 # message_id, chat_id.
-app_path = "data/data/jp.naver.line.android"
 files = {
     "main": "databases/unencrypted_test_full_text_search_message.db",
 }
-# The -wal and -journal are extracted beside it by the runner (A-96).
+
+deleted_of = "line"   # its main report: the app location comes from there (A-95)
 
 report_type = "recovered_records"
 recovered_records = [
@@ -53,7 +53,7 @@ recovered_records = [
 ]
 
 core_fields = ["status", "record", "message_id", "message", "chat_id", "changed_fields",
-               "message (now)", "how_found"]
+               "message (now)", "how_found", "copies"]
 hidden_fields = ["recovered", "recovery_method", "recovery_version", "source_table",
                  "source_file_key", "raw_rowid", "raw_page", "raw_file", "raw_offset",
-                 "raw_length", "source", "table_certain"]
+                 "raw_length", "source", "table_certain", "copy_locations"]

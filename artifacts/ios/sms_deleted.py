@@ -25,7 +25,11 @@ description = (
     'PRAGMA secure_delete = FAST (freed ranges all zero); two messages deleted 6+ months '
     "before the extraction are gone, from this table and from Apple's own "
     "recoverable-message tables. A message deleted within iOS's ~30-40 day window is "
-    'still live, and shown in SMS Messages.'
+    'still live, and shown in SMS Messages. '
+    'Also listed: attachment rows still live whose message is gone (status Orphaned): not '
+    'deleted, so not recovered, and not in SMS Messages, which lists a row only with its message. '
+    'On the Josh Hickman iOS 17 image (2026-11-21): 1 of 28 attachments, an outgoing '
+    'image/jpeg with no message_attachment_join row.'
 )
 
 # Declaration-only report (report_type "recovered_records", ASSUMPTIONS.md
@@ -35,9 +39,8 @@ description = (
 # Column names checked against the tables on the test images named in
 # the description (2026-11-21); a column a version of the app lacks is
 # left out and noted in the run log.
-app_path = 'mobile/Library/SMS'
-files = {'sms': 'sms.db'}
-# The -wal and -journal are extracted beside each file by the runner (A-96).
+
+deleted_of = "sms_messages"   # its main report: the app location and database files come from there (A-95)
 
 report_type = "recovered_records"
 recovered_records = [{'file_key': 'sms',
@@ -79,6 +82,7 @@ recovered_records = [{'file_key': 'sms',
              'total_bytes': 'total_bytes',
              'is_outgoing': 'is_outgoing',
              'is_sticker': 'is_sticker'},
+  'orphan_of': {'column': 'ROWID', 'via': ['message_attachment_join', 'attachment_id', 'message_id'], 'in': ['message', 'ROWID']},
   'version_fields': ['filename', 'transfer_name', 'mime_type']}]
 
 timestamp_fields = {'date': 'cocoa_ns',
@@ -96,7 +100,7 @@ core_fields = ['status',
  'filename',
  'changed_fields',
  'message (now)',
- 'how_found']
+ 'how_found', "copies"]
 hidden_fields = ['recovered',
  'recovery_method',
  'recovery_version',
@@ -108,4 +112,4 @@ hidden_fields = ['recovered',
  'raw_offset',
  'raw_length',
  'source',
- 'table_certain']
+ 'table_certain', "copy_locations"]

@@ -12908,9 +12908,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self.tree_view.selectionModel().currentChanged.connect(self._on_tree_current_changed)
         self._start_search_index_build()
         # Clear hex viewer from the previous archive
-        if self._hex_worker is not None and self._hex_worker.isRunning():
-            self._hex_worker.terminate()
-            self._hex_worker.wait()
+        # Cooperative, never terminate(): killing a thread mid-read can leave
+        # Python and the file handle in an undefined state (2026-11-21).
+        self._stop_hex_worker()
         self._hex_entry        = None
         self._hex_file_size    = 0
         self._hex_bytes_loaded = 0

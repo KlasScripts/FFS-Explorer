@@ -293,8 +293,11 @@ FLAGS_VERSION = 1          # bump when scoring changes: kept results are then no
 
 
 def report_stamp(case_dir: str, script_name: str) -> str:
-    """The report's rows as stored: table definition, row count, last rowid
-    (a re-run rewrites the table). Cheap."""
+    """The report's rows as stored: table definition and last rowid (a
+    re-run rewrites the table). The last rowid is the row count too:
+    artifact_db.write_artifact_results makes a new table and inserts rows
+    1..N, and nothing deletes from it. count(*) read every row: 0.2-0.4 s
+    for 500,000 messages, on every report open (2026-11-21)."""
     import hashlib
     import os
     import sqlite3
@@ -303,7 +306,8 @@ def report_stamp(case_dir: str, script_name: str) -> str:
         try:
             sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
                             (f"artifact_{script_name}",)).fetchone()
-            n, last = c.execute(f'SELECT count(*), max(rowid) FROM "artifact_{script_name}"').fetchone()
+            last = c.execute(f'SELECT max(rowid) FROM "artifact_{script_name}"').fetchone()[0]
+            n = last or 0
         finally:
             c.close()
     except sqlite3.Error:

@@ -201,6 +201,8 @@ class SearchIndexWorker(QThread):
         # Try the DB cache first (keyed by zip file size for cheap validation)
         if self.case_dir:
             cached = self._load_from_db()
+            if self._stop.is_set():
+                return
             if cached is not None:
                 self.entries_ready.emit(cached)
                 return
@@ -228,10 +230,15 @@ class SearchIndexWorker(QThread):
             unp = msgpack.Unpacker(raw=False, max_buffer_size=0)
             unp.feed(raw)
             del raw
+            # Checks stop every 20k rows too: opening another case waits
+            # for this thread (start_loading), and until 2026-11-21 it
+            # waited for the whole unpack.
             rows = []
             for i in range(unp.read_array_header()):
                 rows.append(tuple(next(unp)))
                 if i % 20000 == 19999:
+                    if self._stop.is_set():
+                        return None
                     time.sleep(0)
             return rows or None
         except Exception:
@@ -1921,6 +1928,12 @@ class KeywordSearchMixin:
         self._search_file_ancestors: dict[str, list] = {}
         self._search_counts: dict[str, int] = {}
         self._search_counts_dirty: set = set()
+        # Hits still waiting to be added belong to the tree just cleared,
+        # and so does whatever was to run once they were in.
+        buf = getattr(self, '_live_hit_buffer', None)
+        if buf:
+            buf.clear()
+        self._after_hits_added_cbs: list = []
 
     def _search_total_hits(self) -> int:
         return sum(len(h) for h in self._search_file_hits.values())
@@ -2727,15 +2740,20 @@ class KeywordSearchMixin:
         return True
 
     def _on_db_loader_rows(self, rows: list):
-        self.search_results_view.setUpdatesEnabled(False)
-        try:
-            for filename, offset, context in rows:
-                self._search_add_hit(filename, offset, context)
-            self._search_apply_counts()
-        finally:
-            self.search_results_view.setUpdatesEnabled(True)
+        """Queued for the sliced adder (_flush_live_hits), not added here:
+        the loader sends every saved hit at once, and adding them as they
+        arrived kept the window busy until the last one was in."""
+        self._live_hit_buffer.extend(
+            (filename, offset, context, None, None, None, None, None)
+            for filename, offset, context in rows)
+        if not self._live_hit_flush_scheduled:
+            self._live_hit_flush_scheduled = True
+            QTimer.singleShot(0, self._flush_live_hits)
 
     def _on_db_loader_finished(self, total: int):
+        self._after_hits_added(lambda: self._on_db_loader_finished_now(total))
+
+    def _on_db_loader_finished_now(self, total: int):
         db_key = self._db_loader_db_key or self._db_loader_term
         term, scope_label = _decode_search_key(db_key)
         scope_tag = f" in {scope_label}" if scope_label != 'all files' else ''
@@ -3167,6 +3185,7 @@ class KeywordSearchMixin:
         responding however fast hits arrive; drain=True adds them all."""
         self._live_hit_flush_scheduled = False
         if not self._live_hit_buffer:
+            self._run_after_hits_added()
             return
         buf = self._live_hit_buffer
         deadline = time.monotonic() + self._FLUSH_SLICE_S
@@ -3193,6 +3212,28 @@ class KeywordSearchMixin:
         if buf:
             self._live_hit_flush_scheduled = True
             QTimer.singleShot(0, self._flush_live_hits)
+        else:
+            self._run_after_hits_added()
+
+    def _after_hits_added(self, fn) -> None:
+        """Run *fn* once every buffered hit is in the tree: now if none
+        are waiting, else after the last slice of _flush_live_hits. Until
+        2026-11-21 the end of a search added all the rest in one go
+        (drain=True), and a saved search added every hit as it arrived;
+        either froze the window for as long as it took. Dropped if the
+        tree is cleared first (_search_reset_hit_store)."""
+        if not self._live_hit_buffer:
+            fn()
+            return
+        self._after_hits_added_cbs.append(fn)
+        if not self._live_hit_flush_scheduled:
+            self._live_hit_flush_scheduled = True
+            QTimer.singleShot(0, self._flush_live_hits)
+
+    def _run_after_hits_added(self) -> None:
+        cbs, self._after_hits_added_cbs = self._after_hits_added_cbs, []
+        for fn in cbs:
+            fn()
 
     def _on_search_progress(self, done: int, total: int):
         hits = len(self._search_file_items)
@@ -3250,8 +3291,14 @@ class KeywordSearchMixin:
         (self._search_hit_count / len(self._search_file_items)) is the
         TRUE combined total across all three sources, incremented by
         each one's own result handler as hits arrive — never any single
-        worker's own count alone."""
-        self._flush_live_hits(drain=True)   # drain any buffered hits before counting
+        worker's own count alone. Runs once the buffered hits are all in
+        the tree, added in slices (_after_hits_added), so the counts are
+        the full ones."""
+        self._after_hits_added(lambda: self._finalize_search_results_now(
+            total_hits, files_done, files_total, stopped))
+
+    def _finalize_search_results_now(self, total_hits: int, files_done: int,
+                                     files_total: int, stopped: bool):
         if self._search_entries is None and self._search_worker is not None:
             self._search_entries = self._search_worker.entries or None
         self.search_btn.setEnabled(True)

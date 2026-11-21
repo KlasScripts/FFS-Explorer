@@ -281,6 +281,16 @@ class HexViewerMixin:
         worker = self._hex_worker
         if worker is None or not worker.isRunning():
             return
+        # Not waited for: its one read of a compressed entry opens the whole
+        # archive with zipfile, which takes seconds on a big extraction, and
+        # the window waited for it on every file click and case open
+        # (2026-11-21). _retire_worker cuts its signals and keeps it alive
+        # until it ends.
+        retire = getattr(self, '_retire_worker', None)
+        if retire is not None:
+            retire(worker)
+            self._hex_worker = None
+            return
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             for name in ("progress", "load_complete", "error"):

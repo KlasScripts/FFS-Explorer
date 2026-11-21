@@ -92,6 +92,60 @@ def _notes_html_paragraphs(text: str, sentences_per_para: int = 2) -> str:
 
 # ── DB-backed virtual table model ─────────────────────────────────────────────
 
+class _LazySizes:
+    """{physical path: size} for ThumbnailWorker, made at its first .get()
+    (on the worker's thread), not by the window."""
+
+    def __init__(self, ui_paths, resolve, metadata):
+        self._args, self._map = (ui_paths, resolve, metadata), None
+
+    def get(self, physical, default=0):
+        if self._map is None:
+            ui_paths, resolve, meta = self._args
+            self._map = {resolve(p): (meta.get(p) or {}).get('size', 0) for p in ui_paths}
+        return self._map.get(physical, default)
+
+
+class _ReportExtrasWorker(QThread):
+    """report_extras.build_all for a report made before its extras were
+    saved with it: once, off the window thread."""
+    done = Signal(str, str, object)   # (case_dir, script_name, entries or None)
+
+    def __init__(self, case_dir: str, script_name: str, mod):
+        super().__init__()
+        self._case_dir, self._script_name, self._mod = case_dir, script_name, mod
+
+    def run(self) -> None:
+        import report_extras
+        try:
+            entries = report_extras.build_all(self._case_dir, self._script_name, self._mod)
+        except Exception:
+            entries = None
+        self.done.emit(self._case_dir, self._script_name, entries)
+
+
+class _ReportSortWorker(QThread):
+    """One ORDER BY for ArtifactTableModel.sort(), on its own read-only
+    connection: the rowids in the new order."""
+    done = Signal(int, object, bool)   # (sort number, rowids, ok); object: no list copy
+
+    def __init__(self, db_path: str, sql: str, args: list, gen: int):
+        super().__init__()
+        self._db_path, self._sql, self._args, self._gen = db_path, sql, args, gen
+
+    def run(self) -> None:
+        try:
+            conn = sqlite3.connect(f'file:{self._db_path}?mode=ro', uri=True, timeout=5)
+            try:
+                ids = [r[0] for r in conn.execute(self._sql, self._args)]
+            finally:
+                conn.close()
+        except Exception:
+            self.done.emit(self._gen, [], False)
+            return
+        self.done.emit(self._gen, ids, True)
+
+
 class ArtifactTableModel(QAbstractTableModel):
     """Virtual model backed by SQLite — only visible rows are fetched.
 
@@ -104,6 +158,8 @@ class ArtifactTableModel(QAbstractTableModel):
 
     The model owns its connection and closes it on clear() / load_from_db().
     """
+
+    sort_busy = Signal(bool)   # a background sort started (True) / ended or dropped (False)
 
     _PAGE_SIZE = 300   # rows fetched per cache page
     _MAX_PAGES = 12    # evict LRU page above this limit
@@ -156,6 +212,10 @@ class ArtifactTableModel(QAbstractTableModel):
         # exception, deliberately returning ALL columns since callers like
         # ArtifactViewerMixin._art_load_record_hex need the hidden fields.
         self._visible_idx:  list = []
+        # Background sorts (sort()): the newest one's number, and the ones
+        # still running, kept alive until they end.
+        self._sort_gen = 0
+        self._sort_workers: set = set()
 
     # ── Connection ────────────────────────────────────────────────────────
 
@@ -172,6 +232,7 @@ class ArtifactTableModel(QAbstractTableModel):
     def load_from_db(self, conn: sqlite3.Connection, table: str,
                      columns: list, rowids: list) -> None:
         """DB mode: rows fetched on demand; conn is owned by this model."""
+        self._drop_pending_sort()
         self.beginResetModel()
         self._close_conn()
         self._conn    = conn
@@ -193,6 +254,7 @@ class ArtifactTableModel(QAbstractTableModel):
 
     def load_rows(self, columns: list, rows: list) -> None:
         """List mode: small in-memory dataset (e.g. exported-files view)."""
+        self._drop_pending_sort()
         self.beginResetModel()
         self._close_conn()
         self._columns = list(columns)
@@ -212,6 +274,7 @@ class ArtifactTableModel(QAbstractTableModel):
         self.endResetModel()
 
     def clear(self) -> None:
+        self._drop_pending_sort()
         self.beginResetModel()
         self._close_conn()
         self._columns = []
@@ -309,6 +372,7 @@ class ArtifactTableModel(QAbstractTableModel):
 
     def apply_rowids(self, rowids: list, where: str = '', wargs: list = None) -> None:
         """Update the visible row set (result of filtering or sorting)."""
+        self._drop_pending_sort()
         self.beginResetModel()
         self._rowids = list(rowids)
         self._where  = where
@@ -490,22 +554,69 @@ class ArtifactTableModel(QAbstractTableModel):
             return
         direction = 'DESC' if order == Qt.SortOrder.DescendingOrder else 'ASC'
         col_name  = self._columns[real_col]
+        if self._where:
+            sql  = (f'SELECT rowid FROM "{self._table}" WHERE {self._where}'
+                    f' ORDER BY "{col_name}" {direction}')
+            args = list(self._wargs)
+        else:
+            sql  = f'SELECT rowid FROM "{self._table}" ORDER BY "{col_name}" {direction}'
+            args = []
+        # On its own connection in a thread: on the window thread this
+        # query froze the window ~0.75 s for 500,000 messages (2026-11-21).
+        # The current order stays on show, scrollable, until it is done.
         try:
-            if self._where:
-                sql  = (f'SELECT rowid FROM "{self._table}" WHERE {self._where}'
-                        f' ORDER BY "{col_name}" {direction}')
-                args = self._wargs
-            else:
-                sql  = f'SELECT rowid FROM "{self._table}" ORDER BY "{col_name}" {direction}'
-                args = []
-            new_ids = [r[0] for r in self._conn.execute(sql, args)]
+            db_path = self._conn.execute('PRAGMA database_list').fetchone()[2]
         except Exception:
+            db_path = ''
+        if not db_path:
             return
-        self.beginResetModel()
+        self._sort_gen += 1
+        worker = _ReportSortWorker(db_path, sql, args, self._sort_gen)
+        worker.done.connect(self._on_sort_done)
+        self._sort_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self._sort_workers.discard(w))
+        self.sort_busy.emit(True)
+        worker.start()
+
+    def _on_sort_done(self, gen: int, new_ids: list, ok: bool) -> None:
+        if gen != self._sort_gen:
+            return          # a newer sort, filter or load came first
+        self.sort_busy.emit(False)
+        if not ok:
+            return
+        # A layout change, not a reset: the selected and current rows move
+        # with their records (a jump to a row made while the sort ran stays
+        # on that row), as with Qt's own sorting.
+        self.layoutAboutToBeChanged.emit()
+        old = self.persistentIndexList()
+        if old:
+            pos = ({rid: i for i, rid in enumerate(new_ids)} if len(old) > 20 else None)
+
+            def where(rid):
+                if pos is not None:
+                    return pos.get(rid)
+                try:
+                    return new_ids.index(rid)
+                except ValueError:
+                    return None
+            moved = []
+            for idx in old:
+                r = idx.row()
+                to = where(self._rowids[r]) if 0 <= r < len(self._rowids) else None
+                moved.append(self.index(to, idx.column()) if to is not None else QModelIndex())
         self._rowids = new_ids
         self._cache.clear()
         self._lru.clear()
-        self.endResetModel()
+        if old:
+            self.changePersistentIndexList(old, moved)
+        self.layoutChanged.emit()
+
+    def _drop_pending_sort(self) -> None:
+        """A filter, reload or clear replaces the rows: a sort still
+        running was for the old ones."""
+        if self._sort_workers:
+            self.sort_busy.emit(False)
+        self._sort_gen += 1
 
 
 # ── Background SQL filter worker ──────────────────────────────────────────────
@@ -584,6 +695,24 @@ _ART_SCRIPT = "__art_script__:"
 _ART_SOURCE = "__art_source__:"
 _ART_FILES  = "__art_files__:"
 _ART_VALIDATION = "__art_validation__:"
+def _art_chat_folder(script_name: str, decl: dict, index: list) -> QStandardItem:
+    """The report tree's "Chat Groups (N)" folder from the saved chat index
+    [(key, name, messages)] (report_extras)."""
+    def _item(text, role_val):
+        it = QStandardItem(text)
+        it.setEditable(False)
+        it.setCheckable(False)
+        it.setData(role_val, Qt.ItemDataRole.UserRole)
+        return it
+    folder = _item(f"Chat Groups ({len(index):,})", _ART_CHATS + script_name)
+    for key, name, messages in index:
+        title = f"{name} ({messages:,})"
+        if decl.get('id') and key not in (None, ''):
+            title = f"{key}  {title}"
+        folder.appendRow(_item(title, f"{_ART_CHAT}{script_name}\x1f{key}"))
+    return folder
+
+
 def _notes_markdown_path(platform: str, script_name: str) -> str | None:
     """artifacts/<platform>/<script>.notes.md, if the parser has one."""
     from artifact_runner import _ARTIFACTS_DIR
@@ -675,18 +804,6 @@ def _notes_markdown_html(text: str, warning: str = '') -> str:
         f'<html><head><style>{_NOTES_CSS}</style></head><body>'
         f'{_notes_court_banner()}{_notes_warning_html(warning)}{body}</body></html>'
     )
-
-
-def _duration_seconds(label) -> int | None:
-    """'Off' -> 0, '7 days' -> 604800, '24 hours' -> 86400, '90 seconds' -> 90."""
-    import re as _re
-    text = str(label or '').strip()
-    if text.lower() == 'off':
-        return 0
-    m = _re.match(r'^(\d+)\s+(day|hour|second)s?$', text)
-    if not m:
-        return None
-    return int(m.group(1)) * {'day': 86400, 'hour': 3600, 'second': 1}[m.group(2)]
 
 
 def _chat_summary_columns(decl) -> list:
@@ -971,6 +1088,16 @@ class ArtifactRunnerWorker(QThread):
                 else:
                     count = write_artifact_results(case_conn, script_name, rows)
                     self.log.emit(f"  Done — {count} rows written.")
+                    # What opening the report needs (filled columns, media
+                    # paths, Chat Groups), saved now so opening it never
+                    # scans every row (report_extras.py).
+                    if count:
+                        try:
+                            import report_extras
+                            report_extras.build_all(self._case_dir, script_name, module)
+                        except Exception as exc:
+                            self.log.emit(f"  Report extras not saved ({exc}); they are "
+                                          "worked out when the report is opened.")
                     if run_id is not None:
                         try:
                             complete_run_log(case_conn, run_id,
@@ -2205,6 +2332,7 @@ class ArtifactViewerMixin:
         report_layout.addLayout(report_filter_row)
 
         self._art_table_model   = ArtifactTableModel()
+        self._art_table_model.sort_busy.connect(self._art_on_sort_busy)
         self._art_active_filter = ''
         self._art_filter_worker: ArtifactFilterWorker | None = None
 
@@ -2553,16 +2681,14 @@ class ArtifactViewerMixin:
             group.appendRow(_item("Validation",     _ART_VALIDATION + script_name))
             decl = getattr(mod, 'chat_groups', None) if mod else None
             if decl:
-                chats = self._art_chat_groups(script_name, decl)
-                if chats:
-                    folder = _item(f"Chat Groups ({len(chats):,})", _ART_CHATS + script_name)
-                    for c in chats:
-                        title = f"{c['name']} ({c['messages']:,})"
-                        if decl.get('id') and c.get('key') not in (None, ''):
-                            title = f"{c['key']}  {title}"
-                        folder.appendRow(_item(title,
-                                               f"{_ART_CHAT}{script_name}\x1f{c['key']}"))
-                    group.insertRow(0, [folder])
+                # From the index saved with the report (report_extras), never
+                # the summary itself: building it here froze case open 17 s
+                # for 500,000 messages (2026-11-21). A report made before the
+                # index was saved gets its folder when the background build
+                # ends (_art_extras_done).
+                index = self._art_extra(script_name, 'chat_index', mod)
+                if index:
+                    group.insertRow(0, [_art_chat_folder(script_name, decl, index)])
             return group
 
         # A parser opts into a shared parent tree node (instead of sitting
@@ -3230,214 +3356,42 @@ class ArtifactViewerMixin:
         self.status_bar.showMessage(f"{ui_path}  —  offset: {loc['abs_offset']:,}{overflow_note}")
 
     def _art_chat_groups(self, script_name: str, decl: dict) -> list:
-        """_art_chat_groups_build, kept in memory until the report's rows or
-        the bookmarks change (5 s for 500,000 messages, measured 2026-11-17:
-        it ran on the tree build and on every Chat Groups visit)."""
-        try:
-            import chat_flags
-            with closing(_open_results_db(self._case_dir)) as conn:
-                marks = conn.execute("SELECT count(*), max(rowid) FROM bookmark_entries").fetchone()
-            stamp = (self._case_dir, script_name, repr(sorted(decl.items(), key=str)),
-                     chat_flags.report_stamp(self._case_dir, script_name), tuple(marks))
-        except Exception:
-            stamp = None
-        memo = getattr(self, '_art_chat_groups_memo', None)
-        if stamp is not None and memo and memo[0] == stamp:
-            return memo[1]
-        out = self._art_chat_groups_build(script_name, decl)
-        if stamp is not None:
-            self._art_chat_groups_memo = (stamp, out)
-        return out
-
-    def _art_chat_groups_build(self, script_name: str, decl: dict) -> list:
-        """One dict per conversation of a messaging report, from its
-        `chat_groups` declaration (owner request, 2026-10-23/24):
-          key            column identifying the conversation (exact match)
-          name           column(s); first non-empty per row, most common
-                         across the chat = its name (group or remote party)
-          participants   column(s) naming the sender of an incoming message
-          members        column listing everyone in the chat (", "-separated,
-                         the device owner's own entry starts with "Me"), as at
-                         extraction — a property of the chat, not of a message
-                         (owner decision 2026-10-24: no per-message recipients).
-                         Participants = the owner, then members + senders
-          direction/sent column and the value(s) meaning sent by the user
-          system         direction value(s) of app/system events: counted
-                         in Messages only, never as incoming or a participant
-          media          column(s) non-empty on a media message
-          media_prefixes message-text prefixes marking a media message
-          message        message-text column (default "message")
-          time           message time column (unit from timestamp_fields)
-          deleted        {column: [values] or "*"}: a row counts as deleted
-                         if any column has one of the values ("*" = any
-                         non-empty value other than False/0)
-          type           column saying "Group"/"1:1"/... per row (most common
-                         value per chat); without it, >1 other person = group
-          sort / issued  per-message position in its chat and the chat's
-                         "messages ever numbered" counter (iOS WhatsApp):
-                         gaps, missing-at-end and deletion windows
-          setting        column with a disappearing-messages change on that
-                         row ("Off" / "7 days" ...); its direction = who
-          expires        column with a message's expiry time (unit from
-                         timestamp_fields)
-          deleted_for_everyone  placeholder text "... (by me)" / "(by them)"
-          call_pattern   regex on the message text marking a call event;
-                         absent = the report holds no calls (Calls blank)
-          call_field     column call_pattern is matched against instead of
-                         the message text (a report that keeps calls in
-                         their own column, so typed words never count)
-        Keys of each dict: key, name, participants, people (count), messages,
-        incoming, outgoing, media_in, media_out, deleted, calls (None if the
-        report has no call events), links, bookmarked, times (epoch seconds
-        of every message), first, last_in, last_out (epoch seconds or None).
-        Sorted by name. [] if the table can't be read."""
-        import collections
-        import re
-        from sqlite_carve import _epoch_seconds
-        from artifact_runner import list_artifacts
-        platform = 'android' if self._is_android_archive() else 'ios'
-        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
-        units = getattr(mod, 'timestamp_fields', {}) or {}
-
-        def _cols(v):
-            return [v] if isinstance(v, str) else list(v or ())
-        key_col = decl['key']
-        names = _cols(decl.get('name')) or [key_col]
-        senders = _cols(decl.get('participants'))
-        members_col = decl.get('members')
-        dir_col = decl.get('direction', 'direction')
-        sent = set(decl.get('sent', ('Sent', 'Outgoing')))
-        system = set(decl.get('system', ()))
-        media_cols = _cols(decl.get('media'))
-        prefixes = tuple(decl.get('media_prefixes', ()))
-        msg_col = decl.get('message', 'message')
-        time_col = decl.get('time')
-        unit = units.get(time_col) if time_col else None
-        deleted = decl.get('deleted') or {}
-        type_col = decl.get('type')
-        icon_col = decl.get('icon')
-        sort_col, issued_col = decl.get('sort'), decl.get('issued')
-        setting_col, expires_col = decl.get('setting'), decl.get('expires')
-        dfe_col = decl.get('deleted_for_everyone')
-        call_re = re.compile(decl['call_pattern']) if decl.get('call_pattern') else None
-        call_col = decl.get('call_field')
-        url_re = re.compile(r'https?://', re.IGNORECASE)
-        link_cols = _cols(getattr(mod, 'link_fields', None) or getattr(mod, 'media_fields', None))
+        """The Chat Groups summary of a messaging report (report_extras.
+        build_chat_groups: one dict per conversation, sorted by name), with
+        each chat's bookmarked-message count worked out now. Saved when the
+        report is made, so this only reads it. A report made before that is
+        built here once (the background build saves it for next time); until
+        2026-11-21 it was built on every first visit and at case open:
+        5-17 s for 500,000 messages."""
+        import chat_flags
+        import report_extras
         try:
             with closing(_open_results_db(self._case_dir)) as conn:
                 bookmarked = {r[0] for r in conn.execute("SELECT ui_path FROM bookmark_entries")}
+            stamp = chat_flags.report_stamp(self._case_dir, script_name)
         except Exception:
-            bookmarked = set()
-        try:
-            with closing(_open_results_db(self._case_dir)) as conn:
-                cols = {r[1] for r in conn.execute(f'PRAGMA table_info("artifact_{script_name}")')}
-                if key_col not in cols:
-                    return []
-                want = [c for c in dict.fromkeys(
-                    [key_col, dir_col, msg_col, time_col, members_col, *names, *senders,
-                     *media_cols, *deleted, *link_cols, type_col, sort_col, issued_col,
-                     setting_col, expires_col, dfe_col, icon_col, decl.get('call_field')])
-                        if c and c in cols]
-                rows = conn.execute('SELECT ' + ', '.join(f'"{c}"' for c in want)
-                                    + f' FROM "artifact_{script_name}"').fetchall()
-        except Exception:
-            return []
-        at = {c: i for i, c in enumerate(want)}
-
-        def _get(r, c):
-            return r[at[c]] if c in at else None
-        chats: dict = {}
-        for r in rows:
-            key = _get(r, key_col) or ''
-            c = chats.setdefault(key, {
-                'names': collections.Counter(), 'people': collections.Counter(),
-                'messages': 0, 'incoming': 0, 'outgoing': 0, 'media_in': 0, 'media_out': 0,
-                'deleted': 0, 'calls': 0 if call_re else None, 'links': 0, 'bookmarked': 0,
-                'types': collections.Counter(), 'icons': collections.Counter(),
-                'me': {}, 'notes': {},
-                'seq': [], 'issued': None, 'settings': [], 'dfe_me': 0, 'dfe_them': 0,
-                'expiry_seen': False,
-                'times': [], 'first': None, 'last_in': None, 'last_out': None})
-            c['messages'] += 1
-            if _get(r, type_col):
-                c['types'][_get(r, type_col)] += 1
-            if _get(r, icon_col):
-                c['icons'][_get(r, icon_col)] += 1
-            text_all = str(_get(r, msg_col) or '')
-            for col, vals in deleted.items():
-                v = _get(r, col)
-                if (vals == '*' and v not in (None, '', 'False', '0', 0, False)) or \
-                        (vals != '*' and str(v) in vals):
-                    c['deleted'] += 1
-                    break
-            call_text = str(_get(r, call_col) or '') if call_col else text_all
-            if call_re and call_re.search(call_text):
-                c['calls'] += 1
-            if url_re.search(text_all):
-                c['links'] += 1
-            if bookmarked and any(p.strip() in bookmarked
-                                  for lc in link_cols for p in str(_get(r, lc) or '').split('\n') if p.strip()):
-                c['bookmarked'] += 1
-            name = next((_get(r, n) for n in names if _get(r, n)), '')
-            if name:
-                c['names'][name] += 1
-            if _get(r, dir_col) in system:
-                continue
-            out = _get(r, dir_col) in sent
-            c['outgoing' if out else 'incoming'] += 1
-            if not out:
-                who = next((_get(r, n) for n in senders if _get(r, n)), '')
-                if who and not str(who).startswith('['):
-                    c['people'][who] += 1
-            for who in str(_get(r, members_col) or '').split(', ') if members_col else ():
-                if who.startswith('Me'):
-                    c['me'][who] = None
-                elif who and not who.startswith('['):
-                    c['people'][who] += 1
-                elif who:
-                    c['notes'][who] = None
-            text = str(_get(r, msg_col) or '')
-            if (any(_get(r, m) for m in media_cols) or (prefixes and text.startswith(prefixes))):
-                c['media_out' if out else 'media_in'] += 1
-            ts = _epoch_seconds(_get(r, time_col), unit) if unit else None
-            if sort_col:
-                try:
-                    c['seq'].append((int(_get(r, sort_col)), ts))
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    c['issued'] = max(c['issued'] or 0, int(_get(r, issued_col)))
-                except (TypeError, ValueError):
-                    pass
-            if setting_col and _get(r, setting_col):
-                c['settings'].append((ts, out, _duration_seconds(_get(r, setting_col))))
-            if expires_col and _get(r, expires_col) not in (None, '', '0'):
-                c['expiry_seen'] = True
-            dfe = str(_get(r, dfe_col) or '') if dfe_col else ''
-            if dfe:
-                c['dfe_me' if '(by me)' in dfe else 'dfe_them'] += 1
-            if ts:
-                c['times'].append(ts)
-                c['first'] = ts if c['first'] is None else min(c['first'], ts)
-                k = 'last_out' if out else 'last_in'
-                c[k] = ts if c[k] is None else max(c[k], ts)
-        result = []
-        for key, c in chats.items():
-            result.append({
-                'key': key,
-                'name': c['names'].most_common(1)[0][0] if c['names'] else (key or '[no conversation]'),
-                'participants': ', '.join(list(c['me']) + [p for p, _ in c['people'].most_common()]
-                                          + list(c['notes'])),
-                'people': len(c['people']),
-                'type': c['types'].most_common(1)[0][0] if c['types'] else None,
-                'icon': c['icons'].most_common(1)[0][0] if c['icons'] else '',
-                **{k: c[k] for k in ('messages', 'incoming', 'outgoing', 'media_in',
-                                     'media_out', 'deleted', 'calls', 'links', 'bookmarked',
-                                     'times', 'first', 'last_in', 'last_out',
-                                     'seq', 'issued', 'settings', 'dfe_me', 'dfe_them', 'expiry_seen')},
-                'has_sort': bool(sort_col), 'has_setting': bool(setting_col)})
-        result.sort(key=lambda d: str(d['name']).casefold())
-        return result
+            bookmarked, stamp = set(), None
+        memo = getattr(self, '_art_chat_groups_memo', None)
+        memo_key = (self._case_dir, script_name, repr(sorted(decl.items(), key=str)),
+                    stamp, len(bookmarked), hash(frozenset(bookmarked)))
+        if stamp is not None and memo and memo[0] == memo_key:
+            return memo[1]
+        out = (report_extras.chat_groups(self._case_dir, script_name, stamp, bookmarked)
+               if stamp is not None else None)
+        if out is None:
+            from artifact_runner import list_artifacts
+            platform = 'android' if self._is_android_archive() else 'ios'
+            mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+            try:
+                with closing(_open_results_db(self._case_dir)) as conn:
+                    chats, link_rows = report_extras.build_chat_groups(conn, script_name, decl, mod)
+            except Exception:
+                chats, link_rows = [], []
+            out = report_extras.apply_bookmarks(chats, link_rows, bookmarked)
+            self._art_extra(script_name, 'chat_groups', mod)   # saves it for next time
+        if stamp is not None:
+            self._art_chat_groups_memo = (memo_key, out)
+        return out
 
     def _art_reset_list_presentation(self) -> None:
         """Clear what a report left on the shared table before a list view
@@ -3776,7 +3730,9 @@ class ArtifactViewerMixin:
             where, args = f'"{col}" = ?', [key]
         else:
             where, args = f'("{col}" IS NULL OR "{col}" = \'\')', []
-        self._art_show_report(script_name, scope=(where, args, f"Chat: {label.rsplit(' (', 1)[0]}"))
+        import report_columns_store
+        self._art_show_report(script_name, scope=(where, args, f"Chat: {label.rsplit(' (', 1)[0]}"),
+                              scope_key=report_columns_store.chat_scope_key(key))
         self._art_show_chat_summary_text(script_name, key)
 
     def _on_art_tree_clicked(self, index):
@@ -3879,8 +3835,19 @@ class ArtifactViewerMixin:
         # store, so opening a group afterwards can show it again. All and
         # the Columns dialog put it back for the view open now.
         scope = getattr(self, '_art_scope', None)
-        populated = self._art_table_model.columns_with_values(
-            scope[0] if scope else None, scope[1] if scope else ())
+        populated = self._art_filled_columns(script_name, scope)
+        self._art_apply_filled_columns(script_name, scope, populated)
+        if script_name is not None:
+            order = report_columns_store.get_column_order(
+                script_name, self._art_columns_all)
+            if order:
+                self._apply_art_column_order(order)
+        self._update_art_columns_indicator()
+
+    def _art_apply_filled_columns(self, script_name, scope, populated) -> None:
+        """Show the chosen columns that have values in this view
+        (*populated*; None keeps the usual columns)."""
+        import report_columns_store
         chosen = (report_columns_store.get_visible_columns(
                       script_name, self._art_columns_all)
                   if script_name is not None else None)
@@ -3891,12 +3858,89 @@ class ArtifactViewerMixin:
             chosen, populated, one_chat=scope is not None,
             direct=self._art_open_chat_is_direct(scope))
         self._apply_art_column_visibility(visible)
-        if script_name is not None:
-            order = report_columns_store.get_column_order(
-                script_name, self._art_columns_all)
-            if order:
-                self._apply_art_column_order(order)
-        self._update_art_columns_indicator()
+
+    def _art_extra(self, script_name: str, key: str, mod=None):
+        """A saved report extra (report_extras.py) for the report as it is
+        now, or None. On None the extras are built once on a background
+        thread (_art_extras_done applies them when they arrive)."""
+        import chat_flags
+        import report_extras
+        if not self._case_dir:
+            return None
+        got = report_extras.load(self._case_dir, script_name,
+                                 chat_flags.report_stamp(self._case_dir, script_name), key)
+        if got is None:
+            running = getattr(self, '_art_extras_running', None)
+            if running is None:
+                running = self._art_extras_running = {}
+            if (self._case_dir, script_name) not in running:
+                if mod is None:
+                    from artifact_runner import list_artifacts
+                    platform = 'android' if self._is_android_archive() else 'ios'
+                    mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+                worker = _ReportExtrasWorker(self._case_dir, script_name, mod)
+                worker.done.connect(self._art_extras_done)
+                running[(self._case_dir, script_name)] = worker
+                worker.start()
+        return got
+
+    def _art_filled_columns(self, script_name, scope):
+        """Which columns have values in the view being opened: saved with
+        the report (report_extras 'filled:<scope>'), so opening never scans
+        every row. The whole report and one chat are saved; any other view
+        (a short run of rows) and an in-memory view are checked directly,
+        which is quick. A report made before this was saved gets None now,
+        the usual columns; the empty ones are hidden when the background
+        build ends."""
+        import report_columns_store
+        model = self._art_table_model
+        if (script_name is None or not self._case_dir or model._conn is None
+                or model._table != f'artifact_{script_name}'):
+            return model.columns_with_values(scope[0] if scope else None,
+                                             scope[1] if scope else ())
+        key = getattr(self, '_art_scope_key', None) if scope else report_columns_store.WHOLE_REPORT
+        if key is None:
+            return model.columns_with_values(scope[0], scope[1])
+        got = self._art_extra(script_name, 'filled:' + key)
+        return set(got) if got is not None else None
+
+    def _art_extras_done(self, case_dir: str, script_name: str, entries) -> None:
+        """A background extras build ended: add the Chat Groups folder to
+        the tree, and, if that report is open, hide its empty columns,
+        start its thumbnails and check its row count."""
+        running = getattr(self, '_art_extras_running', None) or {}
+        running.pop((case_dir, script_name), None)
+        if entries is None or case_dir != self._case_dir:
+            return
+        import report_columns_store
+        index = entries.get('chat_index')
+        group = self._art_find_tree_item_by_role(_ART_GROUP + script_name)
+        if index and group is not None and not any(
+                (group.child(i).data(Qt.ItemDataRole.UserRole) or '') == _ART_CHATS + script_name
+                for i in range(group.rowCount())):
+            from artifact_runner import list_artifacts
+            platform = 'android' if self._is_android_archive() else 'ios'
+            mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+            decl = getattr(mod, 'chat_groups', None) or {}
+            if decl:
+                group.insertRow(0, [_art_chat_folder(script_name, decl, index)])
+        model = self._art_table_model
+        if model._conn is None or model._table != f'artifact_{script_name}':
+            return
+        if entries.get('rows') != model.total_rows:
+            # Row ids were taken as 1..N from the last rowid; a table with
+            # gaps (not one this tool wrote) is read again in full.
+            self._art_show_report(script_name, getattr(self, '_art_scope', None),
+                                  getattr(self, '_art_scope_key', None))
+            return
+        scope = getattr(self, '_art_scope', None)
+        key = getattr(self, '_art_scope_key', None) if scope else report_columns_store.WHOLE_REPORT
+        if key is not None and ('filled:' + key) in entries:
+            self._art_apply_filled_columns(script_name, scope, set(entries['filled:' + key]))
+            self._update_art_columns_indicator()
+        if getattr(self, '_art_media_pending', None) == script_name:
+            self._art_media_pending = None
+            self._art_start_thumbnails(script_name, entries.get('media') or {})
 
     def _art_open_chat_is_direct(self, scope) -> bool:
         """True when the open view is one one-to-one chat.
@@ -4278,9 +4322,13 @@ class ArtifactViewerMixin:
             self._art_ai_summary_view.setMarkdown(summary["text"])
         self._art_stack.setCurrentIndex(5)
 
-    def _art_show_report(self, script_name: str, scope: tuple | None = None):
+    def _art_show_report(self, script_name: str, scope: tuple | None = None,
+                         scope_key: str | None = None):
         """*scope*: (where, args, label) limiting the report to a subset,
-        e.g. one chat (see _art_show_chat); kept under any typed filter."""
+        e.g. one chat (see _art_show_chat); kept under any typed filter.
+        *scope_key*: its saved filled-columns name, when it has one
+        (report_columns_store.chat_scope_key)."""
+        self._art_scope_key = scope_key
         self._cancel_art_filter_worker()
         self._art_pending_jump = None    # a jump into a previous report is void
         self._art_pending_sort = None
@@ -4291,8 +4339,13 @@ class ArtifactViewerMixin:
             conn = _open_results_db(self._case_dir)
             cur  = conn.execute(f'SELECT * FROM "{table}" LIMIT 0')
             cols = [d[0] for d in cur.description]
-            ids  = [r[0] for r in conn.execute(
-                f'SELECT rowid FROM "{table}" ORDER BY rowid')]
+            # Rows 1..N, never read: artifact_db.write_artifact_results makes
+            # a new table and inserts them in order, so the last rowid is the
+            # count. Reading every rowid froze the window 4 s for 500,000
+            # messages (2026-11-21). The background extras build counts the
+            # rows; a table with gaps is then read in full (_art_extras_done).
+            last = conn.execute(f'SELECT max(rowid) FROM "{table}"').fetchone()[0] or 0
+            ids  = range(1, last + 1)
         except Exception as exc:
             self.status_bar.showMessage(f"Could not load report: {exc}")
             try:
@@ -4371,18 +4424,14 @@ class ArtifactViewerMixin:
         # by anything else — load_from_db() below transfers ownership to
         # the model, and nothing may safely query it out from under that
         # afterwards.
+        # Every distinct media path, for the thumbnails: saved with the
+        # report (report_extras 'media'). Reading them here froze the window
+        # 2.65 s for 500,000 messages (2026-11-21). A report made before
+        # that gets its thumbnails when the background build ends.
         media_fields = list(getattr(mod, 'media_fields', ())) if mod else []
-        media_paths  = set()
-        for col_name in media_fields:
-            if col_name not in cols:
-                continue
-            try:
-                for (v,) in conn.execute(
-                        f'SELECT DISTINCT "{col_name}" FROM "{table}" '
-                        f'WHERE "{col_name}" IS NOT NULL AND "{col_name}" != \'\''):
-                    media_paths.add(v)
-            except Exception:
-                pass
+        saved_media = (self._art_extra(script_name, 'media', mod)
+                       if any(c in cols for c in media_fields) else {})
+        self._art_media_pending = script_name if saved_media is None else None
 
         # Transfer connection ownership to the model
         self._art_table_model.load_from_db(conn, table, cols, ids)
@@ -4448,10 +4497,7 @@ class ArtifactViewerMixin:
         # assumption: the whole media_paths set goes through ONE renderer
         # or the other, never split per-column, since no parser has needed
         # a genuine mix of the two kinds in the same report yet.
-        if mod and getattr(mod, 'webpage_thumbnail_fields', None):
-            self._start_art_webpage_thumbnails(list(media_paths))
-        else:
-            self._start_art_media_thumbnails(list(media_paths))
+        self._art_start_thumbnails(script_name, saved_media or {})
 
         core_fields = getattr(mod, 'core_fields', None) if mod else None
         has_recoverable = bool(getattr(mod, 'recoverable_tables', None)) if mod else False
@@ -4472,6 +4518,19 @@ class ArtifactViewerMixin:
 
     # ── Media columns (thumbnails + full view) ──────────────────────────────
 
+    def _art_start_thumbnails(self, script_name: str, media: dict) -> None:
+        """Thumbnails for the open report's media columns, from the saved
+        {media column: distinct paths} (report_extras)."""
+        from artifact_runner import list_artifacts
+        platform = 'android' if self._is_android_archive() else 'ios'
+        mod = {sn: m for sn, m in list_artifacts(platform)}.get(script_name)
+        fields = list(getattr(mod, 'media_fields', ())) if mod else []
+        paths = sorted({v for c in fields for v in (media.get(c) or ())})
+        if mod and getattr(mod, 'webpage_thumbnail_fields', None):
+            self._start_art_webpage_thumbnails(paths)
+        else:
+            self._start_art_media_thumbnails(paths)
+
     def _retire_art_media_worker(self):
         worker = getattr(self, '_art_media_thumb_worker', None)
         if worker is not None:
@@ -4491,9 +4550,9 @@ class ArtifactViewerMixin:
         if not media_paths or not self.zip_path:
             return
         from media_viewer import ThumbnailWorker
-        zip_info_map = {
-            self._adapter.resolve(p): self.full_metadata.get(p, {}).get('size', 0)
-            for p in media_paths}
+        # Filled on the worker's thread at its first lookup: built here it
+        # froze the window 0.83 s for 50,000 media paths (2026-11-21).
+        zip_info_map = _LazySizes(media_paths, self._adapter.resolve, self.full_metadata)
         worker = ThumbnailWorker(
             self.zip_path, media_paths, self._adapter.resolve, THUMB_CELL_SIZE,
             zip_info_map, cache_dir=self._case_dir)
@@ -5003,6 +5062,17 @@ class ArtifactViewerMixin:
         if pending is not None:          # a jump waiting for this filter
             self._art_pending_jump = None
             self._art_select_report_rowid(pending)
+
+    def _art_on_sort_busy(self, busy: bool) -> None:
+        """Say a report sort is running (it runs in the background; the
+        old order stays scrollable until the new one replaces it)."""
+        bar = getattr(self, 'status_bar', None)
+        if bar is None:
+            return
+        if busy:
+            bar.showMessage("Sorting report…")
+        elif bar.currentMessage() == "Sorting report…":
+            bar.clearMessage()
 
     def _cancel_art_filter_worker(self):
         if self._art_filter_worker and self._art_filter_worker.isRunning():

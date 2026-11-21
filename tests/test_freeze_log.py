@@ -160,15 +160,29 @@ def test_lock_holder_named(fl):
     def lock_holder():
         time.sleep(0.4)
         json.dumps(big)
-    h = threading.Thread(target=lock_holder, name='lock-holder')
-    h.start()
-    try:
-        _run_as_gui(fl, lambda: _beat_for(fl, 2.5))
-    finally:
-        h.join()
-    rec = max(fl.recent, key=lambda r: r['seconds'])
-    assert rec['seconds'] > 0.6 and rec['starved'] > 0.5 * rec['seconds']
-    assert any(name == 'lock-holder' and s > 0.5 for name, _st, _c, s in rec['held'])
+
+    def attempt():
+        fl.recent.clear()
+        h = threading.Thread(target=lock_holder, name='lock-holder')
+        h.start()
+        try:
+            _run_as_gui(fl, lambda: _beat_for(fl, 2.5))
+        finally:
+            h.join()
+        return max(fl.recent, key=lambda r: r['seconds']) if fl.recent else None
+
+    def named(rec):
+        # The holder is the thread credited with the most CPU meanwhile.
+        # Not a fixed number of seconds: on a busy machine (other test runs,
+        # the app open beside them) it gets less CPU in the same freeze, and
+        # a 0.5 s floor failed 1 run in 3 (2026-11-21).
+        return (rec is not None and rec['seconds'] > 0.6
+                and rec['starved'] > 0.5 * rec['seconds'] and rec['held']
+                and max(rec['held'], key=lambda h: h[3])[0] == 'lock-holder')
+    rec = attempt()
+    if not named(rec):
+        rec = attempt()                           # once more if the machine was busy
+    assert named(rec), rec
 
 
 _CHILD = r"""

@@ -137,6 +137,42 @@ def nonempty_column_names(conn, table: str, columns: list,
     return {name for name, flag in zip(columns, row) if flag}
 
 
+WHOLE_REPORT = '*'
+
+
+def chat_scope_key(key) -> str:
+    """The saved-scope name for one chat of a chat_groups report: its key
+    value, or blank (NULL or '') for rows without one, the same two cases
+    ArtifactViewerMixin._art_show_chat filters on."""
+    return 'chat:' + (key if key not in (None, '') else '')
+
+
+def filled_columns_scan(conn, table: str, columns: list, group_col: str | None = None) -> dict:
+    """{scope: set of filled column names} for the whole report
+    (WHOLE_REPORT) and, with *group_col* (a chat_groups key), each chat
+    (chat_scope_key). One pass over the table, same rule as
+    nonempty_column_names. Raises on a failed query."""
+    exprs = [f"MAX(CASE WHEN {_quote_ident(c)} IS NOT NULL AND "
+             f"TRIM(CAST({_quote_ident(c)} AS TEXT)) != '' THEN 1 ELSE 0 END)"
+             for c in columns]
+    if not exprs:
+        return {WHOLE_REPORT: set()}
+    out = {}
+    if group_col:
+        g = _quote_ident(group_col)
+        grp = f"CASE WHEN {g} IS NULL OR {g} = '' THEN '' ELSE {g} END"
+        whole = set()
+        for row in conn.execute(f"SELECT {grp}, {', '.join(exprs)} FROM {_quote_ident(table)} GROUP BY 1"):
+            filled = {c for c, flag in zip(columns, row[1:]) if flag}
+            out[chat_scope_key(row[0])] = filled
+            whole |= filled
+        out[WHOLE_REPORT] = whole
+        return out
+    row = conn.execute(f"SELECT {', '.join(exprs)} FROM {_quote_ident(table)}").fetchone()
+    out[WHOLE_REPORT] = {c for c, flag in zip(columns, row or ()) if flag}
+    return out
+
+
 def nonempty_from_rows(columns: list, rows) -> set:
     """Same rule as nonempty_column_names, for an in-memory table."""
     found = set()

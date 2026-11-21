@@ -217,7 +217,8 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `artifact_media.py` | `MediaThumbnailDelegate`/`WebpageThumbnailRenderer` for report `media_fields` columns. |
 | `research_store.py` | Global artifact research notes (row colouring). |
 | `parser_versions.py` | Parser version tracking and changelog (update banner). |
-| `report_columns_store.py` | Per-report column order (persisted) and visibility (session-only). |
+| `report_columns_store.py` | Per-report column order (persisted) and visibility (session-only); `filled_columns_scan` (which columns have values, whole report and per chat). |
+| `report_extras.py` | What opening a report needs beyond its rows, built when the report is made (`build_all`, called by `ArtifactRunnerWorker`) and kept in `casecache.db` `report_extras` under `chat_flags.report_stamp`: row count (row ids are 1..N, never read), filled columns per scope, distinct media paths, the Chat Groups index (report tree) and summary (`build_chat_groups`; bookmark counts added at display, `apply_bookmarks`). A report made before that gets them once on a background thread when opened (`_ReportExtrasWorker`). Qt-free. Tests: `tests/test_report_extras.py`. |
 | `app_intelligence.py` | Per-app scoring for `list_apps`; `build_app_registry_lookup`/`flatten_row` for App Report. |
 | `ccl_abx.py` | Vendored Android Binary XML decoder (with local fixes). |
 | `ccl_leveldb.py` / `ccl_simplesnappy.py` | Vendored LevelDB reader and Snappy decompressor. |

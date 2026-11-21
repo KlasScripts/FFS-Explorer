@@ -25,8 +25,9 @@ ALLOWED = {
     'app/ai_summary.py': (7, 'caseresults.db (report rows and stored summaries)'),
     'app/chat_flags.py': (4, 'caseresults.db report rows and casecache.db red_flags / text_embeddings (read-only fingerprint and kept red flags)'),
     'app/app_intelligence.py': (1, 'caseresults.db, read-only'),
-    'app/artifact_viewer.py': (1, 'caseresults.db report table'),
+    'app/artifact_viewer.py': (2, 'caseresults.db report table: filter and sort workers'),
     'app/case_names.py': (1, 'casecache.db name update'),
+    'app/report_extras.py': (1, 'caseresults.db report table, read-only (saved report extras)'),
     'app/mcp_server.py': (2, 'caseresults.db for the MCP tools (evidence goes through '
                              '_extract_sqlite_ro -> sqlite_reader)'),
     'app/sqlite_carve.py': (2, '_readonly_connection: an in-memory (or temp) read-only copy of '

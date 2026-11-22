@@ -102,8 +102,17 @@ def _md5_hex(zip_path, phys, zinfo, reader) -> str | None:
     return h.hexdigest()
 
 
+POSSIBLE = 'possible:'   # the 'md5' value of a group matched on size + CRC32 only
+
+
+def is_possible(digest: str) -> bool:
+    """True for a 'possible duplicate' row (same size + CRC32, not read)."""
+    return digest.startswith(POSSIBLE)
+
+
 def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
-                          progress_cb=None, cancel_check=None, processes: int = 0):
+                          progress_cb=None, cancel_check=None, processes: int = 0,
+                          confirm_group=None):
     """*candidates* — [(ui_path, physical_path, zinfo, inode, devid)] for
     every real file to consider, where *zinfo* is the entry's
     zipfile.ZipInfo (already parsed from the central directory — no new
@@ -140,7 +149,16 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
     zip_cd_cache.compute_data_offsets), the rest on threads as before. On
     IOS17 (169k files, 4 GB, warm cache) 3.6 s on 8 threads, 1.2 s on 9
     processes, the same digests (2026-11-18); and the hashing no longer
-    holds the app's Python lock beside the window."""
+    holds the app's Python lock beside the window.
+
+    *confirm_group*(ui_paths) -> bool, optional: only groups it accepts are
+    read to confirm (2026-11-22: groups holding a picture or video, which
+    is what the duplicate features use; on IOS17 16,678 files to read
+    instead of 161,934). A group it declines is never read: members proven
+    the same file by a trusted inode are still confirmed (no read), and
+    every other member is returned as a *possible* duplicate, 'md5' =
+    POSSIBLE + '<size>:<crc>', which nothing treats as identical. Groups
+    proven by recorded SHA-256 need no reads either way."""
     by_size_crc: dict[tuple[int, int], list] = {}
     # Optional 6th field: the SHA-256 the acquisition tool recorded ('' if
     # none). Optional 7th: a zero-arg callable returning the file's bytes,
@@ -171,6 +189,8 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
                 for m in members:
                     results[m[0]] = {'md5': digest, 'size': m[2].file_size,
                                      'group_size': len(members)}
+        elif confirm_group is not None and not confirm_group([m[0] for m in group]):
+            _possible_group(group, inode_trusted, results)
         else:
             to_process.append(group)
 
@@ -259,6 +279,31 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
                 return results
             _record(*fut.result())
     return results
+
+
+def _possible_group(group, inode_trusted, results) -> None:
+    """A (size, CRC32) group not read (find_duplicate_groups' *confirm_group*
+    declined it): members sharing a trusted (inode, devid) are confirmed
+    the same file with no read, under a key naming that inode (no digest:
+    nothing was read); every other member is a possible duplicate."""
+    size, crc = group[0][2].file_size, group[0][2].CRC
+    left = list(group)
+    if inode_trusted:
+        by_inode: dict = {}
+        for m in group:
+            if m[3]:
+                by_inode.setdefault((m[3], m[4]), []).append(m)
+        for (inode, devid), members in by_inode.items():
+            if len(members) < 2:
+                continue
+            for m in members:
+                results[m[0]] = {'md5': f'inode:{inode}:{devid}:{size}:{crc}', 'size': size,
+                                 'group_size': len(members)}
+        left = [m for m in group if m[0] not in results]
+    if len(left) < 2 and len(left) == len(group):
+        return
+    for m in left:
+        results[m[0]] = {'md5': f'{POSSIBLE}{size}:{crc}', 'size': size, 'group_size': len(group)}
 
 
 def _hash_in_processes(zip_path, grouped_units, units, processes, record, cancel_check):

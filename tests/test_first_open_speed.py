@@ -280,3 +280,37 @@ def test_sizes_and_stored_from_the_index_are_the_entries(tmp_path):
     assert list(sizes.items()) == [(i.filename, i.file_size) for i in plain]
     assert ([(i.filename, i.header_offset) for i in stored]
             == [(i.filename, i.header_offset) for i in plain if i.compress_type == 0 and i.file_size > 0])
+
+
+def test_only_accepted_groups_are_read_the_rest_are_possible():
+    """find_duplicate_groups' confirm_group (2026-11-22): a group it accepts
+    is read and confirmed; a declined group is never read, its trusted-inode
+    members are confirmed with no read, the rest are 'possible' duplicates
+    that load_duplicate_files leaves out."""
+    import sqlite3
+    import zlib
+    import duplicate_scan as ds
+    from db_utils import _open_cache_db, load_duplicate_files, load_possible_duplicates, save_duplicate_files
+    reads = []
+
+    def cand(path, data, inode=0):
+        info = SimpleNamespace(file_size=len(data), CRC=zlib.crc32(data))
+        return (path, path, info, inode, 0, '', lambda d=data, p=path: reads.append(p) or d)
+    pic, txt, lnk = b'P' * 50, b'T' * 60, b'L' * 70
+    cands = [cand('a/one.jpg', pic), cand('b/two.jpg', pic),           # a picture group: read
+             cand('a/x.txt', txt), cand('b/y.txt', txt),               # no picture: possible
+             cand('a/l1', lnk, inode=7), cand('b/l2', lnk, inode=7), cand('c/l3', lnk)]
+    out = ds.find_duplicate_groups('unused.zip', cands, inode_trusted=True,
+                                   confirm_group=lambda paths: any(p.endswith('.jpg') for p in paths))
+    assert sorted(reads) == ['a/one.jpg', 'b/two.jpg']               # nothing else was read
+    assert out['a/one.jpg']['md5'] == out['b/two.jpg']['md5'] and len(out['a/one.jpg']['md5']) == 32
+    assert ds.is_possible(out['a/x.txt']['md5']) and ds.is_possible(out['b/y.txt']['md5'])
+    assert out['a/l1']['md5'].startswith('inode:') and out['a/l1']['md5'] == out['b/l2']['md5']
+    assert ds.is_possible(out['c/l3']['md5'])                       # same size+CRC, other inode
+    import tempfile
+    case = tempfile.mkdtemp()
+    with _open_cache_db(case) as db:
+        save_duplicate_files(db, out)
+        confirmed, possible = load_duplicate_files(db), load_possible_duplicates(db)
+    assert set(confirmed) == {'a/one.jpg', 'b/two.jpg', 'a/l1', 'b/l2'}
+    assert set(possible) == {'a/x.txt', 'b/y.txt', 'c/l3'}

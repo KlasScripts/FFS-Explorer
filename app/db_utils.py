@@ -1006,10 +1006,26 @@ def save_duplicate_files(conn: 'sqlite3.Connection', results: dict) -> None:
 
 
 def load_duplicate_files(conn: 'sqlite3.Connection') -> dict:
-    """Return {ui_path: {'md5':, 'size':, 'group_size':}} previously saved."""
+    """Return {ui_path: {'md5':, 'size':, 'group_size':}} previously saved:
+    the CONFIRMED duplicates only. A 'possible' row (same size + CRC32, not
+    read: duplicate_scan.POSSIBLE) is never one; load_possible_duplicates
+    gives those."""
     results: dict = {}
     for ui_path, md5, size, group_size in conn.execute(
-            'SELECT ui_path, md5, size, group_size FROM duplicate_files'):
+            "SELECT ui_path, md5, size, group_size FROM duplicate_files "
+            "WHERE md5 NOT LIKE 'possible:%'"):
+        results[ui_path] = {'md5': md5, 'size': size, 'group_size': group_size}
+    return results
+
+
+def load_possible_duplicates(conn: 'sqlite3.Connection') -> dict:
+    """{ui_path: {'md5':, 'size':, 'group_size':}} of the possible duplicates
+    (same size + CRC32, not read to confirm), shown as such in the File
+    Browser only."""
+    results: dict = {}
+    for ui_path, md5, size, group_size in conn.execute(
+            "SELECT ui_path, md5, size, group_size FROM duplicate_files "
+            "WHERE md5 LIKE 'possible:%'"):
         results[ui_path] = {'md5': md5, 'size': size, 'group_size': group_size}
     return results
 

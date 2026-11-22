@@ -564,7 +564,10 @@ def _load_exif(cache_conn) -> dict:
 
 def _load_md5(cache_conn) -> dict:
     try:
-        return dict(cache_conn.execute('SELECT ui_path, md5 FROM duplicate_files'))
+        # confirmed duplicates only: a 'possible' row (size + CRC32, not
+        # read) never merges two files' events
+        return dict(cache_conn.execute(
+            "SELECT ui_path, md5 FROM duplicate_files WHERE md5 NOT LIKE 'possible:%'"))
     except sqlite3.Error:
         return {}
 

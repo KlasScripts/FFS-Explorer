@@ -49,6 +49,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       save_header_types, load_header_types, clear_header_types,
                       save_media_metadata, load_media_metadata, clear_media_metadata,
                       save_duplicate_files, load_duplicate_files, count_duplicate_groups,
+                      load_possible_duplicates,
                       load_attachment_links,
                       save_guid_bundle_map, load_guid_bundle_map, save_app_registry,
                       save_folder_counts, save_folder_sizes, load_folder_data,
@@ -366,7 +367,7 @@ from file_types import (  # noqa: E402
     CERTIFICATE_EXTENSIONS,
     _EXT_TO_TYPE,
     _WEB_CACHE_NAME,
-    _get_file_type,
+    _get_file_type, _ext,
 )
 
 
@@ -1489,6 +1490,10 @@ def _format_duplicate_cols(dup_info: dict | None) -> tuple[str, str]:
     if not dup_info:
         return '', ''
     digest = dup_info['md5']
+    if duplicate_scan.is_possible(digest):
+        # same size + CRC32 only, not read to confirm (Process Case's
+        # "Confirm only groups with a picture or video")
+        return f"possible {dup_info['group_size']}", ''
     return str(dup_info['group_size']), digest if len(digest) == 32 else ''
 
 # Acquisition-time hashes recorded by GrayKey for every file (not folders) —
@@ -5484,13 +5489,17 @@ class DuplicateDetectionWorker(QThread):
     skipped  = Signal(str)         # reason the stage could not run at all
     done     = Signal(dict, bool)  # {ui_path: {'md5':, 'size':, 'group_size':}} (already saved), complete
 
-    def __init__(self, zip_path, case_dir, ui_metadata, ffs_adapter, run_type):
+    def __init__(self, zip_path, case_dir, ui_metadata, ffs_adapter, run_type,
+                 confirm_group=None):
         super().__init__()
         self._zip_path = zip_path
         self._case_dir = case_dir
         self._ui_metadata = ui_metadata
         self._adapter = ffs_adapter
         self._run_type = run_type
+        # duplicate_scan.find_duplicate_groups' confirm_group: None reads
+        # every group; else only the groups it accepts (the rest possible)
+        self._confirm_group = confirm_group
 
     def run(self):
         # Candidates (on IOS17 a 2.7 s pass over every entry, plus reading
@@ -5520,9 +5529,11 @@ class DuplicateDetectionWorker(QThread):
                 self._zip_path, candidates, inode_trusted=self._adapter.inode_trusted,
                 progress_cb=lambda done, total: self.progress.emit(done, total),
                 cancel_check=self.isInterruptionRequested,
-                processes=_EMBEDDED_MEDIA_PROCESSES)
+                processes=_EMBEDDED_MEDIA_PROCESSES,
+                confirm_group=self._confirm_group)
         complete = not self.isInterruptionRequested()
-        n_groups = len({v['md5'] for v in results.values()})
+        n_groups = len({v['md5'] for v in results.values() if not duplicate_scan.is_possible(v['md5'])})
+        n_possible = len({v['md5'] for v in results.values() if duplicate_scan.is_possible(v['md5'])})
         # A cancelled run keeps the earlier results: save_duplicate_files
         # replaces the whole table, and before 2026-11-20 a cancel replaced
         # a full earlier run with the few groups confirmed so far.
@@ -5538,6 +5549,9 @@ class DuplicateDetectionWorker(QThread):
                     run_id = start_run_log(results_db, self._run_type)
                 if complete:
                     notes, saved = f"{n_groups} group(s)", len(results)
+                    if n_possible:
+                        notes += (f"; {n_possible} possible group(s) (same size + CRC32) not read: "
+                                  "no picture or video in them")
                 else:
                     notes, saved = "cancelled before finishing; nothing saved", 0
                 results_db.execute('UPDATE run_log SET total=?, notes=? WHERE id=?',
@@ -6773,6 +6787,19 @@ class ProcessDialog(QDialog):
         # upgrade) shouldn't silently redo it. See
         # _dedup_results_on_record for why the run log alone isn't enough.
         self._chk_dedup.setChecked(not self._dedup_results_on_record())
+        # Only groups holding a picture or video are read to confirm (what
+        # Hide Duplicates, the User Media count, bookmarks and the Timeline
+        # use); the others are listed as possible duplicates. 2026-11-22:
+        # IOS17 16,678 files to read instead of 161,934.
+        self._chk_dedup_media_only = QCheckBox(
+            "    Confirm only groups with a picture or video (faster; the rest are shown as possible duplicates)")
+        self._chk_dedup_media_only.setChecked(True)
+        self._chk_dedup_media_only.setToolTip(
+            "Files with the same size and CRC32 are possible duplicates. Reading them to confirm\n"
+            "takes time; the duplicate features (Hide Duplicates, User Media count, bookmarks,\n"
+            "Timeline) only use pictures and videos. Untick to confirm every group.")
+        self._chk_dedup.toggled.connect(self._chk_dedup_media_only.setEnabled)
+        self._chk_dedup_media_only.setEnabled(self._chk_dedup.isChecked())
         self._chk_dedup.setToolTip(
             "Groups files by size and CRC32 (free — already read from the "
             "zip's own central directory) across the WHOLE archive, then "
@@ -6788,6 +6815,7 @@ class ProcessDialog(QDialog):
             "File Browser, present only for files confirmed to have a "
             "real duplicate elsewhere in the archive.")
         layout.addWidget(self._chk_dedup)
+        layout.addWidget(self._chk_dedup_media_only)
 
         # Stats block
         self._stats_label = QLabel()
@@ -8324,9 +8352,17 @@ class ProcessDialog(QDialog):
             self._finish_operations()
             return
         self._status_label.setText("Duplicate detection: listing files…")
+        confirm = None
+        if self._chk_dedup_media_only.isChecked():
+            overrides = self._header_type_overrides_snapshot()
+            media_ext = PICTURE_EXTENSIONS | VIDEO_EXTENSIONS | set(header_scan.GRAPHIC_EXTENSIONS)
+
+            def confirm(paths, overrides=overrides, media_ext=media_ext):
+                return any(_ext(p.rsplit('/', 1)[-1]).lower() in media_ext
+                           or overrides.get(p) in ('Picture', 'Graphic', 'Video') for p in paths)
         self._dedup_worker = DuplicateDetectionWorker(
             self._zip_path, self._case_dir, self._ui_metadata, self._adapter,
-            self._RUN_TYPE_DEDUP)
+            self._RUN_TYPE_DEDUP, confirm_group=confirm)
         self._dedup_worker.collected.connect(lambda n: self._status_label.setText(
             f"Duplicate detection: checking {n:,} file(s) for size+CRC32 matches…"))
         self._dedup_worker.skipped.connect(self._on_dedup_skipped)
@@ -11533,7 +11569,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         for k in hash_keys:
             cols.append(meta.get(k, ''))
         if dup_cols:
-            cols.extend(_format_duplicate_cols(self._duplicate_files.get(path)))
+            cols.extend(_format_duplicate_cols(self._duplicate_files.get(path)
+                                               or getattr(self, '_possible_duplicates', {}).get(path)))
         return (cols, path, fc, is_folder and not grey_row, grey_row,
                 path in self._nested_archive_map or path in self._leveldb_folder_map
                 or path in self._embedded_media_containers)
@@ -12101,7 +12138,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         has_links = bool(self._attachment_links)
         has_inode = self._inode_col_available()
         has_link_count = self._has_link_count_data
-        has_dup = bool(self._duplicate_files)
+        has_dup = bool(self._duplicate_files or getattr(self, '_possible_duplicates', None))
         headers = (self.file_headers + (_PHOTO_HEADERS if has_photos else [])
                   + (_EXIF_HEADERS if has_exif else [])
                   + ([_LINKED_REPORT_HEADER] if has_links else [])
@@ -13087,6 +13124,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._header_tier_count_seq += 1
         self._attachment_links = {}   # rebuilt in _start_case_meta_load
         self._duplicate_files = {}    # rebuilt in _start_case_meta_load
+        self._possible_duplicates = {}    # same size + CRC32, not read (duplicate_scan.POSSIBLE)
         self._duplicate_groups: dict = {}   # md5 -> every member ui_path, rebuilt alongside
         self._photos_prompt_shown = False
         self._search_entries = None   # clear cached index for the new archive
@@ -13634,12 +13672,14 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             overrides = {}
             media_exif = {}
             duplicates = {}
+            possible = {}
             links = {}
             try:
                 with closing(_open_cache_db(case_dir)) as db:
                     overrides = load_header_types(db)
                     media_exif = load_media_metadata(db)
                     duplicates = load_duplicate_files(db)
+                    possible = load_possible_duplicates(db)
             except Exception:
                 pass
             # artifact_attachment_links lives in caseresults.db, not
@@ -13653,7 +13693,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 pass
             tz = self._load_or_detect_timezone_settings(zip_path, adapter, case_dir)
             return (overrides, _build_photo_index(case_dir, rules), tz, media_exif,
-                    (duplicates, _duplicate_groups_for(duplicates)), links)
+                    (duplicates, _duplicate_groups_for(duplicates), possible), links)
 
         fut = _CASE_OPEN_POOL.submit(_load)
         self._track_load_job('file types and case results', fut)
@@ -13696,7 +13736,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._photo_index = photos
             self._media_exif = media_exif
             # Grouped on the background thread (_duplicate_groups_for).
-            self._duplicate_files, self._duplicate_groups = duplicates
+            self._duplicate_files, self._duplicate_groups, self._possible_duplicates = duplicates
             self._attachment_links = links
             gc.freeze()   # these live all session too — see on_metadata_ready
             (self._handset_zone_name, self._acquisition_zone_name,
@@ -14470,7 +14510,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         saved — the whole table, since save_duplicate_files replaces it —
         so nothing is re-read from casecache.db on the GUI thread; then
         refreshes the File Browser's "Duplicate Count"/"MD5" columns."""
-        self._duplicate_files = results
+        # confirmed duplicates for every feature; possible ones (same size
+        # + CRC32, not read) only for the File Browser's columns
+        self._duplicate_files = {p: v for p, v in results.items()
+                                 if not duplicate_scan.is_possible(v['md5'])}
+        self._possible_duplicates = {p: v for p, v in results.items()
+                                     if duplicate_scan.is_possible(v['md5'])}
         self._recompute_duplicate_groups()
         self._refresh_current_file_view(preserve_filter=True)
         self._refresh_bookmark_panel()   # "User Media (N · M to review)"
@@ -14869,7 +14914,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         has_links = bool(self._attachment_links)
         has_inode = self._inode_col_available()
         has_link_count = self._has_link_count_data
-        has_dup = bool(self._duplicate_files)
+        has_dup = bool(self._duplicate_files or getattr(self, '_possible_duplicates', None))
         headers = (self.file_headers + (['UUID'] if has_bundles else [])
                    + (_PHOTO_HEADERS if has_photos else [])
                    + (_EXIF_HEADERS if has_exif else [])
@@ -14972,7 +15017,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         has_links = bool(self._attachment_links)
         has_inode = self._inode_col_available()
         has_link_count = self._has_link_count_data
-        has_dup = bool(self._duplicate_files)
+        has_dup = bool(self._duplicate_files or getattr(self, '_possible_duplicates', None))
         headers = (self.file_headers + (['UUID'] if has_bundles else [])
                    + (_PHOTO_HEADERS if has_photos else [])
                    + (_EXIF_HEADERS if has_exif else [])

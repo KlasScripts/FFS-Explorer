@@ -327,16 +327,32 @@ def search_blocks(blocks, patterns: list, ctx_bytes: int = CTX_BYTES,
     return results
 
 
+MEDIA_HEAD_TAIL = 256 * 1024   # bytes read at each end of a media file (search_job)
+
+
+def read_ranges(size: int, head_tail: int = 0) -> list:
+    """[(start, length)] of a file to search: all of it, or for a media
+    entry limited to *head_tail* (Keyword Search's "Media files: start and
+    end only") its first and last *head_tail* bytes, where EXIF, XMP and
+    a video's metadata are kept; data appended after a picture is in the
+    end part too."""
+    if head_tail and size > 2 * head_tail:
+        return [(0, head_tail), (size - head_tail, head_tail)]
+    return [(0, size)]
+
+
 def make_jobs(entries: list, job_bytes: int = JOB_BYTES, job_files: int = JOB_FILES) -> list:
-    """Group (name, data_offset, size) entries into jobs of about
-    *job_bytes* / *job_files*, in archive order so each job reads forward."""
+    """Group (name, data_offset, size[, head_tail]) entries into jobs of
+    about *job_bytes* / *job_files*, in archive order so each job reads
+    forward."""
     jobs, cur, cur_bytes = [], [], 0
     for e in sorted(entries, key=lambda e: e[1]):
-        if cur and (cur_bytes + e[2] > job_bytes or len(cur) >= job_files):
+        n = sum(length for _start, length in read_ranges(e[2], e[3] if len(e) > 3 else 0))
+        if cur and (cur_bytes + n > job_bytes or len(cur) >= job_files):
             jobs.append(cur)
             cur, cur_bytes = [], 0
         cur.append(e)
-        cur_bytes += e[2]
+        cur_bytes += n
     if cur:
         jobs.append(cur)
     return jobs
@@ -345,23 +361,29 @@ def make_jobs(entries: list, job_bytes: int = JOB_BYTES, job_files: int = JOB_FI
 def search_job(zip_path: str, entries: list, patterns: list,
                ctx_bytes: int = CTX_BYTES, chunk: int = CHUNK,
                b64: list | None = None, phone: list | None = None) -> tuple[list, int]:
-    """Worker-process entry point: search each (name, data_offset, size)
-    entry of the archive. Returns ([(name, hits), ...] for files with
-    hits, number of files that could not be read)."""
+    """Worker-process entry point: search each (name, data_offset, size[,
+    head_tail]) entry of the archive (read_ranges: a media entry with
+    head_tail only at its start and end; each part searched on its own,
+    offsets in the file). Returns ([(name, hits), ...] for files with hits,
+    number of files that could not be read)."""
     out, unreadable = [], 0
     with open(zip_path, 'rb', buffering=0) as f:
-        for name, offset, size in entries:
-            def blocks(offset=offset, size=size):
-                pos = 0
-                while pos < size:
-                    f.seek(offset + pos)
-                    data = f.read(min(chunk, size - pos))
-                    if not data:
-                        return
-                    yield data
-                    pos += len(data)
+        for e in entries:
+            name, offset, size = e[0], e[1], e[2]
+            hits = []
             try:
-                hits = search_blocks(blocks(), patterns, ctx_bytes, b64, phone)
+                for start, length in read_ranges(size, e[3] if len(e) > 3 else 0):
+                    def blocks(at=offset + start, length=length):
+                        pos = 0
+                        while pos < length:
+                            f.seek(at + pos)
+                            data = f.read(min(chunk, length - pos))
+                            if not data:
+                                return
+                            yield data
+                            pos += len(data)
+                    hits += [(start + o, ctx) for o, ctx in
+                             search_blocks(blocks(), patterns, ctx_bytes, b64, phone)]
             except OSError:
                 unreadable += 1
                 continue

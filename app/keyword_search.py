@@ -255,6 +255,24 @@ class SearchIndexWorker(QThread):
 
 # ── KeywordSearchWorker ───────────────────────────────────────────────────────
 
+def _limit_media(entries: list, head_tail: int, media_names=frozenset()) -> tuple[list, int]:
+    """*entries* with each picture/video (by extension, or in
+    *media_names*) larger than twice *head_tail* given that limit as a 4th
+    field (keyword_scan.read_ranges); and how many were limited."""
+    from file_types import PICTURE_EXTENSIONS, VIDEO_EXTENSIONS, _ext
+    from header_scan import GRAPHIC_EXTENSIONS
+    media_ext = PICTURE_EXTENSIONS | VIDEO_EXTENSIONS | set(GRAPHIC_EXTENSIONS)
+    out, n = [], 0
+    for e in entries:
+        if (e[2] > 2 * head_tail and len(e) == 3
+                and (_ext(e[0].rsplit('/', 1)[-1]).lower() in media_ext or e[0] in media_names)):
+            out.append((e[0], e[1], e[2], head_tail))
+            n += 1
+        else:
+            out.append(e)
+    return out, n
+
+
 class KeywordSearchWorker(QThread):
     """Search all STORED entries in a zip for a keyword using multiple threads.
 
@@ -278,9 +296,16 @@ class KeywordSearchWorker(QThread):
                  entries=None, scope="all",
                  exclude_prefixes: tuple = (), case_dir: str | None = None,
                  delta: int | None = None, exclude_entry=None, base64: bool = True,
+                 media_head_tail: int = 0, media_names=frozenset(),
                  parent=None):
         super().__init__(parent)
         self.zip_path          = zip_path
+        # Media files searched only at their start and end (keyword_scan.
+        # read_ranges), *media_head_tail* bytes each; 0 = every byte.
+        # *media_names*: zip names of files the header scan typed as media
+        # (no media extension).
+        self._media_head_tail  = media_head_tail
+        self._media_names      = media_names
         # Optional callable(zip entry name) -> True to leave an entry out of
         # an "all" search: the iOS system partition (A-82).
         self._exclude_entry    = exclude_entry
@@ -331,6 +356,13 @@ class KeywordSearchWorker(QThread):
             else:
                 entries = full_entries
         self.status_update.emit(f"Index ready — {len(entries):,} files to search")
+        if self._media_head_tail:
+            entries, n_limited = _limit_media(entries, self._media_head_tail, self._media_names)
+            if n_limited:
+                self.status_update.emit(
+                    f"{n_limited:,} picture/video files searched at their start and end only "
+                    f"(first and last {self._media_head_tail // 1024} KB: EXIF, XMP, video "
+                    "metadata, data appended after the picture)")
         patterns = self._patterns
         total    = len(entries)
         hits     = 0
@@ -417,14 +449,18 @@ class KeywordSearchWorker(QThread):
         reader = ZipReader(self.zip_path)
 
         def search_entry(entry):
-            _name, data_offset, file_size = entry
+            data_offset, file_size = entry[1], entry[2]
             if self._stop.is_set():
                 return []
             try:
-                return keyword_scan.search_blocks(
-                    reader.read_chunked_at(data_offset, file_size, chunk_size=self._CHUNK,
-                                           stop_fn=self._stop.is_set),
-                    patterns, self._CTX_BYTES, self._b64, self._phone)
+                hits = []
+                for start, length in keyword_scan.read_ranges(
+                        file_size, entry[3] if len(entry) > 3 else 0):
+                    hits += [(start + o, ctx) for o, ctx in keyword_scan.search_blocks(
+                        reader.read_chunked_at(data_offset + start, length, chunk_size=self._CHUNK,
+                                               stop_fn=self._stop.is_set),
+                        patterns, self._CTX_BYTES, self._b64, self._phone)]
+                return hits
             except OSError:
                 return []
 
@@ -1416,6 +1452,13 @@ class KeywordSearchMixin:
         search_ctrl.addWidget(self.search_field, 1)
         search_ctrl.addWidget(self.search_scope_combo)
         search_ctrl.addWidget(self.search_b64_check)
+        self.search_media_check = QCheckBox("Media: start/end only")
+        self.search_media_check.setChecked(True)
+        self.search_media_check.setToolTip(
+            "Search pictures and videos only in their first and last 256 KB, where EXIF, XMP,\n"
+            "a video's metadata and anything appended after the picture are kept. The rest is\n"
+            "image or video data, rarely text. Untick to search every byte of every file.")
+        search_ctrl.addWidget(self.search_media_check)
         search_ctrl.addWidget(self.search_btn)
         search_ctrl.addWidget(self.search_stop_btn)
         self._incomplete_banner = QLabel()
@@ -1629,6 +1672,15 @@ class KeywordSearchMixin:
         else:
             entries = None
         return entries, nested_map, "all files", None
+
+    def _search_media_names(self) -> frozenset:
+        """Zip names of the files the header scan typed as a picture or video
+        (_header_type_overrides; no media extension), for the search's
+        "Media: start/end only" option."""
+        overrides = getattr(self, '_header_type_overrides', None) or {}
+        resolve = self._adapter.resolve
+        return frozenset(resolve(p) for p, t in overrides.items()
+                         if t in ('Picture', 'Graphic', 'Video'))
 
     def _ios_system_entry_check(self):
         """FfsAdapter.is_ios_system_entry for an iOS archive, else None."""
@@ -3009,6 +3061,11 @@ class KeywordSearchMixin:
         search_b64 = self.search_b64_check.isChecked()
         if not search_b64:
             scope_label = f"{scope_label}, no base64"
+        # Likewise a search of media files' start and end only is kept apart
+        # from one of every byte.
+        search_media_limited = self.search_media_check.isChecked()
+        if search_media_limited:
+            scope_label = f"{scope_label}, media start/end"
         db_key = _encode_search_key(term, scope_label)
         self._current_search_db_key = db_key
         self._save_recent_search(db_key)
@@ -3050,7 +3107,9 @@ class KeywordSearchMixin:
             exclude_entry=self._ios_system_entry_check() if worker_scope == 'all' else None,
             case_dir=self._case_dir,
             delta=getattr(self, '_local_extra_delta', None),
-            base64=search_b64)
+            base64=search_b64,
+            media_head_tail=keyword_scan.MEDIA_HEAD_TAIL if search_media_limited else 0,
+            media_names=self._search_media_names() if search_media_limited else frozenset())
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
         self._search_worker.results_found.connect(self._on_search_results)
         self._search_worker.progress.connect(self._on_search_progress)

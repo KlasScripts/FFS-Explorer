@@ -215,3 +215,38 @@ def test_not_a_phone_number_keyword():
                  '11/12/26', '192.168.1.100'):
         assert ks.make_phone_patterns(term) == [], term
     assert ks.make_phone_patterns('912 34 567')
+
+
+def test_media_start_and_end_only(tmp_path):
+    """Keyword Search's "Media: start/end only" (2026-11-22): a picture is
+    searched in its first and last MEDIA_HEAD_TAIL bytes, at their true
+    offsets; the middle is not searched; other files are searched whole."""
+    import zipfile
+    import keyword_scan as ks
+    import keyword_search
+    ht = 1024
+    pic = bytearray(b'.' * (10 * ht))
+    for at in (100, 5 * ht, 10 * ht - 200):          # start, middle, end
+        pic[at:at + 6] = b'needle'
+    txt = bytes(pic)
+    zp = tmp_path / 'm.zip'
+    with zipfile.ZipFile(zp, 'w', zipfile.ZIP_STORED) as z:
+        z.writestr('DCIM/a.jpg', bytes(pic))
+        z.writestr('notes/a.txt', txt)
+    with zipfile.ZipFile(zp) as z:
+        entries = []
+        for info in z.infolist():
+            with open(zp, 'rb') as f:
+                f.seek(info.header_offset + 26)
+                n, m = int.from_bytes(f.read(2), 'little'), int.from_bytes(f.read(2), 'little')
+            entries.append((info.filename, info.header_offset + 30 + n + m, info.file_size))
+    limited, n = keyword_search._limit_media(entries, ht)
+    assert n == 1 and [len(e) for e in limited] == [4, 3]
+    pats = ks.make_patterns('needle')
+    got = dict(ks.search_job(str(zp), limited, pats)[0])
+    assert [o for o, _c in got['DCIM/a.jpg']] == [100, 10 * ht - 200]
+    assert [o for o, _c in got['notes/a.txt']] == [100, 5 * ht, 10 * ht - 200]
+    full = dict(ks.search_job(str(zp), entries, pats)[0])
+    assert [o for o, _c in full['DCIM/a.jpg']] == [100, 5 * ht, 10 * ht - 200]
+    # a picture no bigger than both ends is searched whole
+    assert ks.read_ranges(2 * ht, ht) == [(0, 2 * ht)]

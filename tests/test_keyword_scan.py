@@ -271,11 +271,34 @@ def test_app_install_folders_skipped(tmp_path):
                 f.seek(info.header_offset + 26)
                 n, m = int.from_bytes(f.read(2), 'little'), int.from_bytes(f.read(2), 'little')
             entries.append((info.filename, info.header_offset + 30 + n + m, info.file_size))
-    w = keyword_search.KeywordSearchWorker(str(zp), 'needle', entries=entries, base64=False,
-                                           skip_prefixes=('filesystem2/containers/Bundle/',))
+    w = keyword_search.KeywordSearchWorker(
+        str(zp), 'needle', entries=entries, base64=False,
+        skip_entry=lambda n: n.startswith('filesystem2/containers/Bundle/'))
     found, status = [], []
     w.results_found.connect(lambda name, hits: found.append(name))
     w.status_update.connect(status.append)
     w.run()
     assert found == ['filesystem2/mobile/Library/notes.txt']
-    assert any('app install folders not searched' in s for s in status)
+    assert any("apps' own install not searched" in s for s in status)
+
+
+
+def test_app_install_skip_leaves_out_only_app_code():
+    """The skip rule: iOS only inside an app's .app bundle (its
+    iTunesMetadata.plist, which can name the downloading account, is
+    searched); Android only code files under data/app; data never."""
+    from types import SimpleNamespace
+    import keyword_search
+    g = '0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9'
+    ios = keyword_search.app_install_skip(SimpleNamespace(resolve=lambda u: 'filesystem2/' + u))
+    assert ios(f'filesystem2/containers/Bundle/Application/{g}/Maps.app/Info.plist')
+    assert ios(f'filesystem2/containers/Bundle/Application/{g}/Maps.app/Base.lproj/x.strings')
+    assert not ios(f'filesystem2/containers/Bundle/Application/{g}/iTunesMetadata.plist')
+    assert not ios(f'filesystem2/containers/Data/Application/{g}/Documents/a.app/x')
+    assert not ios('filesystem2/mobile/Library/SMS/sms.db')
+    gk = keyword_search.app_install_skip(SimpleNamespace(resolve=lambda u: '/' + u))
+    assert gk('/data/app/~~abc==/com.x-def==/base.apk')
+    assert gk('/data/app/~~abc==/com.x-def==/lib/arm64/libx.so')
+    assert not gk('/data/app/~~abc==/com.x-def==/base.digests')
+    assert not gk('/data/data/com.x/databases/msg.db')
+    assert not gk('/data/media/0/Download/a.apk')        # a user's own download is searched

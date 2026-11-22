@@ -255,6 +255,36 @@ class SearchIndexWorker(QThread):
 
 # ── KeywordSearchWorker ───────────────────────────────────────────────────────
 
+# Installed-app code under Android's data/app (APKs, native libraries,
+# compiled code, staged installs); the folder's small .metadata, .digests
+# and .prof files are still searched.
+_ANDROID_APP_CODE = frozenset({'.apk', '.so', '.odex', '.vdex', '.art', '.oat', '.dm', '.staged'})
+
+
+def app_install_skip(adapter):
+    """callable(zip name) -> True for a file of an app's own install, which
+    "Skip app install folders" leaves out of an all-files search
+    (2026-11-22): on iOS only what is inside an app's .app bundle
+    (containers/Bundle/Application/<GUID>/<name>.app/...: the developer's
+    code and resources; the iTunesMetadata.plist beside it, which can name
+    the account that downloaded the app, is still searched); on Android
+    only the code files under data/app (_ANDROID_APP_CODE). Every data
+    folder, the user's own folders and unpacked archives are searched."""
+    from file_types import _ext
+    ios_pre = adapter.resolve('containers/Bundle').lstrip('/').rstrip('/') + '/Application/'
+    and_pre = adapter.resolve('data/app').lstrip('/').rstrip('/') + '/'
+
+    def skip(zip_name: str) -> bool:
+        n = zip_name.lstrip('/')
+        if n.startswith(ios_pre):
+            rest = n[len(ios_pre):].split('/', 2)
+            return len(rest) == 3 and rest[1].endswith('.app')
+        if n.startswith(and_pre):
+            return _ext(n.rsplit('/', 1)[-1]).lower() in _ANDROID_APP_CODE
+        return False
+    return skip
+
+
 def _limit_media(entries: list, head_tail: int, media_names=frozenset()) -> tuple[list, int]:
     """*entries* with each picture/video (by extension, or in
     *media_names*) larger than twice *head_tail* given that limit as a 4th
@@ -297,7 +327,7 @@ class KeywordSearchWorker(QThread):
                  exclude_prefixes: tuple = (), case_dir: str | None = None,
                  delta: int | None = None, exclude_entry=None, base64: bool = True,
                  media_head_tail: int = 0, media_names=frozenset(),
-                 skip_prefixes: tuple = (), parent=None):
+                 skip_entry=None, parent=None):
         super().__init__(parent)
         self.zip_path          = zip_path
         # Media files searched only at their start and end (keyword_scan.
@@ -306,9 +336,10 @@ class KeywordSearchWorker(QThread):
         # (no media extension).
         self._media_head_tail  = media_head_tail
         self._media_names      = media_names
-        # Zip-name prefixes left out (no leading '/'): the app install
-        # folders, for an "all files" search with "Skip app install folders"
-        self._skip_prefixes    = skip_prefixes
+        # Optional callable(zip name) -> True to leave a file out: the app
+        # install folders' code (app_install_skip), for an "all files"
+        # search with "Skip app install folders"
+        self._skip_entry       = skip_entry
         # Optional callable(zip entry name) -> True to leave an entry out of
         # an "all" search: the iOS system partition (A-82).
         self._exclude_entry    = exclude_entry
@@ -358,15 +389,15 @@ class KeywordSearchWorker(QThread):
                            and not (skip and skip(e[0]))]
             else:
                 entries = full_entries
-        if self._skip_prefixes:
-            skip = self._skip_prefixes
-            kept = [e for e in entries if not e[0].lstrip('/').startswith(skip)]
+        if self._skip_entry:
+            skip = self._skip_entry
+            kept = [e for e in entries if not skip(e[0])]
             n_skip = len(entries) - len(kept)
             if n_skip:
                 gb = (sum(e[2] for e in entries) - sum(e[2] for e in kept)) / 2**30
                 self.status_update.emit(
-                    f"{n_skip:,} files ({gb:.1f} GB) in app install folders not searched "
-                    "(the apps' own code and bundled files; their data folders are searched)")
+                    f"{n_skip:,} files ({gb:.1f} GB) of the apps' own install not searched "
+                    "(inside iOS .app bundles, Android app code; every data folder is searched)")
             entries = kept
         self.status_update.emit(f"Index ready — {len(entries):,} files to search")
         if self._media_head_tail:
@@ -1475,9 +1506,11 @@ class KeywordSearchMixin:
         self.search_skip_apps_check = QCheckBox("Skip app install folders")
         self.search_skip_apps_check.setChecked(True)
         self.search_skip_apps_check.setToolTip(
-            "In an all-files search, leave out the installed apps' own code and bundled files" + chr(10)
-            + "(iOS containers/Bundle, Android data/app): about a quarter to a third of a phone's" + chr(10)
-            + "data, not the user's. The apps' data folders are still searched.")
+            "In an all-files search, leave out the installed apps' own code and bundled files:" + chr(10)
+            + "what is inside each iOS .app bundle, and Android's app code under data/app (APKs," + chr(10)
+            + "libraries, compiled code). That is the developer's, not the user's: about a quarter" + chr(10)
+            + "to a third of a phone's data. Every data folder, the user's own folders, files" + chr(10)
+            + "unpacked from archives and the small files beside the apps are still searched.")
         search_ctrl.addWidget(self.search_skip_apps_check)
         search_ctrl.addWidget(self.search_btn)
         search_ctrl.addWidget(self.search_stop_btn)
@@ -1692,13 +1725,6 @@ class KeywordSearchMixin:
         else:
             entries = None
         return entries, nested_map, "all files", None
-
-    def _app_install_prefixes(self) -> tuple:
-        """Zip-name prefixes (no leading '/') of the app install folders:
-        iOS containers/Bundle, Android data/app, as this archive's layout
-        stores them (FfsAdapter.resolve)."""
-        return tuple(self._adapter.resolve(u).lstrip('/').rstrip('/') + '/'
-                     for u in ('containers/Bundle', 'data/app'))
 
     def _search_media_names(self) -> frozenset:
         """Zip names of the files the header scan typed as a picture or video
@@ -3141,7 +3167,7 @@ class KeywordSearchMixin:
             base64=search_b64,
             media_head_tail=keyword_scan.MEDIA_HEAD_TAIL if search_media_limited else 0,
             media_names=self._search_media_names() if search_media_limited else frozenset(),
-            skip_prefixes=self._app_install_prefixes() if skip_apps else ())
+            skip_entry=app_install_skip(self._adapter) if skip_apps else None)
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
         self._search_worker.results_found.connect(self._on_search_results)
         self._search_worker.progress.connect(self._on_search_progress)

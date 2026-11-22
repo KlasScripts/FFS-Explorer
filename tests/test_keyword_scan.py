@@ -302,3 +302,38 @@ def test_app_install_skip_leaves_out_only_app_code():
     assert not gk('/data/app/~~abc==/com.x-def==/base.digests')
     assert not gk('/data/data/com.x/databases/msg.db')
     assert not gk('/data/media/0/Download/a.apk')        # a user's own download is searched
+
+
+def test_media_metadata_found_wherever_it_sits(tmp_path):
+    """With "Media: start/end only": a video's moov box (GPS, tags) is
+    searched even in the middle of the file, and a TIFF (metadata may sit
+    anywhere) is searched whole (2026-11-22)."""
+    import struct
+    import zipfile
+    import keyword_scan as ks
+    import keyword_search
+    ht = 1024
+
+    def box(kind, body):
+        return struct.pack('>I4s', 8 + len(body), kind) + body
+    video = (box(b'ftyp', b'isom' + b'\0' * 8) + box(b'mdat', b'.' * (6 * ht))
+             + box(b'moov', b'.' * 100 + b'needle-gps' + b'.' * 100) + box(b'mdat', b'.' * (6 * ht)))
+    tif = bytearray(b'.' * (10 * ht))
+    tif[5 * ht:5 * ht + 6] = b'needle'
+    zp = tmp_path / 'v.zip'
+    with zipfile.ZipFile(zp, 'w', zipfile.ZIP_STORED) as z:
+        z.writestr('DCIM/IMG_1.MOV', video)
+        z.writestr('DCIM/scan.tif', bytes(tif))
+    entries = []
+    with zipfile.ZipFile(zp) as z:
+        for info in z.infolist():
+            with open(zp, 'rb') as f:
+                f.seek(info.header_offset + 26)
+                n, m = int.from_bytes(f.read(2), 'little'), int.from_bytes(f.read(2), 'little')
+            entries.append((info.filename, info.header_offset + 30 + n + m, info.file_size))
+    limited, n = keyword_search._limit_media(entries, ht)
+    assert n == 1 and len(limited[1]) == 3                 # the TIFF is searched whole
+    got = dict(ks.search_job(str(zp), limited, ks.make_patterns('needle'))[0])
+    moov_at = video.index(b'needle-gps')
+    assert [o for o, _c in got['DCIM/IMG_1.MOV']] == [moov_at]
+    assert [o for o, _c in got['DCIM/scan.tif']] == [5 * ht]

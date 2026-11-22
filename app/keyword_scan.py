@@ -341,6 +341,55 @@ def read_ranges(size: int, head_tail: int = 0) -> list:
     return [(0, size)]
 
 
+# ISO base media files (MP4/MOV/HEIC/AVIF): their metadata boxes are also
+# read wherever they sit (box_ranges), not only the start and end parts.
+BOX_FORMATS = ('.mov', '.mp4', '.m4v', '.3gp', '.heic', '.heif', '.avif')
+_META_BOXES = (b'moov', b'meta', b'uuid')
+
+
+def box_ranges(f, offset: int, size: int, limit: int = 64) -> list:
+    """[(start, length)] of the top-level moov / meta / uuid boxes of an ISO
+    base media file (MP4, MOV, HEIC, AVIF) stored at *offset* in the open
+    archive *f*: where a video keeps its GPS, camera and creation tags, and
+    HEIC its item metadata. Only box headers are read (8-16 bytes each, at
+    most *limit* boxes); [] for anything that is not a valid box layout.
+    On IOS17 and A14b every one was in a video's first or last 256 KB
+    anyway (2026-11-22); this keeps a long video with its moov in the
+    middle covered too."""
+    out, pos = [], 0
+    import struct
+    for _ in range(limit):
+        if pos + 8 > size:
+            break
+        f.seek(offset + pos)
+        h = f.read(16)
+        if len(h) < 8:
+            break
+        box_size, kind = struct.unpack('>I4s', h[:8])
+        if box_size == 1 and len(h) >= 16:
+            box_size = struct.unpack('>Q', h[8:16])[0]
+        elif box_size == 0:
+            box_size = size - pos
+        if box_size < 8 or pos + box_size > size or not kind.isalnum() and kind != b'ftyp':
+            break
+        if kind in _META_BOXES:
+            out.append((pos, box_size))
+        pos += box_size
+    return out
+
+
+def merge_ranges(ranges: list) -> list:
+    """Sorted, non-overlapping [(start, length)]."""
+    merged = []
+    for start, length in sorted(ranges):
+        if merged and start <= merged[-1][0] + merged[-1][1]:
+            s0, l0 = merged[-1]
+            merged[-1] = (s0, max(l0, start + length - s0))
+        else:
+            merged.append((start, length))
+    return merged
+
+
 def make_jobs(entries: list, job_bytes: int = JOB_BYTES, job_files: int = JOB_FILES) -> list:
     """Group (name, data_offset, size[, head_tail]) entries into jobs of
     about *job_bytes* / *job_files*, in archive order so each job reads
@@ -372,7 +421,10 @@ def search_job(zip_path: str, entries: list, patterns: list,
             name, offset, size = e[0], e[1], e[2]
             hits = []
             try:
-                for start, length in read_ranges(size, e[3] if len(e) > 3 else 0):
+                ranges = read_ranges(size, e[3] if len(e) > 3 else 0)
+                if len(ranges) > 1 and name.lower().endswith(BOX_FORMATS):
+                    ranges = merge_ranges(ranges + box_ranges(f, offset, size))
+                for start, length in ranges:
                     def blocks(at=offset + start, length=length):
                         pos = 0
                         while pos < length:

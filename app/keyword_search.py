@@ -285,13 +285,19 @@ def app_install_skip(adapter):
     return skip
 
 
+_SEARCH_WHOLE_MEDIA = frozenset({'.tif', '.tiff', '.dng', '.cr2', '.nef', '.raw', '.arw', '.orf', '.rw2'})
+
+
 def _limit_media(entries: list, head_tail: int, media_names=frozenset()) -> tuple[list, int]:
     """*entries* with each picture/video (by extension, or in
     *media_names*) larger than twice *head_tail* given that limit as a 4th
     field (keyword_scan.read_ranges); and how many were limited."""
     from file_types import PICTURE_EXTENSIONS, VIDEO_EXTENSIONS, _ext
     from header_scan import GRAPHIC_EXTENSIONS
-    media_ext = PICTURE_EXTENSIONS | VIDEO_EXTENSIONS | set(GRAPHIC_EXTENSIONS)
+    # TIFF and the camera RAW formats built on it may keep their metadata
+    # anywhere in the file: always searched whole.
+    media_ext = ((PICTURE_EXTENSIONS | VIDEO_EXTENSIONS | set(GRAPHIC_EXTENSIONS))
+                 - _SEARCH_WHOLE_MEDIA)
     out, n = [], 0
     for e in entries:
         if (e[2] > 2 * head_tail and len(e) == 3
@@ -498,8 +504,12 @@ class KeywordSearchWorker(QThread):
                 return []
             try:
                 hits = []
-                for start, length in keyword_scan.read_ranges(
-                        file_size, entry[3] if len(entry) > 3 else 0):
+                ranges = keyword_scan.read_ranges(file_size, entry[3] if len(entry) > 3 else 0)
+                if len(ranges) > 1 and entry[0].lower().endswith(keyword_scan.BOX_FORMATS):
+                    with open(self.zip_path, 'rb') as f:      # box headers only
+                        ranges = keyword_scan.merge_ranges(
+                            ranges + keyword_scan.box_ranges(f, data_offset, file_size))
+                for start, length in ranges:
                     hits += [(start + o, ctx) for o, ctx in keyword_scan.search_blocks(
                         reader.read_chunked_at(data_offset + start, length, chunk_size=self._CHUNK,
                                                stop_fn=self._stop.is_set),

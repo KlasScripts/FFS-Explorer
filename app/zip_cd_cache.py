@@ -266,6 +266,18 @@ def open_index(zip_path: str, case_dir: str):
     return _open_index(zip_path, case_dir, cache_path(zip_path, case_dir))
 
 
+def build_index_child(zip_path: str, case_dir: str) -> None:
+    """A child process's target: build the case's index (open_index) and
+    close it. ZipMetadataWorker._build_zip_index runs it: built in the
+    window's process it is ~20 s of Python on 2.19 million entries,
+    competing with the window for Python's lock (2026-11-22)."""
+    import child_priority
+    child_priority.lower_this_process()   # the window is served first
+    index = open_index(zip_path, case_dir)
+    if index is not None:
+        index.close()
+
+
 def _open_index(zip_path: str, case_dir: str, zcd_path: str):
     """The mapped index for this .zcd, built from it first when it is
     missing, older than the .zcd, or of an older format. None if the .zcd

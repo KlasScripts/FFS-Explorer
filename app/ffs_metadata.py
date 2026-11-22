@@ -605,6 +605,37 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
 
 # ── Full archive parse (used by subprocess and in-process fallback) ──────────────
 
+def _save_header_tier_counts(zip_path: str, case_dir: str, ffs_adapter) -> None:
+    """Count the header-scan tiers here, in the parse process, and save them
+    in casecache.db (header_counts._header_tier_counts_cached), against the
+    file table just written and the case's zip index: the window's own
+    count at case open then finds them saved under the same key. Counted in
+    the window's process it was ~27 s of "Preparing case" on 2.19 million
+    entries, beside the window (2026-11-22). A failure only means the
+    window counts as before."""
+    import glob
+    try:
+        import file_table
+        import header_counts
+        tables = glob.glob(os.path.join(case_dir, 'files-*.ffsfiles'))
+        if len(tables) != 1:
+            return
+        infos = _cd_cache_load(zip_path, case_dir)
+        if infos is None:
+            return
+        ui_list, _fm = file_table.open_maps(tables[0])
+        try:
+            header_counts._header_tier_counts_cached(
+                ui_list, ffs_adapter, CachedZipView(zip_path, infos), False, case_dir,
+                pause=False)
+        finally:
+            ui_list.table.close()
+    except Exception as e:
+        import startup_log
+        startup_log.message('warning', f"header-scan counts not saved at parse "
+                            f"({type(e).__name__}: {e}); the window counts them instead")
+
+
 def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict:
     """Parse an FFS archive from its local .zcd cache.
 
@@ -725,6 +756,10 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
         adapter_args, delta, zip_names, zip_ui_paths,
         ui_metadata, folder_map, metadata_only, file_table_dir=case_dir or None,
         zip_path=zip_path)
+    if case_dir:
+        status(f"Counting the files each header-scan tier would read "
+               f"({len(ui_metadata):,} entries)…")
+        _save_header_tier_counts(zip_path, case_dir, ffs_adapter)
 
     return {
         'adapter_args':   [ffs_adapter.format, ffs_adapter.user_prefix,
@@ -777,6 +812,8 @@ def _parse_child(conn, zip_path: str, case_dir: str) -> None:
     snapshot fast-path) rather than piped — keeps IPC and peak memory small.
     Must be module-level so 'spawn' can pickle it.
     """
+    import child_priority
+    child_priority.lower_this_process()   # the window is served first
     try:
         def status(msg):
             try:

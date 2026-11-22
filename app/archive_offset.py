@@ -73,11 +73,38 @@ def _dos_seconds(dt):
         return None
 
 
+class _Picked:
+    """infos[positions[k]] as a sequence: the file entries of a mapped index,
+    each made only when taken (sample_pairs)."""
+
+    def __init__(self, infos, positions):
+        self._infos, self._pos = infos, positions
+
+    def __len__(self):
+        return len(self._pos)
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            return (self._infos[p] for p in self._pos[k])
+        return self._infos[self._pos[k]]
+
+
 def sample_pairs(infos, limit=MAX_SAMPLES) -> list:
     """[(ut_seconds, delta_seconds)] for up to *limit* files spread evenly
     across the archive (every k-th file entry), each with a DOS time and a
     UT mtime that is present and not 0."""
-    files = [i for i in infos if not i.filename.endswith('/')]
+    index = getattr(infos, '_index', None)
+    if index is not None and hasattr(index, 'name_start'):
+        # The case's mapped index (zip_cd_cache._Entries): which entries are
+        # files is read from the last byte of each name, and only the
+        # sampled entries are made. Making all 2.5 million to sample 8,000
+        # took 4.8 s of a first open (2026-11-22). The same entries, in the
+        # same order, as the list below.
+        pool, starts, lens = index._names, index.name_start, index.name_len
+        positions = [k for k, (st, ln) in enumerate(zip(starts, lens)) if pool[st + ln - 1] != 47]
+        files = _Picked(infos, positions)
+    else:
+        files = [i for i in infos if not i.filename.endswith('/')]
     step = max(1, len(files) // (limit * 2))     # oversample: some have no pair
     out = []
     for info in files[::step]:

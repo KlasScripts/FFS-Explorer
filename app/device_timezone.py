@@ -455,10 +455,13 @@ def _zip_reader(zip_path: str, case_dir: str | None):
     if infos is None:
         return None, None
     view = CachedZipView(zip_path, infos)
-    names = frozenset(view.namelist())
 
     def read(name):
-        if name not in names:
+        # one lookup in the case's index: a set of every name (2.5 million
+        # on the synthetic iPhone) took ~2.5 s of a first open (2026-11-22)
+        try:
+            view.getinfo(name)
+        except KeyError:
             return None
         with view.open(name) as f:
             return f.read()

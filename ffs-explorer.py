@@ -349,51 +349,26 @@ _TREE_COL_MIN = 1000
 # with its per-version candidates; see EVIDENCE_LOCATIONS.md).
 FORENSIC_SHORTCUTS = evidence_shortcuts.IOS_SHORTCUTS
 
-# .png/.gif are deliberately NOT here — see header_scan.GRAPHIC_EXTENSIONS
-# and _EXT_TO_TYPE below for why they're their own 'Graphic' Type instead
-# (added 2026-10-11, direct request: "i want you to seperate out png and
-# gif into graphic type both via the ext and the header scan[,] so that
-# the filter only need to use the type without filltering further and
-# missing some images").
-PICTURE_EXTENSIONS = {
-    '.jpg', '.jpeg', '.heic', '.heif',
-    '.bmp', '.tiff', '.tif', '.webp', '.raw', '.cr2', '.nef', '.dng',
-}
-VIDEO_EXTENSIONS = {
-    '.mp4', '.mov', '.avi', '.mkv', '.m4v', '.wmv',
-    '.flv', '.webm', '.3gp', '.mts', '.m2ts', '.mpg', '.mpeg',
-}
-DATABASE_EXTENSIONS = {
-    '.db', '.sqlite', '.sqlite3', '.db3',
-    '.db-wal', '.db-shm', '.db-journal',
-    '.sqlite-wal', '.sqlite-shm', '.sqlite-journal',
-}
-LOG_EXTENSIONS = {
-    '.log', '.ips', '.crash', '.clslog', '.logarchive',
-}
-DOCUMENT_EXTENSIONS = {
-    '.pdf', '.txt', '.rtf', '.csv',
-    '.doc', '.docx', '.pages', '.numbers', '.key',
-    '.xls', '.xlsx', '.ppt', '.pptx',
-}
-AUDIO_EXTENSIONS = {
-    '.mp3', '.m4a', '.aac', '.wav', '.flac', '.aiff', '.aif',
-    '.caf', '.opus', '.ogg', '.amr', '.wma',
-}
-ARCHIVE_EXTENSIONS = {
-    '.zip', '.gz', '.tar', '.bz2', '.xz',
-    '.tgz', '.tbz', '.zst', '.aar',
-}
-APPLICATION_EXTENSIONS = {'.ipa', '.apk', '.apks', '.jar'}
-JSON_EXTENSIONS = {'.json', '.jsonl', '.ndjson'}
-XML_EXTENSIONS  = {'.xml', '.xsl', '.xslt', '.xsd', '.gpx', '.kml', '.rss', '.svg'}
-WEB_DATA_EXTENSIONS = {
-    '.html', '.htm', '.js', '.css', '.ts',
-    '.yaml', '.yml', '.toml',
-}
-CERTIFICATE_EXTENSIONS = {
-    '.pem', '.cer', '.crt', '.der', '.p12', '.p7s', '.p8', '.pfx',
-}
+# The extension sets, the extension -> type table and _get_file_type live in
+# app/file_types.py (the first-open parse process needs them too).
+from file_types import (  # noqa: E402
+    PICTURE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    DATABASE_EXTENSIONS,
+    LOG_EXTENSIONS,
+    DOCUMENT_EXTENSIONS,
+    AUDIO_EXTENSIONS,
+    ARCHIVE_EXTENSIONS,
+    APPLICATION_EXTENSIONS,
+    JSON_EXTENSIONS,
+    XML_EXTENSIONS,
+    WEB_DATA_EXTENSIONS,
+    CERTIFICATE_EXTENSIONS,
+    _EXT_TO_TYPE,
+    _WEB_CACHE_NAME,
+    _get_file_type,
+)
+
 
 
 
@@ -410,44 +385,7 @@ _TEXT_RENDERABLE_EXTENSIONS = frozenset({
 })
 
 
-# Single extension → type lookup table.  One O(1) dict hit replaces a cascade
-# of set-membership tests — _get_file_type runs once per entry in several
-# full-archive loops.  The extension sets are mutually disjoint.
-_EXT_TO_TYPE: dict = {
-    **{e: 'Picture'       for e in PICTURE_EXTENSIONS},
-    **{e: 'Graphic'       for e in header_scan.GRAPHIC_EXTENSIONS},
-    **{e: 'Video'         for e in VIDEO_EXTENSIONS},
-    **{e: 'Database'      for e in DATABASE_EXTENSIONS},
-    '.plist': 'Property List',
-    **{e: 'Log'           for e in LOG_EXTENSIONS},
-    **{e: 'Document'      for e in DOCUMENT_EXTENSIONS},
-    **{e: 'Audio'         for e in AUDIO_EXTENSIONS},
-    **{e: 'Archive'       for e in ARCHIVE_EXTENSIONS},
-    **{e: 'Application'   for e in APPLICATION_EXTENSIONS},
-    **{e: 'JSON'          for e in JSON_EXTENSIONS},
-    **{e: 'XML'           for e in XML_EXTENSIONS},
-    **{e: 'Web / Data'    for e in WEB_DATA_EXTENSIONS},
-    **{e: 'Certificate'   for e in CERTIFICATE_EXTENSIONS},
-}
 
-
-_WEB_CACHE_NAME = re.compile(r'^[0-9a-f]{16}_[01s]$')
-
-
-def _get_file_type(name):
-    # Dotted sidecar extensions (.db-wal, .sqlite-journal, …) are all in the
-    # table; only bare dotless companions ('foo-wal') need the endswith fallback.
-    ft = _EXT_TO_TYPE.get(os.path.splitext(name)[1].lower())
-    if ft is not None:
-        return ft
-    if name.lower().endswith(('-wal', '-shm')):
-        return 'Database'
-    # Chromium Simple Cache files ('<16 hex>_0'/'_1'/'_s'), used by Chrome and
-    # every app with a Chromium WebView (ASSUMPTIONS.md A-75). By name here;
-    # header_scan also recognises the format's own magic for any other name.
-    if _WEB_CACHE_NAME.match(name):
-        return 'Web Cache'
-    return 'Other'
 
 
 
@@ -700,7 +638,8 @@ def _read_android_info(z: zipfile.ZipFile, names: frozenset, ffs_adapter) -> tup
     return fields, label
 
 
-def _read_device_info(zip_path: str, case_dir: str | None = None) -> tuple[list[tuple[str,str,str]], str]:
+def _read_device_info(zip_path: str, case_dir: str | None = None,
+                      adapter=None) -> tuple[list[tuple[str,str,str]], str]:
     """Return (fields, label) extracted from the FFS zip.
 
     fields — [(field_name, data, source), ...]
@@ -726,8 +665,15 @@ def _read_device_info(zip_path: str, case_dir: str | None = None) -> tuple[list[
         if infos is None:
             return [], ''
         with CachedZipView(zip_path, infos) as z:
-            names = frozenset(z.namelist())
-            ffs_adapter = FfsAdapter.detect(z, names)
+            if adapter is not None:
+                # The case's own adapter and one index lookup per name: a set
+                # of every name (2.5 million) and a second format detection
+                # ran beside the case-open jobs on a first open (2026-11-22).
+                # The readers only ask whether a name is there.
+                names, ffs_adapter = z._by_name, adapter
+            else:
+                names = frozenset(z.namelist())
+                ffs_adapter = FfsAdapter.detect(z, names)
             result = _read_ios_info(z, names, ffs_adapter)
             if not result[0]:
                 result = _read_android_info(z, names, ffs_adapter)
@@ -1117,41 +1063,6 @@ def _confirm_tier3(parent) -> bool:
     return box.clickedButton() is yes_btn
 
 
-def _header_candidate_matches(ui_path: str, scan_folders: tuple, tier: int,
-                               excludes: tuple = ()) -> bool:
-    """Does *ui_path* need a header read under *tier*? Shared predicate for
-    both the counting and collecting passes, so the three tiers can never
-    silently drift apart between "how many will this scan" (dialog display)
-    and "which ones actually get read" (the real scan) — see TODO.md item 20
-    for the full three-tier design this implements:
-      1 — unknown-extension files only, within scan_folders() (today's
-          original, only behavior; free extension check first, byte read
-          only for the genuinely ambiguous case)
-      2 — every file, within scan_folders() (also catches a DELIBERATELY
-          mislabeled extension, still cost-bounded to app/user-writable
-          areas — never re-reads the huge OS/system trees outside them)
-      3 — every file, everywhere (no folder restriction — the exhaustive
-          backstop for "the curated scan_folders() list itself might be
-          wrong or incomplete for this case," not a routine default)
-
-    *excludes* — see FfsAdapter.scan_excludes() (e.g. mobile/Library/
-    Caches/ minus its own confirmed-noise subfolders) — tiers 1/2 only,
-    same as scan_folders() itself; tier 3 is already unrestricted and
-    ignores it.
-    """
-    if tier <= 0:
-        return False
-    if tier >= 3:
-        return True
-    if not ui_path.startswith(scan_folders):
-        return False
-    if excludes and ui_path.startswith(excludes):
-        return False
-    if tier == 2:
-        return True
-    return _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
-
-
 def _show_scan_folders_dialog(parent, adapter) -> None:
     """The real, per-format paths a header scan's own folder-scoped tiers
     (1/2) restrict to — see TODO.md item 20's own "Transparency
@@ -1304,122 +1215,12 @@ def _copy_metadata(ui_metadata: dict) -> dict:
     return dict(ui_metadata)
 
 
-def _header_tier_counts(items, ffs_adapter, z, with_tier3: bool = False) -> dict | None:
-    """How many files each header-scan tier reads, in one pass:
-    {'files': {1: n, 2: n[, 3: n]}, 'legacy': {1: n, 2: n, 3: n}}.
-
-    files[3] only *with_tier3*: it needs a zip lookup for every entry (on
-    IOS17 2.9 s against 0.75 s for tiers 1-2, and the GUI thread's Python
-    ran ~3.7x slower beside it), and Tier 3 is rarely used, so it is
-    counted only when picked or when the case already completed it.
-
-    'files' is exactly what HeaderScanWorker reads: a key whose physical
-    name is a file in the main zip (z.getinfo, the same lookup
-    _resolve_file_candidates does). Folders, metadata-only entries and
-    files unpacked from nested archives are left out; the last are typed
-    when unpacked (ASSUMPTIONS.md A-30). 'legacy' is what
-    _count_header_candidates gives (every matching key, folders included),
-    the meaning header_scan_candidate_count was stored with before
-    2026-11-01, so an older case can still be checked against it.
-
-    *items* is a list of (ui_path, meta); the caller copies it so the GUI
-    can keep changing ui_metadata. Built once per case on a background
-    thread (FastZipBrowser._start_header_tier_count): on IOS17 the dialog
-    used to count on the GUI thread at every open, 0.3 s idle but 4.5 s
-    with one busy Python thread alongside (GIL). The loop pauses every
-    2,000 entries so the GUI thread gets the GIL. None if *z* is None."""
-    if z is None:
-        return None
-    scan_folders = tuple(ffs_adapter.scan_folders())
-    excludes = tuple(ffs_adapter.scan_excludes())
-    resolve, getinfo = ffs_adapter.resolve, z.getinfo
-    has_file = getattr(z, 'has_file', None)   # CachedZipView: no entry made per path
-    files = {1: 0, 2: 0, 3: 0} if with_tier3 else {1: 0, 2: 0}
-    legacy = {1: 0, 2: 0, 3: len(items)}
-    for n, (ui_path, _meta) in enumerate(items):
-        if n % 2000 == 1999:
-            time.sleep(0.001)   # a real pause: sleep(0) left the GUI waiting
-        in_scope = _header_candidate_matches(ui_path, scan_folders, 2, excludes)
-        if not in_scope and not with_tier3:
-            continue
-        unknown = in_scope and _header_candidate_matches(ui_path, scan_folders, 1, excludes)
-        legacy[2] += in_scope
-        legacy[1] += unknown
-        if has_file is not None:
-            if not has_file(resolve(ui_path)):
-                continue
-        else:
-            try:
-                info = getinfo(resolve(ui_path))
-            except KeyError:
-                continue
-            if info.is_dir():
-                continue
-        if with_tier3:
-            files[3] += 1
-        files[2] += in_scope
-        files[1] += unknown
-    return {'files': files, 'legacy': legacy}
-
-
-_TIER_COUNTS_KEY = 'header_tier_counts'
-_TIER_COUNTS_VERSION = '1'   # bump when _header_tier_counts or _header_candidate_matches change
-
-
-def _add_tier_counts(a: dict, b: dict) -> dict:
-    """Two _header_tier_counts results for disjoint sets of paths, added:
-    every figure in them is a per-path count (legacy[3] is len(items))."""
-    return {part: {t: a[part][t] + b[part].get(t, 0) for t in a[part]} for part in ('files', 'legacy')}
-
-
-def _header_tier_counts_cached(ui_metadata, ffs_adapter, z, with_tier3: bool,
-                               case_dir: str | None) -> dict | None:
-    """_header_tier_counts for the whole file list, with the part that comes
-    from the extraction's own files (the file table, which never changes for
-    a case) saved in casecache.db and reused at every later open: 3-9 s of
-    the synthetic iPhone's open, every time (2026-11-18). Files added while
-    the case is open (unpacked from nested archives) are counted fresh and
-    added. Same result as counting everything (checked on IOS17, Magnet and
-    the synthetic iPhone). A plain dict file list (no file table) is counted
-    as before."""
-    import file_table as _ft
-    if z is None:
-        return None
-    if not isinstance(ui_metadata, _ft.FileList) or ui_metadata.gone or not case_dir:
-        return _header_tier_counts([(p, None) for p in ui_metadata], ffs_adapter, z,
-                                   with_tier3=with_tier3)
-    table = ui_metadata.table
-    index = getattr(getattr(z, '_by_name', None), '_index', None)
-    ident = hashlib.sha1(repr((
-        os.path.basename(table.path), table.n_files, getattr(index, 'cd_sha256', None),
-        list(ffs_adapter.scan_folders()), list(ffs_adapter.scan_excludes()),
-        ffs_adapter.format, ffs_adapter.user_prefix, ffs_adapter.sys_prefix,
-        ffs_adapter.old_layout, bool(with_tier3))).encode()).hexdigest()
-    version = f'{_TIER_COUNTS_VERSION}|{ident}'
-    stored = None
-    try:
-        with closing(_open_cache_db(case_dir)) as db:
-            raw = load_blob(db, _TIER_COUNTS_KEY + ('3' if with_tier3 else ''), version)
-        if raw is not None:
-            d = json.loads(raw)
-            stored = {part: {int(t): n for t, n in d[part].items()} for part in ('files', 'legacy')}
-    except Exception:
-        stored = None
-    if stored is None:
-        stored = _header_tier_counts([(p, None) for p, _i in ui_metadata._live()],
-                                     ffs_adapter, z, with_tier3=with_tier3)
-        if stored is None:
-            return None
-        try:
-            with closing(_open_cache_db(case_dir)) as db:
-                save_blob(db, _TIER_COUNTS_KEY + ('3' if with_tier3 else ''), version,
-                          json.dumps(stored).encode())
-        except Exception:
-            pass
-    added = [(p, None) for p in list(ui_metadata.top) if p in ui_metadata._added]
-    if not added:
-        return stored
-    return _add_tier_counts(stored, _header_tier_counts(added, ffs_adapter, z, with_tier3=with_tier3))
+# Header-scan tier counts live in app/header_counts.py (the first-open parse
+# process counts and saves them).
+from header_counts import (  # noqa: E402
+    _header_candidate_matches, _header_tier_counts, _header_tier_counts_cached,
+    _add_tier_counts, _TIER_COUNTS_KEY, _TIER_COUNTS_VERSION,
+)
 
 
 def _save_header_scan_count(db, tier: int, tier_counts: dict | None,
@@ -2366,6 +2167,36 @@ class ZipMetadataWorker(QThread):
         candidates itself is what actually reads header_scan_tier."""
         return self.header_scan_tier > 0
 
+    def _build_zip_index(self) -> None:
+        """Build the zip index in a child process when the case has none
+        (or an older one), saying so; everything after only opens it. If
+        the child cannot run, the first open_index builds it here as
+        before."""
+        import zip_cd_cache
+        import zip_index
+        path = zip_index.index_path(self.zip_path, self.case_dir)
+        try:
+            if os.path.getmtime(path) >= os.path.getmtime(
+                    zip_cd_cache.cache_path(self.zip_path, self.case_dir)):
+                return
+        except OSError:
+            pass
+        self.status_update.emit("Indexing the archive's file list (once per case; "
+                                "on a big extraction this takes a minute)…")
+        try:
+            import multiprocessing as mp
+            proc = mp.get_context('spawn').Process(
+                target=zip_cd_cache.build_index_child,
+                args=(self.zip_path, self.case_dir), daemon=True)
+            proc.start()
+            while proc.is_alive():
+                proc.join(0.2)
+                if self.isInterruptionRequested():
+                    proc.terminate()
+                    return
+        except Exception as exc:
+            self.status_update.emit(f"Indexing in this process instead ({exc})…")
+
     def _update_case_names(self) -> None:
         """Bring a case made by an older version up to the file-name rule
         (ASSUMPTIONS.md A-80; case_names.py). Once per case; before the
@@ -2417,6 +2248,27 @@ class ZipMetadataWorker(QThread):
                 stored = ios_system_check.load(db)
             if stored is not None:
                 self.system_check_ready.emit(stored, False)
+                return
+            # In a child process (ios_system_check.run_for_case), which saves
+            # the result; this thread only waits for it.
+            try:
+                import multiprocessing as mp
+                proc = mp.get_context('spawn').Process(
+                    target=ios_system_check.run_for_case,
+                    args=(self.zip_path, self.case_dir), daemon=True)
+                proc.start()
+                while proc.is_alive():
+                    proc.join(0.2)
+                    if self.isInterruptionRequested():
+                        proc.terminate()
+                        return
+                ran = proc.exitcode == 0
+            except Exception:
+                ran = False
+            if ran:
+                with closing(_open_results_db(self.case_dir)) as db:
+                    stored = ios_system_check.load(db)
+                self.system_check_ready.emit(stored, stored is not None)
                 return
             infos = zip_cd_cache.load(self.zip_path, self.case_dir)
             if not infos:
@@ -2703,6 +2555,7 @@ class ZipMetadataWorker(QThread):
                         f"Warning: {e}")
 
             if self.case_dir and _cd_cache_valid(self.zip_path, self.case_dir):
+                self._build_zip_index()
                 self._update_case_names()
                 self._start_system_check()
 
@@ -2731,6 +2584,7 @@ class ZipMetadataWorker(QThread):
                     _elapsed = time.monotonic() - _t0
                     self.status_update.emit(
                         f"Central directory copied to case folder in {_elapsed:.1f}s.")
+                    self._build_zip_index()
                     self._update_case_names()
                     self._start_system_check()
 
@@ -4899,24 +4753,6 @@ class SingleFileScanWorker(QThread):
             return
         results = header_scan.scan_entries(self._zip_path, candidates)
         self.done.emit(results)
-
-
-class DeviceInfoWorker(QThread):
-    """Reads device make/model/OS info from the archive off the GUI thread.
-
-    _read_device_info opens the zip (a full central-directory read, slow on
-    network shares) — running it on the main thread froze the UI after load.
-    """
-    done = Signal(list, str)   # fields, label
-
-    def __init__(self, zip_path: str, case_dir: str | None = None, parent=None):
-        super().__init__(parent)
-        self._zip_path = zip_path
-        self._case_dir = case_dir
-
-    def run(self):
-        fields, label = _read_device_info(self._zip_path, self._case_dir)
-        self.done.emit(fields, label)
 
 
 class NestedArchiveWorker(QThread):
@@ -12011,16 +11847,42 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         got = getattr(self, '_folder_names_cache', None)
         if got is not None and got[0] is fm and got[1] == len(fm):
             return got[2]
-        if threading.current_thread() is threading.main_thread():
-            names = list(fm)
-        else:
-            # a background build pauses every 5,000 folders so the window
-            # gets Python's lock (reading the file table is Python code)
-            names = []
-            for i, k in enumerate(fm):
-                names.append(k)
-                if i % 5000 == 4999:
-                    time.sleep(0.001)
+        # Saved in casecache.db per file table and folder count: folders are
+        # only added when archives are unpacked or media carved, so a
+        # reopen reads it (built, ~3.7 s on 475,233 folders, 2026-11-22).
+        table = getattr(fm, 'table', None)
+        case_dir = getattr(self, '_case_dir', None)
+        saved_as = (f"1|{os.path.basename(table.path)}|{len(fm)}"
+                    if table is not None and case_dir else None)
+        names = None
+        if saved_as:
+            try:
+                import msgpack
+                with closing(_open_cache_db(case_dir)) as db:
+                    raw = load_blob(db, 'folder_names', saved_as)
+                if raw is not None:
+                    names = msgpack.unpackb(raw, raw=False)
+            except Exception:
+                names = None
+        if names is None:
+            if threading.current_thread() is threading.main_thread():
+                names = list(fm)
+            else:
+                # a background build pauses every 5,000 folders so the window
+                # gets Python's lock (reading the file table is Python code)
+                names = []
+                for i, k in enumerate(fm):
+                    names.append(k)
+                    if i % 5000 == 4999:
+                        time.sleep(0.001)
+            if saved_as:
+                try:
+                    import msgpack
+                    with closing(_open_cache_db(case_dir)) as db:
+                        save_blob(db, 'folder_names', saved_as,
+                                  msgpack.packb(names, use_bin_type=True))
+                except Exception:
+                    pass
         self._folder_names_cache = (fm, len(fm), names)
         return names
 
@@ -18563,11 +18425,25 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
 
         # Reading device info opens the zip — run it off the GUI thread.
         # partial binds the context up front; the signal appends (fields, label).
-        worker = DeviceInfoWorker(path, case_dir=self._case_dir)
-        worker.done.connect(partial(self._on_device_info_ready,
-                                    path, self._case_dir, has_db_info, has_label))
-        self._device_info_worker = worker
-        worker.start()
+        # A case-open job on the one case-open lane (the tree waits for it),
+        # with the case's own adapter: see _read_device_info.
+        case_dir, adapter = self._case_dir, getattr(self, '_adapter', None)
+        fut = _CASE_OPEN_POOL.submit(_read_device_info, path, case_dir, adapter)
+        self._track_load_job('device information', fut)
+        metadata = self.full_metadata
+
+        def _poll():
+            if self.full_metadata is not metadata:
+                return
+            if not fut.done():
+                QTimer.singleShot(50, _poll)
+                return
+            try:
+                fields, label = fut.result()
+            except Exception:
+                fields, label = [], ''
+            self._on_device_info_ready(path, case_dir, has_db_info, has_label, fields, label)
+        QTimer.singleShot(50, _poll)
 
     def _on_device_info_ready(self, path, case_dir, has_db_info, has_label,
                               fields, label):

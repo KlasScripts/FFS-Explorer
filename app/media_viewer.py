@@ -1,6 +1,8 @@
 """media_viewer.py — thumbnail worker, media grid widget, and FastZipBrowser mixin."""
 
+import hashlib
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -13,6 +15,7 @@ import av
 from contextlib import closing
 from media_metadata_scan import _LazyZipSlice
 from zip_entry import ZipEntry
+from db_utils import load_blob, save_blob
 from db_utils import (_open_cache_db, _open_results_db, load_embedded_media_hits,
                       mark_media_seen, unmark_media_seen, load_seen_media_paths,
                       load_all_bookmarked_paths, load_bookmark_colors)
@@ -51,6 +54,8 @@ _THUMB_BATCH_COMMIT = 20   # inserts to accumulate before a single db.commit()
 _THUMB_DECODE_THREADS = 4  # ThumbnailWorker's decode pool (see its docstring)
 # One background thread for the archive-wide User Media list
 # (MediaViewerMixin._user_media_paths_async).
+_UM_BLOB_KEY = 'user_media_candidates'   # casecache.db blob (_um_saved_version)
+_UM_BLOB_VERSION = '1'   # bump when _user_media_candidate_paths' rule changes
 _USER_MEDIA_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ffs-usermedia')
 _MEDIA_PAGE_SIZE_DEFAULT = 500
 
@@ -1875,16 +1880,100 @@ class MediaViewerMixin:
         exact = frozenset(norm)
         starts = tuple(p + '/' for p in norm)
         folder_map = self.folder_map
-        # *keys*: a list of full_metadata's keys taken on the GUI thread, so
-        # this can run on _USER_MEDIA_POOL without iterating a dict the GUI
-        # thread may be adding to (lookups are safe; iteration isn't).
-        return sorted(
-            p for p in (self.full_metadata if keys is None else keys)
-            if (p in exact or p.startswith(starts))
-            and p not in folder_map
+        # Kept until what it reads changes, in memory and in casecache.db
+        # (_um_saved_version): it changes only when files are added
+        # (nested archives unpacked, media carved) or re-typed (header scan,
+        # LevelDB), all Process Case runs, or when the locations change.
+        # Built at every case open and panel refresh it cost ~4-6.5 s on 2.19
+        # million entries (2026-11-22). The ignore list and seen files are
+        # applied after (_user_media_paths), fresh each time.
+        overrides = getattr(self, '_header_type_overrides', None) or {}
+        n_keys = len(self.full_metadata) if keys is None else len(keys)   # as scanned
+        memo_key = (id(self.full_metadata), n_keys, id(folder_map), len(folder_map),
+                    tuple(prefixes), id(cache_children), len(cache_children),
+                    id(overrides), len(overrides))
+        memo = getattr(self, '_um_candidates_memo', None)
+        if memo is not None and memo[0] == memo_key:
+            return list(memo[1])
+        saved_as = self._um_saved_version(prefixes, n_keys, folder_map, cache_children, overrides)
+        if saved_as:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    raw = load_blob(db, _UM_BLOB_KEY, saved_as)
+                if raw is not None:
+                    found = json.loads(raw)
+                    self._um_candidates_memo = (memo_key, found)
+                    return list(found)
+            except Exception:
+                pass
+        under = self._user_media_files_under(norm, folder_map)
+        if under is None:
+            # *keys*: a list of full_metadata's keys taken on the GUI thread, so
+            # this can run on _USER_MEDIA_POOL without iterating a dict the GUI
+            # thread may be adding to (lookups are safe; iteration isn't).
+            under = (p for p in (self.full_metadata if keys is None else keys)
+                     if p in exact or p.startswith(starts))
+        found = sorted(
+            p for p in under
+            if p not in folder_map
             and p not in cache_children
             and self._is_media_file(p)
         )
+        self._um_candidates_memo = (memo_key, found)
+        if saved_as:
+            try:
+                with closing(_open_cache_db(self._case_dir)) as db:
+                    save_blob(db, _UM_BLOB_KEY, saved_as, json.dumps(found).encode())
+            except Exception:
+                pass
+        return list(found)
+
+    def _user_media_files_under(self, roots, folder_map):
+        """Every file key at or under *roots*, from the folder tree (only
+        those folders' child lists are read), plus files added this session
+        (full_metadata.top) under them; None for a plain-dict file list
+        (no file table), where the caller scans every key instead. The same
+        keys as that scan: every file of the file table sits in its
+        folder's child list (the tree is built from them)."""
+        md = self.full_metadata
+        top = getattr(md, 'top', None)
+        if top is None:
+            return None
+        out = set()
+        for root in roots:
+            if root in folder_map:
+                stack = [root]
+                while stack:
+                    for c in folder_map.get(stack.pop(), ()):
+                        if c in folder_map:
+                            stack.append(c)
+                        else:
+                            out.add(c)
+            elif root in md:
+                out.add(root)
+        starts = tuple(r + '/' for r in roots)
+        exact = frozenset(roots)
+        out.update(p for p in list(top) if (p in exact or p.startswith(starts)) and p in md)
+        return out
+
+    def _um_saved_version(self, prefixes, n_keys, folder_map, cache_children, overrides):
+        """The version the saved User Media candidates are stored under:
+        the file table, how many files and folders the case has now, the
+        locations, the web-cache files, the header-type results, and the
+        case's newest run-log row (every Process Case stage adds one).
+        None when the case has no file table (nothing is saved then)."""
+        table = getattr(self.full_metadata, 'table', None)
+        case_dir = getattr(self, '_case_dir', None)
+        if table is None or not case_dir:
+            return None
+        try:
+            with closing(_open_results_db(case_dir)) as db:
+                last_run = db.execute("SELECT MAX(id) FROM run_log").fetchone()[0] or 0
+        except Exception:
+            return None
+        where = hashlib.sha1(repr(sorted(prefixes)).encode()).hexdigest()[:12]
+        return (f"{_UM_BLOB_VERSION}|{os.path.basename(table.path)}|{n_keys}|{len(folder_map)}|"
+                f"{where}|{len(cache_children)}|{len(overrides)}|{last_run}")
 
     def _user_media_paths_async(self, callback, purpose: str) -> None:
         """Build _user_media_paths() on _USER_MEDIA_POOL and call

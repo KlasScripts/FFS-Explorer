@@ -3166,52 +3166,32 @@ class KeywordSearchMixin:
         # own file listing, never by magic-byte content scanning), so it
         # gets its own flat "always found" line rather than being folded
         # into the checked/not-checked framing above it.
-        if (not skip_once
-                and not getattr(self, '_search_coverage_reminder_muted', False)
-                and (unextracted_archives > 0 or complete_tier < 3)):
+        # Reworded 2026-11-22 (owner): the search now relies on Process Case
+        # (archives unpacked, media searched by their saved metadata), so
+        # the reminder just recommends running it first, naming only what
+        # is not done yet, with a button that opens it.
+        missing = []
+        if unextracted_archives > 0:
+            missing.append(f"{unextracted_archives:,} archive(s) not unpacked: the files "
+                           "inside them are not searched")
+        if not self._media_metadata_done():
+            missing.append("Media metadata not extracted: pictures and videos are searched "
+                           "only at their start and end, not by their metadata")
+        if complete_tier < 1:
+            missing.append("No header scan: files with a wrong or missing extension "
+                           "(databases, archives, pictures) may be missed")
+        if (missing and not skip_once
+                and not getattr(self, '_search_coverage_reminder_muted', False)):
             box = QMessageBox(self)
-            box.setWindowTitle("Search Coverage")
+            box.setWindowTitle("Run Process Case first?")
             box.setIcon(QMessageBox.Icon.Information)
-            tier_name = {0: "Off", 1: "Tier 1", 2: "Tier 2", 3: "Tier 3"}.get(
-                complete_tier, "Off")
-            coverage = self._HEADER_SCAN_TIER_COVERAGE.get(
-                complete_tier, self._HEADER_SCAN_TIER_COVERAGE[0])
-            tier_note = ""
-            if requested_tier > complete_tier:
-                tier_note = f"  (a Tier {requested_tier} scan is currently running)"
-            lines = [
-                f"Header scan: {tier_name} (current){tier_note}",
-                f"Checked: {coverage['checked']}",
-                f"Not checked: {coverage['not_checked']}",
-            ]
-            if complete_tier < 3:
-                lines += [
-                    "",
-                    "What this means: a database or compressed archive "
-                    "that falls into the \"Not checked\" area above — for "
-                    "example one with a misleading or missing file "
-                    "extension — won't be discovered at all. It won't "
-                    "appear in search, and won't be offered for "
-                    "decompression.",
-                ]
-            lines += [
-                "",
-                "LevelDB/IndexedDB — always found, regardless of tier "
-                "(its own filenames are unambiguous).",
-                "",
-                "Compressed archives — "
-                + (f"{unextracted_archives:,} not yet decompressed."
-                   if unextracted_archives
-                   else "none currently known to be undecompressed."),
-                "",
-                "Review the header scan tier and select archives to "
-                "decompress before searching?",
-            ]
-            box.setText("\n".join(lines))
-            review_btn = box.addButton("Review Header Scan Tier and Archives…",
+            box.setText("For the most complete search, run Process Case first. "
+                        "Not done yet in this case:\n\n"
+                        + "\n".join(f"\u2022 {m}" for m in missing)
+                        + "\n\nThe search starts by itself when Process Case finishes.")
+            review_btn = box.addButton("Open Process Case\u2026",
                                        QMessageBox.ButtonRole.ActionRole)
-            search_btn = box.addButton("Search Now",
-                                       QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Search Now", QMessageBox.ButtonRole.AcceptRole)
             box.setDefaultButton(review_btn)
             mute_chk = QCheckBox("Don't remind me again this session")
             box.setCheckBox(mute_chk)
@@ -3234,6 +3214,22 @@ class KeywordSearchMixin:
         # search-time fallback this used to need (a case where indexing
         # hadn't finished yet) can no longer occur.
         self._start_keyword_search_run(term)
+
+    def _media_metadata_done(self) -> bool:
+        """A complete media metadata run under the current stage rule
+        (media_metadata_scan.STAGE_RULE: every text field saved) is on
+        record for this case."""
+        import media_metadata_scan
+        from db_utils import load_last_run
+        if not getattr(self, '_case_dir', None):
+            return False
+        try:
+            with closing(_open_results_db(self._case_dir)) as db:
+                run = load_last_run(db, 'media_metadata')
+            return (run is not None and bool(run['complete'])
+                    and (run['parser_version'] or 0) >= media_metadata_scan.STAGE_RULE)
+        except Exception:
+            return False
 
     def _start_keyword_search_run(self, term: str):
         """The actual search launch — split out of _start_keyword_search

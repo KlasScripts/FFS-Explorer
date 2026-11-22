@@ -510,7 +510,7 @@ def _png_text(file_like) -> tuple[list, tuple | None]:
                     else:
                         out.append(('PNG text', k, text.decode('utf-8', 'replace')))
                 elif kind == b'eXIf':
-                    out.append(('PNG EXIF', 'eXIf', _printable_runs(data)))
+                    out.append(('PNG EXIF', '_raw', data))
                 else:
                     out.append(('C2PA', 'caBX', _printable_runs(data)))
             except zlib.error:
@@ -519,6 +519,40 @@ def _png_text(file_like) -> tuple[list, tuple | None]:
             return out, ((end, size - end) if end < size else None)
         pos = end
     return out, None
+
+
+def _raw_profile_bytes(text: str) -> bytes:
+    """The bytes of a PNG "Raw profile type ..." text chunk: a name line, a
+    length line, then hex digits (whitespace ignored); b'' if not that."""
+    import binascii
+    lines = text.strip().split('\n')
+    if len(lines) < 3:
+        return b''
+    digits = ''.join(''.join(lines[2:]).split())
+    try:
+        return binascii.unhexlify(digits[:len(digits) // 2 * 2])
+    except (binascii.Error, ValueError):
+        return b''
+
+
+def _add_exif(exif, add) -> None:
+    """Every tag of a Pillow Exif (IFD0, Exif, GPS, Interop) through *add*."""
+    from PIL import ExifTags
+    for tag, v in exif.items():
+        if tag in (0x8769, 0x8825, 0xA005):
+            continue
+        add('EXIF', ExifTags.TAGS.get(tag, hex(tag)), v, tag)
+    for ifd_tag, names, src in ((0x8769, ExifTags.TAGS, 'EXIF'), (0x8825, ExifTags.GPSTAGS, 'GPS'),
+                                (0xA005, ExifTags.TAGS, 'EXIF interop')):
+        try:
+            sub = exif.get_ifd(ifd_tag) or {}
+        except Exception:
+            sub = {}
+        for tag, v in sub.items():
+            if tag == 0x927C:
+                add(src, 'MakerNote (text parts)', _printable_runs(bytes(v)) if isinstance(v, bytes) else v)
+            else:
+                add(src, names.get(tag, hex(tag)), v, tag)
 
 
 def extract_all_text(file_like, ext: str) -> list:
@@ -552,13 +586,46 @@ def extract_all_text(file_like, ext: str) -> list:
             finally:
                 container.close()
             return out
-        if ext == '.png':
+        # By the file's own first bytes, not its name: on IOS17 six ".png"
+        # files were JPEGs (2026-11-22), and the extension lies often.
+        file_like.seek(0)
+        head = file_like.read(8)
+        is_png = head == b'\x89PNG\r\n\x1a\n'
+        is_jpeg = head[:3] == b'\xff\xd8\xff'
+        if is_png:
+            # Everything a PNG holds is found by its chunk walk (text, EXIF in
+            # eXIf, C2PA): no second Pillow open. PNGs were 86% of IOS17's
+            # media and most of this stage's time (2026-11-22).
+            from PIL import Image
             texts, after = _png_text(file_like)
             for src, k, v in texts:
-                add(src, k, v)
+                if k.lower().startswith('raw profile type') and isinstance(v, str):
+                    # EXIF (or another profile) as hex text (ImageMagick and
+                    # others): decoded as EXIF where it is one, else kept as text
+                    raw = _raw_profile_bytes(v)
+                    if raw and k.lower().endswith(('exif', 'app1')):
+                        try:
+                            exif = Image.Exif()
+                            exif.load(raw[6:] if raw.startswith(b'Exif\x00\x00') else raw)
+                            if exif:
+                                _add_exif(exif, add)
+                                continue
+                        except Exception:
+                            pass
+                    add(src, k, v)
+                elif k == '_raw':
+                    try:
+                        exif = Image.Exif()
+                        exif.load(v)
+                        _add_exif(exif, add)
+                    except Exception:
+                        add('PNG EXIF', 'eXIf', _printable_runs(v))
+                else:
+                    add(src, k, v)
             if after:
                 out.append(('file', 'data after the end of the image', f'{after[0]}:{after[1]}'))
-        if ext in ('.jpg', '.jpeg', '.jpe', '.jfif'):
+            return out
+        if is_jpeg:
             for marker, payload in _jpeg_segments(file_like):
                 if marker == 0xE1 and payload.startswith(b'http://ns.adobe.com/xap/1.0/\x00'):
                     add('XMP', 'xmp', payload[29:].decode('utf-8', 'replace'))
@@ -575,21 +642,7 @@ def extract_all_text(file_like, ext: str) -> list:
         file_like.seek(0)
         img = Image.open(file_like)
         exif = img.getexif()
-        for tag, v in exif.items():
-            if tag in (0x8769, 0x8825, 0xA005):
-                continue
-            add('EXIF', ExifTags.TAGS.get(tag, hex(tag)), v, tag)
-        for ifd_tag, names, src in ((0x8769, ExifTags.TAGS, 'EXIF'), (0x8825, ExifTags.GPSTAGS, 'GPS'),
-                                    (0xA005, ExifTags.TAGS, 'EXIF interop')):
-            try:
-                sub = exif.get_ifd(ifd_tag) or {}
-            except Exception:
-                sub = {}
-            for tag, v in sub.items():
-                if tag == 0x927C:
-                    add(src, 'MakerNote (text parts)', _printable_runs(bytes(v)) if isinstance(v, bytes) else v)
-                else:
-                    add(src, names.get(tag, hex(tag)), v, tag)
+        _add_exif(exif, add)
         for k, v in (img.info or {}).items():
             if k in _SKIP_INFO or ext == '.png' and isinstance(v, str):
                 continue                     # PNG text is read above, chunk by chunk

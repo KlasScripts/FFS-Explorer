@@ -2070,6 +2070,8 @@ def _collect_media_metadata_candidates(
         if excludes and ui_path.startswith(excludes):
             continue
         name = ui_path.rsplit('/', 1)[-1]
+        if name.lower().endswith('.gif'):
+            continue        # GIFs left out (owner, 2026-11-22): small, and no metadata worth it
         ft = _get_file_type(name)
         if ft == 'Other':
             ft = header_type_overrides.get(ui_path, 'Other')

@@ -5422,7 +5422,7 @@ class MediaMetadataScanWorker(QThread):
             try:
                 with closing(_open_results_db(self._case_dir)) as db:
                     run_id = start_run_log(db, self._run_type,
-                                           parser_version=media_metadata_scan.TAKEN_RULE)
+                                           parser_version=media_metadata_scan.STAGE_RULE)
             except Exception:
                 pass
         results = self._scan()
@@ -7090,7 +7090,7 @@ class ProcessDialog(QDialog):
             with closing(_open_results_db(self._case_dir)) as db:
                 run = load_last_run(db, self._RUN_TYPE_MEDIA_METADATA)
             return (run is not None and bool(run['complete'])
-                    and (run['parser_version'] or 0) >= media_metadata_scan.TAKEN_RULE)
+                    and (run['parser_version'] or 0) >= media_metadata_scan.STAGE_RULE)
         except Exception:
             return False
 

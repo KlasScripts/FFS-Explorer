@@ -170,6 +170,11 @@ def _dms_to_decimal(dms, ref: str) -> float | None:
 # (when the file was last changed) and the offset was never read. 2:
 # DateTimeOriginal from the Exif sub-IFD plus its offset, or nothing.
 TAKEN_RULE = 2
+# What the stage records, stamped on its run log (parser_version): 3 = also
+# every text metadata field (extract_all_text, table media_metadata_text),
+# 2026-11-22. An older run makes Process Case offer the stage again.
+# TAKEN_RULE stays the rule for 'taken' alone (the Timeline checks it).
+STAGE_RULE = 3
 
 _OFFSET_RE = re.compile(r'^\s*([+-])(\d{2}):?(\d{2})\s*$')
 
@@ -366,10 +371,242 @@ from header_scan import VIDEO_THUMB_EXTENSIONS
 
 def extract_one(file_like, ext: str) -> dict:
     """Dispatch to extract_image_exif/extract_video_metadata by *ext*
-    (lower-cased, with the leading dot)."""
+    (lower-cased, with the leading dot), plus every text metadata field
+    under '_text' (extract_all_text: what Keyword Search searches instead
+    of the media file's bytes)."""
     if ext in VIDEO_THUMB_EXTENSIONS:
-        return extract_video_metadata(file_like)
-    return extract_image_exif(file_like)
+        fields = extract_video_metadata(file_like)
+    else:
+        fields = extract_image_exif(file_like)
+    try:
+        file_like.seek(0)
+        text = extract_all_text(file_like, ext)
+    except Exception:
+        text = []
+    if text:
+        fields['_text'] = text
+    return fields
+
+
+# ── Every text metadata field (Keyword Search searches these) ───────────────
+
+MAX_VALUE = 1024 * 1024          # one value kept at most (a value cut is marked)
+_XP_TAGS = {0x9C9B: 'XPTitle', 0x9C9C: 'XPComment', 0x9C9D: 'XPAuthor',
+            0x9C9E: 'XPKeywords', 0x9C9F: 'XPSubject'}
+_SKIP_INFO = {'exif', 'icc_profile', 'dpi', 'transparency', 'gamma', 'jfif',
+              'jfif_version', 'jfif_unit', 'jfif_density', 'progressive',
+              'progression', 'adobe', 'adobe_transform', 'mp', 'mpoffset',
+              'duration', 'loop', 'background', 'aspect', 'srgb', 'chromaticity',
+              'interlace', 'compression', 'resolution'}
+
+
+def _printable_runs(b: bytes, min_len: int = 4) -> str:
+    """The runs of printable ASCII in binary data, joined by spaces."""
+    out, cur = [], bytearray()
+    for c in b:
+        if 32 <= c < 127:
+            cur.append(c)
+        else:
+            if len(cur) >= min_len:
+                out.append(cur.decode('ascii'))
+            cur = bytearray()
+    if len(cur) >= min_len:
+        out.append(cur.decode('ascii'))
+    return ' '.join(out)
+
+
+def _as_text(value, tag: int | None = None) -> str:
+    """A metadata value as searchable text ('' for none)."""
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value.replace('\x00', ' ').strip()
+    if isinstance(value, (bytes, bytearray)):
+        b = bytes(value)
+        if tag in _XP_TAGS:
+            return b.decode('utf-16-le', 'replace').replace('\x00', ' ').strip()
+        if tag == 0x9286 and len(b) >= 8:          # UserComment: 8-byte character code
+            code, body = b[:8], b[8:]
+            if code.startswith(b'UNICODE'):
+                enc = 'utf-16-be' if body[:2] != b'\xff\xfe' and body[:1] == b'\x00' else 'utf-16-le'
+                return body.decode(enc, 'replace').replace('\x00', ' ').strip()
+            return body.decode('latin-1', 'replace').replace('\x00', ' ').strip()
+        try:
+            t = b.decode('utf-8')
+            if sum(ch.isprintable() or ch in '\r\n\t' for ch in t) >= 0.9 * max(len(t), 1):
+                return t.replace('\x00', ' ').strip()
+        except UnicodeDecodeError:
+            pass
+        return _printable_runs(b)
+    if isinstance(value, (tuple, list)):
+        return ', '.join(t for t in (_as_text(v) for v in value) if t)
+    if isinstance(value, dict):
+        return ', '.join(f'{k}: {_as_text(v)}' for k, v in value.items())
+    return str(value)
+
+
+def _jpeg_segments(file_like) -> list:
+    """[(marker, payload)] of a JPEG's segments before the image data (SOS):
+    APPn, COM. Only those segments are read."""
+    import struct
+    file_like.seek(0)
+    if file_like.read(2) != b'\xff\xd8':
+        return []
+    out = []
+    for _ in range(512):
+        h = file_like.read(4)
+        if len(h) < 4 or h[0] != 0xFF:
+            break
+        marker, length = h[1], struct.unpack('>H', h[2:4])[0]
+        if marker == 0xDA or length < 2:           # start of scan: image data follows
+            break
+        payload = file_like.read(length - 2)
+        if 0xE0 <= marker <= 0xEF or marker == 0xFE:
+            out.append((marker, payload))
+    return out
+
+
+def _png_text(file_like) -> tuple[list, tuple | None]:
+    """([(source, key, value)] of a PNG's text chunks, wherever they sit,
+    compressed ones decompressed; C2PA (caBX) as its text parts) and
+    (offset, length) of any data after the image's end (IEND), else None.
+    Chunk headers only are read for the image data."""
+    import struct
+    import zlib
+    file_like.seek(0)
+    if file_like.read(8) != b'\x89PNG\r\n\x1a\n':
+        return [], None
+    out, pos = [], 8
+    file_like.seek(0, 2)
+    size = file_like.tell()
+    for _ in range(50000):
+        if pos + 12 > size:
+            break
+        file_like.seek(pos)
+        h = file_like.read(8)
+        if len(h) < 8:
+            break
+        length, kind = struct.unpack('>I4s', h)
+        end = pos + 12 + length
+        if end > size:
+            break
+        if kind in (b'tEXt', b'zTXt', b'iTXt', b'eXIf', b'caBX'):
+            data = file_like.read(length)
+            key, _, rest = data.partition(b'\x00')
+            k = key.decode('latin-1', 'replace')
+            try:
+                if kind == b'tEXt':
+                    out.append(('PNG text', k, rest.decode('latin-1', 'replace')))
+                elif kind == b'zTXt':
+                    v = zlib.decompressobj().decompress(rest[1:], MAX_VALUE)
+                    out.append(('PNG text (compressed)', k, v.decode('latin-1', 'replace')))
+                elif kind == b'iTXt':
+                    flag, rest2 = rest[:1], rest[2:]
+                    _lang, _, rest2 = rest2.partition(b'\x00')
+                    _tkw, _, text = rest2.partition(b'\x00')
+                    if flag == b'\x01':
+                        text = zlib.decompressobj().decompress(text, MAX_VALUE)
+                        out.append(('PNG text (compressed)', k, text.decode('utf-8', 'replace')))
+                    else:
+                        out.append(('PNG text', k, text.decode('utf-8', 'replace')))
+                elif kind == b'eXIf':
+                    out.append(('PNG EXIF', 'eXIf', _printable_runs(data)))
+                else:
+                    out.append(('C2PA', 'caBX', _printable_runs(data)))
+            except zlib.error:
+                out.append(('PNG text (compressed, unreadable)', k, ''))
+        if kind == b'IEND':
+            return out, ((end, size - end) if end < size else None)
+        pos = end
+    return out, None
+
+
+def extract_all_text(file_like, ext: str) -> list:
+    """[(source, key, value)]: every text metadata field of a picture or
+    video, for Keyword Search (it searches these instead of the file's
+    bytes, 2026-11-22). Images: every EXIF tag (IFD0, Exif, GPS, Interop),
+    XMP, IPTC, comments, C2PA text, PNG text chunks wherever they sit
+    (compressed ones decompressed), the TIFF tags; videos: every container
+    and stream tag. A value over MAX_VALUE is cut and marked. A PNG's data
+    after the image's end is recorded as ('file', 'data after the end of
+    the image', '<offset>:<length>') so the search can still read it.
+    Never raises."""
+    out = []
+
+    def add(source, key, value, tag=None):
+        t = _as_text(value, tag)
+        if t:
+            if len(t) > MAX_VALUE:
+                t = t[:MAX_VALUE] + ' [cut: over 1 MB]'
+            out.append((source, str(key), t))
+    try:
+        if ext in VIDEO_THUMB_EXTENSIONS:
+            import av
+            container = av.open(file_like)
+            try:
+                for k, v in (container.metadata or {}).items():
+                    add('video', k, v)
+                for st in container.streams:
+                    for k, v in (st.metadata or {}).items():
+                        add(f'video stream {st.index}', k, v)
+            finally:
+                container.close()
+            return out
+        if ext == '.png':
+            texts, after = _png_text(file_like)
+            for src, k, v in texts:
+                add(src, k, v)
+            if after:
+                out.append(('file', 'data after the end of the image', f'{after[0]}:{after[1]}'))
+        if ext in ('.jpg', '.jpeg', '.jpe', '.jfif'):
+            for marker, payload in _jpeg_segments(file_like):
+                if marker == 0xE1 and payload.startswith(b'http://ns.adobe.com/xap/1.0/\x00'):
+                    add('XMP', 'xmp', payload[29:].decode('utf-8', 'replace'))
+                elif marker == 0xE1 and payload.startswith(b'http://ns.adobe.com/xmp/extension/\x00'):
+                    add('XMP', 'extended xmp', payload[35 + 40:].decode('utf-8', 'replace'))
+                elif marker == 0xED:
+                    add('IPTC / Photoshop', 'APP13', _printable_runs(payload))
+                elif marker == 0xEB:
+                    add('C2PA', 'APP11', _printable_runs(payload))
+                elif marker == 0xFE:
+                    add('JPEG comment', 'COM', payload)
+        from PIL import ExifTags, Image
+        _ensure_heif_opener()
+        file_like.seek(0)
+        img = Image.open(file_like)
+        exif = img.getexif()
+        for tag, v in exif.items():
+            if tag in (0x8769, 0x8825, 0xA005):
+                continue
+            add('EXIF', ExifTags.TAGS.get(tag, hex(tag)), v, tag)
+        for ifd_tag, names, src in ((0x8769, ExifTags.TAGS, 'EXIF'), (0x8825, ExifTags.GPSTAGS, 'GPS'),
+                                    (0xA005, ExifTags.TAGS, 'EXIF interop')):
+            try:
+                sub = exif.get_ifd(ifd_tag) or {}
+            except Exception:
+                sub = {}
+            for tag, v in sub.items():
+                if tag == 0x927C:
+                    add(src, 'MakerNote (text parts)', _printable_runs(bytes(v)) if isinstance(v, bytes) else v)
+                else:
+                    add(src, names.get(tag, hex(tag)), v, tag)
+        for k, v in (img.info or {}).items():
+            if k in _SKIP_INFO or ext == '.png' and isinstance(v, str):
+                continue                     # PNG text is read above, chunk by chunk
+            if k in ('xmp', 'XML:com.adobe.xmp'):
+                add('XMP', 'xmp', v)
+            elif k == 'comment':
+                add('comment', 'comment', v)
+            elif isinstance(v, (str, bytes)):
+                add('info', k, v)
+        tags = getattr(img, 'tag_v2', None)          # TIFF
+        if tags:
+            for tag, v in tags.items():
+                if tag not in exif:
+                    add('TIFF', ExifTags.TAGS.get(tag, hex(tag)), v, tag)
+    except Exception:
+        pass
+    return out
 
 
 def scan_zip_candidates(

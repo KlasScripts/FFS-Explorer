@@ -106,6 +106,19 @@ def _open_cache_db(cache_dir: str) -> sqlite3.Connection:
     # ui_path, nothing fancier). taken/camera/gps/software are left NULL
     # (not '') when absent, matching every column builder downstream
     # that already treats a blank/None cell as "not present."
+    # Every text metadata field of each picture/video (media_metadata_scan.
+    # extract_all_text): what Keyword Search searches instead of the media
+    # files' bytes (2026-11-22). Rebuilt with the stage, like media_metadata.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS media_metadata_text (
+            ui_path TEXT NOT NULL,
+            source  TEXT NOT NULL,
+            key     TEXT NOT NULL,
+            value   TEXT NOT NULL
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_media_metadata_text_path '
+                 'ON media_metadata_text (ui_path)')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS media_metadata (
             ui_path     TEXT NOT NULL PRIMARY KEY,
@@ -962,7 +975,25 @@ def save_media_metadata(conn: 'sqlite3.Connection', results: dict) -> None:
         f'VALUES (?, {", ".join("?" * len(_MEDIA_METADATA_FIELDS))})',
         rows,
     )
+    # every text field (the '_text' list), replacing what these files had
+    conn.executemany('DELETE FROM media_metadata_text WHERE ui_path=?',
+                     [(ui_path,) for ui_path in results])
+    conn.executemany(
+        'INSERT INTO media_metadata_text (ui_path, source, key, value) VALUES (?, ?, ?, ?)',
+        [(ui_path, src, key, val)
+         for ui_path, fields in results.items() for src, key, val in fields.get('_text', ())])
     conn.commit()
+
+
+def iter_media_metadata_text(conn: 'sqlite3.Connection'):
+    """(ui_path, source, key, value) of every saved text metadata field."""
+    yield from conn.execute('SELECT ui_path, source, key, value FROM media_metadata_text')
+
+
+def media_metadata_text_paths(conn: 'sqlite3.Connection') -> set:
+    """The files whose text metadata is on record (searched instead of
+    their bytes)."""
+    return {r[0] for r in conn.execute('SELECT DISTINCT ui_path FROM media_metadata_text')}
 
 
 def load_media_metadata(conn: 'sqlite3.Connection') -> dict:

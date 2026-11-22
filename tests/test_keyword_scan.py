@@ -380,3 +380,51 @@ def test_png_text_anywhere_compressed_text_and_data_after_the_end(tmp_path):
     assert data.index(b'hidden needle note') + len(b'hidden ') in offsets  # after IEND
     assert notes['png_compressed_text'] == 1
     assert notes['png_after_end'] == [('DCIM/gen.png', len(png), len(appended))]
+
+
+
+def test_media_searched_by_saved_metadata(tmp_path):
+    """"Media: metadata only" (2026-11-22): a picture with saved metadata is
+    searched by it, not by its bytes; data after a picture's end is still
+    searched, at its file offset; a picture without saved metadata is
+    searched (start/end)."""
+    import zipfile
+    from PySide6.QtCore import QCoreApplication
+    import keyword_scan as ks
+    import keyword_search
+    from db_utils import _open_cache_db, save_media_metadata
+    app = QCoreApplication.instance() or QCoreApplication([])
+    with_meta = b'JPEG needle in the bytes' + b'.' * 100
+    png = b'PNGDATA' + b'.' * 50
+    tail = b'hidden needle note'
+    no_meta = b'other needle picture' + b'.' * 10
+    zp = tmp_path / 'm.zip'
+    with zipfile.ZipFile(zp, 'w', zipfile.ZIP_STORED) as z:
+        z.writestr('DCIM/a.jpg', with_meta)
+        z.writestr('DCIM/b.png', png + tail)
+        z.writestr('DCIM/c.jpg', no_meta)
+    entries = []
+    with zipfile.ZipFile(zp) as z:
+        for info in z.infolist():
+            with open(zp, 'rb') as f:
+                f.seek(info.header_offset + 26)
+                n, m = int.from_bytes(f.read(2), 'little'), int.from_bytes(f.read(2), 'little')
+            entries.append((info.filename, info.header_offset + 30 + n + m, info.file_size))
+    case = str(tmp_path / 'case')
+    import os
+    os.makedirs(case)
+    with _open_cache_db(case) as db:
+        save_media_metadata(db, {
+            'DCIM/a.jpg': {'_text': [('EXIF', 'ImageDescription', 'a needle description')]},
+            'DCIM/b.png': {'_text': [('file', 'data after the end of the image', f'{len(png)}:{len(tail)}')]},
+        })
+    w = keyword_search.KeywordSearchWorker(
+        str(zp), 'needle', entries=entries, base64=False, case_dir=case,
+        media_head_tail=ks.MEDIA_HEAD_TAIL, media_meta=True, resolve=lambda p: p)
+    found = {}
+    w.results_found.connect(lambda name, hits: found.setdefault(name, []).extend(hits))
+    w.run()
+    assert found['DCIM/a.jpg'] == [(0, found['DCIM/a.jpg'][0][1])]          # metadata only
+    assert found['DCIM/a.jpg'][0][1].startswith('[metadata: EXIF ImageDescription]')
+    assert [o for o, _c in found['DCIM/b.png']] == [len(png) + len(b'hidden ')]
+    assert [o for o, _c in found['DCIM/c.jpg']] == [len(b'other ')]

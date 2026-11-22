@@ -333,7 +333,7 @@ class KeywordSearchWorker(QThread):
                  exclude_prefixes: tuple = (), case_dir: str | None = None,
                  delta: int | None = None, exclude_entry=None, base64: bool = True,
                  media_head_tail: int = 0, media_names=frozenset(),
-                 skip_entry=None, parent=None):
+                 skip_entry=None, media_meta: bool = False, resolve=None, parent=None):
         super().__init__(parent)
         self.zip_path          = zip_path
         # Media files searched only at their start and end (keyword_scan.
@@ -346,6 +346,13 @@ class KeywordSearchWorker(QThread):
         # install folders' code (app_install_skip), for an "all files"
         # search with "Skip app install folders"
         self._skip_entry       = skip_entry
+        # "Media: metadata only": a picture/video whose text metadata the
+        # EXIF/video stage saved (media_metadata_text) is searched by that
+        # metadata, not by its bytes; *resolve* maps a ui_path to its zip
+        # name (FfsAdapter.resolve)
+        self._media_meta       = media_meta
+        self._resolve          = resolve
+        self._range_shift: dict = {}
         # Optional callable(zip entry name) -> True to leave an entry out of
         # an "all" search: the iOS system partition (A-82).
         self._exclude_entry    = exclude_entry
@@ -406,10 +413,17 @@ class KeywordSearchWorker(QThread):
                     "(inside iOS .app bundles, Android app code; every data folder is searched)")
             entries = kept
         self.status_update.emit(f"Index ready — {len(entries):,} files to search")
+        n_meta = 0
+        if self._media_meta and self._case_dir and self._resolve is not None:
+            entries, n_meta = self._search_media_metadata(entries)
         if self._media_head_tail:
             entries, n_limited = _limit_media(entries, self._media_head_tail, self._media_names)
             if n_limited:
                 self.status_update.emit(
+                    f"{n_limited:,} picture/video files without saved metadata searched at "
+                    f"their start and end only (first and last {self._media_head_tail // 1024} KB); "
+                    "run Process Case's media metadata stage to search their metadata instead"
+                    if self._media_meta else
                     f"{n_limited:,} picture/video files searched at their start and end only "
                     f"(first and last {self._media_head_tail // 1024} KB: EXIF, XMP, video "
                     "metadata, data appended after the picture)")
@@ -423,13 +437,71 @@ class KeywordSearchWorker(QThread):
         for names_done, file_results in self._search(entries, patterns):
             done += names_done
             for name, entry_results in file_results:
+                shift = self._range_shift.get(name)
+                if shift:                 # data after a picture's end: offsets in the file
+                    entry_results = [(o + shift, c) for o, c in entry_results]
                 hits += len(entry_results)
                 self.results_found.emit(name, entry_results)
             now = time.monotonic()
             if now - _last_prog >= 0.1 or done == total:
                 _last_prog = now
                 self.progress.emit(done, total)
-        self.finished.emit(hits, done, total, self._stop.is_set())
+        hits += getattr(self, '_meta_hits', 0)
+        self.finished.emit(hits, done + n_meta, total + n_meta, self._stop.is_set())
+
+    def _search_media_metadata(self, entries: list) -> tuple[list, int]:
+        """Search the saved text metadata of the pictures/videos among
+        *entries* (casecache.db media_metadata_text) and emit its hits
+        ('[metadata: <source> <field>] ...', offset 0); return the entries
+        left for the byte search: those files are taken out, except the data
+        after a picture's end, which is kept as a range of the file (its
+        hits shifted back to file offsets, _range_shift), and the number of
+        files searched by metadata."""
+        from contextlib import closing as _closing
+        from db_utils import _open_cache_db, iter_media_metadata_text
+        from file_types import PICTURE_EXTENSIONS, VIDEO_EXTENSIONS, _ext
+        from header_scan import GRAPHIC_EXTENSIONS
+        media_ext = PICTURE_EXTENSIONS | VIDEO_EXTENSIONS | set(GRAPHIC_EXTENSIONS)
+        by_zip: dict = {}
+        try:
+            with _closing(_open_cache_db(self._case_dir)) as db:
+                for ui_path, src, key, val in iter_media_metadata_text(db):
+                    by_zip.setdefault(self._resolve(ui_path), []).append((src, key, val))
+        except Exception:
+            return entries, 0
+        if not by_zip:
+            return entries, 0
+        kept, n_meta, meta_hits = [], 0, 0
+        for e in entries:
+            name = e[0]
+            rows = by_zip.get(name)
+            if rows is None or not (_ext(name.rsplit('/', 1)[-1]).lower() in media_ext
+                                    or name in self._media_names):
+                kept.append(e)
+                continue
+            n_meta += 1
+            hits = []
+            for src, key, val in rows:
+                if key == 'data after the end of the image':
+                    try:
+                        off, n = (int(x) for x in val.split(':'))
+                    except ValueError:
+                        continue
+                    kept.append((name, e[1] + off, n))
+                    self._range_shift[name] = off
+                    continue
+                for _o, ctx in keyword_scan.search_blocks(
+                        [val.encode('utf-8', 'surrogatepass')], self._patterns,
+                        self._CTX_BYTES, self._b64, self._phone):
+                    hits.append((0, f'[metadata: {src} {key}] {ctx}'))
+            if hits:
+                meta_hits += len(hits)
+                self.results_found.emit(name, hits)
+        self._meta_hits = meta_hits
+        self.status_update.emit(
+            f"{n_meta:,} picture/video files searched by their saved metadata (EXIF, XMP, "
+            "IPTC, comments, PNG text, C2PA, video tags) instead of their contents")
+        return kept, n_meta
 
     def _search(self, entries: list, patterns: list):
         """Yield (files done, [(name, hits), ...]) as work finishes: on
@@ -1525,12 +1597,14 @@ class KeywordSearchMixin:
         search_ctrl.addWidget(self.search_field, 1)
         search_ctrl.addWidget(self.search_scope_combo)
         search_ctrl.addWidget(self.search_b64_check)
-        self.search_media_check = QCheckBox("Media: start/end only")
+        self.search_media_check = QCheckBox("Media: metadata only")
         self.search_media_check.setChecked(True)
         self.search_media_check.setToolTip(
-            "Search pictures and videos only in their first and last 256 KB, where EXIF, XMP,\n"
-            "a video's metadata and anything appended after the picture are kept. The rest is\n"
-            "image or video data, rarely text. Untick to search every byte of every file.")
+            "Search pictures and videos by the metadata Process Case saved for them (every EXIF\n"
+            "field, XMP, IPTC, comments, PNG text incl. compressed prompts, C2PA, video tags)\n"
+            "instead of their contents; data after a picture's end is still searched. Files\n"
+            "without saved metadata are searched at their first and last 256 KB.\n"
+            "Untick to search every byte of every file.")
         search_ctrl.addWidget(self.search_media_check)
         self.search_skip_apps_check = QCheckBox("Skip app install folders")
         self.search_skip_apps_check.setChecked(True)
@@ -3147,7 +3221,7 @@ class KeywordSearchMixin:
         # from one of every byte.
         search_media_limited = self.search_media_check.isChecked()
         if search_media_limited:
-            scope_label = f"{scope_label}, media start/end"
+            scope_label = f"{scope_label}, media metadata only"
         # The app install folders are left out of an all-files search only.
         skip_apps = (self.search_skip_apps_check.isChecked() and scope == 'all')
         if skip_apps:
@@ -3195,6 +3269,8 @@ class KeywordSearchMixin:
             delta=getattr(self, '_local_extra_delta', None),
             base64=search_b64,
             media_head_tail=keyword_scan.MEDIA_HEAD_TAIL if search_media_limited else 0,
+            media_meta=search_media_limited,
+            resolve=self._adapter.resolve if search_media_limited else None,
             media_names=self._search_media_names() if search_media_limited else frozenset(),
             skip_entry=app_install_skip(self._adapter) if skip_apps else None)
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)

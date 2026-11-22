@@ -250,3 +250,32 @@ def test_media_start_and_end_only(tmp_path):
     assert [o for o, _c in full['DCIM/a.jpg']] == [100, 5 * ht, 10 * ht - 200]
     # a picture no bigger than both ends is searched whole
     assert ks.read_ranges(2 * ht, ht) == [(0, 2 * ht)]
+
+
+def test_app_install_folders_skipped(tmp_path):
+    """Keyword Search's "Skip app install folders" (2026-11-22): an
+    all-files search leaves out the zip names under the given prefixes and
+    says so; everything else is searched."""
+    import zipfile
+    from PySide6.QtCore import QCoreApplication
+    import keyword_search
+    app = QCoreApplication.instance() or QCoreApplication([])
+    zp = tmp_path / 's.zip'
+    with zipfile.ZipFile(zp, 'w', zipfile.ZIP_STORED) as z:
+        z.writestr('filesystem2/containers/Bundle/Application/X/App.app/strings.txt', b'a needle here')
+        z.writestr('filesystem2/mobile/Library/notes.txt', b'the needle there')
+    entries = []
+    with zipfile.ZipFile(zp) as z:
+        for info in z.infolist():
+            with open(zp, 'rb') as f:
+                f.seek(info.header_offset + 26)
+                n, m = int.from_bytes(f.read(2), 'little'), int.from_bytes(f.read(2), 'little')
+            entries.append((info.filename, info.header_offset + 30 + n + m, info.file_size))
+    w = keyword_search.KeywordSearchWorker(str(zp), 'needle', entries=entries, base64=False,
+                                           skip_prefixes=('filesystem2/containers/Bundle/',))
+    found, status = [], []
+    w.results_found.connect(lambda name, hits: found.append(name))
+    w.status_update.connect(status.append)
+    w.run()
+    assert found == ['filesystem2/mobile/Library/notes.txt']
+    assert any('app install folders not searched' in s for s in status)

@@ -297,7 +297,7 @@ class KeywordSearchWorker(QThread):
                  exclude_prefixes: tuple = (), case_dir: str | None = None,
                  delta: int | None = None, exclude_entry=None, base64: bool = True,
                  media_head_tail: int = 0, media_names=frozenset(),
-                 parent=None):
+                 skip_prefixes: tuple = (), parent=None):
         super().__init__(parent)
         self.zip_path          = zip_path
         # Media files searched only at their start and end (keyword_scan.
@@ -306,6 +306,9 @@ class KeywordSearchWorker(QThread):
         # (no media extension).
         self._media_head_tail  = media_head_tail
         self._media_names      = media_names
+        # Zip-name prefixes left out (no leading '/'): the app install
+        # folders, for an "all files" search with "Skip app install folders"
+        self._skip_prefixes    = skip_prefixes
         # Optional callable(zip entry name) -> True to leave an entry out of
         # an "all" search: the iOS system partition (A-82).
         self._exclude_entry    = exclude_entry
@@ -355,6 +358,16 @@ class KeywordSearchWorker(QThread):
                            and not (skip and skip(e[0]))]
             else:
                 entries = full_entries
+        if self._skip_prefixes:
+            skip = self._skip_prefixes
+            kept = [e for e in entries if not e[0].lstrip('/').startswith(skip)]
+            n_skip = len(entries) - len(kept)
+            if n_skip:
+                gb = (sum(e[2] for e in entries) - sum(e[2] for e in kept)) / 2**30
+                self.status_update.emit(
+                    f"{n_skip:,} files ({gb:.1f} GB) in app install folders not searched "
+                    "(the apps' own code and bundled files; their data folders are searched)")
+            entries = kept
         self.status_update.emit(f"Index ready — {len(entries):,} files to search")
         if self._media_head_tail:
             entries, n_limited = _limit_media(entries, self._media_head_tail, self._media_names)
@@ -1459,6 +1472,13 @@ class KeywordSearchMixin:
             "a video's metadata and anything appended after the picture are kept. The rest is\n"
             "image or video data, rarely text. Untick to search every byte of every file.")
         search_ctrl.addWidget(self.search_media_check)
+        self.search_skip_apps_check = QCheckBox("Skip app install folders")
+        self.search_skip_apps_check.setChecked(True)
+        self.search_skip_apps_check.setToolTip(
+            "In an all-files search, leave out the installed apps' own code and bundled files" + chr(10)
+            + "(iOS containers/Bundle, Android data/app): about a quarter to a third of a phone's" + chr(10)
+            + "data, not the user's. The apps' data folders are still searched.")
+        search_ctrl.addWidget(self.search_skip_apps_check)
         search_ctrl.addWidget(self.search_btn)
         search_ctrl.addWidget(self.search_stop_btn)
         self._incomplete_banner = QLabel()
@@ -1672,6 +1692,13 @@ class KeywordSearchMixin:
         else:
             entries = None
         return entries, nested_map, "all files", None
+
+    def _app_install_prefixes(self) -> tuple:
+        """Zip-name prefixes (no leading '/') of the app install folders:
+        iOS containers/Bundle, Android data/app, as this archive's layout
+        stores them (FfsAdapter.resolve)."""
+        return tuple(self._adapter.resolve(u).lstrip('/').rstrip('/') + '/'
+                     for u in ('containers/Bundle', 'data/app'))
 
     def _search_media_names(self) -> frozenset:
         """Zip names of the files the header scan typed as a picture or video
@@ -3066,6 +3093,10 @@ class KeywordSearchMixin:
         search_media_limited = self.search_media_check.isChecked()
         if search_media_limited:
             scope_label = f"{scope_label}, media start/end"
+        # The app install folders are left out of an all-files search only.
+        skip_apps = (self.search_skip_apps_check.isChecked() and scope == 'all')
+        if skip_apps:
+            scope_label = f"{scope_label}, no app folders"
         db_key = _encode_search_key(term, scope_label)
         self._current_search_db_key = db_key
         self._save_recent_search(db_key)
@@ -3109,7 +3140,8 @@ class KeywordSearchMixin:
             delta=getattr(self, '_local_extra_delta', None),
             base64=search_b64,
             media_head_tail=keyword_scan.MEDIA_HEAD_TAIL if search_media_limited else 0,
-            media_names=self._search_media_names() if search_media_limited else frozenset())
+            media_names=self._search_media_names() if search_media_limited else frozenset(),
+            skip_prefixes=self._app_install_prefixes() if skip_apps else ())
         self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
         self._search_worker.results_found.connect(self._on_search_results)
         self._search_worker.progress.connect(self._on_search_progress)

@@ -56,7 +56,7 @@ def test_search_job_reads_each_file_by_offset_only(tmp_path):
     p = tmp_path / 'a.zip'
     p.write_bytes(blob)
     entries = [('one', 6, 5), ('two', 11, 5), ('three', 16, 10)]
-    out, bad = ks.search_job(str(p), entries, ks.make_patterns('test'), chunk=3)
+    out, bad, _notes = ks.search_job(str(p), entries, ks.make_patterns('test'), chunk=3)
     assert bad == 0
     [(name, [(off, ctx)])] = out
     # (context stops at the end of the current read: here 3 bytes)
@@ -337,3 +337,46 @@ def test_media_metadata_found_wherever_it_sits(tmp_path):
     moov_at = video.index(b'needle-gps')
     assert [o for o, _c in got['DCIM/IMG_1.MOV']] == [moov_at]
     assert [o for o, _c in got['DCIM/scan.tif']] == [5 * ht]
+
+
+
+def test_png_text_anywhere_compressed_text_and_data_after_the_end(tmp_path):
+    """With "Media: start/end only" a PNG's text chunks are searched
+    wherever they sit, compressed text (zTXt, as some AI generators store
+    a prompt) is decompressed and searched, and data after IEND is searched
+    in full and reported (2026-11-22)."""
+    import struct
+    import zipfile
+    import zlib
+    import keyword_scan as ks
+    import keyword_search
+    ht = 1024
+
+    def chunk(kind, body):
+        return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
+    png = (ks._PNG_SIG + chunk(b'IHDR', b'\0' * 13) + chunk(b'IDAT', b'.' * (5 * ht))
+           + chunk(b'tEXt', b'parameters\0a cat, needle style')
+           + chunk(b'zTXt', b'prompt\0\0' + zlib.compress(b'{"text": "a needle in a haystack"}'))
+           + chunk(b'IDAT', b'.' * (5 * ht)) + chunk(b'IEND', b''))
+    appended = b'.' * (3 * ht) + b'hidden needle note' + b'.' * (3 * ht)
+    data = png + appended
+    zp = tmp_path / 'p.zip'
+    with zipfile.ZipFile(zp, 'w', zipfile.ZIP_STORED) as z:
+        z.writestr('DCIM/gen.png', data)
+    with zipfile.ZipFile(zp) as z:
+        info = z.infolist()[0]
+        with open(zp, 'rb') as f:
+            f.seek(info.header_offset + 26)
+            n, m = int.from_bytes(f.read(2), 'little'), int.from_bytes(f.read(2), 'little')
+        entries = [(info.filename, info.header_offset + 30 + n + m, info.file_size)]
+    limited, n_lim = keyword_search._limit_media(entries, ht)
+    assert n_lim == 1
+    out, bad, notes = ks.search_job(str(zp), limited, ks.make_patterns('needle'))
+    hits = dict(out)['DCIM/gen.png']
+    offsets = [o for o, _c in hits]
+    assert data.index(b'needle style') in offsets                       # tEXt in the middle
+    ztxt_at = data.index(b'zTXt') - 4
+    assert any(o == ztxt_at and 'compressed PNG text "prompt"' in c for o, c in hits)
+    assert data.index(b'hidden needle note') + len(b'hidden ') in offsets  # after IEND
+    assert notes['png_compressed_text'] == 1
+    assert notes['png_after_end'] == [('DCIM/gen.png', len(png), len(appended))]

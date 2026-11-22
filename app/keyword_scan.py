@@ -378,6 +378,69 @@ def box_ranges(f, offset: int, size: int, limit: int = 64) -> list:
     return out
 
 
+_PNG_SIG = b'\x89PNG\r\n\x1a\n'
+# PNG chunks holding text or metadata: searched wherever they sit
+_PNG_TEXT = (b'tEXt', b'iTXt', b'zTXt', b'eXIf', b'caBX')
+_MAX_INFLATE = 32 * 1024 * 1024     # decompressed PNG text read at most
+
+
+def png_chunks(f, offset: int, size: int, limit: int = 50000):
+    """(text_chunks [(type, start, length incl. header and CRC)], end of the
+    IEND chunk or None) of a PNG stored at *offset* in the open archive *f*;
+    None if it is not a PNG. Only chunk headers are read (image data is
+    skipped), at most *limit* chunks."""
+    import struct
+    f.seek(offset)
+    if f.read(8) != _PNG_SIG:
+        return None
+    pos, texts = 8, []
+    for _ in range(limit):
+        if pos + 12 > size:
+            break
+        f.seek(offset + pos)
+        h = f.read(8)
+        if len(h) < 8:
+            break
+        length, kind = struct.unpack('>I4s', h)
+        end = pos + 12 + length
+        if end > size:
+            break
+        if kind in _PNG_TEXT:
+            texts.append((kind, pos, 12 + length))
+        if kind == b'IEND':
+            return texts, end
+        pos = end
+    return texts, None
+
+
+def png_compressed_text(f, offset: int, chunk: tuple):
+    """(keyword, decompressed bytes) of a zTXt chunk or a compressed iTXt
+    chunk, else None: a generator's prompt ("parameters", "prompt",
+    "workflow") is sometimes stored this way, and is otherwise not
+    searchable. At most _MAX_INFLATE bytes; a broken stream gives what
+    decompressed."""
+    import zlib
+    kind, start, length = chunk
+    if kind not in (b'zTXt', b'iTXt'):
+        return None
+    f.seek(offset + start + 8)
+    data = f.read(length - 12)
+    key, _, rest = data.partition(b'\x00')
+    if kind == b'zTXt':
+        payload = rest[1:]
+    else:
+        if len(rest) < 2 or rest[0] != 1:
+            return None                       # not compressed: searched as it is
+        rest = rest[2:]
+        _lang, _, rest = rest.partition(b'\x00')
+        _tkw, _, payload = rest.partition(b'\x00')
+    try:
+        d = zlib.decompressobj()
+        return key, d.decompress(payload, _MAX_INFLATE)
+    except zlib.error:
+        return None
+
+
 def merge_ranges(ranges: list) -> list:
     """Sorted, non-overlapping [(start, length)]."""
     merged = []
@@ -413,17 +476,39 @@ def search_job(zip_path: str, entries: list, patterns: list,
     """Worker-process entry point: search each (name, data_offset, size[,
     head_tail]) entry of the archive (read_ranges: a media entry with
     head_tail only at its start and end; each part searched on its own,
-    offsets in the file). Returns ([(name, hits), ...] for files with hits,
-    number of files that could not be read)."""
+    offsets in the file; a PNG's text chunks wherever they sit, its
+    compressed text decompressed, and any data after its end in full).
+    Returns ([(name, hits), ...] for files with hits, number of files that
+    could not be read, notes {'png_after_end': [(name, offset, bytes)],
+    'png_compressed_text': chunks decompressed})."""
     out, unreadable = [], 0
+    notes = {'png_after_end': [], 'png_compressed_text': 0}
     with open(zip_path, 'rb', buffering=0) as f:
         for e in entries:
             name, offset, size = e[0], e[1], e[2]
             hits = []
             try:
                 ranges = read_ranges(size, e[3] if len(e) > 3 else 0)
-                if len(ranges) > 1 and name.lower().endswith(BOX_FORMATS):
+                lname = name.lower()
+                if len(ranges) > 1 and lname.endswith(BOX_FORMATS):
                     ranges = merge_ranges(ranges + box_ranges(f, offset, size))
+                png = png_chunks(f, offset, size) if lname.endswith('.png') else None
+                if png is not None:
+                    texts, iend = png
+                    if len(ranges) > 1:           # start/end only: add the text chunks
+                        ranges = merge_ranges(ranges + [(st, ln) for _k, st, ln in texts])
+                    if iend is not None and iend < size:
+                        # data after the end of the image: searched in full
+                        notes['png_after_end'].append((name, iend, size - iend))
+                        ranges = merge_ranges(ranges + [(iend, size - iend)])
+                    for text_chunk in texts:
+                        got = png_compressed_text(f, offset, text_chunk)
+                        if got is None:
+                            continue
+                        notes['png_compressed_text'] += 1
+                        key = got[0].decode('latin-1', 'replace')
+                        hits += [(text_chunk[1], f'[compressed PNG text "{key}"] {ctx}')
+                                 for _o, ctx in search_blocks([got[1]], patterns, ctx_bytes, b64, phone)]
                 for start, length in ranges:
                     def blocks(at=offset + start, length=length):
                         pos = 0
@@ -440,5 +525,5 @@ def search_job(zip_path: str, entries: list, patterns: list,
                 unreadable += 1
                 continue
             if hits:
-                out.append((name, hits))
-    return out, unreadable
+                out.append((name, sorted(hits)))
+    return out, unreadable, notes

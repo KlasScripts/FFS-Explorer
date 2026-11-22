@@ -445,8 +445,10 @@ class KeywordSearchWorker(QThread):
             except Exception as exc:
                 _log_warning(f'keyword search: no process pool ({exc}); searching on threads')
                 pool = None
+        self._png_after_end, self._png_compressed = [], 0
         if pool is None:
             yield from self._search_on_threads(entries, patterns)
+            self._report_png_notes()
             return
         from concurrent.futures import FIRST_COMPLETED, wait
         unreadable = 0
@@ -472,7 +474,7 @@ class KeywordSearchWorker(QThread):
                 for fut in finished:
                     job = pending.pop(fut)
                     try:
-                        file_results, bad = fut.result()
+                        file_results, bad, notes = fut.result()
                     except Exception as exc:
                         # e.g. a worker process died: those files are
                         # counted as not searched, never silently passed
@@ -481,6 +483,8 @@ class KeywordSearchWorker(QThread):
                         yield len(job), []
                         continue
                     unreadable += bad
+                    self._png_after_end += notes['png_after_end']
+                    self._png_compressed += notes['png_compressed_text']
                     yield len(job), file_results
                 top_up()
         finally:
@@ -493,30 +497,45 @@ class KeywordSearchWorker(QThread):
                         pass
             if unreadable:
                 self.status_update.emit(f"{unreadable:,} file(s) could not be read and were not searched")
+            self._report_png_notes()
+
+    def _report_png_notes(self) -> None:
+        """Say in the progress window what the PNG chunk walk found
+        (keyword_scan.search_job's notes)."""
+        after = getattr(self, '_png_after_end', [])
+        if after:
+            total = sum(n for _p, _o, n in after)
+            amount = (f"{total / 2**20:.1f} MB" if total >= 2**20 else
+                      f"{total / 1024:.1f} KB" if total >= 1024 else f"{total:,} bytes")
+            self.status_update.emit(
+                f"{len(after):,} PNG file(s) have data after the end of the image "
+                f"({amount} in all), searched in full: worth a look (data can be hidden this way)")
+            for name, offset, n in after[:20]:
+                self.status_update.emit(f"    {name}: {n:,} bytes after the image, from offset {offset:,}")
+            if len(after) > 20:
+                self.status_update.emit(f"    …and {len(after) - 20:,} more")
+        if getattr(self, '_png_compressed', 0):
+            self.status_update.emit(
+                f"{self._png_compressed:,} compressed PNG text chunk(s) (for example an AI image's "
+                "prompt) decompressed and searched")
 
     def _search_on_threads(self, entries: list, patterns: list):
         """The fallback: this process's thread pool, one file per task."""
         reader = ZipReader(self.zip_path)
 
         def search_entry(entry):
-            data_offset, file_size = entry[1], entry[2]
+            # the same per-file search as the worker processes (search_job)
             if self._stop.is_set():
                 return []
             try:
-                hits = []
-                ranges = keyword_scan.read_ranges(file_size, entry[3] if len(entry) > 3 else 0)
-                if len(ranges) > 1 and entry[0].lower().endswith(keyword_scan.BOX_FORMATS):
-                    with open(self.zip_path, 'rb') as f:      # box headers only
-                        ranges = keyword_scan.merge_ranges(
-                            ranges + keyword_scan.box_ranges(f, data_offset, file_size))
-                for start, length in ranges:
-                    hits += [(start + o, ctx) for o, ctx in keyword_scan.search_blocks(
-                        reader.read_chunked_at(data_offset + start, length, chunk_size=self._CHUNK,
-                                               stop_fn=self._stop.is_set),
-                        patterns, self._CTX_BYTES, self._b64, self._phone)]
-                return hits
+                out, _bad, notes = keyword_scan.search_job(
+                    self.zip_path, [entry], patterns, self._CTX_BYTES,
+                    b64=self._b64, phone=self._phone)
             except OSError:
                 return []
+            self._png_after_end += notes['png_after_end']
+            self._png_compressed += notes['png_compressed_text']
+            return out[0][1] if out else []
 
         for entry, entry_results in reader.run_parallel(
                 entries, search_entry, cancel_check=self._stop.is_set):

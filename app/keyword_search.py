@@ -614,6 +614,74 @@ class KeywordSearchWorker(QThread):
             yield 1, ([(entry[0], entry_results)] if entry_results else [])
 
 
+def name_matches(keyword: str):
+    """callable(name) -> the matched span (start, end) in *name*, or None:
+    the keyword in any of its spellings (keyword_scan.keyword_forms: case,
+    composed / decomposed accents), case-insensitive."""
+    import unicodedata
+    forms = []
+    for f in keyword_scan.keyword_forms(keyword):
+        for g in (f, unicodedata.normalize('NFC', f), unicodedata.normalize('NFD', f)):
+            g = g.lower()
+            if g and g not in forms:
+                forms.append(g)
+
+    def match(name: str):
+        low = name.lower()
+        for g in forms:
+            i = low.find(g)
+            if i >= 0:
+                return i, i + len(g)
+        return None
+    return match
+
+
+class NameSearchWorker(QThread):
+    """Keyword Search over file and folder NAMES (2026-11-22): the last part
+    of every path in the search's scope, files and folders, including
+    unpacked archives and carved media (in the file list). A folder that
+    matches is one hit, not one per file inside it. Results as the main
+    worker's: (zip name, [(0, '[file name] ...' / '[folder name] ...')])."""
+
+    results_found = Signal(str, list)
+    finished      = Signal(int)
+
+    def __init__(self, keyword: str, files, folders, resolve, skip_entry=None, parent=None):
+        super().__init__(parent)
+        self._match = name_matches(keyword)
+        self._files, self._folders = files, folders
+        self._resolve, self._skip = resolve, skip_entry
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        hits = 0
+        batch = []
+        for label, paths in (('file name', self._files), ('folder name', self._folders)):
+            for i, ui_path in enumerate(paths):
+                if not (i & 0x3FFF) and self._stop.is_set():
+                    break
+                name = ui_path.rsplit('/', 1)[-1]
+                span = self._match(name) if name else None
+                if span is None:
+                    continue
+                zip_name = self._resolve(ui_path)
+                if self._skip and self._skip(zip_name):
+                    continue
+                a, b = span
+                batch.append((zip_name, [(0, f'[{label}] {name[:a]}[{name[a:b]}]{name[b:]}')]))
+                hits += 1
+                if len(batch) >= 200:
+                    for n, h in batch:
+                        self.results_found.emit(n, h)
+                    batch = []
+        for n, h in batch:
+            self.results_found.emit(n, h)
+        self.finished.emit(hits)
+
+
 # ── NestedArchiveSearchWorker ─────────────────────────────────────────────────
 
 class NestedArchiveSearchWorker(QThread):
@@ -3301,6 +3369,31 @@ class KeywordSearchMixin:
         # folders in this project's own test archive), 'app_data' is scoped
         # with the same 'data/data/' prefix the main worker's own app_data
         # filter already uses, via LevelDbSearchWorker's path_prefix.
+        # File and folder names in the same scope, on their own thread
+        # (2026-11-22: a keyword in a name was never found before).
+        if self.full_metadata:
+            if scope_ui_paths is not None:
+                in_scope = list(scope_ui_paths)
+                files = [p for p in in_scope if p not in self.folder_map]
+                folders = [p for p in in_scope if p in self.folder_map]
+            else:
+                files = self.full_metadata.copy() if hasattr(self.full_metadata, 'table') \
+                    else list(self.full_metadata)
+                folders = self._all_folder_names() if hasattr(self, '_all_folder_names') \
+                    else list(self.folder_map)
+                if worker_scope == 'app_data':
+                    keep = ('mobile/Containers', 'data/data')
+                    files = [p for p in files if any(k in p for k in keep)]
+                    folders = [p for p in folders if any(k in p for k in keep)]
+            self._search_pending_workers.add('names')
+            self._name_search_worker = NameSearchWorker(
+                term, files, folders, self._adapter.resolve,
+                skip_entry=app_install_skip(self._adapter) if skip_apps else None)
+            self._name_search_worker.results_found.connect(self._on_search_results)
+            self._name_search_worker.finished.connect(
+                lambda _n: self._mark_search_subworker_done('names'))
+            self._name_search_worker.start()
+
         if worker_scope in ('all', 'app_data'):
             self._search_pending_workers.add('leveldb')
             path_prefix = 'data/data/' if worker_scope == 'app_data' else None
@@ -3313,6 +3406,9 @@ class KeywordSearchMixin:
         self._search_progress_dlg.exec()
 
     def _cancel_keyword_search(self):
+        names = getattr(self, '_name_search_worker', None)
+        if names and names.isRunning():
+            names.stop()
         if self._search_worker and self._search_worker.isRunning():
             self._search_worker.stop()
         if self._nested_search_worker and self._nested_search_worker.isRunning():
@@ -3321,6 +3417,10 @@ class KeywordSearchMixin:
             self._leveldb_search_worker.stop()
 
     def _stop_keyword_search(self):
+        names = getattr(self, '_name_search_worker', None)
+        if names and names.isRunning():
+            names.stop()
+            names.wait()
         if self._search_worker and self._search_worker.isRunning():
             self._search_worker.stop()
             self._search_worker.wait()

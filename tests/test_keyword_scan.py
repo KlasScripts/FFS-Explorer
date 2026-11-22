@@ -428,3 +428,34 @@ def test_media_searched_by_saved_metadata(tmp_path):
     assert found['DCIM/a.jpg'][0][1].startswith('[metadata: EXIF ImageDescription]')
     assert [o for o, _c in found['DCIM/b.png']] == [len(png) + len(b'hidden ')]
     assert [o for o, _c in found['DCIM/c.jpg']] == [len(b'other ')]
+
+
+
+def test_file_and_folder_names_are_searched():
+    """Keyword Search over names (2026-11-22): the last part of each path,
+    files and folders, case and accent forms included; a matching folder is
+    one hit (its files are not hits by its name); app code can be left out."""
+    import unicodedata
+    from PySide6.QtCore import QCoreApplication
+    import keyword_search
+    app = QCoreApplication.instance() or QCoreApplication([])
+    nfd = unicodedata.normalize('NFD', 'Bl\u00e5b\u00e6r')
+    files = ['mobile/Media/DCIM/Passport_Scan.JPG', f'mobile/Documents/{nfd}.txt',
+             'mobile/Trips/notes.txt', 'containers/Bundle/Application/G/App.app/passport.png']
+    folders = ['mobile/Trips', 'mobile/Passport Photos', 'mobile/Media']
+    found = {}
+
+    def run(term, skip=None):
+        found.clear()
+        w = keyword_search.NameSearchWorker(term, files, folders, lambda p: 'fs/' + p, skip_entry=skip)
+        w.results_found.connect(lambda n, h: found.setdefault(n, []).extend(h))
+        w.run()
+        return found
+    got = run('passport', skip=lambda z: '.app/' in z)
+    assert set(got) == {'fs/mobile/Media/DCIM/Passport_Scan.JPG', 'fs/mobile/Passport Photos'}
+    assert got['fs/mobile/Media/DCIM/Passport_Scan.JPG'][0][1] == '[file name] [Passport]_Scan.JPG'
+    assert got['fs/mobile/Passport Photos'][0][1].startswith('[folder name] [Passport]')
+    assert 'fs/containers/Bundle/Application/G/App.app/passport.png' in run('passport')
+    got = run('bl\u00e5b\u00e6r')                  # composed keyword, decomposed name
+    assert list(got) == [f'fs/mobile/Documents/{nfd}.txt']
+    assert set(run('trips')) == {'fs/mobile/Trips'}   # the folder, not the files in it

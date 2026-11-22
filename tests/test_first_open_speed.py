@@ -147,3 +147,136 @@ def test_header_counts_saved_at_parse_are_what_the_window_reads(tmp_path):
         assert got == want and not calls          # read back, not counted again
     finally:
         ui_list.table.close()
+
+
+def test_prefix_checks_match_a_scan_of_every_name():
+    """_has_prefix answers from prefix sets made once (format detection asked
+    19 times, each miss a scan of all 2.5 million names): the same answers."""
+    import random
+    import adapters.ffs as AF
+    rnd = random.Random(4)
+    segs = ['filesystem1', 'filesystem2', 'private', 'var', 'mobile', 'a b', 'x.db', '\u00e9', '', 'Dump']
+
+    def scan(zn, prefix):
+        slash = prefix if prefix.endswith('/') else prefix + '/'
+        bare = prefix.rstrip('/')
+        return bare in zn or slash in zn or any(n.startswith(slash) for n in zn)
+    for trial in range(3):
+        names = set()
+        for _ in range(5000):
+            d = rnd.randint(1, 6)
+            n = ('/' if rnd.random() < 0.2 else '') + '/'.join(rnd.choice(segs) for _ in range(d))
+            names.add(n + ('/' if rnd.random() < 0.2 else ''))
+        names = frozenset(names)
+        for _ in range(1500):
+            d = rnd.randint(1, 5)
+            p = (('/' if rnd.random() < 0.2 else '') + '/'.join(rnd.choice(segs + ['zz']) for _ in range(d))
+                 + ('/' if rnd.random() < 0.3 else ''))
+            assert AF._has_prefix(names, p) == scan(names, p), p
+        assert ('Dump/' in AF._prefix_set(names, 1)) == any(n.startswith('Dump/') for n in names)
+
+
+def test_folder_tree_has_the_same_children_as_before():
+    """_build_folder_tree with lists and one 'linked' set: every folder has
+    the same children as the set-per-folder version gave."""
+    import random
+    from collections import defaultdict
+    from ffs_metadata import _build_folder_tree
+
+    def by_sets(keys):
+        sets = defaultdict(set)
+        for p in keys:
+            if p:
+                sets[p.rsplit('/', 1)[0] if '/' in p else ''].add(p)
+        for path in list(sets):
+            cur = path
+            while cur:
+                par = cur.rsplit('/', 1)[0] if '/' in cur else ''
+                if par not in sets:
+                    sets[par] = {cur}
+                elif cur not in sets[par]:
+                    sets[par].add(cur)
+                else:
+                    break
+                cur = par
+        return sets
+    rnd = random.Random(9)
+    for _ in range(20):
+        keys = {}
+        for _ in range(2000):
+            d = rnd.randint(1, 5)
+            p = ('/' if rnd.random() < 0.1 else '') + '/'.join(rnd.choice(['a', 'b', 'c d', 'x.db']) for _ in range(d))
+            keys[p + ('/' if rnd.random() < 0.05 else '')] = {}
+        keys[''] = {}
+        got, want = _build_folder_tree(keys), by_sets(keys)
+        assert got.keys() == want.keys()
+        for k in want:
+            assert len(got[k]) == len(want[k]) and set(got[k]) == want[k]
+
+
+def test_file_table_written_at_once_is_the_same_file(tmp_path):
+    """file_table.write builds its columns at once (_columns_at_once) or
+    declines to the entry-by-entry way: the same bytes either way, for plain
+    entries and for each kind that must be stored whole or declined."""
+    import random
+    import file_table as ft
+    rnd = random.Random(2)
+
+    def entry(kind):
+        v = {k: rnd.choice([None, rnd.randrange(-10**12, 10**12)]) for k in ft.FIELDS}
+        v['xattr'] = rnd.choice([{}, {}, {'com.apple.x': b'\x00\x01'}])
+        if kind == 'bool':
+            v['uid'] = True
+        if kind == 'float':
+            v['size'] = 1.5
+        if kind == 'big':
+            v['mtime'] = 1 << 63
+        if kind == 'order':
+            v = dict(reversed(list(v.items())))
+        if kind == 'odd':
+            v = {'note': 'x', 'n': [1, 2]}
+        return v
+    for kinds in (['plain'], ['plain', 'odd'], ['plain', 'order'], ['plain', 'bool'],
+                  ['plain', 'float'], ['plain', 'big'], ['odd']):
+        ui = {f'a/b{i}': entry(rnd.choice(kinds) if rnd.random() < 0.3 else kinds[0]) for i in range(800)}
+        fm = {'': ['a'], 'a': list(ui)}
+        cols_flags = []
+        for way in ('at_once', 'entry_by_entry'):
+            path = str(tmp_path / f'{way}.ffsfiles')
+            real = ft._columns_at_once
+            if way == 'entry_by_entry':
+                ft._columns_at_once = lambda *a, **k: None
+            try:
+                ft.write(ui, fm, path)
+            finally:
+                ft._columns_at_once = real
+            cols_flags.append(open(path, 'rb').read())
+        assert cols_flags[0] == cols_flags[1], kinds
+
+
+def test_fast_extension_is_splitext():
+    import os
+    import random
+    import file_types
+    rnd = random.Random(5)
+    alpha = ['.', '.', 'a', 'B', 'db', '-', '_', '\u00e9', ' ', '/', '\\', ':', 'wal', 'JPG']
+    for _ in range(50000):
+        n = ''.join(rnd.choice(alpha) for _ in range(rnd.randint(0, 8)))
+        assert file_types._ext(n) == os.path.splitext(n)[1], n
+
+
+def test_sizes_and_stored_from_the_index_are_the_entries(tmp_path):
+    import zip_cd_cache
+    from ffs_metadata import _sizes_and_stored
+    names = ['d/', 'd/a.txt', 'd/b', 'e/', 'e/c.jpg']
+    zp = str(tmp_path / 'c.zip')
+    _zip_with_times(zp, names)
+    case = str(tmp_path / 'case')
+    os.makedirs(case)
+    assert zip_cd_cache.save(zp, case)
+    infos = zip_cd_cache.load(zp, case)
+    sizes, stored = _sizes_and_stored(infos)
+    plain = list(infos)
+    assert list(sizes.items()) == [(i.filename, i.file_size) for i in plain]
+    assert ([(i.filename, i.header_offset) for i in stored]
+            == [(i.filename, i.header_offset) for i in plain if i.compress_type == 0 and i.file_size > 0])

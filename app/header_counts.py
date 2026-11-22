@@ -84,10 +84,12 @@ def _header_tier_counts(items, ffs_adapter, z, with_tier3: bool = False,
     for n, (ui_path, _meta) in enumerate(items):
         if pause and n % 2000 == 1999:
             time.sleep(0.001)   # a real pause: sleep(0) left the GUI waiting
-        in_scope = _header_candidate_matches(ui_path, scan_folders, 2, excludes)
+        # _header_candidate_matches(ui_path, ..., 2 / 1, excludes), written
+        # out: two calls per entry were ~half of this loop (2026-11-22)
+        in_scope = ui_path.startswith(scan_folders) and not (excludes and ui_path.startswith(excludes))
         if not in_scope and not with_tier3:
             continue
-        unknown = in_scope and _header_candidate_matches(ui_path, scan_folders, 1, excludes)
+        unknown = in_scope and _get_file_type(ui_path.rsplit('/', 1)[-1]) == 'Other'
         legacy[2] += in_scope
         legacy[1] += unknown
         if has_file is not None:
@@ -118,7 +120,8 @@ def _add_tier_counts(a: dict, b: dict) -> dict:
 
 
 def _header_tier_counts_cached(ui_metadata, ffs_adapter, z, with_tier3: bool,
-                               case_dir: str | None, pause: bool = True) -> dict | None:
+                               case_dir: str | None, pause: bool = True,
+                               keys=None) -> dict | None:
     """_header_tier_counts for the whole file list, with the part that comes
     from the extraction's own files (the file table, which never changes for
     a case) saved in casecache.db and reused at every later open: 3-9 s of
@@ -151,7 +154,10 @@ def _header_tier_counts_cached(ui_metadata, ffs_adapter, z, with_tier3: bool,
     except Exception:
         stored = None
     if stored is None:
-        stored = _header_tier_counts([(p, None) for p, _i in ui_metadata._live()],
+        # *keys*: the file table's names in its order, when the caller has
+        # them (the parse process, which just wrote the table from them)
+        names = keys if keys is not None else (p for p, _i in ui_metadata._live())
+        stored = _header_tier_counts([(p, None) for p in names],
                                      ffs_adapter, z, with_tier3=with_tier3, pause=pause)
         if stored is None:
             return None

@@ -54,7 +54,42 @@ def _has_prefix(zip_names: frozenset, prefix: str) -> bool:
     bare  = prefix.rstrip("/")
     if bare in zip_names or slash in zip_names:
         return True
-    return any(n.startswith(slash) for n in zip_names)
+    # Answered from the set of every name's leading folders at this depth,
+    # made once per name set (_prefix_set): format detection asks 19 times,
+    # 18 of them misses, and each miss scanned all 2.5 million names on the
+    # synthetic iPhone (3.3 s, 2026-11-22). A first folder no name has is
+    # answered from the depth-1 set.
+    depth = slash.count("/")
+    if depth > 1 and slash[:slash.index("/") + 1] not in _prefix_set(zip_names, 1):
+        return False
+    return slash in _prefix_set(zip_names, depth)
+
+
+_PREFIX_SETS: dict = {}   # (id of the name set, depth) -> (name set, set of prefixes)
+
+
+def _prefix_set(zip_names, depth: int) -> set:
+    """Every name's first *depth* folders, each ending in '/' (a name with
+    fewer folders gives none), for the one name set last asked about."""
+    key = (id(zip_names), depth)
+    hit = _PREFIX_SETS.get(key)
+    if hit is not None and hit[0] is zip_names:
+        return hit[1]
+    if any(v[0] is not zip_names for v in _PREFIX_SETS.values()):
+        _PREFIX_SETS.clear()            # keep only the current archive's
+    if depth == 1:
+        out = {n[:i + 1] for n in zip_names if (i := n.find("/")) >= 0}
+    elif depth == 2:
+        out = {n[:j + 1] for n in zip_names
+               if (i := n.find("/")) >= 0 and (j := n.find("/", i + 1)) >= 0}
+    else:
+        out = set()
+        for n in zip_names:
+            parts = n.split("/", depth)
+            if len(parts) > depth:
+                out.add("/".join(parts[:depth]) + "/")
+    _PREFIX_SETS[key] = (zip_names, out)
+    return out
 
 
 def _detect_user_prefix(zip_names: frozenset) -> tuple[str, bool]:
@@ -557,7 +592,9 @@ class FfsAdapter:
             return cls(cls.FORMAT_GRAYKEY, "private/var", "")
         if names is None:
             names = frozenset(z.namelist())
-        if any(n.startswith("Dump/") for n in names) and _gk._has_ut_extras(z):
+        # "Dump/" in the depth-1 set is any name starting with "Dump/"
+        # (_prefix_set, made once; the scan of every name took ~1 s)
+        if "Dump/" in _prefix_set(names, 1) and _gk._has_ut_extras(z):
             return cls(cls.FORMAT_ZIP_EXTRAS, "Dump", "")
         return cls.detect_from_names(names)
 

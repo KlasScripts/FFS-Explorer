@@ -49,6 +49,8 @@ import struct
 import uuid
 import zlib
 from array import array
+from itertools import repeat
+from operator import add, is_, itemgetter, mul
 from collections.abc import MutableMapping, Set
 
 import msgpack
@@ -99,6 +101,103 @@ def new_path(case_dir: str) -> str:
     return os.path.join(case_dir, f'files-{uuid.uuid4().hex}{SUFFIX}')
 
 
+_ZERO_ROW = (0,) * len(FIELDS)
+_NONE_TYPE = type(None)
+
+
+def _columns_at_once(ui_metadata, n_files, order, flags, p_start, p_len, pool):
+    """write()'s number columns, flags and extra-data pool, the same bytes
+    as _columns_entry_by_entry, or None to have it do them: each entry's
+    fields are taken in one C call (itemgetter), rows become columns in C
+    (zip(*)), and a column is checked by its set of types and made by
+    array('q'), which refuses a number out of range. One field at a time
+    for 2.19 million entries took ~16 s of a first open (2026-11-22).
+    Declines (None) for a column holding anything but int/None (a bool or
+    float included) or a number array('q') cannot hold: the entry-by-entry
+    way then decides per entry, as it always did."""
+    getf = itemgetter(*FIELDS)
+    n_order = len(order)
+    rows = []
+    push = rows.append
+    extra = []          # (row, xattr dict, None) with xattrs, or (row, None, entry): stored whole
+    for i, v in enumerate(ui_metadata.values()):
+        if type(v) is dict and len(v) == n_order and tuple(v) == order:
+            xa = v['xattr']
+            if type(xa) is dict and (not xa or _plain(xa)):
+                push(getf(v))
+                if xa:
+                    extra.append((i, xa, None))
+                continue
+        push(_ZERO_ROW)
+        extra.append((i, None, v))
+    if len(rows) != n_files:
+        return None
+    cols = {}
+    if n_files:
+        null_bits = None    # each entry's null bits, added up column by column (all in C)
+        zero = {None: 0}.get
+        for b, (k, col) in enumerate(zip(FIELDS, zip(*rows))):
+            types = set(map(type, col))
+            if not types <= {int, _NONE_TYPE}:
+                return None
+            try:
+                if _NONE_TYPE in types:
+                    cols[k] = array('q', map(zero, col, col))     # None -> 0
+                    bits = map(mul, map(is_, col, repeat(None)), repeat(1 << b))
+                    null_bits = list(bits) if null_bits is None else list(map(add, null_bits, bits))
+                else:
+                    cols[k] = array('q', col)
+            except OverflowError:
+                return None
+        if null_bits is not None:
+            flags[:] = array('H', null_bits)
+    else:
+        cols = {k: array('q') for k in FIELDS}
+    del rows
+    # the pool in entry order, as the entry-by-entry way writes it
+    for i, xa, whole in extra:
+        if xa is not None:
+            blob = msgpack.packb(xa, use_bin_type=True)
+        else:
+            if not _plain(whole):
+                raise ValueError(f'file-list entry {i} would not read back exactly')
+            blob = msgpack.packb(whole, use_bin_type=True)
+            flags[i] = WHOLE
+        p_start[i], p_len[i] = len(pool), len(blob)
+        pool += blob
+    return cols
+
+
+def _columns_entry_by_entry(ui_metadata, names, n_files, order, flags, p_start, p_len, pool):
+    """The file list's number columns, filled one entry and field at a time
+    (and flags, extra-data pool): the way write() always did it, kept for a
+    list _columns_at_once declines."""
+    cols = {k: array('q', bytes(8 * n_files)) for k in FIELDS}
+    for i in range(n_files):
+        v = ui_metadata[names[i]]
+        if _columnar(v, order):
+            fl = 0
+            for b, k in enumerate(FIELDS):
+                x = v[k]
+                if x is None:
+                    fl |= 1 << b
+                else:
+                    cols[k][i] = x
+            if v['xattr']:
+                blob = msgpack.packb(v['xattr'], use_bin_type=True)
+                p_start[i], p_len[i] = len(pool), len(blob)
+                pool += blob
+            flags[i] = fl
+        else:
+            if not _plain(v):
+                raise ValueError(f'file-list entry {i} would not read back exactly')
+            blob = msgpack.packb(v, use_bin_type=True)
+            p_start[i], p_len[i] = len(pool), len(blob)
+            pool += blob
+            flags[i] = WHOLE
+    return cols
+
+
 def write(ui_metadata: dict, folder_map: dict, path: str, in_zip=None) -> None:
     """Write the file list and folder contents to *path* (through a temporary
     file). ValueError if anything would not read back exactly. *in_zip*:
@@ -132,32 +231,16 @@ def write(ui_metadata: dict, folder_map: dict, path: str, in_zip=None) -> None:
     first = next((v for v in ui_metadata.values()
                   if type(v) is dict and v.keys() == _FIELD_SET), None)
     order = tuple(first) if first is not None else FIELDS + ('xattr',)
-    cols = {k: array('q', bytes(8 * n_files)) for k in FIELDS}
     flags = array('H', bytes(2 * n_files))
     p_start, p_len = array('Q', bytes(8 * n_files)), array('I', bytes(4 * n_files))
     pool = bytearray()
-    for i in range(n_files):
-        v = ui_metadata[names[i]]
-        if _columnar(v, order):
-            fl = 0
-            for b, k in enumerate(FIELDS):
-                x = v[k]
-                if x is None:
-                    fl |= 1 << b
-                else:
-                    cols[k][i] = x
-            if v['xattr']:
-                blob = msgpack.packb(v['xattr'], use_bin_type=True)
-                p_start[i], p_len[i] = len(pool), len(blob)
-                pool += blob
-            flags[i] = fl
-        else:
-            if not _plain(v):
-                raise ValueError(f'file-list entry {i} would not read back exactly')
-            blob = msgpack.packb(v, use_bin_type=True)
-            p_start[i], p_len[i] = len(pool), len(blob)
-            pool += blob
-            flags[i] = WHOLE
+    cols = _columns_at_once(ui_metadata, n_files, order, flags, p_start, p_len, pool)
+    if cols is None:            # declined: start clean, entry by entry
+        flags = array('H', bytes(2 * n_files))
+        p_start, p_len = array('Q', bytes(8 * n_files)), array('I', bytes(4 * n_files))
+        pool = bytearray()
+        cols = _columns_entry_by_entry(ui_metadata, names, n_files, order, flags,
+                                       p_start, p_len, pool)
     n_in_zip = 0
     if in_zip is not None:
         for p in in_zip:

@@ -78,10 +78,23 @@ _EXT_TO_TYPE: dict = {
 _WEB_CACHE_NAME = re.compile(r'^[0-9a-f]{16}_[01s]$')
 
 
+def _ext(name: str) -> str:
+    """os.path.splitext(name)[1], without its cost for a plain name (no
+    path separator or drive): the part from the last '.', unless only dots
+    come before it ('.bashrc' has none). _get_file_type runs once per entry
+    in several whole-archive loops; splitext was ~40% of it (2026-11-22)."""
+    if '/' in name or '\\' in name or ':' in name:
+        return os.path.splitext(name)[1]
+    i = name.rfind('.')
+    if i <= 0 or not name[:i].lstrip('.'):
+        return ''
+    return name[i:]
+
+
 def _get_file_type(name):
     # Dotted sidecar extensions (.db-wal, .sqlite-journal, …) are all in the
     # table; only bare dotless companions ('foo-wal') need the endswith fallback.
-    ft = _EXT_TO_TYPE.get(os.path.splitext(name)[1].lower())
+    ft = _EXT_TO_TYPE.get(_ext(name).lower())
     if ft is not None:
         return ft
     if name.lower().endswith(('-wal', '-shm')):

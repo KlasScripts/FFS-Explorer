@@ -87,7 +87,7 @@ def _empty_folder_entries(adapter_args, zip_names, ui_metadata, folder_map) -> l
     return out
 
 
-def _zip_names_index(zip_names, zip_path, case_dir):
+def _zip_names_index(zip_names, zip_path, case_dir, made_from=None):
     """{'file', 'cd_sha256', 'n'} naming the case's zip index (.ffsidx) when
     its set of names is exactly *zip_names*, so the snapshot need not hold
     the names (0.54 GB as a set, most of the blob, synthetic iPhone); else
@@ -99,7 +99,14 @@ def _zip_names_index(zip_names, zip_path, case_dir):
         path = zip_index.index_path(zip_path, case_dir)
         idx = zip_index.ZipIndex(path)
         try:
-            names = {idx.name(i) for i in range(len(idx))}
+            if (made_from is not None and made_from.cd_sha256 == idx.cd_sha256
+                    and len(made_from) == len(idx)):
+                # *zip_names* was made from this same index (parse stage 4,
+                # _sizes_and_stored): equal by construction. Comparing them
+                # took 7.2 s on 2.5 million names (2026-11-22).
+                return {'file': os.path.basename(path), 'cd_sha256': idx.cd_sha256,
+                        'n': len(zip_names)}
+            names = set(idx.all_names())      # one decode of the pool, not one per name
             want = zip_names if isinstance(zip_names, (set, frozenset)) else set(zip_names)
             if names != want:
                 return None
@@ -119,14 +126,15 @@ def _names_from_index(info: dict, case_dir: str, yield_cb=None) -> list:
     try:
         if idx.cd_sha256 != info['cd_sha256']:
             raise ValueError('the zip index is not the one this snapshot was made with')
-        seen, out = set(), []
-        for i in range(len(idx)):
-            n = idx.name(i)
-            if n not in seen:
-                seen.add(n)
-                out.append(n)
-            if yield_cb and i % _STREAM_YIELD == _STREAM_YIELD - 1:
-                yield_cb()
+        # each distinct name once, in index order: one decode of the name
+        # pool (ZipIndex.all_names) instead of one per name
+        names = idx.all_names()
+        if yield_cb:
+            yield_cb()
+        out = list(dict.fromkeys(names))
+        del names
+        if yield_cb:
+            yield_cb()
         if len(out) != info['n']:
             raise ValueError('the zip index does not match the snapshot')
         return out
@@ -153,7 +161,7 @@ def _leveldb_dirs(folder_map) -> list:
 
 def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
                   ui_metadata, folder_map, metadata_only, file_table_dir=None,
-                  zip_path=None) -> bytes:
+                  zip_path=None, names_from_index=None) -> bytes:
     """Pack a load snapshot as a header object followed by chunked ui_metadata
     and folder_map objects (see SNAPSHOT_VERSION).  Concatenated msgpack
     objects, read back by unpack_snapshot.
@@ -179,7 +187,8 @@ def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
         except ValueError:
             table_name = None
             ui_in_table = False
-    names_index = _zip_names_index(zip_names, zip_path, file_table_dir) if table_name else None
+    names_index = (_zip_names_index(zip_names, zip_path, file_table_dir, names_from_index)
+                   if table_name else None)
     if table_name is None:
         ui_parts = [msgpack.packb(c, use_bin_type=True)
                     for c in _chunked(ui_metadata, _SNAP_CHUNK)]
@@ -575,37 +584,50 @@ def _build_folder_tree(ui_metadata: dict, status_cb=None) -> dict:
     """Build and return folder_map from ui_metadata paths."""
     if status_cb:
         status_cb(f"Building folder tree ({len(ui_metadata):,} entries)...")
-    # defaultdict avoids allocating a throwaway set() per iteration the way
-    # setdefault(parent, set()) would — this loop runs once per archive entry.
-    folder_map_sets: defaultdict[str, set] = defaultdict(set)
+    # Each folder's children go straight into a list; one set says which
+    # paths are already in their parent's list (every file-list key is,
+    # after the first pass). The same children as the earlier version
+    # (a set per folder, then lists): ~3x faster on 2.19 million entries
+    # (17 s of the synthetic iPhone's parse, 2026-11-22). Children are in
+    # file-list order then the order folders were linked; a set's order was
+    # arbitrary (it changed with every process), so nothing relies on it.
+    folder_map: dict[str, list] = {}
+    get = folder_map.get
     for i, ui_path in enumerate(ui_metadata):
         if not ui_path:
             continue  # skip empty-string keys from malformed archives
-        parent = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ""
-        folder_map_sets[parent].add(ui_path)
-        if i % _YIELD_EVERY == 0:
-            time.sleep(0)   # yield GIL so the main thread can process events
+        k = ui_path.rfind('/')
+        parent = ui_path[:k] if k >= 0 else ""
+        kids = get(parent)
+        if kids is None:
+            folder_map[parent] = [ui_path]
+        else:
+            kids.append(ui_path)
+        if not i & 0x3FFFF:
+            time.sleep(0)   # yield GIL (the in-process fallback runs beside the GUI)
     if status_cb:
         status_cb("Resolving folder hierarchy...")
-    for i, path in enumerate(list(folder_map_sets.keys())):
+    linked = set(ui_metadata)
+    for i, path in enumerate(list(folder_map)):
         current = path
-        while current:
-            parent = current.rsplit('/', 1)[0] if '/' in current else ""
-            if parent not in folder_map_sets:
-                folder_map_sets[parent] = {current}
-            elif current not in folder_map_sets[parent]:
-                folder_map_sets[parent].add(current)
+        while current and current not in linked:
+            k = current.rfind('/')
+            parent = current[:k] if k >= 0 else ""
+            kids = get(parent)
+            if kids is None:
+                folder_map[parent] = [current]
             else:
-                break
+                kids.append(current)
+            linked.add(current)
             current = parent
-        if i % _YIELD_EVERY == 0:
+        if not i & 0x3FFFF:
             time.sleep(0)
-    return {k: list(v) for k, v in folder_map_sets.items()}
+    return folder_map
 
 
 # ── Full archive parse (used by subprocess and in-process fallback) ──────────────
 
-def _save_header_tier_counts(zip_path: str, case_dir: str, ffs_adapter) -> None:
+def _save_header_tier_counts(zip_path: str, case_dir: str, ffs_adapter, keys=None) -> None:
     """Count the header-scan tiers here, in the parse process, and save them
     in casecache.db (header_counts._header_tier_counts_cached), against the
     file table just written and the case's zip index: the window's own
@@ -625,15 +647,36 @@ def _save_header_tier_counts(zip_path: str, case_dir: str, ffs_adapter) -> None:
             return
         ui_list, _fm = file_table.open_maps(tables[0])
         try:
+            # *keys*: the table's own names, in its order (they were just
+            # written from them), so they are not read back from it
             header_counts._header_tier_counts_cached(
                 ui_list, ffs_adapter, CachedZipView(zip_path, infos), False, case_dir,
-                pause=False)
+                pause=False, keys=keys)
         finally:
             ui_list.table.close()
     except Exception as e:
         import startup_log
         startup_log.message('warning', f"header-scan counts not saved at parse "
                             f"({type(e).__name__}: {e}); the window counts them instead")
+
+
+def _sizes_and_stored(infos) -> tuple[dict, list]:
+    """({name: uncompressed size} for every entry, in archive order, and the
+    stored (uncompressed) entries with data, for _probe_delta). From the
+    case's mapped index the names are cut from its name pool and the sizes
+    and methods read from its columns, and only the stored entries are
+    made: making all 2.5 million entries for this took ~5.6 s of a first
+    open (2026-11-22). Otherwise from the entries themselves. The same
+    result either way."""
+    index = getattr(infos, '_index', None)
+    if index is None or not hasattr(index, 'name_start'):
+        sizes = {i.filename: i.file_size for i in infos}
+        return sizes, [i for i in infos if i.compress_type == zipfile.ZIP_STORED and i.file_size > 0]
+    names = index.all_names()
+    sizes = dict(zip(names, index.file_size))
+    stored = [infos[k] for k, (method, size) in enumerate(zip(index.compress_type, index.file_size))
+              if method == zipfile.ZIP_STORED and size > 0]
+    return sizes, stored
 
 
 def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict:
@@ -660,12 +703,12 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
     status("Reading zip directory...")
     z_ctx = CachedZipView(zip_path, cached_infos)
     try:
-        infolist  = z_ctx.infolist()
-        zip_sizes = {info.filename: info.file_size for info in infolist}
+        zip_sizes, stored = _sizes_and_stored(cached_infos)
         zip_names = frozenset(zip_sizes)
+        # the index zip_names was made from, if it was (pack_snapshot skips
+        # checking the two against each other)
+        names_from_index = getattr(cached_infos, '_index', None)
         ffs_adapter = FfsAdapter.detect(z_ctx, zip_names)
-        stored = [i for i in infolist
-                  if i.compress_type == zipfile.ZIP_STORED and i.file_size > 0]
         delta = _probe_delta(zip_path, stored)
 
         cached_guid_bundle = None
@@ -755,11 +798,11 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
     snapshot_blob = pack_snapshot(
         adapter_args, delta, zip_names, zip_ui_paths,
         ui_metadata, folder_map, metadata_only, file_table_dir=case_dir or None,
-        zip_path=zip_path)
+        zip_path=zip_path, names_from_index=names_from_index)
     if case_dir:
         status(f"Counting the files each header-scan tier would read "
                f"({len(ui_metadata):,} entries)…")
-        _save_header_tier_counts(zip_path, case_dir, ffs_adapter)
+        _save_header_tier_counts(zip_path, case_dir, ffs_adapter, keys=list(ui_metadata))
 
     return {
         'adapter_args':   [ffs_adapter.format, ffs_adapter.user_prefix,
@@ -814,6 +857,12 @@ def _parse_child(conn, zip_path: str, case_dir: str) -> None:
     """
     import child_priority
     child_priority.lower_this_process()   # the window is served first
+    # No garbage collection in this process: it holds millions of objects,
+    # and each collection pass walked them all (the folder tree took 9.6 s
+    # instead of 1.6 s on 2.19 million entries, 2026-11-22). Nothing here
+    # makes cycles worth collecting, and the process ends when done.
+    import gc
+    gc.disable()
     try:
         def status(msg):
             try:
@@ -835,3 +884,4 @@ def _parse_child(conn, zip_path: str, case_dir: str) -> None:
             conn.close()
         except Exception:
             pass
+    child_priority.end_now(0)   # everything is saved; skip freeing it all

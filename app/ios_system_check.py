@@ -383,7 +383,8 @@ def run_for_case(zip_path: str, case_dir: str) -> None:
     adapter = FfsAdapter.detect(view, frozenset(names))
     result = check(names, adapter, lambda n: view.open(n).read())
     if result is None:
-        return
+        child_priority.end_now(0)
     with closing(_open_results_db(case_dir)) as db:
         save(db, result)
+    child_priority.end_now(0)   # saved; skip freeing 2.5 million names
 

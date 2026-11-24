@@ -894,7 +894,7 @@ order.** *Decision, 2026-10-12; the numbering is Code only.*
     chrome_cache_media, chrome_favicons, chrome_offline_pages); only iOS SMS
     has been checked on real data;
   - the other 30 parsers declare none; any that reference files need it.
-  Tracked in IDEAS.md idea 4; the rule for new parsers is in
+  Tracked in the ffs-notes repo, `research/IDEAS.md` idea 4; the rule for new parsers is in
   WRITING_ARTIFACT_PARSERS.md (`media_fields`).
 - *Fixed 2026-10-22, verified on all six test archives:*
   - GrayKey iOS: paths built from `mobile/...` (SMS attachments, Photos)
@@ -1549,19 +1549,21 @@ Tools menu when AI access was off once hid every other Tools action too.
 
 ## 17. Corrections needed elsewhere
 
-Recorded here; not yet applied.
+The four `FFS_processing.md` corrections below were applied on 2026-11-24.
+That file now lives in the ffs-notes repo at `research/FFS_processing.md`.
 
-1. **`FFS_processing.md`** says Cellebrite Android is handled as
+1. ~~**`FFS_processing.md`** says Cellebrite Android is handled as
    `FORMAT_ZIP_EXTRAS`. That is only layout D1; layout D2 detects as
-   `cellebrite` (A-2).
-2. **`FFS_processing.md`** says Cellebrite physical entries "contain
+   `cellebrite` (A-2).~~ Applied 2026-11-24.
+2. ~~**`FFS_processing.md`** says Cellebrite physical entries "contain
    32-character hex suffixes". On the archives checked, the zip and the
-   msgpack both carry the full `<name>-<hex>`; nothing is shortened (A-7).
-3. **`FFS_processing.md`** refers to a `StreamingZipIndex`, which no longer
-   exists in the code.
-4. **`FFS_processing.md`** says GrayKey Android gets a GUID mapping "if app
+   msgpack both carry the full `<name>-<hex>`; nothing is shortened (A-7).~~
+   Applied 2026-11-24.
+3. ~~**`FFS_processing.md`** refers to a `StreamingZipIndex`, which no longer
+   exists in the code.~~ Applied 2026-11-24. The sentence was removed.
+4. ~~**`FFS_processing.md`** says GrayKey Android gets a GUID mapping "if app
    containers exist". In fact `build_ui_metadata` builds the map only when
-   `/private/var/mobile/Containers/` entries exist, i.e. iOS.
+   `/private/var/mobile/Containers/` entries exist, i.e. iOS.~~ Applied 2026-11-24.
 5. ~~**`CLAUDE.md`** section 1 wording on GrayKey and `private/var/` (A-4).~~
    Resolved 2026-10-20: that text moved here and was corrected.
 

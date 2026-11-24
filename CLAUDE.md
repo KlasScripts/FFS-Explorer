@@ -27,10 +27,8 @@ section map below instead of reading it whole.
 | **`ASSUMPTIONS.md`** | **Every fact about the data and every design decision**, with its evidence: the FFS formats and paths, what the zip reader relies on, scan scope, recovery limits, review-feature decisions, rejected ideas and why, Qt/build pitfalls. |
 | `CLAUDE.md` (this file) | Code map and coding rules only. No facts or decision history. |
 | `WRITING_ARTIFACT_PARSERS.md` | How to write a parser, with examples. |
-| `VERIFICATION_STATUS.md` | Which parts a human has reviewed. |
 | **Issue log** (ffs-notes repo) | **Open bugs, features, and ideas.** GitHub issues on `KlasScripts/ffs-notes`, plus the `ISSUES.md` inbox there. See "Issue log" below. |
-| `IDEAS.md` | Older ideas with evidence and sketches. Read for evidence; open work is tracked in the issue log. |
-| `FFS_processing.md` | Older processing walkthrough; `ASSUMPTIONS.md` §17 lists its known errors. |
+| Thinking write-ups (ffs-notes `research/`) | Older ideas, the processing walkthrough, verification status, and review notes. Evidence only. Open work is the issue log. |
 
 **`ASSUMPTIONS.md` is read-only.**
 - Read the relevant entries before changing code they name.
@@ -317,9 +315,9 @@ commit if the module table is out of sync with `app/`.
 
 ## Human verification status (instruction to Claude)
 
-`VERIFICATION_STATUS.md` tracks which parts of this AI-written codebase a
-human has walked through and confirmed (🔴 not reviewed / 🟡 changed since /
-🟢 reviewed).
+`research/VERIFICATION_STATUS.md` in the ffs-notes repo tracks which parts of
+this AI-written codebase a human has walked through and confirmed
+(🔴 not reviewed / 🟡 changed since / 🟢 reviewed).
 - **Before editing a file or `ffs-explorer.py` section listed as 🟢**, name
   the row and its date first, so the user can decide whether to re-review.
 - A real functional change to a 🟢 row should drop it to 🟡.

@@ -1,129 +1,96 @@
 # FFS Explorer
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![PySide6](https://img.shields.io/badge/UI-PySide6-green.svg)](https://pypi.org/project/PySide6/)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+A forensic viewer for GrayKey and Cellebrite UFED iOS and Android full file system zips. Browse without unpacking, then review the media, search, and read the artifact reports.
 
-A desktop application for exploring **iOS & Android Full File System (FFS)** extractions — the kind produced by tools such as **GrayKey** and **Cellebrite UFED** — directly from the ZIP archive with no unpacking required.
+## Install
 
-It reconstructs the original file system from vendor-specific metadata, resolves iOS app-container identifiers, and provides previews (hex, text, and SQLite) for inspecting individual files.
+### Windows program
 
-The project is built as a **learning, understanding, and validation** aid: a way to see how these extractions are structured, how vendor metadata is stored, and how on-disk artefacts such as SQLite databases (including their write-ahead logs) are laid out — and to cross-check what mainstream forensic suites report against the raw data.
+Download the latest release from [GitHub releases](https://github.com/KlasScripts/FFS-Explorer/releases/latest). The file is named `ffs-explorer-windows-v*.zip`. Unzip it and run `ffs-explorer.exe`.
 
----
+There is no Mac or Linux build. On those systems, run from source.
 
-## ⚠️ Purpose & Disclaimer
+### From source
 
-> **Disclaimer:** This project is intended for educational and research purposes using publicly available data structures. It does not represent operational practices or capabilities of any law enforcement organisation.
->
-> **Note:** This tool has not been validated for evidential or casework use.
+Python 3.12, on Windows, Mac, or Linux.
 
-It is intended for learning about FFS data structures and for sanity-checking / validating the behaviour of mainstream forensic tools — not as a replacement for them, and not for producing evidential results.
+```
+git clone https://github.com/KlasScripts/FFS-Explorer.git
+cd FFS-Explorer
+```
 
----
+Windows:
 
-## 📦 Supported Extraction Formats
+```
+py -3.12 -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python ffs-explorer.py
+```
 
-Unlike standard archive utilities, this browser implements custom parsers to handle how forensic vendors store metadata.
+Mac and Linux:
 
-### 1. Cellebrite UFED (.zip)
-Cellebrite packages FFS extractions using a split structure where the ZIP entries themselves lack standard metadata:
-*   `filesystem2/`: Raw file system tree.
-*   `metadata2/metadata.msgpack`: MessagePack dictionary containing `ctime`, `mtime`, and `size`.
-*   **Handling:** All metadata is reconstructed by mapping the msgpack sidecar to the file tree.
+```
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python ffs-explorer.py
+```
 
-### 2. GrayKey (`full_files` .zip)
-GrayKey uses a different approach, storing critical file metadata within **ZIP extra fields** rather than the central directory.
-*   **Handling:** The browser manually parses GrayKey ZIP extra fields to normalize timestamps and file attributes, ensuring a consistent tree structure across vendors.
+On a Mac, the usual PyAV install cannot decode HEVC video thumbnails.
 
----
+## The window
 
-## 🧠 Key Features
+You open the zip and stay in it. The main window has five tabs.
 
-*   **Zero-Extraction Browsing:** Loads and navigates ZIPs in streaming mode to save disk space and time.
-*   **Vendor-Aware Reconstruction:** Parses Cellebrite `.msgpack` metadata and GrayKey ZIP extra-field metadata.
-*   **iOS App Container Resolution:** Automatically maps cryptic UUIDs to human-readable Bundle IDs.
-*   **Artefact Shortcuts:** Quick-jump to high-value paths (`KnowledgeC`, `Biome`, `SMS`, `Safari`, `Keychain`, and Android equivalents).
-*   **Multi-Pane File Preview:**
-    *   **Hex** — lazily paginated, so even large files open instantly.
-    *   **Text** — pretty-prints JSON, XML, and plist (binary plist included).
-    *   **Database** — full SQLite browser (see below).
-    *   **SEGB** — record viewer for Apple's SEGB format (see below).
-*   **Media Browser:** Thumbnail grid for images. Video thumbnails via frame extraction (`ffmpeg`) are a **work in progress** — frames are not yet generated reliably and require a working `ffmpeg` setup, so videos may appear without a preview.
-*   **Keyword Search:** Search across the extraction, including inside nested archives.
-*   **Artefact Viewer:** Runs bundled parsers (e.g. `Photos.sqlite`, SMS, WhatsApp) and shows results in a sortable, filterable table.
-*   **Export & Audit:** Recursive directory export, data-integrity checks, and basic audit logging.
+- **File Browser.** The folders and the files in the folder you select. This is where you see paths, times, types, and the columns for the files in view.
+- **Media Browser.** The pictures and videos, as thumbnails, with a full-size view and a scrub across a video.
+- **Keyword Search.** A word or phrase across the archive, unpacked nested archives, indexed LevelDB folders, file and folder names, and the picture and video text saved by Process Case.
+- **Artifact Viewer.** The reports from the app parsers, such as messages. Where a report interprets a stored value, its notes page says what was assumed.
+- **Timeline.** The report events whose meaning a parser has stated, and the file times of user media, in time order.
 
----
+Selecting a file opens it in the preview underneath. That preview has four tabs, and it only reads the archive.
 
-## 🗄️ SQLite Database Browser
+- **Hex.** The raw bytes.
+- **Text.** The file as text, including property lists, JSON, XML, Android binary XML, and protobuf.
+- **Database.** A SQLite file, recognised by the `SQLite format 3` header rather than the file name. Tables, a paged row view, and the write-ahead log as a net change: rows the log added, deleted, or modified, with a modified cell shown as `old → new`.
+- **SEGB.** Apple's segmented-buffer records, such as Biome, recognised by the `SEGB` header. Each record's time, state, and size, with the payload decoded as protobuf. Known streams use a built-in schema, and a corrected schema can be saved in the case.
 
-Databases are detected by **content** — the 16-byte `SQLite format 3` header — not by file extension, so databases with unusual or missing extensions (common in iOS extractions) are still recognised, and non-database files that merely end in `.db` are ignored.
+SEGB record parsing uses the MIT-licensed [`ccl_segb`](https://github.com/abrignoni/iLEAPP/tree/main/scripts/ccl_segb) library by Alex Caithness of CCL Forensics, vendored under `app/ccl_segb/`. The built-in stream schemas are ported from [iLEAPP](https://github.com/abrignoni/iLEAPP).
 
-*   **Schema at a glance:** lists every table with its row count.
-*   **Browse rows** in a lazily paged grid that stays responsive on large tables, with a per-table text filter and **CSV export**.
-*   **WAL-aware:** when a `-wal` sidecar is present it is applied so you see the current state. The table is shown as a unified **net-change view** — rows the WAL **added / deleted / modified** are highlighted in place, with modified cells rendered as `old → new`.
-*   **"WAL updates only" toggle:** hide unchanged rows to focus on what the WAL changed, with the table dropdown narrowed to just the tables the WAL touched (each annotated with its update count).
+## Process Case
 
-This makes it easy to *understand* how SQLite stores a table and its recent (WAL) activity, and to *validate* how a commercial tool presents the same database.
+Opening a case detects the layout of the zip, copies the zip's directory into the case folder, and builds the file tree. That result is saved, so opening the same case again uses the saved tree.
 
-> **Scope note:** the WAL view is a **net-change** comparison (last-checkpointed state vs. WAL-applied state). It is not a frame-by-frame WAL carve or a deleted-record recovery engine.
+| Layout | Where the file details come from |
+|---|---|
+| Cellebrite iOS | `filesystemN/` plus `metadata.msgpack` |
+| GrayKey iOS and GrayKey Android | The zip extra fields |
+| Cellebrite Android, `Dump/` | The zip extra fields under `Dump/` |
+| Cellebrite Android, `filesystemN/` | The same detection path as Cellebrite iOS |
 
----
+On iOS, an app container's GUID is shown with its bundle id. The path rules are in `ASSUMPTIONS.md`.
 
-## 🧬 SEGB Record Viewer
+Process Case is a separate step after the tree is up. Nothing in it runs until you press Run, and a stage runs only if it is ticked. A stage that has already been done starts unticked, so a later run does not repeat it unless you tick it again. The stages run in this order, because a later stage uses what an earlier one unpacked or typed.
 
-SEGB ("segmented buffer") is the record container Apple uses across many iOS data stores (Biome streams and others). Like the SQLite browser, SEGB files are detected by their **header** (`SEGB` magic), not by extension.
+**Check data integrity.** Hashes the zip and compares it with the hash recorded at acquisition: the `.ufd` beside a Cellebrite archive, or the PDF report beside a GrayKey archive. A mismatch means the zip has changed since it was acquired. If no hash file is there, the check is skipped and the later stages still run.
 
-*   **Record list:** each record's timestamp, state (Written / Deleted / Unknown), size, and CRC status; deleted records are highlighted.
-*   **Protobuf decoding with known schemas:** record payloads are protobuf. They are decoded with [`blackboxprotobuf`](https://pypi.org/project/blackboxprotobuf/) into an **expandable tree**. When the stream is recognised, a built-in **schema** gives fields the right types, human **names**, and timestamp/GUID rendering — these were ported from iLEAPP's `biome*` artifacts (21 streams). Unknown streams fall back to schema-less auto-decode.
-*   **Analysis aids** (when no schema applies): candidate **timestamp interpretations** for numeric fields (Unix / Mac-Cocoa), a **UTF-8 preview** and **nested-message decode** for byte fields (so a string mis-decoded as a sub-message is still readable), and **JSON export** of the records.
-*   **Editable, per-case schemas:** when the guess is wrong, **Edit schema…** lets you correct the typedef/labels/hints (seeded from the current guess) and **save it into the case database**, so it auto-applies to that stream next time. User schemas override the built-ins.
+**Header scan.** Reads the start of a file and sets its type from that, instead of from the file name. A database named `.bin`, or a picture with no extension, is then shown as what it is. Tier 1 reads files with no recognised extension, inside the app and user folders. Tier 2 reads every file in those folders. Tier 3 reads every file in the user partition. A tier already run is marked as done. You can move up a tier. You cannot run a lower one again from here.
 
-Record parsing uses the MIT-licensed [`ccl_segb`](https://github.com/abrignoni/iLEAPP/tree/main/scripts/ccl_segb) library by Alex Caithness / CCL Forensics, vendored under `app/ccl_segb/` (see its `NOTICE`). The built-in stream schemas are ported from [iLEAPP](https://github.com/abrignoni/iLEAPP) (MIT) — credit to its authors for the field meanings.
+**Find and select archives.** Looks for zip and similar archives in the app, iCloud, Files, Mail, and message locations, then asks which ones to unpack. The unpacked files are available to the stages after this one. Archives with no extension are only found once a header scan has typed them.
 
-> **Scope note:** with no schema, field numbers are opaque and the type/timestamp inferences are heuristics for analyst review — they are not authoritative. Records marked *Deleted* may be partial and can fail to decode (shown as raw hex).
+**Index LevelDB and IndexedDB.** Reads the LevelDB and IndexedDB folders, such as browser local storage and app caches, into a search index. Keyword Search can then find text inside those records. Folders already indexed are left alone. A folder that cannot be read is reported, and Keyword Search does not cover it.
 
----
+**Scan databases, property lists, and web cache for embedded media.** Opens SQLite databases and property lists and pulls out pictures and video stored inside them, including in freed space and the write-ahead log, not only the live rows. It also opens Chromium web-cache records and shows the cached picture or video with its source address. The scope is the app and user folders, or the whole user partition. A known-noise list can leave out databases that hold no useful media. Files unpacked from nested archives are included.
 
-## 🔍 Why metadata parsing matters
+**Extract media metadata.** Reads the text stored with pictures and videos: taken date, camera, GPS, duration, dimensions, and the other saved fields. Those become columns on the File Browser, and Keyword Search can search them. It covers pictures and videos in the folders marked for processing, plus files unpacked or recovered by the stages above.
 
-Standard ZIP libraries often fail to reconstruct forensic images correctly because vendors strip metadata from the standard headers:
+**Detect duplicate files.** Groups files that share a size and a CRC32. Groups that contain a picture or video are then read and confirmed with an MD5, and the File Browser shows a duplicate count and that hash. The other groups are listed as possible duplicates. Untick that option to confirm every group. On a GrayKey archive, a file whose SHA-256 was recorded at acquisition is grouped on that hash with no extra read.
 
-| Feature | Standard ZIP Utility | ios-ffs-browser |
-| :--- | :--- | :--- |
-| **Timestamps** | Often missing/incorrect | **Accurate (Parsed)** |
-| **File Sizes** | May report 0 bytes | **Corrected** |
-| **App Names** | UUIDs only (`A4B2...`) | **Mapped to Bundle IDs** |
-| **Structure** | Flat or fragmented | **Logical Tree** |
+## For developers
 
----
+`CLAUDE.md` is the map of the code. `ASSUMPTIONS.md` is the record of facts and decisions. `WRITING_ARTIFACT_PARSERS.md` is how to add a report. Open work is tracked in [ffs-notes](https://github.com/KlasScripts/ffs-notes/issues).
 
-## 🛠️ Internal Architecture
+## Licence
 
-1.  **Stream Loader:** Accesses the ZIP without full decompression.
-2.  **Tree Builder:** Constructs an in-memory representation of folders and files.
-3.  **Metadata Overlay:** Merges vendor-specific metadata (msgpack/extra-fields) onto the tree nodes.
-4.  **Preview Layer:** Renders hex, decoded text, and — for SQLite files — a paged table browser with the WAL net-change view.
-5.  **UI Layer:** A PySide6-based interface ties the tree, previews, media, search, and artefact views together.
-
----
-
-## 📁 Roadmap
-
-- [ ] Additional Android artefact shortcuts.
-- [ ] Timeline visualization view.
-
----
-
-## 🤝 Contributing
-
-This tool is shared with the DF learning community. Pull requests for new vendor formats or artefact shortcuts are welcome.
-
----
-
-## 📄 Licence
-
-FFS Explorer is released under the **GNU General Public License v3.0**.
-
-You are free to use, modify, and distribute this software. If you distribute a modified version — including bundling it in a commercial product — you must release the source code of your modifications under the same GPL v3 licence. See [LICENSE](LICENSE) for the full terms.
+FFS Explorer is free software under the [GNU General Public License v3.0](LICENSE). The licence is the warranty statement.

@@ -18898,8 +18898,8 @@ if __name__ == "__main__":
                     print(f"[gc] full pass {ms:.0f} ms", file=sys.stderr)
         gc.callbacks.append(_gc_cb)
     try:
-        startup_log.message('info', f"worker processes: {_apply_worker_processes()} "
-                                    f"of {os.cpu_count()} cores")
+        startup_log.step(f"worker processes: {_apply_worker_processes()} "
+                         f"of {os.cpu_count()} cores")
     except Exception:
         pass
     startup_log.step('building main window')

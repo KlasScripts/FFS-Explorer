@@ -275,6 +275,8 @@ def _load_prefs() -> dict:
         # own docstring for why the two are treated differently.
         'user_media_ignore_editable':
             s.value('user_media_ignore_editable', False, type=bool),
+        # 0 = automatic (_apply_worker_processes)
+        'worker_processes': s.value('worker_processes', 0, type=int),
     }
 
 
@@ -292,6 +294,33 @@ def _save_prefs(prefs: dict):
     s.setValue('media_hide_seen', bool(prefs.get('media_hide_seen', True)))
     s.setValue('user_media_ignore_editable',
               bool(prefs.get('user_media_ignore_editable', False)))
+    s.setValue('worker_processes', int(prefs.get('worker_processes', 0)))
+
+
+def _apply_worker_processes(n: int | None = None) -> int:
+    """How many worker processes Keyword Search, the embedded-media sweep,
+    duplicate hashing and the media metadata stage start (Preferences ▸
+    Performance, 2026-11-26, owner request). 0 = automatic: every core,
+    at most 8 (one fewer for the sweep, which keeps the window a core);
+    otherwise exactly *n*, up to the core count. Read when a stage starts,
+    so a change applies to the next one. Returns the number used."""
+    global _EMBEDDED_MEDIA_PROCESSES
+    import keyword_search
+    if n is None:
+        try:
+            n = int(_load_prefs().get('worker_processes', 0))
+        except Exception:
+            n = 0
+    cores = os.cpu_count() or 1
+    if n <= 0:
+        search = max(1, min(8, cores))
+        sweep = max(1, min(8, cores - 1))
+    else:
+        search = sweep = max(1, min(n, cores))
+    keyword_search.SEARCH_PROCESSES = search
+    media_metadata_scan.METADATA_PROCESSES = search
+    _EMBEDDED_MEDIA_PROCESSES = sweep
+    return search
 
 
 # Formatted archive sizes, keyed by path.  Stat-ing every archive on each
@@ -4500,6 +4529,30 @@ class PreferencesDialog(QDialog):
         layout.addWidget(self._preview_label)
         self._update_preview()
 
+        # ── Performance ──────────────────────────────────────────────────────
+        sep_perf = QFrame()
+        sep_perf.setFrameShape(QFrame.Shape.HLine)
+        sep_perf.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep_perf)
+        layout.addWidget(QLabel("<b>Performance</b>"))
+        cores = os.cpu_count() or 1
+        perf_row = QHBoxLayout()
+        perf_row.addWidget(QLabel("Worker processes:"))
+        self._worker_spin = QSpinBox()
+        self._worker_spin.setRange(0, cores)
+        self._worker_spin.setSpecialValueText(f"Automatic ({max(1, min(8, cores))})")
+        self._worker_spin.setValue(min(cores, int(prefs.get('worker_processes', 0))))
+        perf_row.addWidget(self._worker_spin)
+        perf_row.addWidget(QLabel(f"of {cores} cores"))
+        perf_row.addStretch()
+        layout.addLayout(perf_row)
+        layout.addWidget(note_label(
+            "How many processes Keyword Search, the embedded-media sweep, "
+            "duplicate checking and the media metadata stage use. More "
+            "is faster until the disk holding the archive is the limit. "
+            "They run below normal priority, so the window stays "
+            "responsive. Applies to the next stage started."))
+
         # ── Media Browser ────────────────────────────────────────────────────
         sep_media = QFrame()
         sep_media.setFrameShape(QFrame.Shape.HLine)
@@ -4673,7 +4726,9 @@ class PreferencesDialog(QDialog):
             'media_page_size': self._media_page_size_spin.value(),
             'media_hide_seen': self._media_hide_seen_check.isChecked(),
             'user_media_ignore_editable': self._user_media_ignore_check.isChecked(),
+            'worker_processes': self._worker_spin.value(),
         })
+        _apply_worker_processes(self._worker_spin.value())
         self.accept()
 
 
@@ -5448,15 +5503,11 @@ class MediaMetadataScanWorker(QThread):
         if total == 0:
             return {}
         self.progress.emit(total)
-        n_local = len(self._local_candidates)
-        results = media_metadata_scan.scan_zip_candidates(
-            self._zip_path, zip_candidates,
-            progress_cb=lambda remaining: self.progress.emit(remaining + n_local),
+        # On worker processes (media_metadata_scan.scan_all says why).
+        results = media_metadata_scan.scan_all(
+            self._zip_path, zip_candidates, self._local_candidates,
+            progress_cb=self.progress.emit,
             cancel_check=self.isInterruptionRequested)
-        results.update(media_metadata_scan.scan_local_candidates(
-            self._local_candidates,
-            progress_cb=lambda remaining: self.progress.emit(remaining),
-            cancel_check=self.isInterruptionRequested))
         if results and self._case_dir:
             try:
                 with closing(_open_cache_db(self._case_dir)) as cache_db:
@@ -18846,6 +18897,11 @@ if __name__ == "__main__":
                 if ms > 50:
                     print(f"[gc] full pass {ms:.0f} ms", file=sys.stderr)
         gc.callbacks.append(_gc_cb)
+    try:
+        startup_log.message('info', f"worker processes: {_apply_worker_processes()} "
+                                    f"of {os.cpu_count()} cores")
+    except Exception:
+        pass
     startup_log.step('building main window')
     window = FastZipBrowser()
     startup_log.step('main window built')

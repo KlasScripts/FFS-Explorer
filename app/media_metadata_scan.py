@@ -759,20 +759,7 @@ def scan_local_candidates(
     if total == 0:
         return results
 
-    def _scan_one(item):
-        ui_path, source, ext = item
-        try:
-            if isinstance(source, tuple):
-                source = read_nested_entry(source[1], source[2])
-                if source is None:
-                    return ui_path, {}
-            if isinstance(source, bytes):
-                return ui_path, extract_one(io.BytesIO(source), ext)
-            with open(source, 'rb') as f:
-                return ui_path, extract_one(f, ext)
-        except OSError:
-            return ui_path, {}
-
+    _scan_one = _scan_local_item
     done = 0
     with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
         futures = [pool.submit(_scan_one, item) for item in candidates]
@@ -787,6 +774,133 @@ def scan_local_candidates(
             if progress_cb:
                 progress_cb(total - done)
     return results
+
+
+def _scan_local_item(item):
+    """(ui_path, fields) for one scan_local_candidates item."""
+    from zip_reader import read_nested_entry
+    ui_path, source, ext = item
+    try:
+        if isinstance(source, tuple):
+            source = read_nested_entry(source[1], source[2])
+            if source is None:
+                return ui_path, {}
+        if isinstance(source, bytes):
+            return ui_path, extract_one(io.BytesIO(source), ext)
+        with open(source, 'rb') as f:
+            return ui_path, extract_one(f, ext)
+    except OSError:
+        return ui_path, {}
+
+
+# Worker processes, not threads (2026-11-26, owner: "use as much process,
+# ram and disk speed as possible"): the parse is Python (Pillow's EXIF,
+# XMP, the PNG/JPEG walks), so threads in the window's process ran on
+# about one core and competed with the window for the GIL.
+METADATA_PROCESSES = max(1, min(8, os.cpu_count() or 1))
+PROCESS_MIN_FILES = 400      # fewer: threads (a worker's start, ~1 s, costs more)
+JOB_FILES = 64               # files per job sent to a worker
+
+
+def scan_job(zip_path: str, items: list) -> list:
+    """Worker-process side: [(ui_path, fields)] for a job of items, each
+    ('zip', ui_path, data_offset, file_size, ext) or ('local', item) with
+    item as scan_local_candidates takes it. Runs below normal priority."""
+    import child_priority
+    child_priority.lower_this_process()
+    out = []
+    for item in items:
+        if item[0] == 'zip':
+            _, ui_path, data_offset, file_size, ext = item
+            try:
+                with _LazyZipSlice(zip_path, data_offset, file_size) as slice_:
+                    out.append((ui_path, extract_one(slice_, ext)))
+            except OSError:
+                out.append((ui_path, {}))
+        else:
+            out.append(_scan_local_item(item[1]))
+    return out
+
+
+def scan_all(zip_path: str, zip_candidates: list, local_candidates: list,
+             progress_cb=None, cancel_check=None) -> dict:
+    """scan_zip_candidates + scan_local_candidates in one pool of
+    METADATA_PROCESSES worker processes; progress_cb(files remaining).
+    On the threads as before when there are few files or no pool can be
+    started. A job whose worker failed is read again on threads here,
+    never dropped."""
+    total = len(zip_candidates) + len(local_candidates)
+    pool = None
+    if METADATA_PROCESSES > 1 and total >= PROCESS_MIN_FILES:
+        try:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            pool = ProcessPoolExecutor(METADATA_PROCESSES, mp_context=mp.get_context('spawn'))
+        except Exception as exc:
+            _log_warning(f'media metadata: no process pool ({exc}); using threads')
+            pool = None
+    if pool is None:
+        n_local = len(local_candidates)
+        results = scan_zip_candidates(
+            zip_path, zip_candidates,
+            progress_cb=(lambda r: progress_cb(r + n_local)) if progress_cb else None,
+            cancel_check=cancel_check)
+        if not (cancel_check and cancel_check()):
+            results.update(scan_local_candidates(local_candidates, progress_cb=progress_cb,
+                                                 cancel_check=cancel_check))
+        return results
+    from concurrent.futures import FIRST_COMPLETED, wait
+    items = [('zip',) + tuple(c) for c in zip_candidates] + [('local', c) for c in local_candidates]
+    jobs = [items[i:i + JOB_FILES] for i in range(0, len(items), JOB_FILES)]
+    results: dict = {}
+    remaining = total
+    try:
+        it = iter(jobs)
+        pending = {}
+
+        def top_up():
+            for job in it:
+                pending[pool.submit(scan_job, zip_path, job)] = job
+                if len(pending) >= METADATA_PROCESSES * 3:
+                    break
+
+        top_up()
+        while pending:
+            finished, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+            if cancel_check and cancel_check():
+                return results
+            for fut in finished:
+                job = pending.pop(fut)
+                try:
+                    pairs = fut.result()
+                except Exception as exc:
+                    _log_warning(f'media metadata: a worker failed ({exc}); '
+                                 f'reading its {len(job)} files here')
+                    pairs = []
+                    zips = [x[1:] for x in job if x[0] == 'zip']
+                    if zips:
+                        pairs += list(scan_zip_candidates(zip_path, zips).items())
+                    locs = [x[1] for x in job if x[0] == 'local']
+                    if locs:
+                        pairs += list(scan_local_candidates(locs).items())
+                for ui_path, fields in pairs:
+                    if fields:
+                        results[ui_path] = fields
+                remaining -= len(job)
+                if progress_cb:
+                    progress_cb(remaining)
+            top_up()
+        return results
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _log_warning(text: str) -> None:
+    try:
+        import startup_log
+        startup_log.message('warning', text)
+    except Exception:
+        pass
 
 
 def format_duration(seconds: float) -> str:

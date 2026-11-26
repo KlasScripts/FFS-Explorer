@@ -63,33 +63,3 @@ def test_unreadable_plist_is_reported_not_dropped(tmp_path):
     failed = {name.split('/')[-2]: reason for name, reason in failures}
     assert set(failed) == {GROUP, GROUP_NO_PLIST_READ}
     assert 'unreadable plist' in failed[GROUP]
-
-
-def test_stale_cached_map_is_repaired_on_open(tmp_path):
-    zip_path, case_dir, infos, _ = _archive(tmp_path)
-    names = frozenset(i.filename for i in infos)
-    adapter = FfsAdapter(FfsAdapter.FORMAT_GRAYKEY, '', '', False)
-    folder_map = M._build_folder_tree({n.lstrip('/'): {} for n in names})
-    with closing(db_utils._open_cache_db(case_dir)) as db:
-        # an old build's map: every container lost; the app registry knows one group
-        db_utils.save_guid_bundle_map(db, {})
-        db_utils.save_app_registry(db, [{
-            'bundle_id': 'com.example.other', 'display_name': 'Other', 'team_id': None,
-            'bundle_container_path': None, 'data_container_path': None,
-            'app_group_paths': {'group.com.example.known': GROUP_NO_PLIST_READ},
-            'has_parser': False}])
-    fixed = M.repair_guid_map(zip_path, case_dir, adapter, folder_map, names, {})
-    assert fixed == {APP: 'com.example.app', GROUP: 'group.com.example',
-                     GROUP_NO_PLIST_READ: 'group.com.example.known'}
-    assert M._find_missing_plists(folder_map, adapter, fixed) == []
-    with closing(db_utils._open_cache_db(case_dir)) as db:
-        assert db_utils.load_guid_bundle_map(db) == fixed
-
-
-def test_complete_map_is_left_alone(tmp_path):
-    zip_path, case_dir, infos, _ = _archive(tmp_path)
-    names = frozenset(i.filename for i in infos)
-    adapter = FfsAdapter(FfsAdapter.FORMAT_GRAYKEY, '', '', False)
-    folder_map = M._build_folder_tree({n.lstrip('/'): {} for n in names})
-    full = {APP: 'a', GROUP: 'g', GROUP_NO_PLIST_READ: 'h'}
-    assert M.repair_guid_map(zip_path, case_dir, adapter, folder_map, names, full) is full

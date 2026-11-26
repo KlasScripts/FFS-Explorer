@@ -362,29 +362,36 @@ def notice_html(result: dict) -> str:
     return "".join(parts)
 
 
-def run_for_case(zip_path: str, case_dir: str) -> None:
-    """Run the check for a case and save the result in its caseresults.db
-    (nothing is saved for an archive that is not iOS). A child process's
-    target (ZipMetadataWorker._run_system_check): every archive entry is
-    looked at, ~2.5 million on the synthetic iPhone, and in the window's
-    process that Python competed with the window for its lock
-    (2026-11-22)."""
+def run_and_save(zip_path: str, case_dir: str):
+    """Run the check for a case and save the result in its caseresults.db;
+    returns the result (None, nothing saved, for an archive that is not
+    iOS). The one body behind run_for_case and the window's fallback when
+    no child process can start."""
     from contextlib import closing
-    import child_priority
     import zip_cd_cache
     from adapters.ffs import FfsAdapter
-    child_priority.lower_this_process()   # the window is served first
     from db_utils import _open_results_db
     infos = zip_cd_cache.load(zip_path, case_dir)
     if not infos:
-        return
+        return None
     view = zip_cd_cache.CachedZipView(zip_path, infos)
     names = view.namelist()
     adapter = FfsAdapter.detect(view, frozenset(names))
     result = check(names, adapter, lambda n: view.open(n).read())
-    if result is None:
-        child_priority.end_now(0)
-    with closing(_open_results_db(case_dir)) as db:
-        save(db, result)
-    child_priority.end_now(0)   # saved; skip freeing 2.5 million names
+    if result is not None:
+        with closing(_open_results_db(case_dir)) as db:
+            save(db, result)
+    return result
+
+
+def run_for_case(zip_path: str, case_dir: str) -> None:
+    """run_and_save as a child process's target (ZipMetadataWorker.
+    _run_system_check): every archive entry is looked at, ~2.5 million on
+    the synthetic iPhone, and in the window's process that Python competed
+    with the window for its lock (2026-11-22). Below normal priority; ends
+    at once when saved (skips freeing 2.5 million names)."""
+    import child_priority
+    child_priority.lower_this_process()   # the window is served first
+    run_and_save(zip_path, case_dir)
+    child_priority.end_now(0)
 

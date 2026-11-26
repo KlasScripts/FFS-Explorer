@@ -51,8 +51,8 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       save_duplicate_files, load_duplicate_files, count_duplicate_groups,
                       load_possible_duplicates,
                       load_attachment_links,
-                      save_guid_bundle_map, load_guid_bundle_map, save_app_registry,
-                      save_folder_counts, save_folder_sizes, load_folder_data,
+                      load_guid_bundle_map,
+                      save_folder_counts, load_folder_data,
                       save_device_info, load_device_info,
                       save_case_setting, load_case_setting,
                       upsert_device_info_field,
@@ -101,16 +101,13 @@ from artifact_db import load_artifact_results
 from zip_reader import read_nested_entry
 from zip_cd_cache import (CachedZipView, is_valid as _cd_cache_valid,
                           save as _cd_cache_save, load as _cd_cache_load,
-                          probe_delta as _probe_delta,
                           compute_data_offsets as _compute_data_offsets,
                           sidecar_hash as _cd_sidecar_hash,
                           extract_cd_hash as _cd_extract_hash)
-from ffs_metadata import (_build_folder_tree, _compute_folder_sizes,
-                          _find_metadata_only_folders, _find_missing_plists,
+from ffs_metadata import (_build_folder_tree, _find_missing_plists,
                           _UUID_RE, parse_archive_metadata, persist_result,
-                          repair_guid_map,
                           _parse_child as _ffs_parse_child,
-                          pack_snapshot, unpack_snapshot, frozenset_in_steps,
+                          unpack_snapshot, frozenset_in_steps,
                           SNAPSHOT_KEY as _SNAPSHOT_KEY,
                           SNAPSHOT_VERSION as _SNAPSHOT_VERSION)
 from datetime import datetime, timedelta, timezone
@@ -2170,8 +2167,9 @@ class ZipMetadataWorker(QThread):
       7. Compute folder sizes (from cache if available, otherwise calculated)
       8. Emit metadata_ready so the UI tree can appear immediately
       9. Persist GUID map and folder sizes to the SQLite case database
-     10. If scan_headers is set, read magic bytes of unknown-extension files
-         and emit header_scan_done with the detected type overrides
+    The parse itself is ffs_metadata.parse_archive_metadata (child process,
+    or this thread if the child cannot run); the header scan runs from
+    Process Case, not here.
     """
     status_update        = Signal(str)    # message
     # All `object`, never `dict`: PySide6 turns a `dict` signal argument
@@ -2182,26 +2180,15 @@ class ZipMetadataWorker(QThread):
     # the same Python objects, so every emit site below must stop using
     # (or pass a copy of) anything it still reads after emitting.
     metadata_ready       = Signal(object, object, object, object, object, object, object, object, object)  # ui_metadata, folder_map, guid_to_bundle, zip_names, adapter, missing_plist_paths, folder_sizes, zip_ui_paths, metadata_only_folders
-    header_scan_progress = Signal(int)   # remaining (decreasing)
-    header_scan_done     = Signal(dict)  # {ui_path: detected_type}
     # (result dict | None, is_new): ios_system_check's result for this case
     # (None = not iOS / not checkable); is_new when it was made this open.
     system_check_ready   = Signal(object, bool)
     system_check_finished = Signal()    # the check thread ended (with or without a result)
 
-    def __init__(self, zip_path: str, header_scan_tier: int = 0, case_dir: str | None = None):
+    def __init__(self, zip_path: str, case_dir: str | None = None):
         super().__init__()
         self.zip_path = zip_path
-        self.header_scan_tier = header_scan_tier
         self.case_dir = case_dir
-
-    @property
-    def scan_headers(self) -> bool:
-        """True whenever ANY tier is active — every existing boolean gate
-        below (fast-snapshot skip, offloaded-parse skip) only ever cared
-        whether a scan runs at all, not which tier; _collect_header_
-        candidates itself is what actually reads header_scan_tier."""
-        return self.header_scan_tier > 0
 
     def _build_zip_index(self) -> None:
         """Build the zip index in a child process when the case has none
@@ -2230,6 +2217,14 @@ class ZipMetadataWorker(QThread):
                 if self.isInterruptionRequested():
                     proc.terminate()
                     return
+            if proc.exitcode != 0:
+                # The index write is atomic, so nothing half-written is
+                # left; the first open_index builds it here instead. Said,
+                # not silent.
+                msg = (f"The archive index child process ended with code {proc.exitcode}; "
+                       "indexing in this process instead…")
+                startup_log.message('warning', msg)
+                self.status_update.emit(msg)
         except Exception as exc:
             self.status_update.emit(f"Indexing in this process instead ({exc})…")
 
@@ -2275,7 +2270,6 @@ class ZipMetadataWorker(QThread):
         handed over as it is. Needs the case's zip index, so it runs once
         the .zcd exists."""
         import ios_system_check
-        import zip_cd_cache
         if getattr(self, '_system_check_done', False):
             return
         self._system_check_done = True
@@ -2306,19 +2300,9 @@ class ZipMetadataWorker(QThread):
                     stored = ios_system_check.load(db)
                 self.system_check_ready.emit(stored, stored is not None)
                 return
-            infos = zip_cd_cache.load(self.zip_path, self.case_dir)
-            if not infos:
-                return
-            view = zip_cd_cache.CachedZipView(self.zip_path, infos)
-            names = view.namelist()
-            adapter = FfsAdapter.detect(view, frozenset(names))
-            result = ios_system_check.check(names, adapter, lambda n: view.open(n).read())
-            if result is None:
-                self.system_check_ready.emit(None, False)
-                return
-            with closing(_open_results_db(self.case_dir)) as db:
-                ios_system_check.save(db, result)
-            self.system_check_ready.emit(result, True)
+            # No child: the same body here (slower for the window, same result)
+            result = ios_system_check.run_and_save(self.zip_path, self.case_dir)
+            self.system_check_ready.emit(result, result is not None)
         except Exception as exc:
             self.status_update.emit(f"Warning: the iOS system check could not run: {exc}")
 
@@ -2416,11 +2400,15 @@ class ZipMetadataWorker(QThread):
             folder_map  = snap['folder_map']
             metadata_only_folders = set(snap['metadata_only'])
         except Exception:
+            # Still "no snapshot" (the archive is parsed again), but said:
+            # a bad snapshot looked like a first open.
+            import traceback
+            startup_log.message('warning', "the case snapshot could not be read; "
+                                f"parsing the archive again:\n{traceback.format_exc()}")
             return False
 
-        guid_to_bundle = repair_guid_map(
-            self.zip_path, self.case_dir, ffs_adapter, folder_map, zip_names,
-            guid_to_bundle, status_cb=self.status_update.emit)
+        # The saved map is the first parse's (plists + LaunchServices);
+        # it is not repaired on later opens (ffs-notes review, B-76).
         missing_plist_paths = _find_missing_plists(folder_map, ffs_adapter, guid_to_bundle)
         self._set_ui_extras(ui_metadata, folder_map, folder_counts, adapter=ffs_adapter)
         # worked out when the snapshot was packed (None in an older snapshot)
@@ -2446,7 +2434,8 @@ class ZipMetadataWorker(QThread):
         load it back through the tested snapshot fast-path.  If the subprocess
         is unavailable for any reason, we compute in this thread instead
         (correct, just less responsive).  Returns True if metadata was emitted,
-        False if parsing failed entirely (caller falls back to the legacy path).
+        False if parsing failed entirely (the error is on the status line;
+        the open ends there).
         """
         if self._parse_in_subprocess():
             if self._try_load_from_snapshot(first_load=True):
@@ -2539,10 +2528,6 @@ class ZipMetadataWorker(QThread):
         folder_map   = result['folder_map']
         guid_to_bundle = result['guid_to_bundle']
         folder_sizes   = result['folder_sizes']
-        guid_to_bundle = repair_guid_map(
-            self.zip_path, self.case_dir, ffs_adapter, folder_map, zip_names,
-            guid_to_bundle, status_cb=self.status_update.emit)
-        result['guid_to_bundle'] = guid_to_bundle
         missing_plist_paths = _find_missing_plists(
             folder_map, ffs_adapter, guid_to_bundle)
 
@@ -2597,8 +2582,7 @@ class ZipMetadataWorker(QThread):
 
             # Fast path: a previous load of this archive left a snapshot in the
             # cache DB — re-emit it and skip all archive I/O and derivations.
-            # (Header scans need an open archive handle, so they take the full path.)
-            if self.case_dir and not self.scan_headers and self._try_load_from_snapshot():
+            if self.case_dir and self._try_load_from_snapshot():
                 return
 
             # ── Open the archive ──────────────────────────────────────────────
@@ -2624,227 +2608,17 @@ class ZipMetadataWorker(QThread):
                     self._update_case_names()
                     self._start_system_check()
 
-                # Fast path: offload the heavy parse to a child process.  It
-                # runs on its own interpreter/GIL so the CPU-bound work doesn't
-                # freeze the GUI (a QThread can't achieve this for pure-Python
-                # work — one shared GIL).  Header scans stay on the in-thread
-                # path below.
-                if not self.scan_headers:
-                    if self._run_parse_offloaded():
-                        return
-
-                self.status_update.emit("Loading central directory from local copy…")
-                _cached_infos = _cd_cache_load(self.zip_path, self.case_dir)
-                z_ctx = CachedZipView(self.zip_path, _cached_infos) if _cached_infos else None
-                if z_ctx is None:
-                    raise RuntimeError("Failed to load central directory from local copy")
-            else:
-                # No case dir at all — genuinely unreachable via this
-                # project's own UI today (confirmed by inspection: the
-                # one real construction site, start_loading(), returns
-                # immediately if _get_or_ask_case_dir gives back None,
-                # before ZipMetadataWorker is ever built — case_dir is
-                # always real by the time this runs). Previously fell
-                # back to a raw zipfile.ZipFile network open here; per
-                # this project's own standing Convention (no exception
-                # for this case either) and direct instruction, this now
-                # fails honestly instead of silently reaching for
-                # zipfile for a state that can't actually occur.
-                raise RuntimeError("ZipMetadataWorker requires a case_dir")
-
-            try:
-                self.status_update.emit("Reading zip directory...")
-                _infolist = z_ctx.infolist()
-                # One pass: the size dict's keys double as the name set.
-                zip_sizes = {info.filename: info.file_size for info in _infolist}
-                zip_names = frozenset(zip_sizes)
-                ffs_adapter = FfsAdapter.detect(z_ctx, zip_names)
-                _stored = [i for i in _infolist
-                           if i.compress_type == zipfile.ZIP_STORED and i.file_size > 0]
-                self._local_extra_delta = _probe_delta(self.zip_path, _stored)
-                time.sleep(0)   # yield GIL after C-level frozenset build
-
-                cached_guid_bundle: dict | None = None
-                if self.case_dir:
-                    try:
-                        with closing(_open_cache_db(self.case_dir)) as _db:
-                            _cached = load_guid_bundle_map(_db)
-                        if _cached:
-                            cached_guid_bundle = _cached
-                    except Exception:
-                        pass
-
-                # When using the local .zcd cache zip_names is already in memory,
-                # so build_zip_entries runs at pure-Python speed with no network seeks.
-                # Only Cellebrite iOS uses Pass 1; GrayKey/Android return early.
-                _precomputed_zip_entries = (
-                    ffs_adapter.build_zip_entries(zip_names)
-                    if isinstance(z_ctx, CachedZipView)
-                    and ffs_adapter.format == FfsAdapter.FORMAT_CELLEBRITE
-                    else None
-                )
-
-                ui_metadata, guid_to_bundle, zip_ui_paths = ffs_adapter.build_ui_metadata(
-                    self.zip_path, zip_names,
-                    z=z_ctx,
-                    status_cb=self.status_update.emit,
-                    guid_to_bundle=cached_guid_bundle,
-                    zip_entries=_precomputed_zip_entries,
-                )
-                time.sleep(0)   # yield GIL after msgpack/metadata build
-
-                _need_save_guid_initial = cached_guid_bundle is None and bool(guid_to_bundle)
-                header_candidates: list = []
-                header_copies: dict = {}
-                if self.scan_headers:
-                    self.status_update.emit(
-                        "Collecting header scan candidates from archive (may be slow on network)…")
-                    header_candidates = _collect_header_candidates(
-                        self.zip_path, ui_metadata, ffs_adapter,
-                        z=z_ctx,
-                        delta=self._local_extra_delta,
-                        tier=self.header_scan_tier,
-                    )
-                    header_copies = _header_copy_map(
-                        header_candidates, ui_metadata, ffs_adapter, z_ctx)
-            finally:
-                if z_ctx is not None:
-                    z_ctx.__exit__(None, None, None)
-
-            # LaunchServices csstore: same enrichment as the subprocess path
-            # in ffs_metadata.parse_archive_metadata — see that function's
-            # comment for the full rationale. Reuses z_ctx (its own
-            # __exit__ is a no-op, so it's still usable after the earlier
-            # `finally` block) rather than falling back to a raw
-            # zipfile.ZipFile on the main archive.
-            self.status_update.emit("Building app registry from LaunchServices…")
-            _app_registry_rows, _ls_guid_map = ffs_adapter.build_app_registry(
-                self.zip_path, zip_names, z=z_ctx)
-            if _ls_guid_map:
-                guid_to_bundle = {**guid_to_bundle, **_ls_guid_map}
-
-            folder_map = _build_folder_tree(ui_metadata, status_cb=self.status_update.emit)
-            time.sleep(0)   # yield GIL after folder tree build
-
-            guid_to_bundle = repair_guid_map(
-                self.zip_path, self.case_dir, ffs_adapter, folder_map, zip_names,
-                guid_to_bundle, status_cb=self.status_update.emit)
-            missing_plist_paths = _find_missing_plists(
-                folder_map, ffs_adapter, guid_to_bundle)
-
-            _cached_sizes: dict | None = None
-            if self.case_dir:
-                try:
-                    with closing(_open_cache_db(self.case_dir)) as _db:
-                        _, _fs = load_folder_data(_db)
-                    if _fs:
-                        _cached_sizes = _fs
-                except Exception:
-                    pass
-
-            if _cached_sizes is not None:
-                self.status_update.emit("Folder sizes loaded from cache.")
-                folder_sizes = _cached_sizes
-            else:
-                self.status_update.emit("Computing folder sizes...")
-                folder_sizes = _compute_folder_sizes(
-                    folder_map, zip_names, zip_sizes, ffs_adapter,
-                    zip_ui_paths=zip_ui_paths,
-                    progress_cb=lambda done, total: self.status_update.emit(
-                        f"Computing folder sizes… {done:,}/{total:,}"))
-
-            # Metadata-only detection looks for Apple container metadata files,
-            # so run it only for iOS archives (Cellebrite iOS, GrayKey iOS).
-            # GrayKey Android has no private/var tree — the walk would find nothing.
-            _is_ios = (
-                ffs_adapter.format == FfsAdapter.FORMAT_CELLEBRITE
-                or (ffs_adapter.format == FfsAdapter.FORMAT_GRAYKEY
-                    and 'private/var' in folder_map)
-            )
-            if _is_ios:
-                self.status_update.emit("Identifying metadata-only folders...")
-                metadata_only_folders = _find_metadata_only_folders(
-                    folder_map, zip_names, zip_ui_paths, ffs_adapter)
-            else:
-                metadata_only_folders = set()
-
-            # Pack the re-open snapshot BEFORE emitting — once the main thread
-            # processes metadata_ready it mutates these dicts (nested-archive
-            # injection), which would race with serialisation.
-            snapshot_blob = None
-            if self.case_dir:
-                self.status_update.emit("Saving load cache…")
-                try:
-                    snapshot_blob = pack_snapshot(
-                        [ffs_adapter.format, ffs_adapter.user_prefix,
-                         ffs_adapter.sys_prefix, ffs_adapter.old_layout],
-                        self._local_extra_delta, zip_names, zip_ui_paths,
-                        ui_metadata, folder_map, metadata_only_folders,
-                        file_table_dir=self.case_dir, zip_path=self.zip_path)
-                except Exception:
-                    snapshot_blob = None
-
-            # Emit first — UI tree appears immediately. DB and cache writes follow.
-            # guid_to_bundle/folder_sizes are saved below after this emit, so
-            # the GUI gets its own shallow copies (see metadata_ready).
-            self._set_ui_extras(ui_metadata, folder_map, adapter=ffs_adapter)
-            self.metadata_ready.emit(
-                ui_metadata, folder_map, dict(guid_to_bundle), zip_names,
-                ffs_adapter, missing_plist_paths, dict(folder_sizes), zip_ui_paths,
-                metadata_only_folders)
-
-            if self.case_dir:
-                try:
-                    with closing(_open_cache_db(self.case_dir)) as _db:
-                        # Also true whenever the LaunchServices merge resolved
-                        # anything — otherwise an already-cached guid_bundle
-                        # would silently swallow that enrichment, since
-                        # _need_save_guid_initial alone only fires on a cold
-                        # cache (see ffs_metadata.parse_archive_metadata's
-                        # matching comment).
-                        if _need_save_guid_initial or _ls_guid_map:
-                            save_guid_bundle_map(_db, guid_to_bundle)
-                        if _cached_sizes is None:
-                            save_folder_sizes(_db, folder_sizes)
-                        if _app_registry_rows:
-                            save_app_registry(_db, _app_registry_rows)
-                        if snapshot_blob is not None:
-                            save_blob(_db, _SNAPSHOT_KEY, _SNAPSHOT_VERSION,
-                                      snapshot_blob)
-                except Exception as exc:
-                    import traceback
-                    try:
-                        startup_log.message('error', "saving the case snapshot failed (the next open "
-                                            f"will parse the archive again):\n{traceback.format_exc()}")
-                    except Exception:
-                        pass
-                    self.status_update.emit(f"Could not save the case snapshot ({type(exc).__name__}: {exc}); "
-                                            "the next open will parse the archive again.")
-
-            if header_candidates:
-                n_read = len(header_candidates) - len(header_copies)
-                copies_note = (f" ({len(header_copies):,} proven-identical copies read once)"
-                               if header_copies else "")
-                self.status_update.emit(
-                    f"Scanning headers: {len(header_candidates):,} candidate files{copies_note}...")
-                self.header_scan_progress.emit(n_read)
-                results = _scan_headers_once_per_copy(
-                    self.zip_path, header_candidates, header_copies,
-                    progress_cb=self.header_scan_progress.emit,
-                )
-                self.header_scan_done.emit(results)
-                # Tier 2/3 re-check every file, not just unknown-extension
-                # ones, so a raw len(results) count would mostly be boring
-                # reconfirmations of what the extension already said —
-                # see _classify_header_scan_results for why only these
-                # two categories are worth reporting (Tier 1's own count
-                # is unaffected: every one of its results is already
-                # 'newly_identified' by construction).
-                new, mismatch = _classify_header_scan_results(results)
-                msg = f"Header scan complete — {new:,} newly identified"
-                if mismatch:
-                    msg += f", {mismatch:,} mismatched extension{'s' if mismatch != 1 else ''} found"
-                self.status_update.emit(msg)
+                # The one parse, parse_archive_metadata: in a child process
+                # (its own interpreter, so the window stays responsive), or in
+                # this thread if the child cannot run. If both fail, the error
+                # is already on the status line and the open ends here: there
+                # is no second, older parse (ffs-notes case-creation review,
+                # 2026-11-26).
+                self._run_parse_offloaded()
+                return
+            # No case folder: unreachable from the UI (start_loading returns
+            # before building this worker without one).
+            raise RuntimeError("ZipMetadataWorker requires a case_dir")
         except Exception as e:
             self.status_update.emit(f"Error: {str(e)}")
 
@@ -12937,18 +12711,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         # instead just... after the user has selected how they want to
         # deal with the time and date[,] the ok should be tied to opening
         # process case").
-        self.worker = ZipMetadataWorker(zip_path, header_scan_tier=0,
-                                        case_dir=self._case_dir)
+        self.worker = ZipMetadataWorker(zip_path, case_dir=self._case_dir)
         self.worker.status_update.connect(self.status_bar.showMessage)
         self.worker.metadata_ready.connect(self.on_metadata_ready)
-        self.worker.header_scan_progress.connect(self._on_header_scan_progress)
-        # header_scan_tier=0 above means scan_headers is False and this
-        # signal never actually fires for a fresh load any more (see
-        # ZipMetadataWorker.scan_headers) — connected anyway, generic
-        # tier=None form, matching ProcessDialog's own reuse of this same
-        # signal for its unrelated tier-upgrade/nested-archive/gzip-
-        # detection events.
-        self.worker.header_scan_done.connect(self._on_header_scan_done)
         self.worker.finished.connect(self._on_load_worker_finished)
         self._ios_system_check = None
         self._system_notice_pending = False
@@ -13213,7 +12978,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     "Preparing case: " + ", ".join(dict.fromkeys(busy)) + "…")
                 QTimer.singleShot(50, _poll)
                 return
-            self._warn_missing_plists(missing_plist_paths)
             self.reload_tree_entirely()
             self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
             self._after_case_ready(metadata)
@@ -13236,27 +13000,6 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             self._open_process_dialog_for_new_case()
         elif getattr(self, '_system_notice_pending', False):
             self._show_system_check_dialog()
-
-    def _warn_missing_plists(self, missing_plist_paths):
-        """Note app container folders still without a bundle id, with
-        content, on the "Loaded" message (_on_tree_loaded): they are shown
-        by their GUID, and listed in the startup log. Until 2026-11-21 a
-        warning dialog said so and ticked them; dropped (owner): the
-        LaunchServices and App Group sources name nearly every one
-        (A-76), so the dialog was almost always about nothing useful."""
-        actionable = [p for p in (missing_plist_paths or ())
-                      if self._folder_total_size(p) > 0]
-        self._unnamed_containers_note = (
-            f"  ·  {len(actionable):,} app folder{'s' if len(actionable) != 1 else ''} "
-            "could not be named, shown by GUID (see the log)" if actionable else '')
-        if actionable:
-            import startup_log
-            startup_log.message('warning', f"{len(actionable):,} app container folder(s) "
-                                "with content have no bundle id; shown by GUID:\n  "
-                                + "\n  ".join(sorted(actionable)[:200])
-                                + (f"\n  …and {len(actionable) - 200:,} more"
-                                   if len(actionable) > 200 else ''))
-
 
     def _start_header_tier_count(self, with_tier3: bool | None = None):
         """Count each header-scan tier's files once per case, on the
@@ -15037,8 +14780,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._maybe_hide_load_progress()
         elapsed = time.monotonic() - getattr(self, '_load_start', time.monotonic())
         self.status_bar.showMessage(
-            f"Loaded: {os.path.basename(self.zip_path)}  —  {elapsed:.1f}s"
-            + getattr(self, '_unnamed_containers_note', ''))
+            f"Loaded: {os.path.basename(self.zip_path)}  —  {elapsed:.1f}s")
         if hasattr(self, '_adapter') and self._adapter.format == FfsAdapter.FORMAT_GRAYKEY:
             QTimer.singleShot(0, self._expand_to_private_var)
         QTimer.singleShot(0, self._fit_splitter_to_tree)

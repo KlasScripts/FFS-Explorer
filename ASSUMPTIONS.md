@@ -1084,16 +1084,18 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
     still fails is listed in the startup log with the reason;
   - App Group GUIDs from LaunchServices name `Shared/AppGroup` folders
     (all 307 on three real iOS archives match their plist, 0 differ);
-  - on every open (`ffs_metadata.repair_guid_map`), an unnamed container
-    folder is filled from the saved App Group GUIDs, then by re-reading
-    its plist if the zip has one; the result is saved to the case cache.
+  - the map is made once, at the first parse (plists, then LaunchServices
+    including App Group GUIDs), and saved; later opens use it as saved and
+    do not repair it (2026-11-26, ffs-notes review, B-76: the repair walked
+    every folder on every open). A case whose map was saved before v0.45.0
+    keeps its gaps until its cache is rebuilt.
 - Verified on IOS18 (GrayKey) and IOS17 (Cellebrite): with half the plist
   offsets deliberately 12 bytes wrong, all 1,181 / 1,221 containers are
   still named; a cached map missing 131 / 171 folders (every App Group
-  plus 30 apps) is fully repaired on open, 0 wrong names.
-- A container folder still unnamed after this is shown by its GUID; since
-  2026-11-21 (owner) that is said on the Loaded status message and listed
-  in the startup log, not in a warning dialog.
+  plus 30 apps) is fully repaired on open, 0 wrong names. (The repair on
+  open was removed on 2026-11-26.)
+- A container folder still unnamed is shown by its GUID, with no warning
+  or log line (owner, 2026-11-26).
 
 **A-77. Deleted SQLite media larger than one page is recovered by
 following its overflow chain.** *Decision (owner) + Confirmed (real),

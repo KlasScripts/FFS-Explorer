@@ -486,11 +486,15 @@ only.*
 - If wrong: a stale index would read the wrong bytes. Mitigated by the
   mtime/size check.
 
-**A-20. Embedded archives are never extracted automatically.** *Decision.*
-Extraction is an examiner action (Process Case, or right-click), or is
-declared by a parser through `requires_nested_extraction`. Content inside an
-unextracted embedded archive is invisible to search and parsers; `list_apps`
-reports it as `embedded_archives` so the gap is visible.
+**A-20. Embedded archives are unpacked only by an examiner action.**
+*Decision (owner request, 2026-11-26: no picker).* Process Case's "Unpack
+archives" option (every archive found in the review locations, except app
+developer content: `.lottie`, `.aar`), right-click, or a parser's
+`requires_nested_extraction`. An archive that would unpack to over 20 GB,
+over 1000:1 once past 1 GB, or leave under 2 GB free on the case drive is
+not unpacked and is listed as failed. Content inside an unextracted embedded
+archive is invisible to search and parsers; `list_apps` reports it as
+`embedded_archives` so the gap is visible.
 
 ## 7. Other data facts the design relies on
 
@@ -1017,8 +1021,7 @@ by the later stages.** *Decision (owner report) + Confirmed (real),
     case's tier: everywhere in the app an extension's own type wins and the
     header result is used only for an unknown extension, at every tier, so
     a re-check could change no Type shown.
-  - Cancelling archive selection, or finding no archives, carries on with
-    the later stages (they used to be skipped).
+  - Finding no new archives carries on with the later stages.
 - **Not supported:** a LevelDB/IndexedDB folder inside an unpacked archive.
   Unpacked files are shown flat under their archive, so no such folder is
   detected, and LevelDB indexing reads only the main archive.

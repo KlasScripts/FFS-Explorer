@@ -257,7 +257,6 @@ File order, top to bottom:
 - `ExportProgressDialog`.
 - Settings/preferences dialogs, small scan workers, integrity check.
 - `ProcessDialog`: extraction/processing hub, artifact parser runs.
-- `ArchiveSelectionDialog`: open/recent UI.
 - `FastZipBrowser`: the main window. Everything else is a method on it:
   - `__init__`/column config, filtering;
   - `_load_file_preview`, which routes a selection to the right mixin tab;

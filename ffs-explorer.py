@@ -6680,11 +6680,15 @@ class ProcessDialog(QDialog):
         self._current_tier = 0
         self._rebuild_tier_upgrade_ui()
 
-        self._chk_nested = QCheckBox("Find and select archives for extraction")
+        self._chk_nested = QCheckBox("Unpack archives (zip, gzip) in the review locations")
         self._chk_nested.setChecked(False)
         self._chk_nested.setToolTip(
-            "Scans app containers, iCloud/Files, Mail and SMS locations for archive "
-            "files,\nthen shows a selection dialog so you can choose which to extract.\n"
+            "Finds archive files in app containers, iCloud/Files, Mail and SMS "
+            "locations\nand unpacks every one, so search, parsers and the media "
+            "stages see their files.\nLeft packed: app developer content (Lottie "
+            "animations, Android libraries), listed in the log.\n"
+            "An archive that would unpack to over 20 GB, or over 1000 times its size, "
+            "or fill the case drive, is not unpacked and is listed as failed.\n"
             "Extensionless archives are already covered by this case's own "
             "header scan (at least Tier 1 always runs at case creation).")
         layout.addWidget(self._chk_nested)
@@ -7866,19 +7870,17 @@ class ProcessDialog(QDialog):
             self._continue_after_nested()
 
     def _show_archive_selection(self):
-        """Load header overrides, discover archives, show selection dialog,
-        then extract. Discovery is UNSCOPED (whole archive, not just
+        """Load header overrides, discover archives, then unpack every new
+        one (no picker since 2026-11-26). Discovery is UNSCOPED (whole archive, not just
         app/user-accessible areas) once this case's effective tier is
         Tier 3 — see TODO.md item 21 for why Tier 3 alone doesn't already
         guarantee this without the explicit check below, and
         _discover_all_archives's own docstring for what unscoped changes."""
         overrides = {}
-        guid_to_bundle = {}
         if self._case_dir:
             try:
                 with closing(_open_cache_db(self._case_dir)) as db:
                     overrides = load_header_types(db)
-                    guid_to_bundle = load_guid_bundle_map(db)
             except Exception:
                 pass
 
@@ -7975,18 +7977,34 @@ class ProcessDialog(QDialog):
             self._continue_after_nested()
             return
 
-        is_android = (self._adapter.format == self._adapter.FORMAT_ZIP_EXTRAS or
-                      any(a['category'] in ('AndroidApp', 'AndroidMedia') for a in archives))
-        dlg = ArchiveSelectionDialog(new_archives, guid_to_bundle=guid_to_bundle,
-                                     is_android=is_android,
-                                     done_archives=done_archives,
-                                     failed_archives=failed_archives, parent=self)
-        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.selected_paths:
-            self._status_label.setText("Archive selection cancelled — no archives extracted.")
+        # Every archive found is unpacked, no picker (2026-11-26, owner
+        # request): only an app's developer content is left packed
+        # (nested_archive.SKIP_EXTENSIONS), and an archive that failed
+        # before is not tried again. Both are counted and logged.
+        skipped = [(a['ui_path'], nested_archive.skip_reason(a['ui_path']))
+                   for a in new_archives]
+        skipped = [(p_, why) for p_, why in skipped if why]
+        skip_set = {p_ for p_, _ in skipped}
+        todo = [a['ui_path'] for a in new_archives if a['ui_path'] not in skip_set]
+        if skipped:
+            startup_log.message('warning', f"Process Case: {len(skipped):,} archive(s) "
+                                           "left packed as app developer content:")
+            for p_, why in skipped[:200]:
+                startup_log.message('warning', f"  {p_}: {why}")
+        notes = []
+        if done_archives:
+            notes.append(f"{len(done_archives):,} already unpacked")
+        if failed_archives:
+            notes.append(f"{len(failed_archives):,} failed before (not retried)")
+        if skipped:
+            notes.append(f"{len(skipped):,} left packed as app developer content (see the log)")
+        self._nested_notes = notes
+        if not todo:
+            self._status_label.setText(
+                "No new archives to unpack" + (f": {', '.join(notes)}." if notes else "."))
             self._continue_after_nested()
             return
-
-        self._start_nested_extraction(candidates=dlg.selected_paths)
+        self._start_nested_extraction(candidates=todo)
 
     def _start_nested_extraction(self, candidates: list[str] | None = None):
         if candidates is None:
@@ -8039,6 +8057,9 @@ class ProcessDialog(QDialog):
         if err:
             first = self._nested_errors[0] if self._nested_errors else "unknown error"
             msg += f", {err:,} failed ({first})"
+        notes = getattr(self, '_nested_notes', None)
+        if notes:
+            msg += "; " + ", ".join(notes)
         msg += "."
         # Rebuild compound gzip type overrides from the DB and push to the file
         # browser.  Done here (main thread) so it covers skipped files too and
@@ -8515,399 +8536,6 @@ def _bundle_id_for_path(ui_path: str, guid_to_bundle: dict) -> str:
         if _UUID_RE.match(part):
             return guid_to_bundle.get(part, part)
     return ''
-
-
-class ArchiveSelectionDialog(QDialog):
-    """Tree dialog for selecting which discovered archives to extract."""
-
-    def __init__(self, archives: list[dict], guid_to_bundle: dict | None = None,
-                 is_android: bool = False, done_archives: list[dict] | None = None,
-                 failed_archives: list[dict] | None = None,
-                 parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Select Archives for Extraction")
-        self.setModal(True)
-        self.setMinimumSize(820, 520)
-        self.selected_paths: list[str] = []
-        self._archives = archives
-        self._done_archives = done_archives or []
-        self._failed_archives = failed_archives or []
-        self._guid_to_bundle = guid_to_bundle or {}
-        self._is_android = is_android
-        self._updating = False
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-
-        n = len(archives)
-        n_done = len(self._done_archives)
-        n_fail = len(self._failed_archives)
-        parts = []
-        if n_done:
-            parts.append(f"{n_done:,} previously extracted")
-        if n_fail:
-            parts.append(f"{n_fail:,} previously failed")
-        if n == 0:
-            header = (", ".join(parts).capitalize() + ". "
-                      if parts else "") + "No new archives to extract."
-        else:
-            header = (f"<b>{n:,} archive{'s' if n != 1 else ''} available for extraction.</b>"
-                      + (f" ({', '.join(parts)}, shown below.)" if parts else ""))
-        layout.addWidget(QLabel(header))
-
-        self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(["Path", "Type"])
-        self._tree.setColumnWidth(0, 620)
-        self._tree.setAlternatingRowColors(True)
-        self._tree.setSortingEnabled(False)
-        # Forced to Fusion, not the native macOS style — direct report,
-        # 2026-09-25: "i cannot see the checkboxs in this dialog." A real
-        # bug, confirmed with an actual screenshot of this exact dialog
-        # (dark mode, macOS 27, PySide6 6.11): QMacStyle draws NO checkbox
-        # indicator at all here — not faint, not wrong-colored, genuinely
-        # absent — for every item at every state (unchecked/checked/
-        # partially-checked). Fusion draws its own checkbox glyphs rather
-        # than delegating to native NSCell rendering, so it isn't
-        # susceptible to this; confirmed, again via a real screenshot, all
-        # three states (empty box / checkmark / solid grey partial-check
-        # square) render clearly and distinctly once applied. Scoped to
-        # just this tree (not QApplication.setStyle, which would reskin
-        # the entire app) — self._tree_style keeps the created QStyle
-        # object alive for the tree's own lifetime, since QWidget.setStyle
-        # does NOT take ownership the way QApplication.setStyle does.
-        self._tree_style = QStyleFactory.create("Fusion")
-        if self._tree_style is not None:
-            self._tree.setStyle(self._tree_style)
-        layout.addWidget(self._tree)
-
-        self._count_label = QLabel()
-        layout.addWidget(self._count_label)
-
-        btn_row = QHBoxLayout()
-        sel_all = QPushButton("Select All")
-        sel_all.clicked.connect(self._select_all)
-        btn_row.addWidget(sel_all)
-        desel_all = QPushButton("Deselect All")
-        desel_all.clicked.connect(self._deselect_all)
-        btn_row.addWidget(desel_all)
-        btn_row.addStretch()
-        self._extract_btn = QPushButton("Extract Selected")
-        self._extract_btn.setDefault(True)
-        self._extract_btn.clicked.connect(self._accept)
-        btn_row.addWidget(self._extract_btn)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(cancel_btn)
-        layout.addLayout(btn_row)
-
-        self._build_tree()
-        self._tree.itemChanged.connect(self._on_item_changed)
-        self._refresh_count()
-
-    # ── Shared tree helpers ───────────────────────────────────────────────────
-
-    # Every archive dict carries an 'mtime' key (discovery and the DB-failure
-    # fallback both set it), so the C-level itemgetter is safe here.
-    _mtime_key = staticmethod(itemgetter('mtime'))
-
-    @classmethod
-    def _max_mtime(cls, arcs: list) -> int:
-        return max(map(cls._mtime_key, arcs), default=0)
-
-    @staticmethod
-    def _mtime_label(ns: int) -> str:
-        if not ns:
-            return ''
-        try:
-            return ('  — ' + datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
-                    .strftime('%Y-%m-%d'))
-        except Exception:
-            return ''
-
-    def _make_file_item(self, parent, arc: dict) -> QTreeWidgetItem:
-        item = QTreeWidgetItem(parent)
-        item.setText(0, _display_path(arc['ui_path'], self._guid_to_bundle))
-        item.setText(1, arc['file_type'])
-        item.setCheckState(0, Qt.CheckState.Unchecked)
-        item.setData(0, Qt.ItemDataRole.UserRole, arc['ui_path'])
-        return item
-
-    def _make_app_node(self, parent, label: str, arcs: list[dict]) -> QTreeWidgetItem:
-        mt = self._max_mtime(arcs)
-        node = QTreeWidgetItem(parent)
-        node.setText(0, f"{label}  ({len(arcs):,}){self._mtime_label(mt)}")
-        node.setCheckState(0, Qt.CheckState.Unchecked)
-        node.setExpanded(False)
-        for arc in sorted(arcs, key=self._mtime_key, reverse=True):
-            self._make_file_item(node, arc)
-        return node
-
-    def _make_app_group(self, label: str, buckets: dict) -> None:
-        if not buckets:
-            return
-        total = sum(len(v) for v in buckets.values())
-        group = QTreeWidgetItem(self._tree)
-        group.setText(0, f"{label}  ({total:,})")
-        group.setCheckState(0, Qt.CheckState.Unchecked)
-        group.setExpanded(True)
-        for key in sorted(buckets, key=lambda k: self._max_mtime(buckets[k]), reverse=True):
-            self._make_app_node(group, key, buckets[key])
-
-    # ── Platform-specific tree builders ──────────────────────────────────────
-
-    def _build_tree(self):
-        if self._is_android:
-            self._build_tree_android()
-        else:
-            self._build_tree_ios()
-        if self._failed_archives:
-            self._build_tree_failed()
-        if self._done_archives:
-            self._build_tree_done()
-
-    def _build_tree_failed(self):
-        """Append a collapsed, pre-checked 'Previously Failed' section (retryable)."""
-        n = len(self._failed_archives)
-        group = QTreeWidgetItem(self._tree)
-        group.setText(0, f"Previously Failed — retry?  ({n:,})")
-        group.setText(1, "")
-        group.setCheckState(0, Qt.CheckState.Checked)
-        group.setExpanded(False)
-        red = group.foreground(0)
-        red.setColor(Qt.GlobalColor.red)
-        group.setForeground(0, red)
-        group.setForeground(1, red)
-        font = group.font(0)
-        font.setBold(True)
-        group.setFont(0, font)
-
-        for arc in sorted(self._failed_archives, key=self._mtime_key, reverse=True):
-            item = QTreeWidgetItem(group)
-            item.setText(0, _display_path(arc['ui_path'], self._guid_to_bundle))
-            item.setText(1, arc.get('file_type', ''))
-            item.setCheckState(0, Qt.CheckState.Checked)
-            item.setData(0, Qt.ItemDataRole.UserRole, arc['ui_path'])
-            err = arc.get('error_msg', '')
-            if err:
-                item.setToolTip(0, err)
-            item.setForeground(0, red)
-            item.setForeground(1, red)
-
-    def _build_tree_done(self):
-        """Append a collapsed, non-checkable 'Previously Extracted' section."""
-        n = len(self._done_archives)
-        group = QTreeWidgetItem(self._tree)
-        group.setText(0, f"Previously Extracted  ({n:,})")
-        group.setText(1, "")
-        # No check box — set flags without ItemIsUserCheckable
-        group.setFlags(group.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-        grey = group.foreground(0)
-        grey.setColor(Qt.GlobalColor.gray)
-        group.setForeground(0, grey)
-        group.setForeground(1, grey)
-        font = group.font(0)
-        font.setItalic(True)
-        group.setFont(0, font)
-        group.setExpanded(False)
-
-        for arc in sorted(self._done_archives, key=self._mtime_key, reverse=True):
-            item = QTreeWidgetItem(group)
-            item.setText(0, _display_path(arc['ui_path'], self._guid_to_bundle))
-            item.setText(1, arc.get('file_type', ''))
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
-                                       & ~Qt.ItemFlag.ItemIsEnabled)
-            item.setForeground(0, grey)
-            item.setForeground(1, grey)
-
-    def _build_tree_ios(self):
-        g2b = self._guid_to_bundle
-        sms_items:   list[dict] = []
-        mail_items:  list[dict] = []
-        files_items: list[dict] = []
-        app_buckets: dict[str, list[dict]] = {}
-        # Same real gap as _build_tree_android's own 'Other' bucket, fixed
-        # the same day — an archive that's neither SMS/Mail/Files NOR
-        # inside a real app container (only reachable at all once Tier
-        # 3's unscoped discovery is active, per TODO.md item 21) used to
-        # fall into app_buckets['Unknown'], which then nested under
-        # "Third-Party Apps" — implying an unidentified THIRD-PARTY APP's
-        # own data, when the real situation is "not inside any app
-        # container at all" (e.g. mobile/Library/Caches/, mobile/Media/,
-        # private/var/db/, mobile/Library/Biome/). Kept as its own group
-        # instead, never folded into either app bucket.
-        other_archives: list[dict] = []
-
-        for arc in self._archives:
-            cat = arc['category']
-            if cat == 'SMS':
-                sms_items.append(arc)
-            elif cat == 'Mail':
-                mail_items.append(arc)
-            elif cat == 'Files':
-                files_items.append(arc)
-            else:
-                bid = _bundle_id_for_path(arc['ui_path'], g2b)
-                if bid:
-                    app_buckets.setdefault(bid, []).append(arc)
-                else:
-                    other_archives.append(arc)
-
-        def make_top_level(label: str, items: list[dict]) -> QTreeWidgetItem:
-            node = QTreeWidgetItem(self._tree)
-            node.setText(0, f"{label}  ({len(items):,})")
-            node.setCheckState(0, Qt.CheckState.Unchecked)
-            node.setExpanded(True)
-            for arc in sorted(items, key=self._mtime_key, reverse=True):
-                self._make_file_item(node, arc)
-            return node
-
-        if sms_items:
-            make_top_level("SMS Attachments", sms_items)
-        if mail_items:
-            make_top_level("Mail", mail_items)
-        if files_items:
-            make_top_level("Files / iCloud", files_items)
-
-        apple      = {b: a for b, a in app_buckets.items() if b.startswith('com.apple.')}
-        third_party = {b: a for b, a in app_buckets.items() if not b.startswith('com.apple.')}
-        self._make_app_group("Default Apps", apple)
-        self._make_app_group("Third-Party Apps", third_party)
-
-        # Other — neither SMS/Mail/Files nor a resolvable app container
-        if other_archives:
-            self._make_app_node(self._tree, "Other", other_archives)
-
-    def _build_tree_android(self):
-        app_buckets:   dict[str, list[dict]] = {}
-        media_buckets: dict[str, dict[str, list[dict]]] = {}  # volume → subfolder → archives
-        # Genuinely a third case, not a variant of "App Data" — an archive
-        # that's neither under data/media/ NOR inside a real app's own
-        # data/data/<package>/ folder (only reachable at all once Tier 3's
-        # unscoped discovery is active — see TODO.md item 21). Previously
-        # folded into app_buckets under a literal 'Unknown' package name,
-        # which read as "some app we couldn't identify" when the real
-        # situation is "not inside any app's data folder at all" — a
-        # materially different, potentially more interesting fact,
-        # confirmed as real (not just theoretical) directly against a
-        # live case before this was built, not assumed from the code
-        # alone. Kept as its own top-level group so it's never confused
-        # with an actual app.
-        other_archives: list[dict] = []
-
-        for arc in self._archives:
-            if arc['category'] == 'AndroidMedia':
-                vol, sub = _android_media_parts(arc['ui_path'])
-                media_buckets.setdefault(vol, {}).setdefault(sub, []).append(arc)
-            else:
-                pkg = _android_package(arc['ui_path'])
-                if pkg:
-                    app_buckets.setdefault(pkg, []).append(arc)
-                else:
-                    other_archives.append(arc)
-
-        # App Data — all packages sorted by most recently active
-        self._make_app_group("App Data", app_buckets)
-
-        # User Storage — one top-level node per volume (Internal first, then SD cards)
-        for vol_label in sorted(media_buckets,
-                                key=lambda v: (0 if v == 'Internal Storage' else 1, v)):
-            sub_map = media_buckets[vol_label]
-            vol_total = sum(len(v) for v in sub_map.values())
-            vol_node = QTreeWidgetItem(self._tree)
-            vol_node.setText(0, f"User Storage — {vol_label}  ({vol_total:,})")
-            vol_node.setCheckState(0, Qt.CheckState.Unchecked)
-            vol_node.setExpanded(True)
-            for sub in sorted(sub_map):
-                arcs = sub_map[sub]
-                sub_node = QTreeWidgetItem(vol_node)
-                sub_node.setText(0, f"{sub}  ({len(arcs):,})")
-                sub_node.setCheckState(0, Qt.CheckState.Unchecked)
-                sub_node.setExpanded(True)
-                for arc in sorted(arcs, key=self._mtime_key, reverse=True):
-                    self._make_file_item(sub_node, arc)
-
-        # Other — neither app data nor media storage (see comment above)
-        if other_archives:
-            self._make_app_node(self._tree, "Other", other_archives)
-
-    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
-        if column != 0 or self._updating:
-            return
-        self._updating = True
-        state = item.checkState(0)
-        # Propagate downward to children
-        self._set_children(item, state)
-        # Update parent group/location tri-state
-        parent = item.parent()
-        while parent is not None:
-            self._sync_parent(parent)
-            parent = parent.parent()
-        self._updating = False
-        self._refresh_count()
-
-    def _set_children(self, item: QTreeWidgetItem, state: Qt.CheckState):
-        for i in range(item.childCount()):
-            child = item.child(i)
-            child.setCheckState(0, state)
-            self._set_children(child, state)
-
-    def _sync_parent(self, item: QTreeWidgetItem):
-        n = item.childCount()
-        checked = sum(
-            1 for i in range(n)
-            if item.child(i).checkState(0) == Qt.CheckState.Checked
-        )
-        if checked == 0:
-            item.setCheckState(0, Qt.CheckState.Unchecked)
-        elif checked == n:
-            item.setCheckState(0, Qt.CheckState.Checked)
-        else:
-            item.setCheckState(0, Qt.CheckState.PartiallyChecked)
-
-    def _collect_selected(self) -> list[str]:
-        selected = []
-        root = self._tree.invisibleRootItem()
-        self._walk(root, selected)
-        return selected
-
-    def _walk(self, item: QTreeWidgetItem, out: list[str]):
-        path = item.data(0, Qt.ItemDataRole.UserRole)
-        if path and item.checkState(0) == Qt.CheckState.Checked:
-            out.append(path)
-        for i in range(item.childCount()):
-            self._walk(item.child(i), out)
-
-    def _refresh_count(self):
-        selected = self._collect_selected()
-        n = len(selected)
-        total = len(self._archives) + len(self._failed_archives)
-        self._count_label.setText(f"{n:,} of {total:,} archives selected")
-        self._extract_btn.setText(f"Extract Selected ({n:,})")
-        self._extract_btn.setEnabled(n > 0)
-
-    def _select_all(self):
-        self._updating = True
-        root = self._tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            group = root.child(i)
-            group.setCheckState(0, Qt.CheckState.Checked)
-            self._set_children(group, Qt.CheckState.Checked)
-        self._updating = False
-        self._refresh_count()
-
-    def _deselect_all(self):
-        self._updating = True
-        root = self._tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            group = root.child(i)
-            group.setCheckState(0, Qt.CheckState.Unchecked)
-            self._set_children(group, Qt.CheckState.Unchecked)
-        self._updating = False
-        self._refresh_count()
-
-    def _accept(self):
-        self.selected_paths = self._collect_selected()
-        self.accept()
 
 
 def _do_path_change_check(

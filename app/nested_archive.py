@@ -84,6 +84,51 @@ from zip_reader import ZipReader
 
 _MEM_LIMIT = 100 * 1024 * 1024   # 100 MB — larger files written to temp first
 
+# Process Case unpacks every archive it finds (2026-11-26, owner request:
+# no picker), except these: an app's own developer content, never user
+# data (IOS17: 16 .lottie animations, 3 .aar Android libraries). Logs,
+# backups, exports and anything without one of these extensions are
+# always unpacked.
+SKIP_EXTENSIONS = {
+    '.lottie': 'Lottie animation (app artwork)',
+    '.aar': 'Android library (app code)',
+}
+
+# Zip-bomb guard: an archive that would unpack to more than this, or more
+# than BOMB_RATIO times its own size once that is over BOMB_MIN, is not
+# unpacked; it is recorded as failed with the reason (shown, never
+# silently passed).
+MAX_UNPACKED = 20 * 1024 ** 3        # 20 GB per archive
+BOMB_RATIO = 1000
+BOMB_MIN = 1024 ** 3                 # ratio only checked over 1 GB unpacked
+SPACE_MARGIN = 2 * 1024 ** 3         # always leave 2 GB free on the case drive
+
+
+def skip_reason(ui_path: str) -> str | None:
+    """Why Process Case leaves this archive packed, or None."""
+    name = ui_path.rsplit('/', 1)[-1].lower()
+    for ext, why in SKIP_EXTENSIONS.items():
+        if name.endswith(ext):
+            return why
+    return None
+
+
+def _check_unpacked_size(unpacked: int, packed: int, out_dir: str) -> None:
+    """Raise if unpacking *unpacked* bytes looks like a zip bomb or would
+    leave less than SPACE_MARGIN free where the case is."""
+    if unpacked > MAX_UNPACKED:
+        raise RuntimeError(f"not unpacked: would be {unpacked:,} bytes, over the "
+                           f"{MAX_UNPACKED // 1024 ** 3} GB limit for one archive "
+                           f"(possible zip bomb)")
+    if unpacked > BOMB_MIN and packed and unpacked > packed * BOMB_RATIO:
+        raise RuntimeError(f"not unpacked: {packed:,} bytes would become "
+                           f"{unpacked:,} (over {BOMB_RATIO}:1, possible zip bomb)")
+    import shutil
+    free = shutil.disk_usage(out_dir).free
+    if unpacked + SPACE_MARGIN > free:
+        raise RuntimeError(f"not unpacked: needs {unpacked:,} bytes and the case "
+                           f"drive has {free:,} free (keeping 2 GB spare)")
+
 
 def classify_unpacked(name: str, data: bytes, get_file_type) -> str:
     """Type one unpacked file the way the main archive's files are typed:
@@ -438,7 +483,10 @@ def unpack_to_disk(zip_path: str, case_dir: str, ui_path: str, physical_path: st
 
     if raw[:2] == b'\x1f\x8b':
         # ── Gzip: decompress and store the raw decompressed file ──
-        decompressed = gzip.decompress(raw)
+        # Read at most MAX_UNPACKED + 1 bytes: a bomb stops there.
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+            decompressed = gz.read(MAX_UNPACKED + 1)
+        _check_unpacked_size(len(decompressed), len(raw), out_dir)
         with open(out_path, 'wb') as f:
             f.write(decompressed)
         child_name = (basename[:-3] if basename.lower().endswith('.gz')
@@ -467,6 +515,12 @@ def unpack_to_disk(zip_path: str, case_dir: str, ui_path: str, physical_path: st
         compound_type = None
         src_handle = open(src_arg, 'rb') if src_arg else io.BytesIO(raw)
         try:
+            with zipfile.ZipFile(src_handle, 'r') as src_zip:
+                # Declared sizes, before anything is written; zipfile then
+                # refuses an entry that reads past its declared size.
+                _check_unpacked_size(sum(i.file_size for i in src_zip.infolist()),
+                                     file_size, out_dir)
+            src_handle.seek(0)
             with zipfile.ZipFile(src_handle, 'r') as src_zip, \
                  zipfile.ZipFile(out_path, 'w',
                                  compression=zipfile.ZIP_STORED) as dst_zip:

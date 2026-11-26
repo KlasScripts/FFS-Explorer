@@ -109,6 +109,28 @@ class _LazyZipSlice:
     def tell(self) -> int:
         return self._pos
 
+    def readline(self, size: int | None = -1) -> bytes:
+        """Up to and including the next b'\\n' (at most *size* bytes).
+        Pillow's IM plugin, tried before TIFF unless the TIFF plugin is
+        already loaded, calls readline: without it the AttributeError
+        aborted Image.open and a TIFF got no metadata, depending on what
+        the process had read before (B-77, 2026-11-26)."""
+        limit = self._size - self._pos
+        if size is not None and size >= 0:
+            limit = min(limit, size)
+        out = bytearray()
+        while len(out) < limit:
+            block = self.read(min(4096, limit - len(out)))
+            if not block:
+                break
+            nl = block.find(b'\n')
+            if nl >= 0:
+                out += block[:nl + 1]
+                self._pos -= len(block) - nl - 1
+                break
+            out += block
+        return bytes(out)
+
     def seekable(self) -> bool:
         return True
 
@@ -172,9 +194,11 @@ def _dms_to_decimal(dms, ref: str) -> float | None:
 TAKEN_RULE = 2
 # What the stage records, stamped on its run log (parser_version): 3 = also
 # every text metadata field (extract_all_text, table media_metadata_text),
-# 2026-11-22. An older run makes Process Case offer the stage again.
+# 2026-11-22. 4 = TIFF and WebP files no longer missed (B-77:
+# _LazyZipSlice.readline), 2026-11-26. An older run makes Process Case
+# offer the stage again.
 # TAKEN_RULE stays the rule for 'taken' alone (the Timeline checks it).
-STAGE_RULE = 3
+STAGE_RULE = 4
 
 _OFFSET_RE = re.compile(r'^\s*([+-])(\d{2}):?(\d{2})\s*$')
 

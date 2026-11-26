@@ -47,7 +47,7 @@ from db_utils import (_open_cache_db, _open_results_db, OldSchemaError,
                       check_cache_schema, check_results_schema,
                       save_blob, load_blob, open_blob,
                       save_header_types, load_header_types, clear_header_types,
-                      save_media_metadata, load_media_metadata, clear_media_metadata,
+                      save_media_metadata, load_media_metadata, load_media_metadata_other, clear_media_metadata,
                       save_duplicate_files, load_duplicate_files, count_duplicate_groups,
                       load_possible_duplicates,
                       load_attachment_links,
@@ -1393,7 +1393,7 @@ _PHOTO_HEADERS = ['Flags', 'Taken', 'Added', 'Original Name', 'Album', 'Labels',
 # anything already shipped/saved in a report or column layout.
 _EXIF_HEADERS = ['Taken (EXIF)', 'Camera (EXIF)', 'GPS (EXIF)',
                  'Duration (EXIF)', 'Dimensions (EXIF)', 'Software (EXIF)',
-                 'Orientation (EXIF)']
+                 'Orientation (EXIF)', 'Other Metadata (EXIF)']
 
 # File Browser <-> Artifact Report cross-reference — added 2026-10-12,
 # direct request: "i want to be able to link together the artifact
@@ -11559,6 +11559,7 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                     f"{w}x{h}" if w and h else '',
                     fields.get('software', ''),
                     str(orientation) if orientation else '',
+                    self._exif_other_cell(path, fields),
                 ])
             else:
                 cols.extend([''] * len(_EXIF_HEADERS))
@@ -13680,6 +13681,9 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                 with closing(_open_cache_db(case_dir)) as db:
                     overrides = load_header_types(db)
                     media_exif = load_media_metadata(db)
+                    for p_, cell in load_media_metadata_other(db).items():
+                        if p_ in media_exif:
+                            media_exif[p_]['_other'] = cell
                     duplicates = load_duplicate_files(db)
                     possible = load_possible_duplicates(db)
             except Exception:
@@ -14474,6 +14478,17 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
             if source_local is not None:
                 out.append((ui_path, source_local, ext))
         return out
+
+    @staticmethod
+    def _exif_other_cell(path, fields) -> str:
+        """The "Other Metadata (EXIF)" cell; a file just scanned carries its
+        full '_text' list, turned into the cell once and then dropped (the
+        values are saved in casecache.db)."""
+        cell = fields.get('_other')
+        if cell is None:
+            cell = media_metadata_scan.other_summary(fields.pop('_text', ()) or ())
+            fields['_other'] = cell
+        return cell
 
     def _on_media_metadata_scan_done(self, results: dict) -> None:
         """Runs when ProcessDialog's media-metadata scan finishes (see

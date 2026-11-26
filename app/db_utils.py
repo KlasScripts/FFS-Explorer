@@ -990,6 +990,18 @@ def iter_media_metadata_text(conn: 'sqlite3.Connection'):
     yield from conn.execute('SELECT ui_path, source, key, value FROM media_metadata_text')
 
 
+def load_media_metadata_other(conn: 'sqlite3.Connection') -> dict:
+    """{ui_path: "Other Metadata (EXIF)" cell} from the saved text fields
+    (media_metadata_scan.other_summary). Values read cut to 2,000 chars:
+    the cell shows at most 120 of each."""
+    from media_metadata_scan import other_summary
+    rows: dict = {}
+    for path, src, key, val in conn.execute(
+            'SELECT ui_path, source, key, substr(value, 1, 2000) FROM media_metadata_text'):
+        rows.setdefault(path, []).append((src, key, val))
+    return {p: other_summary(t) for p, t in rows.items()}
+
+
 def media_metadata_text_paths(conn: 'sqlite3.Connection') -> set:
     """The files whose text metadata is on record (searched instead of
     their bytes)."""

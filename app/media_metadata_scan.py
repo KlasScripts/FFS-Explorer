@@ -555,6 +555,44 @@ def _add_exif(exif, add) -> None:
                 add(src, names.get(tag, hex(tag)), v, tag)
 
 
+# Text fields already shown in their own "(EXIF)" columns, left out of
+# "Other Metadata (EXIF)" (2026-11-22, owner: main EXIF in own columns,
+# the rest in one column).
+_OWN_COLUMN_KEYS = frozenset(k.lower() for k in (
+    'DateTimeOriginal', 'Make', 'Model', 'Software', 'Orientation',
+    'OffsetTimeOriginal', 'ExifImageWidth', 'ExifImageHeight',
+    'ImageWidth', 'ImageLength', 'GPSInfo'))
+OTHER_VALUE_CHARS = 120      # per value, cut marked with "…"
+OTHER_TOTAL_CHARS = 1000     # per cell, cut marked with the fields left
+
+
+def other_summary(texts) -> str:
+    """One cell for "Other Metadata (EXIF)": every saved text field
+    (source, key, value) not shown in its own column, as "key: value; ...".
+    Values longer than OTHER_VALUE_CHARS end in "…"; a cell over
+    OTHER_TOTAL_CHARS ends with how many fields were left out. Never
+    silent: the full values stay in casecache.db and Keyword Search."""
+    parts, total, left = [], 0, 0
+    for _src, key, value in texts:
+        if key.lower() in _OWN_COLUMN_KEYS or key == '_raw':
+            continue
+        v = ' '.join(str(value).split())
+        if not v:
+            continue
+        if len(v) > OTHER_VALUE_CHARS:
+            v = v[:OTHER_VALUE_CHARS] + '…'
+        part = f'{key}: {v}'
+        if total + len(part) > OTHER_TOTAL_CHARS:
+            left += 1
+            continue
+        parts.append(part)
+        total += len(part) + 2
+    cell = '; '.join(parts)
+    if left:
+        cell += f' … (+{left} more fields: see Keyword Search)'
+    return cell
+
+
 def extract_all_text(file_like, ext: str) -> list:
     """[(source, key, value)]: every text metadata field of a picture or
     video, for Keyword Search (it searches these instead of the file's

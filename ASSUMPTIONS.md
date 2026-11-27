@@ -1323,11 +1323,19 @@ default.** *Decision (owner, 2026-11-16).*
   truth. First: `artifacts/ios/line_deleted_messages.py` (both documented
   deletions on the Josh Hickman iOS 17 image recovered).
 - *Decision (owner, 2026-11-21):* a main report holds live rows only.
-  Deleted and older records are in a separate `recovered_records` report
-  per app, covering its message table and its media/attachment tables,
-  which can't be reliably linked to each other. `recoverable_tables` is
-  retired: it carved on every run (23.9 s of 74 s for 500,000 WhatsApp
-  messages).
+  Deleted and older records are in a separate `recovered_records` report.
+  `recoverable_tables` is retired: it carved on every run (23.9 s of 74 s
+  for 500,000 WhatsApp messages).
+- *Decision (owner, 2026-11-27; replaces "one report per app, covering its
+  message and media tables", 2026-11-21):* a deleted / changed records
+  report covers one table. Where an app keeps messages and media in
+  separate tables, each has its own report. A record's key to the other
+  table is shown with where that key was found (live, recovered or not
+  found), never joined. The notes say how the link is made and why it can
+  be wrong. Done first for WhatsApp (Android, iOS), Google Messages and
+  iOS SMS; every other report to follow, each with its deleted data apart
+  even from one table, and a table left out only where its deleted records
+  are of little value, noted in the report (ffs-notes F-169, #147).
 - *Decision (owner, 2026-11-21):* identical copies of a recovered record
   (same shown values, any row ID) are one row, with the number of copies;
   their locations are kept. An app that rewrites a row by delete + insert

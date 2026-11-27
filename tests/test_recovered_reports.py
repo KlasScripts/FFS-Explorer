@@ -100,7 +100,9 @@ def test_deleted_of_takes_app_and_files_from_the_main_report():
     assert ar._take_from_main_report(rep, main) is None
     assert rep.app_path == 'data/data/x'
     assert rep.files == {'db': 'databases/x.db'} and rep.optional_files == {'side': 'databases/side.db'}
-    assert main.deleted_report is rep
+    assert main.deleted_reports == [rep]
+    assert ar._take_from_main_report(rep, main) is None      # loaded again: listed once
+    assert main.deleted_reports == [rep]
     bad = types.SimpleNamespace(deleted_of='x', recovered_records=[{'file_key': 'nope', 'table': 't'}])
     assert 'nope' in ar._take_from_main_report(bad, main)
     assert 'not a report' in ar._take_from_main_report(rep, None)
@@ -174,3 +176,132 @@ def test_orphaned_live_rows_are_listed(tmp_path):
     # message, attachment 3 has no join row at all
     assert got == [('Attachment', 'y.jpg'), ('Attachment', 'z.jpg'), ('Media', 'gone.jpg')]
     assert all(r['recovered'] is False and r['raw_rowid'] for r in rows)
+
+
+def _wal_copy(tmp_path, script, name='m.db'):
+    """A database built by *script* (statements run one commit each), copied
+    while open so the WAL keeps the deleted rows, as on a phone."""
+    import shutil
+    live = str(tmp_path / ('live_' + name))
+    c = sqlite3.connect(live)
+    c.execute('PRAGMA journal_mode = WAL')
+    c.execute('PRAGMA wal_autocheckpoint = 0')
+    c.execute('PRAGMA secure_delete = OFF')
+    for stmt in script:
+        c.executescript(stmt)
+        c.commit()
+    db = str(tmp_path / name)
+    shutil.copy(live, db)
+    shutil.copy(live + '-wal', db + '-wal')
+    c.close()
+    return db
+
+
+def test_links_say_where_the_other_tables_row_was_found(tmp_path):
+    """One table per deleted report (A-95, 2026-11-27): each row says where
+    the row it names in the other table was found, live, recovered (with
+    the report that lists it) or not found; ids compared, nothing joined."""
+    import artifact_runner as ar
+    import types
+    db = _wal_copy(tmp_path, [
+        'CREATE TABLE message (_id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT);'
+        'CREATE TABLE media (message_row_id INTEGER PRIMARY KEY, path TEXT);',
+        ''.join(f"INSERT INTO message VALUES ({i}, 'message text number {i} here');" for i in range(1, 31))
+        + ''.join(f"INSERT INTO media VALUES ({i}, 'Media/picture_{i}.jpg');" for i in range(1, 21)),
+        'DELETE FROM message WHERE _id IN (5, 7, 25); DELETE FROM media WHERE message_row_id IN (5, 9);',
+    ])
+    msg = {'file_key': 'db', 'table': 'message', 'label': 'Message',
+           'fields': {'_id': 'message_id', 'text': 'message'}, 'version_fields': ['text'],
+           'links': [{'name': 'linked_media', 'what': 'media', 'column': '_id', 'table': 'media',
+                      'key': 'message_row_id', 'report_name': 'Deleted Media'}]}
+    med = {'file_key': 'db', 'table': 'media', 'label': 'Media',
+           'fields': {'message_row_id': 'message_id', 'path': 'media_path'}, 'version_fields': ['path'],
+           'orphan_of': {'column': 'message_row_id', 'in': ['message', '_id']},
+           'links': [{'name': 'linked_message', 'what': 'message', 'column': 'message_row_id',
+                      'table': 'message', 'key': '_id', 'report_name': 'Deleted Messages'}]}
+    m_rows = ar.recovered_records_report(types.SimpleNamespace(recovered_records=[msg]), {'db': db})
+    d_rows = ar.recovered_records_report(types.SimpleNamespace(recovered_records=[med]), {'db': db})
+    by_msg = {r['message_id']: r['linked_media'] for r in m_rows if r['status'] == 'Deleted'}
+    by_med = {(r['status'], r['message_id']): r['linked_message'] for r in d_rows}
+    assert by_msg == {5: 'media 5: recovered (in Deleted Media)',     # both gone
+                      7: 'media 7: live',                              # its media left behind
+                      25: 'media 25: not found'}                       # it had none
+    assert by_med == {('Deleted', 5): 'message 5: recovered (in Deleted Messages)',
+                      ('Deleted', 9): 'message 9: live',               # media gone, message kept
+                      ('Orphaned', 7): 'message 7: recovered (in Deleted Messages)'}
+    assert not any('media_path' in r for r in m_rows)      # nothing joined in
+    assert not any('message' in r for r in d_rows)
+
+
+def test_links_one_to_many_and_through_a_join_table(tmp_path):
+    """A message's parts (one to many, Google Messages) and SMS-style links
+    through a join table whose rows go with the deleted ones."""
+    import artifact_runner as ar
+    import types
+    db = _wal_copy(tmp_path, [
+        'CREATE TABLE messages (_id INTEGER PRIMARY KEY AUTOINCREMENT, sub TEXT);'
+        'CREATE TABLE parts (_id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INT, text TEXT);'
+        'CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT);'
+        'CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);',
+        ''.join(f"INSERT INTO messages VALUES ({i}, 'subject {i}');" for i in range(1, 11))
+        + ''.join(f"INSERT INTO parts VALUES ({10 * i + k}, {i}, 'part {k} of message {i} text');"
+                  for i in range(1, 11) for k in (1, 2))
+        + ''.join(f"INSERT INTO attachment VALUES ({i}, 'Library/SMS/Attachments/a{i}.heic');" for i in range(1, 11))
+        + ''.join(f"INSERT INTO message_attachment_join VALUES ({i}, {i});" for i in range(1, 11)),
+        'DELETE FROM messages WHERE _id = 3; DELETE FROM parts WHERE _id = 31;'
+        'DELETE FROM message_attachment_join WHERE message_id = 3; DELETE FROM attachment WHERE ROWID = 3;',
+    ])
+    msg = {'file_key': 'db', 'table': 'messages', 'label': 'Message',
+           'fields': {'_id': 'message_id', 'sub': 'sub'},
+           'links': [{'name': 'linked_parts', 'what': 'parts', 'column': '_id', 'table': 'parts',
+                      'key': 'message_id', 'report_name': 'Deleted Parts'},
+                     {'name': 'linked_attachments', 'what': 'attachment', 'column': '_id',
+                      'via': ['message_attachment_join', 'message_id', 'attachment_id'],
+                      'table': 'attachment', 'key': 'ROWID', 'report_name': 'Deleted Attachments'}]}
+    att = {'file_key': 'db', 'table': 'attachment', 'label': 'Attachment',
+           'fields': {'ROWID': 'attachment_id', 'filename': 'filename'},
+           'links': [{'name': 'linked_message', 'what': 'message', 'column': 'ROWID',
+                      'via': ['message_attachment_join', 'attachment_id', 'message_id'],
+                      'table': 'messages', 'key': '_id', 'report_name': 'Deleted Messages'}]}
+    [m] = [r for r in ar.recovered_records_report(types.SimpleNamespace(recovered_records=[msg]), {'db': db})
+           if r['status'] == 'Deleted']
+    assert m['message_id'] == 3
+    assert m['linked_parts'] == 'parts with message_id = 3: live row 32; recovered row 31 (in Deleted Parts)'
+    assert m['linked_attachments'] == ('attachment 3: recovered (in Deleted Attachments) '
+                                       '(recovered message_attachment_join row)')
+    [a] = [r for r in ar.recovered_records_report(types.SimpleNamespace(recovered_records=[att]), {'db': db})
+           if r['status'] == 'Deleted']
+    assert a['attachment_id'] == 3
+    assert a['linked_message'] == ('message 3: recovered (in Deleted Messages) '
+                                   '(recovered message_attachment_join row)')
+
+
+def test_main_report_names_each_of_its_deleted_reports(tmp_path):
+    """Under a main report, one line names every deleted report (one per
+    table): a link for one that has rows, how to run it for one never run."""
+    import types
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    import artifact_viewer as av
+
+    class Label:
+        text = ''
+        visible = None
+
+        def setText(self, t):
+            self.text = t
+
+        def setVisible(self, v):
+            self.visible = v
+    msgs = types.SimpleNamespace(__name__='x_deleted', name='X — Deleted Messages')
+    media = types.SimpleNamespace(__name__='x_deleted_media', name='X — Deleted Media')
+    fake = types.SimpleNamespace(
+        _case_dir=str(tmp_path), _art_deleted_link=Label(),
+        _art_find_tree_item_by_role=lambda role: object() if role.endswith(':x_deleted') else None)
+    av.ArtifactViewerMixin._update_art_deleted_link(
+        fake, types.SimpleNamespace(deleted_reports=[msgs, media]))
+    t = fake._art_deleted_link.text
+    assert fake._art_deleted_link.visible is True
+    assert '<a href="x_deleted">X — Deleted Messages</a>' in t
+    assert '"X — Deleted Media": not run yet' in t
+    av.ArtifactViewerMixin._update_art_deleted_link(fake, types.SimpleNamespace())
+    assert fake._art_deleted_link.visible is False

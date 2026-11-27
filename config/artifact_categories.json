@@ -201,7 +201,15 @@
       "category": "Chats & Messaging",
       "app": "WhatsApp"
     },
+    "whatsapp_deleted_media": {
+      "category": "Chats & Messaging",
+      "app": "WhatsApp"
+    },
     "google_messages_deleted": {
+      "category": "Chats & Messaging",
+      "app": "Google Messages"
+    },
+    "google_messages_deleted_parts": {
       "category": "Chats & Messaging",
       "app": "Google Messages"
     },
@@ -264,7 +272,15 @@
       "category": "Chats & Messaging",
       "app": "WhatsApp"
     },
+    "whatsapp_deleted_media": {
+      "category": "Chats & Messaging",
+      "app": "WhatsApp"
+    },
     "sms_deleted": {
+      "category": "Chats & Messaging",
+      "app": "Messages"
+    },
+    "sms_deleted_attachments": {
       "category": "Chats & Messaging",
       "app": "Messages"
     }

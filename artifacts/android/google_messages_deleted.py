@@ -1,32 +1,39 @@
-name = 'Google Messages — Deleted & Changed Records'
+name = 'Google Messages — Deleted & Changed Messages'
 description = (
-    'Deleted and changed Google Messages records from bugle_db (tables messages and '
-    "parts: a message's text and attachments are parts rows). Live messages are in Google "
-    'Messages (SMS/MMS/RCS); deleted conversations from the audit tables are in Google '
-    'Messages — Recovered (deleted conversations).\n'
+    'Deleted and changed Google Messages message records from bugle_db (table messages). '
+    "A message's text and attachments are not in this table but in parts rows: deleted and "
+    'changed parts are in Google Messages — Deleted & Changed Parts. Live messages are in '
+    'Google Messages (SMS/MMS/RCS); deleted conversations from the audit tables are in '
+    'Google Messages — Recovered (deleted conversations).\n'
     '\n'
-    'Each row is one record as found in one table, never joined to another table '
-    '(ASSUMPTIONS.md A-95): ids are the stored ids, and a message and its media are '
-    'separate rows. Status says Deleted (no longer in the table), Changed (an earlier '
-    'version of a row still there, listed only when one of the columns that matter '
-    'changed, with the current value beside it as "(now)") or an unfinished write/delete '
-    'under a hot journal. How found says how each record was recovered and how sure that '
-    'is; a record found by pattern has no row id. Values are as stored: no code is turned '
-    'into a word here unless it was checked against a test image.\n'
+    'Each row is one record as found in the messages table, never joined to another table '
+    '(ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no longer in the '
+    'table), Changed (an earlier version of a row still there, listed only when one of the '
+    'columns that matter changed, with the current value beside it as "(now)") or an '
+    'unfinished write/delete under a hot journal. How found says how each record was '
+    'recovered and how sure that is; a record found by pattern has no row id. Values are '
+    'as stored: no code is turned into a word here unless it was checked against a test '
+    'image.\n'
     '\n'
     'Times are Unix milliseconds, as in the Google Messages report.\n'
+    '\n'
+    "linked_parts: where this message's parts (its text and attachments) were found. Each "
+    "parts row names its message in parts.message_id, so the link is made by finding the "
+    "parts rows whose message_id is this record's message_id, in the table now (live, with "
+    'their row ids) and in the records Google Messages — Deleted & Changed Parts finds '
+    '(recovered, with their row ids); a message can have several (up to 3 on the test '
+    'images) or none (178 of 1,278 live messages on the Josh Hickman image). Only ids are '
+    'compared: no value of a part is brought in. How the link can be wrong: messages._id and parts._id are AUTOINCREMENT (checked 2026-11-27 on the Josh Hickman and CTF26 Android 14 images), so SQLite does not hand out an id again, but an app that re-inserts rows with their old ids (a restore from backup) can still put a different record under the same id; an earlier version found in the WAL and a live row with the same id were stored at different times; a record found by pattern has no row id and cannot be linked to by id; several copies of one record can carry the same id.\n'
     '\n'
     'Checked 2026-11-21 on the Josh Hickman Android 14 image: 0 records. Found earlier '
     '(carried over from the Google Messages report): bugle_db has PRAGMA secure_delete = '
     'FAST; the freed page ranges were all zero on a database known to have a deleted '
     'conversation. A real negative for recovery, not evidence nothing was deleted.'
-    '\n\nAlso listed: live parts rows whose message is gone (status Orphaned): '
-    'not deleted, so not recovered, and not in the main report, which lists a row only '
-    'with its message. None on the test image checked (2026-11-21).'
 )
 
 # Declaration-only report (report_type "recovered_records", ASSUMPTIONS.md
-# A-95, 2026-11-21: main reports hold live rows only). The shared code in
+# A-95: main reports hold live rows only, 2026-11-21; one table per
+# deleted report, 2026-11-27). The shared code in
 # artifact_runner.recovered_records_report recovers the records with
 # sqlite_recovery and makes the rows. Never joined to other tables.
 # Column names checked against the tables on the test images named in
@@ -49,37 +56,21 @@ recovered_records = [{'file_key': 'bugle_db',
              'mms_subject': 'mms_subject',
              'sms_message_uri': 'sms_message_uri',
              'rcs_message_id': 'rcs_message_id'},
-  'version_fields': ['conversation_id', 'sender_id', 'message_protocol', 'mms_subject']},
- {'file_key': 'bugle_db',
-  'table': 'parts',
-  'label': 'Part (text or attachment)',
-  'fields': {'_id': 'part_id',
-             'message_id': 'message_id',
-             'conversation_id': 'conversation_id',
-             'text': 'message',
-             'content_type': 'content_type',
-             'uri': 'uri',
-             'file_name': 'file_name',
-             'file_size_bytes': 'file_size',
-             'timestamp': 'timestamp',
-             'latitude': 'latitude',
-             'longitude': 'longitude',
-             'local_cache_path': 'local_cache_path'},
-  'orphan_of': {'column': 'message_id', 'in': ['messages', '_id']},
-  'version_fields': ['text', 'content_type', 'uri', 'file_name']}]
+  'version_fields': ['conversation_id', 'sender_id', 'message_protocol', 'mms_subject'],
+  'links': [{'name': 'linked_parts', 'what': 'parts', 'column': '_id',
+             'table': 'parts', 'key': 'message_id', 'report': 'google_messages_deleted_parts'}]}]
 
-timestamp_fields = {'sent_timestamp': 'ms', 'received_timestamp': 'ms', 'timestamp': 'ms'}
+timestamp_fields = {'sent_timestamp': 'ms', 'received_timestamp': 'ms'}
 
 core_fields = ['status',
- 'record',
  'received_timestamp',
- 'timestamp',
- 'message',
- 'content_type',
+ 'sent_timestamp',
+ 'mms_subject',
+ 'linked_parts',
  'changed_fields',
- 'message (now)',
  'how_found', "copies"]
-hidden_fields = ['recovered',
+hidden_fields = ['record',
+ 'recovered',
  'recovery_method',
  'recovery_version',
  'source_table',

@@ -5,7 +5,7 @@ import os
 import pathlib
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 from functools import partial
 
@@ -4191,35 +4191,40 @@ class ArtifactViewerMixin:
             self._art_report_view.setColumnWidth(col, min(w, max_width))
 
     def _update_art_deleted_link(self, mod) -> None:
-        """Under a main report: the line naming its deleted-records report
-        (set by artifact_runner._take_from_main_report), a link when that
-        report has been run, else how to run it."""
-        deleted = getattr(mod, 'deleted_report', None) if mod is not None else None
-        if deleted is None:
+        """Under a main report: the line naming its deleted-records reports
+        (one per table, set by artifact_runner._take_from_main_report),
+        each a link when it has been run, else how to run it."""
+        reports = list(getattr(mod, 'deleted_reports', None) or []) if mod is not None else []
+        if not reports:
             self._art_deleted_link.setVisible(False)
             return
-        name = html.escape(getattr(deleted, 'name', deleted.__name__))
-        if self._art_find_tree_item_by_role(_ART_GROUP + deleted.__name__) is not None:
-            self._art_deleted_link.setText(
-                f'Live rows only. Deleted and changed records: '
-                f'<a href="{html.escape(deleted.__name__)}">{name}</a>')
-        else:
-            # Not in the tree: never run, or run and found nothing (a report
-            # with no rows has no table). The run log says which.
-            try:
-                with closing(_open_results_db(self._case_dir)) as db:
-                    last = load_last_run(db, f'artifact_{deleted.__name__}')
-            except Exception:
-                last = None
-            if last and last['complete']:
-                when = html.escape(_local_date(last.get('completed_at') or last.get('run_at') or ''))
-                state = f'ran {when}: no deleted or changed records found'
-            elif last:
-                state = 'its last run did not finish (Tools ▸ Run Artifact Parsers)'
-            else:
-                state = 'not run yet (Tools ▸ Run Artifact Parsers)'
-            self._art_deleted_link.setText(
-                f'Live rows only. Deleted and changed records are in "{name}": {state}.')
+        try:
+            db = _open_results_db(self._case_dir)
+        except Exception:
+            db = None
+        parts = []
+        with closing(db) if db is not None else nullcontext():
+            for deleted in reports:
+                name = html.escape(getattr(deleted, 'name', deleted.__name__))
+                if self._art_find_tree_item_by_role(_ART_GROUP + deleted.__name__) is not None:
+                    parts.append(f'<a href="{html.escape(deleted.__name__)}">{name}</a>')
+                    continue
+                # Not in the tree: never run, or run and found nothing (a
+                # report with no rows has no table). The run log says which.
+                try:
+                    last = load_last_run(db, f'artifact_{deleted.__name__}') if db is not None else None
+                except Exception:
+                    last = None
+                if last and last['complete']:
+                    when = html.escape(_local_date(last.get('completed_at') or last.get('run_at') or ''))
+                    state = f'ran {when}: no deleted or changed records found'
+                elif last:
+                    state = 'its last run did not finish (Tools ▸ Run Artifact Parsers)'
+                else:
+                    state = 'not run yet (Tools ▸ Run Artifact Parsers)'
+                parts.append(f'"{name}": {state}')
+        self._art_deleted_link.setText(
+            'Live rows only. Deleted and changed records: ' + '; '.join(parts) + '.')
         self._art_deleted_link.setVisible(True)
 
     def _art_open_deleted_report(self, script_name: str) -> None:

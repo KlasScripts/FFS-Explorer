@@ -1,39 +1,36 @@
-name = 'SMS & iMessage — Deleted & Changed Records'
+name = 'SMS & iMessage — Deleted & Changed Messages'
 description = (
-    'Deleted and changed messages and attachment records from sms.db (tables message and '
-    "attachment). Live messages, and the ones in iOS's own Recently Deleted window, are "
-    "in SMS Messages. From iOS 16 a message's text is often only in attributedBody (a "
+    'Deleted and changed messages from sms.db (table message). Live messages, and the ones '
+    "in iOS's own Recently Deleted window, are in SMS Messages; deleted and changed "
+    'attachment records (table attachment) are in SMS & iMessage — Deleted & Changed '
+    "Attachments. From iOS 16 a message's text is often only in attributedBody (a "
     'typedstream blob), shown here as stored, not decoded.\n'
     '\n'
-    'Each row is one record as found in one table, never joined to another table '
-    '(ASSUMPTIONS.md A-95): ids are the stored ids, and a message and its media are '
-    'separate rows. Status says Deleted (no longer in the table), Changed (an earlier '
-    'version of a row still there, listed only when one of the columns that matter '
-    'changed, with the current value beside it as "(now)") or an unfinished write/delete '
-    'under a hot journal. How found says how each record was recovered and how sure that '
-    'is; a record found by pattern has no row id. Values are as stored: no code is turned '
-    'into a word here unless it was checked against a test image.\n'
+    'Each row is one record as found in the message table, never joined to another table '
+    '(ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no longer in the '
+    'table), Changed (an earlier version of a row still there, listed only when one of the '
+    'columns that matter changed, with the current value beside it as "(now)") or an '
+    'unfinished write/delete under a hot journal. How found says how each record was '
+    'recovered and how sure that is; a record found by pattern has no row id. Values are '
+    'as stored: no code is turned into a word here unless it was checked against a test '
+    'image.\n'
     '\n'
-    'message dates are Cocoa nanoseconds, as in SMS Messages; attachment.created_date is '
-    'Cocoa seconds (checked 2026-11-21 on the Josh Hickman iOS 17 image: the earliest '
-    'attachment is 2.5 s after the earliest message).\n'
+    'message dates are Cocoa nanoseconds, as in SMS Messages.\n'
+    '\n'
+    "linked_attachments: where this message's attachments were found. message_attachment_join holds one row per (message_id, attachment_id) pair, both the ROWIDs of their rows, so the link goes through it: the join rows holding this record's id are taken live or as recovered records of message_attachment_join, and the other id in each is looked up live and in the records the other deleted report finds. Each part of the cell says whether its join row was live or recovered. Only ids are compared: no value of the other row is brought in. On the Josh Hickman iOS 17 image (2026-11-27): 27 join rows, up to 3 attachments per message, every join row names a live message. How the link can be wrong: message.ROWID and attachment.ROWID are AUTOINCREMENT, so SQLite does not hand out an id again, but an app that re-inserts rows with their old ids (a restore from backup) can still put a different record under the same id; when a message goes, its join rows go with it, and sms.db's own trigger then deletes an attachment no other join row names, so a deleted record is linked only when its join row was recovered too, and a recovered join row may be from a different time than the rows it names; an earlier version found in the WAL and a live row with the same id were stored at different times; a record found by pattern has no row id and cannot be linked; several copies of one record can carry the same id.\n"
     '\n'
     'Checked 2026-11-21 on the Josh Hickman iOS 17 image: 4 earlier versions of 2 '
-    'messages (from the WAL and overflow pages) and 6 of attachments (from the WAL), all '
-    "Changed; 2 more versions differ only in columns that don't matter here and are "
-    'counted in the run log. Found earlier (carried over from SMS Messages): sms.db has '
-    'PRAGMA secure_delete = FAST (freed ranges all zero); two messages deleted 6+ months '
-    "before the extraction are gone, from this table and from Apple's own "
-    "recoverable-message tables. A message deleted within iOS's ~30-40 day window is "
-    'still live, and shown in SMS Messages. '
-    'Also listed: attachment rows still live whose message is gone (status Orphaned): not '
-    'deleted, so not recovered, and not in SMS Messages, which lists a row only with its message. '
-    'On the Josh Hickman iOS 17 image (2026-11-21): 1 of 28 attachments, an outgoing '
-    'image/jpeg with no message_attachment_join row.'
+    'messages (from the WAL and overflow pages), all Changed; more versions that differ '
+    "only in columns that don't matter here are counted in the run log. Found earlier "
+    '(carried over from SMS Messages): sms.db has PRAGMA secure_delete = FAST (freed '
+    'ranges all zero); two messages deleted 6+ months before the extraction are gone, from '
+    "this table and from Apple's own recoverable-message tables. A message deleted within "
+    "iOS's ~30-40 day window is still live, and shown in SMS Messages."
 )
 
 # Declaration-only report (report_type "recovered_records", ASSUMPTIONS.md
-# A-95, 2026-11-21: main reports hold live rows only). The shared code in
+# A-95: main reports hold live rows only, 2026-11-21; one table per
+# deleted report, 2026-11-27). The shared code in
 # artifact_runner.recovered_records_report recovers the records with
 # sqlite_recovery and makes the rows. Never joined to other tables.
 # Column names checked against the tables on the test images named in
@@ -68,40 +65,26 @@ recovered_records = [{'file_key': 'sms',
                      'handle_id',
                      'is_from_me',
                      'item_type',
-                     'group_title']},
- {'file_key': 'sms',
-  'table': 'attachment',
-  'label': 'Attachment',
-  'fields': {'ROWID': 'attachment_id',
-             'guid': 'guid',
-             'created_date': 'created_date',
-             'filename': 'filename',
-             'transfer_name': 'transfer_name',
-             'mime_type': 'mime_type',
-             'uti': 'uti',
-             'total_bytes': 'total_bytes',
-             'is_outgoing': 'is_outgoing',
-             'is_sticker': 'is_sticker'},
-  'orphan_of': {'column': 'ROWID', 'via': ['message_attachment_join', 'attachment_id', 'message_id'], 'in': ['message', 'ROWID']},
-  'version_fields': ['filename', 'transfer_name', 'mime_type']}]
+                     'group_title'],
+  'links': [{'name': 'linked_attachments', 'what': 'attachment', 'column': 'ROWID',
+             'via': ['message_attachment_join', 'message_id', 'attachment_id'],
+             'table': 'attachment', 'key': 'ROWID', 'report': 'sms_deleted_attachments'}]}]
 
 timestamp_fields = {'date': 'cocoa_ns',
  'date_read': 'cocoa_ns',
  'date_delivered': 'cocoa_ns',
  'date_edited': 'cocoa_ns',
- 'date_retracted': 'cocoa_ns',
- 'created_date': 'cocoa_s'}
+ 'date_retracted': 'cocoa_ns'}
 
 core_fields = ['status',
- 'record',
  'date',
- 'created_date',
  'message',
- 'filename',
+ 'linked_attachments',
  'changed_fields',
  'message (now)',
  'how_found', "copies"]
-hidden_fields = ['recovered',
+hidden_fields = ['record',
+ 'recovered',
  'recovery_method',
  'recovery_version',
  'source_table',

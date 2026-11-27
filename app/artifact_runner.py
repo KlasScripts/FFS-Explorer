@@ -1190,6 +1190,15 @@ def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[
             if problem:
                 modules.remove((script_name, mod))
                 errors.append((f"{script_name}.py", problem))
+    for script_name, mod in modules:
+        for spec in getattr(mod, 'recovered_records', None) or ():
+            for link in spec.get('links') or ():
+                other = by_name.get(link.get('report'))
+                if other is not None:
+                    link['report_name'] = getattr(other, 'name', link['report'])
+                elif link.get('report'):
+                    errors.append((f"{script_name}.py", f"links names '{link['report']}', "
+                                   "which is not a report on this platform"))
     return modules, errors
 
 
@@ -1199,8 +1208,9 @@ def _take_from_main_report(mod, main) -> str | None:
     app_group) and every database file its tables name (file_key), from the
     main report's files or optional_files, so they are declared once. What
     the report declares itself wins (e.g. LINE's full-text index, a database
-    the main report doesn't read). Marks the main report with
-    `deleted_report` (this report's module) for the viewer's pointer.
+    the main report doesn't read). Adds this report's module to the main
+    report's `deleted_reports` (one per table, A-95 2026-11-27) for the
+    viewer's pointer.
     Returns what is wrong, or None."""
     if main is None:
         return f"deleted_of names '{mod.deleted_of}', which is not a report on this platform"
@@ -1223,7 +1233,10 @@ def _take_from_main_report(mod, main) -> str | None:
         else:
             return f"file_key '{key}' is not a file of {mod.deleted_of} or of this report"
     mod.files, mod.optional_files = files, optional
-    main.deleted_report = mod
+    reports = list(getattr(main, 'deleted_reports', None) or [])
+    if mod not in reports:
+        reports.append(mod)
+    main.deleted_reports = reports
     return None
 
 
@@ -1469,6 +1482,20 @@ def _extract_db_sidecars(dest_path: str, candidates: list[str], zip_path: str,
 #               [join table, its column for this row, its column for the
 #               message] when a join table links them (iOS SMS). Compared by
 #               id, never joined (A-95)
+#       "links": [{"name": "linked_message", "what": "message",
+#                  "column": "message_row_id", "table": "message", "key": "_id",
+#                  "report": "whatsapp_deleted"}],
+#               optional (A-95, 2026-11-27: one table per report): a column
+#               saying where the rows of another table whose *key* equals
+#               this record's *column* were found: live (in the table now),
+#               recovered (as that table's deleted report finds them; its
+#               row id) or not found. "via": [join table, its column equal
+#               to ours, its column equal to the other's key] (iOS SMS),
+#               the join rows themselves taken live or recovered. Ids are
+#               compared, never joined: no value of the other row is shown.
+#               The report's description says how the link is made and why
+#               it can be wrong (ids reused, versions from different times,
+#               records with no row id or table not certain).
 #   }]
 # Only declare a label or derived value that was checked against ground
 # truth, and say where in the parser.
@@ -1481,6 +1508,109 @@ RECOVERED_STATUS = {
     'header_schema': 'Deleted', 'unfinished_write': 'Unfinished write',
     'unfinished_delete': 'Unfinished delete', 'checkpoint_older': 'Changed',
 }
+
+
+def _key_index(conn, checkpoint, fr, table: str, column: str, cache: dict):
+    """For a `links` lookup: (index, is_id) for *table*, where index maps a
+    value of *column* to the rows holding it, [(where, rowid, table_certain,
+    values)], where 'live' (in the table now) or 'recovered' (a record
+    sqlite_recovery finds whose row id is not live: what the table's deleted
+    report lists; an older version of a live row is the live row). is_id:
+    *column* is the table's row id. None when the table or column can't be
+    read. Kept in *cache* for the report's other links."""
+    import sqlite_recovery
+    ck = (table, column)
+    if ck in cache:
+        return cache[ck]
+    out = None
+    t = sqlite_recovery.table_info(conn, table, checkpoint)
+    if t is not None:
+        is_id = column == t.id_col or (column.lower() == 'rowid' and column not in t.columns)
+        i = t.columns.index(column) if column in t.columns else None
+        if i is not None or is_id:
+            index: dict = {}
+
+            def val(rowid, vals):
+                if is_id:
+                    return rowid
+                return vals[i] if i < len(vals) else None
+            for rowid, vals in t.live.items():
+                v = val(rowid, vals)
+                if v is not None:
+                    index.setdefault(v, []).append(('live', rowid, True, vals))
+            records, _notes = fr.records(t)
+            for r in records:
+                if r['rowid'] is not None and r['rowid'] in t.live:
+                    continue
+                v = val(r['rowid'], r['values'])
+                if v is not None:
+                    index.setdefault(v, []).append(('recovered', r['rowid'], r['table_certain'],
+                                                    r['values']))
+            out = (index, is_id, t.columns)
+    cache[ck] = out
+    return out
+
+
+def _col_value(t, vals, rowid, column):
+    """*column*'s value in a record of table *t* (its row id for the rowid
+    or its alias)."""
+    if column == t.id_col or (column.lower() == 'rowid' and column not in t.columns):
+        return rowid
+    i = t.columns.index(column)
+    return vals[i] if i < len(vals) else None
+
+
+def _link_hits(hits: list, report_name: str) -> str:
+    """'live' / 'recovered (in <report>)' / both, with the row ids where
+    the matched column is not the row id (rows of a one-to-many link)."""
+    live = sorted({rid for w, rid, _c, _v in hits if w == 'live'})
+    rec = sorted({rid for w, rid, _c, _v in hits if w == 'recovered' and rid is not None})
+    no_id = sum(1 for w, rid, _c, _v in hits if w == 'recovered' and rid is None)
+    unsure = any(w == 'recovered' and not c for w, _r, c, _v in hits)
+    parts = []
+    if live:
+        parts.append('live row ' + ', '.join(map(str, live)))
+    if rec or no_id:
+        what = []
+        if rec:
+            what.append('row ' + ', '.join(map(str, rec)))
+        if no_id:
+            what.append(f"{no_id} with no row id")
+        parts.append('recovered ' + ', '.join(what) + f" (in {report_name}"
+                     + ('; table not certain' if unsure else '') + ')')
+    return '; '.join(parts)
+
+
+def _link_text(link: dict, v, target, join=None) -> str:
+    """The `links` cell for one record whose link column holds *v*."""
+    what = link.get('what', link['table'])
+    name = link.get('report_name') or link['table']
+    if target is None:
+        return f"not checked: {link['table']}.{link['key']} could not be read"
+    if v is None:
+        return f"no {what} id"
+
+    def describe(w):
+        index, is_id, _cols = target
+        hits = index.get(w, [])
+        if is_id:
+            found = (_link_hits(hits, name).replace(f'live row {w}', 'live')
+                     .replace(f'recovered row {w} (', 'recovered ('))
+            return f"{what} {w}: " + (found or 'not found')
+        return f"{what} with {link['key']} = {w}: " + (_link_hits(hits, name) or 'not found')
+    if link.get('via') is None:
+        return describe(v)
+    if join is None:
+        return f"not checked: {link['via'][0]} could not be read"
+    jindex, _is_id, jcols = join
+    jt, _mine, theirs = link['via']
+    j = jcols.index(theirs) if theirs in jcols else None
+    out = []
+    for where, _rid, certain, vals in jindex.get(v, []):
+        w = vals[j] if j is not None and j < len(vals) else None
+        jw = 'live' if where == 'live' else ('recovered' if certain else 'recovered, table not certain')
+        out.append(f"{describe(w) if w is not None else f'no {what} id'} ({jw} {jt} row)")
+    return '; '.join(dict.fromkeys(out)) or f"no {jt} row for {v}"
 
 
 def recovered_records_report(module, paths: dict) -> list[dict]:
@@ -1552,6 +1682,18 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
                         f'AND "{ocol}" NOT IN ({target})')]
                 except sqlite3.Error as e:
                     log_note(f"{spec.get('label', spec['table'])}: orphaned rows not checked ({e}).")
+            # links (A-95, 2026-11-27): where the other table's rows with
+            # this record's key were found; ids compared, never joined
+            key_cache: dict = {}
+            links = []
+            for link in spec.get('links') or ():
+                target = _key_index(conn, checkpoint, fr, link['table'], link['key'], key_cache)
+                join = (_key_index(conn, checkpoint, fr, link['via'][0], link['via'][1], key_cache)
+                        if link.get('via') else None)
+                if target is None or (link.get('via') and join is None):
+                    log_note(f"{spec.get('label', spec['table'])}: {link['name']} not worked out "
+                             f"({link['table']} or its key not readable).")
+                links.append((link, target, join))
         finally:
             conn.close()
             if checkpoint is not None:
@@ -1664,6 +1806,10 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
             })
             if r.get('truncated'):
                 row['truncated'] = True
+            for link, target, join in links:
+                if link['column'] in idx or link['column'].lower() == 'rowid':
+                    row[link['name']] = _link_text(link, _col_value(t, vals, rowid, link['column']),
+                                                   target, join)
             row['copies'] = 1
             row['copy_locations'] = (f"{r['file']} offset {r['offset']}"
                                      + (f" rowid {rowid}" if rowid is not None else ''))
@@ -1673,7 +1819,7 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
         if orphans:
             labels_ = spec.get('labels') or {}
             what = (f"{ospec['in'][0]} (through {ospec['via'][0]})" if ospec.get('via')
-                    else f"{ospec['in'][0]} row")
+                    else ospec['in'][0])
             for rowid in orphans:
                 vals = t.live.get(rowid)
                 if vals is None:
@@ -1693,6 +1839,10 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
                 for col, note_text in (spec.get('field_notes') or {}).items():
                     if col in idx:
                         row[f"{fields.get(col, col)}_caveat"] = note_text
+                for link, target, join in links:
+                    if link['column'] in idx or link['column'].lower() == 'rowid':
+                        row[link['name']] = _link_text(
+                            link, _col_value(t, vals, rowid, link['column']), target, join)
                 key_v = vals[idx[ospec['column']]] if ospec['column'] in idx else rowid
                 row.update({
                     'changed_fields': '',

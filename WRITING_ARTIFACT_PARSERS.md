@@ -582,8 +582,14 @@ For "what was deleted or changed in this app's messages", don't write a
 `run()` at all. Declare the database and, per table, the columns that
 matter; the shared code (`artifact_runner.recovered_records_report`, using
 the one carver, `app/sqlite_recovery.py`, the Database tab uses too) makes
-the report. Examples: `artifacts/android/whatsapp_deleted.py` (a message
-table and a media table), `artifacts/android/burner_messageentity.py` (a
+the report. **One table per report** (ASSUMPTIONS.md A-95, owner decision
+2026-11-27): an app's message table and its media table each get their own
+deleted report, both naming the same main report in `deleted_of`. Examples:
+`artifacts/android/whatsapp_deleted.py` and
+`artifacts/android/whatsapp_deleted_media.py` (messages and media, linked
+by `links`), `artifacts/ios/sms_deleted.py` and
+`artifacts/ios/sms_deleted_attachments.py` (linked through a join table),
+`artifacts/android/burner_messageentity.py` (a
 JSON-blob column split with `json_fields`, a checked caveat with
 `field_notes`),
 `artifacts/ios/line_deleted_messages.py`.
@@ -635,6 +641,19 @@ What each row is, and the rules:
   not the value of another table's column in any live or recovered row,
   e.g. a chat's last-message preview whose text is in no message. A
   comparison of values, not a join.
+- `links` (optional): a column saying where the rows of another table
+  that this record names were found: `message 5: live`, `message 5:
+  recovered (in <its deleted report>)`, `message 5: not found`, or, for a
+  one-to-many link, the row ids (`parts with message_id = 100: live row
+  67; recovered row 66 (in ...)`). `"via"` goes through a join table, whose
+  rows are themselves taken live or recovered (iOS SMS). Ids are compared;
+  no value of the other row is shown. `"report"` names the other table's
+  deleted report (checked when the reports load). The description must say
+  how the link is made and why it can be wrong: whether the ids can be
+  handed out again (AUTOINCREMENT, Core Data's Z_PRIMARYKEY counter, or
+  neither; check the schema on a test image), that a WAL version and a
+  live row with the same id are from different times, that a record found
+  by pattern has no row id, and that copies share an id.
 - Use the same field names as the app's other reports (`timestamp`,
   `message`, `direction`) so they line up.
 - The `-wal` / `-journal` need not be declared (the runner extracts them).

@@ -159,6 +159,9 @@ _CASE_OPEN_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ffs-case
 # one CPU left for the GUI. Measured on IOS17's six largest databases
 # (4 CPUs): 16.0 s on one thread, 8.8 s on 4 processes.
 _EMBEDDED_MEDIA_PROCESSES = max(1, min(8, (os.cpu_count() or 2) - 1))
+# Worker processes for the LevelDB/IndexedDB search index (LevelDbIndexWorker,
+# F-167); set with the others by _apply_worker_processes.
+_LEVELDB_INDEX_PROCESSES = max(1, min(8, os.cpu_count() or 1))
 
 
 def _build_cached_zip_view(zip_path: str, case_dir: str) -> "CachedZipView | None":
@@ -296,12 +299,12 @@ def _save_prefs(prefs: dict):
 
 def _apply_worker_processes(n: int | None = None) -> int:
     """How many worker processes Keyword Search, the embedded-media sweep,
-    duplicate hashing and the media metadata stage start (Preferences ▸
+    duplicate hashing, the media metadata stage and the LevelDB index start (Preferences ▸
     Performance, 2026-11-26, owner request). 0 = automatic: every core,
     at most 8 (one fewer for the sweep, which keeps the window a core);
     otherwise exactly *n*, up to the core count. Read when a stage starts,
     so a change applies to the next one. Returns the number used."""
-    global _EMBEDDED_MEDIA_PROCESSES
+    global _EMBEDDED_MEDIA_PROCESSES, _LEVELDB_INDEX_PROCESSES
     import keyword_search
     if n is None:
         try:
@@ -317,6 +320,7 @@ def _apply_worker_processes(n: int | None = None) -> int:
     keyword_search.SEARCH_PROCESSES = search
     media_metadata_scan.METADATA_PROCESSES = search
     _EMBEDDED_MEDIA_PROCESSES = sweep
+    _LEVELDB_INDEX_PROCESSES = search
     return search
 
 
@@ -4322,7 +4326,8 @@ class PreferencesDialog(QDialog):
         layout.addLayout(perf_row)
         layout.addWidget(note_label(
             "How many processes Keyword Search, the embedded-media sweep, "
-            "duplicate checking and the media metadata stage use. More "
+            "duplicate checking, the media metadata stage and LevelDB "
+            "indexing use. More "
             "is faster until the disk holding the archive is the limit. "
             "They run below normal priority, so the window stays "
             "responsive. Applies to the next stage started."))
@@ -5409,7 +5414,9 @@ class LevelDbIndexWorker(QThread):
     """Decodes LevelDB/IndexedDB folders for Keyword Search and saves the
     rows to casecache.db's leveldb_search_index (the Process Case stage).
     Each job comes from LevelDbViewerMixin.plan_leveldb_search_index, made
-    on the GUI thread; this thread reads and decodes the files
+    on the GUI thread; this thread reads the files and, from
+    _POOL_MIN_JOBS folders, sends the decode to worker processes
+    (_run_on_pool, leveldb_index_job; F-167), else decodes them here
     (leveldb_viewer.run_leveldb_search_index). Until 2026-11-05 all of it
     ran on the GUI thread between frames, and one large folder froze the
     window for as long as it took (Android 15 CTF25: 3.8 s).
@@ -5448,22 +5455,132 @@ class LevelDbIndexWorker(QThread):
             if _leveldb_index_rows_version(db) != self._version:
                 clear_leveldb_search_index(db)
             save_blob(db, _LEVELDB_ROWS_VERSION_KEY, '1', self._version.encode())
-            for i, job in enumerate(self._jobs):
-                if self.isInterruptionRequested() or (
-                        self._cancel_check and self._cancel_check()):
-                    cancelled = True
-                    break
-                try:
-                    rows = run_leveldb_search_index(job)
-                    save_leveldb_search_records(db, job['ui_path'], rows)
-                except Exception as exc:
-                    reason = (str(exc) if isinstance(exc, LevelDbIndexError)
-                              else f"{type(exc).__name__}: {exc}")
-                    failed.append((job['ui_path'], reason))
-                    startup_log.message(
-                        'WARNING', f"LevelDB index: {job['ui_path']} not indexed ({reason})")
-                self.progress.emit(i + 1, total)
+            pool = self._start_pool()
+            if pool is not None:
+                cancelled = self._run_on_pool(pool, db, failed)
+            else:
+                for i, job in enumerate(self._jobs):
+                    if self._stopping():
+                        cancelled = True
+                        break
+                    try:
+                        rows = run_leveldb_search_index(job)
+                        save_leveldb_search_records(db, job['ui_path'], rows)
+                    except Exception as exc:
+                        reason = (str(exc) if isinstance(exc, LevelDbIndexError)
+                                  else f"{type(exc).__name__}: {exc}")
+                        self._fail(failed, job, reason)
+                    self.progress.emit(i + 1, total)
         self.finished_index.emit(failed, cancelled)
+
+    # Fewer folders than this: decode on this thread (starting the worker
+    # processes, about a second, costs more than it saves).
+    _POOL_MIN_JOBS = 8
+
+    def _stopping(self) -> bool:
+        return self.isInterruptionRequested() or bool(
+            self._cancel_check and self._cancel_check())
+
+    @staticmethod
+    def _fail(failed: list, job: dict, reason: str) -> None:
+        failed.append((job['ui_path'], reason))
+        startup_log.message('WARNING', f"LevelDB index: {job['ui_path']} not indexed ({reason})")
+
+    def _start_pool(self):
+        """A pool of _LEVELDB_INDEX_PROCESSES worker processes, or None
+        (decode on this thread): one process, few folders, or no pool."""
+        if _LEVELDB_INDEX_PROCESSES <= 1 or len(self._jobs) < self._POOL_MIN_JOBS:
+            return None
+        try:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            return ProcessPoolExecutor(_LEVELDB_INDEX_PROCESSES,
+                                       mp_context=mp.get_context('spawn'))
+        except Exception as exc:
+            startup_log.message('WARNING', f'LevelDB index: no process pool ({exc}); '
+                                           'decoding on this thread')
+            return None
+
+    def _run_on_pool(self, pool, db, failed: list) -> bool:
+        """The decode on worker processes (leveldb_index_job, F-167), the
+        biggest folder first; this thread copies each folder's files out of
+        the archive (on its threads, as before), sends the decode, and saves
+        each folder's rows as they come back, so a cancelled run keeps what
+        it finished. A job whose worker process failed is decoded here,
+        never dropped. Returns True when cancelled."""
+        from concurrent.futures import FIRST_COMPLETED, wait
+        from db_utils import save_leveldb_search_records
+        from leveldb_viewer import _parallel_extract, run_leveldb_search_index, LevelDbIndexError
+        import leveldb_index_job
+        total = len(self._jobs)
+        done = 0
+        pending: dict = {}
+        cancelled = False
+
+        def finish(job, outcome):
+            nonlocal done
+            status, value = outcome
+            if status == 'ok':
+                try:
+                    save_leveldb_search_records(db, job['ui_path'], value)
+                except Exception as exc:
+                    self._fail(failed, job, f"{type(exc).__name__}: {exc}")
+            else:
+                self._fail(failed, job, value)
+            done += 1
+            self.progress.emit(done, total)
+
+        def collect(timeout):
+            if not pending:
+                return
+            finished, _ = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                job = pending.pop(fut)
+                try:
+                    outcome = fut.result()
+                except Exception as exc:     # the process itself failed
+                    startup_log.message('WARNING', f"LevelDB index: a worker failed ({exc}); "
+                                                   f"decoding {job['ui_path']} here")
+                    try:
+                        outcome = 'ok', run_leveldb_search_index(job)
+                    except Exception as exc2:
+                        outcome = 'error', (str(exc2) if isinstance(exc2, LevelDbIndexError)
+                                            else f"{type(exc2).__name__}: {exc2}")
+                finish(job, outcome)
+
+        try:
+            jobs = sorted(self._jobs, key=leveldb_index_job.job_bytes, reverse=True)
+            for job in jobs:
+                if self._stopping():
+                    cancelled = True
+                    return True
+                errors = job['errors'] + _parallel_extract(job['to_fetch'])
+                if errors:
+                    more = f" (and {len(errors) - 3} more)" if len(errors) > 3 else ""
+                    finish(job, ('error', "; ".join(errors[:3]) + more))
+                else:
+                    # Nothing left to fetch: no archive entry goes to a process.
+                    sent = dict(job, to_fetch=[], errors=[])
+                    pending[pool.submit(leveldb_index_job.index_job, sent)] = sent
+                collect(0)
+            while pending:
+                if self._stopping():
+                    cancelled = True
+                    return True
+                collect(0.25)
+            return False
+        finally:
+            # Taken before shutdown, which sets pool._processes to None: read
+            # after it, there was nothing to end, and a cancelled run's
+            # workers were left running (alive after the window closed).
+            procs = list((getattr(pool, '_processes', None) or {}).values())
+            pool.shutdown(wait=False, cancel_futures=True)
+            if cancelled:
+                for proc in procs:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
 
 
 class SingleFileEmbeddedMediaWorker(QThread):

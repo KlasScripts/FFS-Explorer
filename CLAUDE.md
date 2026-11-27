@@ -213,6 +213,7 @@ Which table belongs where and why: `ASSUMPTIONS.md` §13.
 | `epoch_store.py` | Database tab: which columns are times — the examiner's choices, then built-in `config/epoch_formats.json`, then the guess. Qt-free. |
 | `segb_viewer.py` / `segb_schemas.py` | SEGB/Biome tab and built-in stream schemas. |
 | `leveldb_viewer.py` | `LevelDbViewerMixin`: LevelDB/IndexedDB records as virtual files. |
+| `leveldb_index_job.py` | Worker-process side of the LevelDB/IndexedDB search index (`index_job`: an already-extracted folder decoded by `leveldb_viewer.run_leveldb_search_index`; `job_bytes` orders the biggest first), run by `LevelDbIndexWorker._run_on_pool`; how many is Preferences ▸ Performance. Kept out of `leveldb_viewer.py` so its decode-version hash is unchanged. Qt-free. Tests: `tests/test_leveldb_index_pool.py`. |
 | `artifact_runner.py` / `artifact_db.py` / `artifact_viewer.py` | Parser plugin system: running, storing, viewing. |
 | `artifact_categories.py` | Category → App → Report arrangement for Run Artifact Parsers and the Artifact Viewer, from `config/artifact_categories.json` (kept out of the parsers so their hash-derived versions don't change); a parser's own `category` / `app_group_label` wins; anything unset is listed under "Other (category not set)", never hidden. Qt-free. Tests: `tests/test_artifact_categories.py` (every shipped parser has a category). |
 | `chrome_cache.py` / `chrome_shared.py` | Chrome HTTP-cache decode and helpers shared by the `chrome_*` parsers. |

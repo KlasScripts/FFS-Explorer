@@ -869,8 +869,10 @@ on Griffeye).*
 - It used to start automatically at case load, competing with the Process
   Case dialog that opens at the same moment. It now runs first in Process
   Case and is ticked by default.
-- It runs on the main thread in short time slices, because it reads through
-  the GUI's shared archive reader and background workers must own their own.
+- Only the planning (which folders, which files to copy out) runs on the
+  main thread, in short time slices. Copying the stores out of the zip runs
+  on a background thread, and decoding them on worker processes (F-167,
+  2026-11-27; 8 folders or fewer stay on the thread).
 - Cancelling never writes the "fully covered" marker, so unreached folders
   stay reported as unindexed (*Confirmed (real)*).
 - The Keyword Search tab is disabled only while the stage runs.

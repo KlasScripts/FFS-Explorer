@@ -5060,10 +5060,11 @@ class EmbeddedMediaScanWorker(QThread):
                                         f'not scanned ({exc})')
                     yield futures[fut][1], None, None
         finally:
+            # the list is taken first: shutdown sets pool._processes to None
+            procs = list((getattr(pool, '_processes', None) or {}).values())
             pool.shutdown(wait=False, cancel_futures=True)
             if cancelled:
-                procs = getattr(pool, '_processes', None) or {}
-                for proc in list(procs.values()):
+                for proc in procs:
                     try:
                         proc.terminate()
                     except Exception:

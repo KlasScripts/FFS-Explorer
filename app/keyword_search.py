@@ -560,9 +560,11 @@ class KeywordSearchWorker(QThread):
                     yield len(job), file_results
                 top_up()
         finally:
+            # the list is taken first: shutdown sets pool._processes to None
+            procs = list((getattr(pool, '_processes', None) or {}).values())
             pool.shutdown(wait=False, cancel_futures=True)
             if cancelled:
-                for proc in list((getattr(pool, '_processes', None) or {}).values()):
+                for proc in procs:
                     try:
                         proc.terminate()
                     except Exception:

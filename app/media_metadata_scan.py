@@ -878,6 +878,7 @@ def scan_all(zip_path: str, zip_candidates: list, local_candidates: list,
     jobs = [items[i:i + JOB_FILES] for i in range(0, len(items), JOB_FILES)]
     results: dict = {}
     remaining = total
+    cancelled = False
     try:
         it = iter(jobs)
         pending = {}
@@ -892,6 +893,7 @@ def scan_all(zip_path: str, zip_candidates: list, local_candidates: list,
         while pending:
             finished, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
             if cancel_check and cancel_check():
+                cancelled = True
                 return results
             for fut in finished:
                 job = pending.pop(fut)
@@ -916,7 +918,16 @@ def scan_all(zip_path: str, zip_candidates: list, local_candidates: list,
             top_up()
         return results
     finally:
+        # a cancelled run ends its workers; the list is taken first,
+        # since shutdown sets pool._processes to None
+        procs = list((getattr(pool, '_processes', None) or {}).values())
         pool.shutdown(wait=False, cancel_futures=True)
+        if cancelled:
+            for proc in procs:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
 
 
 def _log_warning(text: str) -> None:

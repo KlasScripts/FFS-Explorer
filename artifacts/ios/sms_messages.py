@@ -326,6 +326,34 @@ deleted_tables = [{'script': 'sms_deleted',
                  'has no row id and cannot be linked; several copies of one record can carry '
                  'the same id.\n'
                  '\n'
+                 'linked_handle: where the handle (the other party\'s number or email) this '
+                 'message names in handle_id was found, live or in the records SMS & iMessage — '
+                 'Deleted & Changed Handles finds; handle_id 0 means no handle. linked_chat: '
+                 'its conversation, through chat_message_join (one chat per message on the '
+                 'test image, 2026-11-28), live or in SMS & iMessage — Deleted & Changed Chats. '
+                 'Only ids are compared, as above; chat.ROWID and handle.ROWID are '
+                 'AUTOINCREMENT too. chat_message_join keeps the message\'s date '
+                 '(message_date, equal to message.date on all 90 live rows of the test '
+                 'image), so each join row is checked against this record\'s date and the '
+                 'cell says whether its message_date is this record\'s date. A recovered '
+                 'join row with another date may belong to another message; an earlier '
+                 'version whose date has since changed differs from its live join row. When a '
+                 'message is deleted its join rows go with it and are seldom recovered; '
+                 'then, if the handle it names is in exactly one chat (chat_handle_join; '
+                 'true of every handle on the test image), that chat is named, marked '
+                 '"inferred, not stored"; a handle in several chats is said so, and no chat '
+                 'is guessed.\n'
+                 '\n'
+                 'iOS\'s own record of deletions: a trigger on the message table writes the '
+                 'guid of every deleted message into sync_deleted_messages (with its '
+                 'CloudKit recordID). Rows there whose guid is in no live message are listed '
+                 'too, status "Deleted (recorded by the app)": a message that existed, '
+                 'with no other trace left, or whose record was also recovered (how_found '
+                 'says which). linked_deletion_record on a recovered record says whether '
+                 'its guid is in that table. On the Josh Hickman iOS 17 image (2026-11-28): '
+                 '2 such rows, neither a live message; deleted_messages, written by another '
+                 'trigger the same way, held 2 rows once (sqlite_sequence) and is empty.\n'
+                 '\n'
                  'Checked 2026-11-21 on the Josh Hickman iOS 17 image: 4 earlier versions of 2 '
                  'messages (from the WAL and overflow pages), all Changed; more versions that '
                  "differ only in columns that don't matter here are counted in the run log. "
@@ -343,6 +371,9 @@ deleted_tables = [{'script': 'sms_deleted',
                   'date',
                   'message',
                   'linked_attachments',
+                  'linked_handle',
+                  'linked_chat',
+                  'linked_deletion_record',
                   'changed_fields',
                   'message (now)',
                   'how_found',
@@ -379,7 +410,35 @@ deleted_tables = [{'script': 'sms_deleted',
              'via': ['message_attachment_join', 'message_id', 'attachment_id'],
              'table': 'attachment',
              'key': 'ROWID',
-             'report': 'sms_deleted_attachments'}]},
+             'report': 'sms_deleted_attachments'},
+            {'name': 'linked_handle',
+             'what': 'handle',
+             'column': 'handle_id',
+             'none': [0],
+             'table': 'handle',
+             'key': 'ROWID',
+             'report': 'sms_deleted_handles'},
+            {'name': 'linked_chat',
+             'what': 'chat',
+             'column': 'ROWID',
+             'via': ['chat_message_join', 'message_id', 'chat_id'],
+             'via_check': {'column': 'date', 'join_column': 'message_date'},
+             'fallback': {'via': ['chat_handle_join', 'handle_id', 'chat_id'],
+                          'column': 'handle_id',
+                          'what': 'handle'},
+             'none': [0],
+             'table': 'chat',
+             'key': 'ROWID',
+             'report': 'sms_deleted_chats'},
+            {'name': 'linked_deletion_record',
+             'what': 'deletion record',
+             'column': 'guid',
+             'table': 'sync_deleted_messages',
+             'key': 'guid'}],
+  'deletion_log': {'table': 'sync_deleted_messages',
+                   'key': 'guid',
+                   'column': 'guid',
+                   'fields': {'recordID': 'cloudkit_record_id'}}},
  {'script': 'sms_deleted_attachments',
   'name': 'SMS & iMessage — Deleted & Changed Attachments',
   'description': 'Deleted and changed attachment records from sms.db (table attachment). Live '
@@ -462,4 +521,147 @@ deleted_tables = [{'script': 'sms_deleted',
              'via': ['message_attachment_join', 'attachment_id', 'message_id'],
              'table': 'message',
              'key': 'ROWID',
-             'report': 'sms_deleted'}]}]
+             'report': 'sms_deleted'}]},
+ {'script': 'sms_deleted_chats',
+  'name': 'SMS & iMessage — Deleted & Changed Chats',
+  'description': 'Deleted and changed conversation records from sms.db (table chat): the other '
+                 "party or group (chat_identifier), the group's name (display_name), the "
+                 'service. A deleted chat is a conversation that existed. Live chats are in '
+                 'SMS Messages, as the conversation of each message; deleted and changed '
+                 'messages are in SMS & iMessage — Deleted & Changed Messages, handles (the '
+                 'phone numbers and emails) in SMS & iMessage — Deleted & Changed Handles.\n'
+                 '\n'
+                 'Each row is one record as found in the chat table, never joined to another '
+                 'table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id. Values are as stored: no code is '
+                 'turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'last_read_message_timestamp is Cocoa nanoseconds, as message dates in SMS '
+                 'Messages. properties is a plist BLOB, shown as stored.\n'
+                 '\n'
+                 'linked_handles: where the handles of this chat were found. chat_handle_join '
+                 'holds one row per (chat_id, handle_id) pair, the ROWIDs of their rows, so '
+                 "the link goes through it: the join rows holding this record's id, live or "
+                 'recovered, and the handle each names, looked up live and in the records SMS '
+                 '& iMessage — Deleted & Changed Handles finds. Only ids are compared. On the '
+                 'Josh Hickman iOS 17 image (2026-11-28): 36 join rows, one handle per chat, '
+                 'every join row names a live chat and handle. A message names its chat '
+                 'through chat_message_join, so the link is on the message report '
+                 '(linked_chat), not here. How the link can be wrong: chat.ROWID and '
+                 'handle.ROWID are AUTOINCREMENT (checked 2026-11-28 on the Josh Hickman iOS '
+                 '17 image), so SQLite does not hand out an id again, but an app that '
+                 're-inserts rows with their old ids (a restore from backup) can still put a '
+                 'different record under the same id; an earlier version found in the WAL and '
+                 'a live row with the same id were stored at different times; a record found '
+                 'by pattern has no row id and cannot be linked; several copies of one record '
+                 'can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman iOS 17 image: 12 earlier versions of '
+                 '1 chat, all differing only in properties and last_read_message_timestamp, so '
+                 'none is listed (counted in the run log); no deleted chat. sqlite_sequence '
+                 'says chat ids up to 36 were handed out and 36 chats are live: none was '
+                 'deleted on this phone.',
+  'timestamp_fields': {'last_read_message_timestamp': 'cocoa_ns'},
+  'core_fields': ['status',
+                  'chat_identifier',
+                  'display_name',
+                  'service_name',
+                  'linked_handles',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'sms',
+  'table': 'chat',
+  'label': 'Chat',
+  'fields': {'ROWID': 'chat_id',
+             'guid': 'guid',
+             'chat_identifier': 'chat_identifier',
+             'service_name': 'service_name',
+             'display_name': 'display_name',
+             'room_name': 'room_name',
+             'group_id': 'group_id',
+             'account_login': 'account_login',
+             'last_addressed_handle': 'last_addressed_handle',
+             'style': 'style',
+             'state': 'state',
+             'is_archived': 'is_archived',
+             'is_filtered': 'is_filtered',
+             'is_recovered': 'is_recovered',
+             'last_read_message_timestamp': 'last_read_message_timestamp',
+             'properties': 'properties'},
+  'version_fields': ['chat_identifier',
+                     'display_name',
+                     'room_name',
+                     'group_id',
+                     'service_name',
+                     'style',
+                     'is_archived',
+                     'is_recovered'],
+  'links': [{'name': 'linked_handles',
+             'what': 'handle',
+             'column': 'ROWID',
+             'via': ['chat_handle_join', 'chat_id', 'handle_id'],
+             'table': 'handle',
+             'key': 'ROWID',
+             'report': 'sms_deleted_handles'}]},
+ {'script': 'sms_deleted_handles',
+  'name': 'SMS & iMessage — Deleted & Changed Handles',
+  'description': 'Deleted and changed handle records from sms.db (table handle): the phone '
+                 'number or email of the other party (id), with its service. A message names '
+                 'its handle by handle_id, so a deleted message without its handle has no '
+                 'counterpart; this report is where that handle may still be. Live handles are '
+                 'in SMS Messages, as the sender of each message.\n'
+                 '\n'
+                 'Each row is one record as found in the handle table, never joined to another '
+                 'table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id. Values are as stored: no code is '
+                 'turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'linked_chats: the chats this handle is in, through chat_handle_join (as '
+                 'linked_handles in SMS & iMessage — Deleted & Changed Chats, the other way '
+                 'round), looked up live and in the records that report finds. Only ids are '
+                 'compared. How the link can be wrong: chat.ROWID and handle.ROWID are '
+                 'AUTOINCREMENT (checked 2026-11-28 on the Josh Hickman iOS 17 image), so '
+                 'SQLite does not hand out an id again, but an app that re-inserts rows with '
+                 'their old ids (a restore from backup) can still put a different record under '
+                 'the same id; an earlier version found in the WAL and a live row with the '
+                 'same id were stored at different times; a record found by pattern has no row '
+                 'id and cannot be linked; several copies of one record can carry the same '
+                 'id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman iOS 17 image: no deleted or changed '
+                 'handle. sqlite_sequence says handle ids up to 36 were handed out and 36 '
+                 'handles are live: none was deleted on this phone.',
+  'timestamp_fields': {},
+  'core_fields': ['status',
+                  'handle',
+                  'service',
+                  'linked_chats',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'sms',
+  'table': 'handle',
+  'label': 'Handle',
+  'fields': {'ROWID': 'handle_id',
+             'id': 'handle',
+             'service': 'service',
+             'country': 'country',
+             'uncanonicalized_id': 'uncanonicalized_id',
+             'person_centric_id': 'person_centric_id'},
+  'version_fields': ['id', 'service', 'country', 'uncanonicalized_id'],
+  'links': [{'name': 'linked_chats',
+             'what': 'chat',
+             'column': 'ROWID',
+             'via': ['chat_handle_join', 'handle_id', 'chat_id'],
+             'table': 'chat',
+             'key': 'ROWID',
+             'report': 'sms_deleted_chats'}]}]

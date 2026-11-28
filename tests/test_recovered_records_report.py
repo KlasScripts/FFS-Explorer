@@ -115,3 +115,117 @@ def test_derived_lookup_of_the_local_users_ids(tmp_path):
     got = {r['message'][:15]: r['direction'] for r in rows}
     assert got == {'message body 03': 'Outgoing', 'message body 04': 'Incoming'}
     assert all('name' not in r for r in rows)
+
+
+def test_identity_ties_a_rewritten_row_to_its_live_row(tmp_path):
+    """'identity': a record whose row id is no longer live but whose unique
+    key is a live row's (the app deleted it and wrote it again under a new
+    id) is an earlier version of that row: Changed when a column that
+    matters differs, counted when not; a really deleted one stays Deleted."""
+    src = str(tmp_path / 'work.db')
+    c = sqlite3.connect(src, isolation_level=None)
+    c.execute('pragma journal_mode=wal')
+    c.execute('pragma wal_autocheckpoint=0')
+    c.execute('create table item(id integer primary key, uuid text, body text, seen integer)')
+    for i in range(1, 21):
+        c.execute('insert into item values(?,?,?,?)',
+                  (i, f'uuid-{i:04d}-abcdef', f'body text of item {i} ' + 'y' * 30, 0))
+    c.execute('pragma wal_checkpoint(truncate)')
+    # 3: rewritten under a new id with a new body; 4: rewritten, only seen changed
+    c.execute('delete from item where id in (3, 4)')
+    c.execute("insert into item values(21, 'uuid-0003-abcdef', 'new body of three', 0)")
+    c.execute("insert into item values(22, 'uuid-0004-abcdef', ?, 1)",
+              ('body text of item 4 ' + 'y' * 30,))
+    c.execute('delete from item where id = 5')                   # really gone
+    out = str(tmp_path / 'p' / 'item.db')
+    os.makedirs(os.path.dirname(out))
+    for s in ('', '-wal'):
+        shutil.copyfile(src + s, out + s)
+    c.close()
+    module = SimpleNamespace(recovered_records=[{
+        'file_key': 'db', 'table': 'item', 'label': 'Item', 'identity': ['uuid'],
+        'fields': {'id': 'item_id', 'uuid': 'uuid', 'body': 'body', 'seen': 'seen'},
+        'version_fields': ['uuid', 'body']}])
+    ar.take_open_notes()
+    rows = ar.recovered_records_report(module, {'db': out})
+    notes = ar.take_open_notes()
+    got = {(r['status'], r['uuid']): r for r in rows}
+    assert set(got) == {('Changed', 'uuid-0003-abcdef'), ('Deleted', 'uuid-0005-abcdef')}
+    ch = got[('Changed', 'uuid-0003-abcdef')]
+    assert ch['row_id'] == 21 and ch['raw_rowid'] == 3
+    assert ch['body (now)'] == 'new body of three' and ch['changed_fields'] == 'body'
+    assert 'stored under row id 3, no longer live: tied to live row 21 by uuid' in ch['how_found']
+    assert any('2 record(s) with no row id, or one no longer live' in n for n in notes)
+    assert any('differ only in columns other than' in n for n in notes)
+
+
+def test_deletion_log_via_check_and_fallback(tmp_path):
+    """deletion_log lists the app's own record of a deleted row; via_check
+    compares the join row's date; fallback infers the chat from the handle
+    only when that handle is in one chat."""
+    src = str(tmp_path / 'work.db')
+    c = sqlite3.connect(src, isolation_level=None)
+    c.execute('pragma journal_mode=wal')
+    c.execute('pragma wal_autocheckpoint=0')
+    c.execute('create table message(ROWID integer primary key autoincrement, guid text, '
+              'handle_id integer, date integer, text text)')
+    c.execute('create table chat(ROWID integer primary key autoincrement, ident text)')
+    c.execute('create table chat_message_join(chat_id integer, message_id integer, message_date integer)')
+    c.execute('create table chat_handle_join(chat_id integer, handle_id integer)')
+    c.execute('create table sync_deleted_messages(ROWID integer primary key autoincrement, '
+              'guid text, recordID text)')
+    c.execute("insert into chat values(1, 'one'), (2, 'two'), (3, 'three')")
+    c.execute('insert into chat_handle_join values(1, 10), (2, 20), (3, 20)')   # 20: two chats
+    for i in range(1, 21):
+        h = 10 if i % 2 else 20
+        c.execute('insert into message values(?,?,?,?,?)',
+                  (i, f'GUID-{i:04d}', h, 1000 + i, f'message text number {i} ' + 'q' * 30))
+        c.execute('insert into chat_message_join values(?,?,?)', (1 if h == 10 else 2, i, 1000 + i))
+    c.execute('pragma wal_checkpoint(truncate)')
+    # 5 and 6: their join rows wiped for good first (zeroed, then checkpointed),
+    # so only the fallback can name a chat; 7: its join row recoverable
+    c.execute('pragma secure_delete=on')
+    c.execute('delete from chat_message_join where message_id in (5, 6)')
+    c.execute('pragma wal_checkpoint(truncate)')
+    c.execute('pragma secure_delete=off')
+    for i in (5, 6, 7):
+        c.execute('delete from message where ROWID=?', (i,))
+        if i == 7:
+            c.execute('delete from chat_message_join where message_id=?', (i,))
+        c.execute("insert into sync_deleted_messages(guid) values(?)", (f'GUID-{i:04d}',))
+    c.execute("insert into sync_deleted_messages(guid, recordID) values('GUID-GONE', 'rec-1')")
+    out = str(tmp_path / 'p' / 'sms.db')
+    os.makedirs(os.path.dirname(out))
+    for s in ('', '-wal'):
+        shutil.copyfile(src + s, out + s)
+    c.close()
+    module = SimpleNamespace(recovered_records=[{
+        'file_key': 'db', 'table': 'message', 'label': 'Message',
+        'fields': {'ROWID': 'message_id', 'guid': 'guid', 'handle_id': 'handle_id',
+                   'date': 'date', 'text': 'message'},
+        'version_fields': ['text'],
+        'links': [{'name': 'linked_chat', 'what': 'chat', 'column': 'ROWID',
+                   'via': ['chat_message_join', 'message_id', 'chat_id'],
+                   'via_check': {'column': 'date', 'join_column': 'message_date'},
+                   'fallback': {'via': ['chat_handle_join', 'handle_id', 'chat_id'],
+                                'column': 'handle_id', 'what': 'handle'},
+                   'none': [0], 'table': 'chat', 'key': 'ROWID'}],
+        'deletion_log': {'table': 'sync_deleted_messages', 'key': 'guid', 'column': 'guid',
+                         'fields': {'recordID': 'cloudkit_record_id'}}}])
+    rows = ar.recovered_records_report(module, {'db': out})
+    by = {r['guid']: r for r in rows if r['status'] != 'Deleted (recorded by the app)'}
+    assert by['GUID-0005']['status'] == 'Deleted'
+    assert by['GUID-0005']['linked_chat'] == (
+        "no chat_message_join row for 5; inferred, not stored: chat 1: live "
+        "(handle 10 is in this one chat only, by chat_handle_join)")
+    assert by['GUID-0006']['linked_chat'] == (
+        "no chat_message_join row for 6; not inferred: handle 20 is in 2 chats (chat_handle_join)")
+    assert by['GUID-0007']['linked_chat'] == (
+        "chat 1: live (recovered chat_message_join row, its message_date is this record's date)")
+    logged = [r for r in rows if r['status'] == 'Deleted (recorded by the app)']
+    assert [r['guid'] for r in logged] == ['GUID-0005', 'GUID-0006', 'GUID-0007', 'GUID-GONE']
+    gone = [r for r in logged if r['guid'] == 'GUID-GONE'][0]
+    assert gone['cloudkit_record_id'] == 'rec-1'
+    assert 'no record of it was recovered' in gone['how_found']
+    assert [r for r in logged if r['guid'] == 'GUID-0005'][0]['how_found'].endswith(
+        'its record was also recovered (listed in this report)')

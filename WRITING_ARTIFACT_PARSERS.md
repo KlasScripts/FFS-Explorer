@@ -601,6 +601,32 @@ an app that rewrites a row by delete + insert leaves) are one row: its
 `copies` column counts them and the hidden `copy_locations` keeps where
 each was found (A-95). Put `copies` in `core_fields`.
 
+When the app keeps a unique key per row besides the row id (Photos'
+`ZUUID`, a message id), declare it as `identity`. A record with no row id,
+or with a row id no longer live, whose key is a live row's is then an
+earlier version of that row, not a deletion: Changed when a version field
+differs, otherwise counted in the run log. Without it, an app that rewrites
+a row under a new id makes every rewrite look deleted (Instagram on the
+Josh Hickman iOS 17 image: 464 records, 1 message really gone).
+
+When the value that matters is inside a BLOB (Instagram's message text in
+an NSKeyedArchiver archive), give the entry `decode`: the name of a
+function in the main report, `{column: value} -> {field: value}`, reading
+it the same way the main report does, and list the names it adds in
+`decoded_fields`. A version field may name one of them; it is compared
+between the record and the live row (`artifacts/ios/instagram.py`). A
+change to the function is a new version of the deleted report.
+
+When the app keeps its own record of deletions (iOS sms.db's
+`sync_deleted_messages`, written by a trigger with the guid of every
+deleted message), declare `deletion_log`: its live rows whose key is in no
+live row are listed as "Deleted (recorded by the app)", saying whether a
+record of it was also recovered. For a link through a join table, `via_check`
+compares a column of the join row with the record's own (`message_date`
+with `date`), and `fallback` names the other row through a second join when
+no join row is left, only when exactly one row fits, marked "inferred, not
+stored" (`artifacts/ios/sms_messages.py`).
+
 For a media or attachment table, declare `orphan_of` to also list its
 LIVE rows whose message is gone (status Orphaned): not deleted, so never
 recovered, and missing from the main report, which lists a row only with

@@ -491,3 +491,306 @@ def run(paths):
         return out
     finally:
         db.close()
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'photos_deleted_assets',
+  'name': 'Photos — Deleted & Changed Assets',
+  'description': 'Deleted and changed photo and video records from Photos.sqlite (table '
+                 'ZASSET): file name and folder, when taken and added, location, size, and the '
+                 'trash, hidden and favourite states. A deleted record is a photo or video '
+                 'removed past Recently Deleted; a changed one shows an earlier state, for '
+                 'example before it was trashed, hidden, edited or moved. Live assets are in '
+                 'Photos Metadata; their original file name and import source are in Photos — '
+                 'Deleted & Changed Additional Attributes, camera and EXIF in Photos — Deleted '
+                 '& Changed Extended Attributes.\n'
+                 '\n'
+                 'Each row is one record as found in the ZASSET table, never joined to another '
+                 'table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id. Values are as stored: no code is '
+                 'turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'Dates are Cocoa seconds, as in Photos Metadata. ZTRASHEDSTATE 1 is in '
+                 'Recently Deleted (0 on every live asset here); ZKIND, ZSAVEDASSETTYPE and '
+                 'ZVISIBILITYSTATE are shown as stored. Analysis scores and counters that '
+                 'Photos rewrites on its own (Z_OPT, ZANALYSISSTATEMODIFICATIONDATE, curation '
+                 'and highlight scores) are not columns that matter here: a version differing '
+                 'only in them is counted in the run log, not listed.\n'
+                 '\n'
+                 'linked_additional and linked_extended: where the ZADDITIONALASSETATTRIBUTES '
+                 'and ZEXTENDEDATTRIBUTES rows this asset names (ZADDITIONALATTRIBUTES, '
+                 'ZEXTENDEDATTRIBUTES) were found, live or in their deleted reports. Those '
+                 'rows name the asset back in ZASSET; both ways agree for all 567 live assets '
+                 '(2026-11-28 on the Josh Hickman iOS 17 image). Only ids are compared. How '
+                 'the link can be wrong: ZASSET.Z_PK, ZADDITIONALASSETATTRIBUTES.Z_PK and '
+                 'ZEXTENDEDATTRIBUTES.Z_PK are each a Core Data Z_PK (checked 2026-11-28 on '
+                 'the Josh Hickman iOS 17 image): Core Data takes the next id from '
+                 'Z_PRIMARYKEY.Z_MAX and does not hand one out again, but a store rebuilt from '
+                 'a backup or a migration can renumber; an earlier version found in the WAL '
+                 'and a live row with the same id were stored at different times; a record '
+                 'found by pattern has no row id and cannot be linked; several copies of one '
+                 'record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman iOS 17 image: Z_PRIMARYKEY says 568 '
+                 'ids were handed out in each of the three tables and 567 rows are live in '
+                 'each: one photo or video was removed for good (past Recently Deleted). '
+                 'A record found by pattern has no row id; when its ZUUID (unique per asset) '
+                 'is a live asset\'s, it is an earlier version of that asset, not a deleted '
+                 'one, and is treated as such ("tied to live row" in how_found; counted in '
+                 'the run log): on this image all 3 found by pattern were, and none differed '
+                 'in a column that matters.',
+  'timestamp_fields': {'ZDATECREATED': 'cocoa_s',
+                       'ZADDEDDATE': 'cocoa_s',
+                       'ZMODIFICATIONDATE': 'cocoa_s',
+                       'ZTRASHEDDATE': 'cocoa_s',
+                       'ZADJUSTMENTTIMESTAMP': 'cocoa_s'},
+  'core_fields': ['status',
+                  'ZDATECREATED',
+                  'ZFILENAME',
+                  'ZDIRECTORY',
+                  'ZTRASHEDSTATE',
+                  'ZHIDDEN',
+                  'linked_additional',
+                  'linked_extended',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'photos_db',
+  'table': 'ZASSET',
+  'label': 'Asset',
+  'identity': ['ZUUID'],
+  'fields': {'Z_PK': 'asset_id',
+             'ZUUID': 'ZUUID',
+             'ZFILENAME': 'ZFILENAME',
+             'ZDIRECTORY': 'ZDIRECTORY',
+             'ZDATECREATED': 'ZDATECREATED',
+             'ZADDEDDATE': 'ZADDEDDATE',
+             'ZMODIFICATIONDATE': 'ZMODIFICATIONDATE',
+             'ZTRASHEDSTATE': 'ZTRASHEDSTATE',
+             'ZTRASHEDDATE': 'ZTRASHEDDATE',
+             'ZHIDDEN': 'ZHIDDEN',
+             'ZFAVORITE': 'ZFAVORITE',
+             'ZKIND': 'ZKIND',
+             'ZKINDSUBTYPE': 'ZKINDSUBTYPE',
+             'ZUNIFORMTYPEIDENTIFIER': 'ZUNIFORMTYPEIDENTIFIER',
+             'ZWIDTH': 'ZWIDTH',
+             'ZHEIGHT': 'ZHEIGHT',
+             'ZDURATION': 'ZDURATION',
+             'ZLATITUDE': 'ZLATITUDE',
+             'ZLONGITUDE': 'ZLONGITUDE',
+             'ZSAVEDASSETTYPE': 'ZSAVEDASSETTYPE',
+             'ZVISIBILITYSTATE': 'ZVISIBILITYSTATE',
+             'ZHASADJUSTMENTS': 'ZHASADJUSTMENTS',
+             'ZADJUSTMENTTIMESTAMP': 'ZADJUSTMENTTIMESTAMP',
+             'ZCLOUDASSETGUID': 'ZCLOUDASSETGUID',
+             'ZDELETEREASON': 'ZDELETEREASON',
+             'ZADDITIONALATTRIBUTES': 'additional_id',
+             'ZEXTENDEDATTRIBUTES': 'extended_id'},
+  'version_fields': ['ZFILENAME',
+                     'ZDIRECTORY',
+                     'ZDATECREATED',
+                     'ZTRASHEDSTATE',
+                     'ZTRASHEDDATE',
+                     'ZHIDDEN',
+                     'ZFAVORITE',
+                     'ZLATITUDE',
+                     'ZLONGITUDE',
+                     'ZWIDTH',
+                     'ZHEIGHT',
+                     'ZHASADJUSTMENTS',
+                     'ZADJUSTMENTTIMESTAMP',
+                     'ZVISIBILITYSTATE',
+                     'ZDELETEREASON',
+                     'ZSAVEDASSETTYPE'],
+  'links': [{'name': 'linked_additional',
+             'what': 'additional attributes',
+             'column': 'ZADDITIONALATTRIBUTES',
+             'table': 'ZADDITIONALASSETATTRIBUTES',
+             'key': 'Z_PK',
+             'report': 'photos_deleted_additional_attributes'},
+            {'name': 'linked_extended',
+             'what': 'extended attributes',
+             'column': 'ZEXTENDEDATTRIBUTES',
+             'table': 'ZEXTENDEDATTRIBUTES',
+             'key': 'Z_PK',
+             'report': 'photos_deleted_extended_attributes'}]},
+ {'script': 'photos_deleted_additional_attributes',
+  'name': 'Photos — Deleted & Changed Additional Attributes',
+  'description': 'Deleted and changed records from Photos.sqlite (table '
+                 "ZADDITIONALASSETATTRIBUTES): a photo's or video's original file name and "
+                 'size, which app imported it (ZIMPORTEDBY, bundle id and display name), its '
+                 'title and caption, its time zone, and the place names Photos looked up for '
+                 'its location (ZREVERSELOCATIONDATA, a plist BLOB, shown as stored). One row '
+                 'per asset. Live values are in Photos Metadata.\n'
+                 '\n'
+                 'Each row is one record as found in the ZADDITIONALASSETATTRIBUTES table, '
+                 'never joined to another table (ASSUMPTIONS.md A-95): ids are the stored ids. '
+                 'Status says Deleted (no longer in the table), Changed (an earlier version of '
+                 'a row still there, listed only when one of the columns that matter changed, '
+                 'with the current value beside it as "(now)") or an unfinished write/delete '
+                 'under a hot journal. How found says how each record was recovered and how '
+                 'sure that is; a record found by pattern has no row id. Values are as stored: '
+                 'no code is turned into a word here unless it was checked against a test '
+                 'image.\n'
+                 '\n'
+                 'ZLASTVIEWEDDATE is Cocoa seconds. Counters and analysis versions Photos '
+                 'rewrites on its own (Z_OPT, ZREVERSELOCATIONDATAISVALID, face and scene '
+                 'analysis versions, pending view counts) are not columns that matter here.\n'
+                 '\n'
+                 'linked_asset: the asset this row belongs to (ZASSET), live or in Photos — '
+                 'Deleted & Changed Assets. Only ids are compared. How the link can be wrong: '
+                 'ZASSET.Z_PK, ZADDITIONALASSETATTRIBUTES.Z_PK and ZEXTENDEDATTRIBUTES.Z_PK '
+                 'are each a Core Data Z_PK (checked 2026-11-28 on the Josh Hickman iOS 17 '
+                 'image): Core Data takes the next id from Z_PRIMARYKEY.Z_MAX and does not '
+                 'hand one out again, but a store rebuilt from a backup or a migration can '
+                 'renumber; an earlier version found in the WAL and a live row with the same '
+                 'id were stored at different times; a record found by pattern has no row id '
+                 'and cannot be linked; several copies of one record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman iOS 17 image: Z_PRIMARYKEY says 568 '
+                 'ids were handed out in each of the three tables and 567 rows are live in '
+                 'each: one photo or video was removed for good (past Recently Deleted). 42 '
+                 'earlier versions of 15 rows, mostly differing only in analysis versions and '
+                 'view counters; 5 with different place-name data.',
+  'timestamp_fields': {'ZLASTVIEWEDDATE': 'cocoa_s'},
+  'core_fields': ['status',
+                  'ZORIGINALFILENAME',
+                  'ZIMPORTEDBYBUNDLEIDENTIFIER',
+                  'ZIMPORTEDBYDISPLAYNAME',
+                  'ZTITLE',
+                  'linked_asset',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'photos_db',
+  'table': 'ZADDITIONALASSETATTRIBUTES',
+  'label': 'Additional attributes',
+  'fields': {'Z_PK': 'additional_id',
+             'ZASSET': 'asset_id',
+             'ZORIGINALFILENAME': 'ZORIGINALFILENAME',
+             'ZORIGINALFILESIZE': 'ZORIGINALFILESIZE',
+             'ZORIGINALWIDTH': 'ZORIGINALWIDTH',
+             'ZORIGINALHEIGHT': 'ZORIGINALHEIGHT',
+             'ZIMPORTEDBY': 'ZIMPORTEDBY',
+             'ZIMPORTEDBYBUNDLEIDENTIFIER': 'ZIMPORTEDBYBUNDLEIDENTIFIER',
+             'ZIMPORTEDBYDISPLAYNAME': 'ZIMPORTEDBYDISPLAYNAME',
+             'ZTITLE': 'ZTITLE',
+             'ZACCESSIBILITYDESCRIPTION': 'ZACCESSIBILITYDESCRIPTION',
+             'ZEXIFTIMESTAMPSTRING': 'ZEXIFTIMESTAMPSTRING',
+             'ZTIMEZONENAME': 'ZTIMEZONENAME',
+             'ZTIMEZONEOFFSET': 'ZTIMEZONEOFFSET',
+             'ZEDITORBUNDLEID': 'ZEDITORBUNDLEID',
+             'ZLASTVIEWEDDATE': 'ZLASTVIEWEDDATE',
+             'ZVIEWCOUNT': 'ZVIEWCOUNT',
+             'ZSHARECOUNT': 'ZSHARECOUNT',
+             'ZREVERSELOCATIONDATA': 'ZREVERSELOCATIONDATA'},
+  'version_fields': ['ZASSET',
+                     'ZORIGINALFILENAME',
+                     'ZORIGINALFILESIZE',
+                     'ZIMPORTEDBY',
+                     'ZIMPORTEDBYBUNDLEIDENTIFIER',
+                     'ZIMPORTEDBYDISPLAYNAME',
+                     'ZTITLE',
+                     'ZACCESSIBILITYDESCRIPTION',
+                     'ZEXIFTIMESTAMPSTRING',
+                     'ZTIMEZONENAME',
+                     'ZTIMEZONEOFFSET',
+                     'ZEDITORBUNDLEID',
+                     'ZREVERSELOCATIONDATA'],
+  'links': [{'name': 'linked_asset',
+             'what': 'asset',
+             'column': 'ZASSET',
+             'table': 'ZASSET',
+             'key': 'Z_PK',
+             'report': 'photos_deleted_assets'}]},
+ {'script': 'photos_deleted_extended_attributes',
+  'name': 'Photos — Deleted & Changed Extended Attributes',
+  'description': 'Deleted and changed records from Photos.sqlite (table ZEXTENDEDATTRIBUTES): '
+                 'the camera and lens, the location and date from the file itself (EXIF), '
+                 'exposure settings and, for a video, codec and duration. One row per asset: '
+                 'what is left of a removed photo can still say which camera took it, where '
+                 'and when. Live values are in Photos Metadata.\n'
+                 '\n'
+                 'Each row is one record as found in the ZEXTENDEDATTRIBUTES table, never '
+                 'joined to another table (ASSUMPTIONS.md A-95): ids are the stored ids. '
+                 'Status says Deleted (no longer in the table), Changed (an earlier version of '
+                 'a row still there, listed only when one of the columns that matter changed, '
+                 'with the current value beside it as "(now)") or an unfinished write/delete '
+                 'under a hot journal. How found says how each record was recovered and how '
+                 'sure that is; a record found by pattern has no row id. Values are as stored: '
+                 'no code is turned into a word here unless it was checked against a test '
+                 'image.\n'
+                 '\n'
+                 'ZDATECREATED is Cocoa seconds.\n'
+                 '\n'
+                 'linked_asset: the asset this row belongs to (ZASSET), live or in Photos — '
+                 'Deleted & Changed Assets. Only ids are compared. How the link can be wrong: '
+                 'ZASSET.Z_PK, ZADDITIONALASSETATTRIBUTES.Z_PK and ZEXTENDEDATTRIBUTES.Z_PK '
+                 'are each a Core Data Z_PK (checked 2026-11-28 on the Josh Hickman iOS 17 '
+                 'image): Core Data takes the next id from Z_PRIMARYKEY.Z_MAX and does not '
+                 'hand one out again, but a store rebuilt from a backup or a migration can '
+                 'renumber; an earlier version found in the WAL and a live row with the same '
+                 'id were stored at different times; a record found by pattern has no row id '
+                 'and cannot be linked; several copies of one record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman iOS 17 image: Z_PRIMARYKEY says 568 '
+                 'ids were handed out in each of the three tables and 567 rows are live in '
+                 'each: one photo or video was removed for good (past Recently Deleted). One '
+                 'record with a rebuilt header (its first bytes overwritten), whose table is '
+                 'not certain.',
+  'timestamp_fields': {'ZDATECREATED': 'cocoa_s'},
+  'core_fields': ['status',
+                  'ZDATECREATED',
+                  'ZCAMERAMAKE',
+                  'ZCAMERAMODEL',
+                  'ZLATITUDE',
+                  'ZLONGITUDE',
+                  'linked_asset',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'photos_db',
+  'table': 'ZEXTENDEDATTRIBUTES',
+  'label': 'Extended attributes',
+  'fields': {'Z_PK': 'extended_id',
+             'ZASSET': 'asset_id',
+             'ZCAMERAMAKE': 'ZCAMERAMAKE',
+             'ZCAMERAMODEL': 'ZCAMERAMODEL',
+             'ZLENSMODEL': 'ZLENSMODEL',
+             'ZLATITUDE': 'ZLATITUDE',
+             'ZLONGITUDE': 'ZLONGITUDE',
+             'ZDATECREATED': 'ZDATECREATED',
+             'ZTIMEZONENAME': 'ZTIMEZONENAME',
+             'ZTIMEZONEOFFSET': 'ZTIMEZONEOFFSET',
+             'ZISO': 'ZISO',
+             'ZFOCALLENGTH': 'ZFOCALLENGTH',
+             'ZAPERTURE': 'ZAPERTURE',
+             'ZSHUTTERSPEED': 'ZSHUTTERSPEED',
+             'ZFLASHFIRED': 'ZFLASHFIRED',
+             'ZCODEC': 'ZCODEC',
+             'ZDURATION': 'ZDURATION'},
+  'version_fields': ['ZASSET',
+                     'ZCAMERAMAKE',
+                     'ZCAMERAMODEL',
+                     'ZLENSMODEL',
+                     'ZLATITUDE',
+                     'ZLONGITUDE',
+                     'ZDATECREATED',
+                     'ZTIMEZONENAME',
+                     'ZTIMEZONEOFFSET'],
+  'links': [{'name': 'linked_asset',
+             'what': 'asset',
+             'column': 'ZASSET',
+             'table': 'ZASSET',
+             'key': 'Z_PK',
+             'report': 'photos_deleted_assets'}]}]

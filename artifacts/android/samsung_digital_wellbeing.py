@@ -71,6 +71,12 @@ def _event_names() -> dict:
     return mod._EVENT_TYPES
 
 
+def _deleted_fields(values):
+    """deleted_tables 'decode' (A-95): the event type's name, as run() shows it."""
+    code = values.get("eventType")
+    return {"event_type": _event_names().get(code, str(code)) if code is not None else None}
+
+
 def run(paths):
     from artifact_runner import log_note, open_db_readonly
 
@@ -107,3 +113,78 @@ def run(paths):
     finally:
         conn.close()
     return rows
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'samsung_digital_wellbeing_deleted',
+  'name': 'Digital Wellbeing (Samsung) — Deleted Events',
+  'description': "Deleted app-usage event records from Samsung Digital Wellbeing's "
+                 'dwbCommon.db (table usageEvents): an app opened, closed or moved to the '
+                 'background, with the time to the millisecond. Pattern of life from before '
+                 'the window the phone keeps. Live events are in Digital Wellbeing (Samsung).\n'
+                 '\n'
+                 'Each row is one record as found in the usageEvents table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'These apps remove their own events once they are old, so here Deleted means '
+                 'only "no longer in the table", never "the user deleted it". The report '
+                 'cannot tell who removed a record, but the time gives a hint, in age_check: '
+                 "an event older than the oldest live event fits the app's own pruning; one "
+                 'inside the live window does not, and is worth a closer look. How long the '
+                 'app keeps events has not been checked against a test image, so no period is '
+                 'stated here.\n'
+                 '\n'
+                 'timeStamp is Unix milliseconds, as in Digital Wellbeing (Samsung); '
+                 'event_type is named as there (Android UsageEvents codes).\n'
+                 '\n'
+                 'linked_package: where the foundPackages row this event names (pkgId) was '
+                 'found, live or recovered (only the id is compared; the package name is in '
+                 'Digital Wellbeing (Samsung) for a live one). eventId and foundPackages.pkgId '
+                 'are AUTOINCREMENT (checked 2026-11-28 on the CTF26 Android 14 image (the only one with Samsung Digital Wellbeing)), so SQLite does not hand out an id again.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the CTF26 Android 14 image (the only one with Samsung Digital Wellbeing): on CTF26, sqlite_sequence says 3,354 event ids were '
+                 'handed out and 2,307 events are live; none of the removed ones was '
+                 'recovered.',
+  'timestamp_fields': {'timeStamp': 'ms'},
+  'core_fields': ['status',
+                  'timeStamp',
+                  'event_type',
+                  'pkgId',
+                  'linked_package',
+                  'age_check',
+                  'how_found',
+                  'copies'],
+  'file_key': 'dwb',
+  'table': 'usageEvents',
+  'label': 'Event',
+  'fields': {'eventId': 'eventId',
+             'timeStamp': 'timeStamp',
+             'eventType': 'eventType',
+             'className': 'className',
+             'instanceId': 'instanceId',
+             'pkgId': 'pkgId'},
+  'decode': '_deleted_fields',
+  'decoded_fields': ['event_type'],
+  'derived': {'age_check': {'from': 'timeStamp',
+                            'before_live': True,
+                            'then': 'older than every live event (fits the app removing old '
+                                    'events itself)',
+                            'else': 'inside the live window: not removed for age'}},
+  'version_fields': ['timeStamp', 'eventType', 'pkgId', 'className'],
+  'links': [{'name': 'linked_package',
+             'what': 'package',
+             'column': 'pkgId',
+             'table': 'foundPackages',
+             'key': 'pkgId'}]}]

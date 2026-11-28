@@ -277,6 +277,12 @@ deleted_tables = [{'script': 'google_messages_deleted',
                  'by pattern has no row id and cannot be linked to by id; several copies of '
                  'one record can carry the same id.\n'
                  '\n'
+                 'linked_sender and linked_conversation: where the participant (sender_id) '
+                 'and the conversation (conversation_id) this message names were found, live '
+                 'or in the records of Google Messages — Deleted & Changed Participants and '
+                 '— Deleted & Changed Conversations. Only ids are compared, as above; both '
+                 'tables use AUTOINCREMENT ids (checked 2026-11-28).\n'
+                 '\n'
                  'Checked 2026-11-21 on the Josh Hickman Android 14 image: 0 records. Found '
                  'earlier (carried over from the Google Messages report): bugle_db has PRAGMA '
                  'secure_delete = FAST; the freed page ranges were all zero on a database '
@@ -288,6 +294,8 @@ deleted_tables = [{'script': 'google_messages_deleted',
                   'sent_timestamp',
                   'mms_subject',
                   'linked_parts',
+                  'linked_sender',
+                  'linked_conversation',
                   'changed_fields',
                   'how_found',
                   'copies'],
@@ -310,7 +318,19 @@ deleted_tables = [{'script': 'google_messages_deleted',
              'column': '_id',
              'table': 'parts',
              'key': 'message_id',
-             'report': 'google_messages_deleted_parts'}]},
+             'report': 'google_messages_deleted_parts'},
+            {'name': 'linked_sender',
+             'what': 'participant',
+             'column': 'sender_id',
+             'table': 'participants',
+             'key': '_id',
+             'report': 'google_messages_deleted_participants'},
+            {'name': 'linked_conversation',
+             'what': 'conversation',
+             'column': 'conversation_id',
+             'table': 'conversations',
+             'key': '_id',
+             'report': 'google_messages_deleted_conversation_rows'}]},
  {'script': 'google_messages_deleted_parts',
   'name': 'Google Messages — Deleted & Changed Parts',
   'description': 'Deleted and changed Google Messages parts records from bugle_db (table '
@@ -386,4 +406,171 @@ deleted_tables = [{'script': 'google_messages_deleted',
              'column': 'message_id',
              'table': 'messages',
              'key': '_id',
-             'report': 'google_messages_deleted'}]}]
+             'report': 'google_messages_deleted'}]},
+ {'script': 'google_messages_deleted_participants',
+  'name': 'Google Messages — Deleted & Changed Participants',
+  'description': 'Deleted and changed participant records from bugle_db (table participants): '
+                 'the phone number or address of each party (normalized_destination, '
+                 'display_destination) and the contact name the app had for it. A message '
+                 "names its sender by sender_id, so this is where a deleted message's "
+                 'counterpart may be. Live participants are in Google Messages (SMS/MMS/RCS), '
+                 'as the sender of each message.\n'
+                 '\n'
+                 'Each row is one record as found in the participants table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'linked_conversations: the conversations this participant is in. '
+                 'conversation_participants holds one row per (conversation_id, '
+                 'participant_id) pair, so the link goes through it, live or recovered, and '
+                 'each conversation is looked up live and in the records Google Messages — '
+                 'Deleted & Changed Conversations finds. Only ids are compared. Up to 2 '
+                 'conversations per participant on the test images. How the link can be wrong: '
+                 'participants._id, conversations._id and conversation_participants._id are '
+                 'AUTOINCREMENT (checked 2026-11-28 on the Josh Hickman and CTF26 Android 14 '
+                 'and CTF25 Android 15 images), so SQLite does not hand out an id again, but '
+                 'an app that re-inserts rows with their old ids (a restore from backup) can '
+                 'still put a different record under the same id; an earlier version found in '
+                 'the WAL and a live row with the same id were stored at different times; a '
+                 'record found by pattern has no row id and cannot be linked; several copies '
+                 'of one record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman and CTF26 Android 14 and CTF25 '
+                 'Android 15 images: no deleted or changed participant. sqlite_sequence says '
+                 'no participant was ever deleted on any of the three phones (the highest id '
+                 'handed out equals the number live).',
+  'timestamp_fields': {},
+  'core_fields': ['status',
+                  'display_destination',
+                  'full_name',
+                  'linked_conversations',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'bugle_db',
+  'table': 'participants',
+  'label': 'Participant',
+  'fields': {'_id': 'participant_id',
+             'sub_id': 'sub_id',
+             'normalized_destination': 'normalized_destination',
+             'send_destination': 'send_destination',
+             'display_destination': 'display_destination',
+             'full_name': 'full_name',
+             'first_name': 'first_name',
+             'alias': 'alias',
+             'contact_id': 'contact_id',
+             'lookup_key': 'lookup_key',
+             'blocked': 'blocked',
+             'is_spam': 'is_spam',
+             'participant_type': 'participant_type',
+             'profile_photo_uri': 'profile_photo_uri'},
+  'version_fields': ['normalized_destination',
+                     'send_destination',
+                     'display_destination',
+                     'full_name',
+                     'first_name',
+                     'alias',
+                     'blocked',
+                     'is_spam'],
+  'links': [{'name': 'linked_conversations',
+             'what': 'conversation',
+             'column': '_id',
+             'via': ['conversation_participants', 'participant_id', 'conversation_id'],
+             'table': 'conversations',
+             'key': '_id',
+             'report': 'google_messages_deleted_conversation_rows'}]},
+ {'script': 'google_messages_deleted_conversation_rows',
+  'name': 'Google Messages — Deleted & Changed Conversations',
+  'description': 'Deleted and changed conversation records from bugle_db (table '
+                 'conversations): its name, the other party, and snippet_text, the text of its '
+                 'latest message at the time. An earlier version can hold the text of a '
+                 'message that has since gone. Live conversations are in Google Messages '
+                 '(SMS/MMS/RCS). Not the same as Google Messages — Recovered (deleted '
+                 "conversations), which reads the app's own audit tables: this report reads "
+                 'the conversations table itself, and both can list one conversation.\n'
+                 '\n'
+                 'Each row is one record as found in the conversations table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'sort_timestamp and last_read_timestamp are Unix milliseconds, as in the '
+                 'Google Messages report.\n'
+                 '\n'
+                 'linked_participants: the participants of this conversation, through '
+                 'conversation_participants (as linked_conversations in Google Messages — '
+                 'Deleted & Changed Participants, the other way round). Up to 20 per '
+                 'conversation on the test images. How the link can be wrong: '
+                 'participants._id, conversations._id and conversation_participants._id are '
+                 'AUTOINCREMENT (checked 2026-11-28 on the Josh Hickman and CTF26 Android 14 '
+                 'and CTF25 Android 15 images), so SQLite does not hand out an id again, but '
+                 'an app that re-inserts rows with their old ids (a restore from backup) can '
+                 'still put a different record under the same id; an earlier version found in '
+                 'the WAL and a live row with the same id were stored at different times; a '
+                 'record found by pattern has no row id and cannot be linked; several copies '
+                 'of one record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman and CTF26 Android 14 and CTF25 '
+                 'Android 15 images: one earlier version each on CTF26 and CTF25, with a '
+                 'different snippet_text, from earlier WAL frames whose table is not certain '
+                 '(table_certain). sqlite_sequence says 5, 1 and 20 conversations were deleted '
+                 'on the three phones; none of them was recovered: the freed ranges are zero '
+                 '(bugle_db is written with secure_delete, see Google Messages — Deleted & '
+                 'Changed Messages). delete_timestamp was 0 on every live conversation.',
+  'timestamp_fields': {'sort_timestamp': 'ms',
+                       'last_read_timestamp': 'ms',
+                       'delete_timestamp': 'ms'},
+  'core_fields': ['status',
+                  'sort_timestamp',
+                  'name',
+                  'snippet_text',
+                  'participant_display_destination',
+                  'linked_participants',
+                  'changed_fields',
+                  'snippet_text (now)',
+                  'how_found',
+                  'copies'],
+  'file_key': 'bugle_db',
+  'table': 'conversations',
+  'label': 'Conversation',
+  'fields': {'_id': 'conversation_id',
+             'name': 'name',
+             'snippet_text': 'snippet_text',
+             'subject_text': 'subject_text',
+             'draft_snippet_text': 'draft_snippet_text',
+             'latest_message_id': 'latest_message_id',
+             'sort_timestamp': 'sort_timestamp',
+             'last_read_timestamp': 'last_read_timestamp',
+             'participant_normalized_destination': 'participant_normalized_destination',
+             'participant_display_destination': 'participant_display_destination',
+             'participant_count': 'participant_count',
+             'archive_status': 'archive_status',
+             'conv_type': 'conv_type',
+             'delete_timestamp': 'delete_timestamp',
+             'preview_uri': 'preview_uri',
+             'sms_thread_id': 'sms_thread_id'},
+  'version_fields': ['name',
+                     'snippet_text',
+                     'subject_text',
+                     'draft_snippet_text',
+                     'participant_normalized_destination',
+                     'participant_display_destination',
+                     'archive_status',
+                     'delete_timestamp',
+                     'preview_uri'],
+  'links': [{'name': 'linked_participants',
+             'what': 'participant',
+             'column': '_id',
+             'via': ['conversation_participants', 'conversation_id', 'participant_id'],
+             'table': 'participants',
+             'key': '_id',
+             'report': 'google_messages_deleted_participants'}]}]

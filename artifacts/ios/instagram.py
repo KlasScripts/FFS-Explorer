@@ -60,6 +60,38 @@ record_source = {
 }
 
 
+def _message_fields(archive):
+    """sender_id, message, timestamp (Unix seconds) and thread_id from one
+    messages.archive BLOB, as run() reads them; {} when it does not decode."""
+    from datetime import timezone
+
+    from artifact_runner import decode_plist_blob
+    plist = decode_plist_blob(archive)
+    if not isinstance(plist, dict):
+        return {}
+    metadata = plist.get("IGDirectPublishedMessageMetadata*metadata")
+    content = plist.get("IGDirectPublishedMessageContent*content")
+    if not isinstance(metadata, dict):
+        return {}
+    ts = metadata.get("NSDate*serverTimestamp")
+    epoch_s = None
+    if ts is not None:
+        try:
+            epoch_s = ts.replace(tzinfo=timezone.utc).timestamp()
+        except Exception:
+            epoch_s = None
+    return {"sender_id": metadata.get("NSString*senderPk"),
+            "message": content.get("NSString*string") if isinstance(content, dict) else None,
+            "timestamp": epoch_s,
+            "archive_thread_id": metadata.get("NSString*threadId")}
+
+
+def _deleted_fields(values):
+    """deleted_tables 'decode' (A-95): the readable fields of a recovered
+    messages record, the same way run() reads a live one."""
+    return _message_fields(values.get("archive"))
+
+
 def run(paths):
     from datetime import timezone
 
@@ -120,3 +152,75 @@ def run(paths):
             "source_table": "messages",
         })
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'instagram_deleted_messages',
+  'name': 'Instagram — Deleted & Changed Direct Messages',
+  'description': "Deleted and changed Instagram direct-message records from the account's "
+                 'DirectSQLiteDatabase/<account id>.db (table messages). The text, sender and '
+                 'time are inside the archive BLOB (an NSKeyedArchiver plist) and are read out '
+                 'of it the same way as in Instagram Direct Messages: message, sender_id, '
+                 'timestamp. A record that does not decode is listed with its stored values '
+                 '(counted in the run log). Live messages are in Instagram Direct Messages.\n'
+                 '\n'
+                 'Each row is one record as found in the messages table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'Instagram rewrites a message under a new row id, often: on the test image '
+                 '943 row ids were handed out (sqlite_sequence) for 42 live messages. So a '
+                 "record whose message_id is still a live message's is an earlier version of "
+                 'that message, never a deletion: it is listed as Changed only when the text '
+                 'or thread differs, with the current text beside it as "message (now)"; '
+                 'otherwise it is counted in the run log ("tied to live row" in how_found). A '
+                 'record listed as Deleted is one whose message_id is in no live row: a '
+                 'message unsent or deleted, or one removed when its thread went.\n'
+                 '\n'
+                 'timestamp is Unix seconds, as in Instagram Direct Messages.\n'
+                 '\n'
+                 'linked_thread: where the thread this record names (thread_id) was found, '
+                 'live or recovered (the threads table has no deleted report of its own; only '
+                 'the id is compared). thread_id is a text id from Instagram, not a row id, so '
+                 'SQLite does not reuse it; the link can still be wrong where a record found '
+                 'by pattern has a cut-off value.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman iOS 17 image: 464 records carrying 43 '
+                 'message ids; 42 of those are live messages (rewrites, counted in the run '
+                 'log), and 1 message is gone, found 3 times (one row, copies 3).',
+  'timestamp_fields': {'timestamp': 's'},
+  'core_fields': ['status',
+                  'timestamp',
+                  'message',
+                  'sender_id',
+                  'linked_thread',
+                  'changed_fields',
+                  'message (now)',
+                  'how_found',
+                  'copies'],
+  'file_key': 'direct_db',
+  'table': 'messages',
+  'label': 'Message',
+  'fields': {'message_id': 'message_id',
+             'thread_id': 'thread_id',
+             'class_name': 'class_name'},
+  'decode': '_deleted_fields',
+  'decoded_fields': ['sender_id', 'message', 'timestamp', 'archive_thread_id'],
+  'identity': ['message_id'],
+  'version_fields': ['thread_id', 'message'],
+  'links': [{'name': 'linked_thread',
+             'what': 'thread',
+             'column': 'thread_id',
+             'table': 'threads',
+             'key': 'thread_id'}]}]

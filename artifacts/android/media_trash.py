@@ -908,3 +908,113 @@ def run(paths):
     rows.sort(key=lambda row: (row["trashed_time"] is None, row["trashed_time"] or 0,
                                row["media_store_id"] or 0))
     return rows
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'media_trash_deleted_files',
+  'name': 'Media Store — Deleted & Changed File Records',
+  'description': "Deleted and changed records of Android's media store (MediaProvider's "
+                 'external.db, table files): one row per file on shared storage, with its path '
+                 '(_data), name, folder, size, type, the app that owns it, and its trash state '
+                 '(is_trashed, date_expires). A deleted record is a file gone from the phone; '
+                 'a changed one shows an earlier path or name (a move or rename), or the state '
+                 'before it was trashed or restored. Files in the trash now are in Media '
+                 'Trash.\n'
+                 '\n'
+                 'Each row is one record as found in the files table, never joined to another '
+                 'table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id. Values are as stored: no code is '
+                 'turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'Many records of this table are found in freed pages or earlier WAL frames, '
+                 'where the page no longer says which table it belonged to. Such a record is '
+                 "listed only when it fits this table's own record pattern and no other "
+                 "table's (table_certain says which records these are); the run log counts the "
+                 'ones left out.\n'
+                 '\n'
+                 'The media store keeps one row per path: a record whose _data is still a live '
+                 "row's path is that file indexed again under a new id, not a file gone, and "
+                 'is treated as an earlier version of it ("tied to live row" in how_found; '
+                 'counted in the run log unless a column that matters differs).\n'
+                 '\n'
+                 'date_added, date_modified and date_expires are Unix seconds, datetaken Unix '
+                 'milliseconds, as in Media Trash. is_trashed 1 is in the trash; a trashed '
+                 'file is renamed .trashed-<expiry>-<name> (see Media Trash). media_type and '
+                 'format are shown as stored.\n'
+                 '\n'
+                 '_id is AUTOINCREMENT, numbered from 1,000,000,000 (checked 2026-11-28 on the '
+                 'Josh Hickman and CTF26 Android 14 and CTF25 Android 15 images), so SQLite '
+                 'does not hand out an id again; MediaProvider itself can re-index a file '
+                 'under a new id, which the path check above covers.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman and CTF26 Android 14 and CTF25 '
+                 'Android 15 images (before the path check): 9, 1 and 14 records whose id is '
+                 'no longer live, most from earlier WAL frames whose table is not certain; '
+                 'changed records showing moves and renames (_data, _display_name, '
+                 'relative_path differ) and files finishing their write (is_pending).',
+  'timestamp_fields': {'date_added': 's',
+                       'date_modified': 's',
+                       'date_expires': 's',
+                       'datetaken': 'ms'},
+  'core_fields': ['status',
+                  'date_added',
+                  'path',
+                  'display_name',
+                  'is_trashed',
+                  'owner_package_name',
+                  'changed_fields',
+                  'path (now)',
+                  'how_found',
+                  'copies'],
+  'file_key': 'external_db',
+  'table': 'files',
+  'label': 'File',
+  'fields': {'_id': 'media_id',
+             '_data': 'path',
+             '_display_name': 'display_name',
+             'relative_path': 'relative_path',
+             'volume_name': 'volume_name',
+             '_size': 'size',
+             'mime_type': 'mime_type',
+             'media_type': 'media_type',
+             'format': 'format',
+             'date_added': 'date_added',
+             'date_modified': 'date_modified',
+             'datetaken': 'datetaken',
+             'owner_package_name': 'owner_package_name',
+             'is_trashed': 'is_trashed',
+             'date_expires': 'date_expires',
+             'is_pending': 'is_pending',
+             'is_favorite': 'is_favorite',
+             'is_download': 'is_download',
+             'download_uri': 'download_uri',
+             'bucket_display_name': 'bucket_display_name',
+             'latitude': 'latitude',
+             'longitude': 'longitude',
+             'width': 'width',
+             'height': 'height',
+             'duration': 'duration'},
+  'identity': ['_data'],
+  'version_fields': ['_data',
+                     '_display_name',
+                     'relative_path',
+                     'is_trashed',
+                     'date_expires',
+                     'is_pending',
+                     'owner_package_name',
+                     'is_favorite',
+                     'mime_type',
+                     'download_uri',
+                     'latitude',
+                     'longitude'],
+  'links': []}]

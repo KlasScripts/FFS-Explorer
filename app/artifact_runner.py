@@ -1252,6 +1252,17 @@ def _deleted_table_module(platform: str, main_script: str, main, entry: dict, ta
             setattr(m, key, entry[key])
     spec = {k: v for k, v in entry.items() if k not in _DELETED_TABLE_MODULE_KEYS and k != 'script'}
     spec.setdefault('label', entry['table'])
+    decode_src = b''
+    if spec.get('decode'):
+        fn = getattr(main, spec['decode'], None) if isinstance(spec['decode'], str) else None
+        if not callable(fn):
+            return None, f"deleted_tables entry '{script}': decode names no function of {main_script}"
+        spec['decode'] = fn
+        try:
+            import inspect
+            decode_src = inspect.getsource(fn).encode()    # a change to it is a new version
+        except (OSError, TypeError):
+            pass
     m.recovered_records = [spec]
     m.report_type = 'recovered_records'
     m.deleted_of = main_script
@@ -1267,7 +1278,8 @@ def _deleted_table_module(platform: str, main_script: str, main, entry: dict, ta
     try:
         import parser_versions
         parser_versions.check_version(platform, script, m.__file__ or '',
-                                      data=repr(sorted(entry.items(), key=lambda kv: kv[0])).encode())
+                                      data=repr(sorted(entry.items(), key=lambda kv: kv[0])).encode()
+                                      + decode_src)
     except Exception:
         pass
     return m, None
@@ -1530,6 +1542,23 @@ def _extract_db_sidecars(dest_path: str, candidates: list[str], zip_path: str,
 #       "label": "Message",            # shown in the Record column
 #       "fields": {"ZTEXT": "message_text", ...},   # column -> report name
 #       "version_fields": ["ZTEXT", ...],           # what makes a version matter
+#       "decode": "_deleted_fields",  # optional, in a main report's deleted_tables:
+#               a function of the main report, {column: value} -> {field:
+#               value}, adding readable fields (text out of an archive BLOB);
+#               a version_field that is not a column names one of them;
+#               "decoded_fields" lists the names it adds (checked by tests)
+#       "deletion_log": {"table": "sync_deleted_messages", "key": "guid",
+#                        "column": "guid", "fields": {"recordID": "..."}},
+#               optional: the app's own record of deletions (a log table a
+#               trigger writes). Its live rows whose key is in no live row of
+#               this table's column are listed, status "Deleted (recorded by
+#               the app)", saying whether a record was also recovered
+#       "identity": ["ZUUID"],        # optional: columns the app keeps unique
+#               per row. A record with no row id (found by pattern) or with a
+#               row id no longer live, whose identity values are a live row's,
+#               is an earlier version of that row (an app that rewrites a row
+#               under a new id; Photos' copies found by pattern): Changed when
+#               a version_field differs, else counted, never Deleted
 #       "labels": {"ZCONTENTTYPE": {0: "text", 1: "picture"}},  # optional:
 #               shown as "picture (1)": the word, then the stored value kept;
 #               a value without a label is shown as stored
@@ -1539,7 +1568,10 @@ def _extract_db_sidecars(dest_path: str, candidates: list[str], zip_path: str,
 #               "ZCHATMEMBER", "column": "Z_PK", "where": "ZISLOGGEDINUSER = 1"},
 #               "then": "Outgoing", "else": "Incoming": the value is looked up
 #               in that column of the rows the where-clause selects (which
-#               ids are the local user); no field of that table is added
+#               ids are the local user); no field of that table is added.
+#               Or "before_live": True, "then": ..., "else": ...: whether the
+#               value is below the smallest of that column in the live rows
+#               (a record older than every live one fits an app's own pruning)
 #       "not_found_in": {"ZLASTMESSAGE": ["ZMESSAGE", "ZTEXT"]},  # optional:
 #               list a record only when this column's value is not the value
 #               of that other table's column in any live or recovered row
@@ -1670,6 +1702,19 @@ def _col_value(t, vals, rowid, column):
     return vals[i] if i < len(vals) else None
 
 
+def _link_extras(t, vals, rowid, link, fallback=None) -> dict:
+    """_link_text's check / fallback arguments for one record."""
+    out = {}
+    vc = link.get('via_check')
+    if vc and vc.get('column') in t.columns:
+        out['check'] = _col_value(t, vals, rowid, vc['column'])
+    fb = link.get('fallback')
+    if fb and fb.get('column') in t.columns:
+        out['fallback'] = fallback
+        out['fb_v'] = _col_value(t, vals, rowid, fb['column'])
+    return out
+
+
 def _link_hits(hits: list, report_name: str) -> str:
     """'live' / 'recovered (in <report>)' / both, with the row ids where
     the matched column is not the row id (rows of a one-to-many link)."""
@@ -1691,13 +1736,19 @@ def _link_hits(hits: list, report_name: str) -> str:
     return '; '.join(parts)
 
 
-def _link_text(link: dict, v, target, join=None) -> str:
-    """The `links` cell for one record whose link column holds *v*."""
+def _link_text(link: dict, v, target, join=None, check=None, fallback=None, fb_v=None) -> str:
+    """The `links` cell for one record whose link column holds *v*.
+    *check*: the record's value of link['via_check']['column'], compared
+    with that column of each join row. *fallback* / *fb_v*: the index of
+    link['fallback']['via'] and the record's value of its column, used only
+    when no join row holds *v*."""
     what = link.get('what', link['table'])
     name = link.get('report_name') or link['table']
     if target is None:
         return f"not checked: {link['table']}.{link['key']} could not be read"
-    if v is None:
+    # 'none': stored values that mean "no id" in this app (iOS sms.db
+    # handle_id 0 on the owner's own messages), never looked up
+    if v is None or v in link.get('none', ()):
         return f"no {what} id"
 
     def describe(w):
@@ -1715,12 +1766,33 @@ def _link_text(link: dict, v, target, join=None) -> str:
     jindex, _is_id, jcols = join
     jt, _mine, theirs = link['via']
     j = jcols.index(theirs) if theirs in jcols else None
+    vc = link.get('via_check') or {}
+    k = jcols.index(vc['join_column']) if vc.get('join_column') in jcols else None
     out = []
     for where, _rid, certain, vals in jindex.get(v, []):
         w = vals[j] if j is not None and j < len(vals) else None
         jw = 'live' if where == 'live' else ('recovered' if certain else 'recovered, table not certain')
-        out.append(f"{describe(w) if w is not None else f'no {what} id'} ({jw} {jt} row)")
-    return '; '.join(dict.fromkeys(out)) or f"no {jt} row for {v}"
+        tail = ''
+        if k is not None and check is not None and k < len(vals):
+            tail = (f", its {vc['join_column']} is this record's {vc['column']}" if vals[k] == check
+                    else f", its {vc['join_column']} is not this record's {vc['column']}")
+        out.append(f"{describe(w) if w is not None else f'no {what} id'} ({jw} {jt} row{tail})")
+    if out:
+        return '; '.join(dict.fromkeys(out))
+    fb = link.get('fallback')
+    if fb and fallback is not None and fb_v is not None and fb_v not in link.get('none', ()):
+        findex, _fi, fcols = fallback
+        fjt, _fm, ftheirs = fb['via']
+        fj = fcols.index(ftheirs) if ftheirs in fcols else None
+        cands = sorted({vals[fj] for _w, _r, _c, vals in findex.get(fb_v, [])
+                        if fj is not None and fj < len(vals) and vals[fj] is not None})
+        if len(cands) == 1:
+            return (f"no {jt} row for {v}; inferred, not stored: {describe(cands[0])} "
+                    f"({fb['what']} {fb_v} is in this one {what} only, by {fjt})")
+        if cands:
+            return (f"no {jt} row for {v}; not inferred: {fb['what']} {fb_v} is in "
+                    f"{len(cands)} {what}s ({fjt})")
+    return f"no {jt} row for {v}"
 
 
 def recovered_records_report(module, paths: dict) -> list[dict]:
@@ -1795,6 +1867,29 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
                         except sqlite3.Error:
                             vals_ = set()
                 not_in[col] = (vals_, otable, ocol)
+            # The app's own record of deletions (deletion_log): live rows of a
+            # log table (iOS sms.db sync_deleted_messages, written by a
+            # trigger when a message is deleted) whose key is in no live row
+            # of this table. Compared by value, never joined (A-95).
+            dlog_rows = []
+            dspec = spec.get('deletion_log')
+            if dspec:
+                try:
+                    lcols = [r[1] for r in conn.execute(f'PRAGMA table_info("{dspec["table"]}")')]
+                    if lcols:
+                        keep = [c for c in dict.fromkeys([dspec['key']] + list(dspec.get('fields') or {}))
+                                if c in lcols]
+                        live_keys = {r[0] for r in conn.execute(
+                            f'SELECT "{dspec["column"]}" FROM "{t.name}" '
+                            f'WHERE "{dspec["column"]}" IS NOT NULL')}
+                        for r in conn.execute(
+                                f'SELECT rowid, {", ".join(chr(34) + c + chr(34) for c in keep)} '
+                                f'FROM "{dspec["table"]}"'):
+                            d = dict(zip(['rowid'] + keep, r))
+                            if d.get(dspec['key']) is not None and d[dspec['key']] not in live_keys:
+                                dlog_rows.append(d)
+                except sqlite3.Error as e:
+                    log_note(f"{spec.get('label', spec['table'])}: {dspec['table']} not read ({e}).")
             # Live rows whose message is gone (orphan_of): not deleted, so
             # never recovered, and missing from the main report, whose query
             # starts from the message. Compared by id, never joined (A-95).
@@ -1821,10 +1916,13 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
                 target = _key_index(conn, checkpoint, carver, link['table'], link['key'], key_cache)
                 join = (_key_index(conn, checkpoint, carver, link['via'][0], link['via'][1], key_cache)
                         if link.get('via') else None)
+                fallback = (_key_index(conn, checkpoint, carver, link['fallback']['via'][0],
+                                       link['fallback']['via'][1], key_cache)
+                            if link.get('fallback') else None)
                 if target is None or (link.get('via') and join is None):
                     log_note(f"{spec.get('label', spec['table'])}: {link['name']} not worked out "
                              f"({link['table']} or its key not readable).")
-                links.append((link, target, join))
+                links.append((link, target, join, fallback))
         finally:
             conn.close()
             if checkpoint is not None:
@@ -1837,14 +1935,64 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             log_note(f"{spec['table']} has no column(s) {', '.join(missing)} in this version of the app.")
         vf = [c for c in (spec.get('version_fields') or []) if c in t.columns]
         idx = {c: t.columns.index(c) for c in t.columns}
+        # 'decode': a function of the main report turning a record's stored
+        # values ({column: value}) into readable fields (Instagram's message
+        # text out of its archive BLOB); a version_field that is not a column
+        # is one of these, compared between the record and the live row
+        decode = spec.get('decode') if callable(spec.get('decode')) else None
+        dvf = [c for c in (spec.get('version_fields') or []) if c not in t.columns] if decode else []
+        decode_errors = 0
+
+        def decoded(v):
+            nonlocal decode_errors
+            if decode is None:
+                return {}
+            try:
+                out = decode({c: (v[idx[c]] if idx[c] < len(v) else None) for c in t.columns})
+                return out if isinstance(out, dict) else {}
+            except Exception:
+                decode_errors += 1
+                return {}
         label = spec.get('label', spec['table'])
         seen: dict = {}          # copy key -> the row listed for it
         hidden: dict = {}
         known = 0
+        # 'identity': columns the app keeps unique per row (Photos' ZUUID,
+        # Instagram's message id). A record with no row id (found by pattern),
+        # or with a row id no longer live (an app that rewrites a row under a
+        # new id), whose identity values are a live row's is an earlier
+        # version of that row, not a deletion: Changed when a column that
+        # matters differs, else counted (A-95).
+        ident = [c for c in (spec.get('identity') or ()) if c in idx]
+        by_ident: dict = {}
+        if ident:
+            for lrid, lv in t.live.items():
+                k = tuple(lv[idx[c]] if idx[c] < len(lv) else None for c in ident)
+                if None not in k:
+                    by_ident[k] = None if k in by_ident else lrid    # None: not unique
+        tied = 0
+        mins: dict = {}
+
+        def live_min(col):
+            """The smallest number in *col* over the live rows (derived
+            'before_live'), None when there is none."""
+            if col not in mins:
+                i = idx[col]
+                nums = [v[i] for v in t.live.values()
+                        if i < len(v) and isinstance(v[i], (int, float))]
+                mins[col] = min(nums) if nums else None
+            return mins[col]
         for r in records:
             status = RECOVERED_STATUS.get(r['method'], 'Deleted')
             vals = list(r['values'])
             rowid = r['rowid']
+            tied_to = None
+            if by_ident and (rowid is None or rowid not in t.live) \
+                    and r['method'] != 'unfinished_delete':
+                k = tuple(vals[idx[c]] if idx[c] < len(vals) else None for c in ident)
+                if None not in k and by_ident.get(k) is not None:
+                    tied_to = rowid = by_ident[k]
+                    tied += 1
             live = t.live.get(rowid) if rowid is not None else None
             if r['method'] == 'unfinished_delete':
                 status = 'Unfinished delete'
@@ -1853,9 +2001,14 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             elif live is not None:
                 status = 'Changed'
             changed = []
+            dec = decoded(vals)
+            dlive = {}
             if status == 'Changed':
-                changed = [c for c in (vf or t.columns)
+                changed = [c for c in (vf or ([] if dvf else t.columns))
                            if idx[c] < len(vals) and vals[idx[c]] != live[idx[c]]]
+                if dvf:
+                    dlive = decoded(live)
+                    changed += [k for k in dvf if dec.get(k) != dlive.get(k)]
                 if not changed:
                     hidden[rowid] = hidden.get(rowid, 0) + 1
                     continue
@@ -1896,7 +2049,11 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             for name, d in (spec.get('derived') or {}).items():
                 if d['from'] in idx and idx[d['from']] < len(vals):
                     v = value(d['from'])
-                    if 'in' in d:
+                    if d.get('before_live'):
+                        lo = live_min(d['from'])
+                        row[name] = ('' if lo is None or not isinstance(v, (int, float))
+                                     else d['then'] if v < lo else d.get('else', ''))
+                    elif 'in' in d:
                         ids = lookups.get(name)
                         row[name] = '' if ids is None else (d['then'] if v in ids else d.get('else', ''))
                     else:
@@ -1915,13 +2072,23 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             for col, name in (spec.get('blob_files') or {}).items():
                 if col in idx:
                     row[name] = _save_recovered_blob(paths, module, r, value(col))
+            for k, v in dec.items():
+                row.setdefault(k, blob_safe(v))
             for c in changed:
-                if c in fields:
+                if c in dvf:
+                    now = dlive.get(c)
+                    row[f"{c} (now)"] = '(empty)' if now in (None, '') else blob_safe(now)
+                elif c in fields:
                     now = live[idx[c]]
                     # an empty current value says so, rather than a blank
                     # cell that reads as missing data
                     row[f"{fields[c]} (now)"] = '(empty)' if now in (None, '') else shown(c, now)
             note = sqlite_recovery.describe(r)
+            if tied_to is not None:
+                own = ('no row id of its own' if r['rowid'] is None
+                       else f"stored under row id {r['rowid']}, no longer live")
+                note += (f"; {own}: tied to live row {tied_to} by "
+                         f"{', '.join(fields.get(c, c) for c in ident)}")
             row.update({
                 'changed_fields': ', '.join(fields.get(c, c) for c in changed),
                 'how_found': note,
@@ -1934,7 +2101,7 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
                 'recovery_version': sqlite_recovery.RECOVERY_VERSION,
                 'source_table': t.name,
                 'source_file_key': spec['file_key'],
-                'raw_rowid': rowid,
+                'raw_rowid': r['rowid'],
                 'raw_page': r['page'],
                 'raw_file': r['file'],
                 'raw_offset': r['offset'],
@@ -1942,10 +2109,11 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             })
             if r.get('truncated'):
                 row['truncated'] = True
-            for link, target, join in links:
+            for link, target, join, fallback in links:
                 if link['column'] in idx or link['column'].lower() == 'rowid':
-                    row[link['name']] = _link_text(link, _col_value(t, vals, rowid, link['column']),
-                                                   target, join)
+                    row[link['name']] = _link_text(
+                        link, _col_value(t, vals, rowid, link['column']), target, join,
+                        **_link_extras(t, vals, rowid, link, fallback))
             row['copies'] = 1
             row['copy_locations'] = (f"{r['file']} offset {r['offset']}"
                                      + (f" rowid {rowid}" if rowid is not None else ''))
@@ -1975,10 +2143,11 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
                 for col, note_text in (spec.get('field_notes') or {}).items():
                     if col in idx:
                         row[f"{fields.get(col, col)}_caveat"] = note_text
-                for link, target, join in links:
+                for link, target, join, fallback in links:
                     if link['column'] in idx or link['column'].lower() == 'rowid':
                         row[link['name']] = _link_text(
-                            link, _col_value(t, vals, rowid, link['column']), target, join)
+                            link, _col_value(t, vals, rowid, link['column']), target, join,
+                            **_link_extras(t, vals, rowid, link, fallback))
                 key_v = vals[idx[ospec['column']]] if ospec['column'] in idx else rowid
                 row.update({
                     'changed_fields': '',
@@ -1999,6 +2168,39 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
                 rows.append(row)
             log_note(f"{label}: {len(orphans)} live row(s) whose {what} is gone: "
                      "listed as Orphaned.")
+        if dlog_rows:
+            kname = fields.get(dspec['column'], dspec['column'])
+            listed = {x.get(kname) for x in rows if x.get('source_table') == t.name
+                      and x['record'] == label}
+            for d in dlog_rows:
+                kv = d[dspec['key']]
+                row = {'record': label, 'status': 'Deleted (recorded by the app)', 'row_id': None,
+                       kname: blob_safe(kv)}
+                for col, name in (dspec.get('fields') or {}).items():
+                    if col in d:
+                        row[name] = blob_safe(d[col])
+                rec = blob_safe(kv) in listed
+                row.update({
+                    'changed_fields': '',
+                    'damaged': '',
+                    'how_found': (f"live row {d['rowid']} of {dspec['table']}: the app's own record "
+                                  f"that a {label.lower()} with this {kname} was deleted; "
+                                  + ("its record was also recovered (listed in this report)" if rec
+                                     else "no record of it was recovered")),
+                    'table_certain': True,
+                    'source': f"Live — {dspec['table']} (deletion record)",
+                    'recovered': False,
+                    'recovery_method': 'deletion_log',
+                    'recovery_version': sqlite_recovery.RECOVERY_VERSION,
+                    'source_table': dspec['table'],
+                    'source_file_key': spec['file_key'],
+                    'raw_rowid': d['rowid'], 'raw_page': None, 'raw_file': 'main',
+                    'raw_offset': None, 'raw_length': None,
+                    'copies': 1, 'copy_locations': '',
+                })
+                rows.append(row)
+            log_note(f"{label}: {len(dlog_rows)} deletion(s) recorded by the app in "
+                     f"{dspec['table']} whose {kname} is in no live row: listed.")
         collapsed = sum(x['copies'] - 1 for x in rows if x.get('source_table') == t.name
                         and x.get('source_file_key') == spec['file_key'] and x['record'] == label)
         if collapsed:
@@ -2010,9 +2212,16 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             log_note(f"{label}: {known} record(s) whose {where} already in the report or the "
                      "live table: not listed.")
         if hidden:
-            names = ', '.join(fields.get(c, c) for c in vf)
+            names = ', '.join(fields.get(c, c) for c in vf + dvf)
             log_note(f"{label}: {sum(hidden.values())} earlier version(s) of {len(hidden)} live "
                      f"row(s) differ only in columns other than {names}: not listed.")
+        if decode_errors:
+            log_note(f"{label}: {decode_errors} record(s) could not be decoded: their stored "
+                     "values are listed as found.")
+        if tied:
+            log_note(f"{label}: {tied} record(s) with no row id, or one no longer live, carried the "
+                     f"{', '.join(fields.get(c, c) for c in ident)} of a live row: treated as "
+                     "earlier versions of it, not as deleted.")
     return rows
 
 

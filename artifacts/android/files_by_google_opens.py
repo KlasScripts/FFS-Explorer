@@ -83,3 +83,63 @@ def run(paths):
     finally:
         conn.close()
     return rows
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'opened_files_deleted',
+  'name': 'Opened Files — Deleted Open Records',
+  'description': "Deleted records from Files by Google's files_master_database (table "
+                 'file_open_info_table): one row each time a file was opened in Files, with '
+                 'the time to the millisecond and the file (file_id, a files_master_table id). '
+                 'A deleted record is an open no longer in the history. Live opens are in '
+                 'Opened Files.\n'
+                 '\n'
+                 'Each row is one record as found in the file_open_info_table table, never '
+                 'joined to another table (ASSUMPTIONS.md A-95): ids are the stored ids. '
+                 'Status says Deleted (no longer in the table), Changed (an earlier version of '
+                 'a row still there, listed only when one of the columns that matter changed, '
+                 'with the current value beside it as "(now)") or an unfinished write/delete '
+                 'under a hot journal. How found says how each record was recovered and how '
+                 'sure that is; a record found by pattern has no row id. Values are as stored: '
+                 'no code is turned into a word here unless it was checked against a test '
+                 'image.\n'
+                 '\n'
+                 'file_open_time_stamp_ms is Unix milliseconds, as in Opened Files.\n'
+                 '\n'
+                 "This table has no id column of its own: SQLite's row id is used, and can be "
+                 'handed to a new row, so a record is tied to a live row by its file and time '
+                 'together ("tied to live row" in how_found).\n'
+                 '\n'
+                 'linked_file: where the files_master_table row this open names was found, '
+                 'live or recovered (that table has no deleted report of its own; only the id '
+                 'is compared; its path is in Opened Files for a live file). '
+                 'files_master_table.id is AUTOINCREMENT, so it is not handed out again; the '
+                 "table drops a file's row when the file goes (sqlite_sequence: 745 ids for "
+                 '434 live files on CTF25), and its opens go with it (ON DELETE CASCADE), so a '
+                 'recovered open can name a file that is gone.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman Android 14 and CTF25 Android 15 images: no deleted open record (4 and 43 live).',
+  'timestamp_fields': {'file_open_time_stamp_ms': 'ms'},
+  'core_fields': ['status',
+                  'file_open_time_stamp_ms',
+                  'file_id',
+                  'linked_file',
+                  'how_found',
+                  'copies'],
+  'file_key': 'master',
+  'table': 'file_open_info_table',
+  'label': 'File open',
+  'fields': {'file_id': 'file_id', 'file_open_time_stamp_ms': 'file_open_time_stamp_ms'},
+  'identity': ['file_id', 'file_open_time_stamp_ms'],
+  'version_fields': ['file_id', 'file_open_time_stamp_ms'],
+  'links': [{'name': 'linked_file',
+             'what': 'file',
+             'column': 'file_id',
+             'table': 'files_master_table',
+             'key': 'id'}]}]

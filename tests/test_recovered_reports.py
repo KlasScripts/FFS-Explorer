@@ -68,10 +68,15 @@ def test_recovered_report_is_declared_consistently(plat, script):
     for spec in m.recovered_records:
         assert spec['file_key'] in keys, spec['file_key']
         assert spec.get('fields'), spec['table']
-        assert set(spec.get('version_fields') or ()) <= set(spec['fields']), spec['table']
+        # 'decode' names the fields it adds in 'decoded_fields'; a
+        # version_field is a column or one of those
+        decoded = set(spec.get('decoded_fields') or ())
+        assert callable(spec.get('decode')) == bool(decoded), spec['table']
+        assert set(spec.get('version_fields') or ()) <= set(spec['fields']) | decoded, spec['table']
         assert set(spec.get('json_fields') or ()) <= set(spec['fields']), spec['table']
         assert set(spec.get('blob_files') or ()) <= set(spec['fields']), spec['table']
         names |= set(spec['fields'].values())
+        names |= decoded
         names |= set((spec.get('blob_files') or {}).values())
         names |= {lk['name'] for lk in spec.get('links') or ()}
     for f in getattr(m, 'timestamp_fields', {}) or {}:

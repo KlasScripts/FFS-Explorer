@@ -93,3 +93,60 @@ def run(paths):
             "raw_ui_path": ui_path,
         })
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'gboard_clipboard_deleted',
+  'name': 'Gboard Clipboard — Deleted & Changed Clips',
+  'description': "Deleted and changed clipboard records from Gboard's gboard_clipboard.db "
+                 '(table clips): text the user copied, with when. Gboard drops clips after a '
+                 'while and on request, so a deleted clip is copied text the phone no longer '
+                 'shows. Live clips are in Gboard Clipboard.\n'
+                 '\n'
+                 'Each row is one record as found in the clips table, never joined to another '
+                 'table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id. Values are as stored: no code is '
+                 'turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'Gboard writes this database with a rollback journal: records come from freed '
+                 'space and freed pages, and from the -journal file when one was extracted.\n'
+                 '\n'
+                 'timestamp is Unix milliseconds, as in Gboard Clipboard. _id is a time too '
+                 '(milliseconds, set by Gboard), so it is not reused the way a counter can be. '
+                 'item_type and entity_type are shown as stored; sensitive marks a clip '
+                 'Android flagged as sensitive (a password).\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman Android 14 and CTF25 Android 15 images: no deleted or changed clip (4 live on Josh Hickman and '
+                 'CTF25).',
+  'timestamp_fields': {'timestamp': 'ms'},
+  'core_fields': ['status',
+                  'timestamp',
+                  'text',
+                  'sensitive',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'clipboard_db',
+  'table': 'clips',
+  'label': 'Clip',
+  'fields': {'_id': 'clip_id',
+             'text': 'text',
+             'html_text': 'html_text',
+             'item_type': 'item_type',
+             'entity_type': 'entity_type',
+             'timestamp': 'timestamp',
+             'sensitive': 'sensitive',
+             'uri': 'uri',
+             'group_id': 'group_id'},
+  'version_fields': ['text', 'html_text', 'uri', 'item_type', 'sensitive'],
+  'links': []}]

@@ -162,3 +162,64 @@ def run(paths):
         row["inferred_site_seconds_before"] = seconds_before
 
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'chrome_autofill_deleted',
+  'name': 'Chrome Autofill — Deleted Entries',
+  'description': "Deleted autofill records from Chrome's Web Data (table autofill): a value "
+                 'typed into a web form field (name is the field, value what was typed), when '
+                 'first and last used and how often. A deleted record is a value cleared from '
+                 'Chrome or removed by it. Live entries are in Chrome Autofill.\n'
+                 '\n'
+                 'Each row is one record as found in the autofill table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'Chrome writes this database with a rollback journal, not a WAL: records come '
+                 'from freed space and freed pages, and from the -journal file when one was '
+                 'extracted.\n'
+                 '\n'
+                 'date_created and date_last_used are Unix seconds, as in Chrome Autofill.\n'
+                 '\n'
+                 "This table has no id column of its own: SQLite's row id is used, and SQLite "
+                 "gives a new row the highest row id + 1, so a deleted row's row id can be "
+                 'handed to a new one. A record is therefore tied to a live row by the columns '
+                 'Chrome keeps unique (name and value), not by its row id: a record with the '
+                 'same name and value as a live row is an earlier version of it ("tied to live '
+                 'row" in how_found). Only name and value matter here: an earlier version '
+                 'differing only in its use count or last-used time is counted in the run log, '
+                 'not listed.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman and CTF26 Android 14 and CTF25 '
+                 'Android 15 images: no deleted autofill record (4, 6 and 1 live).',
+  'timestamp_fields': {'date_created': 's', 'date_last_used': 's'},
+  'core_fields': ['status',
+                  'field_name',
+                  'value',
+                  'date_last_used',
+                  'count',
+                  'how_found',
+                  'copies'],
+  'file_key': 'web_data',
+  'table': 'autofill',
+  'label': 'Autofill entry',
+  'fields': {'name': 'field_name',
+             'value': 'value',
+             'date_created': 'date_created',
+             'date_last_used': 'date_last_used',
+             'count': 'count'},
+  'identity': ['name', 'value'],
+  'version_fields': ['name', 'value'],
+  'links': []}]

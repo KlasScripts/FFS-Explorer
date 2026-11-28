@@ -1226,6 +1226,13 @@ deleted_tables = [{'script': 'whatsapp_deleted',
                  'by pattern has no row id and cannot be linked; several copies of one record '
                  'can carry the same id.\n'
                  '\n'
+                 'linked_location: the location of a location message (message_location, '
+                 'whose row id is the message _id), live or in WhatsApp — Deleted & Changed '
+                 'Locations; "not found" is usual. linked_chat: the chat this message names '
+                 'in chat_row_id, live or in WhatsApp — Deleted & Changed Chats. Only ids '
+                 'are compared, as above; chat._id is AUTOINCREMENT too (checked '
+                 '2026-11-28).\n'
+                 '\n'
                  'Checked 2026-11-21 on the Josh Hickman Android 14 image: 0 records. Found '
                  'earlier, on the extraction the WhatsApp report was built against (carried '
                  'over from it): msgstore.db has PRAGMA secure_delete = FAST, which zeroes '
@@ -1238,6 +1245,8 @@ deleted_tables = [{'script': 'whatsapp_deleted',
                   'timestamp',
                   'message',
                   'linked_media',
+                  'linked_location',
+                  'linked_chat',
                   'changed_fields',
                   'message (now)',
                   'how_found',
@@ -1266,7 +1275,19 @@ deleted_tables = [{'script': 'whatsapp_deleted',
              'column': '_id',
              'table': 'message_media',
              'key': 'message_row_id',
-             'report': 'whatsapp_deleted_media'}]},
+             'report': 'whatsapp_deleted_media'},
+            {'name': 'linked_location',
+             'what': 'location',
+             'column': '_id',
+             'table': 'message_location',
+             'key': 'message_row_id',
+             'report': 'whatsapp_deleted_locations'},
+            {'name': 'linked_chat',
+             'what': 'chat',
+             'column': 'chat_row_id',
+             'table': 'chat',
+             'key': '_id',
+             'report': 'whatsapp_deleted_chats'}]},
  {'script': 'whatsapp_deleted_media',
   'name': 'WhatsApp — Deleted & Changed Media',
   'description': 'Deleted and changed WhatsApp media records from msgstore.db (table '
@@ -1397,4 +1418,236 @@ deleted_tables = [{'script': 'whatsapp_deleted',
              'column': 'message_row_id',
              'table': 'message_media',
              'key': 'message_row_id',
-             'report': 'whatsapp_deleted_media'}]}]
+             'report': 'whatsapp_deleted_media'}]},
+ {'script': 'whatsapp_deleted_calls',
+  'name': 'WhatsApp — Deleted & Changed Calls',
+  'description': 'Deleted and changed WhatsApp call records from msgstore.db (table call_log): '
+                 'who (jid_row_id, an id in the jid table), when, voice or video, the result '
+                 'and the duration. Live calls are in WhatsApp Messages, as a call event in '
+                 'the chat.\n'
+                 '\n'
+                 'Each row is one record as found in the call_log table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'timestamp is Unix milliseconds and duration whole seconds, as in WhatsApp '
+                 'Messages. call_result and video_call are shown as stored; WhatsApp Messages '
+                 'explains the codes (5 answered, 2 not answered, 4 not named by the app).\n'
+                 '\n'
+                 'linked_contact: where the jid row this call names was found, live or '
+                 'recovered (the jid table has no deleted report of its own; only its id is '
+                 'compared, the address itself is in WhatsApp Messages). linked_message: the '
+                 'call event message, through message_call_log (one row per call: '
+                 'message_row_id, call_log_row_id), looked up live and in the records WhatsApp '
+                 '— Deleted & Changed Messages finds. How the link can be wrong: call_log._id, '
+                 'jid._id and message._id are AUTOINCREMENT (checked 2026-11-28 on the Josh '
+                 'Hickman Android 14 and CTF25 Android 15 images), so SQLite does not hand out '
+                 'an id again, but an app that re-inserts rows with their old ids (a restore '
+                 'from backup) can still put a different record under the same id; an earlier '
+                 'version found in the WAL and a live row with the same id were stored at '
+                 'different times; a record found by pattern has no row id and cannot be '
+                 'linked; several copies of one record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman Android 14 and CTF25 Android 15 '
+                 'images: no deleted or changed call. Josh Hickman: sqlite_sequence says 4 '
+                 'call ids were handed out and 4 calls are live. CTF25: no call was ever '
+                 'recorded (no sqlite_sequence entry for call_log).',
+  'timestamp_fields': {'timestamp': 'ms'},
+  'core_fields': ['status',
+                  'timestamp',
+                  'from_me',
+                  'video_call',
+                  'call_result',
+                  'duration',
+                  'linked_contact',
+                  'linked_message',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'msgstore',
+  'table': 'call_log',
+  'label': 'Call',
+  'fields': {'_id': 'call_id',
+             'jid_row_id': 'jid_id',
+             'from_me': 'from_me',
+             'call_id': 'whatsapp_call_id',
+             'timestamp': 'timestamp',
+             'video_call': 'video_call',
+             'duration': 'duration',
+             'call_result': 'call_result',
+             'bytes_transferred': 'bytes_transferred',
+             'group_jid_row_id': 'group_jid_id',
+             'is_joinable_group_call': 'is_joinable_group_call',
+             'call_type': 'call_type'},
+  'version_fields': ['jid_row_id',
+                     'from_me',
+                     'timestamp',
+                     'video_call',
+                     'duration',
+                     'call_result',
+                     'group_jid_row_id'],
+  'links': [{'name': 'linked_contact',
+             'what': 'jid',
+             'column': 'jid_row_id',
+             'table': 'jid',
+             'key': '_id'},
+            {'name': 'linked_message',
+             'what': 'message',
+             'column': '_id',
+             'via': ['message_call_log', 'call_log_row_id', 'message_row_id'],
+             'table': 'message',
+             'key': '_id',
+             'report': 'whatsapp_deleted'}]},
+ {'script': 'whatsapp_deleted_locations',
+  'name': 'WhatsApp — Deleted & Changed Locations',
+  'description': 'Deleted and changed WhatsApp location records from msgstore.db (table '
+                 'message_location): the latitude and longitude of a shared or live location, '
+                 'with the place name and address when one was picked. Live locations are in '
+                 'WhatsApp Messages, with their message.\n'
+                 '\n'
+                 'Each row is one record as found in the message_location table, never joined '
+                 'to another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'live_location_final_timestamp is Unix milliseconds; '
+                 'live_location_share_duration is seconds, as in WhatsApp Messages.\n'
+                 '\n'
+                 "linked_message: the message this location belongs to. message_location's row "
+                 'id (message_row_id) is the _id of its message, so the two are compared, live '
+                 'and in the records WhatsApp — Deleted & Changed Messages finds. A message '
+                 'deleted with its location leaves both, so a recovered location may have its '
+                 'message recovered too, or not at all. How the link can be wrong: message._id '
+                 '(and so message_location.message_row_id) is AUTOINCREMENT (checked '
+                 '2026-11-28 on the Josh Hickman Android 14 and CTF25 Android 15 images), so '
+                 'SQLite does not hand out an id again, but an app that re-inserts rows with '
+                 'their old ids (a restore from backup) can still put a different record under '
+                 'the same id; an earlier version found in the WAL and a live row with the '
+                 'same id were stored at different times; a record found by pattern has no row '
+                 'id and cannot be linked; several copies of one record can carry the same '
+                 'id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman Android 14 and CTF25 Android 15 '
+                 'images: no deleted or changed location; 4 live on Josh Hickman, 0 on CTF25. '
+                 'Every live location names a live message.',
+  'timestamp_fields': {'live_location_final_timestamp': 'ms'},
+  'core_fields': ['status',
+                  'latitude',
+                  'longitude',
+                  'place_name',
+                  'place_address',
+                  'linked_message',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'msgstore',
+  'table': 'message_location',
+  'label': 'Location',
+  'fields': {'message_row_id': 'message_id',
+             'chat_row_id': 'chat_id',
+             'latitude': 'latitude',
+             'longitude': 'longitude',
+             'place_name': 'place_name',
+             'place_address': 'place_address',
+             'url': 'url',
+             'live_location_share_duration': 'live_location_share_duration',
+             'live_location_final_latitude': 'live_location_final_latitude',
+             'live_location_final_longitude': 'live_location_final_longitude',
+             'live_location_final_timestamp': 'live_location_final_timestamp'},
+  'version_fields': ['latitude',
+                     'longitude',
+                     'place_name',
+                     'place_address',
+                     'url',
+                     'live_location_final_latitude',
+                     'live_location_final_longitude'],
+  'links': [{'name': 'linked_message',
+             'what': 'message',
+             'column': 'message_row_id',
+             'table': 'message',
+             'key': '_id',
+             'report': 'whatsapp_deleted'}]},
+ {'script': 'whatsapp_deleted_chats',
+  'name': 'WhatsApp — Deleted & Changed Chats',
+  'description': 'Deleted and changed WhatsApp chat records from msgstore.db (table chat): who '
+                 'the chat is with (jid_row_id), the group subject, when it was created, '
+                 'archived or hidden. A changed subject is a group renamed; a deleted chat is '
+                 'a conversation that existed. Live chats are in WhatsApp Messages, as the '
+                 'chat of each message.\n'
+                 '\n'
+                 'Each row is one record as found in the chat table, never joined to another '
+                 'table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id. Values are as stored: no code is '
+                 'turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'created_timestamp and sort_timestamp are Unix milliseconds, as in WhatsApp '
+                 'Messages.\n'
+                 '\n'
+                 'linked_contact: where the jid row this chat names was found, live or '
+                 'recovered (ids only, as in WhatsApp — Deleted & Changed Calls). A message '
+                 'names its chat in chat_row_id, so the link from a message to its chat is on '
+                 'the message report (linked_chat). How the link can be wrong: chat._id and '
+                 'jid._id are AUTOINCREMENT (checked 2026-11-28 on the Josh Hickman Android 14 '
+                 'and CTF25 Android 15 images), so SQLite does not hand out an id again, but '
+                 'an app that re-inserts rows with their old ids (a restore from backup) can '
+                 'still put a different record under the same id; an earlier version found in '
+                 'the WAL and a live row with the same id were stored at different times; a '
+                 'record found by pattern has no row id and cannot be linked; several copies '
+                 'of one record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman Android 14 and CTF25 Android 15 '
+                 'images: 2 earlier versions of 2 chats on CTF25, differing only in which '
+                 'message was last and the unseen count, so none is listed (counted in the run '
+                 'log); no deleted chat. sqlite_sequence says 68 and 19 chat ids were handed '
+                 'out, the number live: none was deleted.',
+  'timestamp_fields': {'created_timestamp': 'ms', 'sort_timestamp': 'ms'},
+  'core_fields': ['status',
+                  'created_timestamp',
+                  'subject',
+                  'linked_contact',
+                  'archived',
+                  'hidden',
+                  'changed_fields',
+                  'subject (now)',
+                  'how_found',
+                  'copies'],
+  'file_key': 'msgstore',
+  'table': 'chat',
+  'label': 'Chat',
+  'fields': {'_id': 'chat_id',
+             'jid_row_id': 'jid_id',
+             'subject': 'subject',
+             'created_timestamp': 'created_timestamp',
+             'sort_timestamp': 'sort_timestamp',
+             'archived': 'archived',
+             'hidden': 'hidden',
+             'group_type': 'group_type',
+             'last_message_row_id': 'last_message_id',
+             'ephemeral_expiration': 'ephemeral_expiration',
+             'chat_lock': 'chat_lock'},
+  'version_fields': ['jid_row_id',
+                     'subject',
+                     'created_timestamp',
+                     'archived',
+                     'hidden',
+                     'group_type',
+                     'ephemeral_expiration',
+                     'chat_lock'],
+  'links': [{'name': 'linked_contact',
+             'what': 'jid',
+             'column': 'jid_row_id',
+             'table': 'jid',
+             'key': '_id'}]}]

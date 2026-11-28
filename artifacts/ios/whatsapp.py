@@ -402,6 +402,9 @@ deleted_tables = [{'script': 'whatsapp_deleted',
                  'pattern has no row id and cannot be linked to; several copies of one record '
                  'can carry the same id.\n'
                  '\n'
+                 'linked_chat: the chat this message names in ZCHATSESSION, live or in '
+                 'WhatsApp — Deleted & Changed Chats (iOS). Only ids are compared, as above.\n'
+                 '\n'
                  'Checked 2026-11-21 on the Josh Hickman iOS 17 image: 0 records. Found '
                  'earlier (carried over from WhatsApp Messages (iOS)): ChatStorage.sqlite has '
                  'PRAGMA secure_delete = FAST; carving found nothing for a documented deleted '
@@ -412,6 +415,7 @@ deleted_tables = [{'script': 'whatsapp_deleted',
                   'message_date',
                   'message',
                   'linked_media',
+                  'linked_chat',
                   'changed_fields',
                   'message (now)',
                   'how_found',
@@ -446,7 +450,13 @@ deleted_tables = [{'script': 'whatsapp_deleted',
              'column': 'ZMEDIAITEM',
              'table': 'ZWAMEDIAITEM',
              'key': 'Z_PK',
-             'report': 'whatsapp_deleted_media'}]},
+             'report': 'whatsapp_deleted_media'},
+            {'name': 'linked_chat',
+             'what': 'chat',
+             'column': 'ZCHATSESSION',
+             'table': 'ZWACHATSESSION',
+             'key': 'Z_PK',
+             'report': 'whatsapp_deleted_chats'}]},
  {'script': 'whatsapp_deleted_media',
   'name': 'WhatsApp — Deleted & Changed Media (iOS)',
   'description': 'Deleted and changed WhatsApp media records from ChatStorage.sqlite (table '
@@ -518,6 +528,89 @@ deleted_tables = [{'script': 'whatsapp_deleted',
   'links': [{'name': 'linked_message',
              'what': 'message',
              'column': 'ZMESSAGE',
+             'table': 'ZWAMESSAGE',
+             'key': 'Z_PK',
+             'report': 'whatsapp_deleted'}]},
+ {'script': 'whatsapp_deleted_chats',
+  'name': 'WhatsApp — Deleted & Changed Chats (iOS)',
+  'description': 'Deleted and changed WhatsApp chat records from ChatStorage.sqlite (table '
+                 'ZWACHATSESSION): who the chat is with (ZCONTACTJID), the name WhatsApp '
+                 "showed (ZPARTNERNAME, a group subject for a group), the last message's text "
+                 'and date, and how many messages were ever numbered in it (ZMESSAGECOUNTER). '
+                 'A deleted chat is a conversation that existed; an earlier ZLASTMESSAGETEXT '
+                 'can be the text of a message since removed. Live chats are in WhatsApp '
+                 'Messages (iOS), as the chat of each message.\n'
+                 '\n'
+                 'Each row is one record as found in the ZWACHATSESSION table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'Dates are Cocoa seconds, as in WhatsApp Messages (iOS). ZREMOVED and '
+                 'ZSESSIONTYPE are shown as stored.\n'
+                 '\n'
+                 'linked_last_message: where the message ZLASTMESSAGE names was found, live or '
+                 'in the records WhatsApp — Deleted & Changed Messages (iOS) finds. A message '
+                 'names its chat in ZCHATSESSION, so the link from a message to its chat is on '
+                 'the message report (linked_chat). How the link can be wrong: '
+                 'ZWACHATSESSION.Z_PK and ZWAMESSAGE.Z_PK are each a Core Data Z_PK (checked '
+                 '2026-11-28 on the Josh Hickman iOS 17 image): Core Data takes the next id '
+                 'from Z_PRIMARYKEY.Z_MAX and does not hand one out again, but a store rebuilt '
+                 'from a backup or a migration can renumber; an earlier version found in the '
+                 'WAL and a live row with the same id were stored at different times; a record '
+                 'found by pattern has no row id and cannot be linked; several copies of one '
+                 'record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman iOS 17 image: no deleted or changed '
+                 'chat record found. Z_PRIMARYKEY says 9 chat ids were handed out and 8 chats '
+                 'are live: one chat was deleted, and nothing of it is left in the file '
+                 '(ChatStorage.sqlite zeroes freed bytes, see WhatsApp — Deleted & Changed '
+                 'Messages (iOS)).',
+  'timestamp_fields': {'ZLASTMESSAGEDATE': 'cocoa_s', 'ZLOCATIONSHARINGENDDATE': 'cocoa_s'},
+  'core_fields': ['status',
+                  'ZLASTMESSAGEDATE',
+                  'ZPARTNERNAME',
+                  'ZCONTACTJID',
+                  'ZLASTMESSAGETEXT',
+                  'linked_last_message',
+                  'changed_fields',
+                  'ZLASTMESSAGETEXT (now)',
+                  'how_found',
+                  'copies'],
+  'file_key': 'chatstorage',
+  'table': 'ZWACHATSESSION',
+  'label': 'Chat',
+  'fields': {'Z_PK': 'chat_id',
+             'ZCONTACTJID': 'ZCONTACTJID',
+             'ZPARTNERNAME': 'ZPARTNERNAME',
+             'ZLASTMESSAGETEXT': 'ZLASTMESSAGETEXT',
+             'ZLASTMESSAGEDATE': 'ZLASTMESSAGEDATE',
+             'ZLASTMESSAGE': 'last_message_id',
+             'ZMESSAGECOUNTER': 'ZMESSAGECOUNTER',
+             'ZSESSIONTYPE': 'ZSESSIONTYPE',
+             'ZARCHIVED': 'ZARCHIVED',
+             'ZHIDDEN': 'ZHIDDEN',
+             'ZREMOVED': 'ZREMOVED',
+             'ZUNREADCOUNT': 'ZUNREADCOUNT',
+             'ZGROUPINFO': 'group_info_id',
+             'ZCONTACTIDENTIFIER': 'ZCONTACTIDENTIFIER',
+             'ZSAVEDINPUT': 'ZSAVEDINPUT',
+             'ZLOCATIONSHARINGENDDATE': 'ZLOCATIONSHARINGENDDATE'},
+  'version_fields': ['ZCONTACTJID',
+                     'ZPARTNERNAME',
+                     'ZLASTMESSAGETEXT',
+                     'ZSESSIONTYPE',
+                     'ZARCHIVED',
+                     'ZHIDDEN',
+                     'ZREMOVED',
+                     'ZSAVEDINPUT'],
+  'links': [{'name': 'linked_last_message',
+             'what': 'message',
+             'column': 'ZLASTMESSAGE',
              'table': 'ZWAMESSAGE',
              'key': 'Z_PK',
              'report': 'whatsapp_deleted'}]}]

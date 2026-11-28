@@ -112,3 +112,70 @@ def run(paths):
             "raw_url_id": url_id,
         })
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'chrome_search_deleted',
+  'name': 'Chrome Search — Deleted & Changed Search Terms',
+  'description': "Deleted and changed search-term records from Chrome's History (table "
+                 'keyword_search_terms): the text typed into the address bar as a search '
+                 '(term), the search engine (keyword_id) and the History url row of the '
+                 'results page (url_id). A deleted record is a search cleared from history. '
+                 'Live search terms are in Chrome Search.\n'
+                 '\n'
+                 'Each row is one record as found in the keyword_search_terms table, never '
+                 'joined to another table (ASSUMPTIONS.md A-95): ids are the stored ids. '
+                 'Status says Deleted (no longer in the table), Changed (an earlier version of '
+                 'a row still there, listed only when one of the columns that matter changed, '
+                 'with the current value beside it as "(now)") or an unfinished write/delete '
+                 'under a hot journal. How found says how each record was recovered and how '
+                 'sure that is; a record found by pattern has no row id. Values are as stored: '
+                 'no code is turned into a word here unless it was checked against a test '
+                 'image.\n'
+                 '\n'
+                 'Chrome writes this database with a rollback journal, not a WAL: records come '
+                 'from freed space and freed pages, and from the -journal file when one was '
+                 'extracted.\n'
+                 '\n'
+                 "This table has no id column of its own: SQLite's row id is used, and SQLite "
+                 "gives a new row the highest row id + 1, so a deleted row's row id can be "
+                 'handed to a new one. A record is therefore tied to a live row by the columns '
+                 'Chrome keeps unique (url_id and keyword_id together), not by its row id: a '
+                 'record with the same url_id and keyword_id as a live row is an earlier '
+                 'version of it ("tied to live row" in how_found).\n'
+                 '\n'
+                 'linked_url: where the urls row this record names (url_id) was found, live or '
+                 'in Chrome — Deleted & Changed URLs; its last visit time and the results page '
+                 'are there. Only ids are compared. How the link can be wrong: urls.id is '
+                 'AUTOINCREMENT (checked 2026-11-27 on the three Android images), so SQLite '
+                 'does not hand out an id again, but an app that re-inserts rows with their '
+                 'old ids (a restore from backup) can still put a different record under the '
+                 'same id; an earlier version found in the WAL and a live row with the same id '
+                 'were stored at different times; a record found by pattern has no row id and '
+                 'cannot be linked; several copies of one record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman and CTF26 Android 14 and CTF25 '
+                 'Android 15 images: no deleted or changed search term (2, 16 and 3 live).',
+  'timestamp_fields': {},
+  'core_fields': ['status', 'term', 'linked_url', 'changed_fields', 'how_found', 'copies'],
+  'file_key': 'history',
+  'table': 'keyword_search_terms',
+  'label': 'Search term',
+  'fields': {'keyword_id': 'keyword_id',
+             'url_id': 'url_id',
+             'term': 'term',
+             'normalized_term': 'normalized_term'},
+  'identity': ['url_id', 'keyword_id'],
+  'version_fields': ['term', 'normalized_term'],
+  'links': [{'name': 'linked_url',
+             'what': 'url',
+             'column': 'url_id',
+             'table': 'urls',
+             'key': 'id',
+             'report': 'chrome_deleted_history_urls'}]}]

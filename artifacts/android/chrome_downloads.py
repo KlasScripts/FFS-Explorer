@@ -171,3 +171,98 @@ def _download_link(paths, target_path):
     from artifact_runner import archive_has, device_path_to_ui_path
     ui = device_path_to_ui_path(target_path)
     return ui if archive_has(paths, ui) else ""
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'chrome_downloads_deleted',
+  'name': 'Chrome Downloads — Deleted & Changed Downloads',
+  'description': "Deleted and changed download records from Chrome's History (table "
+                 'downloads): the file saved (target_path), the page it came from (tab_url, '
+                 'referrer), when, how much and whether it finished. A deleted record is a '
+                 "download removed from Chrome's list. Live downloads are in Chrome Downloads; "
+                 'the URL each download was fetched from is in downloads_url_chains.\n'
+                 '\n'
+                 'Each row is one record as found in the downloads table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'Chrome writes this database with a rollback journal, not a WAL: records come '
+                 'from freed space and freed pages, and from the -journal file when one was '
+                 'extracted.\n'
+                 '\n'
+                 'start_time, end_time and last_access_time are WebKit microseconds, as in '
+                 'Chrome Downloads. state, danger_type and interrupt_reason are shown as '
+                 'stored (Chrome Downloads explains the codes).\n'
+                 '\n'
+                 'id is a plain INTEGER PRIMARY KEY: SQLite gives a new row the highest id + '
+                 "1, so a deleted download's id can be handed to a new one. guid is unique per "
+                 'download, so a record with the guid of a live download is an earlier version '
+                 'of it ("tied to live row" in how_found).\n'
+                 '\n'
+                 'linked_url_chain: where the downloads_url_chains rows of this download (id) '
+                 'were found, live or recovered (that table has no deleted report of its own; '
+                 'only ids are compared; the id can have been reused, as above).\n'
+                 '\n'
+                 'Checked 2026-11-28 on the Josh Hickman and CTF26 Android 14 and CTF25 '
+                 'Android 15 images: no download records, live or deleted, on any of the '
+                 'three. Value in principle; nothing to check it against yet.',
+  'timestamp_fields': {'start_time': 'webkit_us',
+                       'end_time': 'webkit_us',
+                       'last_access_time': 'webkit_us'},
+  'core_fields': ['status',
+                  'start_time',
+                  'target_path',
+                  'tab_url',
+                  'state',
+                  'linked_url_chain',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'history',
+  'table': 'downloads',
+  'label': 'Download',
+  'fields': {'id': 'download_id',
+             'guid': 'guid',
+             'target_path': 'target_path',
+             'current_path': 'current_path',
+             'start_time': 'start_time',
+             'end_time': 'end_time',
+             'received_bytes': 'received_bytes',
+             'total_bytes': 'total_bytes',
+             'state': 'state',
+             'danger_type': 'danger_type',
+             'interrupt_reason': 'interrupt_reason',
+             'opened': 'opened',
+             'last_access_time': 'last_access_time',
+             'referrer': 'referrer',
+             'site_url': 'site_url',
+             'tab_url': 'tab_url',
+             'tab_referrer_url': 'tab_referrer_url',
+             'mime_type': 'mime_type',
+             'original_mime_type': 'original_mime_type'},
+  'identity': ['guid'],
+  'version_fields': ['guid',
+                     'target_path',
+                     'current_path',
+                     'state',
+                     'tab_url',
+                     'referrer',
+                     'site_url',
+                     'total_bytes',
+                     'opened'],
+  'links': [{'name': 'linked_url_chain',
+             'what': 'url chain',
+             'column': 'id',
+             'table': 'downloads_url_chains',
+             'key': 'id'}]}]

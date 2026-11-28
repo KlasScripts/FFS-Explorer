@@ -102,7 +102,8 @@ def _hash_source(path: str) -> str | None:
     return hashlib.blake2b(data, digest_size=8).hexdigest()
 
 
-def check_version(platform: str, script_name: str, source_path: str) -> None:
+def check_version(platform: str, script_name: str, source_path: str,
+                  data: bytes | None = None) -> None:
     """Called once per (platform, script_name) per process — see
     artifact_runner.load_artifacts(), the only real call site, which
     already has *source_path* on hand for every script it imports. A
@@ -112,7 +113,11 @@ def check_version(platform: str, script_name: str, source_path: str) -> None:
     if key in _checked_this_session:
         return
     _checked_this_session.add(key)
-    current_hash = _hash_source(source_path)
+    # *data*: what the version follows instead of a file's bytes (a
+    # deleted-records report declared in its main report's deleted_tables:
+    # its own entry, artifact_runner._deleted_table_module)
+    current_hash = (hashlib.blake2b(data, digest_size=8).hexdigest() if data is not None
+                    else _hash_source(source_path))
     if current_hash is None:
         return
     parsers = _load()

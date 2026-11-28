@@ -149,3 +149,122 @@ def run(paths):
             "source_table": "DbMessage",
         })
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'burner_deleted_dbmessage',
+  'name': 'Burner — Deleted & Changed Messages (DbMessage)',
+  'description': 'Deleted and changed Burner messages from com.adhoclabs.burner.messages.db '
+                 "(table DbMessage, Burner's primary message store, shown live in the "
+                 '"Burner" report). Deleted and changed records of the other store, '
+                 'burnerDatabase.db (MessageEntity), are in Burner — Deleted & Changed '
+                 'Messages (MessageEntity).\n'
+                 '\n'
+                 'Each row is one record as found in this table, never joined to another table '
+                 '(ASSUMPTIONS.md A-95). Status says Deleted, Changed (an earlier version of a '
+                 'row still there, listed only when one of the columns that matter changed, '
+                 'the current value beside it as "(now)") or an unfinished write/delete. How '
+                 'found says how each record was recovered and how sure that is; damaged says '
+                 'why a record is not whole.\n'
+                 '\n'
+                 'The other Burner store keeps the same messages under the same text id '
+                 '(checked 2026-11-27 on the Josh Hickman Android 14 image: the one '
+                 'MessageEntity id is also a DbMessage id). The two are separate databases, so '
+                 'no link column is made: compare message_id with the other report by hand.\n'
+                 '\n'
+                 'What was found before (2026-11-21; carried over): on the extraction this was '
+                 'built against, DbMessage had nothing recoverable (no WAL, and carving its '
+                 'live pages found nothing).\n'
+                 '\n'
+                 'dateCreated is Unix milliseconds, as in the Burner report.',
+  'core_fields': ['status',
+                  'dateCreated',
+                  'message',
+                  'direction',
+                  'changed_fields',
+                  'message (now)',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'timestamp_fields': {'dateCreated': 'ms'},
+  'file_key': 'messages',
+  'table': 'DbMessage',
+  'label': 'Message (DbMessage)',
+  'fields': {'id': 'message_id',
+             'burnerId': 'burner_id',
+             'contactId': 'contact_id',
+             'dateCreated': 'dateCreated',
+             'direction': 'direction',
+             'type': 'type',
+             'state': 'state',
+             'isRead': 'isRead',
+             'mediaUrl': 'media_url',
+             'text': 'message'},
+  'version_fields': ['text', 'direction', 'type', 'mediaUrl', 'contactId']},
+ {'script': 'burner_messageentity',
+  'name': 'Burner — Deleted & Changed Messages (MessageEntity)',
+  'description': 'Deleted and changed Burner records from burnerDatabase.db (table '
+                 'MessageEntity, a separate store that keeps each message as one JSON object '
+                 'in its value column, shown here split into value.<key> fields). Deleted and '
+                 'changed records of the primary store (DbMessage) are in Burner — Deleted & '
+                 'Changed Messages (DbMessage).\n'
+                 '\n'
+                 'Each row is one record as found in this table, never joined to another table '
+                 '(ASSUMPTIONS.md A-95). Status says Deleted, Changed (an earlier version of a '
+                 'row still there, listed only when one of the columns that matter changed, '
+                 'the current value beside it as "(now)") or an unfinished write/delete. How '
+                 'found says how each record was recovered and how sure that is; damaged says '
+                 'why a record is not whole.\n'
+                 '\n'
+                 'The other Burner store keeps the same messages under the same text id '
+                 '(checked 2026-11-27 on the Josh Hickman Android 14 image: the one '
+                 'MessageEntity id is also a DbMessage id). The two are separate databases, so '
+                 'no link column is made: compare message_id with the other report by hand.\n'
+                 '\n'
+                 'Burner rewrites a message here by delete + insert under a new row id, so '
+                 'most "Deleted" records are earlier copies of a message that is still there, '
+                 'not deletions: identical copies are one row with their number in copies '
+                 '(A-95; on the Josh Hickman Android 14 image 99 rows for 17 messages, 18 once '
+                 'collapsed, the 18th a real change, the read flag). A record whose message id '
+                 'is still live is a rewrite.\n'
+                 '\n'
+                 'What was found before (2026-11-21; carried over): on the extraction this was '
+                 'built against, MessageEntity kept, via WAL history, a message the primary '
+                 'store had already lost entirely. The same message captured at two points of '
+                 'the WAL history is kept as two rows: a field changing between captures (a '
+                 "read flag) is real signal. KNOWN ISSUE: MessageEntity's own direction is "
+                 'unreliable for Text messages. Cross-checked against DbMessage.direction '
+                 '(validated against ground truth) for every message in both databases: right '
+                 'on all 3 Voice/Call rows, wrong on all 6 confirmed-Incoming Text rows '
+                 '(always "Outbound"). Each row says so in value_caveat; do not treat its '
+                 'direction as fact without corroboration.\n'
+                 '\n'
+                 'value.dateCreated is Unix milliseconds, as in the Burner report.',
+  'core_fields': ['status',
+                  'value.dateCreated',
+                  'value.text',
+                  'value.direction',
+                  'value_caveat',
+                  'changed_fields',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'timestamp_fields': {'value.dateCreated': 'ms'},
+  'file_key': 'main',
+  'table': 'MessageEntity',
+  'label': 'Message (MessageEntity)',
+  'fields': {'id': 'message_id',
+             'burnerId': 'burner_id',
+             'contactId': 'contact_id',
+             'value': 'value'},
+  'version_fields': ['value'],
+  'json_fields': ['value'],
+  'field_notes': {'value': 'This row\'s "direction" is unreliable for Text messages — '
+                           'confirmed by cross-checking against the other database. Do not '
+                           'depend on it.'}}]

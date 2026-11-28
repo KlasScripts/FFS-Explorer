@@ -192,3 +192,218 @@ def run(paths):
             "source_table": "ZMESSAGE",
         })
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'line_deleted_messages',
+  'name': 'LINE — Deleted & Changed Messages (iOS)',
+  'description': 'LINE messages that were deleted, or changed after they were stored, '
+                 'recovered from Line.sqlite (iOS, table ZMESSAGE): rows removed from the '
+                 'message table (from the WAL, free space, freed pages), the unfinished write '
+                 'under a hot journal, and earlier versions of messages that are still there, '
+                 'listed only when the text, kind, sender, chat or location changed (the '
+                 'current value beside it, as "(now)"). Earlier versions of a chat\'s '
+                 'last-message preview are in LINE — Deleted & Changed Chat Previews (iOS); '
+                 'contacts in LINE — Deleted & Changed Contacts (iOS).\n'
+                 '\n'
+                 'Each row is the record as found in this one table, never joined '
+                 '(ASSUMPTIONS.md A-95): ids are the stored ids. How found says how each '
+                 'record was recovered and how sure that is; a record found by pattern has no '
+                 'row id; damaged says why a record is not whole. Live messages and calls are '
+                 'in LINE Messages (iOS).\n'
+                 '\n'
+                 'Direction (Outgoing / Incoming, as in the Android LINE report) comes from '
+                 'the sender column being empty for messages this phone sent, checked against '
+                 'documented actions on a test image; so are the content-type words. See the '
+                 'notes page.\n'
+                 '\n'
+                 "linked_sender and linked_chat: where the ZUSER row this message's ZSENDER "
+                 'names, and the ZCHAT row its ZCHAT names, were found: in the table now '
+                 '(live), in the records the contacts and chat-preview reports find '
+                 '(recovered, with its row id) or not found. ZSENDER is empty for a message '
+                 'this phone sent (no ZUSER row exists for the local user). Checked 2026-11-27 '
+                 "on the Josh Hickman iOS 17 image: every live message's ZSENDER is a ZUSER "
+                 'Z_PK (34 of 34) and its ZCHAT a ZCHAT Z_PK (62 of 62).\n'
+                 'Only ids are compared: no value of the other row is brought in. How a link '
+                 "can be wrong: Z_PK comes from Core Data's own counter (Z_PRIMARYKEY.Z_MAX; "
+                 'checked 2026-11-27 on the Josh Hickman iOS 17 image: the highest Z_PK of '
+                 'ZMESSAGE, ZCHAT and ZUSER is its Z_MAX), so an id is not normally handed out '
+                 'again, but a store rebuilt from a backup or a migration can put a different '
+                 'record under an old id; an earlier version found in the WAL and a live row '
+                 'with the same id were stored at different times; a record found by pattern '
+                 'has no row id and cannot be linked to.\n'
+                 '\n',
+  'category': 'Chats & Messaging',
+  'core_fields': ['status',
+                  'timestamp',
+                  'direction',
+                  'message',
+                  'changed_fields',
+                  'message (now)',
+                  'content_type',
+                  'linked_sender',
+                  'linked_chat',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'hidden_fields': ['recovered',
+                    'recovery_method',
+                    'recovery_version',
+                    'source_table',
+                    'source_file_key',
+                    'raw_rowid',
+                    'raw_page',
+                    'raw_file',
+                    'raw_offset',
+                    'raw_length',
+                    'source',
+                    'copy_locations'],
+  'timestamp_fields': {'timestamp': 'ms'},
+  'file_key': 'line',
+  'table': 'ZMESSAGE',
+  'label': 'Message',
+  'fields': {'ZTIMESTAMP': 'timestamp',
+             'ZTEXT': 'message',
+             'ZCONTENTTYPE': 'content_type',
+             'ZLATITUDE': 'latitude',
+             'ZLONGITUDE': 'longitude',
+             'ZCHAT': 'chat_id',
+             'ZSENDER': 'sender_id',
+             'ZID': 'line_message_id'},
+  'version_fields': ['ZTEXT', 'ZCONTENTTYPE', 'ZSENDER', 'ZCHAT', 'ZLATITUDE', 'ZLONGITUDE'],
+  'labels': {'ZCONTENTTYPE': {0: 'text', 1: 'picture', 100: 'location'}},
+  'derived': {'direction': {'from': 'ZSENDER',
+                            'values': {None: 'Outgoing'},
+                            'else': 'Incoming'}},
+  'links': [{'name': 'linked_sender',
+             'what': 'contact',
+             'column': 'ZSENDER',
+             'table': 'ZUSER',
+             'key': 'Z_PK',
+             'report': 'line_deleted_users'},
+            {'name': 'linked_chat',
+             'what': 'chat',
+             'column': 'ZCHAT',
+             'table': 'ZCHAT',
+             'key': 'Z_PK',
+             'report': 'line_deleted_chats'}]},
+ {'script': 'line_deleted_chats',
+  'name': 'LINE — Deleted & Changed Chat Previews (iOS)',
+  'description': "Earlier versions of a LINE chat's last-message preview, and deleted chats, "
+                 'from Line.sqlite (iOS, table ZCHAT). A preview is listed only when its text '
+                 'is in no message, live or recovered (a comparison of values, not a join: the '
+                 'messages LINE — Deleted & Changed Messages (iOS) finds count); the others '
+                 'are counted in the run log. Most are app-generated (call durations, '
+                 'locations, official accounts), but one can be the only trace of a deleted '
+                 'message. It is a preview, not a message row: it has no time, sender or '
+                 'direction.\n'
+                 '\n'
+                 'Each row is the record as found in this one table, never joined '
+                 '(ASSUMPTIONS.md A-95): ids are the stored ids. How found says how each '
+                 'record was recovered and how sure that is; a record found by pattern has no '
+                 'row id; damaged says why a record is not whole. Live messages and calls are '
+                 'in LINE Messages (iOS).\n'
+                 '\n',
+  'category': 'Chats & Messaging',
+  'core_fields': ['status',
+                  'message',
+                  'chat_mid',
+                  'changed_fields',
+                  'message (now)',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'hidden_fields': ['recovered',
+                    'recovery_method',
+                    'recovery_version',
+                    'source_table',
+                    'source_file_key',
+                    'raw_rowid',
+                    'raw_page',
+                    'raw_file',
+                    'raw_offset',
+                    'raw_length',
+                    'source',
+                    'copy_locations'],
+  'file_key': 'line',
+  'table': 'ZCHAT',
+  'label': 'Chat preview (not a message row)',
+  'fields': {'ZLASTMESSAGE': 'message', 'ZMID': 'chat_mid'},
+  'version_fields': ['ZLASTMESSAGE'],
+  'not_found_in': {'ZLASTMESSAGE': ['ZMESSAGE', 'ZTEXT']}},
+ {'script': 'line_deleted_users',
+  'name': 'LINE — Deleted & Changed Contacts (iOS)',
+  'description': 'Deleted LINE contacts, and earlier versions of contacts that are still '
+                 'there, from Line.sqlite (iOS, table ZUSER): who a sender id was, a name or '
+                 'status message as it was before it changed, a contact marked removed. Listed '
+                 'when the name, the name the user gave the contact, the address-book name, '
+                 'the status message or the removed flag changed. The local user has no ZUSER '
+                 'row.\n'
+                 '\n'
+                 'Each row is the record as found in this one table, never joined '
+                 '(ASSUMPTIONS.md A-95): ids are the stored ids. How found says how each '
+                 'record was recovered and how sure that is; a record found by pattern has no '
+                 'row id; damaged says why a record is not whole. Live messages and calls are '
+                 'in LINE Messages (iOS).\n'
+                 '\n'
+                 "user_id is the Z_PK a message's ZSENDER holds (see LINE — Deleted & Changed "
+                 'Messages (iOS), linked_sender). created_time and status_updated_at are shown '
+                 'as stored: their unit was not checked against a test image.\n'
+                 '\n'
+                 'Only ids are compared: no value of the other row is brought in. How a link '
+                 "can be wrong: Z_PK comes from Core Data's own counter (Z_PRIMARYKEY.Z_MAX; "
+                 'checked 2026-11-27 on the Josh Hickman iOS 17 image: the highest Z_PK of '
+                 'ZMESSAGE, ZCHAT and ZUSER is its Z_MAX), so an id is not normally handed out '
+                 'again, but a store rebuilt from a backup or a migration can put a different '
+                 'record under an old id; an earlier version found in the WAL and a live row '
+                 'with the same id were stored at different times; a record found by pattern '
+                 'has no row id and cannot be linked to.\n'
+                 '\n',
+  'category': 'Chats & Messaging',
+  'core_fields': ['status',
+                  'user_id',
+                  'name',
+                  'custom_name',
+                  'address_book_name',
+                  'status_message',
+                  'changed_fields',
+                  'name (now)',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'hidden_fields': ['recovered',
+                    'recovery_method',
+                    'recovery_version',
+                    'source_table',
+                    'source_file_key',
+                    'raw_rowid',
+                    'raw_page',
+                    'raw_file',
+                    'raw_offset',
+                    'raw_length',
+                    'source',
+                    'copy_locations'],
+  'file_key': 'line',
+  'table': 'ZUSER',
+  'label': 'Contact',
+  'fields': {'Z_PK': 'user_id',
+             'ZMID': 'mid',
+             'ZNAME': 'name',
+             'ZCUSTOMNAME': 'custom_name',
+             'ZADDRESSBOOKNAME': 'address_book_name',
+             'ZSTATUSMESSAGE': 'status_message',
+             'ZISREMOVED': 'is_removed',
+             'ZISFRIEND': 'is_friend',
+             'ZCREATEDTIME': 'created_time',
+             'ZSTATUSUPDATEDAT': 'status_updated_at'},
+  'version_fields': ['ZNAME',
+                     'ZCUSTOMNAME',
+                     'ZADDRESSBOOKNAME',
+                     'ZSTATUSMESSAGE',
+                     'ZISREMOVED']}]

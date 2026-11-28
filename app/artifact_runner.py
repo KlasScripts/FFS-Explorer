@@ -1183,6 +1183,21 @@ def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[
         except Exception as exc:
             errors.append((fname, f"{type(exc).__name__}: {exc}"))
             print(f"[artifact_runner] Could not load {fname}: {exc}")
+    # A main report's deleted_tables (A-95, 2026-11-27): one deleted-records
+    # report per entry, made here, listed right after the main report.
+    for script_name, mod in list(modules):
+        if not getattr(mod, 'deleted_tables', None):
+            continue
+        at = modules.index((script_name, mod)) + 1
+        taken = {sn for sn, _m in modules}
+        for entry in mod.deleted_tables:
+            made, problem = _deleted_table_module(platform, script_name, mod, entry, taken)
+            if problem:
+                errors.append((f"{script_name}.py", problem))
+                continue
+            modules.insert(at, (made.__name__, made))
+            taken.add(made.__name__)
+            at += 1
     by_name = dict(modules)
     for script_name, mod in list(modules):
         if getattr(mod, 'deleted_of', None):
@@ -1200,6 +1215,62 @@ def load_artifacts(platform: str) -> tuple[list[tuple[str, object]], list[tuple[
                     errors.append((f"{script_name}.py", f"links names '{link['report']}', "
                                    "which is not a report on this platform"))
     return modules, errors
+
+
+# What a deleted_tables entry sets on its report rather than on its table
+# spec (everything else is the recovered_records spec, documented below).
+_DELETED_TABLE_MODULE_KEYS = ('name', 'description', 'warning', 'core_fields', 'hidden_fields',
+                              'files', 'optional_files',
+                              'timestamp_fields', 'timeline_fields', 'timeline_skip',
+                              'media_fields', 'link_fields', 'category', 'app_group_label')
+
+# Columns of every deleted-records report kept out of the default view.
+DELETED_HIDDEN_FIELDS = ['record', 'recovered', 'recovery_method', 'recovery_version',
+                         'source_table', 'source_file_key', 'raw_rowid', 'raw_page', 'raw_file',
+                         'raw_offset', 'raw_length', 'source', 'table_certain', 'copy_locations']
+
+
+def _deleted_table_module(platform: str, main_script: str, main, entry: dict, taken: set):
+    """(module, None) for one entry of a main report's deleted_tables, or
+    (None, what is wrong). The module is a report_type "recovered_records"
+    report named entry['script'], deleted_of the main report; its version is
+    tracked on the entry itself (parser_versions), so a change to the main
+    report's query does not change it."""
+    import types
+    script = entry.get('script')
+    if not script or not isinstance(script, str):
+        return None, "a deleted_tables entry has no 'script' name"
+    if script in taken:
+        return None, f"deleted_tables names '{script}', which is already a report"
+    missing = [k for k in ('name', 'description', 'file_key', 'table', 'fields') if k not in entry]
+    if missing:
+        return None, f"deleted_tables entry '{script}' has no {', '.join(missing)}"
+    m = types.ModuleType(script)
+    m.__file__ = getattr(main, '__file__', None)
+    for key in _DELETED_TABLE_MODULE_KEYS:
+        if key in entry:
+            setattr(m, key, entry[key])
+    spec = {k: v for k, v in entry.items() if k not in _DELETED_TABLE_MODULE_KEYS and k != 'script'}
+    spec.setdefault('label', entry['table'])
+    m.recovered_records = [spec]
+    m.report_type = 'recovered_records'
+    m.deleted_of = main_script
+    m.deleted_table_of = main_script          # declared in the main report
+    if not hasattr(m, 'hidden_fields'):
+        m.hidden_fields = list(DELETED_HIDDEN_FIELDS)
+    if not hasattr(m, 'core_fields'):
+        m.core_fields = (['status'] + list(spec['fields'].values())[:3]
+                         + [lk['name'] for lk in spec.get('links') or ()]
+                         + ['changed_fields', 'damaged', 'how_found', 'copies'])
+    m.run = lambda paths, _m=m: recovered_records_report(_m, paths)
+    m.record_source = _recovered_records_record_source(m)
+    try:
+        import parser_versions
+        parser_versions.check_version(platform, script, m.__file__ or '',
+                                      data=repr(sorted(entry.items(), key=lambda kv: kv[0])).encode())
+    except Exception:
+        pass
+    return m, None
 
 
 def _take_from_main_report(mod, main) -> str | None:
@@ -1233,6 +1304,13 @@ def _take_from_main_report(mod, main) -> str | None:
         else:
             return f"file_key '{key}' is not a file of {mod.deleted_of} or of this report"
     mod.files, mod.optional_files = files, optional
+    # the main report's extracted files are used, not a copy of their own
+    mod.files_folder = getattr(main, 'name', None)
+    core = list(getattr(mod, 'core_fields', None) or [])
+    if core and 'damaged' not in core:
+        at = core.index('how_found') if 'how_found' in core else len(core)
+        core.insert(at, 'damaged')
+        mod.core_fields = core
     reports = list(getattr(main, 'deleted_reports', None) or [])
     if mod not in reports:
         reports.append(mod)
@@ -1482,6 +1560,9 @@ def _extract_db_sidecars(dest_path: str, candidates: list[str], zip_path: str,
 #               [join table, its column for this row, its column for the
 #               message] when a join table links them (iOS SMS). Compared by
 #               id, never joined (A-95)
+#       "blob_files": {"thumbnail": "thumbnail_file"},   # optional: a BLOB
+#               column saved as a file (_save_recovered_blob) and its path put
+#               in the named column, for media_fields (a thumbnail)
 #       "links": [{"name": "linked_message", "what": "message",
 #                  "column": "message_row_id", "table": "message", "key": "_id",
 #                  "report": "whatsapp_deleted"}],
@@ -1510,7 +1591,36 @@ RECOVERED_STATUS = {
 }
 
 
-def _key_index(conn, checkpoint, fr, table: str, column: str, cache: dict):
+_BLOB_EXT = ((b'\xff\xd8\xff', 'jpg'), (b'\x89PNG', 'png'), (b'GIF8', 'gif'), (b'RIFF', 'webp'))
+
+
+def _save_recovered_blob(paths: dict, module, r: dict, data) -> str:
+    """A recovered record's BLOB (blob_files: e.g. a thumbnail) as a file in
+    the report's files folder, recovered_blobs/<report>/<file>-<offset>.<ext>
+    (ext from its first bytes, else .bin), so the report can show it
+    (media_fields: an absolute path is read from disk). The bytes are the
+    record's as found, never changed. '' when there is no BLOB or no
+    folder."""
+    folder = paths.get('_parser_files_dir')
+    if not folder or not isinstance(data, (bytes, bytearray)) or not data:
+        return ''
+    ext = next((e for magic, e in _BLOB_EXT if bytes(data[:len(magic)]) == magic), 'bin')
+    where = (r['offset'] if r.get('offset') is not None
+             else f"p{r.get('page')}-r{r.get('rowid')}")
+    out_dir = os.path.join(folder, 'recovered_blobs', getattr(module, '__name__', 'report'))
+    path = os.path.join(out_dir, f"{r['file']}-{where}.{ext}")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        if not os.path.exists(path):
+            with open(path, 'wb') as f:
+                f.write(bytes(data))
+    except OSError as exc:
+        log_note(f"recovered BLOB not saved ({exc}).")
+        return ''
+    return path
+
+
+def _key_index(conn, checkpoint, carver, table: str, column: str, cache: dict):
     """For a `links` lookup: (index, is_id) for *table*, where index maps a
     value of *column* to the rows holding it, [(where, rowid, table_certain,
     values)], where 'live' (in the table now) or 'recovered' (a record
@@ -1538,7 +1648,7 @@ def _key_index(conn, checkpoint, fr, table: str, column: str, cache: dict):
                 v = val(rowid, vals)
                 if v is not None:
                     index.setdefault(v, []).append(('live', rowid, True, vals))
-            records, _notes = fr.records(t)
+            records, _notes = carver.records(t.name)
             for r in records:
                 if r['rowid'] is not None and r['rowid'] in t.live:
                     continue
@@ -1615,19 +1725,30 @@ def _link_text(link: dict, v, target, join=None) -> str:
 
 def recovered_records_report(module, paths: dict) -> list[dict]:
     """The rows of a report_type = "recovered_records" parser (see above)."""
+    rows: list[dict] = []
+    seen_values: dict = {}       # (table, column) -> values in live and recovered rows
+    carvers: dict = {}           # database file -> its ReportCarver (one carve per file)
+    try:
+        return _recovered_records_rows(module, paths, rows, seen_values, carvers)
+    finally:
+        for c in carvers.values():
+            c.close()
+
+
+def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[dict]:
     import sqlite_reader
     import sqlite_recovery
     from sqlite_carve import blob_safe
-    rows: list[dict] = []
-    seen_values: dict = {}       # (table, column) -> values in live and recovered rows
     for spec in getattr(module, 'recovered_records', ()):
         db_path = paths.get(spec['file_key'])
         if not db_path or not os.path.isfile(db_path):
             log_note(f"{spec.get('label', spec['table'])}: {spec['file_key']} not in this extraction.")
             continue
-
-        def rd(p):
-            return open(p, 'rb').read() if os.path.isfile(p) else None
+        carver = carvers.get(db_path)
+        if carver is None:
+            carver = carvers[db_path] = sqlite_recovery.ReportCarver(
+                db_path, (paths.get('_ui_paths') or {}).get(spec['file_key']),
+                paths.get('_case_dir'))
         conn, notes = sqlite_reader.connect_committed(db_path)
         checkpoint = sqlite_reader.connect_checkpoint(db_path)
         try:
@@ -1636,9 +1757,7 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
                 log_note(f"{spec['table']} is not a table with rowids in "
                          f"{os.path.basename(db_path)}: nothing recovered from it.")
                 continue
-            fr = sqlite_recovery.for_connection(rd(db_path), rd(db_path + '-wal'),
-                                                rd(db_path + '-journal'), conn)
-            records, rnotes = fr.records(t)
+            records, rnotes = carver.records(t.name)
             idx0 = {c: i for i, c in enumerate(t.columns)}
             for c, i in idx0.items():
                 bucket = seen_values.setdefault((t.name, c), set())
@@ -1659,10 +1778,22 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
             for col, (otable, ocol) in (spec.get('not_found_in') or {}).items():
                 vals_ = seen_values.get((otable, ocol))
                 if vals_ is None:
-                    try:
-                        vals_ = {r[0] for r in conn.execute(f'SELECT "{ocol}" FROM "{otable}"')}
-                    except sqlite3.Error:
-                        vals_ = set()
+                    # the other table is another report's (one table per
+                    # report, A-95 2026-11-27): its live values and the
+                    # values of every record its deleted report finds, as
+                    # when both tables were one report (seen_values)
+                    vals_ = set()
+                    ot = sqlite_recovery.table_info(conn, otable, checkpoint)
+                    if ot is not None and ocol in ot.columns:
+                        oi = ot.columns.index(ocol)
+                        vals_.update(v[oi] for v in ot.live.values())
+                        vals_.update(r['values'][oi] for r in carver.records(ot.name)[0]
+                                     if oi < len(r['values']))
+                    else:
+                        try:
+                            vals_ = {r[0] for r in conn.execute(f'SELECT "{ocol}" FROM "{otable}"')}
+                        except sqlite3.Error:
+                            vals_ = set()
                 not_in[col] = (vals_, otable, ocol)
             # Live rows whose message is gone (orphan_of): not deleted, so
             # never recovered, and missing from the main report, whose query
@@ -1687,8 +1818,8 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
             key_cache: dict = {}
             links = []
             for link in spec.get('links') or ():
-                target = _key_index(conn, checkpoint, fr, link['table'], link['key'], key_cache)
-                join = (_key_index(conn, checkpoint, fr, link['via'][0], link['via'][1], key_cache)
+                target = _key_index(conn, checkpoint, carver, link['table'], link['key'], key_cache)
+                join = (_key_index(conn, checkpoint, carver, link['via'][0], link['via'][1], key_cache)
                         if link.get('via') else None)
                 if target is None or (link.get('via') and join is None):
                     log_note(f"{spec.get('label', spec['table'])}: {link['name']} not worked out "
@@ -1781,6 +1912,9 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
             for col, note_text in (spec.get('field_notes') or {}).items():
                 if col in idx:
                     row[f"{fields.get(col, col)}_caveat"] = note_text
+            for col, name in (spec.get('blob_files') or {}).items():
+                if col in idx:
+                    row[name] = _save_recovered_blob(paths, module, r, value(col))
             for c in changed:
                 if c in fields:
                     now = live[idx[c]]
@@ -1791,6 +1925,8 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
             row.update({
                 'changed_fields': ', '.join(fields.get(c, c) for c in changed),
                 'how_found': note,
+                # kept and flagged, never cleaned up (A-95, 2026-11-27)
+                'damaged': sqlite_recovery.damage(r),
                 'table_certain': r['table_certain'],
                 'source': f"Carved — {label}" + (f" ({note})" if note else ''),
                 'recovered': True,
@@ -1846,6 +1982,7 @@ def recovered_records_report(module, paths: dict) -> list[dict]:
                 key_v = vals[idx[ospec['column']]] if ospec['column'] in idx else rowid
                 row.update({
                     'changed_fields': '',
+                    'damaged': '',
                     'how_found': (f"live row; no {what} row has its "
                                   f"{fields.get(ospec['column'], ospec['column'])} ({key_v})"),
                     'table_certain': True,
@@ -2024,7 +2161,9 @@ def run_artifact(
     error describes what went wrong.
     """
     parser_name = getattr(module, 'name', script_name)
-    dest_dir    = _parser_files_dir(case_dir, parser_name)
+    # a deleted-records report reads its main report's files (files_folder,
+    # _take_from_main_report), so they are extracted once
+    dest_dir    = _parser_files_dir(case_dir, getattr(module, 'files_folder', None) or parser_name)
 
     # ── Device-wide API ──────────────────────────────────────────────────────
     if getattr(module, 'device_wide', False):
@@ -2122,6 +2261,9 @@ def run_artifact(
         # the two by os.path.isabs(): an archive ui_path is never
         # absolute, so this needs no new field convention at all.
         paths['_parser_files_dir'] = dest_dir
+        # the case folder: a deleted-records report keeps what it carves in
+        # its casecache.db (sqlite_recovery.ReportCarver)
+        paths['_case_dir'] = case_dir
 
         # requires_nested_extraction (see WRITING_ARTIFACT_PARSERS.md): a
         # parser declaring it needs a SPECIFIC embedded archive extracted

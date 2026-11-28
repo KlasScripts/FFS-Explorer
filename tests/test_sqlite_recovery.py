@@ -182,3 +182,105 @@ def test_live_row_is_located_where_the_committed_view_has_it(tmp_path):
         assert got == rid and sc.decode_record(cell[c1 + c2:c1 + c2 + plen])[1] == text
     assert rv.locate_committed_row(main, wal, 'messages', 5) is None       # deleted in the WAL
     assert rv.locate_committed_row(main, None, 'messages', 5)['file'] == 'main'
+
+
+def _two_shapes_freed(path, twin: bool):
+    """Table a's rows on pages that are then freed (all of them deleted,
+    secure_delete off). With *twin*, table b has the same shape (two
+    columns: text, integer) and live rows of the same pattern; without it,
+    b is a different shape."""
+    c = sqlite3.connect(path, isolation_level=None)
+    c.execute('pragma secure_delete=off')
+    c.execute('pragma journal_mode=delete')
+    c.execute('create table a(id integer primary key, body text, n integer)')
+    if twin:
+        c.execute('create table b(id integer primary key, body text, n integer)')
+    else:
+        c.execute('create table b(id integer primary key, x real, y blob, z text)')
+    c.execute('begin')
+    for i in range(1, 400):
+        c.execute('insert into a(body, n) values (?, ?)', (f'message number {i:04d}', 1000 + i))
+    for i in range(1, 400):
+        if twin:
+            c.execute('insert into b(body, n) values (?, ?)', (f'other number - {i:04d}', 1000 + i))
+        else:
+            c.execute('insert into b(x, y, z) values (?, ?, ?)', (i / 3, b'\x00\x01', 'z'))
+    c.execute('commit')
+    c.execute('delete from a where id > 6')         # its later pages are freed
+    c.close()
+
+
+@pytest.mark.parametrize('twin', [False, True])
+def test_a_freed_page_record_must_fit_no_other_table(tmp_path, twin):
+    """Owner decision 2026-11-27 (A-95): a record whose table is not certain
+    (here a freed page) is kept only when it fits this table's own pattern
+    and no other table's. With a twin table of the same shape, neither table
+    is given the freed records, and both say why; without one, they are
+    table a's, labelled table not certain."""
+    db = str(tmp_path / 'x.db')
+    _two_shapes_freed(db, twin)
+    deleted = {i: (i, f'message number {i:04d}', 1000 + i) for i in range(7, 400)}
+    _t, recs, notes = _recover(db, 'a')
+    freed = [r for r in recs if r['method'] == 'freed_page']
+    if twin:
+        assert freed == []
+        assert any('also fit another table (b)' in n for n in notes)
+        _t, recs_b, notes_b = _recover(db, 'b')
+        assert [r for r in recs_b if r['method'] == 'freed_page'] == []
+    else:
+        assert freed and all(not r['table_certain'] for r in freed)
+        for r in freed:
+            assert deleted[r['rowid']] == tuple(r['values'])
+
+
+def test_free_space_scan_with_a_column_count_finds_the_same_records(tmp_path):
+    """_brute_force_records(ncols=N) returns exactly the N-column records
+    the unrestricted scan finds (the carver keeps only those)."""
+    db, _truth = deleted_rows_db(str(tmp_path), n=60, delete=[3, 9, 10, 11, 30, 41])
+    raw = open(db, 'rb').read()
+    hdr = sc.parse_db_header(raw)
+    ps = hdr['page_size']
+    for pno in range(1, len(raw) // ps + 1):
+        page = sc._page_bytes(raw, ps, pno)
+        ho = 100 if pno == 1 else 0
+        if page[ho] != sc._LEAF_TABLE_PAGE:
+            continue
+        for start, end, kind in sc._free_byte_ranges(page, ho):
+            every = sc._brute_force_records(page[start:end], start, pno, kind)
+            for n in {len(r['values']) for r in every} | {1, 2, 3}:
+                assert (sc._brute_force_records(page[start:end], start, pno, kind, ncols=n)
+                        == [r for r in every if len(r['values']) == n])
+
+
+def test_damage_says_why_a_record_is_not_whole():
+    base = {'method': 'freeblock', 'truncated': False, 'partly_overwritten': False}
+    assert rv.damage(base) == ''
+    assert 'cut off' in rv.damage(dict(base, truncated=True))
+    assert 'partly overwritten' in rv.damage(dict(base, partly_overwritten=True))
+    assert 'header rebuilt' in rv.damage(dict(base, method='header_rebuilt'))
+    assert 'all zero' in rv.damage(dict(base, values=[1, bytes(570)]))
+    assert rv.damage(dict(base, values=[1, b'\x00' * 4])) == ''
+    d = rv.damage(dict(base, method='overflow', truncated=True, overflow_status='chain broken'))
+    assert d == 'overflow chain incomplete (chain broken)'
+
+
+def test_report_carver_keeps_results_and_reuses_them(tmp_path):
+    """The deleted reports' carver: carved once in the worker process, kept
+    in casecache.db, and a second carver of the same bytes reads them back
+    unchanged without carving."""
+    db, _truth = deleted_rows_db(str(tmp_path), n=40, delete=[5, 6, 20])
+    case = tmp_path / 'case'
+    case.mkdir()
+    c1 = rv.ReportCarver(db, 'ui/d.db', str(case))
+    try:
+        first = c1.records('chat')
+    finally:
+        c1.close()
+    assert c1.carved == 1 and first[0]
+    c2 = rv.ReportCarver(db, 'ui/d.db', str(case))
+    try:
+        again = c2.records('chat')
+    finally:
+        c2.close()
+    assert c2.carved == 0
+    assert again == first

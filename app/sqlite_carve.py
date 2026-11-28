@@ -1235,13 +1235,17 @@ def iter_freeblocks(page: bytes, header_offset: int = 0):
 
 
 def _brute_force_records(chunk: bytes, base_offset: int, page_no: int,
-                         source: str) -> list[dict]:
+                         source: str, ncols: int | None = None) -> list[dict]:
     """Try every byte offset in *chunk* as a candidate cell start
     (payload_len varint, rowid varint, record). Used for any free-space
     byte range regardless of kind — a formally-linked freeblock or the
     single unallocated page-gap (see _free_byte_ranges) — since a deleted
     cell's start doesn't necessarily align with the range's own start
-    (page compaction can leave old bytes anywhere inside a merged region)."""
+    (page compaction can leave old bytes anywhere inside a merged region).
+    With *ncols*, only records of exactly that many columns are returned:
+    a header is read no further than that, and a record of another width
+    is never decoded (each offset is tried on its own, so this changes
+    nothing else)."""
     out = []
     for start in range(len(chunk)):
         try:
@@ -1254,7 +1258,15 @@ def _brute_force_records(chunk: bytes, base_offset: int, page_no: int,
             payload = chunk[payload_start:payload_start + payload_len]
             if len(payload) < payload_len:
                 continue
-            values = decode_record(payload)
+            if ncols is None:
+                values = decode_record(payload)
+            else:
+                types, header_len = parse_record_header(payload, 0, ncols)
+                if len(types) != ncols:
+                    continue
+                values, truncated = decode_body(payload, types, header_len)
+                if truncated:
+                    continue
             if not values:
                 continue
             out.append({'page': page_no, 'offset': base_offset + start,

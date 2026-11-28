@@ -546,26 +546,60 @@ picker the same way a missed SQL JOIN is.
 
 A main report holds live rows only (ASSUMPTIONS.md A-95, 2026-11-21).
 `recoverable_tables` (carving a table on every run and appending what it
-found to the live rows) is retired: it took 23.9 s of a 74 s run for
-500,000 WhatsApp messages, usually to find nothing. Deleted and older
-records go in a separate `report_type = "recovered_records"` report per
-app, covering its message table and its media/attachment tables (below);
-`tests/test_recovered_reports.py` stops a shipped parser declaring
-`recoverable_tables` again.
+found to the live rows) is retired; `tests/test_recovered_reports.py` stops
+a shipped parser declaring it again. Deleted and older records go in a
+deleted-records report (`report_type = "recovered_records"`), **one per
+table** (A-95, 2026-11-27): an app's message table, its media table and its
+thumbnail table each get their own.
 
-A deleted-records report names its main report with `deleted_of =
-"<main script name>"`: the loader gives it the main report's app location
-(`app_path` / `app_group`) and every database file its tables name
-(`file_key`, from the main report's `files` or `optional_files`), so they
-are declared once; anything it declares itself wins (LINE's full-text
-index reads a database the main report doesn't). The main report then
-shows a line linking to it. Use the main report's `file_key` names.
+**Declare them in the main report**, as a `deleted_tables` list (A-95,
+2026-11-27). Each entry becomes a report of its own (its own results table,
+version and name), made by the loader
+(`artifact_runner._deleted_table_module`), listed beside the main report,
+and **run whenever the main report runs**, on the files it extracted: the
+run dialog does not offer it separately (`with_deleted_reports`). Each
+database is carved once per run, in the worker process, and the results are
+kept in `casecache.db` (shared with the Database tab), so a second run, or
+the same table in the Database tab, takes no time
+(`sqlite_recovery.ReportCarver`). Example: `artifacts/android/whatsapp.py`
+(messages, media and thumbnails, linked by `links`); others:
+`artifacts/ios/sms_messages.py` (linked through a join table),
+`artifacts/android/burner.py` (two databases; a JSON-blob column split with
+`json_fields`, a checked caveat with `field_notes`), `artifacts/ios/line.py`
+(`not_found_in`, `derived`), `artifacts/android/line.py` (an index database
+the main report doesn't read, declared with the entry's own `files`).
+
+```python
+deleted_tables = [{
+    "script": "line_deleted_messages",           # the report's own name
+    "name": "LINE — Deleted & Changed Messages (iOS)",
+    "description": "...",                         # how linked, how it can be wrong
+    "core_fields": ["status", "timestamp", "message", "changed_fields",
+                    "message (now)", "linked_sender", "damaged", "how_found", "copies"],
+    "timestamp_fields": {"timestamp": "ms"},
+    # the rest is the table's recovered_records spec (below)
+    "file_key": "line", "table": "ZMESSAGE", "label": "Message",
+    "fields": {"ZTIMESTAMP": "timestamp", "ZTEXT": "message", "ZSENDER": "sender_id"},
+    "version_fields": ["ZTEXT", "ZSENDER"],
+    "links": [{"name": "linked_sender", "what": "contact", "column": "ZSENDER",
+               "table": "ZUSER", "key": "Z_PK", "report": "line_deleted_users"}],
+}, ...]
+```
+
+The entry's own keys are `script`, `name`, `description`, and optionally
+`core_fields`, `hidden_fields` (the standard list when left out),
+`timestamp_fields`, `media_fields`, `files` / `optional_files` (a database
+the main report doesn't read), `category`; the rest is the table's spec. A
+deleted report takes the main report's app location and database files
+(`file_key` names the main report's `files` / `optional_files` keys) and
+its category. A report of its own file with `deleted_of = "<main script>"`
+still works the same way (`artifacts/ios/life360_deleted_messages.py` has
+no main report and stands alone).
 
 Identical copies of a record (the same shown values under any row id, as
 an app that rewrites a row by delete + insert leaves) are one row: its
 `copies` column counts them and the hidden `copy_locations` keeps where
-each was found (A-95). Put `copies` in `core_fields` and
-`copy_locations` in `hidden_fields`, as the shipped reports do.
+each was found (A-95). Put `copies` in `core_fields`.
 
 For a media or attachment table, declare `orphan_of` to also list its
 LIVE rows whose message is gone (status Orphaned): not deleted, so never
@@ -576,41 +610,19 @@ message]` when a join table links them (iOS SMS attachments). Compared by
 id, never joined. On the Josh Hickman iOS 17 image this found 1 of 28 SMS
 attachments.
 
-### `report_type = "recovered_records"`: a deleted / changed records report with no `run()`
+### The table spec of a deleted-records report
 
-For "what was deleted or changed in this app's messages", don't write a
-`run()` at all. Declare the database and, per table, the columns that
-matter; the shared code (`artifact_runner.recovered_records_report`, using
-the one carver, `app/sqlite_recovery.py`, the Database tab uses too) makes
-the report. **One table per report** (ASSUMPTIONS.md A-95, owner decision
-2026-11-27): an app's message table and its media table each get their own
-deleted report, both naming the same main report in `deleted_of`. Examples:
-`artifacts/android/whatsapp_deleted.py` and
-`artifacts/android/whatsapp_deleted_media.py` (messages and media, linked
-by `links`), `artifacts/ios/sms_deleted.py` and
-`artifacts/ios/sms_deleted_attachments.py` (linked through a join table),
-`artifacts/android/burner_messageentity.py` (a
-JSON-blob column split with `json_fields`, a checked caveat with
-`field_notes`),
-`artifacts/ios/line_deleted_messages.py`.
+Declare the database and the columns that matter; the shared code
+(`artifact_runner.recovered_records_report`, using the one carver,
+`app/sqlite_recovery.py`, the Database tab uses too) makes the report.
 
 ```python
-name = "LINE — Deleted & Changed Messages (iOS)"
-description = "..."
-category = "Chats & Messaging"
-app_group = "group.com.linecorp.line"
-files = {"line": "Library/Application Support/PrivateStore/P_*/Messages/Line.sqlite"}
-
-report_type = "recovered_records"
-recovered_records = [{
-    "file_key": "line", "table": "ZMESSAGE", "label": "Message",
-    "fields": {"ZTIMESTAMP": "timestamp", "ZTEXT": "message", "ZSENDER": "sender_id"},
-    "version_fields": ["ZTEXT", "ZSENDER"],            # what makes a version matter
-    "labels": {"ZCONTENTTYPE": {0: "text", 1: "picture"}},          # optional
-    "derived": {"direction": {"from": "ZSENDER", "values": {None: "Outgoing"},
-                              "else": "Incoming"}},                  # optional
-}]
-timestamp_fields = {"timestamp": "ms"}
+"file_key": "line", "table": "ZMESSAGE", "label": "Message",
+"fields": {"ZTIMESTAMP": "timestamp", "ZTEXT": "message", "ZSENDER": "sender_id"},
+"version_fields": ["ZTEXT", "ZSENDER"],            # what makes a version matter
+"labels": {"ZCONTENTTYPE": {0: "text", 1: "picture"}},          # optional
+"derived": {"direction": {"from": "ZSENDER", "values": {None: "Outgoing"},
+                          "else": "Incoming"}},                  # optional
 ```
 
 What each row is, and the rules:
@@ -621,6 +633,23 @@ What each row is, and the rules:
 - `status`: **Deleted** (no longer in the table), **Changed** (an earlier
   version of a row that is still there), **Unfinished write / delete**
   (hot journal). `how_found` and `table_certain` say how and how sure.
+- A record whose table is not certain (a rollback-journal page, a freed
+  page, a WAL frame of an earlier WAL round or of a page that is free now,
+  overflow found from a freed page; a pattern match on a page that is also
+  another table's leaf) is kept only when it fits this table's own record
+  pattern, learned from its live rows, holds the kinds of value they hold,
+  and fits no other table of the database (owner decision 2026-11-27,
+  A-95). The rest are counted in the run log, with the tables they also
+  fit.
+- `damaged` says why a record is not whole: cut off, text partly
+  overwritten, a BLOB whose bytes are all zero (wiped), header rebuilt (one
+  column type taken from the pattern), overflow chain incomplete. Such
+  records are kept and shown, never cleaned up (A-95, 2026-11-27). Put
+  `damaged` in `core_fields` (the loader adds it if you don't).
+- `blob_files` (optional): `{"thumbnail": "thumbnail_file"}` saves that
+  BLOB column of each record, as found, to a file in the report's folder
+  (`recovered_blobs/<report>/`) and puts its path in the named column, so
+  `media_fields` can show it (WhatsApp thumbnails).
 - **Changed** rows are listed only when a `version_fields` column differs
   from the live row, with the live value beside it as `<name> (now)` and
   `changed_fields` naming what changed. Choose the columns that carry
@@ -656,6 +685,9 @@ What each row is, and the rules:
   by pattern has no row id, and that copies share an id.
 - Use the same field names as the app's other reports (`timestamp`,
   `message`, `direction`) so they line up.
+- `not_found_in` against a table of another deleted report counts that
+  table's recovered records too (they are carved, from the cache if kept),
+  as when the two tables were one report.
 - The `-wal` / `-journal` need not be declared (the runner extracts them).
   `record_source` is made for you (the Hex panel jumps to the record's
   exact bytes).

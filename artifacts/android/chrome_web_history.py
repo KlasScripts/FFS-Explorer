@@ -192,3 +192,185 @@ def run(paths):
         conn.close()
 
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'chrome_deleted_history',
+  'name': 'Chrome — Deleted History Visits',
+  'description': 'Deleted and changed Chrome visits from History (table visits: one row per '
+                 'visit; its url is the id of a urls row). Live history is in Chrome Web '
+                 'History; deleted URL records are in Chrome — Deleted History URLs, and '
+                 "Chrome's own URL log (ukm_db) in Chrome — Deleted URL Log (Segmentation "
+                 'Platform).\n'
+                 '\n'
+                 'Each row is one record as found in this table, never joined to another table '
+                 '(ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id; damaged says why a record is not '
+                 'whole. Values are as stored.\n'
+                 '\n'
+                 'linked_url: where the urls row this visit names was found: in the table now '
+                 '(live: the URL is in Chrome Web History), in the records Chrome — Deleted '
+                 'History URLs finds (recovered, with its row id) or not found. Only ids are '
+                 'compared: no value of the URL row is brought in.\n'
+                 'How the link can be wrong: urls.id and visits.id are AUTOINCREMENT (checked '
+                 '2026-11-27 on the Josh Hickman Android 14, CTF26 and CTF25 images: the '
+                 "highest id of each is its sqlite_sequence value, and every live visit's url "
+                 'is a live urls id), so SQLite does not hand out an id again, but Chrome '
+                 'rebuilding the file, or a sync restore, can put a different URL under an old '
+                 'id; an earlier version found in the WAL and a live row with the same id were '
+                 'stored at different times; a record found by pattern has no row id and '
+                 'cannot be linked to.\n'
+                 '\n'
+                 'visit_time is Chromium microseconds since 1601-01-01 UTC, as in Chrome Web '
+                 'History. transition is the stored number (core type plus qualifier bits); '
+                 'Chrome Web History decodes it for live visits.\n'
+                 '\n'
+                 'Found earlier (carried over from the combined report): a tested negative for '
+                 'History itself (a single deleted entry and a full clear left nothing; Chrome '
+                 'appears to rebuild the file). Checked 2026-11-27 on the Josh Hickman Android '
+                 '14, CTF25 and CTF26 images: 0 records.\n',
+  'core_fields': ['status',
+                  'visit_time',
+                  'url_id',
+                  'linked_url',
+                  'transition',
+                  'changed_fields',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'timestamp_fields': {'visit_time': 'webkit_us'},
+  'file_key': 'history',
+  'table': 'visits',
+  'label': 'Visit (History)',
+  'fields': {'id': 'visit_id',
+             'url': 'url_id',
+             'visit_time': 'visit_time',
+             'from_visit': 'from_visit',
+             'transition': 'transition',
+             'visit_duration': 'visit_duration'},
+  'version_fields': ['url', 'transition'],
+  'links': [{'name': 'linked_url',
+             'what': 'URL',
+             'column': 'url',
+             'table': 'urls',
+             'key': 'id',
+             'report': 'chrome_deleted_history_urls'}]},
+ {'script': 'chrome_deleted_history_urls',
+  'name': 'Chrome — Deleted History URLs',
+  'description': 'Deleted and changed Chrome URL records from History (table urls: one row per '
+                 'URL, with its title and visit counts). Live history is in Chrome Web '
+                 'History; deleted visits are in Chrome — Deleted History Visits.\n'
+                 '\n'
+                 'Each row is one record as found in this table, never joined to another table '
+                 '(ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id; damaged says why a record is not '
+                 'whole. Values are as stored.\n'
+                 '\n'
+                 "linked_visits: where the visits whose url is this record's id were found: in "
+                 'the table now (live), in the records Chrome — Deleted History Visits finds '
+                 '(recovered, with its row id) or not found. One URL can have many visits. '
+                 'Only ids are compared: no value of a visit is brought in.\n'
+                 'How the link can be wrong: urls.id and visits.id are AUTOINCREMENT (checked '
+                 '2026-11-27 on the Josh Hickman Android 14, CTF26 and CTF25 images: the '
+                 "highest id of each is its sqlite_sequence value, and every live visit's url "
+                 'is a live urls id), so SQLite does not hand out an id again, but Chrome '
+                 'rebuilding the file, or a sync restore, can put a different URL under an old '
+                 'id; an earlier version found in the WAL and a live row with the same id were '
+                 'stored at different times; a record found by pattern has no row id and '
+                 'cannot be linked to.\n'
+                 '\n'
+                 'last_visit_time is Chromium microseconds since 1601-01-01 UTC, as in Chrome '
+                 'Web History.\n'
+                 '\n'
+                 'Found earlier (carried over from the combined report): a tested negative for '
+                 'History itself (a single deleted entry and a full clear left nothing; Chrome '
+                 'appears to rebuild the file). Checked 2026-11-27 on the Josh Hickman Android '
+                 '14, CTF25 and CTF26 images: 0 records.\n',
+  'core_fields': ['status',
+                  'last_visit_time',
+                  'url',
+                  'title',
+                  'linked_visits',
+                  'changed_fields',
+                  'url (now)',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'timestamp_fields': {'last_visit_time': 'webkit_us'},
+  'file_key': 'history',
+  'table': 'urls',
+  'label': 'URL (History)',
+  'fields': {'id': 'url_id',
+             'url': 'url',
+             'title': 'title',
+             'visit_count': 'visit_count',
+             'typed_count': 'typed_count',
+             'last_visit_time': 'last_visit_time',
+             'hidden': 'hidden'},
+  'version_fields': ['url', 'title'],
+  'links': [{'name': 'linked_visits',
+             'what': 'visit',
+             'column': 'id',
+             'table': 'visits',
+             'key': 'url',
+             'report': 'chrome_deleted_history'}]},
+ {'script': 'chrome_deleted_ukm_urls',
+  'name': 'Chrome — Deleted URL Log (Segmentation Platform)',
+  'description': "Deleted and changed records of Chrome's own URL log, "
+                 'segmentation_platform/ukm_db (table urls), when the phone has it. It '
+                 'survives "Clear browsing data": the main report recorded 6 rows recovered '
+                 'via WAL history after a clear-history run on a GTLAB test image, none of it '
+                 'visible elsewhere (carried over). Live history is in Chrome Web History; '
+                 "History's own deleted records are in Chrome — Deleted History Visits and "
+                 'Chrome — Deleted History URLs. ukm_db is a separate database: its url_id is '
+                 'not a History id, and no link is made.\n'
+                 '\n'
+                 'Each row is one record as found in this table, never joined to another table '
+                 '(ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id; damaged says why a record is not '
+                 'whole. Values are as stored.\n'
+                 '\n'
+                 'last_timestamp is Chromium microseconds since 1601-01-01 UTC.\n'
+                 '\n'
+                 'Checked 2026-11-27 on the Josh Hickman Android 14, CTF25 and CTF26 images: '
+                 'each has a ukm_db (22, 4 and 38 live URLs), and 0 deleted or changed '
+                 'records. (The combined report said the Josh Hickman Android 14 image had no '
+                 'ukm_db; it has one.)',
+  'core_fields': ['status',
+                  'last_timestamp',
+                  'url',
+                  'title',
+                  'changed_fields',
+                  'url (now)',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'timestamp_fields': {'last_timestamp': 'webkit_us'},
+  'file_key': 'ukm_db',
+  'table': 'urls',
+  'label': 'URL (Segmentation Platform)',
+  'fields': {'url_id': 'url_id',
+             'url': 'url',
+             'title': 'title',
+             'last_timestamp': 'last_timestamp',
+             'counter': 'counter',
+             'profile_id': 'profile_id'},
+  'version_fields': ['url', 'title']}]

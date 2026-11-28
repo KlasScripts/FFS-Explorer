@@ -13,10 +13,14 @@ ROOT = os.path.join(os.path.dirname(__file__), '..')
 
 @pytest.mark.parametrize('platform', ['ios', 'android'])
 def test_every_shipped_parser_has_a_category(platform):
-    folder = os.path.join(ROOT, 'artifacts', platform)
-    scripts = sorted(f[:-3] for f in os.listdir(folder)
-                     if f.endswith('.py') and not f.startswith('_'))
-    missing = [s for s in scripts if ac.classify(platform, s)[0] == ac.OTHER]
+    # every report the loader makes, the deleted-records reports declared in
+    # a main report's deleted_tables included (A-95, 2026-11-27)
+    import artifact_runner
+    mods, errors = artifact_runner.load_artifacts(platform)
+    assert not errors, errors
+    scripts = sorted(sn for sn, _m in mods)
+    by_name = dict(mods)
+    missing = [s for s in scripts if ac.classify(platform, s, by_name[s])[0] == ac.OTHER]
     assert not missing, missing
     with open(ac.store_path(), encoding='utf-8') as f:
         named = set(json.load(f)[platform])

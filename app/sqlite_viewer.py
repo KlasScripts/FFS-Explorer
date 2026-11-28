@@ -466,6 +466,8 @@ def recovered_rows_for(recovery, db_path: str, before_path: str | None, table: s
     conn = sqlite3.connect(f'file:{db_path}?immutable=1', uri=True)
     ck = sqlite3.connect(f'file:{before_path}?immutable=1', uri=True) if before_path else None
     try:
+        if recovery.shapes is None:
+            recovery.shapes = sqlite_recovery.table_shapes(conn)
         t = sqlite_recovery.table_info(conn, table, ck)
         if t is None:
             return [], []

@@ -981,6 +981,24 @@ def _earlier_capture_warnings(touched, earlier: dict) -> list[str]:
     return lines
 
 
+def with_deleted_reports(selected: list) -> list:
+    """*selected* with each main report's deleted-records reports (one per
+    table, artifact_runner deleted_reports) right after it: they run
+    whenever it runs, on the files it extracted (A-95, 2026-11-27). A
+    deleted report chosen on its own is kept once, where it was."""
+    out, seen = [], set()
+    for script_name, mod in selected:
+        if script_name in seen:
+            continue
+        out.append((script_name, mod))
+        seen.add(script_name)
+        for d in getattr(mod, 'deleted_reports', None) or ():
+            if d.__name__ not in seen:
+                out.append((d.__name__, d))
+                seen.add(d.__name__)
+    return out
+
+
 class ArtifactRunnerWorker(QThread):
     log  = Signal(str)
     done = Signal()
@@ -988,7 +1006,7 @@ class ArtifactRunnerWorker(QThread):
     def __init__(self, selected, zip_path, adapter, case_dir, platform: str,
                 guid_to_bundle: dict | None = None):
         super().__init__()
-        self._selected        = selected
+        self._selected        = with_deleted_reports(selected)
         self._zip_path        = zip_path
         self._adapter         = adapter
         self._case_dir        = case_dir
@@ -1273,10 +1291,12 @@ class ArtifactRunnerDialog(QDialog):
                 for ui_path in getattr(mod, 'target_paths', [])
             )
 
+        # A deleted-records report is not a choice of its own: it runs with
+        # its main report (with_deleted_reports), named on that report's row.
         available = [
             (script_name, mod)
             for script_name, mod in all_artifacts
-            if _mod_matches(mod)
+            if not getattr(mod, 'deleted_of', None) and _mod_matches(mod)
         ]
 
         layout = QVBoxLayout(self)
@@ -1308,7 +1328,7 @@ class ArtifactRunnerDialog(QDialog):
         if case_dir:
             try:
                 with closing(_open_results_db(case_dir)) as rdb:
-                    for _sn, _ in available:
+                    for _sn, _m in with_deleted_reports(available):
                         _last = load_last_run(rdb, f'artifact_{_sn}')
                         if _last:
                             run_history[_sn] = _last
@@ -1340,14 +1360,25 @@ class ArtifactRunnerDialog(QDialog):
 
         def _leaf(owner, script_name, mod):
             last = run_history.get(script_name)
-            it = QTreeWidgetItem(owner, [getattr(mod, 'name', None) or script_name, ""])
+            label = getattr(mod, 'name', None) or script_name
+            n_deleted = len(getattr(mod, 'deleted_reports', None) or ())
+            if n_deleted:
+                label += (f"  (+ {n_deleted} deleted-records "
+                          f"report{'s' if n_deleted > 1 else ''})")
+            it = QTreeWidgetItem(owner, [label, ""])
             it.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
                         | Qt.ItemFlag.ItemIsSelectable)
+            deleted = list(getattr(mod, 'deleted_reports', None) or ())
+            if deleted:
+                it.setToolTip(0, "Runs with its deleted-records reports, one per table: "
+                              + "; ".join(getattr(d, 'name', d.__name__) for d in deleted))
             # Default to unchecked for parsers already run to completion in
             # this case — they don't need re-running. Never-run and
-            # incomplete parsers stay ticked.
-            it.setCheckState(0, Qt.CheckState.Unchecked if (last and last['complete'])
-                             else Qt.CheckState.Checked)
+            # incomplete parsers stay ticked, as does one whose
+            # deleted-records reports have not all run to completion.
+            done = all((run_history.get(sn) or {}).get('complete')
+                       for sn in [script_name] + [d.__name__ for d in deleted])
+            it.setCheckState(0, Qt.CheckState.Unchecked if done else Qt.CheckState.Checked)
             if last:
                 rows = last['output_rows'] or 0
                 run_at = _local_date(last['run_at'])

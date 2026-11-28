@@ -1326,6 +1326,9 @@ default.** *Decision (owner, 2026-11-16).*
   Deleted and older records are in a separate `recovered_records` report.
   `recoverable_tables` is retired: it carved on every run (23.9 s of 74 s
   for 500,000 WhatsApp messages).
+  (2026-11-27: carving runs on every run again, with the deleted reports
+  made automatically, below, but once per database and from the cache,
+  and the rows stay in their own reports.)
 - *Decision (owner, 2026-11-27; replaces "one report per app, covering its
   message and media tables", 2026-11-21):* a deleted / changed records
   report covers one table. Where an app keeps messages and media in
@@ -1344,8 +1347,17 @@ default.** *Decision (owner, 2026-11-16).*
   read flag).
 - *Decision (owner, 2026-11-21):* a deleted-records report names its main
   report (`deleted_of`) and takes its app location and database files from
-  it, so they are declared once; it stays a separate report (its own run,
-  version and table), never a section of the main one.
+  it, so they are declared once. (Replaced 2026-11-27: "it stays a
+  separate report (its own run, version and table), never a section of the
+  main one".)
+- *Decision (owner, 2026-11-27):* the main report declares its deleted
+  tables (`deleted_tables`). Each becomes its own report (its own table,
+  version and name), made and run automatically when the main report runs,
+  and shown beside it. Each database is carved once per run and the results
+  are kept in `casecache.db`. Records whose table is not certain are kept
+  only when they pass the table's own record pattern and fit no other
+  table. Damaged records are kept and flagged (`damaged`), never cleaned
+  up.
 - *Decision (owner, 2026-11-21):* a deleted-records report also lists its
   media/attachment tables' LIVE rows whose message is gone (status
   Orphaned, `orphan_of`): not deleted, so never recovered, and missing from

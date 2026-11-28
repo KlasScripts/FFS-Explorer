@@ -46,10 +46,23 @@ def test_every_report_loads_and_deleted_of_resolves():
     assert not errors, errors
 
 
-@pytest.mark.parametrize('path', RECOVERED, ids=lambda p: os.path.relpath(p, ROOT))
-def test_recovered_report_is_declared_consistently(path):
-    assert 'def run(' not in open(path, encoding='utf-8').read(), 'a recovered_records report has no run()'
-    m = _loaded()[0][path]                     # as the app loads it (deleted_of resolved)
+def _recovered_names():
+    import artifact_runner as ar
+    return [(plat, n) for plat in ('android', 'ios') for n, m in ar.load_artifacts(plat)[0]
+            if getattr(m, 'report_type', None) == 'recovered_records']
+
+
+@pytest.mark.parametrize('plat,script', _recovered_names(), ids=lambda v: str(v))
+def test_recovered_report_is_declared_consistently(plat, script):
+    """Every deleted-records report, a file of its own or declared in its
+    main report's deleted_tables: one table (A-95, 2026-11-27), its file a
+    file of the report, its fields and times consistent."""
+    import artifact_runner as ar
+    m = dict(ar.load_artifacts(plat)[0])[script]      # as the app loads it (deleted_of resolved)
+    path = os.path.join(ROOT, 'artifacts', plat, script + '.py')
+    if os.path.exists(path):
+        assert 'def run(' not in open(path, encoding='utf-8').read(), 'a recovered_records report has no run()'
+    assert len(m.recovered_records) == 1, 'one table per deleted-records report (A-95)'
     keys = set(m.files) | set(getattr(m, 'optional_files', {}) or {})
     names = set()
     for spec in m.recovered_records:
@@ -57,9 +70,14 @@ def test_recovered_report_is_declared_consistently(path):
         assert spec.get('fields'), spec['table']
         assert set(spec.get('version_fields') or ()) <= set(spec['fields']), spec['table']
         assert set(spec.get('json_fields') or ()) <= set(spec['fields']), spec['table']
+        assert set(spec.get('blob_files') or ()) <= set(spec['fields']), spec['table']
         names |= set(spec['fields'].values())
+        names |= set((spec.get('blob_files') or {}).values())
+        names |= {lk['name'] for lk in spec.get('links') or ()}
     for f in getattr(m, 'timestamp_fields', {}) or {}:
         assert f in names or f.split('.', 1)[0] in names, f'timestamp field {f} is not a report field'
+    for f in getattr(m, 'media_fields', ()) or ():
+        assert f in names, f'media field {f} is not a report field'
 
 
 def test_json_fields_and_field_notes(tmp_path):
@@ -305,3 +323,36 @@ def test_main_report_names_each_of_its_deleted_reports(tmp_path):
     assert '"X — Deleted Media": not run yet' in t
     av.ArtifactViewerMixin._update_art_deleted_link(fake, types.SimpleNamespace())
     assert fake._art_deleted_link.visible is False
+
+
+def test_deleted_tables_entry_becomes_its_own_report():
+    """A main report's deleted_tables entry (A-95, 2026-11-27): its own
+    report, named by 'script', deleted_of the main report, one table; a name
+    already taken or a missing key is refused, never silently dropped."""
+    import types
+    import artifact_runner as ar
+    main = types.SimpleNamespace(name='Main', __file__=__file__)
+    entry = {'script': 'x_deleted', 'name': 'X — Deleted', 'description': 'd',
+             'file_key': 'db', 'table': 't', 'fields': {'a': 'a'}, 'core_fields': ['status'],
+             'links': [{'name': 'linked', 'what': 'y', 'column': 'a', 'table': 'u', 'key': 'k'}]}
+    m, problem = ar._deleted_table_module('android', 'x', main, entry, {'x'})
+    assert problem is None
+    assert m.__name__ == 'x_deleted' and m.deleted_of == 'x' and m.name == 'X — Deleted'
+    assert [s['table'] for s in m.recovered_records] == ['t']
+    assert 'name' not in m.recovered_records[0] and 'core_fields' not in m.recovered_records[0]
+    assert m.hidden_fields == ar.DELETED_HIDDEN_FIELDS and callable(m.run)
+    assert ar._deleted_table_module('android', 'x', main, entry, {'x', 'x_deleted'})[1]
+    bad = {k: v for k, v in entry.items() if k != 'fields'}
+    assert 'fields' in ar._deleted_table_module('android', 'x', main, bad, {'x'})[1]
+
+
+def test_a_main_report_runs_with_its_deleted_reports():
+    """Choosing a main report runs its deleted-records reports right after
+    it, each once (artifact_viewer.with_deleted_reports)."""
+    import types
+    from artifact_viewer import with_deleted_reports
+    d1, d2 = types.ModuleType('w_del'), types.ModuleType('w_del_media')
+    w = types.SimpleNamespace(deleted_reports=[d1, d2])
+    other = types.SimpleNamespace()
+    got = with_deleted_reports([('w', w), ('other', other), ('w_del', d1)])
+    assert [n for n, _m in got] == ['w', 'w_del', 'w_del_media', 'other']

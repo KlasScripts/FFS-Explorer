@@ -56,6 +56,7 @@ def scan_parser(path: str) -> dict:
     src = open(path, encoding="utf-8").read()
     tree = ast.parse(src)
     mod = {}
+    deleted_tables = []
     for node in tree.body:
         if (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in _MODULE_KEYS):
@@ -63,6 +64,12 @@ def scan_parser(path: str) -> dict:
                 mod[node.targets[0].id] = ast.literal_eval(node.value)
             except Exception:
                 mod[node.targets[0].id] = "<expr>"
+        elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "deleted_tables"):
+            try:
+                deleted_tables = ast.literal_eval(node.value)
+            except Exception:
+                deleted_tables = []
     funcs = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name != "run":
@@ -81,7 +88,7 @@ def scan_parser(path: str) -> dict:
                     shared.add(a.name)
     if re.search(r'with_name\("\w+\.py"\)', src):
         shared.update(f"{m} (loaded from sibling parser)" for m in re.findall(r'with_name\("(\w+)\.py"\)', src))
-    return {"mod": mod, "funcs": funcs, "shared": sorted(shared),
+    return {"mod": mod, "funcs": funcs, "shared": sorted(shared), "deleted_tables": deleted_tables,
             "formats": [label for label, rx in FORMATS if re.search(rx, _code_only(src), re.M)],
             "lines": src.count("\n")}
 
@@ -92,8 +99,20 @@ def scan_all() -> dict:
         folder = os.path.join(ROOT, "artifacts", plat)
         for f in sorted(os.listdir(folder)):
             if f.endswith(".py") and not f.startswith("_"):
-                out[f"{plat}/{f[:-3]}"] = scan_parser(os.path.join(folder, f))
-    return out
+                p = out[f"{plat}/{f[:-3]}"] = scan_parser(os.path.join(folder, f))
+                # a deleted-records report declared in this report's
+                # deleted_tables (A-95, 2026-11-27): a report of its own
+                for e in p["deleted_tables"]:
+                    m = {k: e[k] for k in ("name", "category", "app_group_label") if k in e}
+                    for k in ("app_path", "app_group", "app_bundle_id"):
+                        if k in p["mod"]:
+                            m[k] = p["mod"][k]
+                    m["declared_in"] = f[:-3]
+                    m.setdefault("category", p["mod"].get("category"))
+                    out[f"{plat}/{e['script']}"] = {"mod": m, "funcs": {}, "shared": [],
+                                                    "deleted_tables": [], "formats": ["SQLite"],
+                                                    "lines": 0}
+    return dict(sorted(out.items()))
 
 
 def _categories() -> dict:
@@ -148,10 +167,13 @@ def render(parsers: dict) -> str:
                 continue
             script = key.split("/", 1)[1]
             m = p["mod"]
-            cat = m.get("category") or (cats.get(plat, {}).get(script) or {}).get("category", "—")
+            cat = (m.get("category") or (cats.get(plat, {}).get(script) or {}).get("category")
+                   or (cats.get(plat, {}).get(m.get("declared_in")) or {}).get("category", "—"))
             src = ("device-wide" if m.get("device_wide") else
                    m.get("app_path") or m.get("app_group") or m.get("app_bundle_id") or "—")
-            lines.append(f"| `{script}` | {m.get('name', '—')} | {cat} | `{src}` | "
+            shown = (f"`{script}` (in `{m['declared_in']}.py`)" if m.get("declared_in")
+                     else f"`{script}`")
+            lines.append(f"| {shown} | {m.get('name', '—')} | {cat} | `{src}` | "
                          f"{', '.join(p['formats']) or '—'} | "
                          f"{', '.join(f'`{s}`' for s in p['shared']) or '—'} | {len(p['funcs'])} |")
         lines.append("")

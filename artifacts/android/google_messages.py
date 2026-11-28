@@ -232,3 +232,158 @@ def run(paths):
 
     conn.close()
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'google_messages_deleted',
+  'name': 'Google Messages — Deleted & Changed Messages',
+  'description': 'Deleted and changed Google Messages message records from bugle_db (table '
+                 "messages). A message's text and attachments are not in this table but in "
+                 'parts rows: deleted and changed parts are in Google Messages — Deleted & '
+                 'Changed Parts. Live messages are in Google Messages (SMS/MMS/RCS); deleted '
+                 'conversations from the audit tables are in Google Messages — Recovered '
+                 '(deleted conversations).\n'
+                 '\n'
+                 'Each row is one record as found in the messages table, never joined to '
+                 'another table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says '
+                 'Deleted (no longer in the table), Changed (an earlier version of a row still '
+                 'there, listed only when one of the columns that matter changed, with the '
+                 'current value beside it as "(now)") or an unfinished write/delete under a '
+                 'hot journal. How found says how each record was recovered and how sure that '
+                 'is; a record found by pattern has no row id. Values are as stored: no code '
+                 'is turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'Times are Unix milliseconds, as in the Google Messages report.\n'
+                 '\n'
+                 "linked_parts: where this message's parts (its text and attachments) were "
+                 'found. Each parts row names its message in parts.message_id, so the link is '
+                 "made by finding the parts rows whose message_id is this record's message_id, "
+                 'in the table now (live, with their row ids) and in the records Google '
+                 'Messages — Deleted & Changed Parts finds (recovered, with their row ids); a '
+                 'message can have several (up to 3 on the test images) or none (178 of 1,278 '
+                 'live messages on the Josh Hickman image). Only ids are compared: no value of '
+                 'a part is brought in. How the link can be wrong: messages._id and parts._id '
+                 'are AUTOINCREMENT (checked 2026-11-27 on the Josh Hickman and CTF26 Android '
+                 '14 images), so SQLite does not hand out an id again, but an app that '
+                 're-inserts rows with their old ids (a restore from backup) can still put a '
+                 'different record under the same id; an earlier version found in the WAL and '
+                 'a live row with the same id were stored at different times; a record found '
+                 'by pattern has no row id and cannot be linked to by id; several copies of '
+                 'one record can carry the same id.\n'
+                 '\n'
+                 'Checked 2026-11-21 on the Josh Hickman Android 14 image: 0 records. Found '
+                 'earlier (carried over from the Google Messages report): bugle_db has PRAGMA '
+                 'secure_delete = FAST; the freed page ranges were all zero on a database '
+                 'known to have a deleted conversation. A real negative for recovery, not '
+                 'evidence nothing was deleted.',
+  'timestamp_fields': {'sent_timestamp': 'ms', 'received_timestamp': 'ms'},
+  'core_fields': ['status',
+                  'received_timestamp',
+                  'sent_timestamp',
+                  'mms_subject',
+                  'linked_parts',
+                  'changed_fields',
+                  'how_found',
+                  'copies'],
+  'file_key': 'bugle_db',
+  'table': 'messages',
+  'label': 'Message',
+  'fields': {'_id': 'message_id',
+             'conversation_id': 'conversation_id',
+             'sender_id': 'sender_id',
+             'sent_timestamp': 'sent_timestamp',
+             'received_timestamp': 'received_timestamp',
+             'message_protocol': 'message_protocol',
+             'message_status': 'message_status',
+             'mms_subject': 'mms_subject',
+             'sms_message_uri': 'sms_message_uri',
+             'rcs_message_id': 'rcs_message_id'},
+  'version_fields': ['conversation_id', 'sender_id', 'message_protocol', 'mms_subject'],
+  'links': [{'name': 'linked_parts',
+             'what': 'parts',
+             'column': '_id',
+             'table': 'parts',
+             'key': 'message_id',
+             'report': 'google_messages_deleted_parts'}]},
+ {'script': 'google_messages_deleted_parts',
+  'name': 'Google Messages — Deleted & Changed Parts',
+  'description': 'Deleted and changed Google Messages parts records from bugle_db (table '
+                 "parts: a message's text and each of its attachments is a parts row). Live "
+                 'messages are in Google Messages (SMS/MMS/RCS); deleted and changed message '
+                 'records (table messages) are in Google Messages — Deleted & Changed '
+                 'Messages.\n'
+                 '\n'
+                 'Each row is one record as found in the parts table, never joined to another '
+                 'table (ASSUMPTIONS.md A-95): ids are the stored ids. Status says Deleted (no '
+                 'longer in the table), Changed (an earlier version of a row still there, '
+                 'listed only when one of the columns that matter changed, with the current '
+                 'value beside it as "(now)") or an unfinished write/delete under a hot '
+                 'journal. How found says how each record was recovered and how sure that is; '
+                 'a record found by pattern has no row id. Values are as stored: no code is '
+                 'turned into a word here unless it was checked against a test image.\n'
+                 '\n'
+                 'timestamp is Unix milliseconds, as in the Google Messages report.\n'
+                 '\n'
+                 'linked_message: where the message this part belongs to was found. '
+                 'parts.message_id holds the _id of its messages row, so the link is made by '
+                 'comparing the two, in the table now (live: the message is in Google '
+                 'Messages) and in the records Google Messages — Deleted & Changed Messages '
+                 'finds (recovered, with its row id). Every live part names a live message on '
+                 'the test images (2026-11-27). Only ids are compared: no value of the message '
+                 'is brought in. How the link can be wrong: messages._id and parts._id are '
+                 'AUTOINCREMENT (checked 2026-11-27 on the Josh Hickman and CTF26 Android 14 '
+                 'images), so SQLite does not hand out an id again, but an app that re-inserts '
+                 'rows with their old ids (a restore from backup) can still put a different '
+                 'record under the same id; an earlier version found in the WAL and a live row '
+                 'with the same id were stored at different times; a record found by pattern '
+                 'has no row id and cannot be linked to by id; several copies of one record '
+                 'can carry the same id.\n'
+                 '\n'
+                 'Also listed: live parts rows whose message is gone (status Orphaned): not '
+                 'deleted, so not recovered, and not in the main report, which lists a row '
+                 'only with its message. linked_message says whether that message was '
+                 'recovered. None on the test image checked (2026-11-21).\n'
+                 '\n'
+                 'Checked 2026-11-21 on the Josh Hickman Android 14 image: 0 records. bugle_db '
+                 'has PRAGMA secure_delete = FAST (carried over from the Google Messages '
+                 'report).',
+  'timestamp_fields': {'timestamp': 'ms'},
+  'core_fields': ['status',
+                  'timestamp',
+                  'message',
+                  'content_type',
+                  'file_name',
+                  'linked_message',
+                  'changed_fields',
+                  'message (now)',
+                  'how_found',
+                  'copies'],
+  'file_key': 'bugle_db',
+  'table': 'parts',
+  'label': 'Part (text or attachment)',
+  'fields': {'_id': 'part_id',
+             'message_id': 'message_id',
+             'conversation_id': 'conversation_id',
+             'text': 'message',
+             'content_type': 'content_type',
+             'uri': 'uri',
+             'file_name': 'file_name',
+             'file_size_bytes': 'file_size',
+             'timestamp': 'timestamp',
+             'latitude': 'latitude',
+             'longitude': 'longitude',
+             'local_cache_path': 'local_cache_path'},
+  'orphan_of': {'column': 'message_id', 'in': ['messages', '_id']},
+  'version_fields': ['text', 'content_type', 'uri', 'file_name'],
+  'links': [{'name': 'linked_message',
+             'what': 'message',
+             'column': 'message_id',
+             'table': 'messages',
+             'key': '_id',
+             'report': 'google_messages_deleted'}]}]

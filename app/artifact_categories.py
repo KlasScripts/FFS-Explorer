@@ -54,6 +54,10 @@ def categories() -> list:
 def classify(platform: str, script_name: str, mod=None) -> tuple:
     """(category, app or None) for one report."""
     entry = (_load().get(platform) or {}).get(script_name) or {}
+    if not entry and getattr(mod, 'deleted_table_of', None):
+        # a deleted-records report declared in its main report's
+        # deleted_tables is listed beside that report (A-95, 2026-11-27)
+        entry = (_load().get(platform) or {}).get(mod.deleted_table_of) or {}
     cat = getattr(mod, 'category', None) or entry.get("category")
     app = getattr(mod, 'app_group_label', None) or entry.get("app")
     if cat not in (_load().get("categories") or []):

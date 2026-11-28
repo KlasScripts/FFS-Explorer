@@ -201,3 +201,186 @@ def run(paths):
             "source_table": "chat_history",
         })
     return out
+
+
+# Deleted and changed records, one report per table (ASSUMPTIONS.md A-95:
+# declared here, 2026-11-27). Each entry is its own report, named by
+# "script", made by artifact_runner._deleted_table_module and run
+# whenever this report runs, on the files it extracted. The keys are
+# recovered_records keys (artifact_runner, above recovered_records_report)
+# plus the report's own: name, description, core_fields, timestamp_fields.
+# Never joined to other tables; links compare ids only.
+deleted_tables = [{'script': 'line_deleted',
+  'name': 'LINE — Deleted & Changed Messages',
+  'description': 'Deleted and changed LINE messages from naver_line (table chat_history: the '
+                 'message and its attachment fields are in the same row). Live messages are in '
+                 "Line; messages kept only in LINE's full-text search index are in LINE — "
+                 'Recovered (full-text search index).\n'
+                 '\n'
+                 'Each row is one record as found in one table, never joined to another table '
+                 '(ASSUMPTIONS.md A-95): ids are the stored ids, and a message and its media '
+                 'are separate rows. Status says Deleted (no longer in the table), Changed (an '
+                 'earlier version of a row still there, listed only when one of the columns '
+                 'that matter changed, with the current value beside it as "(now)") or an '
+                 'unfinished write/delete under a hot journal. How found says how each record '
+                 'was recovered and how sure that is; a record found by pattern has no row id. '
+                 'Values are as stored: no code is turned into a word here unless it was '
+                 'checked against a test image.\n'
+                 '\n'
+                 'created_time and delivered_time are Unix milliseconds, as in the Line '
+                 'report.\n'
+                 '\n'
+                 'Checked 2026-11-21 on the Josh Hickman Android 14 image: 0 records. Found '
+                 'earlier (carried over from the Line report): on the extraction it was built '
+                 'against naver_line has no WAL and its live pages held nothing recoverable; '
+                 'the one deleted message there survived only in the full-text-search index '
+                 '(see LINE — Recovered (full-text search index)).',
+  'timestamp_fields': {'created_time': 'ms', 'delivered_time': 'ms'},
+  'core_fields': ['status',
+                  'created_time',
+                  'message',
+                  'attachment_type',
+                  'changed_fields',
+                  'message (now)',
+                  'how_found',
+                  'copies'],
+  'file_key': 'naver_line',
+  'table': 'chat_history',
+  'label': 'Message',
+  'fields': {'id': 'message_id',
+             'server_id': 'server_id',
+             'chat_id': 'chat_id',
+             'from_mid': 'from_mid',
+             'type': 'type',
+             'content': 'message',
+             'created_time': 'created_time',
+             'delivered_time': 'delivered_time',
+             'status': 'message_status',
+             'attachement_type': 'attachment_type',
+             'attachement_local_uri': 'attachment_local_uri',
+             'location_name': 'location_name',
+             'location_latitude': 'location_latitude',
+             'location_longitude': 'location_longitude'},
+  'version_fields': ['content', 'from_mid', 'chat_id', 'type', 'attachement_local_uri'],
+  'hidden_fields': ['recovered',
+                    'recovery_method',
+                    'recovery_version',
+                    'source_table',
+                    'source_file_key',
+                    'raw_rowid',
+                    'raw_page',
+                    'raw_file',
+                    'raw_offset',
+                    'raw_length',
+                    'source',
+                    'table_certain',
+                    'copy_locations']},
+ {'script': 'line_fts',
+  'name': 'LINE — Recovered message text (full-text search index)',
+  'description': "Deleted and changed message texts in LINE's full-text-search index (table "
+                 'fts_message_content: docid, the message id, and its text). Which '
+                 'conversation each belongs to is in LINE — Recovered message conversations '
+                 '(full-text search index).\n'
+                 '\n'
+                 "LINE's separate full-text-search index of message bodies "
+                 '(unencrypted_test_full_text_search_message.db) is independent of the '
+                 'chat_history table the "Line" report reads. The index keeps only message '
+                 'text and which conversation it belongs to: no time, no sender, no direction; '
+                 'do not infer those for a row here, they are not in this source.\n'
+                 '\n'
+                 'Each row is one record as found in one table, never joined (ASSUMPTIONS.md '
+                 'A-95). How found says how each record was recovered and how sure that is; '
+                 'damaged says why a record is not whole.\n'
+                 '\n'
+                 'linked_conversation: where the message_chat_relation row for this message id '
+                 'was found: live, recovered (with its row id) or not found.\n'
+                 'The two index tables share an id: fts_message_content.docid = '
+                 'message_chat_relation.message_id = chat_history.id in naver_line. Only ids '
+                 'are compared: no value of the other row is brought in. How the link can be '
+                 "wrong: the id is LINE's own message id, written by the app, not a counter of "
+                 'this database, and whether LINE ever reuses one was not checked; an earlier '
+                 'version found in the WAL and a live row with the same id were stored at '
+                 'different times; a record found by pattern has no row id and cannot be '
+                 'linked.\n'
+                 '\n'
+                 'Checked on the Josh Hickman Android 14 image (carried over): one message '
+                 'deleted from chat_history (no trace left there) is still here, from the '
+                 "index's WAL history (its text in fts_message_content, its conversation in "
+                 'message_chat_relation); a row-level match confirmed the text and '
+                 'conversation id line up exactly with the gap in chat_history. Deleted '
+                 'messages from chat_history itself are in LINE — Deleted & Changed Messages.',
+  'files': {'main': 'databases/unencrypted_test_full_text_search_message.db'},
+  'core_fields': ['status',
+                  'message_id',
+                  'message',
+                  'linked_conversation',
+                  'changed_fields',
+                  'message (now)',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'file_key': 'main',
+  'table': 'fts_message_content',
+  'label': 'Message text (index)',
+  'fields': {'docid': 'message_id', 'c0formatted_message': 'message'},
+  'version_fields': ['c0formatted_message'],
+  'links': [{'name': 'linked_conversation',
+             'what': 'conversation',
+             'column': 'docid',
+             'table': 'message_chat_relation',
+             'key': 'message_id',
+             'report': 'line_fts_chat_relation'}]},
+ {'script': 'line_fts_chat_relation',
+  'name': 'LINE — Recovered message conversations (full-text search index)',
+  'description': 'Deleted and changed records of which conversation a message belongs to, in '
+                 "LINE's full-text-search index (table message_chat_relation: message_id and "
+                 'chat_id). The message texts are in LINE — Recovered message text (full-text '
+                 'search index).\n'
+                 '\n'
+                 "LINE's separate full-text-search index of message bodies "
+                 '(unencrypted_test_full_text_search_message.db) is independent of the '
+                 'chat_history table the "Line" report reads. The index keeps only message '
+                 'text and which conversation it belongs to: no time, no sender, no direction; '
+                 'do not infer those for a row here, they are not in this source.\n'
+                 '\n'
+                 'Each row is one record as found in one table, never joined (ASSUMPTIONS.md '
+                 'A-95). How found says how each record was recovered and how sure that is; '
+                 'damaged says why a record is not whole.\n'
+                 '\n'
+                 'linked_text: where the fts_message_content row for this message id was '
+                 'found: live, recovered (with its row id) or not found.\n'
+                 'The two index tables share an id: fts_message_content.docid = '
+                 'message_chat_relation.message_id = chat_history.id in naver_line. Only ids '
+                 'are compared: no value of the other row is brought in. How the link can be '
+                 "wrong: the id is LINE's own message id, written by the app, not a counter of "
+                 'this database, and whether LINE ever reuses one was not checked; an earlier '
+                 'version found in the WAL and a live row with the same id were stored at '
+                 'different times; a record found by pattern has no row id and cannot be '
+                 'linked.\n'
+                 '\n'
+                 'Checked on the Josh Hickman Android 14 image (carried over): one message '
+                 'deleted from chat_history (no trace left there) is still here, from the '
+                 "index's WAL history (its text in fts_message_content, its conversation in "
+                 'message_chat_relation); a row-level match confirmed the text and '
+                 'conversation id line up exactly with the gap in chat_history. Deleted '
+                 'messages from chat_history itself are in LINE — Deleted & Changed Messages.',
+  'files': {'main': 'databases/unencrypted_test_full_text_search_message.db'},
+  'core_fields': ['status',
+                  'message_id',
+                  'chat_id',
+                  'linked_text',
+                  'changed_fields',
+                  'damaged',
+                  'how_found',
+                  'copies'],
+  'file_key': 'main',
+  'table': 'message_chat_relation',
+  'label': "Message's conversation (index)",
+  'fields': {'message_id': 'message_id', 'chat_id': 'chat_id'},
+  'version_fields': ['chat_id'],
+  'links': [{'name': 'linked_text',
+             'what': 'message text',
+             'column': 'message_id',
+             'table': 'fts_message_content',
+             'key': 'docid',
+             'report': 'line_fts'}]}]

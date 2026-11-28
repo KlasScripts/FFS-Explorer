@@ -79,11 +79,17 @@ def test_rows_and_filters(tmp_path):
 
 
 def test_declaration_only_parser_gets_a_run(tmp_path):
-    """The loader gives such a parser its run() and a record_source."""
+    """The loader gives such a parser its run() and a record_source; one
+    declared in its main report's deleted_tables is its own report, one
+    table each, run with the main report (A-95, 2026-11-27)."""
     mods = dict(ar.load_artifacts('ios')[0])
     m = mods['line_deleted_messages']
     assert callable(m.run)
-    assert [e['table'] for e in m.record_source] == ['ZMESSAGE', 'ZCHAT']
+    assert [e['table'] for e in m.record_source] == ['ZMESSAGE']
+    assert [d.__name__ for d in mods['line'].deleted_reports] == [
+        'line_deleted_messages', 'line_deleted_chats', 'line_deleted_users']
+    assert mods['line_deleted_chats'].files_folder == mods['line'].name
+    assert 'damaged' in m.core_fields
 
 
 def test_derived_lookup_of_the_local_users_ids(tmp_path):

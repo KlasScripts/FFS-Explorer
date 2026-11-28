@@ -63,9 +63,12 @@ the same-day comparison with FQLite and DC3 sqlite_dissect in its header).
 
 A record equal to the committed or checkpoint version of its row is never
 returned, nor a pattern match equal to a live row: those are copies, not
-lost data (counted in the notes). Nothing is dropped for being doubtful;
-it is labelled ('table_certain', 'truncated', the report's confidence
-gate). WITHOUT ROWID tables are not carved.
+lost data (counted in the notes). A record whose table is not certain is
+kept only when it fits this table's own record pattern and no other
+table's (owner decision 2026-11-27, A-95; the rest counted in the notes);
+otherwise nothing is dropped for being doubtful: it is labelled
+('table_certain', 'truncated', 'partly_overwritten'). WITHOUT ROWID tables
+are not carved.
 
 RECOVERY_VERSION changes whenever what a given set of bytes yields changes
 (discovery, decoding, attribution or labels), so cached results made by an
@@ -81,7 +84,7 @@ from dataclasses import dataclass, field
 import sqlite_carve as sc
 import sqlite_reader
 
-RECOVERY_VERSION = 14
+RECOVERY_VERSION = 15
 
 CERTAIN_METHODS = {'checkpoint_deleted', 'checkpoint_older', 'wal_frame', 'freeblock',
                    'page_gap', 'unfinished_write'}
@@ -232,6 +235,50 @@ def _type_allowed(t: int, affinity: str) -> bool:
     return True
 
 
+def _template_fits(types: list, tpl: dict | None) -> bool:
+    """Serial types fit a table's declared column types (_schema_template):
+    the rowid alias stored as NULL, no NULL in a NOT NULL column, each other
+    type one the column's affinity allows."""
+    if tpl is None or len(types) != tpl['ncols']:
+        return False
+    for i, ty in enumerate(types):
+        if i == tpl['id_idx']:
+            if ty != 0:
+                return False
+        elif ty == 0:
+            if i in tpl['notnull']:
+                return False
+        elif not _type_allowed(ty, tpl['affinity'][i]):
+            return False
+    return True
+
+
+def table_shapes(conn: sqlite3.Connection) -> list[dict]:
+    """Every rowid table of the database on *conn*: name, root page, column
+    count and its declared-type template, for FileRecovery's rule that a
+    record whose table is not certain fits no other table."""
+    out = []
+    try:
+        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    except sqlite3.Error:
+        return out
+    for name in names:
+        try:
+            root = _root(conn, name)
+            if root is None:
+                continue
+            columns = sc.record_column_names(conn, name)
+            id_col = sc.rowid_alias_column(conn, name)
+            notnull = sc.notnull_columns(conn, name) - ({id_col} if id_col else set())
+            declared = [r[2] or '' for r in conn.execute(f'PRAGMA table_info("{name}")')]
+        except sqlite3.Error:
+            continue
+        t = TableInfo(name, columns, id_col, root, {}, None, None, notnull, declared)
+        out.append({'name': name, 'root': root, 'ncols': len(columns),
+                    'tpl': FileRecovery._schema_template(t, need_text=False)})
+    return out
+
+
 def _h(image: bytes) -> bytes:
     return hashlib.blake2b(image, digest_size=16).digest()
 
@@ -252,8 +299,11 @@ class FileRecovery:
     *main* (a -wal applied or a hot journal rolled back), else None."""
 
     def __init__(self, main: bytes, wal: bytes | None = None, journal: bytes | None = None,
-                 committed: bytes | None = None):
+                 committed: bytes | None = None, shapes: list | None = None):
         self.main = main
+        # every table of the database (table_shapes): for the rule that a
+        # record whose table is not certain must fit no other table
+        self.shapes = shapes
         self.wal = wal if wal and sqlite_reader.is_wal(wal) else None
         self.journal = journal or None
         self.committed = committed if committed and committed != main else None
@@ -458,14 +508,18 @@ class FileRecovery:
             self._memo[key] = cells
         return self._memo[key]
 
-    def _free_space_cells(self, page_no: int, image: bytes) -> list[dict]:
-        key = ('free', page_no, _h(image))
+    def _free_space_cells(self, page_no: int, image: bytes, ncols: int | None = None) -> list[dict]:
+        """Cells found by trying every free byte; with *ncols*, only those
+        with exactly that many columns (all records() keeps), which skips
+        the rest without decoding them."""
+        key = ('free', page_no, _h(image), ncols)
         if key not in self._memo:
             ho = 100 if page_no == 1 else 0
             out = []
             if len(image) > ho and image[ho] == sc._LEAF_TABLE_PAGE:
                 for start, end, kind in sc._free_byte_ranges(image, ho):
-                    out.extend(sc._brute_force_records(image[start:end], start, page_no, kind))
+                    out.extend(sc._brute_force_records(image[start:end], start, page_no, kind,
+                                                       ncols=ncols))
             self._memo[key] = out
         return self._memo[key]
 
@@ -514,6 +568,56 @@ class FileRecovery:
                 out.append(dict(o, types=types, values=list(values), truncated=truncated))
             self._memo['overflow'] = out
         return self._memo['overflow']
+
+    def _pattern(self, shape: dict) -> dict:
+        """{'sig': signature or None, 'tpl': declared-type template} of one
+        table of this database (a table_shapes entry): its record pattern
+        learned from its own leaf pages (sample_header_signature: five or
+        more live rows), and its declared column types."""
+        key = ('pattern', shape['name'])
+        if key not in self._memo:
+            raw = self.committed or self.main
+            sig = None
+            if shape.get('root'):
+                try:
+                    leaves = sc.walk_table_leaf_pages(raw, self.page_size, shape['root'],
+                                                      self._wal_images())
+                    present = [p for p in leaves if len(self._page(raw, p)) == self.page_size]
+                    sig = sc.sample_header_signature(raw, self.page_size, present)
+                except Exception:
+                    sig = None
+            if not (sig and sig['anchors'] and sig['length'] == shape['ncols']):
+                sig = None
+            self._memo[key] = {'sig': sig, 'tpl': shape.get('tpl')}
+        return self._memo[key]
+
+    def _leaf_owners(self, page_no: int) -> set:
+        """The tables whose leaf *page_no* is in the main file (the database
+        at the last checkpoint) and in the committed view."""
+        if 'leaf_owners' not in self._memo:
+            maps = [self._owners_at(-1)]
+            frames = [f for f in self._wal_frames() if not f['older_wal'] and f['is_commit']]
+            if frames:
+                maps.append(self._owners_at(frames[-1]['frame_index']))
+            self._memo['leaf_owners'] = maps
+        return {m[page_no] for m in self._memo['leaf_owners'] if page_no in m}
+
+    def _other_tables_fitting(self, name: str, types: list) -> list[str]:
+        """The other tables of this database whose record pattern *types*
+        fits: the same column count and their pattern learned from live
+        rows, or, for a table with no such pattern, their declared column
+        types. [] when the tables are not known (no shapes)."""
+        out = []
+        for shape in self.shapes or ():
+            if shape['name'] == name or shape['ncols'] != len(types):
+                continue
+            pat = self._pattern(shape)
+            if pat['sig'] is not None:
+                if sc._matches_signature(types, pat['sig']):
+                    out.append(shape['name'])
+            elif _template_fits(types, pat['tpl']):
+                out.append(shape['name'])
+        return out
 
     def leaves(self, t: TableInfo) -> set:
         """This table's leaf pages in main and in committed (a table created
@@ -564,8 +668,40 @@ class FileRecovery:
         out: list[dict] = []
         seen: set = set()
         skipped = {'live_copy': 0, 'implausible_text': 0, 'ambiguous_rebuild': 0,
-                   'wrong_shape': 0}
+                   'wrong_shape': 0, 'not_own_pattern': 0, 'other_table': 0}
+        other_names: set = set()
         shape = _shape(list(live.values()) + list(before.values()), ncols)
+        # This table's own record pattern, learned from its live rows. Used
+        # for records found where the page's table is not proven (A-95).
+        free_sig = None
+        try:
+            present = [p for p in leaves if len(self._page(self.committed or self.main, p)) == self.page_size]
+            free_sig = sc.sample_header_signature(self.committed or self.main, self.page_size, present)
+        except Exception:
+            free_sig = None
+        # No pattern (a wiped table): only when no other table in the database
+        # has this many columns, and the record's types fit the declared
+        # column types (iPhone Viber / Life360 messages: their table had been
+        # emptied, the only 23-column table, Josh Hickman ground truth).
+        has_sig = bool(free_sig and free_sig['anchors'] and free_sig['length'] == ncols)
+        free_tpl = None if has_sig else (self._schema_template(t, need_text=False)
+                                         if t.same_width == 1 else None)
+
+        def free_ok(types):
+            if has_sig:
+                return sc._matches_signature(types, free_sig)
+            if free_tpl is None or len(types) != ncols:
+                return False
+            for i, ty in enumerate(types):
+                if i == free_tpl['id_idx']:
+                    if ty != 0:
+                        return False
+                elif ty == 0:
+                    if i in free_tpl['notnull']:
+                        return False
+                elif not _type_allowed(ty, free_tpl['affinity'][i]):
+                    return False
+            return True
 
         def odd(v):
             """Mechanical signs of random bytes: text that was not valid
@@ -605,6 +741,30 @@ class FileRecovery:
 
         def empty(vals):
             return all(v in (None, '', b'') for i, v in enumerate(vals) if i != id_idx)
+
+        def fits_other(types) -> bool:
+            others = self._other_tables_fitting(t.name, list(types or ()))
+            if others:
+                skipped['other_table'] += 1
+                other_names.update(others)
+                return True
+            return False
+
+        def tight_ok(types, values) -> bool:
+            """A record whose table is not certain (a rollback-journal page,
+            a freed page, a WAL frame of an earlier WAL round, overflow found
+            from a freed page) is kept only when it fits this table's own
+            record pattern (free_ok: learned from five or more live rows, or
+            for a table with none, its declared column types when no other
+            table has as many columns), holds in every column the kind of
+            value the live rows hold there (shape_ok), and fits no other
+            table of the database (owner decision 2026-11-27, A-95)."""
+            if not free_ok(types or []):
+                skipped['not_own_pattern'] += 1
+                return False
+            if not shape_ok(values):
+                return False
+            return not fits_other(types)
 
         def plausible(values) -> bool:
             """The checks a carved record must pass, without counting: not
@@ -652,7 +812,7 @@ class FileRecovery:
             r['partly_overwritten'] = any(isinstance(v, str) and '\x00' in v for v in values)
             out.append(r)
 
-        def keep(method, cell, file, base, carved=False, **extra):
+        def keep(method, cell, file, base, carved=False, tight=False, **extra):
             values = list(cell['values'])
             if len(values) != ncols:
                 return
@@ -667,6 +827,10 @@ class FileRecovery:
             if live.get(rowid) == version or before.get(rowid) == version:
                 return
             if (rowid, version) in seen:
+                return
+            # checked after the copies above, so its count in the notes is
+            # of records that would otherwise have been listed
+            if tight and not tight_ok(cell.get('types'), values):
                 return
             seen.add((rowid, version))
             found_noid.append(version)
@@ -697,7 +861,7 @@ class FileRecovery:
             if f['page'] not in leaves:
                 continue
             for c in guarded(self._cells, f['page'], f['image']):
-                keep('wal_frame', c, 'wal', f['frame_offset'] + 24,
+                keep('wal_frame', c, 'wal', f['frame_offset'] + 24, tight=f['older_wal'],
                      older_wal=f['older_wal'], frame_index=f['frame_index'])
 
         # WAL frames of a page that is free now but was one of this table's
@@ -732,35 +896,6 @@ class FileRecovery:
         # pattern, learned from its live rows: a table with fewer than five
         # live rows (no pattern) gets none of these.
         in_use = self._pages_in_use()
-        free_sig = None
-        try:
-            present = [p for p in leaves if len(self._page(self.committed or self.main, p)) == self.page_size]
-            free_sig = sc.sample_header_signature(self.committed or self.main, self.page_size, present)
-        except Exception:
-            free_sig = None
-        # No pattern (a wiped table): only when no other table in the database
-        # has this many columns, and the record's types fit the declared
-        # column types (iPhone Viber / Life360 messages: their table had been
-        # emptied, the only 23-column table, Josh Hickman ground truth).
-        has_sig = bool(free_sig and free_sig['anchors'] and free_sig['length'] == ncols)
-        free_tpl = None if has_sig else (self._schema_template(t, need_text=False)
-                                         if t.same_width == 1 else None)
-
-        def free_ok(types):
-            if has_sig:
-                return sc._matches_signature(types, free_sig)
-            if free_tpl is None or len(types) != ncols:
-                return False
-            for i, ty in enumerate(types):
-                if i == free_tpl['id_idx']:
-                    if ty != 0:
-                        return False
-                elif ty == 0:
-                    if i in free_tpl['notnull']:
-                        return False
-                elif not _type_allowed(ty, free_tpl['affinity'][i]):
-                    return False
-            return True
         if has_sig or free_tpl:
             for f in self._wal_frames():
                 if f['page'] in leaves or f['page'] in in_use:
@@ -774,7 +909,7 @@ class FileRecovery:
                 for c in guarded(self._cells, f['page'], f['image']):
                     if not free_ok(c.get('types') or []):
                         continue
-                    keep('wal_frame', c, 'wal', f['frame_offset'] + 24, carved=True,
+                    keep('wal_frame', c, 'wal', f['frame_offset'] + 24, carved=True, tight=True,
                          older_wal=f['older_wal'], frame_index=f['frame_index'],
                          table_certain=False, page_now_free=True)
 
@@ -783,7 +918,7 @@ class FileRecovery:
         for pno, image, off in journal:
             if pno in leaves:
                 for c in self._cells(pno, image):
-                    keep('journal', c, 'journal', off, table_certain=False)
+                    keep('journal', c, 'journal', off, tight=True, table_certain=False)
 
         # pages the unfinished change had written in the in-flight main file
         # (hot journal rolled back): every page whose main-file image is not
@@ -826,7 +961,7 @@ class FileRecovery:
         leaf_images = self._leaf_images(leaves)
         for source, pno, image in leaf_images:
             file, base = self._origin(source, pno, image)
-            for c in guarded(self._free_space_cells, pno, image):
+            for c in guarded(self._free_space_cells, pno, image, ncols):
                 keep(c['source'], c, file, base, carved=True,
                      in_unfinished_write=unfinished(source, pno))
 
@@ -842,7 +977,7 @@ class FileRecovery:
                 fi = (base - 24 - 32) // (24 + self.page_size)
                 if self._owner_when_written(fi, c['page'])[0]:
                     continue
-            keep('freed_page', c, file, base, carved=True, table_certain=False)
+            keep('freed_page', c, file, base, carved=True, tight=True, table_certain=False)
 
         # overflowing deleted records
         live_rows = list(live.values()) + list(before.values())
@@ -875,6 +1010,9 @@ class FileRecovery:
             if rowid is None and full and tuple(values) in live_set:
                 skipped['live_copy'] += 1
                 continue
+            certain = on_table and not src.startswith('freed_page')
+            if not certain and not tight_ok(o['types'][:ncols], values):
+                continue
             key = ('ovf', o['page'], o['offset'])
             if key in seen:
                 continue
@@ -891,7 +1029,7 @@ class FileRecovery:
             local, _ovf = sc._cell_local_payload_size(o.get('payload_len') or 0, usable)
             rec('overflow', rowid, values, file, offset, local + 4, o['page'],
                 truncated=not full, overflow_status=o.get('status'),
-                table_certain=on_table and not src.startswith('freed_page'),
+                table_certain=certain,
                 leaf_at_commit=leaf_at_commit)
 
         # record-pattern searches (no rowid): copies of live rows are dropped
@@ -910,7 +1048,7 @@ class FileRecovery:
             return any(without_id(list(v)[:n]) == version for v in found_noid)
 
         def keep_pattern(method, values, read, truncated, file, offset, length, page, page_off,
-                         in_unfinished_write=False):
+                         in_unfinished_write=False, types=None):
             if empty(values + [None] * (ncols - len(values))):
                 return
             if read < ncols and read < 2:
@@ -929,6 +1067,15 @@ class FileRecovery:
             if already_listed(version, read):
                 return
             if ('sig', read, version) in seen or ('ovf', page, page_off) in seen:
+                return
+            # found by pattern on a page that is also another table's leaf
+            # in the other image (main file or committed view): which
+            # table's free space it is is not known, so it must fit no other
+            # table (A-95, 2026-11-27). On a page only this table has, the
+            # page settles the table (SQLite Forensic Corpus 0C: two tables
+            # of one shape, every rebuilt record real).
+            if (types is not None and self._leaf_owners(page) - {t.name}
+                    and fits_other(types)):
                 return
             seen.add(('sig', read, version))
             rec(method, None, values, file, offset, length, page,
@@ -953,7 +1100,8 @@ class FileRecovery:
                     for m in guarded(self._schema_matches, pno, image, template):
                         keep_pattern('header_schema', m['values'], len(m['values']),
                                      m['truncated'], file, base + m['header_offset'], m['length'],
-                                     pno, m['header_offset'], unfinished(source, pno))
+                                     pno, m['header_offset'], unfinished(source, pno),
+                                     m.get('types'))
         rebuild_template = self._schema_template(t, need_text=False)
         for source, pno, image in leaf_images:
             sig = signatures.get(source) or signatures.get('main')
@@ -963,14 +1111,14 @@ class FileRecovery:
                     values = list(m['values'])[:ncols]
                     keep_pattern('header_signature', values, len(values), m['truncated'],
                                  file, base + m['header_offset'], m['length'], pno,
-                                 m['header_offset'], unfinished(source, pno))
+                                 m['header_offset'], unfinished(source, pno), m.get('types'))
             # overwritten headers: rebuilt from the live-row pattern when it
             # fixes the lost type, else from the declared column types
             for m in guarded(self._rebuilt_matches, pno, image, sig, ncols, skipped, plausible,
                              repr(shape), rebuild_template):
                 keep_pattern('header_rebuilt', m['values'], len(m['values']), m['truncated'],
                              file, base + m['cell_offset'], m['length'], pno, m['cell_offset'],
-                             unfinished(source, pno))
+                             unfinished(source, pno), m.get('types'))
 
         notes = []
         if damaged:
@@ -988,6 +1136,15 @@ class FileRecovery:
                          "text, blob, empty) this table's live rows never hold in that column, "
                          "text that is not valid UTF-8, or an impossible number, so are taken "
                          "to be random bytes, and are not listed.")
+        if skipped['not_own_pattern']:
+            notes.append(f"{skipped['not_own_pattern']} record(s) from a page whose table is not "
+                         "certain (rollback journal, freed page, an earlier WAL round, overflow) "
+                         "did not fit this table's record pattern, and are not listed.")
+        if skipped['other_table']:
+            notes.append(f"{skipped['other_table']} record(s) whose table is not certain also fit "
+                         f"another table ({', '.join(sorted(other_names)[:5])}"
+                         f"{' …' if len(other_names) > 5 else ''}), so are not given to this "
+                         "one, and are not listed.")
         if skipped['ambiguous_rebuild']:
             notes.append(f"{skipped['ambiguous_rebuild']} overwritten record header(s) could be "
                          "rebuilt more than one way and are not listed.")
@@ -1071,7 +1228,8 @@ class FileRecovery:
                         continue
                     seen_body.add(body_start)
                     out.append({'header_offset': offset, 'values': list(values), 'truncated': False,
-                                'length': header_len + sum(sc._serial_type_size(x) for x in types)})
+                                'length': header_len + sum(sc._serial_type_size(x) for x in types),
+                                'types': list(types)})
         self._memo[key] = out
         return out
 
@@ -1087,7 +1245,10 @@ class FileRecovery:
                     bounded = image[:end]
                     for offset in range(start, end):
                         try:
-                            types, header_len = sc.parse_record_header(bounded, offset)
+                            # a header with more columns than the signature
+                            # never matches it: stop reading there
+                            types, header_len = sc.parse_record_header(
+                                bounded, offset, max_cols=sig['length'])
                         except ValueError:
                             continue
                         if not sc._matches_signature(types, sig):
@@ -1103,7 +1264,8 @@ class FileRecovery:
                         if truncated:
                             length = min(length, end - offset)
                         out.append({'header_offset': offset, 'values': values,
-                                    'truncated': truncated, 'length': length})
+                                    'truncated': truncated, 'length': length,
+                                    'types': list(types)})
             self._memo[key] = out
         return self._memo[key]
 
@@ -1252,7 +1414,7 @@ class FileRecovery:
         if truncated or len(values) != ncols:
             return None
         return {'cell_offset': cell, 'values': list(values), 'truncated': False,
-                'length': cell_len}
+                'length': cell_len, 'types': list(types)}
 
 
 def for_connection(main: bytes, wal: bytes | None, journal: bytes | None,
@@ -1265,7 +1427,7 @@ def for_connection(main: bytes, wal: bytes | None, journal: bytes | None,
             committed = sqlite_reader.committed_image(conn)
         except Exception:
             committed = None
-    return FileRecovery(main, wal, journal, committed)
+    return FileRecovery(main, wal, journal, committed, table_shapes(conn))
 
 
 _DESCRIBE = {
@@ -1278,7 +1440,7 @@ _DESCRIBE = {
                           "moved to a page not yet written); never committed"),
     'freeblock': "",
     'page_gap': "",
-    'freed_page': "freed page; table not certain, matched by column count",
+    'freed_page': "freed page; table not certain, matched by this table's record pattern",
     'overflow': "overflowing record",
     'header_signature': "unverified match",
     'header_rebuilt': "record header rebuilt from this table's pattern; unverified match",
@@ -1293,7 +1455,7 @@ def describe(r: dict) -> str:
     text = _DESCRIBE.get(r['method'], r['method'])
     if r['method'] == 'wal_frame' and r.get('page_now_free'):
         text = ("version in the WAL of a page that is free now; table not certain, "
-                "matched by column count")
+                "matched by this table's record pattern")
     elif r['method'] == 'wal_frame' and r.get('older_wal'):
         text = "older version in an earlier WAL round; table not certain"
     if r.get('leaf_at_commit') is not None:
@@ -1312,6 +1474,30 @@ def describe(r: dict) -> str:
     if r.get('older_version') and r['method'] not in ('checkpoint_older',):
         text = (text + "; " if text else "") + "an earlier version of a row that is still live"
     return text
+
+
+def damage(r: dict) -> str:
+    """Why a recovered record is not whole, in plain words ('' when it is):
+    cut off, text partly overwritten, header rebuilt (one serial type taken
+    from the table's pattern or declared types), overflow chain incomplete.
+    Such records are kept and flagged, never cleaned up (owner decision
+    2026-11-27, A-95)."""
+    out = []
+    status = r.get('overflow_status') or 'complete'
+    if r['method'] == 'overflow' and status != 'complete':
+        out.append(f"overflow chain incomplete ({status})")
+    elif r.get('truncated'):
+        out.append("cut off: the record runs past the space it was found in")
+    if r.get('partly_overwritten'):
+        out.append("text partly overwritten (zero bytes in it)")
+    # a BLOB of 16 or more bytes that are all zero: its content was wiped
+    # (secure_delete zeroes freed bytes), only its length survives
+    if any(isinstance(v, (bytes, bytearray)) and len(v) >= 16 and not any(v)
+           for v in r.get('values') or ()):
+        out.append("a BLOB's bytes are all zero (wiped); only its length survived")
+    if r['method'] == 'header_rebuilt':
+        out.append("record header rebuilt: one column type taken from the table's pattern")
+    return '; '.join(out)
 
 
 # ── carving in a worker process (the Database tab) ──────────────────────────
@@ -1492,6 +1678,8 @@ def records_for_files(files: dict, table: str) -> tuple[list, list, int]:
     ck = (sqlite3.connect(f"file:{files['before']}?immutable=1", uri=True)
           if files.get('before') else None)
     try:
+        if fr.shapes is None:
+            fr.shapes = table_shapes(conn)
         t = table_info(conn, table, ck)
         if t is None:
             return [], [], 0
@@ -1507,6 +1695,73 @@ def records_in_process(files: dict, table: str) -> tuple[list, list, int]:
     """records_for_files() run in the worker process; blocks the calling
     (non-GUI) thread until done without holding the GIL."""
     return _pool().submit(records_for_files, files, table).result()
+
+
+class ReportCarver:
+    """One database file's recovered records for the deleted reports
+    (artifact_runner.recovered_records_report): kept results from
+    casecache.db when there are some, else carved in the worker process and
+    then kept, as the Database tab does, under the same key (path in the
+    archive, size and CRC of the file and its -wal and -journal), so either
+    reuses what the other carved. The worker keeps the file's FileRecovery
+    under that key, so the reports of one run, and their links, carve a
+    database once (A-95, 2026-11-27). records() runs on the calling thread
+    only while it waits for the worker, without holding Python's lock.
+    *ui_path*: the file's path in the archive (else its own path)."""
+
+    def __init__(self, db_path: str, ui_path: str | None = None, case_dir: str | None = None):
+        import os
+
+        def rd(p):
+            if not os.path.isfile(p):
+                return None
+            with open(p, 'rb') as f:
+                return f.read()
+        self.db_path, self.case_dir = db_path, case_dir
+        self._raw, self._wal, self._journal = rd(db_path), rd(db_path + '-wal'), rd(db_path + '-journal')
+        self.db_key = db_cache_key(ui_path or db_path, self._raw or b'', self._wal, self._journal)
+        self._tmp = None
+        self._files = None
+        self._memo: dict = {}
+        self.carved = 0          # tables carved here (not from the cache)
+
+    def _prepared(self) -> dict | None:
+        if self._files is None:
+            import tempfile
+            self._tmp = tempfile.mkdtemp(prefix='ffs-carve-')
+            got = recovery_files(self._raw, self._wal, self._journal, self._tmp)
+            self._files = False if got is None else dict(got[0], key=self.db_key)
+        return self._files or None
+
+    def records(self, table: str) -> tuple[list, list]:
+        """(records, notes) for *table*, as FileRecovery.records gives them."""
+        if table in self._memo:
+            return self._memo[table]
+        hit = cache_get(self.case_dir, self.db_key, table)
+        if hit is not None:
+            out = (hit[0], hit[1])
+        else:
+            files = self._prepared()
+            if files is None:
+                out = ([], [])
+            else:
+                try:
+                    recs, notes, ncols = records_in_process(files, table)
+                except Exception as exc:
+                    # the worker process could not run: carve here instead
+                    recs, notes, ncols = records_for_files(files, table)
+                    notes = list(notes) + [f"carved in this process ({type(exc).__name__})"]
+                self.carved += 1
+                cache_put(self.case_dir, self.db_key, table, recs, notes, ncols)
+                out = (recs, notes)
+        self._memo[table] = out
+        return out
+
+    def close(self):
+        if self._tmp:
+            import shutil
+            shutil.rmtree(self._tmp, ignore_errors=True)
+            self._tmp = None
 
 
 # ── kept results (casecache.db recovered_records) ───────────────────────

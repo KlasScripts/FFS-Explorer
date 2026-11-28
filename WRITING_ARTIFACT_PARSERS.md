@@ -22,6 +22,36 @@ ships with FFS Explorer itself. That's what "self-contained" means here:
 you could copy the one `.py` file to someone else's copy of this app and
 it would work.
 
+## Keep artifact scripts small
+
+Prefer a small set of reusable report patterns. Common examples are a
+SQLite database, a database with linked media or cache files, and a
+database with structured values inside a column. An artifact script
+should mainly declare the source files, the fields to extract and show,
+and which fields matter when comparing recovered and live records.
+
+Reuse shared code for opening databases and their sidecars, resolving
+media references, decoding structured values, and comparing recovered
+records. JSON, Apple plists, and protobuf can all occur inside database
+columns. Use an existing decoder or schema where available. For
+protobuf, use verified field numbers and types. Keep a small
+artifact-specific decoder for formats that need app-specific handling.
+For recovered records, the shared comparison uses decoded values for
+declared version fields and keeps distinct versions separate when
+grouping copies. A decoder should omit a field it could not read and
+return an empty value for a field it successfully read as empty. When
+a version field is unavailable and no other field confirms a change,
+the report shows the recovered row as `Comparison incomplete`.
+
+| Report pattern | Example in this repo |
+| --- | --- |
+| SQLite with ordinary columns | [Android Chrome Search](artifacts/android/chrome_search.py) opens the History database with the shared SQLite reader. |
+| SQLite with linked media or cache files | [iOS WhatsApp](artifacts/ios/whatsapp.py) exposes attachment paths through `link_fields` and `media_fields`. |
+| SQLite with JSON in a column | [Android Burner](artifacts/android/burner.py) uses `json_fields` to expose values from a JSON column in its recovery report. |
+| SQLite with an archived Apple plist in a BLOB | [iOS Instagram](artifacts/ios/instagram.py) uses the shared plist decoder and declares which decoded fields its recovery report uses. |
+| SQLite with protobuf in a BLOB | [Android Media Trash](artifacts/android/media_trash.py) reads known fields from `entity_blob` using its own protobuf helper. |
+| A standalone structured file | [Android Notification History](artifacts/android/notification_history.py) reads protobuf history files directly. |
+
 ## The fast way: ask the app to draft one
 
 FFS Explorer has a built-in AI-access feature (Tools → Enable AI Access)

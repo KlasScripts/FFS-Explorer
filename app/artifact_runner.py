@@ -2003,15 +2003,20 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             changed = []
             dec = decoded(vals)
             dlive = {}
+            unavailable = []
             if status == 'Changed':
                 changed = [c for c in (vf or ([] if dvf else t.columns))
                            if idx[c] < len(vals) and vals[idx[c]] != live[idx[c]]]
                 if dvf:
                     dlive = decoded(live)
-                    changed += [k for k in dvf if dec.get(k) != dlive.get(k)]
+                    unavailable = [k for k in dvf if k not in dec or k not in dlive]
+                    changed += [k for k in dvf
+                                if k in dec and k in dlive and dec[k] != dlive[k]]
                 if not changed:
-                    hidden[rowid] = hidden.get(rowid, 0) + 1
-                    continue
+                    if not unavailable:
+                        hidden[rowid] = hidden.get(rowid, 0) + 1
+                        continue
+                    status = 'Comparison incomplete'
             if any(idx[c] < len(vals) and vals[idx[c]] in pool
                    for c, (pool, _ot, _oc) in not_in.items() if c in idx):
                 known += 1
@@ -2021,12 +2026,18 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             # that rewrites by delete + insert leaves; A-95) is counted on
             # the row already listed, with its location, never dropped.
             key_cols = vf or t.columns
+            decoded_key = tuple((k, repr(v)) for k, v in sorted(dec.items()))
+            # Keep distinct stored values when a decoded version field is missing.
+            unreadable_key = (tuple(map(repr, vals))
+                              if any(k not in dec for k in dvf) else ())
             key = (status, rowid, tuple(repr(vals[idx[c]]) if idx[c] < len(vals) else None
-                                        for c in key_cols))
+                                        for c in key_cols), decoded_key, unreadable_key)
             shown_key = (status,
                          tuple(repr(vals[idx[c]]) if c in idx and idx[c] < len(vals) else None
                                for c in fields),
-                         tuple(repr(live[idx[c]]) for c in changed))
+                         decoded_key, unreadable_key,
+                         tuple((c, repr(live[idx[c]] if c in idx else dlive[c]))
+                               for c in changed))
             first = seen.get(key) or seen.get(shown_key)
             if first is not None:
                 first['copies'] += 1
@@ -2084,6 +2095,8 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
                     # cell that reads as missing data
                     row[f"{fields[c]} (now)"] = '(empty)' if now in (None, '') else shown(c, now)
             note = sqlite_recovery.describe(r)
+            if unavailable:
+                note += f"; unable to compare decoded field(s): {', '.join(unavailable)}"
             if tied_to is not None:
                 own = ('no row id of its own' if r['rowid'] is None
                        else f"stored under row id {r['rowid']}, no longer live")

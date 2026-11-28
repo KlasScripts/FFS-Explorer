@@ -52,6 +52,43 @@ MODULE = SimpleNamespace(recovered_records=[
 ])
 
 
+def test_decoded_versions_keep_distinct_text_and_group_copies(tmp_path):
+    db = tmp_path / 'work.db'
+    out = tmp_path / 'copied.db'
+    c = sqlite3.connect(db, isolation_level=None)
+    try:
+        c.execute('pragma journal_mode=wal')
+        c.execute('pragma wal_autocheckpoint=0')
+        c.execute('create table msg(id integer primary key, thread text, archive blob, seen integer)')
+        c.execute('insert into msg values(1, ?, ?, 0)', ('chat', b'text:first'))
+        c.execute('pragma wal_checkpoint(truncate)')
+        c.execute('update msg set seen=1')
+        for archive in (b'text:second', b'partial archive', b'text:'):
+            c.execute('update msg set archive=?', (archive,))
+        shutil.copyfile(db, out)
+        shutil.copyfile(f'{db}-wal', f'{out}-wal')
+    finally:
+        c.close()
+
+    def decode(values):
+        archive = values['archive']
+        return {'message': archive[5:].decode()} if archive.startswith(b'text:') else {}
+
+    module = SimpleNamespace(recovered_records=[{
+        'file_key': 'db', 'table': 'msg', 'fields': {'thread': 'thread'},
+        'decode': decode, 'decoded_fields': ['message'], 'version_fields': ['thread', 'message'],
+    }])
+    rows = ar.recovered_records_report(module, {'db': str(out)})
+    changed = sorted((r for r in rows if r['status'] == 'Changed'), key=lambda r: r['message'])
+    assert [(r['message'], r['message (now)'], r['copies']) for r in changed] == [
+        ('first', '(empty)', 2), ('second', '(empty)', 1),
+    ]
+    assert changed[0]['copy_locations'].count('offset') == 2
+    [partial] = [r for r in rows if r['status'] == 'Comparison incomplete']
+    assert 'message' not in partial and 'message (now)' not in partial
+    assert 'unable to compare decoded field(s): message' in partial['how_found']
+
+
 def test_rows_and_filters(tmp_path):
     path = _chat_db(str(tmp_path))
     ar.take_open_notes()

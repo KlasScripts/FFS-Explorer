@@ -124,7 +124,7 @@ class ZipReader:
     """
 
     # run_parallel's queue depth: enough to keep THREAD_WORKERS busy.
-    _IN_FLIGHT = THREAD_WORKERS * 32
+    _IN_FLIGHT_PER_WORKER = 32
 
     def __init__(self, zip_path: str) -> None:
         self.zip_path = zip_path
@@ -204,7 +204,7 @@ class ZipReader:
         progress_cb(done, total) called after each batch and once at the end.
         cancel_check() -> bool halts processing when True.
 
-        At most _IN_FLIGHT items are queued at once, topped up as they
+        At most THREAD_WORKERS * _IN_FLIGHT_PER_WORKER items are queued at once, topped up as they
         finish. Queuing every item first (as before 2026-11-02) meant nothing
         was yielded until all were queued: on IOS17 (311,798 files) a Windows
         keyword search showed no count for its first 26 s, by which time
@@ -214,13 +214,15 @@ class ZipReader:
         total = len(items)
         it = iter(items)
         done = 0
-        with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as pool:
+        workers = THREAD_WORKERS          # read now: Preferences can change it
+        in_flight = workers * self._IN_FLIGHT_PER_WORKER
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             pending = {}
 
             def top_up():
                 for item in it:
                     pending[pool.submit(work_fn, item)] = item
-                    if len(pending) >= self._IN_FLIGHT:
+                    if len(pending) >= in_flight:
                         break
 
             top_up()

@@ -248,12 +248,137 @@ def sniff_media_kind(ext: str, data: bytes) -> str | None:
     return None
 
 
+# Worker processes (owner request 2026-11-28: use every core). The check of
+# one file is a few microseconds of Python, so on threads the scan stayed at
+# about 1.3 cores whatever the thread count (IOS17, tier 1, Mac: 2.8 s on 2
+# threads, 2.6 s on 10). Files go to the workers in jobs of JOB_FILES; below
+# PROCESS_MIN_FILES starting the pool costs more than it saves. How many:
+# the disk-heavy setting (zip_reader.THREAD_WORKERS, worker_counts.py).
+PROCESS_MIN_FILES = 20_000
+JOB_FILES = 2_000
+_lowered = False
+
+
+def _classify(read, item) -> str | None:
+    """The type of one (ui_path, data_offset, file_size) entry, reading
+    through read(offset, size, max_bytes): the first _FIRST_READ bytes and
+    classify_magic(); only a file small enough for the text check
+    (TEXT_SIZE_LIMIT) whose first bytes are all text has the rest read."""
+    _ui_path, data_offset, file_size = item
+    small = 0 < file_size <= TEXT_SIZE_LIMIT
+    head = read(data_offset, file_size, _FIRST_READ if small else 16)
+    detected = classify_magic(head)
+    if detected is None and small and is_text(head):
+        if file_size > len(head):
+            rest = read(data_offset + len(head), file_size - len(head), None)
+            if rest and not is_text(rest):   # (is_text(b'') is False)
+                return None
+        detected = 'Text'
+    return detected
+
+
+def scan_job(zip_path: str, items: list) -> list:
+    """Worker-process entry point: [(ui_path, type or None)] for *items*,
+    read through one file handle, in the order given (archive order)."""
+    global _lowered
+    if not _lowered:
+        import child_priority
+        child_priority.lower_this_process()      # the window is served first
+        _lowered = True
+    out = []
+    with open(zip_path, 'rb') as fh:
+        def read(offset, size, max_bytes):
+            n = min(size, max_bytes) if max_bytes is not None else size
+            if n <= 0:
+                return b''
+            fh.seek(offset)
+            return fh.read(n)
+        for item in items:
+            out.append((item[0], _classify(read, item)))
+    return out
+
+
+def _scan_in_processes(zip_path, candidates, processes, progress_cb, cancel_check):
+    """{ui_path: type} on *processes* worker processes, or None when a pool
+    cannot be started (the caller then uses threads). Entries a dead worker
+    held are scanned on this process's threads, never dropped."""
+    try:
+        import multiprocessing as mp
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+        pool = ProcessPoolExecutor(processes, mp_context=mp.get_context('spawn'))
+    except Exception:
+        return None
+    items = sorted(candidates, key=lambda c: c[1])     # each job reads forward
+    jobs = [items[k:k + JOB_FILES] for k in range(0, len(items), JOB_FILES)]
+    results: dict[str, str] = {}
+    left = []
+    remaining = len(items)
+    cancelled = False
+    try:
+        it = iter(jobs)
+        pending = {}
+
+        def top_up():
+            for job in it:
+                pending[pool.submit(scan_job, zip_path, job)] = job
+                if len(pending) >= processes * 3:
+                    break
+        top_up()
+        while pending:
+            finished, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+            if cancel_check and cancel_check():
+                cancelled = True
+                return results
+            for fut in finished:
+                job = pending.pop(fut)
+                try:
+                    for ui_path, detected in fut.result():
+                        if detected:
+                            results[ui_path] = detected
+                except Exception:
+                    left.extend(job)
+                remaining -= len(job)
+                if progress_cb:
+                    progress_cb(remaining)
+            top_up()
+    finally:
+        procs = list((getattr(pool, '_processes', None) or {}).values())
+        pool.shutdown(wait=False, cancel_futures=True)
+        if cancelled:
+            for proc in procs:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+    if left:
+        results.update(_scan_on_threads(zip_path, left, None, cancel_check, 200))
+    return results
+
+
+def _scan_on_threads(zip_path, candidates, progress_cb, cancel_check, batch_size):
+    reader = ZipReader(zip_path)
+
+    def read(offset, size, max_bytes):
+        return reader.read_at(offset, size, max_bytes=max_bytes)
+    results: dict[str, str] = {}
+    _pcb = (lambda d, t: progress_cb(t - d)) if progress_cb else None
+    for (ui_path, _, __), detected in reader.run_parallel(
+            candidates, lambda item: _classify(read, item),
+            progress_cb=_pcb,
+            cancel_check=cancel_check,
+            batch_size=batch_size):
+        if detected:
+            results[ui_path] = detected
+    return results
+
+
 def scan_entries(
     zip_path: str,
     candidates: list[tuple[str, int, int]],
     progress_cb=None,
     cancel_check=None,
     batch_size: int = 200,
+    processes: int | None = None,
 ) -> dict[str, str]:
     """Return {ui_path: detected_type} for entries with a positively identified type.
 
@@ -266,34 +391,18 @@ def scan_entries(
     bytes are all text has the rest read, for the full-content text check.
     Same results as reading the whole small file at once, but most files are
     settled by their first bytes: on IOS17, 2,000 sampled candidates read
-    14 MB instead of 77 MB, no result different. Entries are processed
-    concurrently using up to 8 threads (each opens its own file handle).
+    14 MB instead of 77 MB, no result different.
+
+    On *processes* worker processes (default: the disk-heavy setting,
+    zip_reader.THREAD_WORKERS) from PROCESS_MIN_FILES files, else on that
+    many threads; the same _classify either way.
 
     progress_cb(remaining: int) called after each batch.
     """
-    reader = ZipReader(zip_path)
-
-    def _scan_one(item: tuple[str, int, int]) -> str | None:
-        ui_path, data_offset, file_size = item
-        small = 0 < file_size <= TEXT_SIZE_LIMIT
-        head = reader.read_at(data_offset, file_size,
-                              max_bytes=_FIRST_READ if small else 16)
-        detected = classify_magic(head)
-        if detected is None and small and is_text(head):
-            if file_size > len(head):
-                rest = reader.read_at(data_offset + len(head), file_size - len(head))
-                if rest and not is_text(rest):   # (is_text(b'') is False)
-                    return None
-            detected = 'Text'
-        return detected
-
-    results: dict[str, str] = {}
-    _pcb = (lambda d, t: progress_cb(t - d)) if progress_cb else None
-    for (ui_path, _, __), detected in reader.run_parallel(
-            candidates, _scan_one,
-            progress_cb=_pcb,
-            cancel_check=cancel_check,
-            batch_size=batch_size):
-        if detected:
-            results[ui_path] = detected
-    return results
+    import zip_reader
+    n = processes if processes is not None else zip_reader.THREAD_WORKERS
+    if n > 1 and len(candidates) >= PROCESS_MIN_FILES:
+        results = _scan_in_processes(zip_path, candidates, n, progress_cb, cancel_check)
+        if results is not None:
+            return results
+    return _scan_on_threads(zip_path, candidates, progress_cb, cancel_check, batch_size)

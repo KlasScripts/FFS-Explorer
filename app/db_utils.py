@@ -827,7 +827,7 @@ def save_guid_bundle_map(conn: 'sqlite3.Connection', mapping: dict) -> None:
     conn.execute('DELETE FROM guid_bundle')
     conn.executemany(
         'INSERT INTO guid_bundle (guid, bundle_id) VALUES (?,?)',
-        list(mapping.items()),
+        sorted(mapping.items()),        # the same case saved the same way (2026-11-28)
     )
     conn.commit()
 
@@ -1428,14 +1428,16 @@ def save_folder_sizes(conn: 'sqlite3.Connection', sizes: dict) -> None:
     ambiguous with a legitimately empty folder).
     """
     existing_counts, _ = load_folder_data(conn)
-    combined = {path: [existing_counts.get(path, -1), size] for path, size in sizes.items()}
+    # sorted, so the same case is saved the same way whatever order the
+    # sizes were worked out in (2026-11-28)
+    combined = {path: [existing_counts.get(path, -1), sizes[path]] for path in sorted(sizes)}
     save_blob(conn, 'folder_data', _FOLDER_DATA_VERSION, msgpack.packb(combined, use_bin_type=True))
 
 
 def save_folder_counts(conn: 'sqlite3.Connection', counts: dict) -> None:
     """Merge {folder_path: count} into the blob, preserving existing sizes."""
     _, existing_sizes = load_folder_data(conn)
-    paths    = set(existing_sizes) | set(counts)
+    paths    = sorted(set(existing_sizes) | set(counts))     # a set's order changes per run
     combined = {path: [counts.get(path, 0), existing_sizes.get(path, 0)] for path in paths}
     save_blob(conn, 'folder_data', _FOLDER_DATA_VERSION, msgpack.packb(combined, use_bin_type=True))
 

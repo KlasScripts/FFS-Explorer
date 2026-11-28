@@ -57,3 +57,8 @@ openpyxl
 # the Artifact Viewer's Report Notes (artifact_viewer._notes_markdown_html).
 # Pure Python; the app falls back to Qt's own Markdown renderer without it.
 markdown
+# app/stage_timing.py: per-stage time, CPU of the app and its worker
+# processes, and disk throughput for Process Case (the run's stage_timing.tsv
+# in the case folder), the same way on Windows and Mac; physical and logical
+# core counts. Owner decision 2026-11-28.
+psutil

@@ -120,20 +120,28 @@ def _cd_bounds(payload: bytes) -> tuple[int, int]:
     return cd_off, cd_size
 
 
-def parse_directory(payload: bytes) -> dict:
-    """Columns, pools and the name table for a .zcd payload. Pure: the same
-    payload always gives the same index."""
-    cd_off, cd_size = _cd_bounds(payload)
-    cd = memoryview(payload)[cd_off:cd_off + cd_size]
-    cols = {name: array(code) for name, code in _COLUMNS}
-    names = bytearray()
-    origs = bytearray()
+_RECORD_COLS = ("header_offset", "compress_size", "file_size", "crc", "flag_bits",
+                "compress_type", "dos_time", "dos_date", "external_attr", "stored_name_len",
+                "extra_start", "extra_len")
+# Worker processes for the record loop (owner request 2026-11-28: use every
+# core): from PARALLEL_MIN_BYTES of directory, in about JOB_RECORDS records a
+# job. IOS17 (830,298 records): the loop is ~70% of parse_directory.
+PARALLEL_MIN_BYTES = 8 * 1024 * 1024
+JOB_RECORDS = 50_000
+
+
+def _parse_records(cd, pos: int, end: int) -> dict:
+    """The central directory records in cd[pos:end], as parse_directory
+    reads them: per-record columns (extra_start relative to this part's
+    extras), zipfile's orig names, the sanitized names, the extras bytes,
+    and {index in this part: older names} where they differ. Raises
+    IndexError_ as zipfile would refuse the archive."""
+    cols = {name: array(code) for name, code in _COLUMNS if name in _RECORD_COLS}
     extras = bytearray()
     final_names: list[str] = []
     origs_list: list[str] = []
-    old: dict[int, tuple[str, str]] = {}      # entry -> its names in older versions, when different
+    old: dict[int, tuple[str, str]] = {}
     unpack = _CD_RECORD.unpack_from
-    pos, end = 0, len(cd)
     while pos < end:
         if end - pos < 46:
             raise IndexError_("truncated central directory")
@@ -207,31 +215,151 @@ def parse_directory(payload: bytes) -> dict:
                 old[len(final_names)] = olds
         final_names.append(name)
         pos = p + elen + clen
+    return {"cols": cols, "extras": extras, "names": final_names, "origs": origs_list,
+            "old": old}
+
+
+def parse_records_job(zcd_path: str, start: int, end: int) -> dict:
+    """Worker-process entry point: _parse_records on bytes start:end of the
+    .zcd file (a run of whole records), read here, not sent."""
+    with open(zcd_path, "rb") as fh:
+        fh.seek(start)
+        chunk = fh.read(end - start)
+    if len(chunk) != end - start:
+        raise IndexError_("truncated central directory")
+    return _parse_records(memoryview(chunk), 0, len(chunk))
+
+
+def _job_bounds(cd, job_records: int) -> list[tuple[int, int]] | None:
+    """[(start, end)] of runs of about *job_records* whole records in *cd*,
+    from each record's own lengths; None when the directory does not walk
+    cleanly (the serial loop then gives zipfile's exact error)."""
+    lens = struct.Struct("<HHH").unpack_from
+    pos, end, n, start, out = 0, len(cd), 0, 0, []
+    while pos < end:
+        if end - pos < 46 or cd[pos:pos + 4] != _CD_SIG:
+            return None
+        nlen, elen, clen = lens(cd, pos + 28)
+        pos += 46 + nlen + elen + clen
+        n += 1
+        if n == job_records:
+            out.append((start, pos))
+            start, n = pos, 0
+    if pos != end:
+        return None
+    if start < end:
+        out.append((start, end))
+    return out
+
+
+def _records_in_processes(cd, zcd_path: str, cd_file_off: int, processes: int) -> dict | None:
+    """_parse_records over the whole directory on *processes* worker
+    processes, joined in order; None when it cannot run (the caller then
+    parses here). An IndexError_ from a worker is raised as the serial loop
+    would raise it, on the first bad part."""
+    bounds = _job_bounds(cd, JOB_RECORDS)
+    if not bounds or len(bounds) < 2:
+        return None
+    try:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+        pool = ProcessPoolExecutor(min(processes, len(bounds)), mp_context=mp.get_context("spawn"))
+    except Exception:
+        return None
+    try:
+        try:
+            futs = [pool.submit(parse_records_job, zcd_path, cd_file_off + a, cd_file_off + b)
+                    for a, b in bounds]
+        except Exception:
+            return None                        # no workers here (e.g. a daemon process)
+        parts = []
+        for f in futs:
+            try:
+                parts.append(f.result())
+            except IndexError_:
+                raise
+            except Exception:
+                return None                    # a worker could not run: parse here
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    out = {"cols": {name: array(code) for name, code in _COLUMNS if name in _RECORD_COLS},
+           "extras": bytearray(), "names": [], "origs": [], "old": {}}
+    for part in parts:
+        base, xbase = len(out["names"]), len(out["extras"])
+        for name in _RECORD_COLS:
+            if name == "extra_start":
+                out["cols"][name].extend(v + xbase for v in part["cols"][name])
+            else:
+                out["cols"][name].extend(part["cols"][name])
+        out["extras"] += part["extras"]
+        out["names"].extend(part["names"])
+        out["origs"].extend(part["origs"])
+        out["old"].update({base + k: v for k, v in part["old"].items()})
+    return out
+
+
+def parse_directory(payload: bytes, zcd_path: str | None = None, payload_file_off: int = 0,
+                    processes: int = 1) -> dict:
+    """Columns, pools and the name table for a .zcd payload. Pure: the same
+    payload always gives the same index. With *zcd_path* (the file the
+    payload was read from, at *payload_file_off*) and *processes* > 1, a
+    large directory's records are read on worker processes; the result is
+    the same."""
+    cd_off, cd_size = _cd_bounds(payload)
+    cd = memoryview(payload)[cd_off:cd_off + cd_size]
+    recs = None
+    if processes > 1 and zcd_path and cd_size >= PARALLEL_MIN_BYTES:
+        recs = _records_in_processes(cd, zcd_path, payload_file_off + cd_off, processes)
+    if recs is None:
+        recs = _parse_records(cd, 0, len(cd))
+    cols = {name: array(code) for name, code in _COLUMNS}
+    for name in _RECORD_COLS:
+        cols[name] = recs["cols"][name]
+    names = bytearray()
+    origs = bytearray()
+    extras = recs["extras"]
+    final_names = recs["names"]
+    origs_list = recs["origs"]
+    old = recs["old"]
     # zipfile's NameToInfo (last entry with a name wins, first-seen order),
     # then the capture renaming, exactly as zip_cd_cache did on ZipInfo.
     base_names = list(final_names) if old else None
-    by_name: dict[str, int] = {}
-    for i, name in enumerate(final_names):
-        by_name[name] = i
-    _name_repeated_captures(final_names, cols["header_offset"], by_name)
+    # {name: last index with it}, in first-seen order: what the loop
+    # `by_name[name] = i` gives, built in C
+    by_name: dict[str, int] = dict(zip(final_names, range(len(final_names))))
+    if len(by_name) != len(final_names):      # some name is stored more than once
+        _name_repeated_captures(final_names, cols["header_offset"], by_name)
     renames = _renames(base_names, old, final_names, by_name, cols["header_offset"]) if old else []
-    for i, name in enumerate(final_names):
-        nb = name.encode("utf-8", "surrogatepass")
-        cols["name_start"].append(len(names))
-        cols["name_len"].append(len(nb))
-        names += nb
-        o = origs_list[i]
-        if o == name:                         # the usual case: share the name's bytes
-            cols["orig_start"].append(cols["name_start"][i])
-            cols["orig_len"].append(len(nb))
-            cols["orig_in_names"].append(1)
-        else:
-            ob = o.encode("utf-8", "surrogatepass")
-            cols["orig_start"].append(len(origs))
-            cols["orig_len"].append(len(ob))
-            cols["orig_in_names"].append(0)
-            origs += ob
-    return {"cols": cols, "names": bytes(names), "origs": bytes(origs), "extras": bytes(extras),
+    # The names pool and each entry's place in it, and zipfile's orig names
+    # (sharing the name's bytes when the same), in whole-list steps.
+    from itertools import accumulate
+    enc = [n.encode("utf-8", "surrogatepass") for n in final_names]
+    nlens = array("I", map(len, enc))
+    nstarts = array("Q", accumulate(nlens, initial=0))
+    del nstarts[-1:]
+    names = b"".join(enc)
+    cols["name_start"] = nstarts
+    cols["name_len"] = nlens
+    same = [o == n for o, n in zip(origs_list, final_names)]
+    if all(same):
+        cols["orig_start"] = array("Q", nstarts)
+        cols["orig_len"] = array("I", nlens)
+        cols["orig_in_names"] = array("B", [1]) * len(final_names)
+    else:
+        o_start, o_len, o_in = array("Q"), array("I"), array("B")
+        for i, eq in enumerate(same):
+            if eq:                            # the usual case: share the name's bytes
+                o_start.append(nstarts[i])
+                o_len.append(nlens[i])
+                o_in.append(1)
+            else:
+                ob = origs_list[i].encode("utf-8", "surrogatepass")
+                o_start.append(len(origs))
+                o_len.append(len(ob))
+                o_in.append(0)
+                origs += ob
+        cols["orig_start"], cols["orig_len"], cols["orig_in_names"] = o_start, o_len, o_in
+    return {"cols": cols, "names": names, "origs": bytes(origs), "extras": bytes(extras),
             "table": _hash_table(by_name), "order": array("I", by_name.values()),
             "renames": renames}
 
@@ -249,11 +377,9 @@ def _renames(base_names: list[str], old: dict, final_names: list[str], by_name: 
         names = list(base_names)
         for i, pair in old.items():
             names[i] = pair[variant]
-        names_by = {}
-        for i, name in enumerate(names):
-            names_by[name] = i
+        names_by = dict(zip(names, range(len(names))))
         _name_repeated_captures(names, header_offsets, names_by)
-        for i, (was, now) in enumerate(zip(names, final_names)):
+        for was, now in zip(names, final_names):
             if was != now:
                 for a, b in _with_folders(was.rstrip("/"), now.rstrip("/")):
                     found.setdefault(a, set()).add(b)
@@ -283,14 +409,18 @@ def _with_folders(was: str, now: str) -> list[tuple[str, str]]:
 def _name_repeated_captures(names: list[str], header_offsets, by_name: dict) -> None:
     """zip_cd_cache._name_repeated_captures, on names and a {name: index}
     dict instead of ZipInfo objects (see A-72)."""
+    from collections import Counter
     from zip_cd_cache import capture_alias
+    # only the names stored more than once (counted in C), grouped in the
+    # order of their first entry: the order a group per name had
+    repeated = {n for n, c in Counter(names).items() if c > 1 and not n.endswith("/")}
+    if not repeated:
+        return
     copies: dict[str, list[int]] = {}
     for i, name in enumerate(names):
-        if not name.endswith("/"):
+        if name in repeated:
             copies.setdefault(name, []).append(i)
     for name, group in copies.items():
-        if len(group) < 2:
-            continue
         group.sort(key=lambda i: header_offsets[i])
         n = len(group)
         for k, i in enumerate(group, 1):

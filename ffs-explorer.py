@@ -78,6 +78,7 @@ import header_scan
 import nested_archive
 import media_metadata_scan
 import duplicate_scan
+import stage_timing
 import evidence_shortcuts
 import os_coverage
 import embedded_media_skip_list
@@ -162,6 +163,28 @@ _EMBEDDED_MEDIA_PROCESSES = max(1, min(8, (os.cpu_count() or 2) - 1))
 # Worker processes for the LevelDB/IndexedDB search index (LevelDbIndexWorker,
 # F-167); set with the others by _apply_worker_processes.
 _LEVELDB_INDEX_PROCESSES = max(1, min(8, os.cpu_count() or 1))
+# Worker processes for duplicate hashing (disk-heavy); set with the others by
+# _apply_worker_processes (worker_counts.py).
+_DISK_PROCESSES = 4
+
+
+# Parse children still finishing after reporting done (they count the
+# header-scan tiers then), by case folder; wait_for_parse_tail joins one.
+_PARSE_TAILS: dict = {}
+
+
+def wait_for_parse_tail(case_dir, timeout: float = 300) -> None:
+    """Wait (off the GUI thread) until the case's parse child has saved
+    its header-scan tier counts and ended."""
+    proc = _PARSE_TAILS.pop(case_dir, None)
+    if proc is None:
+        return
+    try:
+        proc.join(timeout)
+        if proc.is_alive():
+            proc.terminate()
+    except Exception:
+        pass
 
 
 def _build_cached_zip_view(zip_path: str, case_dir: str) -> "CachedZipView | None":
@@ -275,8 +298,11 @@ def _load_prefs() -> dict:
         # own docstring for why the two are treated differently.
         'user_media_ignore_editable':
             s.value('user_media_ignore_editable', False, type=bool),
-        # 0 = automatic (_apply_worker_processes)
+        # 0 = automatic (_apply_worker_processes, worker_counts.py): CPU-heavy
+        # stages (the key the one setting had before 2026-11-28) and
+        # disk-heavy ones
         'worker_processes': s.value('worker_processes', 0, type=int),
+        'disk_workers': s.value('disk_workers', 0, type=int),
     }
 
 
@@ -295,33 +321,51 @@ def _save_prefs(prefs: dict):
     s.setValue('user_media_ignore_editable',
               bool(prefs.get('user_media_ignore_editable', False)))
     s.setValue('worker_processes', int(prefs.get('worker_processes', 0)))
+    s.setValue('disk_workers', int(prefs.get('disk_workers', 0)))
 
 
-def _apply_worker_processes(n: int | None = None) -> int:
-    """How many worker processes Keyword Search, the embedded-media sweep,
-    duplicate hashing, the media metadata stage and the LevelDB index start (Preferences ▸
-    Performance, 2026-11-26, owner request). 0 = automatic: every core,
-    at most 8 (one fewer for the sweep, which keeps the window a core);
-    otherwise exactly *n*, up to the core count. Read when a stage starts,
-    so a change applies to the next one. Returns the number used."""
-    global _EMBEDDED_MEDIA_PROCESSES, _LEVELDB_INDEX_PROCESSES
+def _apply_worker_processes(n: int | None = None, disk: int | None = None) -> int:
+    """Set how many workers each stage starts (Preferences ▸ Performance;
+    worker_counts.py says why there are two settings). CPU-heavy: the
+    embedded-media sweep, the media metadata stage, LevelDB indexing.
+    Disk-heavy: Keyword Search, duplicate hashing and the header scan's
+    readers (threads). 0 = automatic. Read when a stage starts, so a change applies
+    to the next one. Returns the CPU count."""
+    global _EMBEDDED_MEDIA_PROCESSES, _LEVELDB_INDEX_PROCESSES, _DISK_PROCESSES
     import keyword_search
-    if n is None:
+    import worker_counts
+    import zip_reader
+    prefs = {}
+    if n is None or disk is None:
         try:
-            n = int(_load_prefs().get('worker_processes', 0))
+            prefs = _load_prefs()
         except Exception:
-            n = 0
-    cores = os.cpu_count() or 1
-    if n <= 0:
-        search = max(1, min(8, cores))
-        sweep = max(1, min(8, cores - 1))
-    else:
-        search = sweep = max(1, min(n, cores))
-    keyword_search.SEARCH_PROCESSES = search
-    media_metadata_scan.METADATA_PROCESSES = search
-    _EMBEDDED_MEDIA_PROCESSES = sweep
-    _LEVELDB_INDEX_PROCESSES = search
-    return search
+            prefs = {}
+    cpu, dsk = worker_counts.resolve(
+        prefs.get(worker_counts.CPU_PREF, 0) if n is None else n,
+        prefs.get(worker_counts.DISK_PREF, 0) if disk is None else disk)
+    keyword_search.SEARCH_PROCESSES = dsk          # reads the whole archive: disk-heavy (owner, 2026-11-28)
+    media_metadata_scan.METADATA_PROCESSES = cpu
+    _EMBEDDED_MEDIA_PROCESSES = cpu
+    _LEVELDB_INDEX_PROCESSES = cpu
+    _DISK_PROCESSES = dsk
+    zip_reader.THREAD_WORKERS = dsk
+    return cpu
+
+
+def _worker_setting_text() -> str:
+    """Preferences ▸ Performance as set, and the counts in use, for
+    stage_timing.tsv: 'cpu auto=9, disk auto=4'."""
+    import worker_counts
+    try:
+        prefs = _load_prefs()
+    except Exception:
+        prefs = {}
+    c = int(prefs.get(worker_counts.CPU_PREF, 0) or 0)
+    d = int(prefs.get(worker_counts.DISK_PREF, 0) or 0)
+    import zip_reader
+    return (f"cpu {'auto' if c <= 0 else 'set'}={_EMBEDDED_MEDIA_PROCESSES}, "
+            f"disk {'auto' if d <= 0 else 'set'}={zip_reader.THREAD_WORKERS}")
 
 
 # Formatted archive sizes, keyed by path.  Stat-ing every archive on each
@@ -2212,9 +2256,13 @@ class ZipMetadataWorker(QThread):
                                 "on a big extraction this takes a minute)…")
         try:
             import multiprocessing as mp
+            # Not a daemon: the child reads the directory on worker
+            # processes of its own (zip_index.parse_directory), which a
+            # daemon process may not start. It is stopped on cancel below
+            # and ends by itself within seconds otherwise.
             proc = mp.get_context('spawn').Process(
                 target=zip_cd_cache.build_index_child,
-                args=(self.zip_path, self.case_dir), daemon=True)
+                args=(self.zip_path, self.case_dir, _EMBEDDED_MEDIA_PROCESSES), daemon=False)
             proc.start()
             while proc.is_alive():
                 proc.join(0.2)
@@ -2462,10 +2510,12 @@ class ZipMetadataWorker(QThread):
             return False
         return True
 
-    def _parse_in_subprocess(self) -> bool:
-        """Run the parse in a child process which persists to casecache.db.
-        Returns True if it finished successfully, False on any failure (so the
-        caller can fall back to an in-process parse)."""
+    def _spawn_parse_child(self, early: bool = False):
+        """Start the parse child: (process, its message end, the end to tell
+        it the index is ready, or None). *early*: started beside the index
+        build; it unpacks the extraction's metadata meanwhile and waits for
+        'go' (ffs_metadata._parse_child; owner request 2026-11-28). None if
+        it cannot start."""
         try:
             # Cover the spawn gap: in a frozen exe, starting the child means
             # relaunching the executable (bootloader + interpreter + imports),
@@ -2474,16 +2524,55 @@ class ZipMetadataWorker(QThread):
             import multiprocessing as mp
             ctx = mp.get_context('spawn')
             recv_conn, send_conn = ctx.Pipe(duplex=False)
+            ready_recv = ready_send = None
+            if early:
+                ready_recv, ready_send = ctx.Pipe(duplex=False)
             proc = ctx.Process(
                 target=_ffs_parse_child,
-                args=(send_conn, self.zip_path, self.case_dir),
+                args=(send_conn, self.zip_path, self.case_dir, ready_recv),
                 daemon=True,
             )
             proc.start()
             send_conn.close()   # parent only receives
+            if ready_recv is not None:
+                ready_recv.close()
+            return proc, recv_conn, ready_send
         except Exception as exc:
             self.status_update.emit(f"Could not start parser process: {exc}")
-            return False
+            return None
+
+    def _release_early_parse(self, go: bool) -> None:
+        """Tell the early parse child to go on (the index is ready) or stop."""
+        early = getattr(self, '_early_parse', None)
+        if early is None or early[2] is None:
+            return
+        try:
+            early[2].send('go' if go else 'stop')
+            early[2].close()
+        except Exception:
+            pass
+        self._early_parse = (early[0], early[1], None)
+        if not go:
+            self._early_parse = None
+            try:
+                early[0].join(timeout=2)
+                if early[0].is_alive():
+                    early[0].terminate()
+                early[1].close()
+            except Exception:
+                pass
+
+    def _parse_in_subprocess(self) -> bool:
+        """Run the parse in a child process which persists to casecache.db.
+        Returns True if it finished successfully, False on any failure (so the
+        caller can fall back to an in-process parse)."""
+        started = getattr(self, '_early_parse', None)
+        self._early_parse = None
+        if started is None:
+            started = self._spawn_parse_child()
+            if started is None:
+                return False
+        proc, recv_conn, _ready = started
 
         done = False
         try:
@@ -2515,9 +2604,14 @@ class ZipMetadataWorker(QThread):
                     break
         finally:
             recv_conn.close()
-            proc.join(timeout=10)
-            if proc.is_alive():
-                proc.terminate()
+            if done:
+                # still counting the header-scan tiers (ffs_metadata
+                # _parse_child): not waited for here; the tier count waits
+                _PARSE_TAILS[self.case_dir] = proc
+            else:
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    proc.terminate()
         return done
 
     def _emit_and_persist_result(self, result: dict):
@@ -2608,8 +2702,19 @@ class ZipMetadataWorker(QThread):
                     _elapsed = time.monotonic() - _t0
                     self.status_update.emit(
                         f"Central directory copied to case folder in {_elapsed:.1f}s.")
-                    self._build_zip_index()
-                    self._update_case_names()
+                    # The parse starts now, beside the index build: it reads
+                    # the extraction's own metadata (one C unpack, 0.7 s on
+                    # IOS17, 3.3 s on 2.19 million entries) while the index
+                    # is built, and goes on once the index and the case
+                    # names are done (2026-11-28).
+                    self._early_parse = self._spawn_parse_child(early=True)
+                    try:
+                        self._build_zip_index()
+                        self._update_case_names()
+                    except BaseException:
+                        self._release_early_parse(False)
+                        raise
+                    self._release_early_parse(True)
                     self._start_system_check()
 
                 # The one parse, parse_archive_metadata: in a child process
@@ -4313,23 +4418,35 @@ class PreferencesDialog(QDialog):
         sep_perf.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(sep_perf)
         layout.addWidget(QLabel("<b>Performance</b>"))
-        cores = os.cpu_count() or 1
-        perf_row = QHBoxLayout()
-        perf_row.addWidget(QLabel("Worker processes:"))
+        import worker_counts
+        cores = worker_counts.logical_cores()
+        phys = worker_counts.physical_cores()
+        perf_grid = QGridLayout()
+        perf_grid.addWidget(QLabel("CPU-heavy stages:"), 0, 0)
         self._worker_spin = QSpinBox()
         self._worker_spin.setRange(0, cores)
-        self._worker_spin.setSpecialValueText(f"Automatic ({max(1, min(8, cores))})")
-        self._worker_spin.setValue(min(cores, int(prefs.get('worker_processes', 0))))
-        perf_row.addWidget(self._worker_spin)
-        perf_row.addWidget(QLabel(f"of {cores} cores"))
-        perf_row.addStretch()
-        layout.addLayout(perf_row)
+        self._worker_spin.setSpecialValueText(f"Automatic ({worker_counts.auto_cpu()})")
+        self._worker_spin.setValue(min(cores, int(prefs.get(worker_counts.CPU_PREF, 0))))
+        perf_grid.addWidget(self._worker_spin, 0, 1)
+        perf_grid.addWidget(QLabel("Disk-heavy stages:"), 1, 0)
+        self._disk_spin = QSpinBox()
+        self._disk_spin.setRange(0, cores)
+        self._disk_spin.setSpecialValueText(f"Automatic ({worker_counts.auto_disk()})")
+        self._disk_spin.setValue(min(cores, int(prefs.get(worker_counts.DISK_PREF, 0))))
+        perf_grid.addWidget(self._disk_spin, 1, 1)
+        cores_text = (f"{phys} cores" if phys == cores
+                      else f"{phys} cores, {cores} threads")
+        perf_grid.addWidget(QLabel(f"workers ({cores_text})"), 0, 2, 2, 1)
+        perf_grid.setColumnStretch(3, 1)
+        layout.addLayout(perf_grid)
         layout.addWidget(note_label(
-            "How many processes Keyword Search, the embedded-media sweep, "
-            "duplicate checking, the media metadata stage and LevelDB "
-            "indexing use. More "
-            "is faster until the disk holding the archive is the limit. "
-            "They run below normal priority, so the window stays "
+            "CPU-heavy: the embedded-media sweep, the media metadata stage "
+            "and LevelDB indexing. They keep getting faster with more "
+            "workers until every core is busy; automatic is one per core, "
+            "one left for the window. Disk-heavy: Keyword Search, duplicate "
+            "checking and the header scan. They read the whole archive or "
+            "much of it; past some number of readers the disk is the limit. "
+            "Workers run below normal priority, so the window stays "
             "responsive. Applies to the next stage started."))
 
         # ── Media Browser ────────────────────────────────────────────────────
@@ -4506,8 +4623,9 @@ class PreferencesDialog(QDialog):
             'media_hide_seen': self._media_hide_seen_check.isChecked(),
             'user_media_ignore_editable': self._user_media_ignore_check.isChecked(),
             'worker_processes': self._worker_spin.value(),
+            'disk_workers': self._disk_spin.value(),
         })
-        _apply_worker_processes(self._worker_spin.value())
+        _apply_worker_processes(self._worker_spin.value(), self._disk_spin.value())
         self.accept()
 
 
@@ -5362,7 +5480,7 @@ class DuplicateDetectionWorker(QThread):
                 self._zip_path, candidates, inode_trusted=self._adapter.inode_trusted,
                 progress_cb=lambda done, total: self.progress.emit(done, total),
                 cancel_check=self.isInterruptionRequested,
-                processes=_EMBEDDED_MEDIA_PROCESSES,
+                processes=_DISK_PROCESSES,
                 confirm_group=self._confirm_group)
         complete = not self.isInterruptionRequested()
         n_groups = len({v['md5'] for v in results.values() if not duplicate_scan.is_possible(v['md5'])})
@@ -6782,6 +6900,15 @@ class ProcessDialog(QDialog):
         self._integrity_label.setWordWrap(True)
         self._integrity_label.setVisible(False)
         layout.addWidget(self._integrity_label)
+        # Duplicate detection runs beside the stages after unpacking
+        # (_start_dedup_beside), so it has its own line too.
+        self._dedup_label = QLabel()
+        self._dedup_label.setWordWrap(True)
+        self._dedup_label.setVisible(False)
+        layout.addWidget(self._dedup_label)
+        self._dedup_pending = False
+        self._dedup_beside = False
+        self._finish_after_dedup = False
         self._status_label = QLabel()
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
@@ -7408,7 +7535,17 @@ class ProcessDialog(QDialog):
         self._pending_upgrade_tier = upgrade_tier if run_scan else 0
         self._run_integrity = run_integrity
         self._finish_after_integrity = False
+        self._dedup_beside = self._dedup_pending = self._finish_after_dedup = False
+        self._dedup_label.setVisible(False)
+        _apply_worker_processes()     # the counts the stages will use, for the log
+        self._stage_log = stage_timing.StageLog(self._case_dir, _worker_setting_text())
         self._wait_for_case_open()
+
+    def _stage_begin(self, name: str) -> None:
+        """stage_timing: *name* starts now, the stage before it ends."""
+        log = getattr(self, '_stage_log', None)
+        if log is not None:
+            log.begin(name)
 
     def _wait_for_case_open(self):
         """Start the first stage only once the case-open jobs are done.
@@ -7451,12 +7588,14 @@ class ProcessDialog(QDialog):
             self._continue_after_nested()
 
     def _start_leveldb_stage(self):
+        self._start_dedup_beside()
         if self._chk_leveldb.isChecked() and self._leveldb_coverage_fn and self._leveldb_index_fn:
             self._start_leveldb_indexing()
         else:
             self._continue_after_leveldb_indexing()
 
     def _start_leveldb_indexing(self):
+        self._stage_begin('leveldb_index')
         self.leveldb_indexing_started.emit()
         _, unindexed = self._leveldb_coverage_fn()
         if not unindexed:
@@ -7577,6 +7716,8 @@ class ProcessDialog(QDialog):
         self._integrity_worker.progress.connect(self._on_integrity_progress)
         self._integrity_worker.done.connect(self._on_integrity_done)
         self._integrity_pending = True
+        if getattr(self, '_stage_log', None) is not None:
+            self._stage_log.begin('integrity_hash', sequential=False)
         self._integrity_worker.start()
         self._continue_after_integrity()
 
@@ -7589,6 +7730,8 @@ class ProcessDialog(QDialog):
 
     def _on_integrity_done(self, digest: str):
         self._integrity_pending = False
+        if getattr(self, '_stage_log', None) is not None:
+            self._stage_log.end('integrity_hash')
         if not digest:
             self._integrity_label.setText(
                 "Integrity check cancelled." if getattr(self, '_integrity_cancelled', False)
@@ -7632,6 +7775,7 @@ class ProcessDialog(QDialog):
             self._finish_operations()
 
     def _start_header_scan(self):
+        self._stage_begin('header_scan')
         self._run_id: int | None = None
 
         if self._case_dir:
@@ -7768,6 +7912,7 @@ class ProcessDialog(QDialog):
         Tier 3 — see TODO.md item 21 for why Tier 3 alone doesn't already
         guarantee this without the explicit check below, and
         _discover_all_archives's own docstring for what unscoped changes."""
+        self._stage_begin('nested_archives')
         overrides = {}
         if self._case_dir:
             try:
@@ -8152,6 +8297,7 @@ class ProcessDialog(QDialog):
             self._continue_after_media_metadata()
 
     def _start_embedded_media_scan(self):
+        self._stage_begin('embedded_media')
         scan_folders = (tuple(self._adapter.scan_folders())
                         if self._rb_embedded_scope_app.isChecked() else None)
         skip_entries = (embedded_media_skip_list.load(self._skip_list_platform)
@@ -8270,6 +8416,7 @@ class ProcessDialog(QDialog):
         self._continue_after_embedded_media()
 
     def _start_media_metadata_scan(self):
+        self._stage_begin('media_metadata')
         # Only the cheap part here: the nested/embedded files' locations
         # (no bytes read). The main-archive candidates are found, and
         # everything read, on the worker.
@@ -8298,18 +8445,41 @@ class ProcessDialog(QDialog):
         self._continue_after_media_metadata()
 
     def _continue_after_media_metadata(self):
-        """The real last stage in the operation chain — duplicate
-        detection (app/duplicate_scan.py), added 2026-10-16. Has no
-        dependency on any other stage's own output, so appending it here
-        was simplest rather than interleaving it earlier."""
+        """The end of the chain. Duplicate detection (app/duplicate_scan.py)
+        reads only the file list, the unpacked archives and the header
+        types, so it runs beside LevelDB, the embedded-media sweep and the
+        media metadata stage (_start_dedup_beside, 2026-11-28: it is mostly
+        a few large files hashed on one core each, and other stages' work
+        fills the rest of the machine meanwhile); _finish_operations waits
+        for it. Started here only if it did not start there."""
         if self._stop_all_requested():
             return
-        if self._chk_dedup.isChecked():
+        if self._chk_dedup.isChecked() and not self._dedup_beside:
             self._start_dedup_scan()
         else:
             self._finish_operations()
 
+    def _start_dedup_beside(self):
+        """Start duplicate detection beside the stages still to come
+        (once per run), when it is ticked and the run has a case folder."""
+        if self._dedup_beside or not self._chk_dedup.isChecked() or not self._case_dir:
+            return
+        if self._stop_all_requested():
+            return
+        self._dedup_beside = True
+        self._dedup_pending = True
+        self._dedup_label.setVisible(True)
+        self._start_dedup_scan()
+
+    def _dedup_text(self, text: str) -> None:
+        (self._dedup_label if self._dedup_beside else self._status_label).setText(text)
+
     def _start_dedup_scan(self):
+        if self._dedup_beside:
+            if getattr(self, '_stage_log', None) is not None:
+                self._stage_log.begin('duplicates', sequential=False)
+        else:
+            self._stage_begin('duplicates')
         # Candidates, save and run log are all on the worker (see
         # DuplicateDetectionWorker.run), including the "no .zcd cache:
         # honestly skip" check.
@@ -8317,7 +8487,7 @@ class ProcessDialog(QDialog):
             self._status_label.setText("Duplicate detection: no case folder — skipped.")
             self._finish_operations()
             return
-        self._status_label.setText("Duplicate detection: listing files…")
+        self._dedup_text("Duplicate detection: listing files…")
         confirm = None
         if self._chk_dedup_media_only.isChecked():
             overrides = self._header_type_overrides_snapshot()
@@ -8329,7 +8499,7 @@ class ProcessDialog(QDialog):
         self._dedup_worker = DuplicateDetectionWorker(
             self._zip_path, self._case_dir, self._ui_metadata, self._adapter,
             self._RUN_TYPE_DEDUP, confirm_group=confirm)
-        self._dedup_worker.collected.connect(lambda n: self._status_label.setText(
+        self._dedup_worker.collected.connect(lambda n: self._dedup_text(
             f"Duplicate detection: checking {n:,} file(s) for size+CRC32 matches…"))
         self._dedup_worker.skipped.connect(self._on_dedup_skipped)
         self._dedup_worker.progress.connect(self._on_dedup_progress)
@@ -8337,15 +8507,28 @@ class ProcessDialog(QDialog):
         self._dedup_worker.start()
 
     def _on_dedup_skipped(self, reason: str):
-        self._status_label.setText(f"Duplicate detection: {reason} — skipped.")
+        self._dedup_text(f"Duplicate detection: {reason} — skipped.")
+        self._dedup_ended()
+
+    def _dedup_ended(self):
+        """Duplicate detection is over: beside the others, finish if the
+        chain was waiting for it; at the end of the chain, finish now."""
+        if getattr(self, '_stage_log', None) is not None:
+            self._stage_log.end('duplicates')
+        if self._dedup_beside:
+            self._dedup_pending = False
+            if self._finish_after_dedup:
+                self._finish_after_dedup = False
+                self._finish_operations()
+            return
         self._finish_operations()
 
     def _on_dedup_progress(self, done: int, total: int):
         if total == 0:
-            self._status_label.setText(
+            self._dedup_text(
                 "Duplicate detection: no size+CRC32 matches found — nothing to MD5-confirm.")
         else:
-            self._status_label.setText(
+            self._dedup_text(
                 f"Duplicate detection: MD5-confirming {done:,} / {total:,} "
                 "candidate file(s)…")
 
@@ -8354,23 +8537,35 @@ class ProcessDialog(QDialog):
         n_groups = len({v['md5'] for v in results.values()})
         if not complete:
             # not saved (DuplicateDetectionWorker.run): earlier results stay
-            self._status_label.setText(
+            self._dedup_text(
                 "Duplicate detection cancelled — nothing saved; the previous "
                 "results, if any, are kept.")
         else:
-            self._status_label.setText(
+            self._dedup_text(
                 f"Duplicate detection done — {len(results):,} file(s) in "
                 f"{n_groups:,} group(s) confirmed byte-identical.")
             self.duplicate_detection_done.emit(results)
-        self._finish_operations()
+        self._dedup_ended()
 
     def _finish_operations(self):
+        if self._dedup_pending:
+            # duplicates still running beside: finish when it ends (_dedup_ended)
+            self._finish_after_dedup = True
+            if getattr(self, '_stage_log', None) is not None:
+                self._stage_log.end()      # the last chain stage, not the wait
+            self._status_label.setText("Waiting for duplicate detection to finish…")
+            return
         if self._integrity_pending:
             # the last stage ended before the hash: finish when it does
             # (_finish_waiting_for_integrity). A flag, not isRunning(): the
             # thread can still be ending after its done() was handled.
             self._finish_after_integrity = True
+            if getattr(self, '_stage_log', None) is not None:
+                self._stage_log.end()      # the last stage, not the wait for the hash
             return
+        if getattr(self, '_stage_log', None) is not None:
+            log, self._stage_log = self._stage_log, None
+            log.close()
         if getattr(self, '_leveldb_index_failed', None):
             # Later stages replace the status line; keep this one visible.
             self._status_label.setText(
@@ -8392,6 +8587,7 @@ class ProcessDialog(QDialog):
                       self._embedded_media_worker.isRunning())) or
                 (bool(self._media_metadata_worker and
                       self._media_metadata_worker.isRunning())) or
+                (bool(self._dedup_worker and self._dedup_worker.isRunning())) or
                 self._leveldb_indexing_active
                 or getattr(self, '_waiting_for_case_open', False))
 
@@ -12689,6 +12885,10 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         self._user_media_last_label = None   # that count belonged to the previous case
         self._selected_only_tree_stale = False
         self._case_dir = case_dir
+        # how long opening takes and how much of the machine it uses
+        # (stage_timing.tsv in the case folder, written in _after_case_ready)
+        self._open_timing = stage_timing.StageLog(case_dir, _worker_setting_text())
+        self._open_timing.begin('open_case')
         self._photo_index = {}        # rebuilt in on_metadata_ready
         self._media_exif = {}         # rebuilt in _start_case_meta_load
         # Both belong to the previous archive; rebuilt in _start_case_meta_load.
@@ -13113,6 +13313,12 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
         if not getattr(self, '_tree_done', True) or QApplication.activeModalWidget() is not None:
             QTimer.singleShot(100, lambda: self._after_case_ready(metadata))
             return
+        timing = getattr(self, '_open_timing', None)
+        if timing is not None:
+            self._open_timing = None
+            timing.rename('open_case', 'open_case (new case)'
+                          if getattr(self, '_new_case_first_load', False) else 'open_case (reopen)')
+            timing.close()
         if getattr(self, '_new_case_first_load', False):
             self._new_case_first_load = False
             self._open_process_dialog_for_new_case()
@@ -13146,6 +13352,8 @@ class FastZipBrowser(QMainWindow, HexViewerMixin, MediaViewerMixin, KeywordSearc
                             tier3 = load_case_setting(db, 'header_scan_complete_tier', '0') == '3'
                     except Exception:
                         pass
+            # the parse child saves these counts after it reports done
+            wait_for_parse_tail(case_dir)
             # Copied here, not on the GUI thread (see _copy_metadata).
             meta = _copy_metadata(ui_metadata)
             infos = _cd_cache_load(zip_path, case_dir) if case_dir else None

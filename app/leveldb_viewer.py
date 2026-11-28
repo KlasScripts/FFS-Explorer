@@ -74,7 +74,7 @@ import secrets
 from concurrent.futures import ThreadPoolExecutor
 
 from zip_entry import ZipEntry
-from zip_reader import THREAD_WORKERS
+import zip_reader                # THREAD_WORKERS read when used (Preferences)
 
 # See ccl_leveldb.RawLevelDb.__init__/DATA_FILE_PATTERN and
 # ManifestFile.MANIFEST_FILENAME_PATTERN — the real on-disk shape a
@@ -1021,7 +1021,7 @@ def _parallel_extract(to_fetch: list) -> None:
             return f"{entry.physical_path}: write failed ({exc})"
         return None
 
-    with ThreadPoolExecutor(max_workers=min(THREAD_WORKERS, len(to_fetch))) as pool:
+    with ThreadPoolExecutor(max_workers=min(zip_reader.THREAD_WORKERS, len(to_fetch))) as pool:
         return [e for e in pool.map(_fetch_one, to_fetch) if e]
 
 

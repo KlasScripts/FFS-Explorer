@@ -265,9 +265,9 @@ def test_fast_extension_is_splitext():
         assert file_types._ext(n) == os.path.splitext(n)[1], n
 
 
-def test_sizes_and_stored_from_the_index_are_the_entries(tmp_path):
+def test_sizes_from_the_index_are_the_entries(tmp_path):
     import zip_cd_cache
-    from ffs_metadata import _sizes_and_stored
+    from ffs_metadata import _sizes
     names = ['d/', 'd/a.txt', 'd/b', 'e/', 'e/c.jpg']
     zp = str(tmp_path / 'c.zip')
     _zip_with_times(zp, names)
@@ -275,11 +275,9 @@ def test_sizes_and_stored_from_the_index_are_the_entries(tmp_path):
     os.makedirs(case)
     assert zip_cd_cache.save(zp, case)
     infos = zip_cd_cache.load(zp, case)
-    sizes, stored = _sizes_and_stored(infos)
+    sizes = _sizes(infos)
     plain = list(infos)
     assert list(sizes.items()) == [(i.filename, i.file_size) for i in plain]
-    assert ([(i.filename, i.header_offset) for i in stored]
-            == [(i.filename, i.header_offset) for i in plain if i.compress_type == 0 and i.file_size > 0])
 
 
 def test_only_accepted_groups_are_read_the_rest_are_possible():

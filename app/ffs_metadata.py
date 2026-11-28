@@ -30,8 +30,7 @@ from adapters import FfsAdapter
 from db_utils import (_open_cache_db, load_guid_bundle_map, load_folder_data,
                       save_blob, save_guid_bundle_map, save_folder_sizes,
                       save_app_registry, open_blob)
-from zip_cd_cache import (CachedZipView, load as _cd_cache_load,
-                          probe_delta as _probe_delta)
+from zip_cd_cache import CachedZipView, load as _cd_cache_load
 
 # Snapshot identity — must stay identical to what the GUI reads back, so it is
 # defined here and imported into ffs-explorer.py (single source of truth).
@@ -205,7 +204,9 @@ def pack_snapshot(adapter_args, delta, zip_names, zip_ui_paths,
         'zip_names_index': names_index,
         'zip_ui_paths':  (list(zip_ui_paths) if zip_ui_paths is not None and not ui_in_table else None),
         'zip_ui_in_table': ui_in_table,
-        'metadata_only': list(metadata_only),
+        # sorted: a set's order changes with Python's hash seed, and the
+        # same archive should give the same case (2026-11-28)
+        'metadata_only': sorted(metadata_only),
         'n_ui':          len(ui_parts),
         'n_fm':          len(fm_parts),
         'file_table':    table_name,
@@ -588,26 +589,22 @@ def _save_header_tier_counts(zip_path: str, case_dir: str, ffs_adapter, keys=Non
                             f"({type(e).__name__}: {e}); the window counts them instead")
 
 
-def _sizes_and_stored(infos) -> tuple[dict, list]:
-    """({name: uncompressed size} for every entry, in archive order, and the
-    stored (uncompressed) entries with data, for _probe_delta). From the
-    case's mapped index the names are cut from its name pool and the sizes
-    and methods read from its columns, and only the stored entries are
-    made: making all 2.5 million entries for this took ~5.6 s of a first
-    open (2026-11-22). Otherwise from the entries themselves. The same
-    result either way."""
+def _sizes(infos) -> dict:
+    """{name: uncompressed size} for every entry, in archive order. From
+    the case's mapped index the names are cut from its name pool and the
+    sizes read from its column (making all 2.5 million entries for this
+    took ~5.6 s of a first open, 2026-11-22); otherwise from the entries
+    themselves. The same result either way. (Until 2026-11-28 this also made
+    every stored entry, ~0.4 s on IOS17, for probe_delta, which has ignored
+    them and returned None since data offsets come from the sidecar layout.)"""
     index = getattr(infos, '_index', None)
     if index is None or not hasattr(index, 'name_start'):
-        sizes = {i.filename: i.file_size for i in infos}
-        return sizes, [i for i in infos if i.compress_type == zipfile.ZIP_STORED and i.file_size > 0]
-    names = index.all_names()
-    sizes = dict(zip(names, index.file_size))
-    stored = [infos[k] for k, (method, size) in enumerate(zip(index.compress_type, index.file_size))
-              if method == zipfile.ZIP_STORED and size > 0]
-    return sizes, stored
+        return {i.filename: i.file_size for i in infos}
+    return dict(zip(index.all_names(), index.file_size))
 
 
-def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict:
+def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None,
+                           preloaded_metadata=None, save_tier_counts: bool = True) -> dict:
     """Parse an FFS archive from its local .zcd cache.
 
     Returns a result dict with the live objects plus the packed snapshot:
@@ -631,13 +628,16 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
     status("Reading zip directory...")
     z_ctx = CachedZipView(zip_path, cached_infos)
     try:
-        zip_sizes, stored = _sizes_and_stored(cached_infos)
+        zip_sizes = _sizes(cached_infos)
         zip_names = frozenset(zip_sizes)
         # the index zip_names was made from, if it was (pack_snapshot skips
         # checking the two against each other)
         names_from_index = getattr(cached_infos, '_index', None)
         ffs_adapter = FfsAdapter.detect(z_ctx, zip_names)
-        delta = _probe_delta(zip_path, stored)
+        # (entry name, metadata) unpacked before the index existed
+        # (preload_metadata); used only by the Cellebrite path, for that entry
+        ffs_adapter._preloaded_metadata = preloaded_metadata
+        delta = None          # probe_delta is obsolete and returns None (see _sizes)
 
         cached_guid_bundle = None
         try:
@@ -654,7 +654,10 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
             # ~500k-entry pass — without its own status it sits under a stale
             # "Reading zip directory..." message.
             status(f"Scanning user partition ({ffs_adapter.user_prefix})…")
-            precomputed = ffs_adapter.build_zip_entries(zip_names)
+            # zip_sizes, not the zip_names set: its archive order makes the
+            # file list's order the same on every open (a set's order
+            # changes with Python's hash seed, 2026-11-28)
+            precomputed = ffs_adapter.build_zip_entries(zip_sizes)
         ui_metadata, guid_to_bundle, zip_ui_paths = ffs_adapter.build_ui_metadata(
             zip_path, zip_names,
             z=z_ctx,
@@ -727,7 +730,7 @@ def parse_archive_metadata(zip_path: str, case_dir: str, status_cb=None) -> dict
         adapter_args, delta, zip_names, zip_ui_paths,
         ui_metadata, folder_map, metadata_only, file_table_dir=case_dir or None,
         zip_path=zip_path, names_from_index=names_from_index)
-    if case_dir:
+    if case_dir and save_tier_counts:
         status(f"Counting the files each header-scan tier would read "
                f"({len(ui_metadata):,} entries)…")
         _save_header_tier_counts(zip_path, case_dir, ffs_adapter, keys=list(ui_metadata))
@@ -773,7 +776,77 @@ def persist_result(case_dir: str, result: dict) -> None:
             save_blob(db, SNAPSHOT_KEY, SNAPSHOT_VERSION, result['snapshot_blob'])
 
 
-def _parse_child(conn, zip_path: str, case_dir: str) -> None:
+_METADATA_CANDIDATES = ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack")
+
+
+def preload_metadata(zip_path: str, case_dir: str):
+    """(entry name, unpacked metadata) of a Cellebrite extraction's
+    metadata.msgpack, read before the case's index exists (owner request
+    2026-11-28: it is one C unpack of 0.7 s on IOS17 and 3.3 s on the big
+    synthetic iPhone, and it now runs while the index is built). Found in
+    the .zcd by walking its records' own lengths (never by searching for the
+    name's bytes); the same entry the adapter would open (metadata2 first;
+    of a name stored twice, the copy furthest in, as the index names them,
+    A-72); the bytes checked against the entry's CRC, as zipfile does.
+    None whenever anything is not plain (no such entry, ZIP64 sizes,
+    encryption, a method other than stored or deflate, a CRC mismatch): the
+    adapter then opens it as before."""
+    import struct
+    import zlib as _zlib
+    import zip_cd_cache
+    import zip_index
+    try:
+        with open(zip_cd_cache.cache_path(zip_path, case_dir), 'rb') as fh:
+            if fh.read(4) != zip_cd_cache._MAGIC:
+                return None
+            payload = fh.read()
+        cd_off, cd_size = zip_index._cd_bounds(payload)
+        cd = memoryview(payload)[cd_off:cd_off + cd_size]
+        want = {c.encode('ascii'): c for c in _METADATA_CANDIDATES}
+        found: dict = {}
+        rec = zip_index._CD_RECORD.unpack_from
+        pos, end = 0, len(cd)
+        while pos < end:
+            if end - pos < 46 or cd[pos:pos + 4] != zip_index._CD_SIG:
+                return None
+            (_sig, _cv, _ev, flags, method, _t, _d, crc, csize, usize,
+             nlen, elen, clen, _disk, _ia, _ea, hoff) = rec(cd, pos)
+            if nlen in (26,):                       # both candidates are 26 bytes
+                name = bytes(cd[pos + 46:pos + 46 + nlen])
+                if name in want:
+                    prev = found.get(name)
+                    if prev is None or hoff > prev[0]:
+                        found[name] = (hoff, flags, method, crc, csize, usize)
+            pos += 46 + nlen + elen + clen
+        if pos != end:
+            return None
+        for raw_name, cand in want.items():
+            if raw_name not in found:
+                continue
+            hoff, flags, method, crc, csize, usize = found[raw_name]
+            if 0xFFFFFFFF in (hoff, csize, usize) or flags & 0x1 or method not in (0, 8):
+                return None
+            with open(zip_path, 'rb') as zf:
+                zf.seek(hoff)
+                head = zf.read(30)
+                if len(head) != 30 or head[:4] != b'PK\x03\x04':
+                    return None
+                n2, e2 = struct.unpack_from('<HH', head, 26)
+                zf.seek(hoff + 30 + n2 + e2)
+                data = zf.read(csize)
+            if len(data) != csize:
+                return None
+            if method == 8:
+                data = _zlib.decompressobj(-15).decompress(data)
+            if len(data) != usize or (_zlib.crc32(data) & 0xFFFFFFFF) != crc:
+                return None
+            return cand, msgpack.unpackb(data)
+        return None
+    except Exception:
+        return None
+
+
+def _parse_child(conn, zip_path: str, case_dir: str, ready_conn=None) -> None:
     """Child-process entry point.
 
     Parses the archive, persists the result to casecache.db, and reports only
@@ -797,10 +870,30 @@ def _parse_child(conn, zip_path: str, case_dir: str) -> None:
                 conn.send(('status', msg))
             except Exception:
                 pass
-        result = parse_archive_metadata(zip_path, case_dir, status_cb=status)
+        preloaded = None
+        if ready_conn is not None:
+            # Started beside the index build (ZipMetadataWorker): unpack the
+            # metadata now, then wait until the index is ready.
+            preloaded = preload_metadata(zip_path, case_dir)
+            try:
+                go = ready_conn.recv()
+            except EOFError:
+                go = 'stop'
+            if go != 'go':
+                return
+        result = parse_archive_metadata(zip_path, case_dir, status_cb=status,
+                                        preloaded_metadata=preloaded, save_tier_counts=False)
         status("Writing case cache…")
         persist_result(case_dir, result)
         conn.send(('done',))
+        # After 'done': the window loads the case meanwhile, and its own
+        # tier count waits for this process to end (ZipMetadataWorker,
+        # wait_for_parse_tail), then finds these saved (2026-11-28: 2.25 s
+        # of the big synthetic iPhone's open, off the wait).
+        fmt, user_pfx, sys_pfx, old_layout = result['adapter_args']
+        _save_header_tier_counts(zip_path, case_dir,
+                                 FfsAdapter(fmt, user_pfx, sys_pfx, bool(old_layout)),
+                                 keys=list(result['ui_metadata']))
     except Exception:
         import traceback
         try:

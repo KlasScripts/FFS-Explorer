@@ -266,13 +266,30 @@ def open_index(zip_path: str, case_dir: str):
     return _open_index(zip_path, case_dir, cache_path(zip_path, case_dir))
 
 
-def build_index_child(zip_path: str, case_dir: str) -> None:
+# Worker processes for building the index (zip_index.parse_directory); None:
+# automatic (worker_counts, CPU-heavy). build_index_child sets it.
+INDEX_PROCESSES: int | None = None
+
+
+def _index_processes() -> int:
+    if INDEX_PROCESSES:
+        return INDEX_PROCESSES
+    try:
+        import worker_counts
+        return worker_counts.auto_cpu()
+    except Exception:
+        return 1
+
+
+def build_index_child(zip_path: str, case_dir: str, processes: int | None = None) -> None:
     """A child process's target: build the case's index (open_index) and
     close it. ZipMetadataWorker._build_zip_index runs it: built in the
     window's process it is ~20 s of Python on 2.19 million entries,
     competing with the window for Python's lock (2026-11-22)."""
     import child_priority
     child_priority.lower_this_process()   # the window is served first
+    global INDEX_PROCESSES
+    INDEX_PROCESSES = processes
     index = open_index(zip_path, case_dir)
     if index is not None:
         index.close()
@@ -294,7 +311,8 @@ def _open_index(zip_path: str, case_dir: str, zcd_path: str):
             if fh.read(4) != _MAGIC:
                 return None
             payload = fh.read()
-        parsed = zip_index.parse_directory(payload)
+        parsed = zip_index.parse_directory(payload, zcd_path=zcd_path, payload_file_off=len(_MAGIC),
+                                           processes=_index_processes())
         zip_index.write(parsed, path, hashlib.sha256(payload).hexdigest())
         return zip_index.ZipIndex(path)
     except (OSError, zip_index.IndexError_, UnicodeDecodeError):

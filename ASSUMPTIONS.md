@@ -1574,6 +1574,67 @@ Tools menu when AI access was off once hid every other Tools action too.
   same way (`spawn`, `freeze_support`) as the first-open parse, which
   works in the exe.
 
+**A-98. Workers: two settings, and stages side by side.** *Decision
+(owner), 2026-11-28: use every core and the disk fully.*
+- Preferences ▸ Performance has two worker counts (`app/worker_counts.py`):
+  CPU-heavy (embedded-media sweep, media metadata, LevelDB indexing) and
+  disk-heavy (Keyword Search, by the owner's choice: it reads the whole
+  archive; duplicate hashing; the header scan). The CPU setting keeps the
+  old key (`worker_processes`), so a number set before still applies.
+- Automatic: CPU = physical cores − 1 (one for the window). Physical, not
+  logical: a second SMT thread adds far less than a core to this work.
+  Disk = physical cores, at most 12. No cap of 8 any more (before: 8 for
+  everything, so a 20-core machine left 12 idle).
+- Measured on a Mac (M5, 10 cores, internal SSD), IOS17: duplicate hashing
+  of every file 14.8 s on 1 worker, 7.4 on 2, 5.9 on 4, 5.4 on 8, 5.0 on
+  10, the disk never above ~0.8 GB/s; Keyword Search 33 s on 1, 4.6 on 10;
+  the sweep keeps ~8.8 of 9 workers busy. Nothing stopped gaining below
+  the core count here. The owner found 12 best for Keyword Search on a
+  20-core (40-thread) Threadripper (from memory, not measured here): hence
+  the most of 12. *Not yet measured on Windows:* `stage_timing.tsv` in the
+  case folder records each stage's time, cores, workers and disk MB/s.
+- The header scan runs on worker processes from 20,000 files (it stayed at
+  ~1.3 cores on threads whatever their number): IOS17 tier 1 2.6 → 1.6 s,
+  the same 25,393 types.
+- Duplicate detection runs beside LevelDB, the sweep and the media metadata
+  stage (it reads only the file list, unpacked archives and header types)
+  and Process Case ends when it does: IOS17 42.6 → 40.0 s for the case, the
+  same 173,980 rows. Its progress has its own line, as the integrity hash.
+- First open, IOS17 on the Mac: 8.75 → 7.6 s, the same case (index and
+  zcd byte-identical; file list, folders, tier counts, folder sizes and
+  user-media candidates equal in content; the snapshot differs only in the
+  file list's random file name). The index's record loop runs on worker
+  processes (`zip_index.parse_directory`; its build child is no longer a
+  daemon, which may not start workers) and its tail no longer walks every
+  name for repeated paths when it can tell there are few (1.9 → 1.2 s); the
+  parse no longer makes an entry for every stored file for `probe_delta`,
+  which has ignored them since offsets come from the sidecar layout.
+  Still one process each: the index (needed by everything after it), the
+  parse (~4.4 s: Cellebrite's metadata.msgpack, one C unpack of ~0.7 s; the
+  file list's columns, ~1.2 s, already C-level; and passes of 0.1-0.5 s),
+  the window's reload of the snapshot (~0.7 s) and the tree (~0.9 s).
+- The same archive now gives the same case (2026-11-28). Before, on
+  Cellebrite iOS the file list's order (and each folder's children) changed
+  from one open to the next: `build_zip_entries` went through the zip's
+  names as a set, whose order follows Python's per-run hash seed. It now
+  goes in archive order (the parse passes `zip_sizes`; a set given is
+  sorted), and the sets saved with the case (metadata-only folders, folder
+  counts, the GUID map) are saved sorted. Checked: two opens with different
+  hash seeds give byte-identical index, file list and case cache data,
+  apart from the file list's random file name and the cache stamps made
+  from it (`tests/test_case_repeatable.py`).
+- First open, run side by side (2026-11-28): the parse child starts with
+  the index build, unpacks Cellebrite's `metadata.msgpack` meanwhile
+  (`ffs_metadata.preload_metadata`: found by walking the .zcd's records,
+  the copy the index names, checked against its CRC; anything unusual and
+  the adapter opens it as before), and goes on once the index and the case
+  names are done. It saves the header-tier counts after reporting done;
+  the window's tier count waits for it (`wait_for_parse_tail`). IOS17
+  8.75 → 5.9 s, the big synthetic iPhone (2.19 million files) 26.6 → 22.0 s,
+  the same case. Splitting the parse itself into slices does not fit: the
+  metadata is one msgpack map, and each slice would need its own copy of
+  it (gigabytes) or the result shipped between processes.
+
 ## 17. Corrections needed elsewhere
 
 The four `FFS_processing.md` corrections below were applied on 2026-11-24.

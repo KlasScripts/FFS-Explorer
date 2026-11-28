@@ -1055,7 +1055,15 @@ class FfsAdapter:
                 }
             return result
         else:
+            pre = getattr(self, '_preloaded_metadata', None)
             for candidate in ("metadata2/metadata.msgpack", "metadata1/metadata.msgpack"):
+                if pre is not None and pre[0] == candidate:
+                    # read and checked before the index existed
+                    # (ffs_metadata.preload_metadata): the same bytes, unpacked
+                    raw = pre[1]
+                    if self.old_layout:
+                        return {k.removeprefix("private/var/"): v for k, v in raw.items()}
+                    return raw
                 try:
                     with z.open(candidate) as f:
                         # Single GIL hold for the whole unpack (~1-2 s for a large
@@ -1089,6 +1097,12 @@ class FfsAdapter:
         """
         prefix    = self.user_prefix + '/'
         old_strip = (prefix + 'private/var/') if self.old_layout else None
+        # The order of the result is the order of the file list. Given in
+        # archive order (a dict of the names, as the parse passes), it is
+        # kept; a set has no order of its own (it changes with Python's hash
+        # seed from one run to the next), so it is sorted.
+        if isinstance(zip_names, (set, frozenset)):
+            zip_names = sorted(zip_names)
 
         result: dict[str, str] = {}
         for i, entry in enumerate(zip_names):

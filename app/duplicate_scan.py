@@ -37,7 +37,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from zip_entry import ZipEntry
-from zip_reader import THREAD_WORKERS
+import zip_reader                # THREAD_WORKERS read when a scan starts (Preferences)
 
 # Files are hashed in chunks of this size, never read whole: a duplicated
 # multi-GB video would otherwise be held in memory in one piece, once per
@@ -271,7 +271,7 @@ def find_duplicate_groups(zip_path, candidates, inode_trusted=False,
         if units_left is None:          # cancelled
             return results
 
-    with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=zip_reader.THREAD_WORKERS) as pool:
         futures = [pool.submit(_hash, g, u) for g, u in units_left]
         for fut in as_completed(futures):
             if cancel_check and cancel_check():

@@ -266,3 +266,52 @@ def test_deletion_log_via_check_and_fallback(tmp_path):
     assert 'no record of it was recovered' in gone['how_found']
     assert [r for r in logged if r['guid'] == 'GUID-0005'][0]['how_found'].endswith(
         'its record was also recovered (listed in this report)')
+
+
+def test_stable_id_tells_a_reused_row_id(tmp_path):
+    """stable_id: a record under a live row id whose stable id is not that
+    row's is another item: Deleted when no live row has its stable id (the
+    id was handed to a new row), that row's earlier version when one does."""
+    src = str(tmp_path / 'work.db')
+    c = sqlite3.connect(src, isolation_level=None)
+    c.execute('pragma journal_mode=wal')
+    c.execute('pragma wal_autocheckpoint=0')
+    c.execute('create table dl(id integer primary key, guid text, path text, state integer)')
+    for i in range(1, 21):
+        c.execute('insert into dl values(?,?,?,?)', (i, f'guid-{i:04d}', f'/sdcard/Download/file {i}.pdf', 1))
+    c.execute('pragma wal_checkpoint(truncate)')
+    # 20 deleted, and a new download takes id 20 (plain INTEGER PRIMARY KEY)
+    c.execute('delete from dl where id = 20')
+    c.execute("insert into dl values(20, 'guid-NEW1', '/sdcard/Download/new one.pdf', 1)")
+    # 7 rewritten under id 30, and a new download takes id 7
+    c.execute('delete from dl where id = 7')
+    c.execute("insert into dl values(30, 'guid-0007', '/sdcard/Download/file 7 renamed.pdf', 1)")
+    c.execute("insert into dl values(7, 'guid-NEW2', '/sdcard/Download/other.pdf', 1)")
+    # 3 changed in place: same id, same guid
+    c.execute("update dl set path = '/sdcard/Download/three moved.pdf' where id = 3")
+    out = str(tmp_path / 'p' / 'dl.db')
+    os.makedirs(os.path.dirname(out))
+    for s in ('', '-wal'):
+        shutil.copyfile(src + s, out + s)
+    c.close()
+    module = SimpleNamespace(recovered_records=[{
+        'file_key': 'db', 'table': 'dl', 'label': 'Download', 'stable_id': ['guid'],
+        'fields': {'id': 'download_id', 'guid': 'guid', 'path': 'path'},
+        'version_fields': ['guid', 'path'],
+        'links': [{'name': 'linked_self', 'what': 'download', 'column': 'id',
+                   'table': 'dl', 'key': 'id'}]}])
+    ar.take_open_notes()
+    rows = ar.recovered_records_report(module, {'db': out})
+    notes = ar.take_open_notes()
+    got = {r['guid']: r for r in rows}
+    gone = got['guid-0020']
+    assert gone['status'] == 'Deleted' and gone['raw_rowid'] == 20
+    assert 'row id 20 now holds a different item (its guid differs)' in gone['how_found']
+    assert gone['linked_self'] == 'not linked: row id 20 now holds a different item'
+    moved = got['guid-0007']
+    assert moved['status'] == 'Changed' and moved['row_id'] == 30
+    assert moved['path (now)'] == '/sdcard/Download/file 7 renamed.pdf'
+    assert 'stored under row id 7, which now holds a different item' in moved['how_found']
+    three = got['guid-0003']
+    assert three['status'] == 'Changed' and three['row_id'] == 3   # same item: not a reuse
+    assert any('2 record(s) under a live row id whose guid is not that row' in n for n in notes)

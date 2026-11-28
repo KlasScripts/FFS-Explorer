@@ -221,5 +221,6 @@ deleted_tables = [{'script': 'chrome_autofill_deleted',
              'date_last_used': 'date_last_used',
              'count': 'count'},
   'identity': ['name', 'value'],
+  'stable_id': ['name', 'value'],
   'version_fields': ['name', 'value'],
   'links': []}]

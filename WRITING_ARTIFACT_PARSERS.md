@@ -639,6 +639,14 @@ differs, otherwise counted in the run log. Without it, an app that rewrites
 a row under a new id makes every rewrite look deleted (Instagram on the
 Josh Hickman iOS 17 image: 464 records, 1 message really gone).
 
+When that key never changes over a row's life (a UUID, a guid, a
+message id; never a path, which a rename changes), declare it as
+`stable_id` too. In a table without AUTOINCREMENT, SQLite can give a
+deleted row's id to a new row; a record under a live row id whose stable
+id is not that row's is then another item: the earlier version of the
+live row that has its stable id, or Deleted ("row id N now holds a
+different item"), with links on the id not followed.
+
 When the value that matters is inside a BLOB (Instagram's message text in
 an NSKeyedArchiver archive), give the entry `decode`: the name of a
 function in the main report, `{column: value} -> {field: value}`, reading

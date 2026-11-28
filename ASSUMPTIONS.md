@@ -1367,6 +1367,13 @@ default.** *Decision (owner, 2026-11-16).*
 - Rows of DROPPED tables are not recovered. *Decision (owner, 2026-11-17):*
   phone apps delete, update and insert rows; dropping a table is rare (e.g.
   a schema migration). FQLite 5.21 recovers them (corpus 0A: 99/100).
+- Row ids reused (2026-11-28, from a review by Codex): a record under a
+  live row id is that row's earlier version only if its `stable_id` (a key
+  that never changes: UUID, guid, message id, Chrome's cookie key; never a
+  path) is the live row's; otherwise it is another item, tied to the live
+  row with its stable id or listed as Deleted. None found on the test
+  images. A decoded field that cannot be read leaves an earlier version
+  "Comparison incomplete", listed, not hidden (Codex, 85a29c3).
 
 **A-96. The runner extracts every database's `-wal` and `-journal`.**
 *Decision.* For every SQLite file a parser extracts, from the same archive

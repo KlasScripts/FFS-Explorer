@@ -1264,6 +1264,14 @@ def _deleted_table_module(platform: str, main_script: str, main, entry: dict, ta
         except (OSError, TypeError):
             pass
     m.recovered_records = [spec]
+    if spec.get('decode') and isinstance(getattr(m, 'description', None), str):
+        # the status only a decoded field can give (said once, here, for
+        # every such report rather than in each description)
+        m.description += (
+            '\n\nComparison incomplete: an earlier version of a live row whose decoded '
+            "value (read out of a BLOB, as the main report reads it) could not be read "
+            "in the record or in the live row, so it cannot be shown to differ; listed "
+            "rather than hidden, with the field named in how_found.")
     m.report_type = 'recovered_records'
     m.deleted_of = main_script
     m.deleted_table_of = main_script          # declared in the main report
@@ -1553,6 +1561,11 @@ def _extract_db_sidecars(dest_path: str, candidates: list[str], zip_path: str,
 #               trigger writes). Its live rows whose key is in no live row of
 #               this table's column are listed, status "Deleted (recorded by
 #               the app)", saying whether a record was also recovered
+#       "stable_id": ["guid"],       # optional: columns that never change over a
+#               row's life. A record under a live row id whose stable id is not
+#               that row's is another item (the id was reused): that item's
+#               earlier version if a live row has its stable id, else Deleted.
+#               Only for keys that cannot change (a UUID, a guid), never a path
 #       "identity": ["ZUUID"],        # optional: columns the app keeps unique
 #               per row. A record with no row id (found by pattern) or with a
 #               row id no longer live, whose identity values are a live row's,
@@ -1971,6 +1984,21 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
                 if None not in k:
                     by_ident[k] = None if k in by_ident else lrid    # None: not unique
         tied = 0
+        # 'stable_id': columns that never change over a row's life (a UUID,
+        # Chrome's download guid, a cookie's key). SQLite can give a deleted
+        # row's id to a new row in a table without AUTOINCREMENT; a record
+        # whose row id is live but whose stable id is not that live row's is
+        # another item: an earlier version of the live row that has its
+        # stable id, if one does, else a deleted item (2026-11-28, from a
+        # review by Codex). Never a key that can change (a path).
+        stable = [c for c in (spec.get('stable_id') or ()) if c in idx]
+        by_stable: dict = {}
+        if stable:
+            for lrid, lv in t.live.items():
+                k = tuple(lv[idx[c]] if idx[c] < len(lv) else None for c in stable)
+                if None not in k:
+                    by_stable[k] = None if k in by_stable else lrid    # None: not unique
+        reused_ids = 0
         mins: dict = {}
 
         def live_min(col):
@@ -1987,13 +2015,28 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             vals = list(r['values'])
             rowid = r['rowid']
             tied_to = None
-            if by_ident and (rowid is None or rowid not in t.live) \
+            reused = False
+            if stable and rowid is not None and rowid in t.live \
+                    and r['method'] != 'unfinished_delete':
+                lv = t.live[rowid]
+                rk = tuple(vals[idx[c]] if idx[c] < len(vals) else None for c in stable)
+                lk = tuple(lv[idx[c]] if idx[c] < len(lv) else None for c in stable)
+                if None not in rk and None not in lk and rk != lk:
+                    reused_ids += 1
+                    other = by_stable.get(rk)
+                    if other is not None:
+                        tied_to = rowid = other      # that item, now under another id
+                    else:
+                        reused = True                # gone: its id now holds another item
+            if by_ident and not reused and (rowid is None or rowid not in t.live) \
                     and r['method'] != 'unfinished_delete':
                 k = tuple(vals[idx[c]] if idx[c] < len(vals) else None for c in ident)
                 if None not in k and by_ident.get(k) is not None:
                     tied_to = rowid = by_ident[k]
                     tied += 1
-            live = t.live.get(rowid) if rowid is not None else None
+            live = t.live.get(rowid) if rowid is not None and not reused else None
+            if reused:
+                status = 'Deleted'
             if r['method'] == 'unfinished_delete':
                 status = 'Unfinished delete'
             elif r.get('in_unfinished_write'):
@@ -2097,8 +2140,14 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
             note = sqlite_recovery.describe(r)
             if unavailable:
                 note += f"; unable to compare decoded field(s): {', '.join(unavailable)}"
+            if reused:
+                note += (f"; row id {r['rowid']} now holds a different item (its "
+                         f"{', '.join(fields.get(c, c) for c in stable)} differs): not an "
+                         "earlier version of it")
             if tied_to is not None:
                 own = ('no row id of its own' if r['rowid'] is None
+                       else f"stored under row id {r['rowid']}, which now holds a different item"
+                       if r['rowid'] in t.live
                        else f"stored under row id {r['rowid']}, no longer live")
                 note += (f"; {own}: tied to live row {tied_to} by "
                          f"{', '.join(fields.get(c, c) for c in ident)}")
@@ -2124,6 +2173,11 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
                 row['truncated'] = True
             for link, target, join, fallback in links:
                 if link['column'] in idx or link['column'].lower() == 'rowid':
+                    if reused and (link['column'] == t.id_col or link['column'].lower() == 'rowid'):
+                        # the id is the live item's now: its rows are not this record's
+                        row[link['name']] = (f"not linked: row id {r['rowid']} now holds "
+                                             "a different item")
+                        continue
                     row[link['name']] = _link_text(
                         link, _col_value(t, vals, rowid, link['column']), target, join,
                         **_link_extras(t, vals, rowid, link, fallback))
@@ -2231,6 +2285,10 @@ def _recovered_records_rows(module, paths, rows, seen_values, carvers) -> list[d
         if decode_errors:
             log_note(f"{label}: {decode_errors} record(s) could not be decoded: their stored "
                      "values are listed as found.")
+        if reused_ids:
+            log_note(f"{label}: {reused_ids} record(s) under a live row id whose "
+                     f"{', '.join(fields.get(c, c) for c in stable)} is not that row's: "
+                     "another item (the id was reused), not an earlier version of it.")
         if tied:
             log_note(f"{label}: {tied} record(s) with no row id, or one no longer live, carried the "
                      f"{', '.join(fields.get(c, c) for c in ident)} of a live row: treated as "

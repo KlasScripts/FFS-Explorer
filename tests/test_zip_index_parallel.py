@@ -63,3 +63,40 @@ def test_damaged_directory_same_error(tmp_path, monkeypatch):
         zip_index.parse_directory(bad, zcd_path=str(tmp_path / 'b.zcd'), payload_file_off=4,
                                   processes=3)
     assert str(e1.value) == str(e2.value)
+
+
+def _renames_both(payload):
+    """parse_directory's renames, and the full way's on the same records."""
+    out = zip_index.parse_directory(payload)
+    cd_off, cd_size = zip_index._cd_bounds(payload)
+    recs = zip_index._parse_records(memoryview(payload)[cd_off:cd_off + cd_size], 0, cd_size)
+    names = list(recs['names'])
+    base = list(names)
+    by_name = dict(zip(names, range(len(names))))
+    rep = zip_index._name_repeated_captures(names, recs['cols']['header_offset'], by_name)
+    full = zip_index._renames(base, recs['old'], names, by_name, recs['cols']['header_offset'],
+                              repeated=rep, _full=True)
+    fast = zip_index._renames_fast(base, recs['old'], names, by_name, rep)
+    return out['renames'], full, fast
+
+
+def _zip_payload(tmp_path, entries):
+    p = tmp_path / 'r.zip'
+    with zipfile.ZipFile(p, 'w', zipfile.ZIP_STORED) as z:
+        for n in entries:
+            z.writestr(n, b'x')
+    return p.read_bytes()
+
+
+@pytest.mark.parametrize('entries,expect_fast', [
+    (['a\\b.txt', 'c/d.txt', 'dir\\sub\\e.db'], True),                  # plain backslash names
+    (['a\\b.txt', 'a/b.txt', 'x.txt'], False),                          # its other reading is a real name
+    (['a\\b.txt', 'a\\b.txt', 'q.txt'], False),                         # the renamed name stored twice
+    (['f\\g [capture 1 of 2].txt', 'h.txt'], False),                    # looks like a capture alias
+    (['m\\n.txt', 'm/n.txt', 'm\\n.txt', 'z.db', 'z.db'], False),       # all of it at once
+    (['p\\q.txt', 'r.db', 'r.db', 's/t'], True),                        # repeats elsewhere only
+])
+def test_renames_fast_way_equals_full_way(tmp_path, entries, expect_fast):
+    got, full, fast = _renames_both(_zip_payload(tmp_path, entries))
+    assert got == full
+    assert (fast is not None) == expect_fast

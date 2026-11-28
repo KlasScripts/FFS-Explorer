@@ -327,9 +327,11 @@ def parse_directory(payload: bytes, zcd_path: str | None = None, payload_file_of
     # {name: last index with it}, in first-seen order: what the loop
     # `by_name[name] = i` gives, built in C
     by_name: dict[str, int] = dict(zip(final_names, range(len(final_names))))
+    repeated: set = set()
     if len(by_name) != len(final_names):      # some name is stored more than once
-        _name_repeated_captures(final_names, cols["header_offset"], by_name)
-    renames = _renames(base_names, old, final_names, by_name, cols["header_offset"]) if old else []
+        repeated = _name_repeated_captures(final_names, cols["header_offset"], by_name)
+    renames = (_renames(base_names, old, final_names, by_name, cols["header_offset"],
+                        repeated=repeated) if old else [])
     # The names pool and each entry's place in it, and zipfile's orig names
     # (sharing the name's bytes when the same), in whole-list steps.
     from itertools import accumulate
@@ -364,8 +366,34 @@ def parse_directory(payload: bytes, zcd_path: str | None = None, payload_file_of
             "renames": renames}
 
 
+def _renames_fast(base_names, old, final_names, by_name, repeated):
+    """_renames' (was, now) name pairs per variant, worked out from the
+    entries in *old* alone, or None when that is not certain to give what
+    the full way gives. Certain when, for each entry with an older name:
+    neither name is a repeated path (*repeated*, the names stored more than
+    once), neither holds a capture alias's marker (so no alias can be one of
+    them), and its older name is no other entry's name and no other entry's
+    older name. Then the capture renaming sees the same groups, makes the
+    same aliases and checks them against the same names, so every other
+    entry's name is the same in both readings (2026-11-28: the full way
+    rebuilt and walked all 2.5 million names twice)."""
+    out = []
+    for variant in (0, 1):
+        seen = set()
+        pairs = []
+        for i, pair in old.items():
+            b, y = base_names[i], pair[variant]
+            if (b in repeated or y in repeated or " [capture " in b or " [capture " in y
+                    or (y != b and y in by_name) or y in seen):
+                return None
+            seen.add(y)
+            pairs.append((y, final_names[i]))
+        out.append(pairs)
+    return out
+
+
 def _renames(base_names: list[str], old: dict, final_names: list[str], by_name: dict,
-             header_offsets) -> list[tuple[str, str]]:
+             header_offsets, repeated=None, _full: bool = False) -> list[tuple[str, str]]:
     """[(name in older versions, name now)] for every entry whose name the
     A-80 rule changed, once for the macOS/Linux reading and once for the
     Windows one, plus each folder above it whose name changed (a folder
@@ -373,7 +401,15 @@ def _renames(base_names: list[str], old: dict, final_names: list[str], by_name: 
     are dropped when the old name is ambiguous: it is also a name some
     entry has now, or it stood for two different names."""
     found: dict[str, set] = {}
-    for variant in (0, 1):
+    fast = (None if _full or repeated is None
+            else _renames_fast(base_names, old, final_names, by_name, repeated))
+    if fast is not None:
+        for pairs in fast:
+            for was, now in pairs:
+                if was != now:
+                    for a, b in _with_folders(was.rstrip("/"), now.rstrip("/")):
+                        found.setdefault(a, set()).add(b)
+    for variant in (() if fast is not None else (0, 1)):
         names = list(base_names)
         for i, pair in old.items():
             names[i] = pair[variant]
@@ -383,10 +419,12 @@ def _renames(base_names: list[str], old: dict, final_names: list[str], by_name: 
             if was != now:
                 for a, b in _with_folders(was.rstrip("/"), now.rstrip("/")):
                     found.setdefault(a, set()).add(b)
-    current = set(by_name)
-    current |= {n.rstrip("/") for n in by_name}
+    # "a name some entry has now", as the name or with its trailing slashes
+    # off: only folder entries end in "/", so only theirs are stripped (the
+    # same set as stripping every name, without building one of every name)
+    folders = {n.rstrip("/") for n in by_name if n.endswith("/")}
     return sorted((a, next(iter(b))) for a, b in found.items()
-                  if len(b) == 1 and a not in current)
+                  if len(b) == 1 and a not in by_name and a not in folders)
 
 
 def _with_folders(was: str, now: str) -> list[tuple[str, str]]:
@@ -406,16 +444,17 @@ def _with_folders(was: str, now: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _name_repeated_captures(names: list[str], header_offsets, by_name: dict) -> None:
+def _name_repeated_captures(names: list[str], header_offsets, by_name: dict) -> set:
     """zip_cd_cache._name_repeated_captures, on names and a {name: index}
-    dict instead of ZipInfo objects (see A-72)."""
+    dict instead of ZipInfo objects (see A-72). Returns the names stored
+    more than once (folders aside)."""
     from collections import Counter
     from zip_cd_cache import capture_alias
     # only the names stored more than once (counted in C), grouped in the
     # order of their first entry: the order a group per name had
     repeated = {n for n, c in Counter(names).items() if c > 1 and not n.endswith("/")}
     if not repeated:
-        return
+        return repeated
     copies: dict[str, list[int]] = {}
     for i, name in enumerate(names):
         if name in repeated:
@@ -432,6 +471,7 @@ def _name_repeated_captures(names: list[str], header_offsets, by_name: dict) -> 
             names[i] = alias
             by_name[alias] = i
         by_name[name] = group[-1]
+    return repeated
 
 
 def _hash_table(by_name: dict[str, int]) -> array:

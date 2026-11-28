@@ -1629,9 +1629,14 @@ Tools menu when AI access was off once hid every other Tools action too.
   the copy the index names, checked against its CRC; anything unusual and
   the adapter opens it as before), and goes on once the index and the case
   names are done. It saves the header-tier counts after reporting done;
-  the window's tier count waits for it (`wait_for_parse_tail`). IOS17
-  8.75 → 5.9 s, the big synthetic iPhone (2.19 million files) 26.6 → 22.0 s,
-  the same case. Splitting the parse itself into slices does not fit: the
+  the window's tier count waits for it (`wait_for_parse_tail`). Then the
+  index's rename pass works from the few entries with an older name when
+  that is certain to give the same (`zip_index._renames_fast`; else the
+  full way), and the file list's write does its name offsets, NUL check,
+  lookup table and folder children in C (`file_table`). IOS17
+  8.75 → 5.6 s, the big synthetic iPhone (2.19 million files) 26.6 → 21.4 s;
+  index and file list byte-identical on IOS17, the big iPhone, Android 14
+  and the Magnet iOS 18 image. Splitting the parse itself into slices does not fit: the
   metadata is one msgpack map, and each slice would need its own copy of
   it (gigabytes) or the result shipped between processes.
 

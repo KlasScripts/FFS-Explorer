@@ -57,6 +57,23 @@ import msgpack
 
 from zip_index import _hash_table
 
+
+def _table_of(enc: list) -> array:
+    """zip_index._hash_table for {name: its place in the list}, from the
+    names already encoded (UTF-8, surrogatepass, as _hash_table encodes
+    them): the same slots, the CRCs taken in one C call."""
+    size = 1
+    while size < max(len(enc), 1) * 2:
+        size <<= 1
+    table = array("i", [-1]) * size
+    mask = size - 1
+    for i, h in enumerate(map(zlib.crc32, enc)):
+        h &= mask
+        while table[h] != -1:
+            h = (h + 1) & mask
+        table[h] = i
+    return table
+
 MAGIC = b'FFSFILE\x03'   # 2: a NUL after each name; 3: in_zip bits
 FIELDS = ('atime', 'btime', 'ctime', 'gid', 'inode', 'links', 'mode', 'mtime',
           'prot', 'size', 'uid')
@@ -220,13 +237,18 @@ def write(ui_metadata: dict, folder_map: dict, path: str, in_zip=None) -> None:
         return i
 
     folder_rows, child_start, child_len, children = array('i'), array('Q'), array('I'), array('i')
+    known = row.__getitem__
     for f, kids in folder_map.items():
         if type(kids) is not list:
             raise ValueError('a folder\'s children are not a list')
         folder_rows.append(rid(f))
         child_start.append(len(children))
         child_len.append(len(kids))
-        children.extend(rid(k) for k in kids)
+        try:
+            ids = list(map(known, kids))       # all already rows: looked up in C
+        except (KeyError, TypeError):
+            ids = [rid(k) for k in kids]       # new rows numbered in order, as always
+        children.extend(ids)
 
     first = next((v for v in ui_metadata.values()
                   if type(v) is dict and v.keys() == _FIELD_SET), None)
@@ -252,19 +274,19 @@ def write(ui_metadata: dict, folder_map: dict, path: str, in_zip=None) -> None:
                 n_in_zip += 1
 
     enc = [n.encode('utf-8', 'surrogatepass') for n in names]
-    if any(b'\x00' in b for b in enc):
+    if b'\x00' in b''.join(enc):      # a NUL in any name is a NUL in them all joined
         raise ValueError('a path holds a NUL character')
-    name_start, name_len = array('Q'), array('I')
-    off = 0
-    for b in enc:
-        name_start.append(off)
-        name_len.append(len(b))
-        off += len(b) + 1          # each name is followed by a NUL (names_run)
+    # each name is followed by a NUL (names_run): starts are the running sum
+    # of length + 1, in C
+    from itertools import accumulate
+    name_len = array('I', map(len, enc))
+    name_start = array('Q', accumulate(map((1).__add__, name_len), initial=0))
+    del name_start[-1:]
     sections = [('counts', struct.pack('<QQ', n_files, len(names))),
                 ('in_zip', struct.pack('<qQ', 1 if in_zip is not None else 0, n_in_zip)),
                 ('order', ','.join(order).encode('ascii')),
                 ('names', b'\x00'.join(enc) + b'\x00'), ('name_start', name_start.tobytes()),
-                ('name_len', name_len.tobytes()), ('table', _hash_table(row).tobytes()),
+                ('name_len', name_len.tobytes()), ('table', _table_of(enc).tobytes()),
                 ('flags', flags.tobytes()), ('p_start', p_start.tobytes()),
                 ('p_len', p_len.tobytes()), ('pool', bytes(pool)),
                 ('folder_rows', folder_rows.tobytes()), ('child_start', child_start.tobytes()),
